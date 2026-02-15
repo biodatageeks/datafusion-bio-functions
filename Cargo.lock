@@ -870,7 +870,6 @@ dependencies = [
  "async-trait",
  "datafusion",
  "datafusion-bio-format-bam",
- "datafusion-bio-format-core",
  "futures",
  "log",
  "serde",
