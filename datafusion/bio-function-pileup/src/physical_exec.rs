@@ -39,6 +39,7 @@ fn handle_contig_transition(
     contig_lengths: &HashMap<String, usize>,
     pending_batches: &mut VecDeque<RecordBatch>,
     schema: &SchemaRef,
+    batch_size: usize,
 ) -> bool {
     let contig_changed = current_contig.as_ref().is_none_or(|c| c.as_str() != chrom);
     if !contig_changed {
@@ -47,10 +48,10 @@ fn handle_contig_transition(
 
     // Emit the previous contig if we had one
     if let (Some(prev_contig), Some(prev_depth)) = (current_contig.take(), current_depth.take()) {
-        if let Ok(rb) = coverage::dense_depth_to_record_batch(&prev_contig, &prev_depth, schema) {
-            if rb.num_rows() > 0 {
-                pending_batches.push_back(rb);
-            }
+        if let Ok(batches) =
+            coverage::dense_depth_to_record_batches(&prev_contig, &prev_depth, schema, batch_size)
+        {
+            pending_batches.extend(batches);
         }
     }
 
@@ -126,7 +127,7 @@ impl PileupExec {
         let cache = PlanProperties::new(
             EquivalenceProperties::new(schema),
             input.properties().partitioning.clone(),
-            EmissionType::Final,
+            EmissionType::Incremental,
             Boundedness::Bounded,
         );
         Self {
@@ -188,11 +189,17 @@ impl ExecutionPlan for PileupExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context)?;
+        let input_stream = self.input.execute(partition, context.clone())?;
+        let batch_size = context.session_config().batch_size();
         let config = self.config.clone();
         let schema = self.schema();
 
-        Ok(Box::pin(PileupStream::new(input_stream, config, schema)))
+        Ok(Box::pin(PileupStream::new(
+            input_stream,
+            config,
+            schema,
+            batch_size,
+        )))
     }
 }
 
@@ -207,8 +214,6 @@ enum DepthAccumulator {
         current_depth: Option<DenseContigDepth>,
         /// Contig lengths from BAM header metadata.
         contig_lengths: HashMap<String, usize>,
-        /// Queue of completed RecordBatches ready to emit.
-        pending_batches: VecDeque<RecordBatch>,
     },
     /// Sparse BTreeMap accumulation — fallback when no contig lengths available.
     Sparse {
@@ -237,6 +242,8 @@ struct PileupStream {
     config: PileupConfig,
     /// Output schema.
     schema: SchemaRef,
+    /// Maximum rows per output batch (from DataFusion session config).
+    batch_size: usize,
     /// Whether we've finished processing (no more output).
     finished: bool,
     /// Whether we've consumed all input.
@@ -245,22 +252,31 @@ struct PileupStream {
     initialized: bool,
     /// The depth accumulator (dense or sparse).
     accumulator: DepthAccumulator,
+    /// Queue of completed RecordBatches ready to emit.
+    pending_batches: VecDeque<RecordBatch>,
     /// Cached column indices (computed once on first batch).
     col_idx: Option<ColumnIndices>,
 }
 
 impl PileupStream {
-    fn new(input: SendableRecordBatchStream, config: PileupConfig, schema: SchemaRef) -> Self {
+    fn new(
+        input: SendableRecordBatchStream,
+        config: PileupConfig,
+        schema: SchemaRef,
+        batch_size: usize,
+    ) -> Self {
         Self {
             input,
             config,
             schema,
+            batch_size,
             finished: false,
             input_exhausted: false,
             initialized: false,
             accumulator: DepthAccumulator::Sparse {
                 contig_events: HashMap::new(),
             },
+            pending_batches: VecDeque::new(),
             col_idx: None,
         }
     }
@@ -284,7 +300,6 @@ impl PileupStream {
                     current_contig: None,
                     current_depth: None,
                     contig_lengths,
-                    pending_batches: VecDeque::new(),
                 };
             }
         }
@@ -311,11 +326,14 @@ impl PileupStream {
             current_contig,
             current_depth,
             contig_lengths,
-            pending_batches,
         } = &mut self.accumulator
         else {
             return;
         };
+
+        let pending_batches = &mut self.pending_batches;
+        let schema = &self.schema;
+        let batch_size = self.batch_size;
 
         if col_idx.binary_cigar {
             let cigar_arr = batch.column(col_idx.cigar).as_binary::<i32>();
@@ -339,7 +357,8 @@ impl PileupStream {
                     current_depth,
                     contig_lengths,
                     pending_batches,
-                    &self.schema,
+                    schema,
+                    batch_size,
                 ) {
                     continue;
                 }
@@ -373,7 +392,8 @@ impl PileupStream {
                     current_depth,
                     contig_lengths,
                     pending_batches,
-                    &self.schema,
+                    schema,
+                    batch_size,
                 ) {
                     continue;
                 }
@@ -393,7 +413,6 @@ impl PileupStream {
         let DepthAccumulator::Dense {
             current_contig,
             current_depth,
-            pending_batches,
             ..
         } = &mut self.accumulator
         else {
@@ -401,10 +420,13 @@ impl PileupStream {
         };
 
         if let (Some(contig), Some(depth)) = (current_contig.take(), current_depth.take()) {
-            if let Ok(rb) = coverage::dense_depth_to_record_batch(&contig, &depth, &self.schema) {
-                if rb.num_rows() > 0 {
-                    pending_batches.push_back(rb);
-                }
+            if let Ok(batches) = coverage::dense_depth_to_record_batches(
+                &contig,
+                &depth,
+                &self.schema,
+                self.batch_size,
+            ) {
+                self.pending_batches.extend(batches);
             }
         }
     }
@@ -417,14 +439,9 @@ impl Stream for PileupStream {
         let this = self.get_mut();
 
         loop {
-            // 1. Drain pending batches (dense path)
-            if let DepthAccumulator::Dense {
-                pending_batches, ..
-            } = &mut this.accumulator
-            {
-                if let Some(batch) = pending_batches.pop_front() {
-                    return Poll::Ready(Some(Ok(batch)));
-                }
+            // 1. Drain pending batches (shared queue for both dense and sparse)
+            if let Some(batch) = this.pending_batches.pop_front() {
+                return Poll::Ready(Some(Ok(batch)));
             }
 
             // 2. If finished, no more output
@@ -483,16 +500,21 @@ impl Stream for PileupStream {
                 continue;
             }
 
-            // Sparse finalization: emit all contigs in one batch
+            // Sparse finalization: emit chunked batches
             if let DepthAccumulator::Sparse { contig_events } = &mut this.accumulator {
                 if contig_events.is_empty() {
                     return Poll::Ready(None);
                 }
-                return match coverage::all_events_to_record_batch(contig_events, &this.schema) {
-                    Ok(batch) if batch.num_rows() == 0 => Poll::Ready(None),
-                    Ok(batch) => Poll::Ready(Some(Ok(batch))),
-                    Err(e) => Poll::Ready(Some(Err(e))),
-                };
+                match coverage::all_events_to_record_batches(
+                    contig_events,
+                    &this.schema,
+                    this.batch_size,
+                ) {
+                    Ok(batches) => this.pending_batches.extend(batches),
+                    Err(e) => return Poll::Ready(Some(Err(e))),
+                }
+                // Loop back to drain pending batches (step 1), then step 2 returns None
+                continue;
             }
 
             return Poll::Ready(None);
@@ -874,5 +896,49 @@ mod tests {
             .downcast_ref::<Int16Array>()
             .unwrap();
         assert_eq!(covs.value(0), 1);
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_chunking() {
+        // Two overlapping reads produce 3 coverage blocks:
+        // [0,4] cov=1, [5,9] cov=2, [10,14] cov=1
+        let batch = make_batch(vec![
+            ("chr1", 0, 10, 0, "10M", 60),
+            ("chr1", 5, 15, 0, "10M", 60),
+        ]);
+        let schema = bam_schema();
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+
+        // Configure batch_size=2 so 3 rows get split into 2 batches
+        let config = SessionConfig::new().with_batch_size(2);
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("reads", Arc::new(mem_table)).unwrap();
+
+        let df = ctx.table("reads").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let pileup = PileupExec::new(
+            plan,
+            PileupConfig {
+                zero_based: true,
+                ..PileupConfig::default()
+            },
+        );
+        let task_ctx = ctx.task_ctx();
+        let stream = pileup.execute(0, task_ctx).unwrap();
+        let batches: Vec<RecordBatch> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Should produce 2 batches: [2 rows] + [1 row]
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(batches[1].num_rows(), 1);
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
     }
 }

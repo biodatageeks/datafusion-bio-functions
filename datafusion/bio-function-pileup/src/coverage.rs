@@ -182,6 +182,58 @@ pub fn dense_depth_to_record_batch(
     coverage_blocks_to_record_batch(&blocks, schema)
 }
 
+/// Convert a single contig's dense depth to multiple RecordBatches, each at most `batch_size` rows.
+pub fn dense_depth_to_record_batches(
+    contig: &str,
+    depth: &DenseContigDepth,
+    schema: &SchemaRef,
+    batch_size: usize,
+) -> datafusion::common::Result<Vec<RecordBatch>> {
+    let blocks = dense_depth_to_coverage_blocks_bounded(
+        contig,
+        depth.touched_range(),
+        depth.touched_start(),
+    );
+    coverage_blocks_to_chunked_batches(&blocks, schema, batch_size)
+}
+
+/// Convert all contig events to multiple RecordBatches, each at most `batch_size` rows.
+pub fn all_events_to_record_batches(
+    contig_events: &mut HashMap<String, ContigEvents>,
+    schema: &SchemaRef,
+    batch_size: usize,
+) -> datafusion::common::Result<Vec<RecordBatch>> {
+    let mut all_blocks = Vec::new();
+
+    let mut contigs: Vec<String> = contig_events.keys().cloned().collect();
+    contigs.sort();
+
+    for contig in &contigs {
+        let events = &mut contig_events.get_mut(contig).unwrap().events;
+        let blocks = events_to_coverage_blocks(contig, events);
+        all_blocks.extend(blocks);
+    }
+
+    coverage_blocks_to_chunked_batches(&all_blocks, schema, batch_size)
+}
+
+/// Split coverage blocks into multiple RecordBatches of at most `batch_size` rows each.
+pub fn coverage_blocks_to_chunked_batches(
+    blocks: &[CoverageBlock],
+    schema: &SchemaRef,
+    batch_size: usize,
+) -> datafusion::common::Result<Vec<RecordBatch>> {
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut batches = Vec::with_capacity(blocks.len().div_ceil(batch_size));
+    for chunk in blocks.chunks(batch_size) {
+        let batch = coverage_blocks_to_record_batch(chunk, schema)?;
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
 /// Convert a slice of coverage blocks to an Arrow RecordBatch.
 ///
 /// Uses Arrow builders for single-pass construction without intermediate Vecs.
