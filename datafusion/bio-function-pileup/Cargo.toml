@@ -1,0 +1,23 @@
+[package]
+name = "datafusion-bio-function-pileup"
+version = "0.1.0"
+description = "Depth-of-coverage (pileup) function for Apache DataFusion"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+
+[dependencies]
+datafusion.workspace = true
+tokio.workspace = true
+futures.workspace = true
+log.workspace = true
+datafusion-bio-format-bam = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "a3366b18204e31495eca3f76bf623c5e4d1bb979" }
+datafusion-bio-format-core = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "a3366b18204e31495eca3f76bf623c5e4d1bb979" }
+async-trait = "0.1.88"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
