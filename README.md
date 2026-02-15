@@ -49,10 +49,24 @@ async fn main() -> datafusion::error::Result<()> {
     let ctx = SessionContext::new();
     register_pileup_functions(&ctx);
 
+    // 1-based coordinates (default, matches polars-bio)
     let df = ctx.sql("SELECT * FROM depth('path/to/alignments.bam')").await?;
     df.show().await?;
+
+    // 0-based coordinates (explicit)
+    let df = ctx.sql("SELECT * FROM depth('path/to/alignments.bam', true)").await?;
+    df.show().await?;
+
     Ok(())
 }
+```
+
+The optional second argument controls the coordinate system:
+
+```sql
+SELECT * FROM depth('file.bam')          -- 1-based (default)
+SELECT * FROM depth('file.bam', true)    -- 0-based
+SELECT * FROM depth('file.bam', false)   -- 1-based (explicit)
 ```
 
 Output schema:
@@ -60,9 +74,11 @@ Output schema:
 | Column | Type | Description |
 |--------|------|-------------|
 | `contig` | Utf8 | Chromosome/contig name |
-| `pos_start` | Int32 | Block start position (0-based, inclusive) |
-| `pos_end` | Int32 | Block end position (0-based, inclusive) |
+| `pos_start` | Int32 | Block start position (inclusive) |
+| `pos_end` | Int32 | Block end position (inclusive) |
 | `coverage` | Int16 | Read depth in this block |
+
+The output schema includes metadata key `bio.coordinate_system_zero_based` (`"true"` or `"false"`) so downstream consumers can interpret the coordinate system.
 
 ### Coverage via Programmatic API
 
@@ -77,15 +93,15 @@ use futures::StreamExt;
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
-    // Register BAM file as a table
-    let table = BamTableProvider::new("path/to/alignments.bam", None, true, None, true).await?;
+    // Register BAM file as a table (zero_based=false for 1-based coordinates)
+    let table = BamTableProvider::new("path/to/alignments.bam", None, false, None, true).await?;
     let ctx = SessionContext::new();
     ctx.register_table("reads", Arc::new(table))?;
 
     // Create physical plan and wrap with PileupExec
     let df = ctx.table("reads").await?;
     let plan = df.create_physical_plan().await?;
-    let pileup = PileupExec::new(plan, PileupConfig::default());
+    let pileup = PileupExec::new(plan, PileupConfig::default()); // zero_based=false by default
 
     // Execute and collect results
     let task_ctx = ctx.task_ctx();
@@ -115,7 +131,7 @@ let config = PileupConfig {
         filter_flag: 1796,        // unmapped | secondary | failed_qc | duplicate
         min_mapping_quality: 20,  // minimum MAPQ
     },
-    ..PileupConfig::default()     // binary_cigar=true, dense_mode=Auto (dense)
+    ..PileupConfig::default()     // zero_based=false, binary_cigar=true, dense_mode=Auto
 };
 let pileup = PileupExec::new(plan, config);
 ```
@@ -159,7 +175,7 @@ The BAM reader accepts a `binary_cigar` parameter:
 BamTableProvider::new(
     file_path,           // String: path to BAM file (local or object-store URL)
     storage_opts,        // Option<ObjectStorageOptions>: S3/GCS/Azure credentials
-    zero_based,          // bool: true for 0-based coordinates (recommended)
+    zero_based,          // bool: false for 1-based (default), true for 0-based
     tag_fields,          // Option<Vec<String>>: optional BAM tag fields to include
     binary_cigar,        // bool: true for zero-copy binary CIGAR (recommended)
 ).await?
@@ -173,6 +189,7 @@ When `binary_cigar=true`, the CIGAR column has `DataType::Binary` (packed LE u32
 
 | Field | Default | Description |
 |-------|---------|-------------|
+| `zero_based` | `false` | 1-based coordinates (matches polars-bio default) |
 | `binary_cigar` | `true` | Use binary CIGAR (zero-copy, no string parsing) |
 | `dense_mode` | `Auto` (dense) | Dense `i32[]` array accumulation with streaming emission |
 | `filter.filter_flag` | `1796` | Exclude unmapped, secondary, failed QC, duplicate |
@@ -182,6 +199,7 @@ To override specific fields:
 
 ```rust
 let config = PileupConfig {
+    zero_based: true,                       // 0-based coordinates
     binary_cigar: false,                    // force string CIGAR (e.g., for debugging)
     dense_mode: DenseMode::Disable,         // force sparse BTreeMap accumulation
     filter: ReadFilter {
@@ -212,7 +230,7 @@ use futures::StreamExt;
 
 async fn compute_coverage(bam_path: &str, partitions: usize) -> Vec<RecordBatch> {
     let table = BamTableProvider::new(
-        bam_path.to_string(), None, true, None, true,  // binary_cigar=true
+        bam_path.to_string(), None, false, None, true,  // zero_based=false, binary_cigar=true
     ).await.unwrap();
 
     let config = SessionConfig::new().with_target_partitions(partitions);

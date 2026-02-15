@@ -8,17 +8,21 @@ use datafusion_bio_function_pileup::physical_exec::{PileupConfig, PileupExec};
 use futures::StreamExt;
 
 /// Dumps coverage output as BED (0-based half-open) to stdout for comparison with mosdepth.
-/// Our output is 0-based closed, so we convert pos_end from inclusive to exclusive (pos_end + 1).
+///
+/// By default uses 1-based coordinates. Pass `--zero-based` for 0-based output.
+/// When 0-based: output is closed intervals, we convert pos_end to exclusive (pos_end + 1) for BED.
+/// When 1-based: output is closed intervals, we convert to BED by subtracting 1 from start and keeping end as-is.
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: dump_coverage <bam_file>");
+        eprintln!("Usage: dump_coverage <bam_file> [--zero-based]");
         std::process::exit(1);
     }
     let bam_path = &args[1];
+    let zero_based = args.iter().any(|a| a == "--zero-based");
 
-    let table = BamTableProvider::new(bam_path.clone(), None, true, None, true)
+    let table = BamTableProvider::new(bam_path.clone(), None, zero_based, None, true)
         .await
         .expect("Failed to open BAM file");
 
@@ -29,7 +33,13 @@ async fn main() {
 
     let df = ctx.table("reads").await.unwrap();
     let plan = df.create_physical_plan().await.unwrap();
-    let pileup = PileupExec::new(plan, PileupConfig::default());
+    let pileup = PileupExec::new(
+        plan,
+        PileupConfig {
+            zero_based,
+            ..PileupConfig::default()
+        },
+    );
     let task_ctx = ctx.task_ctx();
 
     let stream = pileup.execute(0, task_ctx).unwrap();

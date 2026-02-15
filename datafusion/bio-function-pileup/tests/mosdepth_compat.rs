@@ -11,10 +11,17 @@ use datafusion_bio_function_pileup::physical_exec::{PileupConfig, PileupExec};
 use datafusion_bio_function_pileup::register_pileup_functions;
 
 /// Helper to collect coverage results from a PileupExec over all partitions.
+/// Uses `zero_based: true` so positions match 0-based test expectations.
 async fn collect_coverage(ctx: &SessionContext, table_name: &str) -> Vec<(String, i32, i32, i16)> {
     let df = ctx.table(table_name).await.unwrap();
     let plan = df.create_physical_plan().await.unwrap();
-    let pileup = PileupExec::new(plan, PileupConfig::default());
+    let pileup = PileupExec::new(
+        plan,
+        PileupConfig {
+            zero_based: true,
+            ..PileupConfig::default()
+        },
+    );
 
     let task_ctx = ctx.task_ctx();
     let num_partitions = pileup.properties().partitioning.partition_count();
@@ -177,7 +184,8 @@ async fn test_overlapping_pairs() {
     assert_eq!(chr1_rows[0], &("1".to_string(), 565173, 565252, 2));
 }
 
-/// Test coverage via SQL UDTF: SELECT * FROM depth('path/to/file.bam')
+/// Test coverage via SQL UDTF: SELECT * FROM depth('path/to/file.bam', true)
+/// Uses `true` (0-based) to match mosdepth 0-based expectations.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ovl_fast_mode_sql() {
     let bam_path = format!("{}/tests/data/ovl.bam", env!("CARGO_MANIFEST_DIR"));
@@ -185,7 +193,7 @@ async fn test_ovl_fast_mode_sql() {
     let ctx = SessionContext::new();
     register_pileup_functions(&ctx);
 
-    let sql = format!("SELECT * FROM depth('{bam_path}')");
+    let sql = format!("SELECT * FROM depth('{bam_path}', true)");
     let rows = collect_coverage_sql(&ctx, &sql).await;
 
     let mt_rows: Vec<_> = rows.iter().filter(|r| r.0 == "MT").collect();
@@ -197,6 +205,7 @@ async fn test_ovl_fast_mode_sql() {
 }
 
 /// Test coverage via SQL UDTF for overlapping pairs.
+/// Uses `true` (0-based) to match mosdepth 0-based expectations.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_overlapping_pairs_sql() {
     let bam_path = format!(
@@ -207,11 +216,61 @@ async fn test_overlapping_pairs_sql() {
     let ctx = SessionContext::new();
     register_pileup_functions(&ctx);
 
-    let sql = format!("SELECT * FROM depth('{bam_path}')");
+    let sql = format!("SELECT * FROM depth('{bam_path}', true)");
     let rows = collect_coverage_sql(&ctx, &sql).await;
 
     let chr1_rows: Vec<_> = rows.iter().filter(|r| r.0 == "1").collect();
 
     assert_eq!(chr1_rows.len(), 1);
     assert_eq!(chr1_rows[0], &("1".to_string(), 565173, 565252, 2));
+}
+
+/// Test that the default coordinate system (1-based) works via SQL.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ovl_fast_mode_sql_default_one_based() {
+    let bam_path = format!("{}/tests/data/ovl.bam", env!("CARGO_MANIFEST_DIR"));
+
+    let ctx = SessionContext::new();
+    register_pileup_functions(&ctx);
+
+    // No second argument → default 1-based coordinates
+    let sql = format!("SELECT * FROM depth('{bam_path}')");
+    let rows = collect_coverage_sql(&ctx, &sql).await;
+
+    let mt_rows: Vec<_> = rows.iter().filter(|r| r.0 == "MT").collect();
+
+    assert_eq!(mt_rows.len(), 3);
+    // 1-based: positions are shifted by +1 compared to 0-based
+    assert_eq!(mt_rows[0], &("MT".to_string(), 1, 6, 1));
+    assert_eq!(mt_rows[1], &("MT".to_string(), 7, 42, 2));
+    assert_eq!(mt_rows[2], &("MT".to_string(), 43, 80, 1));
+}
+
+/// Test that coordinate metadata is present in the output schema.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_coordinate_metadata_in_schema() {
+    use datafusion_bio_function_pileup::schema::COORDINATE_SYSTEM_METADATA_KEY;
+
+    let bam_path = format!("{}/tests/data/ovl.bam", env!("CARGO_MANIFEST_DIR"));
+
+    let ctx = SessionContext::new();
+    register_pileup_functions(&ctx);
+
+    // 0-based
+    let sql = format!("SELECT * FROM depth('{bam_path}', true)");
+    let df = ctx.sql(&sql).await.unwrap();
+    let schema = df.schema().inner().clone();
+    assert_eq!(
+        schema.metadata().get(COORDINATE_SYSTEM_METADATA_KEY),
+        Some(&"true".to_string()),
+    );
+
+    // 1-based (default)
+    let sql = format!("SELECT * FROM depth('{bam_path}')");
+    let df = ctx.sql(&sql).await.unwrap();
+    let schema = df.schema().inner().clone();
+    assert_eq!(
+        schema.metadata().get(COORDINATE_SYSTEM_METADATA_KEY),
+        Some(&"false".to_string()),
+    );
 }

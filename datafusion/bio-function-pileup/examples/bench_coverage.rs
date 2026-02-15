@@ -11,18 +11,21 @@ use futures::StreamExt;
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: bench_coverage <bam_file> [--partitions N] [--dense] [--binary-cigar]");
+        eprintln!(
+            "Usage: bench_coverage <bam_file> [--partitions N] [--dense] [--binary-cigar] [--zero-based]"
+        );
         std::process::exit(1);
     }
     let bam_path = &args[1];
     let binary_cigar = args.iter().any(|a| a == "--binary-cigar");
+    let zero_based = args.iter().any(|a| a == "--zero-based");
 
     println!("BAM file: {}", bam_path);
     println!("---");
 
     let start = Instant::now();
 
-    let table = BamTableProvider::new(bam_path.clone(), None, true, None, binary_cigar)
+    let table = BamTableProvider::new(bam_path.clone(), None, zero_based, None, binary_cigar)
         .await
         .expect("Failed to open BAM file");
     let open_time = start.elapsed();
@@ -60,10 +63,12 @@ async fn main() {
     };
     println!("Dense mode: {:?}", dense_mode);
     println!("Binary CIGAR: {}", binary_cigar);
+    println!("Zero-based: {}", zero_based);
 
     let pileup_config = PileupConfig {
         dense_mode,
         binary_cigar,
+        zero_based,
         ..PileupConfig::default()
     };
     let pileup = Arc::new(PileupExec::new(plan, pileup_config));

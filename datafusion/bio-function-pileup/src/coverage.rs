@@ -5,7 +5,6 @@ use datafusion::arrow::array::{Int16Builder, Int32Builder, RecordBatch, StringBu
 use datafusion::arrow::datatypes::SchemaRef;
 
 use crate::events::{ContigEvents, DenseContigDepth};
-use crate::schema::coverage_output_schema;
 
 /// A single coverage block.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,8 +66,8 @@ pub fn events_to_coverage_blocks(contig: &str, events: &mut [(u32, i32)]) -> Vec
 /// Convert all contig events to a single RecordBatch of coverage blocks.
 pub fn all_events_to_record_batch(
     contig_events: &mut HashMap<String, ContigEvents>,
+    schema: &SchemaRef,
 ) -> datafusion::common::Result<RecordBatch> {
-    let schema = coverage_output_schema();
     let mut all_blocks = Vec::new();
 
     // Sort contigs for deterministic output
@@ -81,7 +80,7 @@ pub fn all_events_to_record_batch(
         all_blocks.extend(blocks);
     }
 
-    coverage_blocks_to_record_batch(&all_blocks, &schema)
+    coverage_blocks_to_record_batch(&all_blocks, schema)
 }
 
 /// Convert a dense depth array to coverage blocks via prefix sum + RLE.
@@ -334,7 +333,7 @@ mod tests {
             pos_end: 9,
             coverage: 1,
         }];
-        let schema = coverage_output_schema();
+        let schema = crate::schema::coverage_output_schema(true);
         let batch = coverage_blocks_to_record_batch(&blocks, &schema).unwrap();
 
         assert_eq!(batch.num_rows(), 1);

@@ -89,6 +89,10 @@ pub struct PileupConfig {
     /// The actual format is detected from the schema, but this flag controls what we request
     /// from the upstream `BamTableProvider`.
     pub binary_cigar: bool,
+    /// When `true`, output coordinates are 0-based (start inclusive, end inclusive).
+    /// When `false` (default), output coordinates are 1-based.
+    /// This also controls the coordinate system passed to the BAM reader.
+    pub zero_based: bool,
 }
 
 impl Default for PileupConfig {
@@ -97,6 +101,7 @@ impl Default for PileupConfig {
             filter: ReadFilter::default(),
             dense_mode: DenseMode::default(),
             binary_cigar: true,
+            zero_based: false,
         }
     }
 }
@@ -117,7 +122,7 @@ pub struct PileupExec {
 
 impl PileupExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, config: PileupConfig) -> Self {
-        let schema = coverage_output_schema();
+        let schema = coverage_output_schema(config.zero_based);
         let cache = PlanProperties::new(
             EquivalenceProperties::new(schema),
             input.properties().partitioning.clone(),
@@ -136,11 +141,12 @@ impl DisplayAs for PileupExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "PileupExec: filter_flag={}, min_mapq={}, dense={:?}, binary_cigar={}",
+            "PileupExec: filter_flag={}, min_mapq={}, dense={:?}, binary_cigar={}, zero_based={}",
             self.config.filter.filter_flag,
             self.config.filter.min_mapping_quality,
             self.config.dense_mode,
-            self.config.binary_cigar
+            self.config.binary_cigar,
+            self.config.zero_based
         )
     }
 }
@@ -155,7 +161,7 @@ impl ExecutionPlan for PileupExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        coverage_output_schema()
+        self.cache.eq_properties.schema().clone()
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -482,7 +488,7 @@ impl Stream for PileupStream {
                 if contig_events.is_empty() {
                     return Poll::Ready(None);
                 }
-                return match coverage::all_events_to_record_batch(contig_events) {
+                return match coverage::all_events_to_record_batch(contig_events, &this.schema) {
                     Ok(batch) if batch.num_rows() == 0 => Poll::Ready(None),
                     Ok(batch) => Poll::Ready(Some(Ok(batch))),
                     Err(e) => Poll::Ready(Some(Err(e))),
@@ -592,7 +598,13 @@ mod tests {
         let df = ctx.table("reads").await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
 
-        let pileup = PileupExec::new(plan, PileupConfig::default());
+        let pileup = PileupExec::new(
+            plan,
+            PileupConfig {
+                zero_based: true,
+                ..PileupConfig::default()
+            },
+        );
         let task_ctx = ctx.task_ctx();
         let stream = pileup.execute(0, task_ctx).unwrap();
         let batches: Vec<RecordBatch> = stream
@@ -648,7 +660,13 @@ mod tests {
         let df = ctx.table("reads").await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
 
-        let pileup = PileupExec::new(plan, PileupConfig::default());
+        let pileup = PileupExec::new(
+            plan,
+            PileupConfig {
+                zero_based: true,
+                ..PileupConfig::default()
+            },
+        );
         let task_ctx = ctx.task_ctx();
         let stream = pileup.execute(0, task_ctx).unwrap();
         let batches: Vec<RecordBatch> = stream
@@ -681,7 +699,13 @@ mod tests {
         let df = ctx.table("reads").await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
 
-        let pileup = PileupExec::new(plan, PileupConfig::default());
+        let pileup = PileupExec::new(
+            plan,
+            PileupConfig {
+                zero_based: true,
+                ..PileupConfig::default()
+            },
+        );
         let task_ctx = ctx.task_ctx();
         let stream = pileup.execute(0, task_ctx).unwrap();
         let batches: Vec<RecordBatch> = stream
@@ -707,7 +731,13 @@ mod tests {
         let df = ctx.table("reads").await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
 
-        let pileup = PileupExec::new(plan, PileupConfig::default());
+        let pileup = PileupExec::new(
+            plan,
+            PileupConfig {
+                zero_based: true,
+                ..PileupConfig::default()
+            },
+        );
         let task_ctx = ctx.task_ctx();
 
         // Partition 0
@@ -756,7 +786,13 @@ mod tests {
         let df = ctx.table("reads").await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
 
-        let pileup = PileupExec::new(plan, PileupConfig::default());
+        let pileup = PileupExec::new(
+            plan,
+            PileupConfig {
+                zero_based: true,
+                ..PileupConfig::default()
+            },
+        );
         let task_ctx = ctx.task_ctx();
         let stream = pileup.execute(0, task_ctx).unwrap();
         let batches: Vec<RecordBatch> = stream
@@ -813,7 +849,13 @@ mod tests {
         let df = ctx.table("reads").await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
 
-        let pileup = PileupExec::new(plan, PileupConfig::default());
+        let pileup = PileupExec::new(
+            plan,
+            PileupConfig {
+                zero_based: true,
+                ..PileupConfig::default()
+            },
+        );
         let task_ctx = ctx.task_ctx();
         let stream = pileup.execute(0, task_ctx).unwrap();
         let batches: Vec<RecordBatch> = stream

@@ -44,7 +44,7 @@ impl TableProvider for DepthTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        coverage_output_schema()
+        coverage_output_schema(self.config.zero_based)
     }
 
     fn table_type(&self) -> TableType {
@@ -90,21 +90,40 @@ impl TableFunctionImpl for DepthFunction {
             }
         };
 
+        // Extract optional zero_based flag from second argument (default: false = 1-based)
+        let zero_based = if args.len() > 1 {
+            match &args[1] {
+                Expr::Literal(ScalarValue::Boolean(Some(val)), _) => *val,
+                other => {
+                    return Err(DataFusionError::Plan(format!(
+                        "depth() second argument must be a boolean literal (zero_based), got: {other}"
+                    )));
+                }
+            }
+        } else {
+            false
+        };
+
         // Create BamTableProvider — handle both tokio and non-tokio contexts
         // Always request binary CIGAR for zero-copy performance
         let bam_provider = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(BamTableProvider::new(file_path, None, true, None, true))
+                handle.block_on(BamTableProvider::new(
+                    file_path, None, zero_based, None, true,
+                ))
             })?,
             Err(_) => {
                 let rt = tokio::runtime::Runtime::new()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                rt.block_on(BamTableProvider::new(file_path, None, true, None, true))?
+                rt.block_on(BamTableProvider::new(
+                    file_path, None, zero_based, None, true,
+                ))?
             }
         };
 
         let config = PileupConfig {
             binary_cigar: true,
+            zero_based,
             ..PileupConfig::default()
         };
         Ok(Arc::new(DepthTableProvider::new(
