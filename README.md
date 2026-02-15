@@ -137,6 +137,21 @@ datafusion-bio-format-bam = { git = "https://github.com/biodatageeks/datafusion-
 
 Keep `datafusion-bio-formats` and `datafusion-bio-functions` revisions in sync — they must use the same DataFusion/Arrow versions (currently DataFusion 50.3.0, Arrow 56.x).
 
+### Feature Flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `bam` | yes | Enables the `table_function` module (`CoverageFunction`, `register_pileup_functions`) which depends on `datafusion-bio-format-bam` |
+
+Downstream libraries that provide their own `TableProvider` (e.g., polars-bio) can disable the default feature to avoid pulling in `datafusion-bio-format-bam` as a runtime dependency:
+
+```toml
+[dependencies]
+datafusion-bio-function-pileup = { git = "...", rev = "...", default-features = false }
+```
+
+The core pileup API (`PileupExec`, `PileupConfig`, `cigar::*`, `events::*`, `coverage::*`) is always available regardless of features.
+
 ### BamTableProvider API
 
 The BAM reader accepts a `binary_cigar` parameter:

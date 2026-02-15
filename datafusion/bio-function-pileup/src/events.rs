@@ -1,8 +1,25 @@
 use std::collections::HashMap;
 
+use std::collections::HashMap as StdHashMap;
+
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, SchemaRef, UInt32Type};
-use datafusion_bio_format_core::{BAM_REFERENCE_SEQUENCES_KEY, ReferenceSequenceMetadata};
+use serde::Deserialize;
+
+/// Metadata key for BAM reference sequences stored as JSON in Arrow schema metadata.
+/// Inlined from `datafusion-bio-format-core` to avoid a runtime dependency.
+const BAM_REFERENCE_SEQUENCES_KEY: &str = "bio.bam.reference_sequences";
+
+/// Reference sequence metadata (contig name + length) from BAM header.
+/// Inlined from `datafusion-bio-format-core` to avoid a runtime dependency.
+#[derive(Deserialize)]
+struct ReferenceSequenceMetadata {
+    name: String,
+    length: usize,
+    #[serde(default)]
+    #[allow(dead_code)]
+    other_fields: StdHashMap<String, String>,
+}
 
 use crate::cigar;
 use crate::filter::ReadFilter;
