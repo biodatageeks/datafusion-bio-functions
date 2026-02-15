@@ -68,12 +68,23 @@ pub fn parse_cigar(cigar: &str) -> Vec<CigarOp> {
 /// This is the mosdepth-style approach: O(1) writes with no per-read allocation.
 /// Bounds checks prevent writes past the array end.
 ///
+/// Returns `Some((min_written, max_written))` — the inclusive range of positions
+/// actually modified — or `None` if no writes occurred (e.g., read entirely out of bounds).
+///
 /// Parses the CIGAR string inline to avoid allocating an intermediate `Vec<CigarOp>`.
-pub fn apply_cigar_to_depth(start: u32, cigar: &str, depth: &mut [i32]) {
+pub fn apply_cigar_to_depth(start: u32, cigar: &str, depth: &mut [i32]) -> Option<(usize, usize)> {
     let bytes = cigar.as_bytes();
     let depth_len = depth.len();
     let mut ref_pos = start as usize;
+
+    // Early return: entire read starts past the array
+    if ref_pos >= depth_len {
+        return None;
+    }
+
     let mut num_start = 0;
+    let mut min_written: usize = usize::MAX;
+    let mut max_written: usize = 0;
 
     for i in 0..bytes.len() {
         let b = bytes[i];
@@ -86,9 +97,12 @@ pub fn apply_cigar_to_depth(start: u32, cigar: &str, depth: &mut [i32]) {
                 let end = ref_pos + len;
                 if ref_pos < depth_len {
                     depth[ref_pos] += 1;
+                    min_written = min_written.min(ref_pos);
+                    max_written = max_written.max(ref_pos);
                 }
                 if end < depth_len {
                     depth[end] -= 1;
+                    max_written = max_written.max(end);
                 }
                 ref_pos = end;
             }
@@ -98,6 +112,16 @@ pub fn apply_cigar_to_depth(start: u32, cigar: &str, depth: &mut [i32]) {
             _ => {} // I, S, H, P — no ref consumption
         }
         num_start = i + 1;
+        // ref_pos is monotonically non-decreasing; stop if past array
+        if ref_pos >= depth_len {
+            break;
+        }
+    }
+
+    if min_written <= max_written {
+        Some((min_written, max_written))
+    } else {
+        None
     }
 }
 
@@ -138,30 +162,41 @@ pub fn apply_cigar_to_event_list(start: u32, cigar: &str, out: &mut Vec<(u32, i3
 ///
 /// Same logic as `apply_cigar_to_depth` but reads from packed binary CIGAR bytes
 /// (4 bytes per op, little-endian u32: op_len = packed >> 4, op_code = packed & 0xF).
-pub fn apply_binary_cigar_to_depth(start: u32, cigar_bytes: &[u8], depth: &mut [i32]) {
+///
+/// Returns `Some((min_written, max_written))` — the inclusive range of positions
+/// actually modified — or `None` if no writes occurred.
+pub fn apply_binary_cigar_to_depth(
+    start: u32,
+    cigar_bytes: &[u8],
+    depth: &mut [i32],
+) -> Option<(usize, usize)> {
     let depth_len = depth.len();
     let mut ref_pos = start as usize;
 
-    let mut offset = 0;
-    while offset + 4 <= cigar_bytes.len() {
-        let packed = u32::from_le_bytes([
-            cigar_bytes[offset],
-            cigar_bytes[offset + 1],
-            cigar_bytes[offset + 2],
-            cigar_bytes[offset + 3],
-        ]);
+    // Early return: entire read starts past the array
+    if ref_pos >= depth_len {
+        return None;
+    }
+
+    let mut min_written: usize = usize::MAX;
+    let mut max_written: usize = 0;
+
+    for chunk in cigar_bytes.chunks_exact(4) {
+        let packed = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let op_len = (packed >> 4) as usize;
         let op_code = packed & 0xF;
-        offset += 4;
 
         match op_code {
             BAM_CIGAR_M | BAM_CIGAR_EQ | BAM_CIGAR_X => {
                 let end = ref_pos + op_len;
                 if ref_pos < depth_len {
                     depth[ref_pos] += 1;
+                    min_written = min_written.min(ref_pos);
+                    max_written = max_written.max(ref_pos);
                 }
                 if end < depth_len {
                     depth[end] -= 1;
+                    max_written = max_written.max(end);
                 }
                 ref_pos = end;
             }
@@ -170,6 +205,16 @@ pub fn apply_binary_cigar_to_depth(start: u32, cigar_bytes: &[u8], depth: &mut [
             }
             _ => {} // I, S, H, P — no ref consumption
         }
+        // ref_pos is monotonically non-decreasing; stop if past array
+        if ref_pos >= depth_len {
+            break;
+        }
+    }
+
+    if min_written <= max_written {
+        Some((min_written, max_written))
+    } else {
+        None
     }
 }
 
@@ -180,17 +225,10 @@ pub fn apply_binary_cigar_to_depth(start: u32, cigar_bytes: &[u8], depth: &mut [
 pub fn apply_binary_cigar_to_event_list(start: u32, cigar_bytes: &[u8], out: &mut Vec<(u32, i32)>) {
     let mut ref_pos = start;
 
-    let mut offset = 0;
-    while offset + 4 <= cigar_bytes.len() {
-        let packed = u32::from_le_bytes([
-            cigar_bytes[offset],
-            cigar_bytes[offset + 1],
-            cigar_bytes[offset + 2],
-            cigar_bytes[offset + 3],
-        ]);
+    for chunk in cigar_bytes.chunks_exact(4) {
+        let packed = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let op_len = packed >> 4;
         let op_code = packed & 0xF;
-        offset += 4;
 
         match op_code {
             BAM_CIGAR_M | BAM_CIGAR_EQ | BAM_CIGAR_X => {

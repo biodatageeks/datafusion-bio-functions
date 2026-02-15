@@ -24,6 +24,46 @@ use crate::events::{ColumnIndices, DenseContigDepth};
 use crate::filter::ReadFilter;
 use crate::schema::coverage_output_schema;
 
+/// Handle a contig transition in the dense accumulator.
+///
+/// If the new contig differs from the current one, finalizes the previous contig
+/// (converting its depth array to a RecordBatch and pushing it to `pending_batches`),
+/// then allocates a new `DenseContigDepth` for the incoming contig.
+///
+/// Returns `true` if the row should be processed (contig is available),
+/// `false` if the contig is unknown and should be skipped.
+fn handle_contig_transition(
+    chrom: &str,
+    current_contig: &mut Option<String>,
+    current_depth: &mut Option<DenseContigDepth>,
+    contig_lengths: &HashMap<String, usize>,
+    pending_batches: &mut VecDeque<RecordBatch>,
+    schema: &SchemaRef,
+) -> bool {
+    let contig_changed = current_contig.as_ref().is_none_or(|c| c.as_str() != chrom);
+    if !contig_changed {
+        return true;
+    }
+
+    // Emit the previous contig if we had one
+    if let (Some(prev_contig), Some(prev_depth)) = (current_contig.take(), current_depth.take()) {
+        if let Ok(rb) = coverage::dense_depth_to_record_batch(&prev_contig, &prev_depth, schema) {
+            if rb.num_rows() > 0 {
+                pending_batches.push_back(rb);
+            }
+        }
+    }
+
+    // Start a new contig
+    if let Some(&len) = contig_lengths.get(chrom) {
+        *current_contig = Some(chrom.to_string());
+        *current_depth = Some(DenseContigDepth::new(len));
+        true
+    } else {
+        false
+    }
+}
+
 /// Controls which depth-accumulation strategy the pileup stream uses.
 ///
 /// - `Auto` — heuristic (currently defaults to sparse; may be enhanced later).
@@ -251,27 +291,15 @@ impl PileupStream {
     /// dense depth array. When a contig transition is detected, the completed
     /// contig's coverage is converted to a RecordBatch and queued for emission.
     ///
-    /// Supports both string and binary CIGAR formats based on `col_idx.binary_cigar`.
+    /// Splits into separate binary and string CIGAR loops to avoid per-row
+    /// `Option::unwrap()` overhead and branch on CIGAR format.
     fn process_batch_dense(&mut self, batch: &RecordBatch) {
         let col_idx = self.col_idx.as_ref().expect("col_idx not initialized");
-        let binary_cigar = col_idx.binary_cigar;
 
         let chrom_arr = batch.column(col_idx.chrom).as_string::<i32>();
         let start_arr = batch.column(col_idx.start).as_primitive::<UInt32Type>();
         let flags_arr = batch.column(col_idx.flags).as_primitive::<UInt32Type>();
         let mapq_arr = batch.column(col_idx.mapq).as_primitive::<UInt32Type>();
-
-        // Pre-downcast CIGAR column based on format
-        let cigar_str_arr = if !binary_cigar {
-            Some(batch.column(col_idx.cigar).as_string::<i32>())
-        } else {
-            None
-        };
-        let cigar_bin_arr = if binary_cigar {
-            Some(batch.column(col_idx.cigar).as_binary::<i32>())
-        } else {
-            None
-        };
 
         let DepthAccumulator::Dense {
             current_contig,
@@ -283,71 +311,72 @@ impl PileupStream {
             return;
         };
 
-        for row in 0..batch.num_rows() {
-            if chrom_arr.is_null(row) || start_arr.is_null(row) {
-                continue;
-            }
-
-            let chrom = chrom_arr.value(row);
-            let start = start_arr.value(row);
-            let flags = flags_arr.value(row);
-            let mapq = mapq_arr.value(row);
-
-            // Skip unmapped reads (binary: empty bytes, string: "*")
-            if binary_cigar {
-                if cigar_bin_arr.unwrap().value(row).is_empty() {
+        if col_idx.binary_cigar {
+            let cigar_arr = batch.column(col_idx.cigar).as_binary::<i32>();
+            for row in 0..batch.num_rows() {
+                if chrom_arr.is_null(row) || start_arr.is_null(row) {
                     continue;
                 }
-            } else if cigar_str_arr.unwrap().value(row) == "*" {
-                continue;
-            }
-
-            if !self.config.filter.passes(flags, mapq) {
-                continue;
-            }
-
-            // Check for contig transition
-            let contig_changed = current_contig.as_ref().is_none_or(|c| c.as_str() != chrom);
-
-            if contig_changed {
-                // Emit the previous contig if we had one
-                if let (Some(prev_contig), Some(prev_depth)) =
-                    (current_contig.take(), current_depth.take())
+                let chrom = chrom_arr.value(row);
+                let cigar_bytes = cigar_arr.value(row);
+                if cigar_bytes.is_empty() {
+                    continue;
+                }
+                let flags = flags_arr.value(row);
+                let mapq = mapq_arr.value(row);
+                if !self.config.filter.passes(flags, mapq) {
+                    continue;
+                }
+                if !handle_contig_transition(
+                    chrom,
+                    current_contig,
+                    current_depth,
+                    contig_lengths,
+                    pending_batches,
+                    &self.schema,
+                ) {
+                    continue;
+                }
+                let depth = current_depth.as_mut().unwrap();
+                let start = start_arr.value(row);
+                if let Some((lo, hi)) =
+                    cigar::apply_binary_cigar_to_depth(start, cigar_bytes, &mut depth.depth)
                 {
-                    if let Ok(rb) = coverage::dense_depth_to_record_batch(
-                        &prev_contig,
-                        &prev_depth.depth,
-                        &self.schema,
-                    ) {
-                        if rb.num_rows() > 0 {
-                            pending_batches.push_back(rb);
-                        }
-                    }
-                }
-
-                // Start a new contig
-                if let Some(&len) = contig_lengths.get(chrom) {
-                    *current_contig = Some(chrom.to_string());
-                    *current_depth = Some(DenseContigDepth::new(len));
-                } else {
-                    continue;
+                    depth.update_bounds(lo, hi);
                 }
             }
-
-            // Apply CIGAR to current depth array
-            if let Some(depth) = current_depth {
-                if binary_cigar {
-                    cigar::apply_binary_cigar_to_depth(
-                        start,
-                        cigar_bin_arr.unwrap().value(row),
-                        &mut depth.depth,
-                    );
-                } else {
-                    cigar::apply_cigar_to_depth(
-                        start,
-                        cigar_str_arr.unwrap().value(row),
-                        &mut depth.depth,
-                    );
+        } else {
+            let cigar_arr = batch.column(col_idx.cigar).as_string::<i32>();
+            for row in 0..batch.num_rows() {
+                if chrom_arr.is_null(row) || start_arr.is_null(row) {
+                    continue;
+                }
+                let chrom = chrom_arr.value(row);
+                let cigar_str = cigar_arr.value(row);
+                if cigar_str == "*" {
+                    continue;
+                }
+                let flags = flags_arr.value(row);
+                let mapq = mapq_arr.value(row);
+                if !self.config.filter.passes(flags, mapq) {
+                    continue;
+                }
+                if !handle_contig_transition(
+                    chrom,
+                    current_contig,
+                    current_depth,
+                    contig_lengths,
+                    pending_batches,
+                    &self.schema,
+                ) {
+                    continue;
+                }
+                let depth = current_depth.as_mut().unwrap();
+                let start = start_arr.value(row);
+                if let Some((lo, hi)) =
+                    cigar::apply_cigar_to_depth(start, cigar_str, &mut depth.depth)
+                {
+                    depth.update_bounds(lo, hi);
                 }
             }
         }
@@ -366,9 +395,7 @@ impl PileupStream {
         };
 
         if let (Some(contig), Some(depth)) = (current_contig.take(), current_depth.take()) {
-            if let Ok(rb) =
-                coverage::dense_depth_to_record_batch(&contig, &depth.depth, &self.schema)
-            {
+            if let Ok(rb) = coverage::dense_depth_to_record_batch(&contig, &depth, &self.schema) {
                 if rb.num_rows() > 0 {
                     pending_batches.push_back(rb);
                 }
@@ -595,7 +622,7 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         let covs = batch
-            .column(4)
+            .column(3)
             .as_any()
             .downcast_ref::<Int16Array>()
             .unwrap();
@@ -635,7 +662,7 @@ mod tests {
         let batch = &batches[0];
         assert_eq!(batch.num_rows(), 1);
         let covs = batch
-            .column(4)
+            .column(3)
             .as_any()
             .downcast_ref::<Int16Array>()
             .unwrap();
@@ -759,7 +786,7 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         let covs = batch
-            .column(4)
+            .column(3)
             .as_any()
             .downcast_ref::<Int16Array>()
             .unwrap();
@@ -800,7 +827,7 @@ mod tests {
         let batch = &batches[0];
         assert_eq!(batch.num_rows(), 1);
         let covs = batch
-            .column(4)
+            .column(3)
             .as_any()
             .downcast_ref::<Int16Array>()
             .unwrap();

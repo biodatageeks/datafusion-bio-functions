@@ -12,7 +12,6 @@ pub const COL_MAPPING_QUALITY: &str = "mapping_quality";
 pub const OUT_CONTIG: &str = "contig";
 pub const OUT_POS_START: &str = "pos_start";
 pub const OUT_POS_END: &str = "pos_end";
-pub const OUT_REF: &str = "ref";
 pub const OUT_COVERAGE: &str = "coverage";
 
 /// Returns the output schema for coverage results.
@@ -21,7 +20,6 @@ pub fn coverage_output_schema() -> SchemaRef {
         Field::new(OUT_CONTIG, DataType::Utf8, true),
         Field::new(OUT_POS_START, DataType::Int32, false),
         Field::new(OUT_POS_END, DataType::Int32, false),
-        Field::new(OUT_REF, DataType::Utf8, false),
         Field::new(OUT_COVERAGE, DataType::Int16, false),
     ]))
 }

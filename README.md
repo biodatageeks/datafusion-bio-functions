@@ -18,7 +18,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 ## Features
 
 - **Depth-of-Coverage**: Compute per-base depth from BAM alignment data using an efficient event-based algorithm
-- **SQL Interface**: Query coverage via SQL table function: `SELECT * FROM coverage('file.bam')`
+- **SQL Interface**: Query coverage via SQL table function: `SELECT * FROM depth('file.bam')`
 - **DataFusion Integration**: Native `ExecutionPlan` implementation with partition-parallel execution
 - **Mosdepth-Compatible**: Fast-mode behavior matching [mosdepth](https://github.com/brentp/mosdepth) (no mate-pair overlap deduplication)
 - **Binary CIGAR**: Zero-copy binary CIGAR processing â€” walks packed 4-byte ops directly from BAM, no string parsing
@@ -38,7 +38,7 @@ datafusion-bio-function-pileup = { git = "https://github.com/biodatageeks/datafu
 
 ### Coverage via SQL Table Function
 
-The simplest way to compute coverage is via the SQL `coverage()` table function:
+The simplest way to compute coverage is via the SQL `depth()` table function:
 
 ```rust
 use datafusion::prelude::*;
@@ -49,7 +49,7 @@ async fn main() -> datafusion::error::Result<()> {
     let ctx = SessionContext::new();
     register_pileup_functions(&ctx);
 
-    let df = ctx.sql("SELECT * FROM coverage('path/to/alignments.bam')").await?;
+    let df = ctx.sql("SELECT * FROM depth('path/to/alignments.bam')").await?;
     df.show().await?;
     Ok(())
 }
@@ -62,7 +62,6 @@ Output schema:
 | `contig` | Utf8 | Chromosome/contig name |
 | `pos_start` | Int32 | Block start position (0-based, inclusive) |
 | `pos_end` | Int32 | Block end position (0-based, inclusive) |
-| `ref` | Utf8 | Always "R" in coverage-only mode |
 | `coverage` | Int16 | Read depth in this block |
 
 ### Coverage via Programmatic API
@@ -141,7 +140,7 @@ Keep `datafusion-bio-formats` and `datafusion-bio-functions` revisions in sync â
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `bam` | yes | Enables the `table_function` module (`CoverageFunction`, `register_pileup_functions`) which depends on `datafusion-bio-format-bam` |
+| `bam` | yes | Enables the `table_function` module (`DepthFunction`, `register_pileup_functions`) which depends on `datafusion-bio-format-bam` |
 
 Downstream libraries that provide their own `TableProvider` (e.g., polars-bio) can disable the default feature to avoid pulling in `datafusion-bio-format-bam` as a runtime dependency:
 

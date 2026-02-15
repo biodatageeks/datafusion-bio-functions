@@ -57,7 +57,7 @@ async fn main() {
             .downcast_ref::<Int32Array>()
             .unwrap();
         let covs = batch
-            .column(4)
+            .column(3)
             .as_any()
             .downcast_ref::<Int16Array>()
             .unwrap();

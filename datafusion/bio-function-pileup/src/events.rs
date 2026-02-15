@@ -137,15 +137,45 @@ pub fn process_batch(
 ///
 /// Uses a flat `Vec<i32>` indexed by genomic position for O(1) writes
 /// and excellent cache locality (mosdepth-style).
+///
+/// Tracks the range of positions actually written to, so finalization
+/// can scan only the touched region instead of the entire contig length.
 pub struct DenseContigDepth {
     pub depth: Vec<i32>,
+    min_touched: Option<usize>,
+    max_touched: Option<usize>,
 }
 
 impl DenseContigDepth {
     pub fn new(length: usize) -> Self {
         Self {
             depth: vec![0i32; length + 1], // +1 for end sentinel
+            min_touched: None,
+            max_touched: None,
         }
+    }
+
+    /// Widen the tracked bounds to include `[lo, hi]`.
+    pub fn update_bounds(&mut self, lo: usize, hi: usize) {
+        self.min_touched = Some(self.min_touched.map_or(lo, |m| m.min(lo)));
+        self.max_touched = Some(self.max_touched.map_or(hi, |m| m.max(hi)));
+    }
+
+    /// Return the slice of the depth array that was actually modified,
+    /// or an empty slice if nothing was touched.
+    pub fn touched_range(&self) -> &[i32] {
+        match (self.min_touched, self.max_touched) {
+            (Some(lo), Some(hi)) => {
+                let end = (hi + 1).min(self.depth.len());
+                &self.depth[lo..end]
+            }
+            _ => &[],
+        }
+    }
+
+    /// Return the start offset of the touched region (0 if untouched).
+    pub fn touched_start(&self) -> usize {
+        self.min_touched.unwrap_or(0)
     }
 }
 
@@ -223,8 +253,12 @@ pub fn process_batch_dense(
             if !ensure_contig(chrom, contig_depths, contig_lengths, &mut seen_contigs) {
                 continue;
             }
-            let depth = &mut contig_depths.get_mut(chrom).unwrap().depth;
-            cigar::apply_binary_cigar_to_depth(start, cigar_bytes, depth);
+            let entry = contig_depths.get_mut(chrom).unwrap();
+            if let Some((lo, hi)) =
+                cigar::apply_binary_cigar_to_depth(start, cigar_bytes, &mut entry.depth)
+            {
+                entry.update_bounds(lo, hi);
+            }
         }
     } else {
         let cigar_arr = batch.column(col_idx.cigar).as_string::<i32>();
@@ -247,8 +281,11 @@ pub fn process_batch_dense(
             if !ensure_contig(chrom, contig_depths, contig_lengths, &mut seen_contigs) {
                 continue;
             }
-            let depth = &mut contig_depths.get_mut(chrom).unwrap().depth;
-            cigar::apply_cigar_to_depth(start, cigar_str, depth);
+            let entry = contig_depths.get_mut(chrom).unwrap();
+            if let Some((lo, hi)) = cigar::apply_cigar_to_depth(start, cigar_str, &mut entry.depth)
+            {
+                entry.update_bounds(lo, hi);
+            }
         }
     }
 

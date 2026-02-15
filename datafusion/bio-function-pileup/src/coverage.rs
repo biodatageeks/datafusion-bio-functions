@@ -4,7 +4,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Int16Builder, Int32Builder, RecordBatch, StringBuilder};
 use datafusion::arrow::datatypes::SchemaRef;
 
-use crate::events::ContigEvents;
+use crate::events::{ContigEvents, DenseContigDepth};
 use crate::schema::coverage_output_schema;
 
 /// A single coverage block.
@@ -123,13 +123,63 @@ pub fn dense_depth_to_coverage_blocks(contig: &str, depth: &[i32]) -> Vec<Covera
     blocks
 }
 
-/// Convert a single contig's dense depth array to a RecordBatch.
+/// Convert a dense depth slice to coverage blocks with a position offset.
+///
+/// Same RLE logic as `dense_depth_to_coverage_blocks` but positions are
+/// shifted by `start_offset`, allowing callers to pass a sub-slice of
+/// the full depth array (the touched region) instead of the entire contig.
+pub fn dense_depth_to_coverage_blocks_bounded(
+    contig: &str,
+    depth_slice: &[i32],
+    start_offset: usize,
+) -> Vec<CoverageBlock> {
+    let contig_arc: Arc<str> = Arc::from(contig);
+    let mut blocks = Vec::new();
+    let mut cov: i32 = 0;
+    let mut prev_cov: i32 = 0;
+    let mut block_start: usize = 0;
+
+    for (i, &delta) in depth_slice.iter().enumerate() {
+        if delta == 0 {
+            continue;
+        }
+        let pos = start_offset + i;
+        cov += delta;
+
+        if prev_cov != 0 && cov != prev_cov {
+            blocks.push(CoverageBlock {
+                contig: Arc::clone(&contig_arc),
+                pos_start: block_start as i32,
+                pos_end: (pos - 1) as i32,
+                coverage: prev_cov as i16,
+            });
+            if cov != 0 {
+                block_start = pos;
+            }
+        } else if prev_cov == 0 && cov != 0 {
+            block_start = pos;
+        }
+
+        prev_cov = cov;
+    }
+
+    blocks
+}
+
+/// Convert a single contig's dense depth to a RecordBatch.
+///
+/// Uses the tracked touched-range bounds from `DenseContigDepth` to scan
+/// only the modified region instead of the full contig-length array.
 pub fn dense_depth_to_record_batch(
     contig: &str,
-    depth: &[i32],
+    depth: &DenseContigDepth,
     schema: &SchemaRef,
 ) -> datafusion::common::Result<RecordBatch> {
-    let blocks = dense_depth_to_coverage_blocks(contig, depth);
+    let blocks = dense_depth_to_coverage_blocks_bounded(
+        contig,
+        depth.touched_range(),
+        depth.touched_start(),
+    );
     coverage_blocks_to_record_batch(&blocks, schema)
 }
 
@@ -144,14 +194,12 @@ pub fn coverage_blocks_to_record_batch(
     let mut contig_builder = StringBuilder::with_capacity(n, n * 5);
     let mut start_builder = Int32Builder::with_capacity(n);
     let mut end_builder = Int32Builder::with_capacity(n);
-    let mut ref_builder = StringBuilder::with_capacity(n, n);
     let mut cov_builder = Int16Builder::with_capacity(n);
 
     for b in blocks {
         contig_builder.append_value(b.contig.as_ref());
         start_builder.append_value(b.pos_start);
         end_builder.append_value(b.pos_end);
-        ref_builder.append_value("R");
         cov_builder.append_value(b.coverage);
     }
 
@@ -161,7 +209,6 @@ pub fn coverage_blocks_to_record_batch(
             Arc::new(contig_builder.finish()),
             Arc::new(start_builder.finish()),
             Arc::new(end_builder.finish()),
-            Arc::new(ref_builder.finish()),
             Arc::new(cov_builder.finish()),
         ],
     )?;
@@ -321,15 +368,6 @@ mod tests {
         assert_eq!(
             batch
                 .column(3)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(0),
-            "R"
-        );
-        assert_eq!(
-            batch
-                .column(4)
                 .as_any()
                 .downcast_ref::<Int16Array>()
                 .unwrap()

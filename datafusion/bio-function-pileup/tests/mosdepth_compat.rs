@@ -46,7 +46,7 @@ async fn collect_coverage(ctx: &SessionContext, table_name: &str) -> Vec<(String
                 .downcast_ref::<Int32Array>()
                 .unwrap();
             let covs = batch
-                .column(4)
+                .column(3)
                 .as_any()
                 .downcast_ref::<Int16Array>()
                 .unwrap();
@@ -87,7 +87,7 @@ async fn collect_coverage_sql(ctx: &SessionContext, sql: &str) -> Vec<(String, i
             .downcast_ref::<Int32Array>()
             .unwrap();
         let covs = batch
-            .column(4)
+            .column(3)
             .as_any()
             .downcast_ref::<Int16Array>()
             .unwrap();
@@ -177,7 +177,7 @@ async fn test_overlapping_pairs() {
     assert_eq!(chr1_rows[0], &("1".to_string(), 565173, 565252, 2));
 }
 
-/// Test coverage via SQL UDTF: SELECT * FROM coverage('path/to/file.bam')
+/// Test coverage via SQL UDTF: SELECT * FROM depth('path/to/file.bam')
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ovl_fast_mode_sql() {
     let bam_path = format!("{}/tests/data/ovl.bam", env!("CARGO_MANIFEST_DIR"));
@@ -185,7 +185,7 @@ async fn test_ovl_fast_mode_sql() {
     let ctx = SessionContext::new();
     register_pileup_functions(&ctx);
 
-    let sql = format!("SELECT * FROM coverage('{bam_path}')");
+    let sql = format!("SELECT * FROM depth('{bam_path}')");
     let rows = collect_coverage_sql(&ctx, &sql).await;
 
     let mt_rows: Vec<_> = rows.iter().filter(|r| r.0 == "MT").collect();
@@ -207,7 +207,7 @@ async fn test_overlapping_pairs_sql() {
     let ctx = SessionContext::new();
     register_pileup_functions(&ctx);
 
-    let sql = format!("SELECT * FROM coverage('{bam_path}')");
+    let sql = format!("SELECT * FROM depth('{bam_path}')");
     let rows = collect_coverage_sql(&ctx, &sql).await;
 
     let chr1_rows: Vec<_> = rows.iter().filter(|r| r.0 == "1").collect();

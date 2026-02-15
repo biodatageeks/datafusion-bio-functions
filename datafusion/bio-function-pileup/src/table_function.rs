@@ -16,29 +16,29 @@ use datafusion_bio_format_bam::table_provider::BamTableProvider;
 use crate::physical_exec::{PileupConfig, PileupExec};
 use crate::schema::coverage_output_schema;
 
-/// A TableProvider that wraps a child provider (e.g., BAM reader) and produces coverage output.
-pub struct CoverageTableProvider {
+/// A TableProvider that wraps a child provider (e.g., BAM reader) and produces depth output.
+pub struct DepthTableProvider {
     input: Arc<dyn TableProvider>,
     config: PileupConfig,
 }
 
-impl CoverageTableProvider {
-    /// Create a new CoverageTableProvider wrapping the given input provider.
+impl DepthTableProvider {
+    /// Create a new DepthTableProvider wrapping the given input provider.
     pub fn new(input: Arc<dyn TableProvider>, config: PileupConfig) -> Self {
         Self { input, config }
     }
 }
 
-impl std::fmt::Debug for CoverageTableProvider {
+impl std::fmt::Debug for DepthTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CoverageTableProvider")
+        f.debug_struct("DepthTableProvider")
             .field("config", &self.config)
             .finish()
     }
 }
 
 #[async_trait]
-impl TableProvider for CoverageTableProvider {
+impl TableProvider for DepthTableProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -68,15 +68,15 @@ impl TableProvider for CoverageTableProvider {
     }
 }
 
-/// A table function that enables SQL: `SELECT * FROM coverage('path/to/file.bam')`
+/// A table function that enables SQL: `SELECT * FROM depth('path/to/file.bam')`
 #[derive(Debug, Default)]
-pub struct CoverageFunction;
+pub struct DepthFunction;
 
-impl TableFunctionImpl for CoverageFunction {
+impl TableFunctionImpl for DepthFunction {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
         if args.is_empty() {
             return Err(DataFusionError::Plan(
-                "coverage() requires at least one argument: the BAM file path".to_string(),
+                "depth() requires at least one argument: the BAM file path".to_string(),
             ));
         }
 
@@ -85,7 +85,7 @@ impl TableFunctionImpl for CoverageFunction {
             Expr::Literal(ScalarValue::Utf8(Some(path)), _) => path.clone(),
             other => {
                 return Err(DataFusionError::Plan(format!(
-                    "coverage() first argument must be a string literal, got: {other}"
+                    "depth() first argument must be a string literal, got: {other}"
                 )));
             }
         };
@@ -107,14 +107,14 @@ impl TableFunctionImpl for CoverageFunction {
             binary_cigar: true,
             ..PileupConfig::default()
         };
-        Ok(Arc::new(CoverageTableProvider::new(
+        Ok(Arc::new(DepthTableProvider::new(
             Arc::new(bam_provider),
             config,
         )))
     }
 }
 
-/// Register pileup/coverage table functions on a SessionContext.
+/// Register pileup/depth table functions on a SessionContext.
 pub fn register_pileup_functions(ctx: &SessionContext) {
-    ctx.register_udtf("coverage", Arc::new(CoverageFunction));
+    ctx.register_udtf("depth", Arc::new(DepthFunction));
 }
