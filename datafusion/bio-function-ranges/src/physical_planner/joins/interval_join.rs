@@ -1907,9 +1907,8 @@ mod tests {
         let create_table_b_query = format!(
             r#"
             CREATE TABLE b (contig VARCHAR NOT NULL, start BIGINT NOT NULL, end BIGINT NOT NULL)
-            AS VALUES ('a', 1, 2), ('b', 3, {})
-        "#,
-            max_plus_one
+            AS VALUES ('a', 1, 2), ('b', 3, {max_plus_one})
+        "#
         );
 
         ctx.sql(create_table_a_query).await?;
@@ -1927,10 +1926,7 @@ mod tests {
 
         assert!(err.is_err());
         assert_eq!(
-            format!(
-                "Arrow error: Cast error: Can't cast value {} to type Int32",
-                max_plus_one
-            ),
+            format!("Arrow error: Cast error: Can't cast value {max_plus_one} to type Int32"),
             err.unwrap_err().to_string(),
         );
 

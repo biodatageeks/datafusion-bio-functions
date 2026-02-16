@@ -1,5 +1,6 @@
 //! This module provides an associative data structure for performing interval intersection queries.
 
+#[cfg(any(target_feature = "avx2", target_feature = "neon"))]
 use aligned_vec::{AVec, ConstAlign};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -39,6 +40,12 @@ pub struct IntervalMap<T> {
     pub data: Vec<T>,
     pub start_sorted: bool,
     pub end_sorted: bool,
+}
+
+impl<T: Clone> Default for IntervalMap<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T: Clone> IntervalMap<T> {
@@ -194,7 +201,7 @@ impl<T: Clone> IntervalMap<T> {
                 idx = idx.wrapping_sub(1);
             }
         }
-        return idx;
+        idx
     }
 
     #[inline(always)]
@@ -206,7 +213,7 @@ impl<T: Clone> IntervalMap<T> {
         unsafe {
             while left > 0 && value < *self.starts.get_unchecked(left) {
                 search_right = left;
-                left = if bound <= left { left - bound } else { 0 };
+                left = left.saturating_sub(bound);
                 bound *= 2;
             }
             // Binary search in the found range
@@ -490,6 +497,7 @@ impl<T: Clone> IntervalMap<T> {
             }
 
             #[cfg(target_arch = "aarch64")]
+            #[allow(clippy::unnecessary_cast)]
             {
                 use std::arch::aarch64::*;
                 let start_vec = vdupq_n_s32(start);
