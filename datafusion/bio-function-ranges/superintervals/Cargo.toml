@@ -1,0 +1,21 @@
+[package]
+name = "superintervals"
+description = "Interval overlap library"
+version = "0.3.6"
+authors = ["Kez Cleal. <clealk@cardiff.ac.uk>"]
+edition = "2021"
+repository = "https://github.com/kcleal/superintervals"
+homepage = "https://github.com/kcleal/superintervals"
+documentation = "https://github.com/kcleal/superintervals"
+readme = "README.md"
+license-file = "LICENSE"
+
+[lib]
+path = "src/superintervals.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+aligned-vec = { version = "0.6.4", features = ["serde"] }
+
+[features]
+nosimd = []
