@@ -21,7 +21,7 @@ fn main() {
             &simple_ops
         };
         for &(len, op) in ops {
-            let _ = write!(buf, "{}{}", len, op);
+            let _ = write!(buf, "{len}{op}");
         }
         // Simulate StringBuilder append (just measure the formatting)
         std::hint::black_box(&buf);
