@@ -46,7 +46,10 @@ pub fn parse_cigar(cigar: &str) -> Vec<CigarOp> {
         if c.is_ascii_digit() {
             continue;
         }
-        let len: u32 = cigar[num_start..i].parse().unwrap_or(0);
+        let len: u32 = cigar[num_start..i].parse().unwrap_or_else(|e| {
+            log::warn!("malformed CIGAR op length '{}': {e}", &cigar[num_start..i]);
+            0
+        });
         let kind = match c {
             'M' | 'X' | '=' => CigarOpKind::AlignmentMatch,
             'D' | 'N' => CigarOpKind::ReferenceSkip,
@@ -91,10 +94,13 @@ pub fn apply_cigar_to_depth(start: u32, cigar: &str, depth: &mut [i32]) -> Optio
         if b.is_ascii_digit() {
             continue;
         }
-        let len: usize = cigar[num_start..i].parse().unwrap_or(0);
+        let len: usize = cigar[num_start..i].parse().unwrap_or_else(|e| {
+            log::warn!("malformed CIGAR op length '{}': {e}", &cigar[num_start..i]);
+            0
+        });
         match b {
             b'M' | b'X' | b'=' => {
-                let end = ref_pos + len;
+                let end = ref_pos.saturating_add(len);
                 if ref_pos < depth_len {
                     depth[ref_pos] += 1;
                     min_written = min_written.min(ref_pos);
@@ -107,7 +113,7 @@ pub fn apply_cigar_to_depth(start: u32, cigar: &str, depth: &mut [i32]) -> Optio
                 ref_pos = end;
             }
             b'D' | b'N' => {
-                ref_pos += len;
+                ref_pos = ref_pos.saturating_add(len);
             }
             _ => {} // I, S, H, P — no ref consumption
         }
@@ -142,15 +148,18 @@ pub fn apply_cigar_to_event_list(start: u32, cigar: &str, out: &mut Vec<(u32, i3
         if b.is_ascii_digit() {
             continue;
         }
-        let len: u32 = cigar[num_start..i].parse().unwrap_or(0);
+        let len: u32 = cigar[num_start..i].parse().unwrap_or_else(|e| {
+            log::warn!("malformed CIGAR op length '{}': {e}", &cigar[num_start..i]);
+            0
+        });
         match b {
             b'M' | b'X' | b'=' => {
                 out.push((ref_pos, 1));
-                ref_pos += len;
+                ref_pos = ref_pos.saturating_add(len);
                 out.push((ref_pos, -1));
             }
             b'D' | b'N' => {
-                ref_pos += len;
+                ref_pos = ref_pos.saturating_add(len);
             }
             _ => {} // I, S, H, P — no ref consumption
         }
@@ -188,7 +197,7 @@ pub fn apply_binary_cigar_to_depth(
 
         match op_code {
             BAM_CIGAR_M | BAM_CIGAR_EQ | BAM_CIGAR_X => {
-                let end = ref_pos + op_len;
+                let end = ref_pos.saturating_add(op_len);
                 if ref_pos < depth_len {
                     depth[ref_pos] += 1;
                     min_written = min_written.min(ref_pos);
@@ -201,7 +210,7 @@ pub fn apply_binary_cigar_to_depth(
                 ref_pos = end;
             }
             BAM_CIGAR_D | BAM_CIGAR_N => {
-                ref_pos += op_len;
+                ref_pos = ref_pos.saturating_add(op_len);
             }
             _ => {} // I, S, H, P — no ref consumption
         }
@@ -233,11 +242,11 @@ pub fn apply_binary_cigar_to_event_list(start: u32, cigar_bytes: &[u8], out: &mu
         match op_code {
             BAM_CIGAR_M | BAM_CIGAR_EQ | BAM_CIGAR_X => {
                 out.push((ref_pos, 1));
-                ref_pos += op_len;
+                ref_pos = ref_pos.saturating_add(op_len);
                 out.push((ref_pos, -1));
             }
             BAM_CIGAR_D | BAM_CIGAR_N => {
-                ref_pos += op_len;
+                ref_pos = ref_pos.saturating_add(op_len);
             }
             _ => {} // I, S, H, P — no ref consumption
         }
@@ -261,14 +270,14 @@ pub fn generate_events(start: u32, cigar: &str) -> Vec<CoverageEvent> {
                     position: ref_pos,
                     delta: 1,
                 });
-                ref_pos += op.len;
+                ref_pos = ref_pos.saturating_add(op.len);
                 events.push(CoverageEvent {
                     position: ref_pos,
                     delta: -1,
                 });
             }
             CigarOpKind::ReferenceSkip => {
-                ref_pos += op.len;
+                ref_pos = ref_pos.saturating_add(op.len);
             }
             CigarOpKind::NoRefConsumption => {
                 // Does not advance reference position

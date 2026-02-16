@@ -26,7 +26,7 @@ use crate::schema::{coverage_output_schema, per_base_output_schema};
 
 /// Controls which depth-accumulation strategy the pileup stream uses.
 ///
-/// - `Auto` — heuristic (currently defaults to sparse; may be enhanced later).
+/// - `Auto` — use dense array when BAM header metadata is available, sparse otherwise.
 /// - `Force` — always use the dense array when BAM header metadata is available.
 /// - `Disable` — always use the sparse BTreeMap, never attempt dense.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -444,7 +444,9 @@ fn merge_sparse_results(
     for part in partitions {
         if let PartitionResult::Sparse { contig_events } = part {
             for (contig, ce) in contig_events {
-                merged.entry(contig).or_default().events.extend(ce.events);
+                let entry = merged.entry(contig).or_default();
+                entry.merge_bounds(&ce);
+                entry.events.extend(ce.events);
             }
         }
     }

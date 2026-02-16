@@ -63,6 +63,34 @@ impl ColumnIndices {
 #[derive(Default)]
 pub struct ContigEvents {
     pub events: Vec<(u32, i32)>,
+    pub min_pos: Option<u32>,
+    pub max_pos: Option<u32>,
+}
+
+impl ContigEvents {
+    pub fn push(&mut self, pos: u32, delta: i32) {
+        self.events.push((pos, delta));
+        self.min_pos = Some(self.min_pos.map_or(pos, |m| m.min(pos)));
+        self.max_pos = Some(self.max_pos.map_or(pos, |m| m.max(pos)));
+    }
+
+    /// Update min/max bounds from events added since `prev_len`.
+    pub fn update_bounds_from(&mut self, prev_len: usize) {
+        for &(pos, _) in &self.events[prev_len..] {
+            self.min_pos = Some(self.min_pos.map_or(pos, |m| m.min(pos)));
+            self.max_pos = Some(self.max_pos.map_or(pos, |m| m.max(pos)));
+        }
+    }
+
+    /// Merge bounds from another `ContigEvents`.
+    pub fn merge_bounds(&mut self, other: &ContigEvents) {
+        if let Some(other_min) = other.min_pos {
+            self.min_pos = Some(self.min_pos.map_or(other_min, |m| m.min(other_min)));
+        }
+        if let Some(other_max) = other.max_pos {
+            self.max_pos = Some(self.max_pos.map_or(other_max, |m| m.max(other_max)));
+        }
+    }
 }
 
 /// Accumulates coverage events from a RecordBatch into per-contig event maps.
@@ -103,7 +131,9 @@ pub fn process_batch(
                 contig_events.insert(chrom.to_string(), ContigEvents::default());
             }
             let contig_entry = contig_events.get_mut(chrom).unwrap();
+            let prev_len = contig_entry.events.len();
             cigar::apply_binary_cigar_to_event_list(start, cigar_bytes, &mut contig_entry.events);
+            contig_entry.update_bounds_from(prev_len);
         }
     } else {
         let cigar_arr = batch.column(col_idx.cigar).as_string::<i32>();
@@ -128,7 +158,9 @@ pub fn process_batch(
                 contig_events.insert(chrom.to_string(), ContigEvents::default());
             }
             let contig_entry = contig_events.get_mut(chrom).unwrap();
+            let prev_len = contig_entry.events.len();
             cigar::apply_cigar_to_event_list(start, cigar_str, &mut contig_entry.events);
+            contig_entry.update_bounds_from(prev_len);
         }
     }
 }
