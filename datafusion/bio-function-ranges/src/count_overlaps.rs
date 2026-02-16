@@ -118,7 +118,7 @@ impl TableProvider for CountOverlapsProvider {
             left_table,
             self.columns_1.clone(),
             self.coverage,
-        ));
+        )?);
         Ok(Arc::new(CountOverlapsExec {
             schema: self.schema().clone(),
             session: Arc::clone(&self.session),

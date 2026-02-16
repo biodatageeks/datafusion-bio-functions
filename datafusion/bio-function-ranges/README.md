@@ -235,3 +235,9 @@ datafusion-bio-function-ranges = { git = "https://github.com/biodatageeks/datafu
 | Rust edition | 2024 |
 
 These versions must stay in sync with `datafusion-bio-formats` and `polars-bio`.
+
+## License
+
+This crate is licensed under the **Apache License 2.0**, consistent with the rest of the `datafusion-bio-functions` workspace.
+
+The vendored `superintervals` sub-crate (in `superintervals/`) is licensed under the **MIT License** by Kez Cleal. MIT is a permissive license fully compatible with Apache 2.0 — MIT-licensed code can be included in Apache 2.0 projects without restriction.

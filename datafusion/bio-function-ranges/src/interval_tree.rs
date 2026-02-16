@@ -47,11 +47,11 @@ pub fn build_coitree_from_batches(
     batches: Vec<RecordBatch>,
     columns: (String, String, String),
     coverage: bool,
-) -> FnvHashMap<String, COITree<(), u32>> {
+) -> Result<FnvHashMap<String, COITree<(), u32>>> {
     let mut nodes = IntervalHashMap::default();
 
     for batch in batches {
-        let (contig_arr, start_arr, end_arr) = get_join_col_arrays(&batch, columns.clone());
+        let (contig_arr, start_arr, end_arr) = get_join_col_arrays(&batch, columns.clone())?;
 
         for i in 0..batch.num_rows() {
             let contig = contig_arr.value(i).to_string();
@@ -72,7 +72,7 @@ pub fn build_coitree_from_batches(
             trees.insert(seqname, COITree::new(&seqname_nodes));
         }
     }
-    trees
+    Ok(trees)
 }
 
 pub fn get_coverage(tree: &COITree<(), u32>, start: i32, end: i32) -> i32 {
@@ -109,36 +109,36 @@ pub async fn get_stream(
 
     let iter = partition_stream.map(move |rb| match rb {
         Ok(rb) => {
-            let (contig, pos_start, pos_end) = get_join_col_arrays(&rb, columns_2.clone());
+            let (contig, pos_start, pos_end) = get_join_col_arrays(&rb, columns_2.clone())?;
             let mut count_arr = Vec::with_capacity(rb.num_rows());
             let num_rows = rb.num_rows();
             for i in 0..num_rows {
                 let contig = contig.value(i).to_string();
                 let pos_start = pos_start.value(i);
                 let pos_end = pos_end.value(i);
-                let tree = trees.get(&contig);
-                if tree.is_none() {
-                    count_arr.push(0);
-                    continue;
-                }
-                let count = if coverage {
-                    if filter_op == FilterOp::Strict {
-                        get_coverage(tree.unwrap(), pos_start + 1, pos_end - 1)
-                    } else {
-                        get_coverage(tree.unwrap(), pos_start, pos_end)
+                let count = match trees.get(&contig) {
+                    None => 0,
+                    Some(tree) => {
+                        if coverage {
+                            if filter_op == FilterOp::Strict {
+                                get_coverage(tree, pos_start + 1, pos_end - 1)
+                            } else {
+                                get_coverage(tree, pos_start, pos_end)
+                            }
+                        } else if filter_op == FilterOp::Strict {
+                            tree.query_count(pos_start + 1, pos_end - 1) as i32
+                        } else {
+                            tree.query_count(pos_start, pos_end) as i32
+                        }
                     }
-                } else if filter_op == FilterOp::Strict {
-                    tree.unwrap().query_count(pos_start + 1, pos_end - 1) as i32
-                } else {
-                    tree.unwrap().query_count(pos_start, pos_end) as i32
                 };
                 count_arr.push(count as i64);
             }
             let count_arr = Arc::new(Int64Array::from(count_arr));
             let mut columns = rb.columns().to_vec();
             columns.push(count_arr);
-            let new_rb = RecordBatch::try_new(new_schema.clone(), columns).unwrap();
-            Ok(new_rb)
+            RecordBatch::try_new(new_schema.clone(), columns)
+                .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))
         }
         Err(e) => Err(e),
     });
