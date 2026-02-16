@@ -246,6 +246,120 @@ async fn test_ovl_fast_mode_sql_default_one_based() {
     assert_eq!(mt_rows[2], &("MT".to_string(), 43, 80, 1));
 }
 
+/// Helper to collect per-base coverage results from SQL UDTF.
+async fn collect_per_base_sql(ctx: &SessionContext, sql: &str) -> Vec<(String, i32, i16)> {
+    let df = ctx.sql(sql).await.unwrap();
+    let batches = df.collect().await.unwrap();
+
+    let mut all_rows = Vec::new();
+    for batch in batches {
+        let contigs = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let positions = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let covs = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+
+        for i in 0..batch.num_rows() {
+            all_rows.push((
+                contigs.value(i).to_string(),
+                positions.value(i),
+                covs.value(i),
+            ));
+        }
+    }
+    all_rows
+}
+
+/// Test per-base output via SQL UDTF: `SELECT * FROM depth('path', true, true)`
+///
+/// The ovl.bam file has reads on MT contig. With per_base=true, we should get
+/// one row per genomic position for each contig that has reads, covering the
+/// full contig length from the BAM header.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_per_base_sql() {
+    let bam_path = format!("{}/tests/data/ovl.bam", env!("CARGO_MANIFEST_DIR"));
+
+    let ctx = SessionContext::new();
+    register_pileup_functions(&ctx);
+
+    let sql = format!("SELECT * FROM depth('{bam_path}', true, true)");
+    let rows = collect_per_base_sql(&ctx, &sql).await;
+
+    // Should have 3 columns per row, not 4
+    assert!(!rows.is_empty(), "Expected per-base rows");
+
+    // Filter to MT contig
+    let mt_rows: Vec<_> = rows.iter().filter(|r| r.0 == "MT").collect();
+
+    // MT contig should have rows for every position (full contig length from header)
+    assert!(
+        mt_rows.len() > 80,
+        "Per-base MT should cover full contig length, got {} rows",
+        mt_rows.len()
+    );
+
+    // Verify 0-based positions start at 0
+    assert_eq!(mt_rows[0].1, 0, "First MT position should be 0 (0-based)");
+
+    // Verify positions are sequential
+    for (i, row) in mt_rows.iter().enumerate() {
+        assert_eq!(
+            row.1, i as i32,
+            "Position should be sequential at index {i}"
+        );
+    }
+
+    // Verify coverage at known positions from block-based test:
+    // Block: MT 0-5 cov=1, 6-41 cov=2, 42-79 cov=1
+    assert_eq!(mt_rows[0].2, 1, "pos 0 should have coverage 1");
+    assert_eq!(mt_rows[5].2, 1, "pos 5 should have coverage 1");
+    assert_eq!(mt_rows[6].2, 2, "pos 6 should have coverage 2");
+    assert_eq!(mt_rows[41].2, 2, "pos 41 should have coverage 2");
+    assert_eq!(mt_rows[42].2, 1, "pos 42 should have coverage 1");
+    assert_eq!(mt_rows[79].2, 1, "pos 79 should have coverage 1");
+
+    // Positions beyond the reads should have coverage 0
+    assert_eq!(mt_rows[80].2, 0, "pos 80 should have coverage 0");
+}
+
+/// Test per-base output schema has correct columns.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_per_base_schema() {
+    use datafusion_bio_function_pileup::schema::COORDINATE_SYSTEM_METADATA_KEY;
+
+    let bam_path = format!("{}/tests/data/ovl.bam", env!("CARGO_MANIFEST_DIR"));
+
+    let ctx = SessionContext::new();
+    register_pileup_functions(&ctx);
+
+    let sql = format!("SELECT * FROM depth('{bam_path}', true, true)");
+    let df = ctx.sql(&sql).await.unwrap();
+    let schema = df.schema().inner().clone();
+
+    assert_eq!(
+        schema.fields().len(),
+        3,
+        "Per-base schema should have 3 columns"
+    );
+    assert_eq!(schema.field(0).name(), "contig");
+    assert_eq!(schema.field(1).name(), "pos");
+    assert_eq!(schema.field(2).name(), "coverage");
+    assert_eq!(
+        schema.metadata().get(COORDINATE_SYSTEM_METADATA_KEY),
+        Some(&"true".to_string()),
+    );
+}
+
 /// Test that coordinate metadata is present in the output schema.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_coordinate_metadata_in_schema() {

@@ -22,7 +22,7 @@ use crate::coverage;
 use crate::events;
 use crate::events::{ColumnIndices, DenseContigDepth};
 use crate::filter::ReadFilter;
-use crate::schema::coverage_output_schema;
+use crate::schema::{coverage_output_schema, per_base_output_schema};
 
 /// Handle a contig transition in the dense accumulator.
 ///
@@ -32,6 +32,7 @@ use crate::schema::coverage_output_schema;
 ///
 /// Returns `true` if the row should be processed (contig is available),
 /// `false` if the contig is unknown and should be skipped.
+#[allow(clippy::too_many_arguments)]
 fn handle_contig_transition(
     chrom: &str,
     current_contig: &mut Option<String>,
@@ -40,6 +41,9 @@ fn handle_contig_transition(
     pending_batches: &mut VecDeque<RecordBatch>,
     schema: &SchemaRef,
     batch_size: usize,
+    per_base_emitter: &mut Option<coverage::PerBaseEmitter>,
+    per_base: bool,
+    zero_based: bool,
 ) -> bool {
     let contig_changed = current_contig.as_ref().is_none_or(|c| c.as_str() != chrom);
     if !contig_changed {
@@ -48,7 +52,19 @@ fn handle_contig_transition(
 
     // Emit the previous contig if we had one
     if let (Some(prev_contig), Some(prev_depth)) = (current_contig.take(), current_depth.take()) {
-        if let Ok(batches) =
+        if per_base {
+            // Flush any existing per-base emitter (rare multi-contig transition)
+            if let Some(emitter) = per_base_emitter.as_mut() {
+                if let Ok(batches) = emitter.flush_remaining(schema, batch_size) {
+                    pending_batches.extend(batches);
+                }
+            }
+            *per_base_emitter = Some(coverage::PerBaseEmitter::new(
+                prev_contig,
+                prev_depth.depth,
+                zero_based,
+            ));
+        } else if let Ok(batches) =
             coverage::dense_depth_to_record_batches(&prev_contig, &prev_depth, schema, batch_size)
         {
             pending_batches.extend(batches);
@@ -94,6 +110,10 @@ pub struct PileupConfig {
     /// When `false` (default), output coordinates are 1-based.
     /// This also controls the coordinate system passed to the BAM reader.
     pub zero_based: bool,
+    /// When `true`, emit one row per genomic position (like `samtools depth -a`)
+    /// instead of RLE coverage blocks. Requires dense mode (BAM header with
+    /// contig lengths). Default: `false`.
+    pub per_base: bool,
 }
 
 impl Default for PileupConfig {
@@ -103,6 +123,7 @@ impl Default for PileupConfig {
             dense_mode: DenseMode::default(),
             binary_cigar: true,
             zero_based: false,
+            per_base: false,
         }
     }
 }
@@ -123,7 +144,11 @@ pub struct PileupExec {
 
 impl PileupExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, config: PileupConfig) -> Self {
-        let schema = coverage_output_schema(config.zero_based);
+        let schema = if config.per_base {
+            per_base_output_schema(config.zero_based)
+        } else {
+            coverage_output_schema(config.zero_based)
+        };
         let cache = PlanProperties::new(
             EquivalenceProperties::new(schema),
             input.properties().partitioning.clone(),
@@ -142,12 +167,13 @@ impl DisplayAs for PileupExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "PileupExec: filter_flag={}, min_mapq={}, dense={:?}, binary_cigar={}, zero_based={}",
+            "PileupExec: filter_flag={}, min_mapq={}, dense={:?}, binary_cigar={}, zero_based={}, per_base={}",
             self.config.filter.filter_flag,
             self.config.filter.min_mapping_quality,
             self.config.dense_mode,
             self.config.binary_cigar,
-            self.config.zero_based
+            self.config.zero_based,
+            self.config.per_base
         )
     }
 }
@@ -256,6 +282,8 @@ struct PileupStream {
     pending_batches: VecDeque<RecordBatch>,
     /// Cached column indices (computed once on first batch).
     col_idx: Option<ColumnIndices>,
+    /// Lazy per-base emitter for the current/last contig (per_base mode only).
+    per_base_emitter: Option<coverage::PerBaseEmitter>,
 }
 
 impl PileupStream {
@@ -278,13 +306,17 @@ impl PileupStream {
             },
             pending_batches: VecDeque::new(),
             col_idx: None,
+            per_base_emitter: None,
         }
     }
 
     /// Try to initialize the dense accumulator from the input schema metadata.
     /// Also computes and caches column indices from the first batch's schema.
     /// Called once on the first input batch. Respects `DenseMode` config.
-    fn try_init_dense(&mut self, input_schema: &SchemaRef) {
+    ///
+    /// Returns an error if `per_base` mode is enabled but dense initialization
+    /// fails (no contig lengths in schema metadata).
+    fn try_init_dense(&mut self, input_schema: &SchemaRef) -> Result<()> {
         // Cache column indices once
         self.col_idx = Some(ColumnIndices::from_schema(input_schema));
 
@@ -303,7 +335,17 @@ impl PileupStream {
                 };
             }
         }
+
+        if self.config.per_base && !self.accumulator.is_dense() {
+            return Err(datafusion::common::DataFusionError::Execution(
+                "per_base mode requires dense accumulation (BAM header with contig lengths). \
+                 Sparse fallback (e.g. MemTable) is not supported for per_base output."
+                    .to_string(),
+            ));
+        }
+
         self.initialized = true;
+        Ok(())
     }
 
     /// Process a single batch through the dense accumulator.
@@ -334,6 +376,9 @@ impl PileupStream {
         let pending_batches = &mut self.pending_batches;
         let schema = &self.schema;
         let batch_size = self.batch_size;
+        let per_base_emitter = &mut self.per_base_emitter;
+        let per_base = self.config.per_base;
+        let zero_based = self.config.zero_based;
 
         if col_idx.binary_cigar {
             let cigar_arr = batch.column(col_idx.cigar).as_binary::<i32>();
@@ -359,6 +404,9 @@ impl PileupStream {
                     pending_batches,
                     schema,
                     batch_size,
+                    per_base_emitter,
+                    per_base,
+                    zero_based,
                 ) {
                     continue;
                 }
@@ -394,6 +442,9 @@ impl PileupStream {
                     pending_batches,
                     schema,
                     batch_size,
+                    per_base_emitter,
+                    per_base,
+                    zero_based,
                 ) {
                     continue;
                 }
@@ -420,7 +471,19 @@ impl PileupStream {
         };
 
         if let (Some(contig), Some(depth)) = (current_contig.take(), current_depth.take()) {
-            if let Ok(batches) = coverage::dense_depth_to_record_batches(
+            if self.config.per_base {
+                // Flush any existing per-base emitter first (rare multi-contig case)
+                if let Some(emitter) = self.per_base_emitter.as_mut() {
+                    if let Ok(batches) = emitter.flush_remaining(&self.schema, self.batch_size) {
+                        self.pending_batches.extend(batches);
+                    }
+                }
+                self.per_base_emitter = Some(coverage::PerBaseEmitter::new(
+                    contig,
+                    depth.depth,
+                    self.config.zero_based,
+                ));
+            } else if let Ok(batches) = coverage::dense_depth_to_record_batches(
                 &contig,
                 &depth,
                 &self.schema,
@@ -439,6 +502,14 @@ impl Stream for PileupStream {
         let this = self.get_mut();
 
         loop {
+            // 0. Drain per-base emitter lazily (one batch per poll)
+            if let Some(emitter) = &mut this.per_base_emitter {
+                if let Some(result) = emitter.next_batch(&this.schema, this.batch_size) {
+                    return Poll::Ready(Some(result));
+                }
+                this.per_base_emitter = None;
+            }
+
             // 1. Drain pending batches (shared queue for both dense and sparse)
             if let Some(batch) = this.pending_batches.pop_front() {
                 return Poll::Ready(Some(Ok(batch)));
@@ -454,7 +525,10 @@ impl Stream for PileupStream {
                 match this.input.poll_next_unpin(cx) {
                     Poll::Ready(Some(Ok(batch))) => {
                         if !this.initialized {
-                            this.try_init_dense(&batch.schema());
+                            if let Err(e) = this.try_init_dense(&batch.schema()) {
+                                this.finished = true;
+                                return Poll::Ready(Some(Err(e)));
+                            }
                         }
 
                         // Use is_dense() to avoid holding a borrow on this.accumulator
@@ -496,7 +570,7 @@ impl Stream for PileupStream {
 
             if this.accumulator.is_dense() {
                 this.finalize_dense();
-                // Loop back to drain pending batches (step 1), then step 2 returns None
+                // Loop back to drain pending batches / per-base emitter
                 continue;
             }
 
@@ -940,5 +1014,43 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3);
+    }
+
+    /// Per-base mode on sparse path (MemTable without contig lengths) must error.
+    #[tokio::test]
+    async fn test_per_base_sparse_errors() {
+        let batch = make_batch(vec![("chr1", 0, 10, 0, "10M", 60)]);
+        let schema = bam_schema();
+        let mem_table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+
+        let ctx = SessionContext::new();
+        ctx.register_table("reads", Arc::new(mem_table)).unwrap();
+
+        let df = ctx.table("reads").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let pileup = PileupExec::new(
+            plan,
+            PileupConfig {
+                zero_based: true,
+                per_base: true,
+                ..PileupConfig::default()
+            },
+        );
+        let task_ctx = ctx.task_ctx();
+        let stream = pileup.execute(0, task_ctx).unwrap();
+        let results: Vec<Result<RecordBatch>> = stream.collect::<Vec<_>>().await;
+
+        // Should get an error since MemTable lacks contig length metadata
+        assert!(results.iter().any(|r| r.is_err()));
+        let err = results
+            .into_iter()
+            .find(|r| r.is_err())
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("per_base"),
+            "Error should mention per_base: {err}"
+        );
     }
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Int16Builder, Int32Builder, RecordBatch, StringBuilder};
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::Result;
 
 use crate::events::{ContigEvents, DenseContigDepth};
 
@@ -265,6 +266,102 @@ pub fn coverage_blocks_to_record_batch(
     )?;
 
     Ok(batch)
+}
+
+/// Lazy streaming emitter for per-base coverage output.
+///
+/// Holds the finalized dense depth delta array for a single contig and
+/// generates one `RecordBatch` per `next_batch()` call, keeping memory
+/// at O(batch_size) instead of materializing all positions at once.
+pub struct PerBaseEmitter {
+    contig: String,
+    /// Delta array taken from `DenseContigDepth`. Prefix-summed lazily.
+    depth: Vec<i32>,
+    /// Next position index to emit.
+    next_idx: usize,
+    /// Exclusive end index.
+    end_idx: usize,
+    /// Running prefix sum carried across batches.
+    cumulative_cov: i32,
+}
+
+impl PerBaseEmitter {
+    /// Create a new emitter for the given contig.
+    ///
+    /// - `zero_based=true`: emits positions `[0..len)` (0-based)
+    /// - `zero_based=false`: emits positions `[1..len]` (1-based), but the
+    ///   underlying array index still starts at 1 (BAM 1-based convention).
+    pub fn new(contig: String, depth_vec: Vec<i32>, zero_based: bool) -> Self {
+        let len = depth_vec.len();
+        let (next_idx, end_idx) = if zero_based {
+            (0, len)
+        } else {
+            // 1-based: skip index 0, emit [1..len)
+            (1, len)
+        };
+        Self {
+            contig,
+            depth: depth_vec,
+            next_idx,
+            end_idx,
+            cumulative_cov: 0,
+        }
+    }
+
+    /// Generate the next batch of up to `batch_size` per-base rows.
+    ///
+    /// Returns `None` when all positions have been emitted.
+    pub fn next_batch(
+        &mut self,
+        schema: &SchemaRef,
+        batch_size: usize,
+    ) -> Option<Result<RecordBatch>> {
+        if self.next_idx >= self.end_idx {
+            return None;
+        }
+
+        let chunk_end = (self.next_idx + batch_size).min(self.end_idx);
+        let n = chunk_end - self.next_idx;
+
+        let mut contig_builder = StringBuilder::with_capacity(n, n * self.contig.len());
+        let mut pos_builder = Int32Builder::with_capacity(n);
+        let mut cov_builder = Int16Builder::with_capacity(n);
+
+        for idx in self.next_idx..chunk_end {
+            self.cumulative_cov += self.depth[idx];
+            contig_builder.append_value(&self.contig);
+            pos_builder.append_value(idx as i32);
+            cov_builder.append_value(self.cumulative_cov as i16);
+        }
+
+        self.next_idx = chunk_end;
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(contig_builder.finish()),
+                Arc::new(pos_builder.finish()),
+                Arc::new(cov_builder.finish()),
+            ],
+        );
+        Some(batch.map_err(Into::into))
+    }
+
+    /// Eagerly drain all remaining positions into batches.
+    ///
+    /// Used when flushing a previous contig's emitter during a multi-contig
+    /// transition (rare edge case).
+    pub fn flush_remaining(
+        &mut self,
+        schema: &SchemaRef,
+        batch_size: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut batches = Vec::new();
+        while let Some(result) = self.next_batch(schema, batch_size) {
+            batches.push(result?);
+        }
+        Ok(batches)
+    }
 }
 
 #[cfg(test)]
@@ -533,5 +630,143 @@ mod tests {
         let dense_blocks = dense_depth_to_coverage_blocks("chr1", &depth);
 
         assert_eq!(sparse_blocks, dense_blocks);
+    }
+
+    // --- Tests for PerBaseEmitter ---
+
+    #[test]
+    fn test_per_base_emitter_single_read() {
+        // 10-position contig with a single 5bp read at position 2
+        let mut depth = vec![0i32; 10];
+        depth[2] = 1;
+        depth[7] = -1;
+
+        let schema = crate::schema::per_base_output_schema(true);
+        let mut emitter = PerBaseEmitter::new("chr1".to_string(), depth, true);
+
+        // Emit all in one big batch
+        let batch = emitter.next_batch(&schema, 1000).unwrap().unwrap();
+        assert!(emitter.next_batch(&schema, 1000).is_none());
+
+        assert_eq!(batch.num_rows(), 10);
+
+        let positions = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let coverages = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+
+        // Positions 0,1 → coverage 0; positions 2-6 → coverage 1; positions 7-9 → coverage 0
+        assert_eq!(coverages.value(0), 0); // pos 0
+        assert_eq!(coverages.value(1), 0); // pos 1
+        assert_eq!(coverages.value(2), 1); // pos 2
+        assert_eq!(coverages.value(6), 1); // pos 6
+        assert_eq!(coverages.value(7), 0); // pos 7
+        assert_eq!(coverages.value(9), 0); // pos 9
+
+        // Verify positions are 0-based sequential
+        for i in 0..10 {
+            assert_eq!(positions.value(i), i as i32);
+        }
+    }
+
+    #[test]
+    fn test_per_base_emitter_chunking() {
+        // 10-position contig with a read at position 3
+        let mut depth = vec![0i32; 10];
+        depth[3] = 1;
+        depth[6] = -1;
+
+        let schema = crate::schema::per_base_output_schema(true);
+        let mut emitter = PerBaseEmitter::new("chr1".to_string(), depth, true);
+
+        // Emit in chunks of 4
+        let batch1 = emitter.next_batch(&schema, 4).unwrap().unwrap();
+        assert_eq!(batch1.num_rows(), 4); // positions 0-3
+
+        let batch2 = emitter.next_batch(&schema, 4).unwrap().unwrap();
+        assert_eq!(batch2.num_rows(), 4); // positions 4-7
+
+        let batch3 = emitter.next_batch(&schema, 4).unwrap().unwrap();
+        assert_eq!(batch3.num_rows(), 2); // positions 8-9
+
+        assert!(emitter.next_batch(&schema, 4).is_none());
+
+        // Verify cumulative_cov carries across batches:
+        // batch1: pos 0→0, 1→0, 2→0, 3→1
+        let cov1 = batch1
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        assert_eq!(cov1.value(3), 1);
+
+        // batch2: pos 4→1, 5→1, 6→0, 7→0 (delta -1 at position 6)
+        let cov2 = batch2
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        assert_eq!(cov2.value(0), 1); // pos 4
+        assert_eq!(cov2.value(1), 1); // pos 5
+        assert_eq!(cov2.value(2), 0); // pos 6
+        assert_eq!(cov2.value(3), 0); // pos 7
+    }
+
+    #[test]
+    fn test_per_base_emitter_one_based() {
+        // 1-based: emits positions [1..len)
+        let mut depth = vec![0i32; 6]; // indices 0..5
+        depth[1] = 1; // 1-based position 1
+        depth[4] = -1; // 1-based position 4
+
+        let schema = crate::schema::per_base_output_schema(false);
+        let mut emitter = PerBaseEmitter::new("chr1".to_string(), depth, false);
+
+        let batch = emitter.next_batch(&schema, 1000).unwrap().unwrap();
+        assert!(emitter.next_batch(&schema, 1000).is_none());
+
+        // Should emit 5 rows (positions 1,2,3,4,5)
+        assert_eq!(batch.num_rows(), 5);
+
+        let positions = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let coverages = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+
+        assert_eq!(positions.value(0), 1);
+        assert_eq!(positions.value(4), 5);
+        assert_eq!(coverages.value(0), 1); // pos 1: delta +1
+        assert_eq!(coverages.value(1), 1); // pos 2
+        assert_eq!(coverages.value(2), 1); // pos 3
+        assert_eq!(coverages.value(3), 0); // pos 4: delta -1
+        assert_eq!(coverages.value(4), 0); // pos 5
+    }
+
+    #[test]
+    fn test_per_base_emitter_flush_remaining() {
+        let mut depth = vec![0i32; 10];
+        depth[2] = 1;
+        depth[7] = -1;
+
+        let schema = crate::schema::per_base_output_schema(true);
+        let mut emitter = PerBaseEmitter::new("chr1".to_string(), depth, true);
+
+        let batches = emitter.flush_remaining(&schema, 3).unwrap();
+        // 10 positions / batch_size 3 → 4 batches (3+3+3+1)
+        assert_eq!(batches.len(), 4);
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 10);
     }
 }

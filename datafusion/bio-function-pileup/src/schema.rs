@@ -14,6 +14,7 @@ pub const COL_MAPPING_QUALITY: &str = "mapping_quality";
 pub const OUT_CONTIG: &str = "contig";
 pub const OUT_POS_START: &str = "pos_start";
 pub const OUT_POS_END: &str = "pos_end";
+pub const OUT_POS: &str = "pos";
 pub const OUT_COVERAGE: &str = "coverage";
 
 /// Schema-level metadata key indicating whether coordinates are 0-based.
@@ -29,6 +30,25 @@ pub fn coverage_output_schema(zero_based: bool) -> SchemaRef {
         Field::new(OUT_CONTIG, DataType::Utf8, true),
         Field::new(OUT_POS_START, DataType::Int32, false),
         Field::new(OUT_POS_END, DataType::Int32, false),
+        Field::new(OUT_COVERAGE, DataType::Int16, false),
+    ];
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        COORDINATE_SYSTEM_METADATA_KEY.to_string(),
+        zero_based.to_string(),
+    );
+    Arc::new(Schema::new(fields).with_metadata(metadata))
+}
+
+/// Returns the output schema for per-base coverage results.
+///
+/// Per-base mode emits one row per genomic position with 3 columns:
+/// `contig`, `pos`, `coverage`. The `zero_based` flag is embedded as
+/// schema metadata.
+pub fn per_base_output_schema(zero_based: bool) -> SchemaRef {
+    let fields = vec![
+        Field::new(OUT_CONTIG, DataType::Utf8, true),
+        Field::new(OUT_POS, DataType::Int32, false),
         Field::new(OUT_COVERAGE, DataType::Int16, false),
     ];
     let mut metadata = HashMap::new();

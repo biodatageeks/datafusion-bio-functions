@@ -14,7 +14,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_bio_format_bam::table_provider::BamTableProvider;
 
 use crate::physical_exec::{PileupConfig, PileupExec};
-use crate::schema::coverage_output_schema;
+use crate::schema::{coverage_output_schema, per_base_output_schema};
 
 /// A TableProvider that wraps a child provider (e.g., BAM reader) and produces depth output.
 pub struct DepthTableProvider {
@@ -44,7 +44,11 @@ impl TableProvider for DepthTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        coverage_output_schema(self.config.zero_based)
+        if self.config.per_base {
+            per_base_output_schema(self.config.zero_based)
+        } else {
+            coverage_output_schema(self.config.zero_based)
+        }
     }
 
     fn table_type(&self) -> TableType {
@@ -104,6 +108,20 @@ impl TableFunctionImpl for DepthFunction {
             false
         };
 
+        // Extract optional per_base flag from third argument (default: false)
+        let per_base = if args.len() > 2 {
+            match &args[2] {
+                Expr::Literal(ScalarValue::Boolean(Some(val)), _) => *val,
+                other => {
+                    return Err(DataFusionError::Plan(format!(
+                        "depth() third argument must be a boolean literal (per_base), got: {other}"
+                    )));
+                }
+            }
+        } else {
+            false
+        };
+
         // Create BamTableProvider — handle both tokio and non-tokio contexts
         // Always request binary CIGAR for zero-copy performance
         let bam_provider = match tokio::runtime::Handle::try_current() {
@@ -124,6 +142,7 @@ impl TableFunctionImpl for DepthFunction {
         let config = PileupConfig {
             binary_cigar: true,
             zero_based,
+            per_base,
             ..PileupConfig::default()
         };
         Ok(Arc::new(DepthTableProvider::new(
