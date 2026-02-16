@@ -14,8 +14,11 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 | Crate | Description | Status |
 |-------|-------------|--------|
 | **[datafusion-bio-function-pileup](datafusion/bio-function-pileup)** | Depth-of-coverage (pileup) computation from BAM alignments | ✅ |
+| **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, and nearest-neighbor operations | ✅ |
 
 ## Features
+
+### Pileup (depth-of-coverage from BAM)
 
 - **Depth-of-Coverage**: Compute per-base depth from BAM alignment data using an efficient event-based algorithm
 - **SQL Interface**: Query coverage via SQL table function: `SELECT * FROM depth('file.bam')`
@@ -25,6 +28,15 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **Binary CIGAR**: Zero-copy binary CIGAR processing — walks packed 4-byte ops directly from BAM, no string parsing
 - **Dense Accumulation**: Mosdepth-style flat `i32[]` depth arrays with O(1) writes and streaming per-contig emission
 
+### Ranges (interval operations)
+
+- **Interval Join**: SQL joins with range overlap conditions, automatically optimized via a custom physical planner
+- **Coverage**: Base-pair overlap depth between two interval sets via `SELECT * FROM coverage('reads', 'targets')`
+- **Count Overlaps**: Count overlapping intervals per region via `SELECT * FROM count_overlaps('reads', 'targets')`
+- **Nearest**: Nearest-neighbor interval matching (one match per query interval)
+- **Multiple Algorithms**: Coitrees (default), IntervalTree, ArrayIntervalTree, Lapper, SuperIntervals — selectable via `SET bio.interval_join_algorithm`
+- **Transparent Optimization**: Hash/nested-loop joins with range conditions are automatically replaced with interval joins
+
 ## Installation
 
 Add the crates you need to your `Cargo.toml`:
@@ -33,6 +45,7 @@ Add the crates you need to your `Cargo.toml`:
 [dependencies]
 datafusion = "50.3.0"
 datafusion-bio-function-pileup = { git = "https://github.com/biodatageeks/datafusion-bio-functions" }
+datafusion-bio-function-ranges = { git = "https://github.com/biodatageeks/datafusion-bio-functions" }
 ```
 
 ## Quick Start
@@ -102,6 +115,80 @@ SELECT * FROM depth('file.bam', false, true)   -- 1-based, per-base output
 Per-base mode emits one row for every genomic position in each contig (including 0-coverage positions), similar to `samtools depth -a`. It requires dense mode (BAM header with contig lengths) and uses a lazy `PerBaseEmitter` that streams positions in batch-sized chunks, keeping memory at O(batch_size).
 
 Both schemas include metadata key `bio.coordinate_system_zero_based` (`"true"` or `"false"`) so downstream consumers can interpret the coordinate system.
+
+### Interval Join via SQL
+
+Create a bio-configured session and write standard SQL — range overlap joins are automatically optimized:
+
+```rust
+use datafusion_bio_function_ranges::create_bio_session;
+
+#[tokio::main]
+async fn main() -> datafusion::error::Result<()> {
+    let ctx = create_bio_session();
+
+    // Register your tables (CSV, Parquet, or any DataFusion table provider)
+    ctx.register_csv("reads", "reads.csv", Default::default()).await?;
+    ctx.register_csv("targets", "targets.csv", Default::default()).await?;
+
+    // Range overlap joins are automatically optimized as interval joins
+    let df = ctx.sql("
+        SELECT *
+        FROM reads
+        JOIN targets
+          ON reads.contig = targets.contig
+          AND reads.pos_start <= targets.pos_end
+          AND reads.pos_end >= targets.pos_start
+    ").await?;
+    df.show().await?;
+
+    Ok(())
+}
+```
+
+### Coverage and Count Overlaps via SQL Table Functions
+
+```sql
+-- Count overlapping intervals per target region
+SELECT * FROM count_overlaps('reads', 'targets')
+
+-- Base-pair coverage depth
+SELECT * FROM coverage('reads', 'targets')
+
+-- Custom column names (shared for both tables)
+SELECT * FROM coverage('reads', 'targets', 'chrom', 'start', 'end')
+
+-- Separate column names for left and right tables
+SELECT * FROM coverage('reads', 'targets', 'chrom', 'start', 'end', 'contig', 'pos_start', 'pos_end')
+
+-- 0-based half-open coordinates
+SELECT * FROM count_overlaps('reads', 'targets', 'contig', 'pos_start', 'pos_end', 'strict')
+```
+
+### Nearest Interval Matching
+
+```sql
+SET bio.interval_join_algorithm = CoitreesNearest;
+
+-- Returns exactly one match per right-side row:
+-- the overlapping interval if one exists, otherwise the nearest by distance
+SELECT *
+FROM targets
+JOIN reads
+  ON targets.contig = reads.contig
+  AND targets.pos_start <= reads.pos_end
+  AND targets.pos_end >= reads.pos_start
+```
+
+### Algorithm Selection
+
+```sql
+SET bio.interval_join_algorithm = Coitrees;        -- default, best general performance
+SET bio.interval_join_algorithm = IntervalTree;     -- rust-bio interval tree
+SET bio.interval_join_algorithm = ArrayIntervalTree; -- rust-bio array-backed
+SET bio.interval_join_algorithm = Lapper;           -- rust-lapper
+SET bio.interval_join_algorithm = SuperIntervals;   -- SIMD-optimized (AVX2/NEON)
+```
 
 ### Coverage via Programmatic API
 
@@ -421,4 +508,6 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 This project builds upon:
 - [Apache DataFusion](https://datafusion.apache.org/) - Fast, extensible query engine
 - [mosdepth](https://github.com/brentp/mosdepth) - Test data and reference implementation for coverage validation
-- [SeQuiLa](https://github.com/biodatageeks/sequila) - Original pileup algorithm design
+- [SeQuiLa](https://github.com/biodatageeks/sequila) - Original pileup and interval join algorithm design
+- [coitrees](https://github.com/dcjones/coitrees) - Cache-oblivious interval tree (default algorithm)
+- [superintervals](https://github.com/kcleal/superintervals) - SIMD-optimized interval tree (vendored, MIT license)
