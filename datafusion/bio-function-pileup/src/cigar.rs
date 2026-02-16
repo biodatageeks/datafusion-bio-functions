@@ -64,7 +64,7 @@ pub fn parse_cigar(cigar: &str) -> Vec<CigarOp> {
 
 /// Apply CIGAR operations directly to a dense depth array.
 ///
-/// For each alignment match (M/X/=), increments depth[start] by +1 and depth[end] by -1.
+/// For each alignment match (M/X/=), increments `depth\[start\]` by +1 and `depth\[end\]` by -1.
 /// This is the mosdepth-style approach: O(1) writes with no per-read allocation.
 /// Bounds checks prevent writes past the array end.
 ///
