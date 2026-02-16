@@ -294,7 +294,7 @@ impl PerBaseEmitter {
     pub fn new(contig: String, depth_vec: Vec<i32>, zero_based: bool) -> Self {
         let len = depth_vec.len();
         let (next_idx, end_idx) = if zero_based {
-            (0, len)
+            (0, len - 1) // exclude sentinel position (DenseContigDepth uses length+1)
         } else {
             // 1-based: skip index 0, emit [1..len)
             (1, len)
@@ -637,7 +637,8 @@ mod tests {
     #[test]
     fn test_per_base_emitter_single_read() {
         // 10-position contig with a single 5bp read at position 2
-        let mut depth = vec![0i32; 10];
+        // Length 11 = contig_length(10) + 1 sentinel (matches DenseContigDepth::new)
+        let mut depth = vec![0i32; 11];
         depth[2] = 1;
         depth[7] = -1;
 
@@ -678,7 +679,8 @@ mod tests {
     #[test]
     fn test_per_base_emitter_chunking() {
         // 10-position contig with a read at position 3
-        let mut depth = vec![0i32; 10];
+        // Length 11 = contig_length(10) + 1 sentinel (matches DenseContigDepth::new)
+        let mut depth = vec![0i32; 11];
         depth[3] = 1;
         depth[6] = -1;
 
@@ -756,7 +758,8 @@ mod tests {
 
     #[test]
     fn test_per_base_emitter_flush_remaining() {
-        let mut depth = vec![0i32; 10];
+        // Length 11 = contig_length(10) + 1 sentinel (matches DenseContigDepth::new)
+        let mut depth = vec![0i32; 11];
         depth[2] = 1;
         depth[7] = -1;
 

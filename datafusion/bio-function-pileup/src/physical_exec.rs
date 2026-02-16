@@ -5,81 +5,24 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use datafusion::arrow::array::{Array, AsArray, RecordBatch};
-use datafusion::arrow::datatypes::{SchemaRef, UInt32Type};
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream,
 };
 use futures::stream::{Stream, StreamExt};
+use tokio::task::JoinSet;
 
-use crate::cigar;
 use crate::coverage;
 use crate::events;
 use crate::events::{ColumnIndices, DenseContigDepth};
 use crate::filter::ReadFilter;
 use crate::schema::{coverage_output_schema, per_base_output_schema};
-
-/// Handle a contig transition in the dense accumulator.
-///
-/// If the new contig differs from the current one, finalizes the previous contig
-/// (converting its depth array to a RecordBatch and pushing it to `pending_batches`),
-/// then allocates a new `DenseContigDepth` for the incoming contig.
-///
-/// Returns `true` if the row should be processed (contig is available),
-/// `false` if the contig is unknown and should be skipped.
-#[allow(clippy::too_many_arguments)]
-fn handle_contig_transition(
-    chrom: &str,
-    current_contig: &mut Option<String>,
-    current_depth: &mut Option<DenseContigDepth>,
-    contig_lengths: &HashMap<String, usize>,
-    pending_batches: &mut VecDeque<RecordBatch>,
-    schema: &SchemaRef,
-    batch_size: usize,
-    per_base_emitter: &mut Option<coverage::PerBaseEmitter>,
-    per_base: bool,
-    zero_based: bool,
-) -> bool {
-    let contig_changed = current_contig.as_ref().is_none_or(|c| c.as_str() != chrom);
-    if !contig_changed {
-        return true;
-    }
-
-    // Emit the previous contig if we had one
-    if let (Some(prev_contig), Some(prev_depth)) = (current_contig.take(), current_depth.take()) {
-        if per_base {
-            // Flush any existing per-base emitter (rare multi-contig transition)
-            if let Some(emitter) = per_base_emitter.as_mut() {
-                if let Ok(batches) = emitter.flush_remaining(schema, batch_size) {
-                    pending_batches.extend(batches);
-                }
-            }
-            *per_base_emitter = Some(coverage::PerBaseEmitter::new(
-                prev_contig,
-                prev_depth.depth,
-                zero_based,
-            ));
-        } else if let Ok(batches) =
-            coverage::dense_depth_to_record_batches(&prev_contig, &prev_depth, schema, batch_size)
-        {
-            pending_batches.extend(batches);
-        }
-    }
-
-    // Start a new contig
-    if let Some(&len) = contig_lengths.get(chrom) {
-        *current_contig = Some(chrom.to_string());
-        *current_depth = Some(DenseContigDepth::new(len));
-        true
-    } else {
-        false
-    }
-}
 
 /// Controls which depth-accumulation strategy the pileup stream uses.
 ///
@@ -131,7 +74,10 @@ impl Default for PileupConfig {
 /// DataFusion ExecutionPlan that computes depth-of-coverage from BAM/alignment data.
 ///
 /// Wraps a child plan (the BAM reader) and computes per-contig coverage blocks.
-/// Each partition runs independently — the child plan handles partition-level parallelism.
+/// Always produces exactly 1 output partition by merging all input partitions.
+/// Phase 1: N input partitions are drained in parallel (one tokio task each).
+/// Phase 2: Per-contig delta arrays are merged element-wise, then emitted as
+/// coverage blocks or per-base rows.
 #[derive(Debug)]
 pub struct PileupExec {
     /// The child execution plan (BAM reader).
@@ -151,7 +97,7 @@ impl PileupExec {
         };
         let cache = PlanProperties::new(
             EquivalenceProperties::new(schema),
-            input.properties().partitioning.clone(),
+            Partitioning::UnknownPartitioning(1), // always 1 output partition
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
@@ -215,13 +161,23 @@ impl ExecutionPlan for PileupExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context.clone())?;
+        assert_eq!(
+            partition, 0,
+            "PileupExec always produces 1 output partition"
+        );
+
+        let num_input_partitions = self.input.properties().partitioning.partition_count();
+        let mut input_streams = Vec::with_capacity(num_input_partitions);
+        for p in 0..num_input_partitions {
+            input_streams.push(self.input.execute(p, context.clone())?);
+        }
+
         let batch_size = context.session_config().batch_size();
         let config = self.config.clone();
         let schema = self.schema();
 
-        Ok(Box::pin(PileupStream::new(
-            input_stream,
+        Ok(Box::pin(MergingPileupStream::new(
+            input_streams,
             config,
             schema,
             batch_size,
@@ -229,374 +185,376 @@ impl ExecutionPlan for PileupExec {
     }
 }
 
-/// Depth accumulator strategy — dense (mosdepth-style) or sparse (BTreeMap fallback).
-enum DepthAccumulator {
-    /// Dense array accumulation with streaming per-contig emission.
-    /// Used when BAM header metadata provides contig lengths.
+// ---------------------------------------------------------------------------
+// Merging pileup stream — replaces the old per-partition PileupStream
+// ---------------------------------------------------------------------------
+
+/// Result of draining one input partition.
+enum PartitionResult {
+    /// Dense delta arrays accumulated per contig (BAM header metadata available).
     Dense {
-        /// Currently active contig name.
-        current_contig: Option<String>,
-        /// Dense depth array for the current contig.
-        current_depth: Option<DenseContigDepth>,
-        /// Contig lengths from BAM header metadata.
-        contig_lengths: HashMap<String, usize>,
+        contig_depths: HashMap<String, DenseContigDepth>,
     },
-    /// Sparse BTreeMap accumulation — fallback when no contig lengths available.
+    /// Sparse event lists per contig (fallback when no contig lengths).
     Sparse {
         contig_events: HashMap<String, events::ContigEvents>,
     },
 }
 
-impl DepthAccumulator {
-    fn is_dense(&self) -> bool {
-        matches!(self, DepthAccumulator::Dense { .. })
-    }
+/// Internal state machine for the merging stream.
+enum StreamPhase {
+    /// Phase 1: parallel accumulation of input partitions.
+    Accumulating {
+        join_set: JoinSet<Result<PartitionResult>>,
+        partial_results: Vec<PartitionResult>,
+        total: usize,
+    },
+    /// Phase 2: merged results being emitted as RecordBatches.
+    Emitting {
+        pending_batches: VecDeque<RecordBatch>,
+        per_base_emitter: Option<coverage::PerBaseEmitter>,
+        remaining_contigs: VecDeque<(String, Vec<i32>)>,
+    },
+    /// Terminal state — no more output.
+    Done,
 }
 
-/// Stream that consumes input batches, accumulates coverage events, and emits
-/// coverage blocks. Supports two strategies:
+/// Stream that merges coverage from all input partitions before emitting.
 ///
-/// - **Dense** (preferred): uses a flat `i32[]` array per contig, streaming
-///   completed contigs as soon as the BAM's coordinate-sorted order moves
-///   to the next contig. Peak memory = one contig at a time.
-/// - **Sparse** (fallback): uses `BTreeMap` per contig, emitting all contigs
-///   at end. Used when schema lacks BAM header metadata (e.g., MemTable tests).
-struct PileupStream {
-    /// The input stream from the child plan.
-    input: SendableRecordBatchStream,
-    /// Pileup configuration.
-    config: PileupConfig,
+/// Phase 1 spawns one tokio task per input partition; each task drains its
+/// stream via [`accumulate_partition`]. Phase 2 element-wise adds delta
+/// arrays per contig across all partitions, then converts merged arrays
+/// to coverage blocks or per-base rows.
+struct MergingPileupStream {
     /// Output schema.
     schema: SchemaRef,
-    /// Maximum rows per output batch (from DataFusion session config).
+    /// Pileup configuration.
+    config: PileupConfig,
+    /// Maximum rows per output batch.
     batch_size: usize,
-    /// Whether we've finished processing (no more output).
-    finished: bool,
-    /// Whether we've consumed all input.
-    input_exhausted: bool,
-    /// Whether we've checked the input schema for contig lengths.
-    initialized: bool,
-    /// The depth accumulator (dense or sparse).
-    accumulator: DepthAccumulator,
-    /// Queue of completed RecordBatches ready to emit.
-    pending_batches: VecDeque<RecordBatch>,
-    /// Cached column indices (computed once on first batch).
-    col_idx: Option<ColumnIndices>,
-    /// Lazy per-base emitter for the current/last contig (per_base mode only).
-    per_base_emitter: Option<coverage::PerBaseEmitter>,
+    /// Current phase of the stream.
+    phase: StreamPhase,
 }
 
-impl PileupStream {
+impl MergingPileupStream {
     fn new(
-        input: SendableRecordBatchStream,
+        input_streams: Vec<SendableRecordBatchStream>,
         config: PileupConfig,
         schema: SchemaRef,
         batch_size: usize,
     ) -> Self {
+        let total = input_streams.len();
+        let mut join_set = JoinSet::new();
+
+        for stream in input_streams {
+            let cfg = config.clone();
+            join_set.spawn(accumulate_partition(stream, cfg));
+        }
+
         Self {
-            input,
-            config,
             schema,
+            config,
             batch_size,
-            finished: false,
-            input_exhausted: false,
-            initialized: false,
-            accumulator: DepthAccumulator::Sparse {
-                contig_events: HashMap::new(),
+            phase: StreamPhase::Accumulating {
+                join_set,
+                partial_results: Vec::with_capacity(total),
+                total,
             },
-            pending_batches: VecDeque::new(),
-            col_idx: None,
-            per_base_emitter: None,
-        }
-    }
-
-    /// Try to initialize the dense accumulator from the input schema metadata.
-    /// Also computes and caches column indices from the first batch's schema.
-    /// Called once on the first input batch. Respects `DenseMode` config.
-    ///
-    /// Returns an error if `per_base` mode is enabled but dense initialization
-    /// fails (no contig lengths in schema metadata).
-    fn try_init_dense(&mut self, input_schema: &SchemaRef) -> Result<()> {
-        // Cache column indices once
-        self.col_idx = Some(ColumnIndices::from_schema(input_schema));
-
-        let use_dense = match self.config.dense_mode {
-            DenseMode::Force => true,
-            DenseMode::Disable => false,
-            DenseMode::Auto => true, // default to dense for best performance
-        };
-
-        if use_dense {
-            if let Some(contig_lengths) = events::extract_contig_lengths(input_schema) {
-                self.accumulator = DepthAccumulator::Dense {
-                    current_contig: None,
-                    current_depth: None,
-                    contig_lengths,
-                };
-            }
-        }
-
-        if self.config.per_base && !self.accumulator.is_dense() {
-            return Err(datafusion::common::DataFusionError::Execution(
-                "per_base mode requires dense accumulation (BAM header with contig lengths). \
-                 Sparse fallback (e.g. MemTable) is not supported for per_base output."
-                    .to_string(),
-            ));
-        }
-
-        self.initialized = true;
-        Ok(())
-    }
-
-    /// Process a single batch through the dense accumulator.
-    ///
-    /// For each row, applies the CIGAR directly to the current contig's
-    /// dense depth array. When a contig transition is detected, the completed
-    /// contig's coverage is converted to a RecordBatch and queued for emission.
-    ///
-    /// Splits into separate binary and string CIGAR loops to avoid per-row
-    /// `Option::unwrap()` overhead and branch on CIGAR format.
-    fn process_batch_dense(&mut self, batch: &RecordBatch) {
-        let col_idx = self.col_idx.as_ref().expect("col_idx not initialized");
-
-        let chrom_arr = batch.column(col_idx.chrom).as_string::<i32>();
-        let start_arr = batch.column(col_idx.start).as_primitive::<UInt32Type>();
-        let flags_arr = batch.column(col_idx.flags).as_primitive::<UInt32Type>();
-        let mapq_arr = batch.column(col_idx.mapq).as_primitive::<UInt32Type>();
-
-        let DepthAccumulator::Dense {
-            current_contig,
-            current_depth,
-            contig_lengths,
-        } = &mut self.accumulator
-        else {
-            return;
-        };
-
-        let pending_batches = &mut self.pending_batches;
-        let schema = &self.schema;
-        let batch_size = self.batch_size;
-        let per_base_emitter = &mut self.per_base_emitter;
-        let per_base = self.config.per_base;
-        let zero_based = self.config.zero_based;
-
-        if col_idx.binary_cigar {
-            let cigar_arr = batch.column(col_idx.cigar).as_binary::<i32>();
-            for row in 0..batch.num_rows() {
-                if chrom_arr.is_null(row) || start_arr.is_null(row) {
-                    continue;
-                }
-                let chrom = chrom_arr.value(row);
-                let cigar_bytes = cigar_arr.value(row);
-                if cigar_bytes.is_empty() {
-                    continue;
-                }
-                let flags = flags_arr.value(row);
-                let mapq = mapq_arr.value(row);
-                if !self.config.filter.passes(flags, mapq) {
-                    continue;
-                }
-                if !handle_contig_transition(
-                    chrom,
-                    current_contig,
-                    current_depth,
-                    contig_lengths,
-                    pending_batches,
-                    schema,
-                    batch_size,
-                    per_base_emitter,
-                    per_base,
-                    zero_based,
-                ) {
-                    continue;
-                }
-                let depth = current_depth.as_mut().unwrap();
-                let start = start_arr.value(row);
-                if let Some((lo, hi)) =
-                    cigar::apply_binary_cigar_to_depth(start, cigar_bytes, &mut depth.depth)
-                {
-                    depth.update_bounds(lo, hi);
-                }
-            }
-        } else {
-            let cigar_arr = batch.column(col_idx.cigar).as_string::<i32>();
-            for row in 0..batch.num_rows() {
-                if chrom_arr.is_null(row) || start_arr.is_null(row) {
-                    continue;
-                }
-                let chrom = chrom_arr.value(row);
-                let cigar_str = cigar_arr.value(row);
-                if cigar_str == "*" {
-                    continue;
-                }
-                let flags = flags_arr.value(row);
-                let mapq = mapq_arr.value(row);
-                if !self.config.filter.passes(flags, mapq) {
-                    continue;
-                }
-                if !handle_contig_transition(
-                    chrom,
-                    current_contig,
-                    current_depth,
-                    contig_lengths,
-                    pending_batches,
-                    schema,
-                    batch_size,
-                    per_base_emitter,
-                    per_base,
-                    zero_based,
-                ) {
-                    continue;
-                }
-                let depth = current_depth.as_mut().unwrap();
-                let start = start_arr.value(row);
-                if let Some((lo, hi)) =
-                    cigar::apply_cigar_to_depth(start, cigar_str, &mut depth.depth)
-                {
-                    depth.update_bounds(lo, hi);
-                }
-            }
-        }
-    }
-
-    /// Finalize the dense accumulator: emit the last contig's coverage.
-    fn finalize_dense(&mut self) {
-        let DepthAccumulator::Dense {
-            current_contig,
-            current_depth,
-            ..
-        } = &mut self.accumulator
-        else {
-            return;
-        };
-
-        if let (Some(contig), Some(depth)) = (current_contig.take(), current_depth.take()) {
-            if self.config.per_base {
-                // Flush any existing per-base emitter first (rare multi-contig case)
-                if let Some(emitter) = self.per_base_emitter.as_mut() {
-                    if let Ok(batches) = emitter.flush_remaining(&self.schema, self.batch_size) {
-                        self.pending_batches.extend(batches);
-                    }
-                }
-                self.per_base_emitter = Some(coverage::PerBaseEmitter::new(
-                    contig,
-                    depth.depth,
-                    self.config.zero_based,
-                ));
-            } else if let Ok(batches) = coverage::dense_depth_to_record_batches(
-                &contig,
-                &depth,
-                &self.schema,
-                self.batch_size,
-            ) {
-                self.pending_batches.extend(batches);
-            }
         }
     }
 }
 
-impl Stream for PileupStream {
+/// Drain one input partition stream, accumulating CIGAR events into
+/// dense delta arrays (preferred) or sparse event lists (fallback).
+async fn accumulate_partition(
+    mut stream: SendableRecordBatchStream,
+    config: PileupConfig,
+) -> Result<PartitionResult> {
+    let mut initialized = false;
+    let mut contig_depths: HashMap<String, DenseContigDepth> = HashMap::new();
+    let mut contig_events: HashMap<String, events::ContigEvents> = HashMap::new();
+    let mut contig_lengths: HashMap<String, usize> = HashMap::new();
+    let mut col_idx: Option<ColumnIndices> = None;
+    let mut is_dense = false;
+
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
+        if !initialized {
+            col_idx = Some(ColumnIndices::from_schema(&batch.schema()));
+
+            let use_dense = match config.dense_mode {
+                DenseMode::Force | DenseMode::Auto => true,
+                DenseMode::Disable => false,
+            };
+
+            if use_dense {
+                if let Some(lengths) = events::extract_contig_lengths(&batch.schema()) {
+                    contig_lengths = lengths;
+                    is_dense = true;
+                }
+            }
+
+            if config.per_base && !is_dense {
+                return Err(datafusion::common::DataFusionError::Execution(
+                    "per_base mode requires dense accumulation (BAM header with contig lengths). \
+                     Sparse fallback (e.g. MemTable) is not supported for per_base output."
+                        .to_string(),
+                ));
+            }
+
+            initialized = true;
+        }
+
+        let idx = col_idx.as_ref().unwrap();
+        if is_dense {
+            events::process_batch_dense(
+                &batch,
+                &config.filter,
+                &mut contig_depths,
+                &contig_lengths,
+                idx,
+            );
+        } else {
+            events::process_batch(&batch, &config.filter, &mut contig_events, idx);
+        }
+    }
+
+    if is_dense {
+        Ok(PartitionResult::Dense { contig_depths })
+    } else {
+        Ok(PartitionResult::Sparse { contig_events })
+    }
+}
+
+/// Merge partition results and transition to the emitting phase.
+fn merge_results(
+    partial_results: Vec<PartitionResult>,
+    schema: &SchemaRef,
+    batch_size: usize,
+    config: &PileupConfig,
+) -> StreamPhase {
+    if partial_results.is_empty() {
+        return StreamPhase::Done;
+    }
+
+    // Separate dense and sparse results (empty sparse partitions are discarded)
+    let mut dense_results = Vec::new();
+    let mut sparse_results = Vec::new();
+
+    for result in partial_results {
+        match result {
+            PartitionResult::Dense { .. } => dense_results.push(result),
+            PartitionResult::Sparse { contig_events } => {
+                if !contig_events.is_empty() {
+                    sparse_results.push(PartitionResult::Sparse { contig_events });
+                }
+            }
+        }
+    }
+
+    if !dense_results.is_empty() {
+        merge_dense_results(dense_results, schema, batch_size, config)
+    } else if !sparse_results.is_empty() {
+        merge_sparse_results(sparse_results, schema, batch_size)
+    } else {
+        StreamPhase::Done
+    }
+}
+
+/// Merge dense partition results by element-wise adding delta arrays per contig.
+fn merge_dense_results(
+    partitions: Vec<PartitionResult>,
+    schema: &SchemaRef,
+    batch_size: usize,
+    config: &PileupConfig,
+) -> StreamPhase {
+    let mut merged_depths: HashMap<String, DenseContigDepth> = HashMap::new();
+
+    for part in partitions {
+        if let PartitionResult::Dense { contig_depths } = part {
+            for (contig, depth) in contig_depths {
+                let start = depth.touched_start();
+                let range = depth.touched_range();
+                if range.is_empty() {
+                    continue;
+                }
+                let end = start + range.len() - 1;
+
+                if let Some(existing) = merged_depths.get_mut(&contig) {
+                    // Element-wise add the touched region
+                    for (i, &delta) in range.iter().enumerate() {
+                        if delta != 0 {
+                            existing.depth[start + i] += delta;
+                        }
+                    }
+                    existing.update_bounds(start, end);
+                } else {
+                    merged_depths.insert(contig, depth);
+                }
+            }
+        }
+    }
+
+    // Sort contigs for deterministic output
+    let mut contigs: Vec<String> = merged_depths.keys().cloned().collect();
+    contigs.sort();
+
+    if config.per_base {
+        let remaining: VecDeque<(String, Vec<i32>)> = contigs
+            .into_iter()
+            .filter_map(|c| merged_depths.remove(&c).map(|d| (c, d.depth)))
+            .collect();
+
+        StreamPhase::Emitting {
+            pending_batches: VecDeque::new(),
+            per_base_emitter: None,
+            remaining_contigs: remaining,
+        }
+    } else {
+        let mut pending_batches = VecDeque::new();
+        for contig in &contigs {
+            if let Some(depth) = merged_depths.get(contig) {
+                if let Ok(batches) =
+                    coverage::dense_depth_to_record_batches(contig, depth, schema, batch_size)
+                {
+                    pending_batches.extend(batches);
+                }
+            }
+        }
+        StreamPhase::Emitting {
+            pending_batches,
+            per_base_emitter: None,
+            remaining_contigs: VecDeque::new(),
+        }
+    }
+}
+
+/// Merge sparse partition results by concatenating event vectors per contig.
+fn merge_sparse_results(
+    partitions: Vec<PartitionResult>,
+    schema: &SchemaRef,
+    batch_size: usize,
+) -> StreamPhase {
+    let mut merged: HashMap<String, events::ContigEvents> = HashMap::new();
+
+    for part in partitions {
+        if let PartitionResult::Sparse { contig_events } = part {
+            for (contig, ce) in contig_events {
+                merged.entry(contig).or_default().events.extend(ce.events);
+            }
+        }
+    }
+
+    if merged.is_empty() {
+        return StreamPhase::Done;
+    }
+
+    match coverage::all_events_to_record_batches(&mut merged, schema, batch_size) {
+        Ok(batches) => StreamPhase::Emitting {
+            pending_batches: VecDeque::from(batches),
+            per_base_emitter: None,
+            remaining_contigs: VecDeque::new(),
+        },
+        Err(_) => StreamPhase::Done,
+    }
+}
+
+impl Stream for MergingPileupStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
         loop {
-            // 0. Drain per-base emitter lazily (one batch per poll)
-            if let Some(emitter) = &mut this.per_base_emitter {
-                if let Some(result) = emitter.next_batch(&this.schema, this.batch_size) {
-                    return Poll::Ready(Some(result));
-                }
-                this.per_base_emitter = None;
-            }
-
-            // 1. Drain pending batches (shared queue for both dense and sparse)
-            if let Some(batch) = this.pending_batches.pop_front() {
-                return Poll::Ready(Some(Ok(batch)));
-            }
-
-            // 2. If finished, no more output
-            if this.finished {
-                return Poll::Ready(None);
-            }
-
-            // 3. Consume input
-            if !this.input_exhausted {
-                match this.input.poll_next_unpin(cx) {
-                    Poll::Ready(Some(Ok(batch))) => {
-                        if !this.initialized {
-                            if let Err(e) = this.try_init_dense(&batch.schema()) {
-                                this.finished = true;
-                                return Poll::Ready(Some(Err(e)));
+            match &mut this.phase {
+                StreamPhase::Accumulating {
+                    join_set,
+                    partial_results,
+                    total,
+                } => {
+                    match join_set.poll_join_next(cx) {
+                        Poll::Ready(Some(Ok(Ok(result)))) => {
+                            partial_results.push(result);
+                            if partial_results.len() == *total {
+                                let results = std::mem::take(partial_results);
+                                this.phase = merge_results(
+                                    results,
+                                    &this.schema,
+                                    this.batch_size,
+                                    &this.config,
+                                );
                             }
-                        }
-
-                        // Use is_dense() to avoid holding a borrow on this.accumulator
-                        // when calling methods that need &mut self
-                        if this.accumulator.is_dense() {
-                            this.process_batch_dense(&batch);
-                            // Loop back to drain any pending batches from contig transitions
                             continue;
                         }
-
-                        // Sparse path
-                        if let DepthAccumulator::Sparse { contig_events } = &mut this.accumulator {
-                            let col_idx = this.col_idx.as_ref().expect("col_idx not initialized");
-                            events::process_batch(
-                                &batch,
-                                &this.config.filter,
-                                contig_events,
-                                col_idx,
-                            );
+                        Poll::Ready(Some(Ok(Err(e)))) => {
+                            // Partition returned a DataFusion error
+                            this.phase = StreamPhase::Done;
+                            return Poll::Ready(Some(Err(e)));
                         }
+                        Poll::Ready(Some(Err(join_err))) => {
+                            // Tokio JoinError (panic or cancellation)
+                            this.phase = StreamPhase::Done;
+                            return Poll::Ready(Some(Err(
+                                datafusion::common::DataFusionError::Execution(format!(
+                                    "Partition task failed: {join_err}"
+                                )),
+                            )));
+                        }
+                        Poll::Ready(None) => {
+                            // All tasks completed (JoinSet drained)
+                            let results = std::mem::take(partial_results);
+                            this.phase =
+                                merge_results(results, &this.schema, this.batch_size, &this.config);
+                            continue;
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+
+                StreamPhase::Emitting {
+                    pending_batches,
+                    per_base_emitter,
+                    remaining_contigs,
+                } => {
+                    // 0. Drain per-base emitter lazily (one batch per poll)
+                    if let Some(emitter) = per_base_emitter {
+                        if let Some(result) = emitter.next_batch(&this.schema, this.batch_size) {
+                            return Poll::Ready(Some(result));
+                        }
+                        *per_base_emitter = None;
+                    }
+
+                    // 1. Drain pending batches
+                    if let Some(batch) = pending_batches.pop_front() {
+                        return Poll::Ready(Some(Ok(batch)));
+                    }
+
+                    // 2. Start next contig for per-base mode
+                    if let Some((contig, depth_vec)) = remaining_contigs.pop_front() {
+                        *per_base_emitter = Some(coverage::PerBaseEmitter::new(
+                            contig,
+                            depth_vec,
+                            this.config.zero_based,
+                        ));
                         continue;
                     }
-                    Poll::Ready(Some(Err(e))) => {
-                        this.finished = true;
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                    Poll::Ready(None) => {
-                        this.input_exhausted = true;
-                        // Fall through to finalization
-                    }
-                    Poll::Pending => {
-                        return Poll::Pending;
-                    }
-                }
-            }
 
-            // 4. Input exhausted — finalize
-            this.finished = true;
-
-            if this.accumulator.is_dense() {
-                this.finalize_dense();
-                // Loop back to drain pending batches / per-base emitter
-                continue;
-            }
-
-            // Sparse finalization: emit chunked batches
-            if let DepthAccumulator::Sparse { contig_events } = &mut this.accumulator {
-                if contig_events.is_empty() {
+                    // 3. All done
+                    this.phase = StreamPhase::Done;
                     return Poll::Ready(None);
                 }
-                match coverage::all_events_to_record_batches(
-                    contig_events,
-                    &this.schema,
-                    this.batch_size,
-                ) {
-                    Ok(batches) => this.pending_batches.extend(batches),
-                    Err(e) => return Poll::Ready(Some(Err(e))),
-                }
-                // Loop back to drain pending batches (step 1), then step 2 returns None
-                continue;
-            }
 
-            return Poll::Ready(None);
+                StreamPhase::Done => return Poll::Ready(None),
+            }
         }
     }
 }
 
-impl RecordBatchStream for PileupStream {
+impl RecordBatchStream for MergingPileupStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -683,7 +641,7 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_basic_coverage() {
         let batch = make_batch(vec![("chr1", 0, 10, 0, "10M", 60)]);
         let schema = bam_schema();
@@ -742,7 +700,7 @@ mod tests {
         assert_eq!(covs.value(0), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_filtering() {
         let batch = make_batch(vec![
             ("chr1", 0, 10, 0, "10M", 60),
@@ -784,7 +742,7 @@ mod tests {
         assert_eq!(covs.value(0), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_empty_input() {
         let schema = bam_schema();
         let batch = RecordBatch::new_empty(schema.clone());
@@ -815,7 +773,7 @@ mod tests {
         assert!(batches.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_multi_partition() {
         let batch1 = make_batch(vec![("chr1", 0, 10, 0, "10M", 60)]);
         let batch2 = make_batch(vec![("chr2", 100, 120, 0, "20M", 60)]);
@@ -835,42 +793,106 @@ mod tests {
                 ..PileupConfig::default()
             },
         );
+
+        // Should always produce 1 output partition
+        assert_eq!(pileup.properties().partitioning.partition_count(), 1);
+
         let task_ctx = ctx.task_ctx();
-
-        // Partition 0
-        let stream0 = pileup.execute(0, task_ctx.clone()).unwrap();
-        let batches0: Vec<RecordBatch> = stream0
+        let stream = pileup.execute(0, task_ctx).unwrap();
+        let batches: Vec<RecordBatch> = stream
             .collect::<Vec<_>>()
             .await
             .into_iter()
             .filter_map(|r| r.ok())
             .collect();
-        assert_eq!(batches0.len(), 1);
-        let contigs0 = batches0[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(contigs0.value(0), "chr1");
 
-        // Partition 1
-        let stream1 = pileup.execute(1, task_ctx).unwrap();
-        let batches1: Vec<RecordBatch> = stream1
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .filter_map(|r| r.ok())
+        // Both contigs should be in the merged output
+        let all_contigs: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let contigs = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..batch.num_rows()).map(move |i| contigs.value(i).to_string())
+            })
             .collect();
-        assert_eq!(batches1.len(), 1);
-        let contigs1 = batches1[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(contigs1.value(0), "chr2");
+
+        assert!(
+            all_contigs.contains(&"chr1".to_string()),
+            "merged output should contain chr1"
+        );
+        assert!(
+            all_contigs.contains(&"chr2".to_string()),
+            "merged output should contain chr2"
+        );
     }
 
-    #[tokio::test]
+    /// Same contig in 2 partitions — verify merged coverage is correct.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multi_partition_merge_overlapping() {
+        // Partition 0: chr1 read at [0, 10)
+        // Partition 1: chr1 read at [5, 15)
+        // Merged: chr1 [0,4] cov=1, [5,9] cov=2, [10,14] cov=1
+        let batch1 = make_batch(vec![("chr1", 0, 10, 0, "10M", 60)]);
+        let batch2 = make_batch(vec![("chr1", 5, 15, 0, "10M", 60)]);
+        let schema = bam_schema();
+        let mem_table = MemTable::try_new(schema, vec![vec![batch1], vec![batch2]]).unwrap();
+
+        let ctx = SessionContext::new();
+        ctx.register_table("reads", Arc::new(mem_table)).unwrap();
+
+        let df = ctx.table("reads").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let pileup = PileupExec::new(
+            plan,
+            PileupConfig {
+                zero_based: true,
+                ..PileupConfig::default()
+            },
+        );
+        let task_ctx = ctx.task_ctx();
+        let stream = pileup.execute(0, task_ctx).unwrap();
+        let batches: Vec<RecordBatch> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "Expected 3 coverage blocks");
+
+        let starts: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                let arr = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..b.num_rows()).map(move |i| arr.value(i))
+            })
+            .collect();
+        let ends: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                let arr = b.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..b.num_rows()).map(move |i| arr.value(i))
+            })
+            .collect();
+        let covs: Vec<i16> = batches
+            .iter()
+            .flat_map(|b| {
+                let arr = b.column(3).as_any().downcast_ref::<Int16Array>().unwrap();
+                (0..b.num_rows()).map(move |i| arr.value(i))
+            })
+            .collect();
+
+        assert_eq!(starts, vec![0, 5, 10]);
+        assert_eq!(ends, vec![4, 9, 14]);
+        assert_eq!(covs, vec![1, 2, 1]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_basic_coverage_binary_cigar() {
         let cigar_10m = encode_op(10, 0); // 10M
         let batch = make_batch_binary(vec![("chr1", 0, 10, 0, cigar_10m.to_vec(), 60)]);
@@ -930,7 +952,7 @@ mod tests {
         assert_eq!(covs.value(0), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_binary_cigar_filtering() {
         let cigar_10m = encode_op(10, 0); // 10M
         let batch = make_batch_binary(vec![
@@ -973,7 +995,7 @@ mod tests {
         assert_eq!(covs.value(0), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_batch_size_chunking() {
         // Two overlapping reads produce 3 coverage blocks:
         // [0,4] cov=1, [5,9] cov=2, [10,14] cov=1
@@ -1018,7 +1040,7 @@ mod tests {
     }
 
     /// Per-base mode on sparse path (MemTable without contig lengths) must error.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_per_base_sparse_errors() {
         let batch = make_batch(vec![("chr1", 0, 10, 0, "10M", 60)]);
         let schema = bam_schema();

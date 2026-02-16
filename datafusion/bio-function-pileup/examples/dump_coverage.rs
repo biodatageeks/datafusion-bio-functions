@@ -7,28 +7,26 @@ use datafusion_bio_format_bam::table_provider::BamTableProvider;
 use datafusion_bio_function_pileup::physical_exec::{PileupConfig, PileupExec};
 use futures::StreamExt;
 
-/// Dumps coverage output as BED (0-based half-open) to stdout for comparison with mosdepth.
+/// Dumps coverage output to stdout for comparison with mosdepth / samtools.
 ///
-/// By default uses 1-based coordinates. Pass `--zero-based` for 0-based output.
-/// When 0-based: output is closed intervals, we convert pos_end to exclusive (pos_end + 1) for BED.
-/// When 1-based: output is closed intervals, we convert to BED by subtracting 1 from start and keeping end as-is.
+/// Pass `--zero-based` for 0-based output (default is 1-based).
+/// Pass `--per-base` to emit per-position rows (contig, pos, coverage) instead of blocks.
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: dump_coverage <bam_file> [--zero-based]");
+        eprintln!("Usage: dump_coverage <bam_file> [--zero-based] [--per-base]");
         std::process::exit(1);
     }
     let bam_path = &args[1];
     let zero_based = args.iter().any(|a| a == "--zero-based");
+    let per_base = args.iter().any(|a| a == "--per-base");
 
     let table = BamTableProvider::new(bam_path.clone(), None, zero_based, None, true)
         .await
         .expect("Failed to open BAM file");
 
-    // Use 1 partition for deterministic sorted output
-    let config = SessionConfig::new().with_target_partitions(1);
-    let ctx = SessionContext::new_with_config(config);
+    let ctx = SessionContext::new();
     ctx.register_table("reads", Arc::new(table)).unwrap();
 
     let df = ctx.table("reads").await.unwrap();
@@ -37,6 +35,7 @@ async fn main() {
         plan,
         PileupConfig {
             zero_based,
+            per_base,
             ..PileupConfig::default()
         },
     );
@@ -50,37 +49,68 @@ async fn main() {
         .filter_map(|r| r.ok())
         .collect();
 
-    for batch in &batches {
-        let contigs = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let starts = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let ends = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let covs = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .unwrap();
+    if per_base {
+        // Per-base schema: contig (Utf8), position (Int32), coverage (Int16)
+        for batch in &batches {
+            let contigs = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let positions = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let covs = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap();
 
-        for i in 0..batch.num_rows() {
-            // Convert from 0-based closed to 0-based half-open (BED format)
-            println!(
-                "{}\t{}\t{}\t{}",
-                contigs.value(i),
-                starts.value(i),
-                ends.value(i) + 1,
-                covs.value(i)
-            );
+            for i in 0..batch.num_rows() {
+                println!(
+                    "{}\t{}\t{}",
+                    contigs.value(i),
+                    positions.value(i),
+                    covs.value(i)
+                );
+            }
+        }
+    } else {
+        // Block schema: contig (Utf8), pos_start (Int32), pos_end (Int32), coverage (Int16)
+        for batch in &batches {
+            let contigs = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let starts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let ends = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let covs = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap();
+
+            for i in 0..batch.num_rows() {
+                // Convert from 0-based closed to 0-based half-open (BED format)
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    contigs.value(i),
+                    starts.value(i),
+                    ends.value(i) + 1,
+                    covs.value(i)
+                );
+            }
         }
     }
 }

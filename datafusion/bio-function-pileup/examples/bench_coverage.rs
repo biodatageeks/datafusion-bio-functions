@@ -53,8 +53,8 @@ async fn main() {
         .unwrap();
     let plan = df.create_physical_plan().await.unwrap();
 
-    let num_partitions = plan.properties().partitioning.partition_count();
-    println!("Input partitions: {num_partitions}");
+    let num_input_partitions = plan.properties().partitioning.partition_count();
+    println!("Input partitions: {num_input_partitions}");
 
     let dense_mode = if args.iter().any(|a| a == "--dense") {
         DenseMode::Force
@@ -71,36 +71,23 @@ async fn main() {
         zero_based,
         ..PileupConfig::default()
     };
-    let pileup = Arc::new(PileupExec::new(plan, pileup_config));
+    let pileup = PileupExec::new(plan, pileup_config);
     let task_ctx = ctx.task_ctx();
 
     let compute_start = Instant::now();
 
-    // Run all partitions concurrently
-    let mut handles = Vec::new();
-    for partition in 0..num_partitions {
-        let pileup = pileup.clone();
-        let task_ctx = task_ctx.clone();
-        handles.push(tokio::spawn(async move {
-            let stream = pileup.execute(partition, task_ctx).unwrap();
-            let batches: Vec<_> = stream
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .filter_map(|r| r.ok())
-                .collect();
-
-            let mut blocks = 0u64;
-            for batch in &batches {
-                blocks += batch.num_rows() as u64;
-            }
-            blocks
-        }));
-    }
+    // PileupExec merges all input partitions into a single output partition
+    let stream = pileup.execute(0, task_ctx).unwrap();
+    let batches: Vec<_> = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .collect();
 
     let mut total_blocks = 0u64;
-    for handle in handles {
-        total_blocks += handle.await.unwrap();
+    for batch in &batches {
+        total_blocks += batch.num_rows() as u64;
     }
 
     let compute_time = compute_start.elapsed();
