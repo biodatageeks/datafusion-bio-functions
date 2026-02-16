@@ -123,24 +123,22 @@ impl TableFunctionImpl for DepthFunction {
         };
 
         // Create BamTableProvider — handle both tokio and non-tokio contexts
-        // Always request binary CIGAR for zero-copy performance
         let bam_provider = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
                 handle.block_on(BamTableProvider::new(
-                    file_path, None, zero_based, None, true,
+                    file_path, None, zero_based, None,
                 ))
             })?,
             Err(_) => {
                 let rt = tokio::runtime::Runtime::new()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 rt.block_on(BamTableProvider::new(
-                    file_path, None, zero_based, None, true,
+                    file_path, None, zero_based, None,
                 ))?
             }
         };
 
         let config = PileupConfig {
-            binary_cigar: true,
             zero_based,
             per_base,
             ..PileupConfig::default()

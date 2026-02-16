@@ -98,13 +98,12 @@ pub enum DenseMode {
 }
 
 /// Configuration for the pileup computation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PileupConfig {
     pub filter: ReadFilter,
     pub dense_mode: DenseMode,
-    /// When `true`, CIGAR data arrives as packed binary (`DataType::Binary`) instead of strings.
-    /// The actual format is detected from the schema, but this flag controls what we request
-    /// from the upstream `BamTableProvider`.
+    /// Whether CIGAR data arrives as packed binary (`DataType::Binary`) instead of strings.
+    /// The actual format is auto-detected from the schema at execution time.
     pub binary_cigar: bool,
     /// When `true`, output coordinates are 0-based (start inclusive, end inclusive).
     /// When `false` (default), output coordinates are 1-based.
@@ -114,18 +113,6 @@ pub struct PileupConfig {
     /// instead of RLE coverage blocks. Requires dense mode (BAM header with
     /// contig lengths). Default: `false`.
     pub per_base: bool,
-}
-
-impl Default for PileupConfig {
-    fn default() -> Self {
-        Self {
-            filter: ReadFilter::default(),
-            dense_mode: DenseMode::default(),
-            binary_cigar: true,
-            zero_based: false,
-            per_base: false,
-        }
-    }
 }
 
 /// DataFusion ExecutionPlan that computes depth-of-coverage from BAM/alignment data.

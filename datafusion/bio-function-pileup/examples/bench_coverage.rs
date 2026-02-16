@@ -12,12 +12,11 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: bench_coverage <bam_file> [--partitions N] [--dense] [--binary-cigar] [--zero-based]"
+            "Usage: bench_coverage <bam_file> [--partitions N] [--dense] [--zero-based]"
         );
         std::process::exit(1);
     }
     let bam_path = &args[1];
-    let binary_cigar = args.iter().any(|a| a == "--binary-cigar");
     let zero_based = args.iter().any(|a| a == "--zero-based");
 
     println!("BAM file: {bam_path}");
@@ -25,7 +24,7 @@ async fn main() {
 
     let start = Instant::now();
 
-    let table = BamTableProvider::new(bam_path.clone(), None, zero_based, None, binary_cigar)
+    let table = BamTableProvider::new(bam_path.clone(), None, zero_based, None)
         .await
         .expect("Failed to open BAM file");
     let open_time = start.elapsed();
@@ -62,12 +61,10 @@ async fn main() {
         DenseMode::default()
     };
     println!("Dense mode: {dense_mode:?}");
-    println!("Binary CIGAR: {binary_cigar}");
     println!("Zero-based: {zero_based}");
 
     let pileup_config = PileupConfig {
         dense_mode,
-        binary_cigar,
         zero_based,
         ..PileupConfig::default()
     };

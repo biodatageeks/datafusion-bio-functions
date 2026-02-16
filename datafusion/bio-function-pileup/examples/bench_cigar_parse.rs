@@ -17,7 +17,7 @@ async fn main() {
     }
     let bam_path = &args[1];
 
-    let table = BamTableProvider::new(bam_path.clone(), None, true, None, false)
+    let table = BamTableProvider::new(bam_path.clone(), None, true, None)
         .await
         .expect("Failed to open BAM file");
 

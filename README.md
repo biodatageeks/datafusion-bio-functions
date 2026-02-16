@@ -22,7 +22,6 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **Per-Base Output**: Optional one-row-per-position mode (like `samtools depth -a`) with lazy streaming to keep memory at O(batch_size)
 - **DataFusion Integration**: Native `ExecutionPlan` implementation with partition-parallel execution
 - **Mosdepth-Compatible**: Fast-mode behavior matching [mosdepth](https://github.com/brentp/mosdepth) (no mate-pair overlap deduplication)
-- **Binary CIGAR**: Zero-copy binary CIGAR processing — walks packed 4-byte ops directly from BAM, no string parsing
 - **Dense Accumulation**: Mosdepth-style flat `i32[]` depth arrays with O(1) writes and streaming per-contig emission
 
 ## Installation
@@ -117,7 +116,7 @@ use futures::StreamExt;
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
     // Register BAM file as a table (zero_based=false for 1-based coordinates)
-    let table = BamTableProvider::new("path/to/alignments.bam", None, false, None, true).await?;
+    let table = BamTableProvider::new("path/to/alignments.bam", None, false, None).await?;
     let ctx = SessionContext::new();
     ctx.register_table("reads", Arc::new(table))?;
 
@@ -154,7 +153,7 @@ let config = PileupConfig {
         filter_flag: 1796,        // unmapped | secondary | failed_qc | duplicate
         min_mapping_quality: 20,  // minimum MAPQ
     },
-    ..PileupConfig::default()     // zero_based=false, binary_cigar=true, dense_mode=Auto
+    ..PileupConfig::default()     // zero_based=false, dense_mode=Auto
 };
 let pileup = PileupExec::new(plan, config);
 ```
@@ -192,19 +191,16 @@ The core pileup API (`PileupExec`, `PileupConfig`, `cigar::*`, `events::*`, `cov
 
 ### BamTableProvider API
 
-The BAM reader accepts a `binary_cigar` parameter:
-
 ```rust
 BamTableProvider::new(
     file_path,           // String: path to BAM file (local or object-store URL)
     storage_opts,        // Option<ObjectStorageOptions>: S3/GCS/Azure credentials
     zero_based,          // bool: false for 1-based (default), true for 0-based
     tag_fields,          // Option<Vec<String>>: optional BAM tag fields to include
-    binary_cigar,        // bool: true for zero-copy binary CIGAR (recommended)
 ).await?
 ```
 
-When `binary_cigar=true`, the CIGAR column has `DataType::Binary` (packed LE u32 ops) instead of `DataType::Utf8` (string like `"10M2I5M"`). The pileup crate auto-detects the format from the schema.
+The pileup crate auto-detects the CIGAR format from the schema (`DataType::Binary` for binary CIGAR, `DataType::Utf8` for string).
 
 ### PileupConfig Defaults
 
@@ -214,7 +210,7 @@ When `binary_cigar=true`, the CIGAR column has `DataType::Binary` (packed LE u32
 |-------|---------|-------------|
 | `zero_based` | `false` | 1-based coordinates (matches polars-bio default) |
 | `per_base` | `false` | RLE block output; set `true` for one-row-per-position |
-| `binary_cigar` | `true` | Use binary CIGAR (zero-copy, no string parsing) |
+| `binary_cigar` | `false` | Auto-detected from schema; `true` when upstream provides binary CIGAR |
 | `dense_mode` | `Auto` (dense) | Dense `i32[]` array accumulation with streaming emission |
 | `filter.filter_flag` | `1796` | Exclude unmapped, secondary, failed QC, duplicate |
 | `filter.min_mapping_quality` | `0` | No MAPQ threshold |
@@ -255,7 +251,7 @@ use futures::StreamExt;
 
 async fn compute_coverage(bam_path: &str, partitions: usize) -> Vec<RecordBatch> {
     let table = BamTableProvider::new(
-        bam_path.to_string(), None, false, None, true,  // zero_based=false, binary_cigar=true
+        bam_path.to_string(), None, false, None,  // zero_based=false
     ).await.unwrap();
 
     let config = SessionConfig::new().with_target_partitions(partitions);
@@ -296,7 +292,7 @@ async fn compute_coverage(bam_path: &str, partitions: usize) -> Vec<RecordBatch>
 
 The coverage algorithm is ported from [SeQuiLa](https://github.com/biodatageeks/sequila) and uses an event-based approach:
 
-1. **CIGAR Processing**: Each aligned read's CIGAR generates +1 (start) and -1 (end) events at reference positions. With binary CIGAR (default), packed 4-byte ops are walked directly — no string parsing.
+1. **CIGAR Processing**: Each aligned read's CIGAR generates +1 (start) and -1 (end) events at reference positions. Both string and binary CIGAR formats are supported (auto-detected from the Arrow schema).
 2. **Dense Accumulation** (default): Events are written to a flat `i32[]` array per contig (O(1) writes). Completed contigs are streamed out as soon as the BAM's coordinate-sorted order moves to the next contig — peak memory is one contig at a time.
 3. **Output Generation**:
    - **Block mode** (default): A sweep-line pass computes running coverage and emits run-length encoded blocks where coverage changes. Zero-coverage gaps are skipped.
