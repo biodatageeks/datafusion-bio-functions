@@ -20,7 +20,7 @@ async fn main() {
     let binary_cigar = args.iter().any(|a| a == "--binary-cigar");
     let zero_based = args.iter().any(|a| a == "--zero-based");
 
-    println!("BAM file: {}", bam_path);
+    println!("BAM file: {bam_path}");
     println!("---");
 
     let start = Instant::now();
@@ -54,16 +54,16 @@ async fn main() {
     let plan = df.create_physical_plan().await.unwrap();
 
     let num_partitions = plan.properties().partitioning.partition_count();
-    println!("Input partitions: {}", num_partitions);
+    println!("Input partitions: {num_partitions}");
 
     let dense_mode = if args.iter().any(|a| a == "--dense") {
         DenseMode::Force
     } else {
         DenseMode::default()
     };
-    println!("Dense mode: {:?}", dense_mode);
-    println!("Binary CIGAR: {}", binary_cigar);
-    println!("Zero-based: {}", zero_based);
+    println!("Dense mode: {dense_mode:?}");
+    println!("Binary CIGAR: {binary_cigar}");
+    println!("Zero-based: {zero_based}");
 
     let pileup_config = PileupConfig {
         dense_mode,
@@ -107,7 +107,7 @@ async fn main() {
     let total_time = start.elapsed();
 
     println!("---");
-    println!("Coverage blocks emitted: {}", total_blocks);
+    println!("Coverage blocks emitted: {total_blocks}");
     println!("Compute time:  {:.3}s", compute_time.as_secs_f64());
     println!("Total time:    {:.3}s", total_time.as_secs_f64());
 }

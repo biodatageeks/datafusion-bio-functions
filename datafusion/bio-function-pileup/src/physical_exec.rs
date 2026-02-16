@@ -659,9 +659,10 @@ mod tests {
         .unwrap()
     }
 
+    #[allow(clippy::type_complexity)]
     fn make_batch_binary(rows: Vec<(&str, u32, u32, u32, Vec<u8>, u32)>) -> RecordBatch {
         let schema = bam_schema_binary();
-        let chroms: Vec<Option<&str>> = rows.iter().map(|r| Some(r.0.as_ref())).collect();
+        let chroms: Vec<Option<&str>> = rows.iter().map(|r| Some(r.0)).collect();
         let starts: Vec<Option<u32>> = rows.iter().map(|r| Some(r.1)).collect();
         let ends: Vec<Option<u32>> = rows.iter().map(|r| Some(r.2)).collect();
         let flags: Vec<u32> = rows.iter().map(|r| r.3).collect();

@@ -66,8 +66,8 @@ async fn main() {
 
     let total_time = total_start.elapsed();
 
-    println!("Reads processed:    {}", total_reads);
-    println!("Events generated:   {}", total_events);
+    println!("Reads processed:    {total_reads}");
+    println!("Events generated:   {total_events}");
     println!("BAM I/O time:       {:.3}s", io_time.as_secs_f64());
     println!("CIGAR parse time:   {:.3}s", parse_time.as_secs_f64());
     println!("Total time:         {:.3}s", total_time.as_secs_f64());

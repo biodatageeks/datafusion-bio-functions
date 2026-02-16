@@ -28,7 +28,7 @@ fn main() {
     }
     let elapsed = start.elapsed();
 
-    println!("Reads formatted:    {}", num_reads);
+    println!("Reads formatted:    {num_reads}");
     println!("Format time:        {:.3}s", elapsed.as_secs_f64());
     println!(
         "Per-read:           {:.0}ns",
