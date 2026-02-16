@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["datafusion/bio-function-pileup"]
+members = ["datafusion/bio-function-pileup", "datafusion/bio-function-ranges"]
+exclude = ["datafusion/bio-function-ranges/superintervals"]
 
 [workspace.package]
 license = "Apache-2.0"

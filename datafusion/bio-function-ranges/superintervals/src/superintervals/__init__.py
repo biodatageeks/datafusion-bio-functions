@@ -1,0 +1,2 @@
+from .intervalmap import (
+    IntervalMap)
