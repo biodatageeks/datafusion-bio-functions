@@ -19,6 +19,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 
 - **Depth-of-Coverage**: Compute per-base depth from BAM alignment data using an efficient event-based algorithm
 - **SQL Interface**: Query coverage via SQL table function: `SELECT * FROM depth('file.bam')`
+- **Per-Base Output**: Optional one-row-per-position mode (like `samtools depth -a`) with lazy streaming to keep memory at O(batch_size)
 - **DataFusion Integration**: Native `ExecutionPlan` implementation with partition-parallel execution
 - **Mosdepth-Compatible**: Fast-mode behavior matching [mosdepth](https://github.com/brentp/mosdepth) (no mate-pair overlap deduplication)
 - **Binary CIGAR**: Zero-copy binary CIGAR processing — walks packed 4-byte ops directly from BAM, no string parsing
@@ -57,19 +58,31 @@ async fn main() -> datafusion::error::Result<()> {
     let df = ctx.sql("SELECT * FROM depth('path/to/alignments.bam', true)").await?;
     df.show().await?;
 
+    // Per-base output: one row per genomic position (like samtools depth -a)
+    let df = ctx.sql("SELECT * FROM depth('path/to/alignments.bam', true, true)").await?;
+    df.show().await?;
+
     Ok(())
 }
 ```
 
-The optional second argument controls the coordinate system:
+The optional arguments control behavior:
 
 ```sql
-SELECT * FROM depth('file.bam')          -- 1-based (default)
-SELECT * FROM depth('file.bam', true)    -- 0-based
-SELECT * FROM depth('file.bam', false)   -- 1-based (explicit)
+SELECT * FROM depth('file.bam')                -- 1-based, block output (default)
+SELECT * FROM depth('file.bam', true)          -- 0-based, block output
+SELECT * FROM depth('file.bam', false)         -- 1-based, block output (explicit)
+SELECT * FROM depth('file.bam', true, true)    -- 0-based, per-base output
+SELECT * FROM depth('file.bam', false, true)   -- 1-based, per-base output
 ```
 
-Output schema:
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `path` | string | (required) | Path to BAM file |
+| `zero_based` | bool | `false` | Use 0-based coordinates |
+| `per_base` | bool | `false` | Emit one row per position instead of RLE blocks |
+
+#### Block output schema (default)
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -78,7 +91,17 @@ Output schema:
 | `pos_end` | Int32 | Block end position (inclusive) |
 | `coverage` | Int16 | Read depth in this block |
 
-The output schema includes metadata key `bio.coordinate_system_zero_based` (`"true"` or `"false"`) so downstream consumers can interpret the coordinate system.
+#### Per-base output schema (`per_base=true`)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `contig` | Utf8 | Chromosome/contig name |
+| `pos` | Int32 | Genomic position |
+| `coverage` | Int16 | Read depth at this position |
+
+Per-base mode emits one row for every genomic position in each contig (including 0-coverage positions), similar to `samtools depth -a`. It requires dense mode (BAM header with contig lengths) and uses a lazy `PerBaseEmitter` that streams positions in batch-sized chunks, keeping memory at O(batch_size).
+
+Both schemas include metadata key `bio.coordinate_system_zero_based` (`"true"` or `"false"`) so downstream consumers can interpret the coordinate system.
 
 ### Coverage via Programmatic API
 
@@ -190,6 +213,7 @@ When `binary_cigar=true`, the CIGAR column has `DataType::Binary` (packed LE u32
 | Field | Default | Description |
 |-------|---------|-------------|
 | `zero_based` | `false` | 1-based coordinates (matches polars-bio default) |
+| `per_base` | `false` | RLE block output; set `true` for one-row-per-position |
 | `binary_cigar` | `true` | Use binary CIGAR (zero-copy, no string parsing) |
 | `dense_mode` | `Auto` (dense) | Dense `i32[]` array accumulation with streaming emission |
 | `filter.filter_flag` | `1796` | Exclude unmapped, secondary, failed QC, duplicate |
@@ -200,6 +224,7 @@ To override specific fields:
 ```rust
 let config = PileupConfig {
     zero_based: true,                       // 0-based coordinates
+    per_base: true,                         // one row per position (requires dense mode)
     binary_cigar: false,                    // force string CIGAR (e.g., for debugging)
     dense_mode: DenseMode::Disable,         // force sparse BTreeMap accumulation
     filter: ReadFilter {
@@ -273,7 +298,9 @@ The coverage algorithm is ported from [SeQuiLa](https://github.com/biodatageeks/
 
 1. **CIGAR Processing**: Each aligned read's CIGAR generates +1 (start) and -1 (end) events at reference positions. With binary CIGAR (default), packed 4-byte ops are walked directly — no string parsing.
 2. **Dense Accumulation** (default): Events are written to a flat `i32[]` array per contig (O(1) writes). Completed contigs are streamed out as soon as the BAM's coordinate-sorted order moves to the next contig — peak memory is one contig at a time.
-3. **Cumulative Sum + RLE**: A sweep-line pass computes running coverage and emits run-length encoded blocks where coverage changes.
+3. **Output Generation**:
+   - **Block mode** (default): A sweep-line pass computes running coverage and emits run-length encoded blocks where coverage changes. Zero-coverage gaps are skipped.
+   - **Per-base mode** (`per_base=true`): A lazy `PerBaseEmitter` walks the delta array with a prefix sum, emitting one row per genomic position (including 0-coverage). Batches are streamed one at a time to keep memory at O(batch_size).
 
 The dense path naturally handles complex CIGAR operations (insertions, deletions, skipped regions) and provides excellent cache locality. A sparse `BTreeMap` fallback is available for targeted sequencing panels where contig-level arrays would be wasteful.
 
