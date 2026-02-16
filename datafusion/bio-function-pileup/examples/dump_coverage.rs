@@ -22,7 +22,7 @@ async fn main() {
     let bam_path = &args[1];
     let zero_based = args.iter().any(|a| a == "--zero-based");
 
-    let table = BamTableProvider::new(bam_path.clone(), None, zero_based, None)
+    let table = BamTableProvider::new(bam_path.clone(), None, zero_based, None, true)
         .await
         .expect("Failed to open BAM file");
 
