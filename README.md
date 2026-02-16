@@ -304,6 +304,67 @@ The coverage algorithm is ported from [SeQuiLa](https://github.com/biodatageeks/
 
 The dense path naturally handles complex CIGAR operations (insertions, deletions, skipped regions) and provides excellent cache locality. A sparse `BTreeMap` fallback is available for targeted sequencing panels where contig-level arrays would be wasteful.
 
+## Validation Against samtools
+
+The coverage output has been validated position-by-position against `samtools depth -a` on a 2.0 GB WES BAM file (NA12878 chr1, 19.1M reads, 247M genomic positions). Both block and per-base output modes produce **zero mismatches** across all 247,249,719 positions.
+
+### Running the validation
+
+**1. Generate reference output with samtools:**
+
+```bash
+samtools depth -a /path/to/alignments.bam > /tmp/samtools_depth.tsv
+```
+
+**2. Generate our output using the `dump_coverage` example:**
+
+```bash
+# Block output (BED format: contig, start, end_exclusive, coverage)
+cargo run --release --example dump_coverage -- /path/to/alignments.bam --zero-based > /tmp/our_blocks.bed
+
+# Per-base output (contig, pos_0based, coverage)
+cargo run --release --example dump_coverage -- /path/to/alignments.bam --zero-based --per-base > /tmp/our_per_base.tsv
+```
+
+**3. Compare with the provided script:**
+
+```bash
+# Compare both outputs against samtools
+python3 datafusion/bio-function-pileup/scripts/compare_samtools.py \
+    /tmp/samtools_depth.tsv \
+    --per-base /tmp/our_per_base.tsv \
+    --blocks /tmp/our_blocks.bed
+
+# Compare only block output
+python3 datafusion/bio-function-pileup/scripts/compare_samtools.py \
+    /tmp/samtools_depth.tsv \
+    --blocks /tmp/our_blocks.bed
+```
+
+**4. Verify multi-partition consistency:**
+
+The `bench_coverage` example reports block counts. These should be identical regardless of `--partitions`:
+
+```bash
+cargo run --release --example bench_coverage -- /path/to/alignments.bam --partitions 1
+cargo run --release --example bench_coverage -- /path/to/alignments.bam --partitions 8
+cargo run --release --example bench_coverage -- /path/to/alignments.bam --partitions 16
+```
+
+### Validated results (NA12878 chr1)
+
+| Output mode | Positions compared | Mismatches |
+|---|---|---|
+| Block (expanded to per-base) | 247,249,719 | 0 |
+| Per-base | 247,249,719 | 0 |
+
+| Partitions | Block count | Match? |
+|---|---|---|
+| 1 | 7,658,496 | Yes |
+| 4 | 7,658,496 | Yes |
+| 8 | 7,658,496 | Yes |
+| 16 | 7,658,496 | Yes |
+
 ## Development
 
 ### Build
