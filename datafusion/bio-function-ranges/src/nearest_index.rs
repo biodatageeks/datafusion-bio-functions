@@ -89,14 +89,21 @@ impl NearestIntervalIndex {
         }
 
         if include_overlaps {
-            let mut first_overlap = None;
+            let mut best_overlap: Option<IntervalMeta> = None;
             self.tree.query(start, end, |node| {
-                if first_overlap.is_none() {
-                    first_overlap = Some(extract_position(node));
+                let pos = extract_coitree_position(node);
+                if let Some(meta) = self.by_position.get(&pos) {
+                    if best_overlap
+                        .as_ref()
+                        .map(|best| cmp_interval_meta(meta, best).is_lt())
+                        .unwrap_or(true)
+                    {
+                        best_overlap = Some(*meta);
+                    }
                 }
             });
-            if first_overlap.is_some() {
-                return first_overlap;
+            if let Some(best) = best_overlap {
+                return Some(best.position);
             }
         }
 
@@ -127,13 +134,12 @@ impl NearestIntervalIndex {
         if include_overlaps {
             let mut overlaps = Vec::<IntervalMeta>::new();
             self.tree.query(start, end, |node| {
-                let pos = extract_position(node);
+                let pos = extract_coitree_position(node);
                 if let Some(meta) = self.by_position.get(&pos) {
                     overlaps.push(*meta);
                 }
             });
             overlaps.sort_by(cmp_interval_meta);
-            overlaps.dedup_by_key(|m| m.position);
             for m in overlaps {
                 if out.len() == k {
                     return;
@@ -184,6 +190,10 @@ impl NearestIntervalIndex {
                     }
                 }
             };
+
+            if !include_overlaps && candidate_distance(start, end, &next) == 0 {
+                continue;
+            }
 
             if seen.insert(next.position, ()).is_none() {
                 out.push(next.position);
@@ -266,7 +276,7 @@ fn cmp_candidate(start: i32, end: i32, a: &IntervalMeta, b: &IntervalMeta) -> Or
         not(target_feature = "avx")
     ),
 ))]
-fn extract_position(node: &coitrees::IntervalNode<Position, u32>) -> Position {
+pub(crate) fn extract_coitree_position(node: &coitrees::IntervalNode<Position, u32>) -> Position {
     node.metadata
 }
 
@@ -278,7 +288,7 @@ fn extract_position(node: &coitrees::IntervalNode<Position, u32>) -> Position {
     all(target_os = "linux", target_arch = "aarch64"),
     all(target_os = "windows", target_arch = "x86_64", target_feature = "avx")
 ))]
-fn extract_position(node: &coitrees::Interval<&Position>) -> Position {
+pub(crate) fn extract_coitree_position(node: &coitrees::Interval<&Position>) -> Position {
     *node.metadata
 }
 
@@ -316,6 +326,14 @@ mod tests {
     }
 
     #[test]
+    fn nearest_one_overlap_uses_deterministic_coordinate_order() {
+        let idx = mk(&[(20, 30, 10), (10, 40, 20), (15, 25, 30)]);
+        let nearest = idx.nearest_one(21, 21, true);
+        // all overlap; deterministic tie-break is (start, end, position)
+        assert_eq!(nearest, Some(20));
+    }
+
+    #[test]
     fn nearest_k_non_overlap_returns_expected_order() {
         let idx = mk(&[(10, 20, 0), (30, 40, 1), (50, 60, 2), (70, 80, 3)]);
         let mut out = Vec::new();
@@ -329,6 +347,14 @@ mod tests {
         let mut out = Vec::new();
         idx.nearest_k(35, 35, 2, true, &mut out);
         assert_eq!(out, vec![1, 0]);
+    }
+
+    #[test]
+    fn nearest_k_non_overlap_excludes_overlapping_candidates() {
+        let idx = mk(&[(10, 20, 0), (30, 40, 1), (50, 60, 2)]);
+        let mut out = Vec::new();
+        idx.nearest_k(35, 35, 2, false, &mut out);
+        assert_eq!(out, vec![0, 2]);
     }
 
     #[test]

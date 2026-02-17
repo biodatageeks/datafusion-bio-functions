@@ -1,4 +1,6 @@
-use crate::nearest_index::{IntervalRecord, NearestIntervalIndex, Position};
+use crate::nearest_index::{
+    IntervalRecord, NearestIntervalIndex, Position, extract_coitree_position,
+};
 use crate::physical_planner::intervals::{ColInterval, ColIntervals};
 use crate::physical_planner::joins::utils::symmetric_join_output_partitioning;
 use crate::physical_planner::joins::utils::{
@@ -706,8 +708,14 @@ impl Debug for IntervalJoinAlgorithm {
                     .collect::<HashMap<_, _>>();
                 f.debug_struct("Coitrees").field("0", &q).finish()
             }
-            &IntervalJoinAlgorithm::CoitreesNearest(_) => todo!(),
-            &IntervalJoinAlgorithm::CoitreesCountOverlaps(_) => todo!(),
+            IntervalJoinAlgorithm::CoitreesNearest(m) => f
+                .debug_struct("CoitreesNearest")
+                .field("groups", &m.len())
+                .finish(),
+            IntervalJoinAlgorithm::CoitreesCountOverlaps(m) => f
+                .debug_struct("CoitreesCountOverlaps")
+                .field("groups", &m.len())
+                .finish(),
 
             IntervalJoinAlgorithm::IntervalTree(m) => {
                 f.debug_struct("IntervalTree").field("0", m).finish()
@@ -827,40 +835,6 @@ impl IntervalJoinAlgorithm {
         }
     }
 
-    /// unoptimized on Linux x64 (without target-cpu=native)
-    #[cfg(any(
-        all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            not(target_feature = "avx")
-        ),
-        all(
-            target_os = "macos",
-            target_arch = "x86_64",
-            not(target_feature = "avx")
-        ),
-        all(
-            target_os = "windows",
-            target_arch = "x86_64",
-            not(target_feature = "avx")
-        ),
-    ))]
-    fn extract_position(&self, node: &coitrees::IntervalNode<Position, u32>) -> Position {
-        node.metadata
-    }
-
-    /// for Apple Intel, Apple M1+(both optimized and not) and optimized (target-cpu=native) on Linux x64 and Linux aarch64
-    #[cfg(any(
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "x86_64", target_feature = "avx"),
-        all(target_os = "linux", target_arch = "x86_64", target_feature = "avx"),
-        all(target_os = "linux", target_arch = "aarch64"),
-        all(target_os = "windows", target_arch = "x86_64", target_feature = "avx")
-    ))]
-    fn extract_position(&self, node: &coitrees::Interval<&Position>) -> Position {
-        *node.metadata
-    }
-
     fn get<F>(&self, k: u64, start: i32, end: i32, mut f: F)
     where
         F: FnMut(Position),
@@ -871,7 +845,7 @@ impl IntervalJoinAlgorithm {
                 use coitrees::IntervalTree;
                 if let Some(tree) = hashmap.get(&k) {
                     tree.query(start, end, |node| {
-                        let position: Position = self.extract_position(node);
+                        let position: Position = extract_coitree_position(node);
                         f(position)
                     });
                 }

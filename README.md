@@ -178,6 +178,7 @@ SET bio.interval_join_algorithm = CoitreesNearest;
 
 -- Returns exactly one match per right-side row:
 -- the overlapping interval if one exists, otherwise the nearest by distance
+-- if no keyed candidate exists, left columns are NULL
 SELECT *
 FROM targets
 JOIN reads

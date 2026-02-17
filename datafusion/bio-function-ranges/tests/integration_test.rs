@@ -1127,6 +1127,53 @@ async fn test_nearest_udtf_strict_zero_based_boundary_distance() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nearest_udtf_empty_left_emits_null_rows() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE l AS
+        SELECT
+            CAST('a' AS TEXT) AS contig,
+            CAST(1 AS INTEGER) AS pos_start,
+            CAST(2 AS INTEGER) AS pos_end
+        WHERE FALSE
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE r (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 110),
+        ('b', 200, 210)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql(
+            r#"SELECT *
+               FROM nearest('l', 'r')
+               ORDER BY right_contig, right_pos_start"#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
+        "| left_contig | left_pos_start | left_pos_end | right_contig | right_pos_start | right_pos_end |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
+        "|             |                |              | a            | 100             | 110           |",
+        "|             |                |              | b            | 200             | 210           |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Table function (UDTF) tests for coverage() and count_overlaps()
 // ─────────────────────────────────────────────────────────────────────────────

@@ -92,6 +92,7 @@ Returns up to `k` nearest left intervals for each right interval.
 - `overlap` default: `true`
   - `true`: overlapping intervals are returned first, then nearest non-overlaps if needed
   - `false`: overlaps are ignored, only nearest non-overlaps are returned
+- If no keyed candidate exists for a right row, a row is still emitted with `NULL` in `left_*` columns.
 
 Output columns are prefixed with `left_` and `right_` to avoid ambiguity.
 
@@ -149,6 +150,7 @@ JOIN reads
 ```
 
 Returns exactly one match per right-side row: the overlapping interval if one exists, otherwise the nearest interval by distance.
+If there is no matching key group on the left side, the row is emitted with nulls on left columns.
 
 ## Programmatic API
 

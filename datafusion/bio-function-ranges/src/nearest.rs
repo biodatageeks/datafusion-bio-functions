@@ -294,6 +294,11 @@ fn get_nearest_stream(
             let mut nearest_buf = Vec::<usize>::with_capacity(k.max(1));
 
             for i in 0..rb.num_rows() {
+                let right_pos_u32 = u32::try_from(i).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "right row index {i} exceeds UInt32 index capacity"
+                    ))
+                })?;
                 let contig = contig_arr.value(i);
                 let mut query_start = start_arr.value(i)?;
                 let mut query_end = end_arr.value(i)?;
@@ -318,7 +323,7 @@ fn get_nearest_stream(
                 if nearest_buf.is_empty() {
                     left_indices.push(0);
                     validity.push(false);
-                    right_indices.push(i as u32);
+                    right_indices.push(right_pos_u32);
                 } else {
                     for &pos in &nearest_buf {
                         let pos_u32 = u32::try_from(pos).map_err(|_| {
@@ -328,7 +333,7 @@ fn get_nearest_stream(
                         })?;
                         left_indices.push(pos_u32);
                         validity.push(true);
-                        right_indices.push(i as u32);
+                        right_indices.push(right_pos_u32);
                     }
                 }
             }
