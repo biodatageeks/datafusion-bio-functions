@@ -13,7 +13,6 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -126,14 +125,6 @@ impl TableProvider for NearestProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let target_partitions = self
-            .session
-            .state()
-            .config()
-            .options()
-            .execution
-            .target_partitions;
-
         let left_df = self.session.table(self.left_table.clone()).await?;
         let left_schema = Arc::new(left_df.schema().as_arrow().clone());
         let left_batches = left_df.collect().await?;
@@ -146,15 +137,6 @@ impl TableProvider for NearestProvider {
 
         let right_df = self.session.table(self.right_table.clone()).await?;
         let right_plan = right_df.create_physical_plan().await?;
-        let right_plan: Arc<dyn ExecutionPlan> =
-            if right_plan.output_partitioning().partition_count() == target_partitions {
-                right_plan
-            } else {
-                Arc::new(RepartitionExec::try_new(
-                    right_plan,
-                    Partitioning::RoundRobinBatch(target_partitions),
-                )?)
-            };
         let output_partitions = right_plan.output_partitioning().partition_count();
 
         Ok(Arc::new(NearestExec {
@@ -288,6 +270,14 @@ fn get_nearest_stream(
             let (contig_arr, start_arr, end_arr) =
                 get_join_col_arrays(&rb, (&columns_2.0, &columns_2.1, &columns_2.2))?;
 
+            // Resolve position arrays once per batch: for Int32 (common case)
+            // this is a zero-copy borrow; other types convert once upfront.
+            // Eliminates per-row enum dispatch and Result construction.
+            let start_resolved = start_arr.resolve()?;
+            let end_resolved = end_arr.resolve()?;
+            let starts = &*start_resolved;
+            let ends = &*end_resolved;
+
             let estimate = rb.num_rows() * k.max(1);
             let mut left_indices = Vec::<u32>::with_capacity(estimate);
             let mut validity = Vec::<bool>::with_capacity(estimate);
@@ -307,8 +297,8 @@ fn get_nearest_stream(
                         ))
                     })?;
                     let contig = contig_arr.value(i);
-                    let mut query_start = start_arr.value(i)?;
-                    let mut query_end = end_arr.value(i)?;
+                    let mut query_start = starts[i];
+                    let mut query_end = ends[i];
 
                     if strict_filter {
                         query_start += 1;
@@ -350,8 +340,8 @@ fn get_nearest_stream(
                         ))
                     })?;
                     let contig = contig_arr.value(i);
-                    let mut query_start = start_arr.value(i)?;
-                    let mut query_end = end_arr.value(i)?;
+                    let mut query_start = starts[i];
+                    let mut query_end = ends[i];
 
                     if strict_filter {
                         query_start += 1;
@@ -439,6 +429,11 @@ fn build_nearest_indexes(
 ) -> Result<FnvHashMap<String, NearestIntervalIndex>> {
     let (contig_arr, start_arr, end_arr) = get_join_col_arrays(batch, columns)?;
 
+    let start_resolved = start_arr.resolve()?;
+    let end_resolved = end_arr.resolve()?;
+    let starts = &*start_resolved;
+    let ends = &*end_resolved;
+
     // Group by borrowed &str (zero-copy from Arrow array), only allocate
     // one owned String per unique contig at the end.
     let mut contig_to_idx = FnvHashMap::<&str, usize>::default();
@@ -456,8 +451,8 @@ fn build_nearest_indexes(
             }
         };
         groups[idx].push(IntervalRecord {
-            start: start_arr.value(i)?,
-            end: end_arr.value(i)?,
+            start: starts[i],
+            end: ends[i],
             position: i,
         });
     }

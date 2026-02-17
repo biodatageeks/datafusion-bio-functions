@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::sync::OnceLock;
 
 use coitrees::{COITree, Interval, IntervalTree};
 use fnv::FnvHashMap;
@@ -22,7 +23,11 @@ struct IntervalMeta {
 pub struct NearestIntervalIndex {
     tree: COITree<Position, u32>,
     by_start: Vec<Interval<Position>>,
-    by_end: Vec<Interval<Position>>,
+    /// Lazily initialized: only allocated when a non-overlap search is needed.
+    /// For the common k=1 include_overlaps=true hot path where most queries
+    /// find overlaps via the COITree, this avoids ~24MB per contig of cache
+    /// pressure from a sorted copy that would rarely be accessed.
+    by_end: OnceLock<Vec<Interval<Position>>>,
 }
 
 impl std::fmt::Debug for NearestIntervalIndex {
@@ -46,21 +51,27 @@ impl NearestIntervalIndex {
                 .then_with(|| a.metadata.cmp(&b.metadata))
         });
 
-        let mut by_end = by_start.clone();
-        by_end.sort_by(|a, b| {
-            a.last
-                .cmp(&b.last)
-                .then_with(|| a.first.cmp(&b.first))
-                .then_with(|| a.metadata.cmp(&b.metadata))
-        });
-
         let tree = COITree::new(by_start.iter());
 
         Self {
             tree,
             by_start,
-            by_end,
+            by_end: OnceLock::new(),
         }
+    }
+
+    /// Returns the by-end sorted intervals, creating them lazily on first use.
+    fn by_end(&self) -> &[Interval<Position>] {
+        self.by_end.get_or_init(|| {
+            let mut by_end = self.by_start.clone();
+            by_end.sort_by(|a, b| {
+                a.last
+                    .cmp(&b.last)
+                    .then_with(|| a.first.cmp(&b.first))
+                    .then_with(|| a.metadata.cmp(&b.metadata))
+            });
+            by_end
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -133,12 +144,13 @@ impl NearestIntervalIndex {
             return;
         }
 
-        let mut left_idx = self.by_end.partition_point(|iv| iv.last < start);
+        let by_end = self.by_end();
+        let mut left_idx = by_end.partition_point(|iv| iv.last < start);
         let mut right_idx = self.by_start.partition_point(|iv| iv.first <= end);
 
         while out.len() < k {
             let left_meta = if left_idx > 0 {
-                Some(interval_meta_from(&self.by_end[left_idx - 1]))
+                Some(interval_meta_from(&by_end[left_idx - 1]))
             } else {
                 None
             };
@@ -181,11 +193,12 @@ impl NearestIntervalIndex {
     }
 
     fn nearest_non_overlap_one(&self, start: i32, end: i32) -> Option<IntervalMeta> {
-        let left_idx = self.by_end.partition_point(|iv| iv.last < start);
+        let by_end = self.by_end();
+        let left_idx = by_end.partition_point(|iv| iv.last < start);
         let right_idx = self.by_start.partition_point(|iv| iv.first <= end);
 
         let left = if left_idx > 0 {
-            Some(interval_meta_from(&self.by_end[left_idx - 1]))
+            Some(interval_meta_from(&by_end[left_idx - 1]))
         } else {
             None
         };

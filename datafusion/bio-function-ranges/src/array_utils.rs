@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use datafusion::arrow::array::{
     GenericStringArray, Int32Array, Int64Array, RecordBatch, StringViewArray, UInt32Array,
     UInt64Array,
@@ -59,6 +61,57 @@ impl PosArray<'_> {
                     ))
                 })
             }
+        }
+    }
+
+    /// Resolve the entire array to a contiguous `&[i32]` slice, converting
+    /// non-Int32 types once per batch. The inner loop can then use direct
+    /// indexing with zero dispatch and no `Result` overhead per row.
+    pub fn resolve(&self) -> Result<Cow<'_, [i32]>> {
+        match self {
+            PosArray::Int32(arr) => Ok(Cow::Borrowed(arr.values())),
+            PosArray::Int64(arr) => arr
+                .values()
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    i32::try_from(v).map_err(|_| {
+                        DataFusionError::Execution(format!(
+                            "coordinate value {v} at row {i} overflows i32 (max {})",
+                            i32::MAX
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i32>>>()
+                .map(Cow::Owned),
+            PosArray::UInt32(arr) => arr
+                .values()
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    i32::try_from(v).map_err(|_| {
+                        DataFusionError::Execution(format!(
+                            "coordinate value {v} at row {i} overflows i32 (max {})",
+                            i32::MAX
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i32>>>()
+                .map(Cow::Owned),
+            PosArray::UInt64(arr) => arr
+                .values()
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    i32::try_from(v).map_err(|_| {
+                        DataFusionError::Execution(format!(
+                            "coordinate value {v} at row {i} overflows i32 (max {})",
+                            i32::MAX
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i32>>>()
+                .map(Cow::Owned),
         }
     }
 }
