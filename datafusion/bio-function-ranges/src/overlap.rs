@@ -43,7 +43,7 @@ impl OverlapProvider {
                 Arc::new(Field::new(
                     format!("left_{}", f.name()),
                     f.data_type().clone(),
-                    true,
+                    f.is_nullable(),
                 ))
             })
             .collect::<Vec<_>>();
@@ -51,7 +51,7 @@ impl OverlapProvider {
             Arc::new(Field::new(
                 format!("right_{}", f.name()),
                 f.data_type().clone(),
-                true,
+                f.is_nullable(),
             ))
         }));
         let schema = Arc::new(Schema::new(fields));
@@ -137,8 +137,8 @@ impl TableProvider for OverlapProvider {
             "SELECT {select_left}, {select_right} \
              FROM `{}` AS b, `{}` AS a \
              WHERE a.`{c1}` = b.`{c2}` \
-             AND CAST(a.`{e1}` AS INT) >{sign} CAST(b.`{s2}` AS INT) \
-             AND CAST(a.`{s1}` AS INT) <{sign} CAST(b.`{e2}` AS INT)",
+             AND CAST(a.`{e1}` AS INTEGER) >{sign} CAST(b.`{s2}` AS INTEGER) \
+             AND CAST(a.`{s1}` AS INTEGER) <{sign} CAST(b.`{e2}` AS INTEGER)",
             self.right_table, self.left_table,
         );
 

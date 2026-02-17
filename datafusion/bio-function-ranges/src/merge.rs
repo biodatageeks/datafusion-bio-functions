@@ -83,13 +83,13 @@ impl TableProvider for MergeProvider {
         let df = self.session.table(&self.table).await?;
         let batches = df.collect().await?;
 
-        // Group intervals by contig
-        let mut groups: AHashMap<String, Vec<(i32, i32)>> = AHashMap::default();
+        // Group intervals by contig (i64 to support large reference assemblies)
+        let mut groups: AHashMap<String, Vec<(i64, i64)>> = AHashMap::default();
         for batch in &batches {
             let (contig_arr, start_arr, end_arr) =
                 get_join_col_arrays(batch, (&self.columns.0, &self.columns.1, &self.columns.2))?;
-            let start_resolved = start_arr.resolve()?;
-            let end_resolved = end_arr.resolve()?;
+            let start_resolved = start_arr.resolve_i64()?;
+            let end_resolved = end_arr.resolve_i64()?;
             let starts = &*start_resolved;
             let ends = &*end_resolved;
             for i in 0..batch.num_rows() {
@@ -127,9 +127,9 @@ impl TableProvider for MergeProvider {
 
             for &(s, e) in &intervals[1..] {
                 let merge_condition = if strict {
-                    i64::from(s) < i64::from(cur_end) + min_dist
+                    s < cur_end + min_dist
                 } else {
-                    i64::from(s) <= i64::from(cur_end) + min_dist
+                    s <= cur_end + min_dist
                 };
 
                 if merge_condition {
@@ -139,8 +139,8 @@ impl TableProvider for MergeProvider {
                     count += 1;
                 } else {
                     contig_builder.append_value(contig);
-                    start_builder.append_value(i64::from(cur_start));
-                    end_builder.append_value(i64::from(cur_end));
+                    start_builder.append_value(cur_start);
+                    end_builder.append_value(cur_end);
                     count_builder.append_value(count);
                     cur_start = s;
                     cur_end = e;
@@ -150,8 +150,8 @@ impl TableProvider for MergeProvider {
 
             // Emit final interval
             contig_builder.append_value(contig);
-            start_builder.append_value(i64::from(cur_start));
-            end_builder.append_value(i64::from(cur_end));
+            start_builder.append_value(cur_start);
+            end_builder.append_value(cur_end);
             count_builder.append_value(count);
         }
 

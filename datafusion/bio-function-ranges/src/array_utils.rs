@@ -129,6 +129,47 @@ impl PosArray<'_> {
                 .map(Cow::Owned),
         }
     }
+
+    /// Resolve the entire array to a contiguous `&[i64]` slice.
+    ///
+    /// Like [`resolve`](Self::resolve) but returns `i64` values, avoiding
+    /// truncation of coordinates that exceed `i32::MAX`.
+    pub fn resolve_i64(&self) -> Result<Cow<'_, [i64]>> {
+        let null_count = match self {
+            PosArray::Int32(arr) => arr.null_count(),
+            PosArray::Int64(arr) => arr.null_count(),
+            PosArray::UInt32(arr) => arr.null_count(),
+            PosArray::UInt64(arr) => arr.null_count(),
+        };
+        if null_count > 0 {
+            return Err(DataFusionError::Execution(
+                "coordinate column contains null values; requires non-null coordinates".to_string(),
+            ));
+        }
+        match self {
+            PosArray::Int32(arr) => Ok(Cow::Owned(
+                arr.values().iter().map(|&v| i64::from(v)).collect(),
+            )),
+            PosArray::Int64(arr) => Ok(Cow::Borrowed(arr.values())),
+            PosArray::UInt32(arr) => Ok(Cow::Owned(
+                arr.values().iter().map(|&v| i64::from(v)).collect(),
+            )),
+            PosArray::UInt64(arr) => arr
+                .values()
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    i64::try_from(v).map_err(|_| {
+                        DataFusionError::Execution(format!(
+                            "coordinate value {v} at row {i} overflows i64 (max {})",
+                            i64::MAX
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<i64>>>()
+                .map(Cow::Owned),
+        }
+    }
 }
 
 /// Extract contig, start, and end column arrays from a [`RecordBatch`].

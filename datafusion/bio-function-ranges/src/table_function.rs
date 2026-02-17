@@ -17,9 +17,18 @@ const DEFAULT_COLS: [&str; 3] = ["contig", "pos_start", "pos_end"];
 type ColTriple = (String, String, String);
 
 /// Extract a string literal from an Expr, returning an error with context on failure.
+///
+/// Rejects values containing backticks to prevent SQL injection in generated queries.
 fn extract_string_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<String> {
     match arg {
-        Expr::Literal(ScalarValue::Utf8(Some(val)), _) => Ok(val.clone()),
+        Expr::Literal(ScalarValue::Utf8(Some(val)), _) => {
+            if val.contains('`') {
+                return Err(DataFusionError::Plan(format!(
+                    "{fn_name}() {name} must not contain backtick characters, got: {val}"
+                )));
+            }
+            Ok(val.clone())
+        }
         other => Err(DataFusionError::Plan(format!(
             "{fn_name}() {name} must be a string literal, got: {other}"
         ))),
@@ -335,8 +344,24 @@ impl TableFunctionImpl for MergeTableFunction {
             (0i64, extra)
         } else {
             match &extra[0] {
-                Expr::Literal(ScalarValue::Int64(Some(v)), _) => (*v, &extra[1..]),
-                Expr::Literal(ScalarValue::Int32(Some(v)), _) => (i64::from(*v), &extra[1..]),
+                Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
+                    if *v < 0 {
+                        return Err(DataFusionError::Plan(format!(
+                            "{}() min_dist must be >= 0, got {}",
+                            self.name, v
+                        )));
+                    }
+                    (*v, &extra[1..])
+                }
+                Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
+                    if *v < 0 {
+                        return Err(DataFusionError::Plan(format!(
+                            "{}() min_dist must be >= 0, got {}",
+                            self.name, v
+                        )));
+                    }
+                    (i64::from(*v), &extra[1..])
+                }
                 Expr::Literal(ScalarValue::UInt64(Some(v)), _) => (
                     i64::try_from(*v).map_err(|_| {
                         DataFusionError::Plan(format!(
