@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::sync::OnceLock;
 
 use coitrees::{COITree, Interval, IntervalTree};
-use fnv::FnvHashMap;
+use fnv::FnvHashSet;
 
 pub type Position = usize;
 
@@ -122,7 +122,7 @@ impl NearestIntervalIndex {
             return;
         }
 
-        let mut seen = FnvHashMap::<Position, ()>::default();
+        let mut seen = FnvHashSet::<Position>::default();
 
         if include_overlaps {
             let mut overlaps = Vec::<IntervalMeta>::new();
@@ -134,7 +134,7 @@ impl NearestIntervalIndex {
                 if out.len() == k {
                     return;
                 }
-                if seen.insert(m.position, ()).is_none() {
+                if seen.insert(m.position) {
                     out.push(m.position);
                 }
             }
@@ -186,7 +186,7 @@ impl NearestIntervalIndex {
                 continue;
             }
 
-            if seen.insert(next.position, ()).is_none() {
+            if seen.insert(next.position) {
                 out.push(next.position);
             }
         }
@@ -254,79 +254,63 @@ fn cmp_candidate(start: i32, end: i32, a: &IntervalMeta, b: &IntervalMeta) -> Or
     ad.cmp(&bd).then_with(|| cmp_interval_meta(a, b))
 }
 
-/// unoptimized on Linux x64 (without target-cpu=native)
-#[cfg(any(
-    all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        not(target_feature = "avx")
-    ),
-    all(
-        target_os = "macos",
-        target_arch = "x86_64",
-        not(target_feature = "avx")
-    ),
-    all(
-        target_os = "windows",
-        target_arch = "x86_64",
-        not(target_feature = "avx")
-    ),
-))]
-pub(crate) fn extract_coitree_position(node: &coitrees::IntervalNode<Position, u32>) -> Position {
-    node.metadata
-}
+// COITree node accessors — grouped per platform so both functions share the
+// same cfg predicate; adding a new target only requires updating one block.
 
+/// x86_64 without AVX (unoptimized builds on Linux/macOS/Windows).
+/// COITree uses `IntervalNode` in this configuration.
 #[cfg(any(
-    all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        not(target_feature = "avx")
-    ),
-    all(
-        target_os = "macos",
-        target_arch = "x86_64",
-        not(target_feature = "avx")
-    ),
-    all(
-        target_os = "windows",
-        target_arch = "x86_64",
-        not(target_feature = "avx")
-    ),
+    all(target_os = "linux", target_arch = "x86_64", not(target_feature = "avx")),
+    all(target_os = "macos", target_arch = "x86_64", not(target_feature = "avx")),
+    all(target_os = "windows", target_arch = "x86_64", not(target_feature = "avx")),
 ))]
-fn extract_coitree_meta(node: &coitrees::IntervalNode<Position, u32>) -> IntervalMeta {
-    IntervalMeta {
-        start: node.first,
-        end: node.last,
-        position: node.metadata,
+mod coitree_extract {
+    use super::*;
+
+    pub(crate) fn extract_coitree_position(
+        node: &coitrees::IntervalNode<Position, u32>,
+    ) -> Position {
+        node.metadata
+    }
+
+    pub(super) fn extract_coitree_meta(
+        node: &coitrees::IntervalNode<Position, u32>,
+    ) -> IntervalMeta {
+        IntervalMeta {
+            start: node.first,
+            end: node.last,
+            position: node.metadata,
+        }
     }
 }
 
-/// for Apple Intel, Apple M1+(both optimized and not) and optimized (target-cpu=native) on Linux x64 and Linux aarch64
+/// aarch64 (Apple M1+, Linux ARM) and x86_64 with AVX (optimized builds).
+/// COITree uses `Interval<&T>` in this configuration.
 #[cfg(any(
     all(target_os = "macos", target_arch = "aarch64"),
     all(target_os = "macos", target_arch = "x86_64", target_feature = "avx"),
     all(target_os = "linux", target_arch = "x86_64", target_feature = "avx"),
     all(target_os = "linux", target_arch = "aarch64"),
-    all(target_os = "windows", target_arch = "x86_64", target_feature = "avx")
+    all(target_os = "windows", target_arch = "x86_64", target_feature = "avx"),
 ))]
-pub(crate) fn extract_coitree_position(node: &coitrees::Interval<&Position>) -> Position {
-    *node.metadata
-}
+mod coitree_extract {
+    use super::*;
 
-#[cfg(any(
-    all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "macos", target_arch = "x86_64", target_feature = "avx"),
-    all(target_os = "linux", target_arch = "x86_64", target_feature = "avx"),
-    all(target_os = "linux", target_arch = "aarch64"),
-    all(target_os = "windows", target_arch = "x86_64", target_feature = "avx")
-))]
-fn extract_coitree_meta(node: &coitrees::Interval<&Position>) -> IntervalMeta {
-    IntervalMeta {
-        start: node.first,
-        end: node.last,
-        position: *node.metadata,
+    pub(crate) fn extract_coitree_position(node: &coitrees::Interval<&Position>) -> Position {
+        *node.metadata
+    }
+
+    pub(super) fn extract_coitree_meta(node: &coitrees::Interval<&Position>) -> IntervalMeta {
+        IntervalMeta {
+            start: node.first,
+            end: node.last,
+            position: *node.metadata,
+        }
     }
 }
+
+pub(crate) use coitree_extract::extract_coitree_position;
+use coitree_extract::extract_coitree_meta;
 
 #[cfg(test)]
 mod tests {

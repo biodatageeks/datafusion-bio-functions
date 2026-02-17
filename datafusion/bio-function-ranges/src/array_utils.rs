@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use datafusion::arrow::array::{
-    GenericStringArray, Int32Array, Int64Array, RecordBatch, StringViewArray, UInt32Array,
+    Array, GenericStringArray, Int32Array, Int64Array, RecordBatch, StringViewArray, UInt32Array,
     UInt64Array,
 };
 use datafusion::arrow::datatypes::DataType;
@@ -67,7 +67,22 @@ impl PosArray<'_> {
     /// Resolve the entire array to a contiguous `&[i32]` slice, converting
     /// non-Int32 types once per batch. The inner loop can then use direct
     /// indexing with zero dispatch and no `Result` overhead per row.
+    ///
+    /// Returns an error if the array contains null values, since
+    /// `values()` exposes raw buffer contents at null positions.
     pub fn resolve(&self) -> Result<Cow<'_, [i32]>> {
+        let null_count = match self {
+            PosArray::Int32(arr) => arr.null_count(),
+            PosArray::Int64(arr) => arr.null_count(),
+            PosArray::UInt32(arr) => arr.null_count(),
+            PosArray::UInt64(arr) => arr.null_count(),
+        };
+        if null_count > 0 {
+            return Err(DataFusionError::Execution(
+                "coordinate column contains null values; nearest requires non-null coordinates"
+                    .to_string(),
+            ));
+        }
         match self {
             PosArray::Int32(arr) => Ok(Cow::Borrowed(arr.values())),
             PosArray::Int64(arr) => arr

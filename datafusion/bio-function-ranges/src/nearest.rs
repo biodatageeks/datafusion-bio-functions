@@ -289,6 +289,10 @@ fn get_nearest_stream(
             let mut cached_contig: &str = "";
             let mut cached_index: Option<&NearestIntervalIndex> = None;
 
+            // The k=1 and k>1 branches duplicate the per-row preamble
+            // (u32 cast, contig lookup, strict filter) intentionally: the k=1
+            // hot path calls nearest_one directly and avoids the Vec allocation
+            // and nearest_buf.clear() that the k>1 path requires on every row.
             if k == 1 {
                 for i in 0..rb.num_rows() {
                     let right_pos_u32 = u32::try_from(i).map_err(|_| {
