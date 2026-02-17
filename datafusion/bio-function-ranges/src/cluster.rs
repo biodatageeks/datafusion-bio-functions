@@ -15,6 +15,11 @@ use datafusion::prelude::{Expr, SessionContext};
 use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
 
+struct ContigGroup {
+    contig: Arc<str>,
+    intervals: Vec<(i64, i64)>,
+}
+
 pub struct ClusterProvider {
     session: Arc<SessionContext>,
     table: String,
@@ -85,11 +90,14 @@ impl TableProvider for ClusterProvider {
         let df = self.session.table(&self.table).await?;
         let batches = df.collect().await?;
 
-        // Collect intervals per contig, preserving original indices for cluster assignment
-        let mut groups: AHashMap<String, Vec<(i64, i64, usize)>> = AHashMap::default();
-        let mut all_rows: Vec<(String, i64, i64)> = Vec::new();
+        // Group intervals by contig while owning each contig string only once.
+        let mut groups: Vec<ContigGroup> = Vec::new();
+        let mut group_idx_by_contig: AHashMap<Arc<str>, usize> = AHashMap::default();
+        let mut n_rows = 0usize;
+        let mut contig_bytes = 0usize;
 
         for batch in &batches {
+            n_rows += batch.num_rows();
             let (contig_arr, start_arr, end_arr) =
                 get_join_col_arrays(batch, (&self.columns.0, &self.columns.1, &self.columns.2))?;
             let start_resolved = start_arr.resolve_i64()?;
@@ -97,101 +105,86 @@ impl TableProvider for ClusterProvider {
             let starts = &*start_resolved;
             let ends = &*end_resolved;
             for i in 0..batch.num_rows() {
-                let contig = contig_arr.value(i).to_string();
-                let global_idx = all_rows.len();
-                groups
-                    .entry(contig.clone())
-                    .or_default()
-                    .push((starts[i], ends[i], global_idx));
-                all_rows.push((contig, starts[i], ends[i]));
+                let contig = contig_arr.value(i);
+                contig_bytes += contig.len();
+
+                if let Some(&group_idx) = group_idx_by_contig.get(contig) {
+                    groups[group_idx].intervals.push((starts[i], ends[i]));
+                } else {
+                    let contig_key: Arc<str> = Arc::from(contig);
+                    let group_idx = groups.len();
+                    group_idx_by_contig.insert(Arc::clone(&contig_key), group_idx);
+                    groups.push(ContigGroup {
+                        contig: contig_key,
+                        intervals: vec![(starts[i], ends[i])],
+                    });
+                }
             }
         }
-
-        let n_rows = all_rows.len();
-        // Per-row cluster assignment
-        let mut row_cluster_id: Vec<i64> = vec![0; n_rows];
-        let mut row_cluster_start: Vec<i64> = vec![0; n_rows];
-        let mut row_cluster_end: Vec<i64> = vec![0; n_rows];
 
         let min_dist = self.min_dist;
         let strict = self.filter_op == FilterOp::Strict;
 
         // Sort contigs for deterministic output
-        let mut contigs: Vec<String> = groups.keys().cloned().collect();
-        contigs.sort();
+        let mut group_order: Vec<usize> = (0..groups.len()).collect();
+        group_order.sort_unstable_by(|&a, &b| groups[a].contig.cmp(&groups[b].contig));
 
-        let mut cluster_id: i64 = 0;
-
-        for contig in &contigs {
-            let intervals = groups.get_mut(contig.as_str()).unwrap();
-            // Sort by (start, end)
-            intervals.sort_unstable_by_key(|&(s, e, _)| (s, e));
-
-            if intervals.is_empty() {
-                continue;
-            }
-
-            let mut cur_start = intervals[0].0;
-            let mut cur_end = intervals[0].1;
-            let mut cluster_members: Vec<usize> = vec![intervals[0].2];
-
-            for &(s, e, idx) in &intervals[1..] {
-                let merge_condition = if strict {
-                    s < cur_end + min_dist
-                } else {
-                    s <= cur_end + min_dist
-                };
-
-                if merge_condition {
-                    if e > cur_end {
-                        cur_end = e;
-                    }
-                    cluster_members.push(idx);
-                } else {
-                    // Finalize current cluster
-                    for &member_idx in &cluster_members {
-                        row_cluster_id[member_idx] = cluster_id;
-                        row_cluster_start[member_idx] = cur_start;
-                        row_cluster_end[member_idx] = cur_end;
-                    }
-                    cluster_id += 1;
-                    cur_start = s;
-                    cur_end = e;
-                    cluster_members.clear();
-                    cluster_members.push(idx);
-                }
-            }
-
-            // Finalize last cluster
-            for &member_idx in &cluster_members {
-                row_cluster_id[member_idx] = cluster_id;
-                row_cluster_start[member_idx] = cur_start;
-                row_cluster_end[member_idx] = cur_end;
-            }
-            cluster_id += 1;
-        }
-
-        // Build output in sorted order (contig, start, end) like merge does
-        // We already have all_rows indexed, and groups are sorted by contig
-        // Re-walk in sorted order to emit rows
-        let mut contig_builder = StringBuilder::with_capacity(n_rows, n_rows * 4);
+        let mut contig_builder = StringBuilder::with_capacity(n_rows, contig_bytes);
         let mut start_builder = Int64Builder::with_capacity(n_rows);
         let mut end_builder = Int64Builder::with_capacity(n_rows);
         let mut cluster_builder = Int64Builder::with_capacity(n_rows);
         let mut cluster_start_builder = Int64Builder::with_capacity(n_rows);
         let mut cluster_end_builder = Int64Builder::with_capacity(n_rows);
 
-        for contig in &contigs {
-            let intervals = groups.get(contig.as_str()).unwrap();
-            // intervals are already sorted by (start, end)
-            for &(s, e, idx) in intervals {
-                contig_builder.append_value(contig);
-                start_builder.append_value(s);
-                end_builder.append_value(e);
-                cluster_builder.append_value(row_cluster_id[idx]);
-                cluster_start_builder.append_value(row_cluster_start[idx]);
-                cluster_end_builder.append_value(row_cluster_end[idx]);
+        let mut cluster_id: i64 = 0;
+
+        for group_idx in group_order {
+            let group = &mut groups[group_idx];
+            let intervals = &mut group.intervals;
+            intervals.sort_unstable();
+
+            if intervals.is_empty() {
+                continue;
             }
+
+            let mut cluster_start_idx = 0usize;
+            let mut cur_start = intervals[0].0;
+            let mut cur_end = intervals[0].1;
+
+            for i in 1..intervals.len() {
+                let (s, e) = intervals[i];
+                let boundary = cur_end.saturating_add(min_dist);
+                let merge_condition = if strict { s < boundary } else { s <= boundary };
+
+                if merge_condition {
+                    if e > cur_end {
+                        cur_end = e;
+                    }
+                } else {
+                    for &(cs, ce) in &intervals[cluster_start_idx..i] {
+                        contig_builder.append_value(group.contig.as_ref());
+                        start_builder.append_value(cs);
+                        end_builder.append_value(ce);
+                        cluster_builder.append_value(cluster_id);
+                        cluster_start_builder.append_value(cur_start);
+                        cluster_end_builder.append_value(cur_end);
+                    }
+                    cluster_id += 1;
+                    cluster_start_idx = i;
+                    cur_start = s;
+                    cur_end = e;
+                }
+            }
+
+            for &(cs, ce) in &intervals[cluster_start_idx..] {
+                contig_builder.append_value(group.contig.as_ref());
+                start_builder.append_value(cs);
+                end_builder.append_value(ce);
+                cluster_builder.append_value(cluster_id);
+                cluster_start_builder.append_value(cur_start);
+                cluster_end_builder.append_value(cur_end);
+            }
+            cluster_id += 1;
         }
 
         let batch = RecordBatch::try_new(

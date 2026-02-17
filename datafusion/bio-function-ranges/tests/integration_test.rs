@@ -2227,6 +2227,58 @@ async fn test_cluster_udtf_strict() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_cluster_udtf_large_min_dist_no_overflow() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start BIGINT, pos_end BIGINT) AS VALUES
+        ('a', CAST(9223372036854775800 AS BIGINT), CAST(9223372036854775806 AS BIGINT)),
+        ('a', CAST(9223372036854775807 AS BIGINT), CAST(9223372036854775807 AS BIGINT))
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM cluster('intervals', 100) ORDER BY pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+    let batch = &result[0];
+
+    let cluster = batch
+        .column_by_name("cluster")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let cluster_start = batch
+        .column_by_name("cluster_start")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let cluster_end = batch
+        .column_by_name("cluster_end")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    assert_eq!(cluster.value(0), 0);
+    assert_eq!(cluster.value(1), 0);
+    assert_eq!(cluster_start.value(0), 9_223_372_036_854_775_800);
+    assert_eq!(cluster_start.value(1), 9_223_372_036_854_775_800);
+    assert_eq!(cluster_end.value(0), i64::MAX);
+    assert_eq!(cluster_end.value(1), i64::MAX);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_cluster_udtf_custom_columns() -> Result<()> {
     let ctx = create_bio_session();
 
