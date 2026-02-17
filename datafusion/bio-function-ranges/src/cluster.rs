@@ -8,17 +8,22 @@ use datafusion::arrow::array::{Int64Builder, RecordBatch, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
-use datafusion::datasource::{MemTable, TableProvider, TableType};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::datasource::{TableProvider, TableType};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_plan::common::collect;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+};
 use datafusion::prelude::{Expr, SessionContext};
+use futures::stream::{BoxStream, once};
 
 use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
-
-struct ContigGroup {
-    contig: Arc<str>,
-    intervals: Vec<(i64, i64)>,
-}
 
 pub struct ClusterProvider {
     session: Arc<SessionContext>,
@@ -82,125 +87,253 @@ impl TableProvider for ClusterProvider {
 
     async fn scan(
         &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let df = self.session.table(&self.table).await?;
-        let batches = df.collect().await?;
+        let target_partitions = self
+            .session
+            .state()
+            .config()
+            .options()
+            .execution
+            .target_partitions;
 
-        // Group intervals by contig while owning each contig string only once.
-        let mut groups: Vec<ContigGroup> = Vec::new();
-        let mut group_idx_by_contig: AHashMap<Arc<str>, usize> = AHashMap::default();
-        let mut n_rows = 0usize;
-        let mut contig_bytes = 0usize;
+        let input_df = self.session.table(&self.table).await?.select_columns(&[
+            &self.columns.0,
+            &self.columns.1,
+            &self.columns.2,
+        ])?;
+        let input_plan = input_df.create_physical_plan().await?;
+        let input_plan: Arc<dyn ExecutionPlan> = if target_partitions > 1 {
+            Arc::new(RepartitionExec::try_new(
+                input_plan,
+                Partitioning::Hash(
+                    vec![Arc::new(Column::new(self.columns.0.as_str(), 0))],
+                    target_partitions,
+                ),
+            )?)
+        } else {
+            input_plan
+        };
+        let output_partitions = input_plan.output_partitioning().partition_count();
 
-        for batch in &batches {
-            n_rows += batch.num_rows();
-            let (contig_arr, start_arr, end_arr) =
-                get_join_col_arrays(batch, (&self.columns.0, &self.columns.1, &self.columns.2))?;
-            let start_resolved = start_arr.resolve_i64()?;
-            let end_resolved = end_arr.resolve_i64()?;
-            let starts = &*start_resolved;
-            let ends = &*end_resolved;
-            for i in 0..batch.num_rows() {
-                let contig = contig_arr.value(i);
-                contig_bytes += contig.len();
+        Ok(Arc::new(ClusterExec {
+            schema: self.schema.clone(),
+            input: input_plan,
+            columns: Arc::new(self.columns.clone()),
+            min_dist: self.min_dist,
+            strict: self.filter_op == FilterOp::Strict,
+            cache: PlanProperties::new(
+                EquivalenceProperties::new(self.schema.clone()),
+                Partitioning::UnknownPartitioning(output_partitions),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ),
+        }))
+    }
+}
 
-                if let Some(&group_idx) = group_idx_by_contig.get(contig) {
-                    groups[group_idx].intervals.push((starts[i], ends[i]));
-                } else {
-                    let contig_key: Arc<str> = Arc::from(contig);
-                    let group_idx = groups.len();
-                    group_idx_by_contig.insert(Arc::clone(&contig_key), group_idx);
-                    groups.push(ContigGroup {
-                        contig: contig_key,
-                        intervals: vec![(starts[i], ends[i])],
-                    });
-                }
-            }
+#[derive(Debug)]
+struct ClusterExec {
+    schema: SchemaRef,
+    input: Arc<dyn ExecutionPlan>,
+    columns: Arc<(String, String, String)>,
+    min_dist: i64,
+    strict: bool,
+    cache: PlanProperties,
+}
+
+impl DisplayAs for ClusterExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ClusterExec: min_dist={}, strict={}",
+            self.min_dist, self.strict
+        )
+    }
+}
+
+impl ExecutionPlan for ClusterExec {
+    fn name(&self) -> &str {
+        "ClusterExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "ClusterExec expects exactly one child plan".to_string(),
+            ));
         }
 
-        let min_dist = self.min_dist;
-        let strict = self.filter_op == FilterOp::Strict;
+        Ok(Arc::new(Self {
+            schema: self.schema.clone(),
+            input: Arc::clone(&children[0]),
+            columns: Arc::clone(&self.columns),
+            min_dist: self.min_dist,
+            strict: self.strict,
+            cache: PlanProperties::new(
+                EquivalenceProperties::new(self.schema.clone()),
+                Partitioning::UnknownPartitioning(
+                    children[0].output_partitioning().partition_count(),
+                ),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ),
+        }))
+    }
 
-        // Sort contigs for deterministic output
-        let mut group_order: Vec<usize> = (0..groups.len()).collect();
-        group_order.sort_unstable_by(|&a, &b| groups[a].contig.cmp(&groups[b].contig));
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        get_cluster_stream(
+            Arc::clone(&self.input),
+            self.schema.clone(),
+            Arc::clone(&self.columns),
+            self.min_dist,
+            self.strict,
+            partition,
+            context,
+        )
+    }
+}
 
-        let mut contig_builder = StringBuilder::with_capacity(n_rows, contig_bytes);
-        let mut start_builder = Int64Builder::with_capacity(n_rows);
-        let mut end_builder = Int64Builder::with_capacity(n_rows);
-        let mut cluster_builder = Int64Builder::with_capacity(n_rows);
-        let mut cluster_start_builder = Int64Builder::with_capacity(n_rows);
-        let mut cluster_end_builder = Int64Builder::with_capacity(n_rows);
+fn get_cluster_stream(
+    input_plan: Arc<dyn ExecutionPlan>,
+    schema: SchemaRef,
+    columns: Arc<(String, String, String)>,
+    min_dist: i64,
+    strict: bool,
+    partition: usize,
+    context: Arc<TaskContext>,
+) -> Result<SendableRecordBatchStream> {
+    let schema_for_closure = schema.clone();
+    let once_stream = once(async move {
+        let partition_stream = input_plan.execute(partition, context)?;
+        let batches = collect(partition_stream).await?;
+        build_cluster_batch(&batches, &schema_for_closure, &columns, min_dist, strict)
+    });
 
-        let mut cluster_id: i64 = 0;
+    let adapted_stream =
+        RecordBatchStreamAdapter::new(schema, Box::pin(once_stream) as BoxStream<'_, _>);
+    Ok(Box::pin(adapted_stream))
+}
 
-        for group_idx in group_order {
-            let group = &mut groups[group_idx];
-            let intervals = &mut group.intervals;
-            intervals.sort_unstable();
+fn build_cluster_batch(
+    batches: &[RecordBatch],
+    schema: &SchemaRef,
+    columns: &(String, String, String),
+    min_dist: i64,
+    strict: bool,
+) -> Result<RecordBatch> {
+    let mut groups: AHashMap<String, Vec<(i64, i64)>> = AHashMap::default();
+    let mut n_rows = 0usize;
+    let mut contig_bytes = 0usize;
 
-            if intervals.is_empty() {
-                continue;
-            }
+    for batch in batches {
+        n_rows += batch.num_rows();
+        let (contig_arr, start_arr, end_arr) =
+            get_join_col_arrays(batch, (&columns.0, &columns.1, &columns.2))?;
+        let start_resolved = start_arr.resolve_i64()?;
+        let end_resolved = end_arr.resolve_i64()?;
+        let starts = &*start_resolved;
+        let ends = &*end_resolved;
+        for i in 0..batch.num_rows() {
+            let contig = contig_arr.value(i);
+            contig_bytes += contig.len();
+            groups
+                .entry(contig.to_string())
+                .or_default()
+                .push((starts[i], ends[i]));
+        }
+    }
 
-            let mut cluster_start_idx = 0usize;
-            let mut cur_start = intervals[0].0;
-            let mut cur_end = intervals[0].1;
+    let mut contigs: Vec<String> = groups.keys().cloned().collect();
+    contigs.sort_unstable();
 
-            for i in 1..intervals.len() {
-                let (s, e) = intervals[i];
-                let boundary = cur_end.saturating_add(min_dist);
-                let merge_condition = if strict { s < boundary } else { s <= boundary };
+    let mut contig_builder = StringBuilder::with_capacity(n_rows, contig_bytes);
+    let mut start_builder = Int64Builder::with_capacity(n_rows);
+    let mut end_builder = Int64Builder::with_capacity(n_rows);
+    let mut cluster_builder = Int64Builder::with_capacity(n_rows);
+    let mut cluster_start_builder = Int64Builder::with_capacity(n_rows);
+    let mut cluster_end_builder = Int64Builder::with_capacity(n_rows);
 
-                if merge_condition {
-                    if e > cur_end {
-                        cur_end = e;
-                    }
-                } else {
-                    for &(cs, ce) in &intervals[cluster_start_idx..i] {
-                        contig_builder.append_value(group.contig.as_ref());
-                        start_builder.append_value(cs);
-                        end_builder.append_value(ce);
-                        cluster_builder.append_value(cluster_id);
-                        cluster_start_builder.append_value(cur_start);
-                        cluster_end_builder.append_value(cur_end);
-                    }
-                    cluster_id += 1;
-                    cluster_start_idx = i;
-                    cur_start = s;
+    let mut cluster_id: i64 = 0;
+
+    for contig in &contigs {
+        let intervals = groups.get_mut(contig.as_str()).unwrap();
+        intervals.sort_unstable();
+        if intervals.is_empty() {
+            continue;
+        }
+
+        let mut cluster_start_idx = 0usize;
+        let mut cur_start = intervals[0].0;
+        let mut cur_end = intervals[0].1;
+
+        for i in 1..intervals.len() {
+            let (s, e) = intervals[i];
+            let boundary = cur_end.saturating_add(min_dist);
+            let merge_condition = if strict { s < boundary } else { s <= boundary };
+            if merge_condition {
+                if e > cur_end {
                     cur_end = e;
                 }
+            } else {
+                for &(cs, ce) in &intervals[cluster_start_idx..i] {
+                    contig_builder.append_value(contig);
+                    start_builder.append_value(cs);
+                    end_builder.append_value(ce);
+                    cluster_builder.append_value(cluster_id);
+                    cluster_start_builder.append_value(cur_start);
+                    cluster_end_builder.append_value(cur_end);
+                }
+                cluster_id += 1;
+                cluster_start_idx = i;
+                cur_start = s;
+                cur_end = e;
             }
-
-            for &(cs, ce) in &intervals[cluster_start_idx..] {
-                contig_builder.append_value(group.contig.as_ref());
-                start_builder.append_value(cs);
-                end_builder.append_value(ce);
-                cluster_builder.append_value(cluster_id);
-                cluster_start_builder.append_value(cur_start);
-                cluster_end_builder.append_value(cur_end);
-            }
-            cluster_id += 1;
         }
 
-        let batch = RecordBatch::try_new(
-            self.schema.clone(),
-            vec![
-                Arc::new(contig_builder.finish()),
-                Arc::new(start_builder.finish()),
-                Arc::new(end_builder.finish()),
-                Arc::new(cluster_builder.finish()),
-                Arc::new(cluster_start_builder.finish()),
-                Arc::new(cluster_end_builder.finish()),
-            ],
-        )
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-
-        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
-        mem_table.scan(state, projection, filters, limit).await
+        for &(cs, ce) in &intervals[cluster_start_idx..] {
+            contig_builder.append_value(contig);
+            start_builder.append_value(cs);
+            end_builder.append_value(ce);
+            cluster_builder.append_value(cluster_id);
+            cluster_start_builder.append_value(cur_start);
+            cluster_end_builder.append_value(cur_end);
+        }
+        cluster_id += 1;
     }
+
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(contig_builder.finish()),
+            Arc::new(start_builder.finish()),
+            Arc::new(end_builder.finish()),
+            Arc::new(cluster_builder.finish()),
+            Arc::new(cluster_start_builder.finish()),
+            Arc::new(cluster_end_builder.finish()),
+        ],
+    )
+    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }

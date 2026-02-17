@@ -426,6 +426,26 @@ async fn init_ranges_tables(ctx: &SessionContext) -> Result<()> {
     Ok(())
 }
 
+fn create_bio_session_with_target_partitions(target_partitions: usize) -> SessionContext {
+    let config = SessionConfig::from(ConfigOptions::new())
+        .with_option_extension(BioConfig::default())
+        .with_information_schema(true)
+        .with_repartition_joins(false)
+        .with_target_partitions(target_partitions);
+    let ctx = SessionContext::new_with_bio(config);
+    register_ranges_functions(&ctx);
+    ctx
+}
+
+async fn collect_udtf_query_with_partitions(
+    target_partitions: usize,
+    query: &str,
+) -> Result<Vec<RecordBatch>> {
+    let ctx = create_bio_session_with_target_partitions(target_partitions);
+    init_ranges_tables(&ctx).await?;
+    ctx.sql(query).await?.collect().await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[rstest::rstest]
 async fn test_count_overlaps(ctx: SessionContext) -> Result<()> {
@@ -3084,5 +3104,41 @@ async fn test_subtract_udtf_overlapping_right() -> Result<()> {
     ];
 
     assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_range_udtfs_target_partitions_invariant() -> Result<()> {
+    let cases = [
+        (
+            "merge",
+            "SELECT * FROM merge('reads') ORDER BY contig, pos_start, pos_end, n_intervals",
+        ),
+        (
+            "cluster",
+            "SELECT * FROM cluster('reads') ORDER BY contig, pos_start, pos_end, cluster",
+        ),
+        (
+            "complement",
+            "SELECT * FROM complement('reads', 'targets') ORDER BY contig, pos_start, pos_end",
+        ),
+        (
+            "subtract",
+            "SELECT * FROM subtract('reads', 'targets') ORDER BY contig, pos_start, pos_end",
+        ),
+    ];
+
+    for (name, query) in cases {
+        let result_1 = collect_udtf_query_with_partitions(1, query).await?;
+        let result_4 = collect_udtf_query_with_partitions(4, query).await?;
+
+        let formatted_1 = pretty_format_batches(&result_1)?.to_string();
+        let formatted_4 = pretty_format_batches(&result_4)?.to_string();
+        assert_eq!(
+            formatted_1, formatted_4,
+            "partition-invariance failed for {name}"
+        );
+    }
+
     Ok(())
 }
