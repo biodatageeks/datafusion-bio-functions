@@ -29,12 +29,36 @@ pub enum PosArray<'a> {
 }
 
 impl PosArray<'_> {
-    pub fn value(&self, i: usize) -> i32 {
+    pub fn value(&self, i: usize) -> Result<i32> {
         match self {
-            PosArray::Int32(arr) => arr.value(i),
-            PosArray::Int64(arr) => arr.value(i) as i32,
-            PosArray::UInt32(arr) => arr.value(i) as i32,
-            PosArray::UInt64(arr) => arr.value(i) as i32,
+            PosArray::Int32(arr) => Ok(arr.value(i)),
+            PosArray::Int64(arr) => {
+                let v = arr.value(i);
+                i32::try_from(v).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "coordinate value {v} at row {i} overflows i32 (max {})",
+                        i32::MAX
+                    ))
+                })
+            }
+            PosArray::UInt32(arr) => {
+                let v = arr.value(i);
+                i32::try_from(v).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "coordinate value {v} at row {i} overflows i32 (max {})",
+                        i32::MAX
+                    ))
+                })
+            }
+            PosArray::UInt64(arr) => {
+                let v = arr.value(i);
+                i32::try_from(v).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "coordinate value {v} at row {i} overflows i32 (max {})",
+                        i32::MAX
+                    ))
+                })
+            }
         }
     }
 }
