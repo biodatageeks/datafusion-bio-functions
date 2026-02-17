@@ -86,7 +86,7 @@ pub fn get_coverage(tree: &COITree<(), u32>, start: i32, end: i32) -> i32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn get_stream(
+pub fn get_stream(
     right_plan: Arc<dyn ExecutionPlan>,
     trees: Arc<FnvHashMap<String, COITree<(), u32>>>,
     new_schema: SchemaRef,
@@ -97,7 +97,7 @@ pub async fn get_stream(
     context: Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
     let partition_stream = right_plan.execute(partition, context)?;
-    let new_schema_out = new_schema.clone();
+    let schema_for_closure = new_schema.clone();
     let strict_filter = filter_op == FilterOp::Strict;
 
     let iter = partition_stream.map(move |rb| match rb {
@@ -140,14 +140,14 @@ pub async fn get_stream(
             let mut columns = Vec::with_capacity(rb.num_columns() + 1);
             columns.extend_from_slice(rb.columns());
             columns.push(count_arr);
-            RecordBatch::try_new(new_schema.clone(), columns)
+            RecordBatch::try_new(schema_for_closure.clone(), columns)
                 .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))
         }
         Err(e) => Err(e),
     });
 
     let adapted_stream =
-        RecordBatchStreamAdapter::new(new_schema_out, Box::pin(iter) as BoxStream<_>);
+        RecordBatchStreamAdapter::new(new_schema, Box::pin(iter) as BoxStream<_>);
     Ok(Box::pin(adapted_stream))
 }
 

@@ -12,13 +12,11 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, SessionContext};
 use fnv::FnvHashMap;
-use futures::TryStreamExt;
 
 use crate::filter_op::FilterOp;
 use crate::interval_tree::{build_coitree_from_batches, get_stream};
@@ -228,7 +226,7 @@ impl ExecutionPlan for CountOverlapsExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let fut = get_stream(
+        get_stream(
             Arc::clone(&self.right),
             self.trees.clone(),
             self.schema.clone(),
@@ -237,9 +235,6 @@ impl ExecutionPlan for CountOverlapsExec {
             self.coverage,
             partition,
             context,
-        );
-        let stream = futures::stream::once(fut).try_flatten();
-        let schema = self.schema.clone();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        )
     }
 }
