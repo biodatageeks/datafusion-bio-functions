@@ -6,13 +6,16 @@ use async_trait::async_trait;
 use coitrees::COITree;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::Session;
-use datafusion::common::Result;
+use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+};
 use datafusion::prelude::{Expr, SessionContext};
 use fnv::FnvHashMap;
 use futures::TryStreamExt;
@@ -108,29 +111,44 @@ impl TableProvider for CountOverlapsProvider {
             .options()
             .execution
             .target_partitions;
+
         let left_table = self
             .session
             .table(self.left_table.clone())
             .await?
+            .select_columns(&[&self.columns_1.0, &self.columns_1.1, &self.columns_1.2])?
             .collect()
             .await?;
+
         let trees = Arc::new(build_coitree_from_batches(
             left_table,
             self.columns_1.clone(),
             self.coverage,
         )?);
+
+        let right_df = self.session.table(self.right_table.clone()).await?;
+        let right_plan = right_df.create_physical_plan().await?;
+        let right_plan: Arc<dyn ExecutionPlan> =
+            if right_plan.output_partitioning().partition_count() == target_partitions {
+                right_plan
+            } else {
+                Arc::new(RepartitionExec::try_new(
+                    right_plan,
+                    Partitioning::RoundRobinBatch(target_partitions),
+                )?)
+            };
+        let output_partitions = right_plan.output_partitioning().partition_count();
+
         Ok(Arc::new(CountOverlapsExec {
             schema: self.schema().clone(),
-            session: Arc::clone(&self.session),
             trees,
-            right_table: self.right_table.clone(),
-            columns_1: self.columns_1.clone(),
+            right: right_plan,
             columns_2: self.columns_2.clone(),
             filter_op: self.filter_op.clone(),
             coverage: self.coverage,
             cache: PlanProperties::new(
                 EquivalenceProperties::new(self.schema().clone()),
-                Partitioning::UnknownPartitioning(target_partitions),
+                Partitioning::UnknownPartitioning(output_partitions),
                 EmissionType::Final,
                 Boundedness::Bounded,
             ),
@@ -140,10 +158,8 @@ impl TableProvider for CountOverlapsProvider {
 
 struct CountOverlapsExec {
     schema: SchemaRef,
-    session: Arc<SessionContext>,
     trees: Arc<FnvHashMap<String, COITree<(), u32>>>,
-    right_table: String,
-    columns_1: (String, String, String),
+    right: Arc<dyn ExecutionPlan>,
     columns_2: (String, String, String),
     filter_op: FilterOp,
     coverage: bool,
@@ -176,14 +192,35 @@ impl ExecutionPlan for CountOverlapsExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
+        vec![&self.right]
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "CountOverlapsExec expects exactly one child plan".to_string(),
+            ));
+        }
+
+        Ok(Arc::new(CountOverlapsExec {
+            schema: self.schema.clone(),
+            trees: Arc::clone(&self.trees),
+            right: Arc::clone(&children[0]),
+            columns_2: self.columns_2.clone(),
+            filter_op: self.filter_op.clone(),
+            coverage: self.coverage,
+            cache: PlanProperties::new(
+                EquivalenceProperties::new(self.schema.clone()),
+                Partitioning::UnknownPartitioning(
+                    children[0].output_partitioning().partition_count(),
+                ),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ),
+        }))
     }
 
     fn execute(
@@ -192,15 +229,12 @@ impl ExecutionPlan for CountOverlapsExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let fut = get_stream(
-            Arc::clone(&self.session),
+            Arc::clone(&self.right),
             self.trees.clone(),
-            self.right_table.clone(),
             self.schema.clone(),
-            self.columns_1.clone(),
             self.columns_2.clone(),
             self.filter_op.clone(),
             self.coverage,
-            self.cache.partitioning.partition_count(),
             partition,
             context,
         );

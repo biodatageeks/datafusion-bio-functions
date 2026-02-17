@@ -60,10 +60,10 @@ fn get_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a dyn std::any
 /// Extract contig, start, and end column arrays from a [`RecordBatch`].
 ///
 /// Returns an error if a column is missing or has an unsupported data type.
-pub fn get_join_col_arrays(
-    batch: &RecordBatch,
-    columns: (String, String, String),
-) -> Result<(ContigArray<'_>, PosArray<'_>, PosArray<'_>)> {
+pub fn get_join_col_arrays<'a>(
+    batch: &'a RecordBatch,
+    columns: (&str, &str, &str),
+) -> Result<(ContigArray<'a>, PosArray<'a>, PosArray<'a>)> {
     let contig_col = batch.column_by_name(&columns.0).ok_or_else(|| {
         DataFusionError::Plan(format!(
             "contig column '{}' not found in batch with columns: {:?}",

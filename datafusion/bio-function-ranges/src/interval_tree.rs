@@ -6,11 +6,8 @@ use datafusion::arrow::array::{Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::prelude::SessionContext;
 use fnv::FnvHashMap;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -27,7 +24,7 @@ pub fn merge_intervals(mut intervals: Vec<Interval<()>>) -> Vec<Interval<()>> {
 
     intervals.sort_by(|a, b| a.first.cmp(&b.first));
 
-    let mut merged = Vec::new();
+    let mut merged = Vec::with_capacity(intervals.len());
     let mut current = intervals[0];
 
     for interval in intervals.into_iter().skip(1) {
@@ -51,16 +48,20 @@ pub fn build_coitree_from_batches(
     let mut nodes = IntervalHashMap::default();
 
     for batch in batches {
-        let (contig_arr, start_arr, end_arr) = get_join_col_arrays(&batch, columns.clone())?;
+        let (contig_arr, start_arr, end_arr) =
+            get_join_col_arrays(&batch, (&columns.0, &columns.1, &columns.2))?;
 
         for i in 0..batch.num_rows() {
-            let contig = contig_arr.value(i).to_string();
+            let contig = contig_arr.value(i);
             let pos_start = start_arr.value(i);
             let pos_end = end_arr.value(i);
-            nodes
-                .entry(contig)
-                .or_default()
-                .push(Interval::new(pos_start, pos_end, ()));
+            let interval = Interval::new(pos_start, pos_end, ());
+
+            if let Some(seqname_nodes) = nodes.get_mut(contig) {
+                seqname_nodes.push(interval);
+            } else {
+                nodes.insert(contig.to_owned(), vec![interval]);
+            }
         }
     }
 
@@ -86,49 +87,42 @@ pub fn get_coverage(tree: &COITree<(), u32>, start: i32, end: i32) -> i32 {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn get_stream(
-    session: Arc<SessionContext>,
+    right_plan: Arc<dyn ExecutionPlan>,
     trees: Arc<FnvHashMap<String, COITree<(), u32>>>,
-    right_table: String,
     new_schema: SchemaRef,
-    _columns_1: (String, String, String),
     columns_2: (String, String, String),
     filter_op: FilterOp,
     coverage: bool,
-    target_partitions: usize,
     partition: usize,
     context: Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
-    let right_table = session.table(right_table);
-    let table_stream = right_table.await?;
-    let plan = table_stream.create_physical_plan().await?;
-    let repartition_stream =
-        RepartitionExec::try_new(plan, Partitioning::RoundRobinBatch(target_partitions))?;
-
-    let partition_stream = repartition_stream.execute(partition, context)?;
+    let partition_stream = right_plan.execute(partition, context)?;
     let new_schema_out = new_schema.clone();
+    let (contig_col, start_col, end_col) = columns_2;
+    let strict_filter = filter_op == FilterOp::Strict;
 
     let iter = partition_stream.map(move |rb| match rb {
         Ok(rb) => {
-            let (contig, pos_start, pos_end) = get_join_col_arrays(&rb, columns_2.clone())?;
+            let (contig, pos_start, pos_end) =
+                get_join_col_arrays(&rb, (&contig_col, &start_col, &end_col))?;
             let mut count_arr = Vec::with_capacity(rb.num_rows());
             let num_rows = rb.num_rows();
             for i in 0..num_rows {
-                let contig = contig.value(i).to_string();
-                let pos_start = pos_start.value(i);
-                let pos_end = pos_end.value(i);
-                let count = match trees.get(&contig) {
+                let contig = contig.value(i);
+                let mut query_start = pos_start.value(i);
+                let mut query_end = pos_end.value(i);
+                if strict_filter {
+                    query_start += 1;
+                    query_end -= 1;
+                }
+
+                let count = match trees.get(contig) {
                     None => 0,
                     Some(tree) => {
                         if coverage {
-                            if filter_op == FilterOp::Strict {
-                                get_coverage(tree, pos_start + 1, pos_end - 1)
-                            } else {
-                                get_coverage(tree, pos_start, pos_end)
-                            }
-                        } else if filter_op == FilterOp::Strict {
-                            tree.query_count(pos_start + 1, pos_end - 1) as i32
+                            get_coverage(tree, query_start, query_end)
                         } else {
-                            tree.query_count(pos_start, pos_end) as i32
+                            tree.query_count(query_start, query_end) as i32
                         }
                     }
                 };
