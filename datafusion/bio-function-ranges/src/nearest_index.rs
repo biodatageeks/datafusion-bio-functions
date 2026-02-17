@@ -23,7 +23,6 @@ pub struct NearestIntervalIndex {
     tree: COITree<Position, u32>,
     by_start: Vec<Interval<Position>>,
     by_end: Vec<Interval<Position>>,
-    by_position: FnvHashMap<Position, IntervalMeta>,
 }
 
 impl std::fmt::Debug for NearestIntervalIndex {
@@ -55,27 +54,12 @@ impl NearestIntervalIndex {
                 .then_with(|| a.metadata.cmp(&b.metadata))
         });
 
-        let by_position = by_start
-            .iter()
-            .map(|r| {
-                (
-                    r.metadata,
-                    IntervalMeta {
-                        start: r.first,
-                        end: r.last,
-                        position: r.metadata,
-                    },
-                )
-            })
-            .collect::<FnvHashMap<_, _>>();
-
         let tree = COITree::new(by_start.iter());
 
         Self {
             tree,
             by_start,
             by_end,
-            by_position,
         }
     }
 
@@ -91,15 +75,13 @@ impl NearestIntervalIndex {
         if include_overlaps {
             let mut best_overlap: Option<IntervalMeta> = None;
             self.tree.query(start, end, |node| {
-                let pos = extract_coitree_position(node);
-                if let Some(meta) = self.by_position.get(&pos) {
-                    if best_overlap
-                        .as_ref()
-                        .map(|best| cmp_interval_meta(meta, best).is_lt())
-                        .unwrap_or(true)
-                    {
-                        best_overlap = Some(*meta);
-                    }
+                let meta = extract_coitree_meta(node);
+                if best_overlap
+                    .as_ref()
+                    .map(|best| cmp_interval_meta(&meta, best).is_lt())
+                    .unwrap_or(true)
+                {
+                    best_overlap = Some(meta);
                 }
             });
             if let Some(best) = best_overlap {
@@ -134,10 +116,7 @@ impl NearestIntervalIndex {
         if include_overlaps {
             let mut overlaps = Vec::<IntervalMeta>::new();
             self.tree.query(start, end, |node| {
-                let pos = extract_coitree_position(node);
-                if let Some(meta) = self.by_position.get(&pos) {
-                    overlaps.push(*meta);
-                }
+                overlaps.push(extract_coitree_meta(node));
             });
             overlaps.sort_by(cmp_interval_meta);
             for m in overlaps {
@@ -159,12 +138,12 @@ impl NearestIntervalIndex {
 
         while out.len() < k {
             let left_meta = if left_idx > 0 {
-                self.interval_meta(&self.by_end[left_idx - 1])
+                Some(interval_meta_from(&self.by_end[left_idx - 1]))
             } else {
                 None
             };
             let right_meta = if right_idx < self.by_start.len() {
-                self.interval_meta(&self.by_start[right_idx])
+                Some(interval_meta_from(&self.by_start[right_idx]))
             } else {
                 None
             };
@@ -206,12 +185,12 @@ impl NearestIntervalIndex {
         let right_idx = self.by_start.partition_point(|iv| iv.first <= end);
 
         let left = if left_idx > 0 {
-            self.interval_meta(&self.by_end[left_idx - 1])
+            Some(interval_meta_from(&self.by_end[left_idx - 1]))
         } else {
             None
         };
         let right = if right_idx < self.by_start.len() {
-            self.interval_meta(&self.by_start[right_idx])
+            Some(interval_meta_from(&self.by_start[right_idx]))
         } else {
             None
         };
@@ -229,9 +208,13 @@ impl NearestIntervalIndex {
             }
         }
     }
+}
 
-    fn interval_meta(&self, iv: &Interval<Position>) -> Option<IntervalMeta> {
-        self.by_position.get(&iv.metadata).copied()
+fn interval_meta_from(iv: &Interval<Position>) -> IntervalMeta {
+    IntervalMeta {
+        start: iv.first,
+        end: iv.last,
+        position: iv.metadata,
     }
 }
 
@@ -280,6 +263,31 @@ pub(crate) fn extract_coitree_position(node: &coitrees::IntervalNode<Position, u
     node.metadata
 }
 
+#[cfg(any(
+    all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(target_feature = "avx")
+    ),
+    all(
+        target_os = "macos",
+        target_arch = "x86_64",
+        not(target_feature = "avx")
+    ),
+    all(
+        target_os = "windows",
+        target_arch = "x86_64",
+        not(target_feature = "avx")
+    ),
+))]
+fn extract_coitree_meta(node: &coitrees::IntervalNode<Position, u32>) -> IntervalMeta {
+    IntervalMeta {
+        start: node.first,
+        end: node.last,
+        position: node.metadata,
+    }
+}
+
 /// for Apple Intel, Apple M1+(both optimized and not) and optimized (target-cpu=native) on Linux x64 and Linux aarch64
 #[cfg(any(
     all(target_os = "macos", target_arch = "aarch64"),
@@ -290,6 +298,21 @@ pub(crate) fn extract_coitree_position(node: &coitrees::IntervalNode<Position, u
 ))]
 pub(crate) fn extract_coitree_position(node: &coitrees::Interval<&Position>) -> Position {
     *node.metadata
+}
+
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "x86_64", target_feature = "avx"),
+    all(target_os = "linux", target_arch = "x86_64", target_feature = "avx"),
+    all(target_os = "linux", target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64", target_feature = "avx")
+))]
+fn extract_coitree_meta(node: &coitrees::Interval<&Position>) -> IntervalMeta {
+    IntervalMeta {
+        start: node.first,
+        end: node.last,
+        position: *node.metadata,
+    }
 }
 
 #[cfg(test)]

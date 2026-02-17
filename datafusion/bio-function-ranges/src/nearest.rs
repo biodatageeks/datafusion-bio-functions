@@ -288,44 +288,31 @@ fn get_nearest_stream(
             let (contig_arr, start_arr, end_arr) =
                 get_join_col_arrays(&rb, (&columns_2.0, &columns_2.1, &columns_2.2))?;
 
-            let mut left_indices = Vec::<u32>::new();
-            let mut validity = Vec::<bool>::new();
-            let mut right_indices = Vec::<u32>::new();
-            let mut nearest_buf = Vec::<usize>::with_capacity(k.max(1));
+            let estimate = rb.num_rows() * k.max(1);
+            let mut left_indices = Vec::<u32>::with_capacity(estimate);
+            let mut validity = Vec::<bool>::with_capacity(estimate);
+            let mut right_indices = Vec::<u32>::with_capacity(estimate);
 
-            for i in 0..rb.num_rows() {
-                let right_pos_u32 = u32::try_from(i).map_err(|_| {
-                    DataFusionError::Execution(format!(
-                        "right row index {i} exceeds UInt32 index capacity"
-                    ))
-                })?;
-                let contig = contig_arr.value(i);
-                let mut query_start = start_arr.value(i)?;
-                let mut query_end = end_arr.value(i)?;
+            if k == 1 {
+                for i in 0..rb.num_rows() {
+                    let right_pos_u32 = u32::try_from(i).map_err(|_| {
+                        DataFusionError::Execution(format!(
+                            "right row index {i} exceeds UInt32 index capacity"
+                        ))
+                    })?;
+                    let contig = contig_arr.value(i);
+                    let mut query_start = start_arr.value(i)?;
+                    let mut query_end = end_arr.value(i)?;
 
-                if strict_filter {
-                    query_start += 1;
-                    query_end -= 1;
-                }
+                    if strict_filter {
+                        query_start += 1;
+                        query_end -= 1;
+                    }
 
-                nearest_buf.clear();
-
-                if let Some(index) = indexes.get(contig) {
-                    index.nearest_k(
-                        query_start,
-                        query_end,
-                        k,
-                        include_overlaps,
-                        &mut nearest_buf,
-                    );
-                }
-
-                if nearest_buf.is_empty() {
-                    left_indices.push(0);
-                    validity.push(false);
-                    right_indices.push(right_pos_u32);
-                } else {
-                    for &pos in &nearest_buf {
+                    if let Some(pos) = indexes
+                        .get(contig)
+                        .and_then(|idx| idx.nearest_one(query_start, query_end, include_overlaps))
+                    {
                         let pos_u32 = u32::try_from(pos).map_err(|_| {
                             DataFusionError::Execution(format!(
                                 "left row index {pos} exceeds UInt32 index capacity"
@@ -334,6 +321,57 @@ fn get_nearest_stream(
                         left_indices.push(pos_u32);
                         validity.push(true);
                         right_indices.push(right_pos_u32);
+                    } else {
+                        left_indices.push(0);
+                        validity.push(false);
+                        right_indices.push(right_pos_u32);
+                    }
+                }
+            } else {
+                let mut nearest_buf = Vec::<usize>::with_capacity(k);
+
+                for i in 0..rb.num_rows() {
+                    let right_pos_u32 = u32::try_from(i).map_err(|_| {
+                        DataFusionError::Execution(format!(
+                            "right row index {i} exceeds UInt32 index capacity"
+                        ))
+                    })?;
+                    let contig = contig_arr.value(i);
+                    let mut query_start = start_arr.value(i)?;
+                    let mut query_end = end_arr.value(i)?;
+
+                    if strict_filter {
+                        query_start += 1;
+                        query_end -= 1;
+                    }
+
+                    nearest_buf.clear();
+
+                    if let Some(index) = indexes.get(contig) {
+                        index.nearest_k(
+                            query_start,
+                            query_end,
+                            k,
+                            include_overlaps,
+                            &mut nearest_buf,
+                        );
+                    }
+
+                    if nearest_buf.is_empty() {
+                        left_indices.push(0);
+                        validity.push(false);
+                        right_indices.push(right_pos_u32);
+                    } else {
+                        for &pos in &nearest_buf {
+                            let pos_u32 = u32::try_from(pos).map_err(|_| {
+                                DataFusionError::Execution(format!(
+                                    "left row index {pos} exceeds UInt32 index capacity"
+                                ))
+                            })?;
+                            left_indices.push(pos_u32);
+                            validity.push(true);
+                            right_indices.push(right_pos_u32);
+                        }
                     }
                 }
             }
