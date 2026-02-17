@@ -8,16 +8,27 @@ use datafusion::prelude::SessionContext;
 
 use crate::count_overlaps::CountOverlapsProvider;
 use crate::filter_op::FilterOp;
+use crate::merge::MergeProvider;
 use crate::nearest::NearestProvider;
+use crate::overlap::OverlapProvider;
 
 const DEFAULT_COLS: [&str; 3] = ["contig", "pos_start", "pos_end"];
 
 type ColTriple = (String, String, String);
 
 /// Extract a string literal from an Expr, returning an error with context on failure.
+///
+/// Rejects values containing backticks to prevent SQL injection in generated queries.
 fn extract_string_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<String> {
     match arg {
-        Expr::Literal(ScalarValue::Utf8(Some(val)), _) => Ok(val.clone()),
+        Expr::Literal(ScalarValue::Utf8(Some(val)), _) => {
+            if val.contains('`') {
+                return Err(DataFusionError::Plan(format!(
+                    "{fn_name}() {name} must not contain backtick characters, got: {val}"
+                )));
+            }
+            Ok(val.clone())
+        }
         other => Err(DataFusionError::Plan(format!(
             "{fn_name}() {name} must be a string literal, got: {other}"
         ))),
@@ -238,6 +249,201 @@ impl TableFunctionImpl for NearestTableFunction {
     }
 }
 
+/// Internal table function for overlap (all pairs of overlapping intervals).
+struct OverlapTableFunction {
+    session: Arc<SessionContext>,
+    name: &'static str,
+}
+
+impl std::fmt::Debug for OverlapTableFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}Function", self.name)
+    }
+}
+
+impl TableFunctionImpl for OverlapTableFunction {
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        if args.len() < 2 {
+            return Err(DataFusionError::Plan(format!(
+                "{}() requires at least 2 arguments: left_table and right_table names",
+                self.name
+            )));
+        }
+
+        let left_table = extract_string_arg(&args[0], "left_table", self.name)?;
+        let right_table = extract_string_arg(&args[1], "right_table", self.name)?;
+        let (cols_left, cols_right, filter_op) = parse_col_args(args, self.name)?;
+
+        let (left_schema, right_schema) = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                let left = handle.block_on(self.session.table(&left_table))?;
+                let right = handle.block_on(self.session.table(&right_table))?;
+                Ok::<_, DataFusionError>((
+                    left.schema().as_arrow().clone(),
+                    right.schema().as_arrow().clone(),
+                ))
+            }),
+            Err(_) => {
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let left = rt.block_on(self.session.table(&left_table))?;
+                let right = rt.block_on(self.session.table(&right_table))?;
+                Ok((
+                    left.schema().as_arrow().clone(),
+                    right.schema().as_arrow().clone(),
+                ))
+            }
+        }?;
+
+        Ok(Arc::new(OverlapProvider::new(
+            Arc::clone(&self.session),
+            left_table,
+            right_table,
+            left_schema,
+            right_schema,
+            vec![cols_left.0, cols_left.1, cols_left.2],
+            vec![cols_right.0, cols_right.1, cols_right.2],
+            filter_op,
+        )))
+    }
+}
+
+/// Internal table function for merge (merge overlapping intervals within a single table).
+struct MergeTableFunction {
+    session: Arc<SessionContext>,
+    name: &'static str,
+}
+
+impl std::fmt::Debug for MergeTableFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}Function", self.name)
+    }
+}
+
+impl TableFunctionImpl for MergeTableFunction {
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        if args.is_empty() {
+            return Err(DataFusionError::Plan(format!(
+                "{}() requires at least 1 argument: table name",
+                self.name
+            )));
+        }
+
+        let table = extract_string_arg(&args[0], "table", self.name)?;
+
+        // Parse optional min_dist and column args.
+        // Patterns:
+        //   merge('t')
+        //   merge('t', 10)
+        //   merge('t', 0, 'c', 's', 'e')
+        //   merge('t', 'c', 's', 'e')
+        //   merge('t', 0, 'c', 's', 'e', 'strict')
+        //   merge('t', 'c', 's', 'e', 'strict')
+        let extra = &args[1..];
+        let (min_dist, col_extra) = if extra.is_empty() {
+            (0i64, extra)
+        } else {
+            match &extra[0] {
+                Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
+                    if *v < 0 {
+                        return Err(DataFusionError::Plan(format!(
+                            "{}() min_dist must be >= 0, got {}",
+                            self.name, v
+                        )));
+                    }
+                    (*v, &extra[1..])
+                }
+                Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
+                    if *v < 0 {
+                        return Err(DataFusionError::Plan(format!(
+                            "{}() min_dist must be >= 0, got {}",
+                            self.name, v
+                        )));
+                    }
+                    (i64::from(*v), &extra[1..])
+                }
+                Expr::Literal(ScalarValue::UInt64(Some(v)), _) => (
+                    i64::try_from(*v).map_err(|_| {
+                        DataFusionError::Plan(format!(
+                            "{}() min_dist value {} does not fit i64",
+                            self.name, v
+                        ))
+                    })?,
+                    &extra[1..],
+                ),
+                Expr::Literal(ScalarValue::UInt32(Some(v)), _) => (i64::from(*v), &extra[1..]),
+                _ => (0i64, extra),
+            }
+        };
+
+        // col_extra now contains column names + optional filter_op
+        let (cols, filter_op) = parse_merge_col_args(col_extra, self.name)?;
+
+        Ok(Arc::new(MergeProvider::new(
+            Arc::clone(&self.session),
+            table,
+            cols,
+            min_dist,
+            filter_op,
+        )))
+    }
+}
+
+/// Parse column + filter_op arguments for merge (single table).
+///
+/// Supports:
+/// - No args: default columns, Weak
+/// - 3 args: column names
+/// - +1 optional 'strict'/'weak' at the end
+fn parse_merge_col_args(
+    extra: &[Expr],
+    fn_name: &str,
+) -> Result<((String, String, String), FilterOp)> {
+    if extra.is_empty() {
+        return Ok((
+            (
+                DEFAULT_COLS[0].to_string(),
+                DEFAULT_COLS[1].to_string(),
+                DEFAULT_COLS[2].to_string(),
+            ),
+            FilterOp::Weak,
+        ));
+    }
+
+    // Check for trailing filter_op argument
+    let (col_args, filter_op) =
+        if let Some(Expr::Literal(ScalarValue::Utf8(Some(val)), _)) = extra.last() {
+            match val.to_lowercase().as_str() {
+                "strict" => (&extra[..extra.len() - 1], FilterOp::Strict),
+                "weak" => (&extra[..extra.len() - 1], FilterOp::Weak),
+                _ => (extra, FilterOp::Weak),
+            }
+        } else {
+            (extra, FilterOp::Weak)
+        };
+
+    match col_args.len() {
+        0 => Ok((
+            (
+                DEFAULT_COLS[0].to_string(),
+                DEFAULT_COLS[1].to_string(),
+                DEFAULT_COLS[2].to_string(),
+            ),
+            filter_op,
+        )),
+        3 => {
+            let c0 = extract_string_arg(&col_args[0], "column name", fn_name)?;
+            let c1 = extract_string_arg(&col_args[1], "column name", fn_name)?;
+            let c2 = extract_string_arg(&col_args[2], "column name", fn_name)?;
+            Ok(((c0, c1, c2), filter_op))
+        }
+        n => Err(DataFusionError::Plan(format!(
+            "{fn_name}() expects 0 or 3 column name arguments (got {n}). \
+             Usage: {fn_name}('table' [, min_dist] [, col1, col2, col3] [, 'strict'|'weak'])"
+        ))),
+    }
+}
+
 impl TableFunctionImpl for RangeTableFunction {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
         if args.len() < 2 {
@@ -320,8 +526,22 @@ pub fn register_ranges_functions(ctx: &SessionContext) {
     ctx.register_udtf(
         "nearest",
         Arc::new(NearestTableFunction {
-            session,
+            session: Arc::clone(&session),
             name: "nearest",
+        }),
+    );
+    ctx.register_udtf(
+        "overlap",
+        Arc::new(OverlapTableFunction {
+            session: Arc::clone(&session),
+            name: "overlap",
+        }),
+    );
+    ctx.register_udtf(
+        "merge",
+        Arc::new(MergeTableFunction {
+            session,
+            name: "merge",
         }),
     );
 }
