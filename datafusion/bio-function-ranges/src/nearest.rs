@@ -293,6 +293,12 @@ fn get_nearest_stream(
             let mut validity = Vec::<bool>::with_capacity(estimate);
             let mut right_indices = Vec::<u32>::with_capacity(estimate);
 
+            // Cache last contig lookup to avoid redundant FNV hashing.
+            // Genomic data is coordinate-sorted, so consecutive rows almost
+            // always share the same contig.
+            let mut cached_contig: &str = "";
+            let mut cached_index: Option<&NearestIntervalIndex> = None;
+
             if k == 1 {
                 for i in 0..rb.num_rows() {
                     let right_pos_u32 = u32::try_from(i).map_err(|_| {
@@ -309,8 +315,15 @@ fn get_nearest_stream(
                         query_end -= 1;
                     }
 
-                    if let Some(pos) = indexes
-                        .get(contig)
+                    let index = if contig == cached_contig {
+                        cached_index
+                    } else {
+                        cached_contig = contig;
+                        cached_index = indexes.get(contig);
+                        cached_index
+                    };
+
+                    if let Some(pos) = index
                         .and_then(|idx| idx.nearest_one(query_start, query_end, include_overlaps))
                     {
                         let pos_u32 = u32::try_from(pos).map_err(|_| {
@@ -345,10 +358,18 @@ fn get_nearest_stream(
                         query_end -= 1;
                     }
 
+                    let index = if contig == cached_contig {
+                        cached_index
+                    } else {
+                        cached_contig = contig;
+                        cached_index = indexes.get(contig);
+                        cached_index
+                    };
+
                     nearest_buf.clear();
 
-                    if let Some(index) = indexes.get(contig) {
-                        index.nearest_k(
+                    if let Some(idx) = index {
+                        idx.nearest_k(
                             query_start,
                             query_end,
                             k,
@@ -418,21 +439,42 @@ fn build_nearest_indexes(
 ) -> Result<FnvHashMap<String, NearestIntervalIndex>> {
     let (contig_arr, start_arr, end_arr) = get_join_col_arrays(batch, columns)?;
 
-    let mut grouped = FnvHashMap::<String, Vec<IntervalRecord>>::default();
+    // Group by borrowed &str (zero-copy from Arrow array), only allocate
+    // one owned String per unique contig at the end.
+    let mut contig_to_idx = FnvHashMap::<&str, usize>::default();
+    let mut groups: Vec<Vec<IntervalRecord>> = Vec::new();
+
     for i in 0..batch.num_rows() {
         let contig = contig_arr.value(i);
-        grouped
-            .entry(contig.to_string())
-            .or_default()
-            .push(IntervalRecord {
-                start: start_arr.value(i)?,
-                end: end_arr.value(i)?,
-                position: i,
-            });
+        let idx = match contig_to_idx.get(contig) {
+            Some(&idx) => idx,
+            None => {
+                let idx = groups.len();
+                groups.push(Vec::new());
+                contig_to_idx.insert(contig, idx);
+                idx
+            }
+        };
+        groups[idx].push(IntervalRecord {
+            start: start_arr.value(i)?,
+            end: end_arr.value(i)?,
+            position: i,
+        });
     }
 
-    Ok(grouped
+    let mut contig_names: Vec<&str> = vec![""; groups.len()];
+    for (&contig, &idx) in &contig_to_idx {
+        contig_names[idx] = contig;
+    }
+
+    Ok(groups
         .into_iter()
-        .map(|(k, records)| (k, NearestIntervalIndex::from_records(records)))
+        .enumerate()
+        .map(|(idx, records)| {
+            (
+                contig_names[idx].to_string(),
+                NearestIntervalIndex::from_records(records),
+            )
+        })
         .collect())
 }
