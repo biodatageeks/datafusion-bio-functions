@@ -191,6 +191,14 @@ impl TableFunctionImpl for NearestTableFunction {
             }
         }
 
+        let mut compute_distance = true;
+        if let Some(arg) = args.get(arg_idx) {
+            if matches!(arg, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) {
+                compute_distance = extract_bool_arg(arg, "compute_distance", self.name)?;
+                arg_idx += 1;
+            }
+        }
+
         let (cols_left, cols_right, filter_op) = parse_col_args_extra(&args[arg_idx..], self.name)?;
 
         let (left_schema, right_schema) = match tokio::runtime::Handle::try_current() {
@@ -225,6 +233,7 @@ impl TableFunctionImpl for NearestTableFunction {
             filter_op,
             include_overlaps,
             k,
+            compute_distance,
         )))
     }
 }

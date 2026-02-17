@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use async_trait::async_trait;
-use datafusion::arrow::array::{Array, PrimitiveArray, RecordBatch};
+use datafusion::arrow::array::{Array, Int64Array, PrimitiveArray, RecordBatch};
 use datafusion::arrow::buffer::NullBuffer;
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef, UInt32Type};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt32Type};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
@@ -24,7 +24,7 @@ use futures::stream::BoxStream;
 
 use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
-use crate::nearest_index::{IntervalRecord, NearestIntervalIndex};
+use crate::nearest_index::{IntervalRecord, NearestIntervalIndex, candidate_distance};
 
 pub struct NearestProvider {
     session: Arc<SessionContext>,
@@ -35,6 +35,7 @@ pub struct NearestProvider {
     filter_op: FilterOp,
     include_overlaps: bool,
     k: usize,
+    compute_distance: bool,
     schema: SchemaRef,
 }
 
@@ -51,6 +52,7 @@ impl NearestProvider {
         filter_op: FilterOp,
         include_overlaps: bool,
         k: usize,
+        compute_distance: bool,
     ) -> Self {
         let mut fields = left_table_schema
             .fields()
@@ -70,6 +72,9 @@ impl NearestProvider {
                 true,
             ))
         }));
+        if compute_distance {
+            fields.push(Arc::new(Field::new("distance", DataType::Int64, true)));
+        }
         let schema = Arc::new(Schema::new(fields));
 
         Self {
@@ -90,6 +95,7 @@ impl NearestProvider {
             filter_op,
             include_overlaps,
             k,
+            compute_distance,
         }
     }
 }
@@ -98,8 +104,8 @@ impl Debug for NearestProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "NearestProvider {{ left: {}, right: {}, k: {}, include_overlaps: {} }}",
-            self.left_table, self.right_table, self.k, self.include_overlaps
+            "NearestProvider {{ left: {}, right: {}, k: {}, include_overlaps: {}, compute_distance: {} }}",
+            self.left_table, self.right_table, self.k, self.include_overlaps, self.compute_distance
         )
     }
 }
@@ -144,10 +150,12 @@ impl TableProvider for NearestProvider {
             left_batch: Arc::new(left_batch),
             indexes,
             right: right_plan,
+            columns_1: Arc::new(self.columns_1.clone()),
             columns_2: Arc::new(self.columns_2.clone()),
             filter_op: self.filter_op.clone(),
             include_overlaps: self.include_overlaps,
             k: self.k,
+            compute_distance: self.compute_distance,
             cache: PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(output_partitions),
@@ -164,10 +172,12 @@ struct NearestExec {
     left_batch: Arc<RecordBatch>,
     indexes: Arc<AHashMap<String, NearestIntervalIndex>>,
     right: Arc<dyn ExecutionPlan>,
+    columns_1: Arc<(String, String, String)>,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
     include_overlaps: bool,
     k: usize,
+    compute_distance: bool,
     cache: PlanProperties,
 }
 
@@ -175,8 +185,8 @@ impl DisplayAs for NearestExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "NearestExec: k={}, include_overlaps={}",
-            self.k, self.include_overlaps
+            "NearestExec: k={}, include_overlaps={}, compute_distance={}",
+            self.k, self.include_overlaps, self.compute_distance
         )
     }
 }
@@ -213,10 +223,12 @@ impl ExecutionPlan for NearestExec {
             left_batch: Arc::clone(&self.left_batch),
             indexes: Arc::clone(&self.indexes),
             right: Arc::clone(&children[0]),
+            columns_1: Arc::clone(&self.columns_1),
             columns_2: Arc::clone(&self.columns_2),
             filter_op: self.filter_op.clone(),
             include_overlaps: self.include_overlaps,
             k: self.k,
+            compute_distance: self.compute_distance,
             cache: PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(
@@ -238,10 +250,12 @@ impl ExecutionPlan for NearestExec {
             Arc::clone(&self.left_batch),
             Arc::clone(&self.indexes),
             self.schema.clone(),
+            Arc::clone(&self.columns_1),
             Arc::clone(&self.columns_2),
             self.filter_op.clone(),
             self.include_overlaps,
             self.k,
+            self.compute_distance,
             partition,
             context,
         )
@@ -254,16 +268,31 @@ fn get_nearest_stream(
     left_batch: Arc<RecordBatch>,
     indexes: Arc<AHashMap<String, NearestIntervalIndex>>,
     new_schema: SchemaRef,
+    columns_1: Arc<(String, String, String)>,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
     include_overlaps: bool,
     k: usize,
+    compute_distance: bool,
     partition: usize,
     context: Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
     let partition_stream = right_plan.execute(partition, context)?;
     let schema_for_closure = new_schema.clone();
     let strict_filter = filter_op == FilterOp::Strict;
+
+    // Resolve left-side position arrays once (shared across all batches).
+    // Convert to owned Vec<i32> so we don't borrow left_batch (which moves into closure).
+    let left_positions: Option<Arc<(Vec<i32>, Vec<i32>)>> = if compute_distance {
+        let (_, ls, le) =
+            get_join_col_arrays(&left_batch, (&columns_1.0, &columns_1.1, &columns_1.2))?;
+        Some(Arc::new((
+            ls.resolve()?.into_owned(),
+            le.resolve()?.into_owned(),
+        )))
+    } else {
+        None
+    };
 
     let iter = partition_stream.map(move |rb| match rb {
         Ok(rb) => {
@@ -282,6 +311,11 @@ fn get_nearest_stream(
             let mut left_indices = Vec::<u32>::with_capacity(estimate);
             let mut validity = Vec::<bool>::with_capacity(estimate);
             let mut right_indices = Vec::<u32>::with_capacity(estimate);
+            let mut distances: Option<Vec<Option<i64>>> = if compute_distance {
+                Some(Vec::with_capacity(estimate))
+            } else {
+                None
+            };
 
             // Cache last contig lookup to avoid redundant FNV hashing.
             // Genomic data is coordinate-sorted, so consecutive rows almost
@@ -328,10 +362,25 @@ fn get_nearest_stream(
                         left_indices.push(pos_u32);
                         validity.push(true);
                         right_indices.push(right_pos_u32);
+                        if let Some(ref mut dists) = distances {
+                            let (left_starts, left_ends) = &**left_positions.as_ref().unwrap();
+                            // Use raw coordinates for distance, not the
+                            // strict-adjusted query_start/query_end.
+                            let d = candidate_distance(
+                                starts[i],
+                                ends[i],
+                                left_starts[pos],
+                                left_ends[pos],
+                            );
+                            dists.push(Some(d));
+                        }
                     } else {
                         left_indices.push(0);
                         validity.push(false);
                         right_indices.push(right_pos_u32);
+                        if let Some(ref mut dists) = distances {
+                            dists.push(None);
+                        }
                     }
                 }
             } else {
@@ -376,6 +425,9 @@ fn get_nearest_stream(
                         left_indices.push(0);
                         validity.push(false);
                         right_indices.push(right_pos_u32);
+                        if let Some(ref mut dists) = distances {
+                            dists.push(None);
+                        }
                     } else {
                         for &pos in &nearest_buf {
                             let pos_u32 = u32::try_from(pos).map_err(|_| {
@@ -386,6 +438,18 @@ fn get_nearest_stream(
                             left_indices.push(pos_u32);
                             validity.push(true);
                             right_indices.push(right_pos_u32);
+                            if let Some(ref mut dists) = distances {
+                                let (left_starts, left_ends) = &**left_positions.as_ref().unwrap();
+                                // Use raw coordinates for distance, not the
+                                // strict-adjusted query_start/query_end.
+                                let d = candidate_distance(
+                                    starts[i],
+                                    ends[i],
+                                    left_starts[pos],
+                                    left_ends[pos],
+                                );
+                                dists.push(Some(d));
+                            }
                         }
                     }
                 }
@@ -400,7 +464,7 @@ fn get_nearest_stream(
             let right_index_array = PrimitiveArray::<UInt32Type>::from(right_indices);
 
             let mut columns: Vec<Arc<dyn Array>> =
-                Vec::with_capacity(left_batch.num_columns() + rb.num_columns());
+                Vec::with_capacity(left_batch.num_columns() + rb.num_columns() + 1);
 
             for array in left_batch.columns() {
                 columns.push(datafusion::arrow::compute::take(
@@ -415,6 +479,10 @@ fn get_nearest_stream(
                     &right_index_array,
                     None,
                 )?);
+            }
+            if let Some(dists) = distances {
+                let dist_array: Int64Array = dists.into_iter().collect();
+                columns.push(Arc::new(dist_array));
             }
 
             RecordBatch::try_new(schema_for_closure.clone(), columns)

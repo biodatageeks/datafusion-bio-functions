@@ -11,6 +11,7 @@ pub mod table_function;
 // Re-export key types
 pub use count_overlaps::CountOverlapsProvider;
 pub use filter_op::FilterOp;
+pub use nearest::NearestProvider;
 pub use physical_planner::BioQueryPlanner;
 pub use physical_planner::IntervalJoinPhysicalOptimizationRule;
 pub use physical_planner::joins::interval_join::IntervalJoinExec;

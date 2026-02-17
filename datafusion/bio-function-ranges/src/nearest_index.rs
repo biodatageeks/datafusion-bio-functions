@@ -182,7 +182,7 @@ impl NearestIntervalIndex {
                 }
             };
 
-            if !include_overlaps && candidate_distance(start, end, &next) == 0 {
+            if !include_overlaps && candidate_distance(start, end, next.start, next.end) == 0 {
                 continue;
             }
 
@@ -238,19 +238,19 @@ fn cmp_interval_meta(a: &IntervalMeta, b: &IntervalMeta) -> Ordering {
         .then_with(|| a.position.cmp(&b.position))
 }
 
-fn candidate_distance(start: i32, end: i32, m: &IntervalMeta) -> i64 {
-    if end < m.start {
-        i64::from(m.start) - i64::from(end)
-    } else if m.end < start {
-        i64::from(start) - i64::from(m.end)
+pub fn candidate_distance(query_start: i32, query_end: i32, iv_start: i32, iv_end: i32) -> i64 {
+    if query_end < iv_start {
+        i64::from(iv_start) - i64::from(query_end)
+    } else if iv_end < query_start {
+        i64::from(query_start) - i64::from(iv_end)
     } else {
         0
     }
 }
 
 fn cmp_candidate(start: i32, end: i32, a: &IntervalMeta, b: &IntervalMeta) -> Ordering {
-    let ad = candidate_distance(start, end, a);
-    let bd = candidate_distance(start, end, b);
+    let ad = candidate_distance(start, end, a.start, a.end);
+    let bd = candidate_distance(start, end, b.start, b.end);
     ad.cmp(&bd).then_with(|| cmp_interval_meta(a, b))
 }
 
