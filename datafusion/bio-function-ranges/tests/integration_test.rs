@@ -683,6 +683,497 @@ async fn test_nearest_csv(ctx: SessionContext) -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nearest_udtf_k1_matches_legacy() -> Result<()> {
+    let ctx = create_bio_session();
+    init_ranges_tables(&ctx).await?;
+
+    ctx.sql("SET bio.interval_join_algorithm TO CoitreesNearest")
+        .await?;
+
+    let legacy_query = r#"SELECT
+               targets.contig AS left_contig,
+               targets.pos_start AS left_pos_start,
+               targets.pos_end AS left_pos_end,
+               reads.contig AS right_contig,
+               reads.pos_start AS right_pos_start,
+               reads.pos_end AS right_pos_end
+               FROM targets
+               JOIN reads
+               ON targets.contig = reads.contig
+                  AND targets.pos_start <= reads.pos_end
+                  AND targets.pos_end >= reads.pos_start
+               ORDER BY right_contig, right_pos_start, right_pos_end, left_contig, left_pos_start, left_pos_end"#;
+
+    let udtf_query = r#"SELECT *
+              FROM nearest('targets', 'reads')
+              ORDER BY right_contig, right_pos_start, right_pos_end, left_contig, left_pos_start, left_pos_end"#;
+
+    let legacy = ctx.sql(legacy_query).await?.collect().await?;
+    let nearest = ctx.sql(udtf_query).await?.collect().await?;
+    assert_eq!(
+        pretty_format_batches(&legacy)?.to_string(),
+        pretty_format_batches(&nearest)?.to_string()
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nearest_udtf_k2_overlap_false_and_null_match() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE l (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 10, 20),
+        ('a', 30, 40),
+        ('a', 50, 60)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE r (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 22, 22),
+        ('a', 37, 37),
+        ('b', 1, 1)
+    "#,
+    )
+    .await?;
+
+    let query = r#"SELECT *
+            FROM nearest('l', 'r', 2, false)
+            ORDER BY right_contig, right_pos_start, right_pos_end, left_pos_start NULLS LAST, left_contig"#;
+
+    let result = ctx.sql(query).await?.collect().await?;
+
+    let expected = [
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
+        "| left_contig | left_pos_start | left_pos_end | right_contig | right_pos_start | right_pos_end |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
+        "| a           | 10             | 20           | a            | 22              | 22            |",
+        "| a           | 30             | 40           | a            | 22              | 22            |",
+        "| a           | 10             | 20           | a            | 37              | 37            |",
+        "| a           | 50             | 60           | a            | 37              | 37            |",
+        "|             |                |              | b            | 1               | 1             |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bioframe parity ports (from polars-bio/tests/test_bioframe.py)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bioframe_overlap_count() -> Result<()> {
+    let ctx = create_bio_session();
+    init_ranges_tables(&ctx).await?;
+
+    let result = ctx
+        .sql(
+            r#"SELECT
+                  reads.contig AS contig_1,
+                  reads.pos_start AS pos_start_1,
+                  reads.pos_end AS pos_end_1,
+                  targets.contig AS contig_2,
+                  targets.pos_start AS pos_start_2,
+                  targets.pos_end AS pos_end_2
+               FROM reads
+               JOIN targets
+                 ON reads.contig = targets.contig
+                AND reads.pos_start <= targets.pos_end
+                AND reads.pos_end >= targets.pos_start"#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    // Ported from bioframe parity tests: 16 overlapping rows.
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 16);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bioframe_overlap_schema_rows() -> Result<()> {
+    let ctx = create_bio_session();
+    init_ranges_tables(&ctx).await?;
+
+    let result = ctx
+        .sql(
+            r#"SELECT
+                  reads.contig AS contig_1,
+                  reads.pos_start AS pos_start_1,
+                  reads.pos_end AS pos_end_1,
+                  targets.contig AS contig_2,
+                  targets.pos_start AS pos_start_2,
+                  targets.pos_end AS pos_end_2
+               FROM reads
+               JOIN targets
+                 ON reads.contig = targets.contig
+                AND reads.pos_start <= targets.pos_end
+                AND reads.pos_end >= targets.pos_start
+               ORDER BY contig_1, pos_start_1, pos_end_1, contig_2, pos_start_2, pos_end_2"#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+----------+-------------+-----------+----------+-------------+-----------+",
+        "| contig_1 | pos_start_1 | pos_end_1 | contig_2 | pos_start_2 | pos_end_2 |",
+        "+----------+-------------+-----------+----------+-------------+-----------+",
+        "| chr1     | 150         | 250       | chr1     | 100         | 190       |",
+        "| chr1     | 150         | 250       | chr1     | 200         | 290       |",
+        "| chr1     | 190         | 300       | chr1     | 100         | 190       |",
+        "| chr1     | 190         | 300       | chr1     | 200         | 290       |",
+        "| chr1     | 300         | 501       | chr1     | 400         | 600       |",
+        "| chr1     | 500         | 700       | chr1     | 400         | 600       |",
+        "| chr1     | 15000       | 15000     | chr1     | 10000       | 20000     |",
+        "| chr1     | 22000       | 22300     | chr1     | 22100       | 22100     |",
+        "| chr2     | 150         | 250       | chr2     | 100         | 190       |",
+        "| chr2     | 150         | 250       | chr2     | 200         | 290       |",
+        "| chr2     | 190         | 300       | chr2     | 100         | 190       |",
+        "| chr2     | 190         | 300       | chr2     | 200         | 290       |",
+        "| chr2     | 300         | 500       | chr2     | 400         | 600       |",
+        "| chr2     | 500         | 700       | chr2     | 400         | 600       |",
+        "| chr2     | 15000       | 15000     | chr2     | 10000       | 20000     |",
+        "| chr2     | 22000       | 22300     | chr2     | 22100       | 22100     |",
+        "+----------+-------------+-----------+----------+-------------+-----------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bioframe_nearest_k1_count() -> Result<()> {
+    let ctx = create_bio_session();
+    init_ranges_tables(&ctx).await?;
+
+    let result = ctx
+        .sql(
+            r#"SELECT
+                   right_contig AS contig_1,
+                   right_pos_start AS pos_start_1,
+                   right_pos_end AS pos_end_1,
+                   left_contig AS contig_2,
+                   left_pos_start AS pos_start_2,
+                   left_pos_end AS pos_end_2,
+                   CASE
+                       WHEN right_pos_end < left_pos_start THEN left_pos_start - right_pos_end
+                       WHEN left_pos_end < right_pos_start THEN right_pos_start - left_pos_end
+                       ELSE 0
+                   END AS distance
+               FROM nearest('reads', 'targets', 1, true)
+               ORDER BY contig_1, pos_start_1, pos_end_1, distance, contig_2, pos_start_2, pos_end_2"#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    // Ported from bioframe parity tests: one nearest row per target.
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 11);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bioframe_nearest_k1_schema_rows() -> Result<()> {
+    let ctx = create_bio_session();
+    init_ranges_tables(&ctx).await?;
+
+    let result = ctx
+        .sql(
+            r#"SELECT
+                   right_contig AS contig_1,
+                   right_pos_start AS pos_start_1,
+                   right_pos_end AS pos_end_1,
+                   left_contig AS contig_2,
+                   left_pos_start AS pos_start_2,
+                   left_pos_end AS pos_end_2,
+                   CASE
+                       WHEN right_pos_end < left_pos_start THEN left_pos_start - right_pos_end
+                       WHEN left_pos_end < right_pos_start THEN right_pos_start - left_pos_end
+                       ELSE 0
+                   END AS distance
+               FROM nearest('reads', 'targets', 1, true)
+               ORDER BY contig_1, pos_start_1, pos_end_1, distance, contig_2, pos_start_2, pos_end_2"#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    // Expected values are ported from polars-bio _expected.PD_DF_NEAREST
+    // (which is generated from bioframe.closest for k=1).
+    let expected = [
+        "+----------+-------------+-----------+----------+-------------+-----------+----------+",
+        "| contig_1 | pos_start_1 | pos_end_1 | contig_2 | pos_start_2 | pos_end_2 | distance |",
+        "+----------+-------------+-----------+----------+-------------+-----------+----------+",
+        "| chr1     | 100         | 190       | chr1     | 150         | 250       | 0        |",
+        "| chr1     | 200         | 290       | chr1     | 150         | 250       | 0        |",
+        "| chr1     | 400         | 600       | chr1     | 300         | 501       | 0        |",
+        "| chr1     | 10000       | 20000     | chr1     | 15000       | 15000     | 0        |",
+        "| chr1     | 22100       | 22100     | chr1     | 22000       | 22300     | 0        |",
+        "| chr2     | 100         | 190       | chr2     | 150         | 250       | 0        |",
+        "| chr2     | 200         | 290       | chr2     | 150         | 250       | 0        |",
+        "| chr2     | 400         | 600       | chr2     | 300         | 500       | 0        |",
+        "| chr2     | 10000       | 20000     | chr2     | 15000       | 15000     | 0        |",
+        "| chr2     | 22100       | 22100     | chr2     | 22000       | 22300     | 0        |",
+        "| chr3     | 100         | 200       | chr3     | 234         | 300       | 34       |",
+        "+----------+-------------+-----------+----------+-------------+-----------+----------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bioframe_count_overlaps_count() -> Result<()> {
+    let ctx = create_bio_session();
+    init_ranges_tables(&ctx).await?;
+
+    let result = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets')")
+        .await?
+        .collect()
+        .await?;
+
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 11);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bioframe_count_overlaps_schema_rows() -> Result<()> {
+    let ctx = create_bio_session();
+    init_ranges_tables(&ctx).await?;
+
+    let result = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets') ORDER BY contig, pos_start, pos_end")
+        .await?
+        .collect()
+        .await?;
+
+    // Expected values are ported from polars-bio _expected.PD_DF_COUNT_OVERLAPS
+    let expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | count |",
+        "+--------+-----------+---------+-------+",
+        "| chr1   | 100       | 190     | 2     |",
+        "| chr1   | 200       | 290     | 2     |",
+        "| chr1   | 400       | 600     | 2     |",
+        "| chr1   | 10000     | 20000   | 1     |",
+        "| chr1   | 22100     | 22100   | 1     |",
+        "| chr2   | 100       | 190     | 2     |",
+        "| chr2   | 200       | 290     | 2     |",
+        "| chr2   | 400       | 600     | 2     |",
+        "| chr2   | 10000     | 20000   | 1     |",
+        "| chr2   | 22100     | 22100   | 1     |",
+        "| chr3   | 100       | 200     | 0     |",
+        "+--------+-----------+---------+-------+",
+    ];
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bioframe_coverage_count() -> Result<()> {
+    let ctx = create_bio_session();
+    init_ranges_tables(&ctx).await?;
+
+    let result = ctx
+        .sql("SELECT * FROM coverage('reads', 'targets')")
+        .await?
+        .collect()
+        .await?;
+
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 11);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_bioframe_coverage_schema_rows() -> Result<()> {
+    let ctx = create_bio_session();
+    init_ranges_tables(&ctx).await?;
+
+    let result = ctx
+        .sql("SELECT * FROM coverage('reads', 'targets') ORDER BY contig, pos_start, pos_end")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+----------+",
+        "| contig | pos_start | pos_end | coverage |",
+        "+--------+-----------+---------+----------+",
+        "| chr1   | 100       | 190     | 41       |",
+        "| chr1   | 200       | 290     | 92       |",
+        "| chr1   | 400       | 600     | 202      |",
+        "| chr1   | 10000     | 20000   | 1        |",
+        "| chr1   | 22100     | 22100   | 2        |",
+        "| chr2   | 100       | 190     | 41       |",
+        "| chr2   | 200       | 290     | 92       |",
+        "| chr2   | 400       | 600     | 202      |",
+        "| chr2   | 10000     | 20000   | 1        |",
+        "| chr2   | 22100     | 22100   | 2        |",
+        "| chr3   | 100       | 200     | 0        |",
+        "+--------+-----------+---------+----------+",
+    ];
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_udtf_strict_zero_based_boundary() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 190, 300)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 190)
+    "#,
+    )
+    .await?;
+
+    let weak = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets')")
+        .await?
+        .collect()
+        .await?;
+    let strict = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets', 'contig', 'pos_start', 'pos_end', 'strict')")
+        .await?
+        .collect()
+        .await?;
+
+    let weak_expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | count |",
+        "+--------+-----------+---------+-------+",
+        "| a      | 100       | 190     | 1     |",
+        "+--------+-----------+---------+-------+",
+    ];
+    let strict_expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | count |",
+        "+--------+-----------+---------+-------+",
+        "| a      | 100       | 190     | 0     |",
+        "+--------+-----------+---------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(weak_expected, &weak);
+    assert_batches_sorted_eq!(strict_expected, &strict);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nearest_udtf_strict_zero_based_boundary_distance() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 190, 190)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 190)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql(
+            r#"SELECT
+                   left_contig,
+                   left_pos_start,
+                   left_pos_end,
+                   right_contig,
+                   right_pos_start,
+                   right_pos_end,
+                   CASE
+                       WHEN (right_pos_end - 1) < left_pos_start THEN left_pos_start - (right_pos_end - 1)
+                       WHEN left_pos_end < (right_pos_start + 1) THEN (right_pos_start + 1) - left_pos_end
+                       ELSE 0
+                   END AS strict_distance
+               FROM nearest('reads', 'targets', 1, true, 'contig', 'pos_start', 'pos_end', 'strict')"#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+-----------------+",
+        "| left_contig | left_pos_start | left_pos_end | right_contig | right_pos_start | right_pos_end | strict_distance |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+-----------------+",
+        "| a           | 190            | 190          | a            | 100             | 190           | 1               |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+-----------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nearest_udtf_empty_left_emits_null_rows() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE l AS
+        SELECT
+            CAST('a' AS TEXT) AS contig,
+            CAST(1 AS INTEGER) AS pos_start,
+            CAST(2 AS INTEGER) AS pos_end
+        WHERE FALSE
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE r (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 110),
+        ('b', 200, 210)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql(
+            r#"SELECT *
+               FROM nearest('l', 'r')
+               ORDER BY right_contig, right_pos_start"#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
+        "| left_contig | left_pos_start | left_pos_end | right_contig | right_pos_start | right_pos_end |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
+        "|             |                |              | a            | 100             | 110           |",
+        "|             |                |              | b            | 200             | 210           |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Table function (UDTF) tests for coverage() and count_overlaps()
 // ─────────────────────────────────────────────────────────────────────────────

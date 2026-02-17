@@ -8,6 +8,7 @@ use datafusion::prelude::SessionContext;
 
 use crate::count_overlaps::CountOverlapsProvider;
 use crate::filter_op::FilterOp;
+use crate::nearest::NearestProvider;
 
 const DEFAULT_COLS: [&str; 3] = ["contig", "pos_start", "pos_end"];
 
@@ -32,7 +33,19 @@ fn extract_string_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<String> {
 /// - +1 optional 'strict'/'weak' arg at the end of any pattern above
 #[allow(clippy::type_complexity)]
 fn parse_col_args(args: &[Expr], fn_name: &str) -> Result<(ColTriple, ColTriple, FilterOp)> {
-    let extra = &args[2..];
+    parse_col_args_extra(&args[2..], fn_name)
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_col_args_extra(extra: &[Expr], fn_name: &str) -> Result<(ColTriple, ColTriple, FilterOp)> {
+    if extra.is_empty() {
+        let cols = (
+            DEFAULT_COLS[0].to_string(),
+            DEFAULT_COLS[1].to_string(),
+            DEFAULT_COLS[2].to_string(),
+        );
+        return Ok((cols.clone(), cols, FilterOp::Weak));
+    }
 
     // Check for trailing filter_op argument
     let (col_args, filter_op) =
@@ -83,6 +96,40 @@ fn parse_col_args(args: &[Expr], fn_name: &str) -> Result<(ColTriple, ColTriple,
     }
 }
 
+fn extract_usize_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<usize> {
+    let as_u64 = match arg {
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) => u64::try_from(*v).ok(),
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => u64::try_from(*v).ok(),
+        Expr::Literal(ScalarValue::UInt64(Some(v)), _) => Some(*v),
+        Expr::Literal(ScalarValue::UInt32(Some(v)), _) => Some(u64::from(*v)),
+        _ => None,
+    };
+
+    if let Some(v) = as_u64 {
+        if v == 0 {
+            return Err(DataFusionError::Plan(format!(
+                "{fn_name}() {name} must be >= 1"
+            )));
+        }
+        return usize::try_from(v).map_err(|_| {
+            DataFusionError::Plan(format!("{fn_name}() {name}={v} does not fit usize"))
+        });
+    }
+
+    Err(DataFusionError::Plan(format!(
+        "{fn_name}() {name} must be an integer literal"
+    )))
+}
+
+fn extract_bool_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<bool> {
+    match arg {
+        Expr::Literal(ScalarValue::Boolean(Some(v)), _) => Ok(*v),
+        _ => Err(DataFusionError::Plan(format!(
+            "{fn_name}() {name} must be a boolean literal"
+        ))),
+    }
+}
+
 /// Internal table function that implements both coverage and count_overlaps.
 struct RangeTableFunction {
     session: Arc<SessionContext>,
@@ -93,6 +140,92 @@ struct RangeTableFunction {
 impl std::fmt::Debug for RangeTableFunction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}Function", self.name)
+    }
+}
+
+/// Internal table function for nearest interval matching.
+struct NearestTableFunction {
+    session: Arc<SessionContext>,
+    name: &'static str,
+}
+
+impl std::fmt::Debug for NearestTableFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}Function", self.name)
+    }
+}
+
+impl TableFunctionImpl for NearestTableFunction {
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        if args.len() < 2 {
+            return Err(DataFusionError::Plan(format!(
+                "{}() requires at least 2 arguments: left_table and right_table names",
+                self.name
+            )));
+        }
+
+        let left_table = extract_string_arg(&args[0], "left_table", self.name)?;
+        let right_table = extract_string_arg(&args[1], "right_table", self.name)?;
+
+        let mut arg_idx = 2usize;
+        let mut k = 1usize;
+        let mut include_overlaps = true;
+
+        if let Some(arg) = args.get(arg_idx) {
+            if matches!(
+                arg,
+                Expr::Literal(ScalarValue::Int64(Some(_)), _)
+                    | Expr::Literal(ScalarValue::Int32(Some(_)), _)
+                    | Expr::Literal(ScalarValue::UInt64(Some(_)), _)
+                    | Expr::Literal(ScalarValue::UInt32(Some(_)), _)
+            ) {
+                k = extract_usize_arg(arg, "k", self.name)?;
+                arg_idx += 1;
+            }
+        }
+
+        if let Some(arg) = args.get(arg_idx) {
+            if matches!(arg, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) {
+                include_overlaps = extract_bool_arg(arg, "overlap", self.name)?;
+                arg_idx += 1;
+            }
+        }
+
+        let (cols_left, cols_right, filter_op) = parse_col_args_extra(&args[arg_idx..], self.name)?;
+
+        let (left_schema, right_schema) = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                let left = handle.block_on(self.session.table(&left_table))?;
+                let right = handle.block_on(self.session.table(&right_table))?;
+                Ok::<_, DataFusionError>((
+                    left.schema().as_arrow().clone(),
+                    right.schema().as_arrow().clone(),
+                ))
+            }),
+            Err(_) => {
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let left = rt.block_on(self.session.table(&left_table))?;
+                let right = rt.block_on(self.session.table(&right_table))?;
+                Ok((
+                    left.schema().as_arrow().clone(),
+                    right.schema().as_arrow().clone(),
+                ))
+            }
+        }?;
+
+        Ok(Arc::new(NearestProvider::new(
+            Arc::clone(&self.session),
+            left_table,
+            right_table,
+            left_schema,
+            right_schema,
+            vec![cols_left.0, cols_left.1, cols_left.2],
+            vec![cols_right.0, cols_right.1, cols_right.2],
+            filter_op,
+            include_overlaps,
+            k,
+        )))
     }
 }
 
@@ -170,9 +303,16 @@ pub fn register_ranges_functions(ctx: &SessionContext) {
     ctx.register_udtf(
         "count_overlaps",
         Arc::new(RangeTableFunction {
-            session,
+            session: Arc::clone(&session),
             coverage: false,
             name: "count_overlaps",
+        }),
+    );
+    ctx.register_udtf(
+        "nearest",
+        Arc::new(NearestTableFunction {
+            session,
+            name: "nearest",
         }),
     );
 }

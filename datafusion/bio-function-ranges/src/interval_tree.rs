@@ -1,6 +1,7 @@
 use std::cmp::{max, min};
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use coitrees::{COITree, Interval, IntervalTree};
 use datafusion::arrow::array::{Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::SchemaRef;
@@ -8,14 +9,13 @@ use datafusion::common::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use fnv::FnvHashMap;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
 
-type IntervalHashMap = FnvHashMap<String, Vec<Interval<()>>>;
+type IntervalHashMap = AHashMap<String, Vec<Interval<()>>>;
 
 pub fn merge_intervals(mut intervals: Vec<Interval<()>>) -> Vec<Interval<()>> {
     if intervals.is_empty() {
@@ -44,7 +44,7 @@ pub fn build_coitree_from_batches(
     batches: Vec<RecordBatch>,
     columns: (&str, &str, &str),
     coverage: bool,
-) -> Result<FnvHashMap<String, COITree<(), u32>>> {
+) -> Result<AHashMap<String, COITree<(), u32>>> {
     let mut nodes = IntervalHashMap::default();
 
     for batch in batches {
@@ -65,7 +65,7 @@ pub fn build_coitree_from_batches(
         }
     }
 
-    let mut trees = FnvHashMap::<String, COITree<(), u32>>::default();
+    let mut trees = AHashMap::<String, COITree<(), u32>>::default();
     for (seqname, seqname_nodes) in nodes {
         if coverage {
             trees.insert(seqname, COITree::new(&merge_intervals(seqname_nodes)));
@@ -88,7 +88,7 @@ pub fn get_coverage(tree: &COITree<(), u32>, start: i32, end: i32) -> i32 {
 #[allow(clippy::too_many_arguments)]
 pub fn get_stream(
     right_plan: Arc<dyn ExecutionPlan>,
-    trees: Arc<FnvHashMap<String, COITree<(), u32>>>,
+    trees: Arc<AHashMap<String, COITree<(), u32>>>,
     new_schema: SchemaRef,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
