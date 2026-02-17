@@ -14,9 +14,8 @@ tokio = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 async-trait = "0.1.88"
-ahash = "0.8.11"
+ahash = "0.8.6"
 coitrees = "0.4.0"
-fnv = "1.0.7"
 bio = "2.0.1"
 rust-lapper = "1.1.0"
 superintervals = { path = "superintervals" }

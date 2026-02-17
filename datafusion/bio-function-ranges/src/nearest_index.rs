@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::sync::OnceLock;
 
 use coitrees::{COITree, Interval, IntervalTree};
-use fnv::FnvHashSet;
+use ahash::AHashSet;
 
 pub type Position = usize;
 
@@ -122,7 +122,7 @@ impl NearestIntervalIndex {
             return;
         }
 
-        let mut seen = FnvHashSet::<Position>::default();
+        let mut seen = AHashSet::<Position>::default();
 
         if include_overlaps {
             let mut overlaps = Vec::<IntervalMeta>::new();

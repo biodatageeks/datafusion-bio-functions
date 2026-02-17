@@ -18,7 +18,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::SessionContext;
-use fnv::FnvHashMap;
+use ahash::AHashMap;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
@@ -162,7 +162,7 @@ impl TableProvider for NearestProvider {
 struct NearestExec {
     schema: SchemaRef,
     left_batch: Arc<RecordBatch>,
-    indexes: Arc<FnvHashMap<String, NearestIntervalIndex>>,
+    indexes: Arc<AHashMap<String, NearestIntervalIndex>>,
     right: Arc<dyn ExecutionPlan>,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
@@ -252,7 +252,7 @@ impl ExecutionPlan for NearestExec {
 fn get_nearest_stream(
     right_plan: Arc<dyn ExecutionPlan>,
     left_batch: Arc<RecordBatch>,
-    indexes: Arc<FnvHashMap<String, NearestIntervalIndex>>,
+    indexes: Arc<AHashMap<String, NearestIntervalIndex>>,
     new_schema: SchemaRef,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
@@ -430,7 +430,7 @@ fn get_nearest_stream(
 fn build_nearest_indexes(
     batch: &RecordBatch,
     columns: (&str, &str, &str),
-) -> Result<FnvHashMap<String, NearestIntervalIndex>> {
+) -> Result<AHashMap<String, NearestIntervalIndex>> {
     let (contig_arr, start_arr, end_arr) = get_join_col_arrays(batch, columns)?;
 
     let start_resolved = start_arr.resolve()?;
@@ -440,7 +440,7 @@ fn build_nearest_indexes(
 
     // Group by borrowed &str (zero-copy from Arrow array), only allocate
     // one owned String per unique contig at the end.
-    let mut contig_to_idx = FnvHashMap::<&str, usize>::default();
+    let mut contig_to_idx = AHashMap::<&str, usize>::default();
     let mut groups: Vec<Vec<IntervalRecord>> = Vec::new();
 
     for i in 0..batch.num_rows() {

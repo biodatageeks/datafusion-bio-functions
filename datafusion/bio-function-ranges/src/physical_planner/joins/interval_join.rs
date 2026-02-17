@@ -34,7 +34,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     handle_state,
 };
-use fnv::FnvHashMap;
+use ahash::AHashMap;
 use futures::{Stream, StreamExt, TryStreamExt, ready};
 use std::any::Any;
 use std::collections::HashMap;
@@ -685,16 +685,16 @@ impl BioInterval {
     }
 }
 
-type CoitreesNearestMap = FnvHashMap<u64, NearestIntervalIndex>;
+type CoitreesNearestMap = AHashMap<u64, NearestIntervalIndex>;
 
 enum IntervalJoinAlgorithm {
-    Coitrees(FnvHashMap<u64, coitrees::COITree<Position, u32>>),
-    IntervalTree(FnvHashMap<u64, rust_bio::IntervalTree<i32, Position>>),
-    ArrayIntervalTree(FnvHashMap<u64, rust_bio::ArrayBackedIntervalTree<i32, Position>>),
-    Lapper(FnvHashMap<u64, rust_lapper::Lapper<u32, Position>>),
-    SuperIntervals(FnvHashMap<u64, superintervals::IntervalMap<Position>>),
+    Coitrees(AHashMap<u64, coitrees::COITree<Position, u32>>),
+    IntervalTree(AHashMap<u64, rust_bio::IntervalTree<i32, Position>>),
+    ArrayIntervalTree(AHashMap<u64, rust_bio::ArrayBackedIntervalTree<i32, Position>>),
+    Lapper(AHashMap<u64, rust_lapper::Lapper<u32, Position>>),
+    SuperIntervals(AHashMap<u64, superintervals::IntervalMap<Position>>),
     CoitreesNearest(CoitreesNearestMap),
-    CoitreesCountOverlaps(FnvHashMap<u64, coitrees::COITree<Position, u32>>),
+    CoitreesCountOverlaps(AHashMap<u64, coitrees::COITree<Position, u32>>),
 }
 
 impl Debug for IntervalJoinAlgorithm {
@@ -749,7 +749,7 @@ impl IntervalJoinAlgorithm {
                         let tree: COITree<Position, u32> = COITree::new(intervals.iter());
                         (k, tree)
                     })
-                    .collect::<FnvHashMap<u64, COITree<Position, u32>>>();
+                    .collect::<AHashMap<u64, COITree<Position, u32>>>();
 
                 match alg {
                     Algorithm::Coitrees => IntervalJoinAlgorithm::Coitrees(hashmap),
@@ -785,7 +785,7 @@ impl IntervalJoinAlgorithm {
                         );
                         (k, tree)
                     })
-                    .collect::<FnvHashMap<u64, rust_bio::IntervalTree<i32, Position>>>();
+                    .collect::<AHashMap<u64, rust_bio::IntervalTree<i32, Position>>>();
 
                 IntervalJoinAlgorithm::IntervalTree(hashmap)
             }
@@ -798,7 +798,7 @@ impl IntervalJoinAlgorithm {
                         );
                         (k, tree)
                     })
-                    .collect::<FnvHashMap<u64, rust_bio::ArrayBackedIntervalTree<i32, Position>>>();
+                    .collect::<AHashMap<u64, rust_bio::ArrayBackedIntervalTree<i32, Position>>>();
 
                 IntervalJoinAlgorithm::ArrayIntervalTree(hashmap)
             }
@@ -814,7 +814,7 @@ impl IntervalJoinAlgorithm {
 
                         (k, Lapper::new(intervals))
                     })
-                    .collect::<FnvHashMap<u64, Lapper<u32, Position>>>();
+                    .collect::<AHashMap<u64, Lapper<u32, Position>>>();
 
                 IntervalJoinAlgorithm::Lapper(hashmap)
             }
@@ -829,7 +829,7 @@ impl IntervalJoinAlgorithm {
                         map.build();
                         (k, map)
                     })
-                    .collect::<FnvHashMap<u64, superintervals::IntervalMap<Position>>>();
+                    .collect::<AHashMap<u64, superintervals::IntervalMap<Position>>>();
                 IntervalJoinAlgorithm::SuperIntervals(hashmap)
             }
         }
