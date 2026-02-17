@@ -29,42 +29,48 @@ pub enum PosArray<'a> {
 }
 
 impl PosArray<'_> {
-    pub fn value(&self, i: usize) -> i32 {
+    pub fn value(&self, i: usize) -> Result<i32> {
         match self {
-            PosArray::Int32(arr) => arr.value(i),
-            PosArray::Int64(arr) => arr.value(i) as i32,
-            PosArray::UInt32(arr) => arr.value(i) as i32,
-            PosArray::UInt64(arr) => arr.value(i) as i32,
+            PosArray::Int32(arr) => Ok(arr.value(i)),
+            PosArray::Int64(arr) => {
+                let v = arr.value(i);
+                i32::try_from(v).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "coordinate value {v} at row {i} overflows i32 (max {})",
+                        i32::MAX
+                    ))
+                })
+            }
+            PosArray::UInt32(arr) => {
+                let v = arr.value(i);
+                i32::try_from(v).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "coordinate value {v} at row {i} overflows i32 (max {})",
+                        i32::MAX
+                    ))
+                })
+            }
+            PosArray::UInt64(arr) => {
+                let v = arr.value(i);
+                i32::try_from(v).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "coordinate value {v} at row {i} overflows i32 (max {})",
+                        i32::MAX
+                    ))
+                })
+            }
         }
     }
-}
-
-/// Look up a column by name, returning a descriptive error if it is missing.
-fn get_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a dyn std::any::Any> {
-    batch
-        .column_by_name(name)
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "column '{name}' not found in batch with columns: {:?}",
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.name())
-                    .collect::<Vec<_>>()
-            ))
-        })
-        .map(|col| col.as_any())
 }
 
 /// Extract contig, start, and end column arrays from a [`RecordBatch`].
 ///
 /// Returns an error if a column is missing or has an unsupported data type.
-pub fn get_join_col_arrays(
-    batch: &RecordBatch,
-    columns: (String, String, String),
-) -> Result<(ContigArray<'_>, PosArray<'_>, PosArray<'_>)> {
-    let contig_col = batch.column_by_name(&columns.0).ok_or_else(|| {
+pub fn get_join_col_arrays<'a>(
+    batch: &'a RecordBatch,
+    columns: (&str, &str, &str),
+) -> Result<(ContigArray<'a>, PosArray<'a>, PosArray<'a>)> {
+    let contig_col = batch.column_by_name(columns.0).ok_or_else(|| {
         DataFusionError::Plan(format!(
             "contig column '{}' not found in batch with columns: {:?}",
             columns.0,
@@ -77,9 +83,10 @@ pub fn get_join_col_arrays(
         ))
     })?;
 
+    let contig_any = contig_col.as_any();
     let contig_arr = match contig_col.data_type() {
         DataType::LargeUtf8 => {
-            let arr = get_column(batch, &columns.0)?
+            let arr = contig_any
                 .downcast_ref::<GenericStringArray<i64>>()
                 .ok_or_else(|| {
                     DataFusionError::Internal(format!(
@@ -90,7 +97,7 @@ pub fn get_join_col_arrays(
             ContigArray::GenericString(arr)
         }
         DataType::Utf8View => {
-            let arr = get_column(batch, &columns.0)?
+            let arr = contig_any
                 .downcast_ref::<StringViewArray>()
                 .ok_or_else(|| {
                     DataFusionError::Internal(format!(
@@ -101,7 +108,7 @@ pub fn get_join_col_arrays(
             ContigArray::Utf8View(arr)
         }
         DataType::Utf8 => {
-            let arr = get_column(batch, &columns.0)?
+            let arr = contig_any
                 .downcast_ref::<GenericStringArray<i32>>()
                 .ok_or_else(|| {
                     DataFusionError::Internal(format!(
@@ -119,8 +126,8 @@ pub fn get_join_col_arrays(
         }
     };
 
-    let start_arr = extract_pos_array(batch, &columns.1, "start")?;
-    let end_arr = extract_pos_array(batch, &columns.2, "end")?;
+    let start_arr = extract_pos_array(batch, columns.1, "start")?;
+    let end_arr = extract_pos_array(batch, columns.2, "end")?;
 
     Ok((contig_arr, start_arr, end_arr))
 }
