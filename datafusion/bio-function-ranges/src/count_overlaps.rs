@@ -2,6 +2,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use async_trait::async_trait;
 use coitrees::COITree;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
@@ -16,7 +17,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, SessionContext};
-use ahash::AHashMap;
 
 use crate::filter_op::FilterOp;
 use crate::interval_tree::{build_coitree_from_batches, get_stream};

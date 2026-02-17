@@ -1,6 +1,7 @@
 use std::cmp::{max, min};
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use coitrees::{COITree, Interval, IntervalTree};
 use datafusion::arrow::array::{Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::SchemaRef;
@@ -8,7 +9,6 @@ use datafusion::common::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use ahash::AHashMap;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 

@@ -93,8 +93,18 @@ Returns up to `k` nearest left intervals for each right interval.
   - `true`: overlapping intervals are returned first, then nearest non-overlaps if needed
   - `false`: overlaps are ignored, only nearest non-overlaps are returned
 - If no keyed candidate exists for a right row, a row is still emitted with `NULL` in `left_*` columns.
+- Deterministic tie-break order is by `(start, end, row_position)` on the left side.
 
 Output columns are prefixed with `left_` and `right_` to avoid ambiguity.
+
+Accepted call forms:
+- `nearest('left', 'right')`
+- `nearest('left', 'right', 3)`
+- `nearest('left', 'right', false)` (use default `k=1`, disable overlap candidates)
+- `nearest('left', 'right', 3, false)`
+- `nearest('left', 'right', 3, false, 'contig', 'pos_start', 'pos_end')`
+- `nearest('left', 'right', 3, false, 'l_contig', 'l_start', 'l_end', 'r_contig', 'r_start', 'r_end')`
+- append `'strict'` or `'weak'` to any columns form above
 
 ```sql
 -- Default k=1, include overlaps
@@ -102,6 +112,22 @@ SELECT * FROM nearest('targets', 'reads')
 
 -- Top-3 nearest per right interval, ignoring overlaps
 SELECT * FROM nearest('targets', 'reads', 3, false)
+
+-- Default k=1, ignore overlaps
+SELECT * FROM nearest('targets', 'reads', false)
+
+-- 0-based half-open coordinates
+SELECT * FROM nearest('targets', 'reads', 1, true, 'contig', 'pos_start', 'pos_end', 'strict')
+
+-- Custom column names for left and right
+SELECT * FROM nearest(
+  'left_tbl',
+  'right_tbl',
+  5,
+  true,
+  'chrom', 'start', 'end',
+  'chr', 'from', 'to'
+)
 ```
 
 ### Filter Operations

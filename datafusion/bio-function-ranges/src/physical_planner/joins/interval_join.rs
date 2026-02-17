@@ -7,6 +7,7 @@ use crate::physical_planner::joins::utils::{
     BuildProbeJoinMetrics, OnceAsync, OnceFut, estimate_join_statistics,
 };
 use crate::session_context::Algorithm;
+use ahash::AHashMap;
 use ahash::RandomState;
 use bio::data_structures::interval_tree as rust_bio;
 use datafusion::arrow::array::{Array, AsArray, PrimitiveArray, PrimitiveBuilder, RecordBatch};
@@ -34,7 +35,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     handle_state,
 };
-use ahash::AHashMap;
 use futures::{Stream, StreamExt, TryStreamExt, ready};
 use std::any::Any;
 use std::collections::HashMap;

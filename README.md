@@ -169,7 +169,20 @@ SELECT * FROM nearest('targets', 'reads')
 
 -- Top-3 nearest neighbors per right interval, ignoring overlaps
 SELECT * FROM nearest('targets', 'reads', 3, false)
+
+-- Default k=1, ignore overlaps
+SELECT * FROM nearest('targets', 'reads', false)
+
+-- 0-based half-open coordinates
+SELECT * FROM nearest('targets', 'reads', 1, true, 'contig', 'pos_start', 'pos_end', 'strict')
 ```
+
+`nearest()` accepted forms:
+- `nearest('left', 'right')`
+- `nearest('left', 'right', k)`
+- `nearest('left', 'right', overlap_bool)`
+- `nearest('left', 'right', k, overlap_bool)`
+- optional shared or separate column names, with optional trailing `'strict'|'weak'`
 
 ### Nearest Interval Matching
 

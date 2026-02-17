@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 use std::sync::OnceLock;
 
-use coitrees::{COITree, Interval, IntervalTree};
 use ahash::AHashSet;
+use coitrees::{COITree, Interval, IntervalTree};
 
 pub type Position = usize;
 
@@ -260,9 +260,21 @@ fn cmp_candidate(start: i32, end: i32, a: &IntervalMeta, b: &IntervalMeta) -> Or
 /// x86_64 without AVX (unoptimized builds on Linux/macOS/Windows).
 /// COITree uses `IntervalNode` in this configuration.
 #[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64", not(target_feature = "avx")),
-    all(target_os = "macos", target_arch = "x86_64", not(target_feature = "avx")),
-    all(target_os = "windows", target_arch = "x86_64", not(target_feature = "avx")),
+    all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        not(target_feature = "avx")
+    ),
+    all(
+        target_os = "macos",
+        target_arch = "x86_64",
+        not(target_feature = "avx")
+    ),
+    all(
+        target_os = "windows",
+        target_arch = "x86_64",
+        not(target_feature = "avx")
+    ),
 ))]
 mod coitree_extract {
     use super::*;
@@ -309,8 +321,8 @@ mod coitree_extract {
     }
 }
 
-pub(crate) use coitree_extract::extract_coitree_position;
 use coitree_extract::extract_coitree_meta;
+pub(crate) use coitree_extract::extract_coitree_position;
 
 #[cfg(test)]
 mod tests {

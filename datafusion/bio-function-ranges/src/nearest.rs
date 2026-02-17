@@ -2,6 +2,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, PrimitiveArray, RecordBatch};
 use datafusion::arrow::buffer::NullBuffer;
@@ -18,7 +19,6 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::SessionContext;
-use ahash::AHashMap;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 

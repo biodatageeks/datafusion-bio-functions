@@ -16,12 +16,11 @@ log = { workspace = true }
 async-trait = "0.1.88"
 ahash = "0.8.6"
 coitrees = "0.4.0"
-bio = "2.0.1"
+bio = "3.0.0"
 rust-lapper = "1.1.0"
 superintervals = { path = "superintervals" }
 parking_lot = "0.12.3"
-hashbrown = "0.14.5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-rstest = "0.22.0"
+rstest = "0.26.1"
