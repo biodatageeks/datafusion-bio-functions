@@ -39,24 +39,6 @@ impl PosArray<'_> {
     }
 }
 
-/// Look up a column by name, returning a descriptive error if it is missing.
-fn get_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a dyn std::any::Any> {
-    batch
-        .column_by_name(name)
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "column '{name}' not found in batch with columns: {:?}",
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.name())
-                    .collect::<Vec<_>>()
-            ))
-        })
-        .map(|col| col.as_any())
-}
-
 /// Extract contig, start, and end column arrays from a [`RecordBatch`].
 ///
 /// Returns an error if a column is missing or has an unsupported data type.
@@ -64,7 +46,7 @@ pub fn get_join_col_arrays<'a>(
     batch: &'a RecordBatch,
     columns: (&str, &str, &str),
 ) -> Result<(ContigArray<'a>, PosArray<'a>, PosArray<'a>)> {
-    let contig_col = batch.column_by_name(&columns.0).ok_or_else(|| {
+    let contig_col = batch.column_by_name(columns.0).ok_or_else(|| {
         DataFusionError::Plan(format!(
             "contig column '{}' not found in batch with columns: {:?}",
             columns.0,
@@ -77,9 +59,10 @@ pub fn get_join_col_arrays<'a>(
         ))
     })?;
 
+    let contig_any = contig_col.as_any();
     let contig_arr = match contig_col.data_type() {
         DataType::LargeUtf8 => {
-            let arr = get_column(batch, &columns.0)?
+            let arr = contig_any
                 .downcast_ref::<GenericStringArray<i64>>()
                 .ok_or_else(|| {
                     DataFusionError::Internal(format!(
@@ -90,7 +73,7 @@ pub fn get_join_col_arrays<'a>(
             ContigArray::GenericString(arr)
         }
         DataType::Utf8View => {
-            let arr = get_column(batch, &columns.0)?
+            let arr = contig_any
                 .downcast_ref::<StringViewArray>()
                 .ok_or_else(|| {
                     DataFusionError::Internal(format!(
@@ -101,7 +84,7 @@ pub fn get_join_col_arrays<'a>(
             ContigArray::Utf8View(arr)
         }
         DataType::Utf8 => {
-            let arr = get_column(batch, &columns.0)?
+            let arr = contig_any
                 .downcast_ref::<GenericStringArray<i32>>()
                 .ok_or_else(|| {
                     DataFusionError::Internal(format!(
@@ -119,8 +102,8 @@ pub fn get_join_col_arrays<'a>(
         }
     };
 
-    let start_arr = extract_pos_array(batch, &columns.1, "start")?;
-    let end_arr = extract_pos_array(batch, &columns.2, "end")?;
+    let start_arr = extract_pos_array(batch, columns.1, "start")?;
+    let end_arr = extract_pos_array(batch, columns.2, "end")?;
 
     Ok((contig_arr, start_arr, end_arr))
 }

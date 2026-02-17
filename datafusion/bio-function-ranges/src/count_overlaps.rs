@@ -122,7 +122,7 @@ impl TableProvider for CountOverlapsProvider {
 
         let trees = Arc::new(build_coitree_from_batches(
             left_table,
-            self.columns_1.clone(),
+            (&self.columns_1.0, &self.columns_1.1, &self.columns_1.2),
             self.coverage,
         )?);
 
@@ -143,7 +143,7 @@ impl TableProvider for CountOverlapsProvider {
             schema: self.schema().clone(),
             trees,
             right: right_plan,
-            columns_2: self.columns_2.clone(),
+            columns_2: Arc::new(self.columns_2.clone()),
             filter_op: self.filter_op.clone(),
             coverage: self.coverage,
             cache: PlanProperties::new(
@@ -160,7 +160,7 @@ struct CountOverlapsExec {
     schema: SchemaRef,
     trees: Arc<FnvHashMap<String, COITree<(), u32>>>,
     right: Arc<dyn ExecutionPlan>,
-    columns_2: (String, String, String),
+    columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
     coverage: bool,
     cache: PlanProperties,
@@ -209,7 +209,7 @@ impl ExecutionPlan for CountOverlapsExec {
             schema: self.schema.clone(),
             trees: Arc::clone(&self.trees),
             right: Arc::clone(&children[0]),
-            columns_2: self.columns_2.clone(),
+            columns_2: Arc::clone(&self.columns_2),
             filter_op: self.filter_op.clone(),
             coverage: self.coverage,
             cache: PlanProperties::new(
@@ -232,7 +232,7 @@ impl ExecutionPlan for CountOverlapsExec {
             Arc::clone(&self.right),
             self.trees.clone(),
             self.schema.clone(),
-            self.columns_2.clone(),
+            Arc::clone(&self.columns_2),
             self.filter_op.clone(),
             self.coverage,
             partition,

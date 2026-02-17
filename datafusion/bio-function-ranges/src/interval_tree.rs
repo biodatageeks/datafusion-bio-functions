@@ -42,14 +42,14 @@ pub fn merge_intervals(mut intervals: Vec<Interval<()>>) -> Vec<Interval<()>> {
 
 pub fn build_coitree_from_batches(
     batches: Vec<RecordBatch>,
-    columns: (String, String, String),
+    columns: (&str, &str, &str),
     coverage: bool,
 ) -> Result<FnvHashMap<String, COITree<(), u32>>> {
     let mut nodes = IntervalHashMap::default();
 
     for batch in batches {
         let (contig_arr, start_arr, end_arr) =
-            get_join_col_arrays(&batch, (&columns.0, &columns.1, &columns.2))?;
+            get_join_col_arrays(&batch, (columns.0, columns.1, columns.2))?;
 
         for i in 0..batch.num_rows() {
             let contig = contig_arr.value(i);
@@ -90,7 +90,7 @@ pub async fn get_stream(
     right_plan: Arc<dyn ExecutionPlan>,
     trees: Arc<FnvHashMap<String, COITree<(), u32>>>,
     new_schema: SchemaRef,
-    columns_2: (String, String, String),
+    columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
     coverage: bool,
     partition: usize,
@@ -98,15 +98,16 @@ pub async fn get_stream(
 ) -> Result<SendableRecordBatchStream> {
     let partition_stream = right_plan.execute(partition, context)?;
     let new_schema_out = new_schema.clone();
-    let (contig_col, start_col, end_col) = columns_2;
     let strict_filter = filter_op == FilterOp::Strict;
 
     let iter = partition_stream.map(move |rb| match rb {
         Ok(rb) => {
             let (contig, pos_start, pos_end) =
-                get_join_col_arrays(&rb, (&contig_col, &start_col, &end_col))?;
+                get_join_col_arrays(&rb, (&columns_2.0, &columns_2.1, &columns_2.2))?;
             let mut count_arr = Vec::with_capacity(rb.num_rows());
             let num_rows = rb.num_rows();
+            let mut cached_contig: &str = "";
+            let mut cached_tree: Option<&COITree<(), u32>> = None;
             for i in 0..num_rows {
                 let contig = contig.value(i);
                 let mut query_start = pos_start.value(i);
@@ -116,7 +117,14 @@ pub async fn get_stream(
                     query_end -= 1;
                 }
 
-                let count = match trees.get(contig) {
+                let tree = if contig == cached_contig {
+                    cached_tree
+                } else {
+                    cached_contig = contig;
+                    cached_tree = trees.get(contig);
+                    cached_tree
+                };
+                let count = match tree {
                     None => 0,
                     Some(tree) => {
                         if coverage {
@@ -129,7 +137,8 @@ pub async fn get_stream(
                 count_arr.push(count as i64);
             }
             let count_arr = Arc::new(Int64Array::from(count_arr));
-            let mut columns = rb.columns().to_vec();
+            let mut columns = Vec::with_capacity(rb.num_columns() + 1);
+            columns.extend_from_slice(rb.columns());
             columns.push(count_arr);
             RecordBatch::try_new(new_schema.clone(), columns)
                 .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))
