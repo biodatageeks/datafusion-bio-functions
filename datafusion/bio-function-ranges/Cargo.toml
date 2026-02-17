@@ -1,6 +1,6 @@
 [package]
 name = "datafusion-bio-function-ranges"
-version = "0.2.1"
+version = "0.2.2"
 description = "Interval join, coverage, and count-overlaps for Apache DataFusion"
 license.workspace = true
 authors.workspace = true
