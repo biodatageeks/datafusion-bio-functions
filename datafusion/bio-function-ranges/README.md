@@ -1,6 +1,6 @@
 # datafusion-bio-function-ranges
 
-Interval join, coverage, and count-overlaps for Apache DataFusion.
+Interval join, coverage, count-overlaps, and nearest-neighbor operations for Apache DataFusion.
 
 This crate provides optimized genomic interval operations as DataFusion extensions:
 
@@ -34,7 +34,7 @@ register_ranges_functions(&ctx);
 
 ### `register_ranges_functions(ctx)`
 
-Registers the `coverage` and `count_overlaps` SQL table functions on an existing `SessionContext`. This is analogous to `register_pileup_functions` in the pileup crate.
+Registers the `coverage`, `count_overlaps`, and `nearest` SQL table functions on an existing `SessionContext`. This is analogous to `register_pileup_functions` in the pileup crate.
 
 ```rust
 use datafusion_bio_function_ranges::register_ranges_functions;
@@ -48,7 +48,7 @@ Convenience function that creates a `SessionContext` with:
 - Custom query planner for automatic interval join detection
 - Physical optimizer rule that converts hash/nested-loop joins to interval joins
 - `BioConfig` extension for algorithm selection via `SET bio.*` statements
-- `coverage()` and `count_overlaps()` SQL table functions
+- `coverage()`, `count_overlaps()`, and `nearest()` SQL table functions
 
 ```rust
 use datafusion_bio_function_ranges::create_bio_session;
@@ -82,6 +82,25 @@ Counts overlapping intervals. Same interface as `coverage`, but returns the coun
 
 ```sql
 SELECT * FROM count_overlaps('reads', 'targets')
+```
+
+### `nearest(left_table, right_table [, k] [, overlap] [, columns...] [, filter_op])`
+
+Returns up to `k` nearest left intervals for each right interval.
+
+- `k` default: `1` (must be `>= 1`)
+- `overlap` default: `true`
+  - `true`: overlapping intervals are returned first, then nearest non-overlaps if needed
+  - `false`: overlaps are ignored, only nearest non-overlaps are returned
+
+Output columns are prefixed with `left_` and `right_` to avoid ambiguity.
+
+```sql
+-- Default k=1, include overlaps
+SELECT * FROM nearest('targets', 'reads')
+
+-- Top-3 nearest per right interval, ignoring overlaps
+SELECT * FROM nearest('targets', 'reads', 3, false)
 ```
 
 ### Filter Operations
@@ -207,11 +226,12 @@ register_ranges_functions(&ctx);  // registers coverage() and count_overlaps() U
 
 ### New SQL Table Functions
 
-The `coverage` and `count_overlaps` operations are now available as SQL table functions (previously only accessible via the Rust `CountOverlapsProvider` API):
+The `coverage`, `count_overlaps`, and `nearest` operations are now available as SQL table functions:
 
 ```sql
 SELECT * FROM coverage('reads', 'targets')
 SELECT * FROM count_overlaps('reads', 'targets')
+SELECT * FROM nearest('targets', 'reads')
 ```
 
 ### Dependency Update

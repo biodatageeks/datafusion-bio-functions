@@ -33,7 +33,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **Interval Join**: SQL joins with range overlap conditions, automatically optimized via a custom physical planner
 - **Coverage**: Base-pair overlap depth between two interval sets via `SELECT * FROM coverage('reads', 'targets')`
 - **Count Overlaps**: Count overlapping intervals per region via `SELECT * FROM count_overlaps('reads', 'targets')`
-- **Nearest**: Nearest-neighbor interval matching (one match per query interval)
+- **Nearest**: Nearest-neighbor interval matching via SQL join (`CoitreesNearest`) or `nearest(...)` table function
 - **Multiple Algorithms**: Coitrees (default), IntervalTree, ArrayIntervalTree, Lapper, SuperIntervals — selectable via `SET bio.interval_join_algorithm`
 - **Transparent Optimization**: Hash/nested-loop joins with range conditions are automatically replaced with interval joins
 
@@ -163,6 +163,12 @@ SELECT * FROM coverage('reads', 'targets', 'chrom', 'start', 'end', 'contig', 'p
 
 -- 0-based half-open coordinates
 SELECT * FROM count_overlaps('reads', 'targets', 'contig', 'pos_start', 'pos_end', 'strict')
+
+-- Nearest neighbors (left_* and right_* output columns)
+SELECT * FROM nearest('targets', 'reads')
+
+-- Top-3 nearest neighbors per right interval, ignoring overlaps
+SELECT * FROM nearest('targets', 'reads', 3, false)
 ```
 
 ### Nearest Interval Matching

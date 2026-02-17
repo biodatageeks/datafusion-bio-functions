@@ -2,6 +2,8 @@ pub mod array_utils;
 pub mod count_overlaps;
 pub mod filter_op;
 pub mod interval_tree;
+pub mod nearest;
+pub mod nearest_index;
 pub mod physical_planner;
 pub mod session_context;
 pub mod table_function;
