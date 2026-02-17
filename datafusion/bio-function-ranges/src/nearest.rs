@@ -364,9 +364,11 @@ fn get_nearest_stream(
                         right_indices.push(right_pos_u32);
                         if let Some(ref mut dists) = distances {
                             let (left_starts, left_ends) = &**left_positions.as_ref().unwrap();
+                            // Use raw coordinates for distance, not the
+                            // strict-adjusted query_start/query_end.
                             let d = candidate_distance(
-                                query_start,
-                                query_end,
+                                starts[i],
+                                ends[i],
                                 left_starts[pos],
                                 left_ends[pos],
                             );
@@ -438,9 +440,11 @@ fn get_nearest_stream(
                             right_indices.push(right_pos_u32);
                             if let Some(ref mut dists) = distances {
                                 let (left_starts, left_ends) = &**left_positions.as_ref().unwrap();
+                                // Use raw coordinates for distance, not the
+                                // strict-adjusted query_start/query_end.
                                 let d = candidate_distance(
-                                    query_start,
-                                    query_end,
+                                    starts[i],
+                                    ends[i],
                                     left_starts[pos],
                                     left_ends[pos],
                                 );
