@@ -146,8 +146,7 @@ pub fn get_stream(
         Err(e) => Err(e),
     });
 
-    let adapted_stream =
-        RecordBatchStreamAdapter::new(new_schema, Box::pin(iter) as BoxStream<_>);
+    let adapted_stream = RecordBatchStreamAdapter::new(new_schema, Box::pin(iter) as BoxStream<_>);
     Ok(Box::pin(adapted_stream))
 }
 
