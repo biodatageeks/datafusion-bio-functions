@@ -705,8 +705,10 @@ async fn test_nearest_udtf_k1_matches_legacy() -> Result<()> {
                   AND targets.pos_end >= reads.pos_start
                ORDER BY right_contig, right_pos_start, right_pos_end, left_contig, left_pos_start, left_pos_end"#;
 
-    let udtf_query = r#"SELECT *
-              FROM nearest('targets', 'reads')
+    let udtf_query = r#"SELECT
+              left_contig, left_pos_start, left_pos_end,
+              right_contig, right_pos_start, right_pos_end
+              FROM nearest('targets', 'reads', 1, true, false)
               ORDER BY right_contig, right_pos_start, right_pos_end, left_contig, left_pos_start, left_pos_end"#;
 
     let legacy = ctx.sql(legacy_query).await?.collect().await?;
@@ -750,15 +752,15 @@ async fn test_nearest_udtf_k2_overlap_false_and_null_match() -> Result<()> {
     let result = ctx.sql(query).await?.collect().await?;
 
     let expected = [
-        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
-        "| left_contig | left_pos_start | left_pos_end | right_contig | right_pos_start | right_pos_end |",
-        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
-        "| a           | 10             | 20           | a            | 22              | 22            |",
-        "| a           | 30             | 40           | a            | 22              | 22            |",
-        "| a           | 10             | 20           | a            | 37              | 37            |",
-        "| a           | 50             | 60           | a            | 37              | 37            |",
-        "|             |                |              | b            | 1               | 1             |",
-        "+-------------+----------------+--------------+--------------+-----------------+---------------+",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+----------+",
+        "| left_contig | left_pos_start | left_pos_end | right_contig | right_pos_start | right_pos_end | distance |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+----------+",
+        "| a           | 10             | 20           | a            | 22              | 22            | 2        |",
+        "| a           | 30             | 40           | a            | 22              | 22            | 8        |",
+        "| a           | 10             | 20           | a            | 37              | 37            | 17       |",
+        "| a           | 50             | 60           | a            | 37              | 37            | 13       |",
+        "|             |                |              | b            | 1               | 1             |          |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+----------+",
     ];
 
     assert_batches_sorted_eq!(expected, &result);
@@ -864,11 +866,7 @@ async fn test_bioframe_nearest_k1_count() -> Result<()> {
                    left_contig AS contig_2,
                    left_pos_start AS pos_start_2,
                    left_pos_end AS pos_end_2,
-                   CASE
-                       WHEN right_pos_end < left_pos_start THEN left_pos_start - right_pos_end
-                       WHEN left_pos_end < right_pos_start THEN right_pos_start - left_pos_end
-                       ELSE 0
-                   END AS distance
+                   distance
                FROM nearest('reads', 'targets', 1, true)
                ORDER BY contig_1, pos_start_1, pos_end_1, distance, contig_2, pos_start_2, pos_end_2"#,
         )
@@ -895,11 +893,7 @@ async fn test_bioframe_nearest_k1_schema_rows() -> Result<()> {
                    left_contig AS contig_2,
                    left_pos_start AS pos_start_2,
                    left_pos_end AS pos_end_2,
-                   CASE
-                       WHEN right_pos_end < left_pos_start THEN left_pos_start - right_pos_end
-                       WHEN left_pos_end < right_pos_start THEN right_pos_start - left_pos_end
-                       ELSE 0
-                   END AS distance
+                   distance
                FROM nearest('reads', 'targets', 1, true)
                ORDER BY contig_1, pos_start_1, pos_end_1, distance, contig_2, pos_start_2, pos_end_2"#,
         )
@@ -1104,23 +1098,19 @@ async fn test_nearest_udtf_strict_zero_based_boundary_distance() -> Result<()> {
                    right_contig,
                    right_pos_start,
                    right_pos_end,
-                   CASE
-                       WHEN (right_pos_end - 1) < left_pos_start THEN left_pos_start - (right_pos_end - 1)
-                       WHEN left_pos_end < (right_pos_start + 1) THEN (right_pos_start + 1) - left_pos_end
-                       ELSE 0
-                   END AS strict_distance
-               FROM nearest('reads', 'targets', 1, true, 'contig', 'pos_start', 'pos_end', 'strict')"#,
+                   distance
+               FROM nearest('reads', 'targets', 1, true, true, 'contig', 'pos_start', 'pos_end', 'strict')"#,
         )
         .await?
         .collect()
         .await?;
 
     let expected = [
-        "+-------------+----------------+--------------+--------------+-----------------+---------------+-----------------+",
-        "| left_contig | left_pos_start | left_pos_end | right_contig | right_pos_start | right_pos_end | strict_distance |",
-        "+-------------+----------------+--------------+--------------+-----------------+---------------+-----------------+",
-        "| a           | 190            | 190          | a            | 100             | 190           | 1               |",
-        "+-------------+----------------+--------------+--------------+-----------------+---------------+-----------------+",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+----------+",
+        "| left_contig | left_pos_start | left_pos_end | right_contig | right_pos_start | right_pos_end | distance |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+----------+",
+        "| a           | 190            | 190          | a            | 100             | 190           | 1        |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+----------+",
     ];
 
     assert_batches_sorted_eq!(expected, &result);
@@ -1162,11 +1152,55 @@ async fn test_nearest_udtf_empty_left_emits_null_rows() -> Result<()> {
         .await?;
 
     let expected = [
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+----------+",
+        "| left_contig | left_pos_start | left_pos_end | right_contig | right_pos_start | right_pos_end | distance |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+----------+",
+        "|             |                |              | a            | 100             | 110           |          |",
+        "|             |                |              | b            | 200             | 210           |          |",
+        "+-------------+----------------+--------------+--------------+-----------------+---------------+----------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nearest_udtf_compute_distance_false() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE l (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 10, 20),
+        ('a', 30, 40)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE r (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 22, 22)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql(
+            r#"SELECT *
+               FROM nearest('l', 'r', 1, true, false)
+               ORDER BY left_pos_start"#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    // No distance column when compute_distance=false
+    let expected = [
         "+-------------+----------------+--------------+--------------+-----------------+---------------+",
         "| left_contig | left_pos_start | left_pos_end | right_contig | right_pos_start | right_pos_end |",
         "+-------------+----------------+--------------+--------------+-----------------+---------------+",
-        "|             |                |              | a            | 100             | 110           |",
-        "|             |                |              | b            | 200             | 210           |",
+        "| a           | 10             | 20           | a            | 22              | 22            |",
         "+-------------+----------------+--------------+--------------+-----------------+---------------+",
     ];
 
