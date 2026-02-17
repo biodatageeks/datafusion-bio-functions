@@ -14,7 +14,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 | Crate | Description | Status |
 |-------|-------------|--------|
 | **[datafusion-bio-function-pileup](datafusion/bio-function-pileup)** | Depth-of-coverage (pileup) computation from BAM alignments | ✅ |
-| **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, and nearest-neighbor operations | ✅ |
+| **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, nearest-neighbor, overlap, merge, cluster, complement, and subtract operations | ✅ |
 
 ## Features
 
@@ -36,6 +36,9 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **Nearest**: Nearest-neighbor interval matching via SQL join (`CoitreesNearest`) or `nearest(...)` table function
 - **Overlap**: Find all pairs of overlapping intervals between two tables via `SELECT * FROM overlap('reads', 'targets')` — delegates to IntervalJoinExec for optimal performance
 - **Merge**: Merge overlapping intervals within a single table via `SELECT * FROM merge('intervals')` — sweep-line algorithm with configurable `min_dist` and `strict`/`weak` modes
+- **Cluster**: Annotate intervals with cluster membership (cluster ID + boundaries) via `SELECT * FROM cluster('intervals')` — groups overlapping/nearby intervals with configurable `min_dist`
+- **Complement**: Find gaps (uncovered regions) relative to optional chromsizes view via `SELECT * FROM complement('intervals', 'chromsizes')`
+- **Subtract**: Basepair-level set difference via `SELECT * FROM subtract('left', 'right')` — fragments left intervals at right-interval overlap boundaries
 - **Multiple Algorithms**: Coitrees (default), IntervalTree, ArrayIntervalTree, Lapper, SuperIntervals — selectable via `SET bio.interval_join_algorithm`
 - **Transparent Optimization**: Hash/nested-loop joins with range conditions are automatically replaced with interval joins
 
@@ -195,6 +198,30 @@ SELECT * FROM merge('intervals', 10)
 
 -- Merge with custom columns and 0-based half-open coordinates
 SELECT * FROM merge('intervals', 0, 'contig', 'pos_start', 'pos_end', 'strict')
+
+-- Cluster: annotate intervals with cluster ID and boundaries
+SELECT * FROM cluster('intervals')
+
+-- Cluster with minimum distance between clusters
+SELECT * FROM cluster('intervals', 5)
+
+-- Cluster with custom columns and 0-based half-open coordinates
+SELECT * FROM cluster('intervals', 0, 'contig', 'pos_start', 'pos_end', 'strict')
+
+-- Complement: find gaps (uncovered regions) with default view (0..MAX per contig)
+SELECT * FROM complement('intervals')
+
+-- Complement with chromsizes view table
+SELECT * FROM complement('intervals', 'chromsizes')
+
+-- Complement with custom column names
+SELECT * FROM complement('intervals', 'chromsizes', 'chrom', 'start', 'end')
+
+-- Subtract: basepair-level set difference
+SELECT * FROM subtract('left_table', 'right_table')
+
+-- Subtract with custom columns and strict mode
+SELECT * FROM subtract('left_table', 'right_table', 'chrom', 'start', 'end', 'strict')
 ```
 
 `nearest()` accepted forms:

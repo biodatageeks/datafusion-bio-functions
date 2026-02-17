@@ -1,6 +1,6 @@
 # datafusion-bio-function-ranges
 
-Interval join, coverage, count-overlaps, and nearest-neighbor operations for Apache DataFusion.
+Interval join, coverage, count-overlaps, nearest-neighbor, overlap, merge, cluster, complement, and subtract operations for Apache DataFusion.
 
 This crate provides optimized genomic interval operations as DataFusion extensions:
 
@@ -8,6 +8,11 @@ This crate provides optimized genomic interval operations as DataFusion extensio
 - **Coverage** — base-pair overlap depth between two interval sets
 - **Count overlaps** — number of overlapping intervals per region
 - **Nearest** — nearest-neighbor interval matching
+- **Overlap** — all pairs of overlapping intervals between two tables
+- **Merge** — merge overlapping intervals within a single table
+- **Cluster** — annotate intervals with cluster membership (cluster ID + boundaries)
+- **Complement** — find gaps (uncovered regions) relative to optional chromsizes view
+- **Subtract** — basepair-level set difference between two interval sets
 
 ## Quick Start
 
@@ -34,7 +39,7 @@ register_ranges_functions(&ctx);
 
 ### `register_ranges_functions(ctx)`
 
-Registers the `coverage`, `count_overlaps`, and `nearest` SQL table functions on an existing `SessionContext`. This is analogous to `register_pileup_functions` in the pileup crate.
+Registers the `coverage`, `count_overlaps`, `nearest`, `overlap`, `merge`, `cluster`, `complement`, and `subtract` SQL table functions on an existing `SessionContext`. This is analogous to `register_pileup_functions` in the pileup crate.
 
 ```rust
 use datafusion_bio_function_ranges::register_ranges_functions;
@@ -48,7 +53,7 @@ Convenience function that creates a `SessionContext` with:
 - Custom query planner for automatic interval join detection
 - Physical optimizer rule that converts hash/nested-loop joins to interval joins
 - `BioConfig` extension for algorithm selection via `SET bio.*` statements
-- `coverage()`, `count_overlaps()`, and `nearest()` SQL table functions
+- All SQL table functions: `coverage()`, `count_overlaps()`, `nearest()`, `overlap()`, `merge()`, `cluster()`, `complement()`, `subtract()`
 
 ```rust
 use datafusion_bio_function_ranges::create_bio_session;
@@ -128,6 +133,80 @@ SELECT * FROM nearest(
   'chrom', 'start', 'end',
   'chr', 'from', 'to'
 )
+```
+
+### `overlap(left_table, right_table [, columns...] [, filter_op])`
+
+Returns all pairs of overlapping intervals between two tables. Output columns are prefixed with `left_` and `right_`.
+
+```sql
+SELECT * FROM overlap('reads', 'targets')
+
+-- With 0-based half-open coordinates
+SELECT * FROM overlap('reads', 'targets', 'contig', 'pos_start', 'pos_end', 'strict')
+
+-- Separate column names for left and right tables
+SELECT * FROM overlap('reads', 'targets', 'l_chr', 'l_s', 'l_e', 'r_chr', 'r_s', 'r_e')
+```
+
+### `merge(table [, min_dist] [, columns...] [, filter_op])`
+
+Merges overlapping intervals within a single table. Returns merged intervals with an `n_intervals` count.
+
+```sql
+SELECT * FROM merge('intervals')
+
+-- Merge intervals within distance 10
+SELECT * FROM merge('intervals', 10)
+
+-- With custom columns and strict mode
+SELECT * FROM merge('intervals', 0, 'contig', 'pos_start', 'pos_end', 'strict')
+```
+
+### `cluster(table [, min_dist] [, columns...] [, filter_op])`
+
+Annotates each interval with its cluster membership. Returns all original rows plus `cluster` (ID), `cluster_start`, and `cluster_end` columns. Same argument pattern as `merge`.
+
+```sql
+SELECT * FROM cluster('intervals')
+
+-- Cluster intervals within distance 5
+SELECT * FROM cluster('intervals', 5)
+
+-- With custom columns and strict mode
+SELECT * FROM cluster('intervals', 0, 'contig', 'pos_start', 'pos_end', 'strict')
+```
+
+### `complement(table [, view_table] [, columns...] [, filter_op])`
+
+Finds gaps (uncovered regions) in the input intervals. Without a view table, gaps extend from `0` to `i64::MAX` per contig. With a view table (chromsizes), gaps are bounded to view coordinates.
+
+```sql
+-- Gaps relative to 0..MAX per contig
+SELECT * FROM complement('intervals')
+
+-- Gaps within chromsizes boundaries
+SELECT * FROM complement('intervals', 'chromsizes')
+
+-- With shared custom column names
+SELECT * FROM complement('intervals', 'chromsizes', 'chrom', 'start', 'end')
+
+-- With separate column names for input and view tables
+SELECT * FROM complement('intervals', 'chromsizes', 'c1', 's1', 'e1', 'vc', 'vs', 've')
+```
+
+### `subtract(left_table, right_table [, columns...] [, filter_op])`
+
+Basepair-level set difference: removes portions of left intervals that overlap with right intervals. Fragments left intervals at overlap boundaries.
+
+```sql
+SELECT * FROM subtract('left_table', 'right_table')
+
+-- With custom columns and strict mode
+SELECT * FROM subtract('left_table', 'right_table', 'chrom', 'start', 'end', 'strict')
+
+-- Separate column names for left and right tables
+SELECT * FROM subtract('left_table', 'right_table', 'l_chr', 'l_s', 'l_e', 'r_chr', 'r_s', 'r_e')
 ```
 
 ### Filter Operations
@@ -254,12 +333,17 @@ register_ranges_functions(&ctx);  // registers coverage() and count_overlaps() U
 
 ### New SQL Table Functions
 
-The `coverage`, `count_overlaps`, and `nearest` operations are now available as SQL table functions:
+All interval operations are available as SQL table functions:
 
 ```sql
 SELECT * FROM coverage('reads', 'targets')
 SELECT * FROM count_overlaps('reads', 'targets')
 SELECT * FROM nearest('targets', 'reads')
+SELECT * FROM overlap('reads', 'targets')
+SELECT * FROM merge('intervals')
+SELECT * FROM cluster('intervals')
+SELECT * FROM complement('intervals', 'chromsizes')
+SELECT * FROM subtract('left_table', 'right_table')
 ```
 
 ### Dependency Update
