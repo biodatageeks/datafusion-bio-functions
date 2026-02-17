@@ -34,6 +34,8 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **Coverage**: Base-pair overlap depth between two interval sets via `SELECT * FROM coverage('reads', 'targets')`
 - **Count Overlaps**: Count overlapping intervals per region via `SELECT * FROM count_overlaps('reads', 'targets')`
 - **Nearest**: Nearest-neighbor interval matching via SQL join (`CoitreesNearest`) or `nearest(...)` table function
+- **Overlap**: Find all pairs of overlapping intervals between two tables via `SELECT * FROM overlap('reads', 'targets')` — delegates to IntervalJoinExec for optimal performance
+- **Merge**: Merge overlapping intervals within a single table via `SELECT * FROM merge('intervals')` — sweep-line algorithm with configurable `min_dist` and `strict`/`weak` modes
 - **Multiple Algorithms**: Coitrees (default), IntervalTree, ArrayIntervalTree, Lapper, SuperIntervals — selectable via `SET bio.interval_join_algorithm`
 - **Transparent Optimization**: Hash/nested-loop joins with range conditions are automatically replaced with interval joins
 
@@ -175,6 +177,24 @@ SELECT * FROM nearest('targets', 'reads', false)
 
 -- 0-based half-open coordinates
 SELECT * FROM nearest('targets', 'reads', 1, true, 'contig', 'pos_start', 'pos_end', 'strict')
+
+-- All pairs of overlapping intervals (left_* and right_* output columns)
+SELECT * FROM overlap('reads', 'targets')
+
+-- Overlap with 0-based half-open coordinates
+SELECT * FROM overlap('reads', 'targets', 'contig', 'pos_start', 'pos_end', 'strict')
+
+-- Separate column names for left and right tables
+SELECT * FROM overlap('reads', 'targets', 'l_chr', 'l_s', 'l_e', 'r_chr', 'r_s', 'r_e')
+
+-- Merge overlapping intervals within a single table
+SELECT * FROM merge('intervals')
+
+-- Merge with minimum distance between intervals
+SELECT * FROM merge('intervals', 10)
+
+-- Merge with custom columns and 0-based half-open coordinates
+SELECT * FROM merge('intervals', 0, 'contig', 'pos_start', 'pos_end', 'strict')
 ```
 
 `nearest()` accepted forms:
