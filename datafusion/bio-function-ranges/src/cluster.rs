@@ -1,26 +1,27 @@
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use ahash::AHashMap;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Int64Builder, RecordBatch, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
-use datafusion::physical_plan::common::collect;
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, SessionContext};
-use futures::stream::{BoxStream, once};
+use futures::{Stream, StreamExt, ready};
 
 use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
@@ -117,6 +118,7 @@ impl TableProvider for ClusterProvider {
         } else {
             input_plan
         };
+
         let output_partitions = input_plan.output_partitioning().partition_count();
 
         Ok(Arc::new(ClusterExec {
@@ -128,7 +130,7 @@ impl TableProvider for ClusterProvider {
             cache: PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(output_partitions),
-                EmissionType::Final,
+                EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
         }))
@@ -143,6 +145,27 @@ struct ClusterExec {
     min_dist: i64,
     strict: bool,
     cache: PlanProperties,
+}
+
+impl ClusterExec {
+    fn sort_ordering(&self) -> LexOrdering {
+        let schema = self.input.schema();
+        [
+            PhysicalSortExpr::new_default(Arc::new(Column::new(
+                &self.columns.0,
+                schema.index_of(&self.columns.0).unwrap(),
+            ))),
+            PhysicalSortExpr::new_default(Arc::new(Column::new(
+                &self.columns.1,
+                schema.index_of(&self.columns.1).unwrap(),
+            ))),
+            PhysicalSortExpr::new_default(Arc::new(Column::new(
+                &self.columns.2,
+                schema.index_of(&self.columns.2).unwrap(),
+            ))),
+        ]
+        .into()
+    }
 }
 
 impl DisplayAs for ClusterExec {
@@ -193,7 +216,7 @@ impl ExecutionPlan for ClusterExec {
                 Partitioning::UnknownPartitioning(
                     children[0].output_partitioning().partition_count(),
                 ),
-                EmissionType::Final,
+                EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
         }))
@@ -204,136 +227,271 @@ impl ExecutionPlan for ClusterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        get_cluster_stream(
-            Arc::clone(&self.input),
-            self.schema.clone(),
-            Arc::clone(&self.columns),
-            self.min_dist,
-            self.strict,
-            partition,
-            context,
-        )
+        let batch_size = context.session_config().batch_size();
+        let sort_exec = SortExec::new(self.sort_ordering(), Arc::clone(&self.input))
+            .with_preserve_partitioning(true);
+        let input = sort_exec.execute(partition, context)?;
+        Ok(Box::pin(ClusterStream {
+            schema: self.schema.clone(),
+            input,
+            columns: Arc::clone(&self.columns),
+            min_dist: self.min_dist,
+            strict: self.strict,
+            batch_size,
+            current_contig: None,
+            cluster_id: 0,
+            cluster_start: 0,
+            cluster_end: 0,
+            pending_intervals: Vec::new(),
+            done: false,
+        }))
     }
 }
 
-fn get_cluster_stream(
-    input_plan: Arc<dyn ExecutionPlan>,
+struct ClusterStream {
     schema: SchemaRef,
+    input: SendableRecordBatchStream,
     columns: Arc<(String, String, String)>,
     min_dist: i64,
     strict: bool,
-    partition: usize,
-    context: Arc<TaskContext>,
-) -> Result<SendableRecordBatchStream> {
-    let schema_for_closure = schema.clone();
-    let once_stream = once(async move {
-        let partition_stream = input_plan.execute(partition, context)?;
-        let batches = collect(partition_stream).await?;
-        build_cluster_batch(&batches, &schema_for_closure, &columns, min_dist, strict)
-    });
-
-    let adapted_stream =
-        RecordBatchStreamAdapter::new(schema, Box::pin(once_stream) as BoxStream<'_, _>);
-    Ok(Box::pin(adapted_stream))
+    batch_size: usize,
+    current_contig: Option<String>,
+    cluster_id: i64,
+    cluster_start: i64,
+    cluster_end: i64,
+    pending_intervals: Vec<(i64, i64)>,
+    done: bool,
 }
 
-fn build_cluster_batch(
-    batches: &[RecordBatch],
-    schema: &SchemaRef,
-    columns: &(String, String, String),
-    min_dist: i64,
-    strict: bool,
-) -> Result<RecordBatch> {
-    let mut groups: AHashMap<String, Vec<(i64, i64)>> = AHashMap::default();
-    let mut n_rows = 0usize;
-    let mut contig_bytes = 0usize;
-
-    for batch in batches {
-        n_rows += batch.num_rows();
-        let (contig_arr, start_arr, end_arr) =
-            get_join_col_arrays(batch, (&columns.0, &columns.1, &columns.2))?;
-        let start_resolved = start_arr.resolve_i64()?;
-        let end_resolved = end_arr.resolve_i64()?;
-        let starts = &*start_resolved;
-        let ends = &*end_resolved;
-        for i in 0..batch.num_rows() {
-            let contig = contig_arr.value(i);
-            contig_bytes += contig.len();
-            groups
-                .entry(contig.to_string())
-                .or_default()
-                .push((starts[i], ends[i]));
+impl ClusterStream {
+    #[allow(clippy::too_many_arguments)]
+    fn emit_cluster(
+        &self,
+        contig_builder: &mut StringBuilder,
+        start_builder: &mut Int64Builder,
+        end_builder: &mut Int64Builder,
+        cluster_builder: &mut Int64Builder,
+        cluster_start_builder: &mut Int64Builder,
+        cluster_end_builder: &mut Int64Builder,
+        contig: &str,
+        pending: &[(i64, i64)],
+        cluster_id: i64,
+        cluster_start: i64,
+        cluster_end: i64,
+    ) {
+        for &(s, e) in pending {
+            contig_builder.append_value(contig);
+            start_builder.append_value(s);
+            end_builder.append_value(e);
+            cluster_builder.append_value(cluster_id);
+            cluster_start_builder.append_value(cluster_start);
+            cluster_end_builder.append_value(cluster_end);
         }
     }
 
-    let mut contigs: Vec<String> = groups.keys().cloned().collect();
-    contigs.sort_unstable();
+    fn flush_builders(
+        &self,
+        contig_builder: &mut StringBuilder,
+        start_builder: &mut Int64Builder,
+        end_builder: &mut Int64Builder,
+        cluster_builder: &mut Int64Builder,
+        cluster_start_builder: &mut Int64Builder,
+        cluster_end_builder: &mut Int64Builder,
+    ) -> Result<RecordBatch> {
+        RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(contig_builder.finish()),
+                Arc::new(start_builder.finish()),
+                Arc::new(end_builder.finish()),
+                Arc::new(cluster_builder.finish()),
+                Arc::new(cluster_start_builder.finish()),
+                Arc::new(cluster_end_builder.finish()),
+            ],
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+}
 
-    let mut contig_builder = StringBuilder::with_capacity(n_rows, contig_bytes);
-    let mut start_builder = Int64Builder::with_capacity(n_rows);
-    let mut end_builder = Int64Builder::with_capacity(n_rows);
-    let mut cluster_builder = Int64Builder::with_capacity(n_rows);
-    let mut cluster_start_builder = Int64Builder::with_capacity(n_rows);
-    let mut cluster_end_builder = Int64Builder::with_capacity(n_rows);
+impl Stream for ClusterStream {
+    type Item = Result<RecordBatch>;
 
-    let mut cluster_id: i64 = 0;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
 
-    for contig in &contigs {
-        let intervals = groups.get_mut(contig.as_str()).unwrap();
-        intervals.sort_unstable();
-        if intervals.is_empty() {
-            continue;
+        if this.done {
+            return Poll::Ready(None);
         }
 
-        let mut cluster_start_idx = 0usize;
-        let mut cur_start = intervals[0].0;
-        let mut cur_end = intervals[0].1;
+        let mut contig_builder = StringBuilder::new();
+        let mut start_builder = Int64Builder::new();
+        let mut end_builder = Int64Builder::new();
+        let mut cluster_builder = Int64Builder::new();
+        let mut cluster_start_builder = Int64Builder::new();
+        let mut cluster_end_builder = Int64Builder::new();
+        let mut pending_rows = 0usize;
 
-        for i in 1..intervals.len() {
-            let (s, e) = intervals[i];
-            let boundary = cur_end.saturating_add(min_dist);
-            let merge_condition = if strict { s < boundary } else { s <= boundary };
-            if merge_condition {
-                if e > cur_end {
-                    cur_end = e;
+        loop {
+            let batch_opt = ready!(this.input.poll_next_unpin(cx));
+
+            match batch_opt {
+                Some(Ok(batch)) => {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    let (contig_arr, start_arr, end_arr) = match get_join_col_arrays(
+                        &batch,
+                        (&this.columns.0, &this.columns.1, &this.columns.2),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            this.done = true;
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                    };
+                    let start_resolved = match start_arr.resolve_i64() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            this.done = true;
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                    };
+                    let end_resolved = match end_arr.resolve_i64() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            this.done = true;
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                    };
+                    let starts = &*start_resolved;
+                    let ends = &*end_resolved;
+
+                    for i in 0..batch.num_rows() {
+                        let contig = contig_arr.value(i);
+                        let s = starts[i];
+                        let e = ends[i];
+
+                        let same_contig = this
+                            .current_contig
+                            .as_ref()
+                            .is_some_and(|c| c.as_str() == contig);
+
+                        if same_contig {
+                            let boundary = this.cluster_end.saturating_add(this.min_dist);
+                            let merge_condition = if this.strict {
+                                s < boundary
+                            } else {
+                                s <= boundary
+                            };
+                            if merge_condition {
+                                // Extend cluster
+                                if e > this.cluster_end {
+                                    this.cluster_end = e;
+                                }
+                                this.pending_intervals.push((s, e));
+                            } else {
+                                // Emit current cluster
+                                let pending = std::mem::take(&mut this.pending_intervals);
+                                this.emit_cluster(
+                                    &mut contig_builder,
+                                    &mut start_builder,
+                                    &mut end_builder,
+                                    &mut cluster_builder,
+                                    &mut cluster_start_builder,
+                                    &mut cluster_end_builder,
+                                    this.current_contig.as_ref().unwrap(),
+                                    &pending,
+                                    this.cluster_id,
+                                    this.cluster_start,
+                                    this.cluster_end,
+                                );
+                                pending_rows += pending.len();
+                                this.cluster_id += 1;
+                                this.cluster_start = s;
+                                this.cluster_end = e;
+                                this.pending_intervals.push((s, e));
+                            }
+                        } else {
+                            // Contig change: emit current cluster if any
+                            if this.current_contig.is_some() {
+                                let pending = std::mem::take(&mut this.pending_intervals);
+                                this.emit_cluster(
+                                    &mut contig_builder,
+                                    &mut start_builder,
+                                    &mut end_builder,
+                                    &mut cluster_builder,
+                                    &mut cluster_start_builder,
+                                    &mut cluster_end_builder,
+                                    this.current_contig.as_ref().unwrap(),
+                                    &pending,
+                                    this.cluster_id,
+                                    this.cluster_start,
+                                    this.cluster_end,
+                                );
+                                pending_rows += pending.len();
+                                this.cluster_id += 1;
+                            }
+                            this.current_contig = Some(contig.to_string());
+                            this.cluster_start = s;
+                            this.cluster_end = e;
+                            this.pending_intervals.push((s, e));
+                        }
+
+                        if pending_rows >= this.batch_size {
+                            return Poll::Ready(Some(this.flush_builders(
+                                &mut contig_builder,
+                                &mut start_builder,
+                                &mut end_builder,
+                                &mut cluster_builder,
+                                &mut cluster_start_builder,
+                                &mut cluster_end_builder,
+                            )));
+                        }
+                    }
                 }
-            } else {
-                for &(cs, ce) in &intervals[cluster_start_idx..i] {
-                    contig_builder.append_value(contig);
-                    start_builder.append_value(cs);
-                    end_builder.append_value(ce);
-                    cluster_builder.append_value(cluster_id);
-                    cluster_start_builder.append_value(cur_start);
-                    cluster_end_builder.append_value(cur_end);
+                Some(Err(e)) => {
+                    this.done = true;
+                    return Poll::Ready(Some(Err(e)));
                 }
-                cluster_id += 1;
-                cluster_start_idx = i;
-                cur_start = s;
-                cur_end = e;
+                None => {
+                    // Input exhausted — emit final cluster
+                    this.done = true;
+                    if this.current_contig.is_some() {
+                        let pending = std::mem::take(&mut this.pending_intervals);
+                        this.emit_cluster(
+                            &mut contig_builder,
+                            &mut start_builder,
+                            &mut end_builder,
+                            &mut cluster_builder,
+                            &mut cluster_start_builder,
+                            &mut cluster_end_builder,
+                            this.current_contig.as_ref().unwrap(),
+                            &pending,
+                            this.cluster_id,
+                            this.cluster_start,
+                            this.cluster_end,
+                        );
+                        pending_rows += pending.len();
+                    }
+                    if pending_rows > 0 {
+                        return Poll::Ready(Some(this.flush_builders(
+                            &mut contig_builder,
+                            &mut start_builder,
+                            &mut end_builder,
+                            &mut cluster_builder,
+                            &mut cluster_start_builder,
+                            &mut cluster_end_builder,
+                        )));
+                    }
+                    return Poll::Ready(None);
+                }
             }
         }
-
-        for &(cs, ce) in &intervals[cluster_start_idx..] {
-            contig_builder.append_value(contig);
-            start_builder.append_value(cs);
-            end_builder.append_value(ce);
-            cluster_builder.append_value(cluster_id);
-            cluster_start_builder.append_value(cur_start);
-            cluster_end_builder.append_value(cur_end);
-        }
-        cluster_id += 1;
     }
+}
 
-    RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(contig_builder.finish()),
-            Arc::new(start_builder.finish()),
-            Arc::new(end_builder.finish()),
-            Arc::new(cluster_builder.finish()),
-            Arc::new(cluster_start_builder.finish()),
-            Arc::new(cluster_end_builder.finish()),
-        ],
-    )
-    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+impl RecordBatchStream for ClusterStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 }

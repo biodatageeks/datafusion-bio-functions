@@ -1,26 +1,28 @@
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use ahash::AHashMap;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Int64Builder, RecordBatch, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
-use datafusion::physical_plan::common::collect;
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, SessionContext};
-use futures::stream::{BoxStream, once};
+use futures::{Stream, StreamExt, ready};
 
 use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
@@ -156,7 +158,7 @@ impl TableProvider for SubtractProvider {
             cache: PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(output_partitions),
-                EmissionType::Final,
+                EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
         }))
@@ -172,6 +174,27 @@ struct SubtractExec {
     right_columns: Arc<(String, String, String)>,
     strict: bool,
     cache: PlanProperties,
+}
+
+impl SubtractExec {
+    fn left_sort_ordering(&self) -> LexOrdering {
+        let schema = self.left.schema();
+        [
+            PhysicalSortExpr::new_default(Arc::new(Column::new(
+                &self.left_columns.0,
+                schema.index_of(&self.left_columns.0).unwrap(),
+            ))),
+            PhysicalSortExpr::new_default(Arc::new(Column::new(
+                &self.left_columns.1,
+                schema.index_of(&self.left_columns.1).unwrap(),
+            ))),
+            PhysicalSortExpr::new_default(Arc::new(Column::new(
+                &self.left_columns.2,
+                schema.index_of(&self.left_columns.2).unwrap(),
+            ))),
+        ]
+        .into()
+    }
 }
 
 impl DisplayAs for SubtractExec {
@@ -219,7 +242,7 @@ impl ExecutionPlan for SubtractExec {
                 Partitioning::UnknownPartitioning(
                     children[0].output_partitioning().partition_count(),
                 ),
-                EmissionType::Final,
+                EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
         }))
@@ -230,167 +253,267 @@ impl ExecutionPlan for SubtractExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        get_subtract_stream(
-            Arc::clone(&self.left),
-            Arc::clone(&self.right),
-            self.schema.clone(),
-            Arc::clone(&self.left_columns),
-            Arc::clone(&self.right_columns),
-            self.strict,
-            partition,
-            context,
-        )
+        let batch_size = context.session_config().batch_size();
+        // Sort left at execution time to avoid optimizer stripping SortExec
+        let left_sort = SortExec::new(self.left_sort_ordering(), Arc::clone(&self.left))
+            .with_preserve_partitioning(true);
+        let left = left_sort.execute(partition, Arc::clone(&context))?;
+        let right = self.right.execute(partition, context)?;
+        Ok(Box::pin(SubtractStream {
+            schema: self.schema.clone(),
+            left,
+            right: Some(right),
+            left_columns: Arc::clone(&self.left_columns),
+            right_columns: Arc::clone(&self.right_columns),
+            strict: self.strict,
+            batch_size,
+            phase: SubtractPhase::CollectRight,
+            right_groups: BTreeMap::new(),
+            right_cursors: BTreeMap::new(),
+        }))
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn get_subtract_stream(
-    left_plan: Arc<dyn ExecutionPlan>,
-    right_plan: Arc<dyn ExecutionPlan>,
+enum SubtractPhase {
+    CollectRight,
+    StreamLeft,
+    Done,
+}
+
+struct SubtractStream {
     schema: SchemaRef,
+    left: SendableRecordBatchStream,
+    right: Option<SendableRecordBatchStream>,
     left_columns: Arc<(String, String, String)>,
     right_columns: Arc<(String, String, String)>,
     strict: bool,
-    partition: usize,
-    context: Arc<TaskContext>,
-) -> Result<SendableRecordBatchStream> {
-    let schema_for_closure = schema.clone();
-    let once_stream = once(async move {
-        let left_stream = left_plan.execute(partition, Arc::clone(&context))?;
-        let left_batches = collect(left_stream).await?;
-
-        let right_stream = right_plan.execute(partition, context)?;
-        let right_batches = collect(right_stream).await?;
-
-        build_subtract_batch(
-            &left_batches,
-            &right_batches,
-            &schema_for_closure,
-            &left_columns,
-            &right_columns,
-            strict,
-        )
-    });
-
-    let adapted_stream =
-        RecordBatchStreamAdapter::new(schema, Box::pin(once_stream) as BoxStream<'_, _>);
-    Ok(Box::pin(adapted_stream))
+    batch_size: usize,
+    phase: SubtractPhase,
+    right_groups: BTreeMap<String, Vec<(i64, i64)>>,
+    right_cursors: BTreeMap<String, usize>,
 }
 
-fn build_subtract_batch(
-    left_batches: &[RecordBatch],
-    right_batches: &[RecordBatch],
-    schema: &SchemaRef,
-    left_columns: &(String, String, String),
-    right_columns: &(String, String, String),
-    strict: bool,
-) -> Result<RecordBatch> {
-    let mut left_groups: AHashMap<String, Vec<(i64, i64)>> = AHashMap::default();
-    for batch in left_batches {
-        let (contig_arr, start_arr, end_arr) =
-            get_join_col_arrays(batch, (&left_columns.0, &left_columns.1, &left_columns.2))?;
-        let start_resolved = start_arr.resolve_i64()?;
-        let end_resolved = end_arr.resolve_i64()?;
-        let starts = &*start_resolved;
-        let ends = &*end_resolved;
-        for i in 0..batch.num_rows() {
-            left_groups
-                .entry(contig_arr.value(i).to_string())
-                .or_default()
-                .push((starts[i], ends[i]));
-        }
+impl SubtractStream {
+    fn flush_builders(
+        &self,
+        contig_builder: &mut StringBuilder,
+        start_builder: &mut Int64Builder,
+        end_builder: &mut Int64Builder,
+    ) -> Result<RecordBatch> {
+        RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                Arc::new(contig_builder.finish()),
+                Arc::new(start_builder.finish()),
+                Arc::new(end_builder.finish()),
+            ],
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
+}
 
-    let mut right_groups: AHashMap<String, Vec<(i64, i64)>> = AHashMap::default();
-    for batch in right_batches {
-        let (contig_arr, start_arr, end_arr) = get_join_col_arrays(
-            batch,
-            (&right_columns.0, &right_columns.1, &right_columns.2),
-        )?;
-        let start_resolved = start_arr.resolve_i64()?;
-        let end_resolved = end_arr.resolve_i64()?;
-        let starts = &*start_resolved;
-        let ends = &*end_resolved;
-        for i in 0..batch.num_rows() {
-            right_groups
-                .entry(contig_arr.value(i).to_string())
-                .or_default()
-                .push((starts[i], ends[i]));
-        }
-    }
+impl Stream for SubtractStream {
+    type Item = Result<RecordBatch>;
 
-    for intervals in left_groups.values_mut() {
-        intervals.sort_unstable();
-    }
-    for intervals in right_groups.values_mut() {
-        intervals.sort_unstable();
-    }
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
 
-    let mut contigs: Vec<String> = left_groups.keys().cloned().collect();
-    contigs.sort_unstable();
-
-    let estimated_rows: usize = left_groups.values().map(Vec::len).sum();
-    let mut contig_builder = StringBuilder::with_capacity(estimated_rows, estimated_rows * 8);
-    let mut start_builder = Int64Builder::with_capacity(estimated_rows);
-    let mut end_builder = Int64Builder::with_capacity(estimated_rows);
-
-    let empty = Vec::new();
-    for contig in &contigs {
-        let left_intervals = left_groups.get(contig.as_str()).unwrap();
-        let right_intervals = right_groups.get(contig.as_str()).unwrap_or(&empty);
-        let mut right_idx = 0usize;
-
-        for &(ls, le) in left_intervals {
-            let mut cursor = ls;
-
-            while right_idx < right_intervals.len() && right_intervals[right_idx].1 <= ls {
-                if strict {
-                    if right_intervals[right_idx].1 <= ls {
-                        right_idx += 1;
-                    } else {
-                        break;
+        loop {
+            match this.phase {
+                SubtractPhase::CollectRight => {
+                    if let Some(ref mut right_stream) = this.right {
+                        loop {
+                            let batch_opt = ready!(right_stream.poll_next_unpin(cx));
+                            match batch_opt {
+                                Some(Ok(batch)) => {
+                                    if batch.num_rows() == 0 {
+                                        continue;
+                                    }
+                                    let right_cols = &this.right_columns;
+                                    let (contig_arr, start_arr, end_arr) = match get_join_col_arrays(
+                                        &batch,
+                                        (&right_cols.0, &right_cols.1, &right_cols.2),
+                                    ) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            this.phase = SubtractPhase::Done;
+                                            return Poll::Ready(Some(Err(e)));
+                                        }
+                                    };
+                                    let start_resolved = match start_arr.resolve_i64() {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            this.phase = SubtractPhase::Done;
+                                            return Poll::Ready(Some(Err(e)));
+                                        }
+                                    };
+                                    let end_resolved = match end_arr.resolve_i64() {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            this.phase = SubtractPhase::Done;
+                                            return Poll::Ready(Some(Err(e)));
+                                        }
+                                    };
+                                    let starts = &*start_resolved;
+                                    let ends = &*end_resolved;
+                                    for i in 0..batch.num_rows() {
+                                        this.right_groups
+                                            .entry(contig_arr.value(i).to_string())
+                                            .or_default()
+                                            .push((starts[i], ends[i]));
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    this.phase = SubtractPhase::Done;
+                                    return Poll::Ready(Some(Err(e)));
+                                }
+                                None => break,
+                            }
+                        }
                     }
-                } else if right_intervals[right_idx].1 < ls {
-                    right_idx += 1;
-                } else {
-                    break;
+                    this.right = None;
+                    for intervals in this.right_groups.values_mut() {
+                        intervals.sort_unstable();
+                    }
+                    this.phase = SubtractPhase::StreamLeft;
                 }
-            }
+                SubtractPhase::StreamLeft => {
+                    let mut contig_builder = StringBuilder::new();
+                    let mut start_builder = Int64Builder::new();
+                    let mut end_builder = Int64Builder::new();
+                    let mut pending_rows = 0usize;
 
-            let mut j = right_idx;
-            while j < right_intervals.len() {
-                let (rs, re) = right_intervals[j];
-                let no_overlap = if strict { rs >= le } else { rs > le };
-                if no_overlap {
-                    break;
-                }
+                    loop {
+                        let batch_opt = ready!(this.left.poll_next_unpin(cx));
 
-                if rs > cursor {
-                    contig_builder.append_value(contig);
-                    start_builder.append_value(cursor);
-                    end_builder.append_value(rs);
-                }
-                if re > cursor {
-                    cursor = re;
-                }
-                j += 1;
-            }
+                        match batch_opt {
+                            Some(Ok(batch)) => {
+                                if batch.num_rows() == 0 {
+                                    continue;
+                                }
+                                let (contig_arr, start_arr, end_arr) = match get_join_col_arrays(
+                                    &batch,
+                                    (
+                                        &this.left_columns.0,
+                                        &this.left_columns.1,
+                                        &this.left_columns.2,
+                                    ),
+                                ) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        this.phase = SubtractPhase::Done;
+                                        return Poll::Ready(Some(Err(e)));
+                                    }
+                                };
+                                let start_resolved = match start_arr.resolve_i64() {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        this.phase = SubtractPhase::Done;
+                                        return Poll::Ready(Some(Err(e)));
+                                    }
+                                };
+                                let end_resolved = match end_arr.resolve_i64() {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        this.phase = SubtractPhase::Done;
+                                        return Poll::Ready(Some(Err(e)));
+                                    }
+                                };
+                                let starts = &*start_resolved;
+                                let ends = &*end_resolved;
 
-            if cursor < le {
-                contig_builder.append_value(contig);
-                start_builder.append_value(cursor);
-                end_builder.append_value(le);
+                                let empty = Vec::new();
+                                for i in 0..batch.num_rows() {
+                                    let contig = contig_arr.value(i);
+                                    let ls = starts[i];
+                                    let le = ends[i];
+
+                                    let right_intervals =
+                                        this.right_groups.get(contig).unwrap_or(&empty);
+                                    let right_idx =
+                                        this.right_cursors.entry(contig.to_string()).or_insert(0);
+
+                                    // Advance cursor past right intervals that end before
+                                    // left start
+                                    while *right_idx < right_intervals.len() {
+                                        let skip = if this.strict {
+                                            right_intervals[*right_idx].1 <= ls
+                                        } else {
+                                            right_intervals[*right_idx].1 < ls
+                                        };
+                                        if skip {
+                                            *right_idx += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+
+                                    let mut cursor = ls;
+                                    let mut j = *right_idx;
+                                    while j < right_intervals.len() {
+                                        let (rs, re) = right_intervals[j];
+                                        let no_overlap =
+                                            if this.strict { rs >= le } else { rs > le };
+                                        if no_overlap {
+                                            break;
+                                        }
+
+                                        if rs > cursor {
+                                            contig_builder.append_value(contig);
+                                            start_builder.append_value(cursor);
+                                            end_builder.append_value(rs);
+                                            pending_rows += 1;
+                                        }
+                                        if re > cursor {
+                                            cursor = re;
+                                        }
+                                        j += 1;
+                                    }
+
+                                    if cursor < le {
+                                        contig_builder.append_value(contig);
+                                        start_builder.append_value(cursor);
+                                        end_builder.append_value(le);
+                                        pending_rows += 1;
+                                    }
+
+                                    if pending_rows >= this.batch_size {
+                                        return Poll::Ready(Some(this.flush_builders(
+                                            &mut contig_builder,
+                                            &mut start_builder,
+                                            &mut end_builder,
+                                        )));
+                                    }
+                                }
+                            }
+                            Some(Err(e)) => {
+                                this.phase = SubtractPhase::Done;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                            None => {
+                                this.phase = SubtractPhase::Done;
+                                if pending_rows > 0 {
+                                    return Poll::Ready(Some(this.flush_builders(
+                                        &mut contig_builder,
+                                        &mut start_builder,
+                                        &mut end_builder,
+                                    )));
+                                }
+                                return Poll::Ready(None);
+                            }
+                        }
+                    }
+                }
+                SubtractPhase::Done => {
+                    return Poll::Ready(None);
+                }
             }
         }
     }
+}
 
-    RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(contig_builder.finish()),
-            Arc::new(start_builder.finish()),
-            Arc::new(end_builder.finish()),
-        ],
-    )
-    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+impl RecordBatchStream for SubtractStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 }
