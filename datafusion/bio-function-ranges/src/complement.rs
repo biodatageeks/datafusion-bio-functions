@@ -108,12 +108,13 @@ impl TableProvider for ComplementProvider {
             &self.columns.2,
         ])?;
         let input_plan = input_df.create_physical_plan().await?;
-        let input_plan: Arc<dyn ExecutionPlan> = if target_partitions > 1 {
+        let input_partitions = input_plan.output_partitioning().partition_count();
+        let input_plan: Arc<dyn ExecutionPlan> = if input_partitions > 1 || target_partitions > 1 {
             Arc::new(RepartitionExec::try_new(
                 input_plan,
                 Partitioning::Hash(
                     vec![Arc::new(Column::new(self.columns.0.as_str(), 0))],
-                    target_partitions,
+                    target_partitions.max(1),
                 ),
             )?)
         } else {
@@ -127,12 +128,13 @@ impl TableProvider for ComplementProvider {
                 &self.view_columns.2,
             ])?;
             let plan = view_df.create_physical_plan().await?;
-            let plan: Arc<dyn ExecutionPlan> = if target_partitions > 1 {
+            let view_partitions = plan.output_partitioning().partition_count();
+            let plan: Arc<dyn ExecutionPlan> = if view_partitions > 1 || target_partitions > 1 {
                 Arc::new(RepartitionExec::try_new(
                     plan,
                     Partitioning::Hash(
                         vec![Arc::new(Column::new(self.view_columns.0.as_str(), 0))],
-                        target_partitions,
+                        target_partitions.max(1),
                     ),
                 )?)
             } else {
@@ -286,6 +288,10 @@ impl ExecutionPlan for ComplementExec {
             merged_intervals: Vec::new(),
             seen_contigs: Vec::new(),
             trailing_iter_idx: 0,
+            contig_builder: StringBuilder::new(),
+            start_builder: Int64Builder::new(),
+            end_builder: Int64Builder::new(),
+            pending_rows: 0,
         }))
     }
 }
@@ -315,28 +321,27 @@ struct ComplementStream {
     merged_intervals: Vec<(i64, i64)>,
     seen_contigs: Vec<String>,
     trailing_iter_idx: usize,
+    contig_builder: StringBuilder,
+    start_builder: Int64Builder,
+    end_builder: Int64Builder,
+    pending_rows: usize,
 }
 
 impl ComplementStream {
-    fn flush_builders(
-        &self,
-        contig_builder: &mut StringBuilder,
-        start_builder: &mut Int64Builder,
-        end_builder: &mut Int64Builder,
-    ) -> Result<RecordBatch> {
+    fn flush_builders(&mut self) -> Result<RecordBatch> {
+        self.pending_rows = 0;
         RecordBatch::try_new(
             self.schema.clone(),
             vec![
-                Arc::new(contig_builder.finish()),
-                Arc::new(start_builder.finish()),
-                Arc::new(end_builder.finish()),
+                Arc::new(self.contig_builder.finish()),
+                Arc::new(self.start_builder.finish()),
+                Arc::new(self.end_builder.finish()),
             ],
         )
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
     /// Compute complement of merged intervals against view intervals for a contig.
-    /// This uses the same algorithm as the original `build_complement_batch`.
     fn emit_contig_complement(
         contig: &str,
         merged_intervals: &[(i64, i64)],
@@ -376,12 +381,7 @@ impl ComplementStream {
     }
 
     /// Finalize the current contig: push last merged interval, compute complement, clear state.
-    fn finalize_contig(
-        &mut self,
-        contig_builder: &mut StringBuilder,
-        start_builder: &mut Int64Builder,
-        end_builder: &mut Int64Builder,
-    ) -> usize {
+    fn finalize_contig(&mut self) -> usize {
         if let Some(prev_contig) = self.current_contig.take() {
             // Push the last in-progress merged interval
             self.merged_intervals
@@ -397,9 +397,9 @@ impl ComplementStream {
                 &prev_contig,
                 &self.merged_intervals,
                 view_intervals,
-                contig_builder,
-                start_builder,
-                end_builder,
+                &mut self.contig_builder,
+                &mut self.start_builder,
+                &mut self.end_builder,
             );
 
             self.merged_intervals.clear();
@@ -477,11 +477,6 @@ impl Stream for ComplementStream {
                     this.phase = ComplementPhase::StreamInput;
                 }
                 ComplementPhase::StreamInput => {
-                    let mut contig_builder = StringBuilder::new();
-                    let mut start_builder = Int64Builder::new();
-                    let mut end_builder = Int64Builder::new();
-                    let mut pending_rows = 0usize;
-
                     loop {
                         let batch_opt = ready!(this.input.poll_next_unpin(cx));
 
@@ -546,11 +541,7 @@ impl Stream for ComplementStream {
                                         }
                                     } else {
                                         // Contig change: compute complement for previous contig
-                                        pending_rows += this.finalize_contig(
-                                            &mut contig_builder,
-                                            &mut start_builder,
-                                            &mut end_builder,
-                                        );
+                                        this.pending_rows += this.finalize_contig();
 
                                         // If no explicit view, add implicit (0, i64::MAX)
                                         if this.view_bounds.is_empty() {
@@ -562,14 +553,11 @@ impl Stream for ComplementStream {
                                         this.cur_merged_start = s;
                                         this.cur_merged_end = e;
                                     }
+                                }
 
-                                    if pending_rows >= this.batch_size {
-                                        return Poll::Ready(Some(this.flush_builders(
-                                            &mut contig_builder,
-                                            &mut start_builder,
-                                            &mut end_builder,
-                                        )));
-                                    }
+                                // Flush after processing the entire batch
+                                if this.pending_rows >= this.batch_size {
+                                    return Poll::Ready(Some(this.flush_builders()));
                                 }
                             }
                             Some(Err(e)) => {
@@ -578,20 +566,12 @@ impl Stream for ComplementStream {
                             }
                             None => {
                                 // Input exhausted: finalize last contig
-                                pending_rows += this.finalize_contig(
-                                    &mut contig_builder,
-                                    &mut start_builder,
-                                    &mut end_builder,
-                                );
+                                this.pending_rows += this.finalize_contig();
 
                                 this.phase = ComplementPhase::EmitTrailingGaps;
 
-                                if pending_rows > 0 {
-                                    return Poll::Ready(Some(this.flush_builders(
-                                        &mut contig_builder,
-                                        &mut start_builder,
-                                        &mut end_builder,
-                                    )));
+                                if this.pending_rows > 0 {
+                                    return Poll::Ready(Some(this.flush_builders()));
                                 }
                                 break;
                             }
@@ -601,11 +581,6 @@ impl Stream for ComplementStream {
                 }
                 ComplementPhase::EmitTrailingGaps => {
                     // Emit full view ranges for contigs never seen in input
-                    let mut contig_builder = StringBuilder::new();
-                    let mut start_builder = Int64Builder::new();
-                    let mut end_builder = Int64Builder::new();
-                    let mut pending_rows = 0usize;
-
                     let view_contigs: Vec<String> = this.view_bounds.keys().cloned().collect();
 
                     while this.trailing_iter_idx < view_contigs.len() {
@@ -618,28 +593,20 @@ impl Stream for ComplementStream {
 
                         let view_intervals = this.view_bounds.get(contig).unwrap();
                         for &(view_start, view_end) in view_intervals {
-                            contig_builder.append_value(contig);
-                            start_builder.append_value(view_start);
-                            end_builder.append_value(view_end);
-                            pending_rows += 1;
+                            this.contig_builder.append_value(contig);
+                            this.start_builder.append_value(view_start);
+                            this.end_builder.append_value(view_end);
+                            this.pending_rows += 1;
                         }
 
-                        if pending_rows >= this.batch_size {
-                            return Poll::Ready(Some(this.flush_builders(
-                                &mut contig_builder,
-                                &mut start_builder,
-                                &mut end_builder,
-                            )));
+                        if this.pending_rows >= this.batch_size {
+                            return Poll::Ready(Some(this.flush_builders()));
                         }
                     }
 
                     this.phase = ComplementPhase::Done;
-                    if pending_rows > 0 {
-                        return Poll::Ready(Some(this.flush_builders(
-                            &mut contig_builder,
-                            &mut start_builder,
-                            &mut end_builder,
-                        )));
+                    if this.pending_rows > 0 {
+                        return Poll::Ready(Some(this.flush_builders()));
                     }
                     return Poll::Ready(None);
                 }

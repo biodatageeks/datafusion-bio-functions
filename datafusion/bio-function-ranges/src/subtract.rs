@@ -112,12 +112,13 @@ impl TableProvider for SubtractProvider {
                 &self.left_columns.2,
             ])?;
         let left_plan = left_df.create_physical_plan().await?;
-        let left_plan: Arc<dyn ExecutionPlan> = if target_partitions > 1 {
+        let left_partitions = left_plan.output_partitioning().partition_count();
+        let left_plan: Arc<dyn ExecutionPlan> = if left_partitions > 1 || target_partitions > 1 {
             Arc::new(RepartitionExec::try_new(
                 left_plan,
                 Partitioning::Hash(
                     vec![Arc::new(Column::new(self.left_columns.0.as_str(), 0))],
-                    target_partitions,
+                    target_partitions.max(1),
                 ),
             )?)
         } else {
@@ -134,12 +135,13 @@ impl TableProvider for SubtractProvider {
                 &self.right_columns.2,
             ])?;
         let right_plan = right_df.create_physical_plan().await?;
-        let right_plan: Arc<dyn ExecutionPlan> = if target_partitions > 1 {
+        let right_partitions = right_plan.output_partitioning().partition_count();
+        let right_plan: Arc<dyn ExecutionPlan> = if right_partitions > 1 || target_partitions > 1 {
             Arc::new(RepartitionExec::try_new(
                 right_plan,
                 Partitioning::Hash(
                     vec![Arc::new(Column::new(self.right_columns.0.as_str(), 0))],
-                    target_partitions,
+                    target_partitions.max(1),
                 ),
             )?)
         } else {
@@ -270,6 +272,10 @@ impl ExecutionPlan for SubtractExec {
             phase: SubtractPhase::CollectRight,
             right_groups: BTreeMap::new(),
             right_cursors: BTreeMap::new(),
+            contig_builder: StringBuilder::new(),
+            start_builder: Int64Builder::new(),
+            end_builder: Int64Builder::new(),
+            pending_rows: 0,
         }))
     }
 }
@@ -291,21 +297,21 @@ struct SubtractStream {
     phase: SubtractPhase,
     right_groups: BTreeMap<String, Vec<(i64, i64)>>,
     right_cursors: BTreeMap<String, usize>,
+    contig_builder: StringBuilder,
+    start_builder: Int64Builder,
+    end_builder: Int64Builder,
+    pending_rows: usize,
 }
 
 impl SubtractStream {
-    fn flush_builders(
-        &self,
-        contig_builder: &mut StringBuilder,
-        start_builder: &mut Int64Builder,
-        end_builder: &mut Int64Builder,
-    ) -> Result<RecordBatch> {
+    fn flush_builders(&mut self) -> Result<RecordBatch> {
+        self.pending_rows = 0;
         RecordBatch::try_new(
             self.schema.clone(),
             vec![
-                Arc::new(contig_builder.finish()),
-                Arc::new(start_builder.finish()),
-                Arc::new(end_builder.finish()),
+                Arc::new(self.contig_builder.finish()),
+                Arc::new(self.start_builder.finish()),
+                Arc::new(self.end_builder.finish()),
             ],
         )
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
@@ -378,11 +384,6 @@ impl Stream for SubtractStream {
                     this.phase = SubtractPhase::StreamLeft;
                 }
                 SubtractPhase::StreamLeft => {
-                    let mut contig_builder = StringBuilder::new();
-                    let mut start_builder = Int64Builder::new();
-                    let mut end_builder = Int64Builder::new();
-                    let mut pending_rows = 0usize;
-
                     loop {
                         let batch_opt = ready!(this.left.poll_next_unpin(cx));
 
@@ -459,10 +460,10 @@ impl Stream for SubtractStream {
                                         }
 
                                         if rs > cursor {
-                                            contig_builder.append_value(contig);
-                                            start_builder.append_value(cursor);
-                                            end_builder.append_value(rs);
-                                            pending_rows += 1;
+                                            this.contig_builder.append_value(contig);
+                                            this.start_builder.append_value(cursor);
+                                            this.end_builder.append_value(rs);
+                                            this.pending_rows += 1;
                                         }
                                         if re > cursor {
                                             cursor = re;
@@ -471,19 +472,16 @@ impl Stream for SubtractStream {
                                     }
 
                                     if cursor < le {
-                                        contig_builder.append_value(contig);
-                                        start_builder.append_value(cursor);
-                                        end_builder.append_value(le);
-                                        pending_rows += 1;
+                                        this.contig_builder.append_value(contig);
+                                        this.start_builder.append_value(cursor);
+                                        this.end_builder.append_value(le);
+                                        this.pending_rows += 1;
                                     }
+                                }
 
-                                    if pending_rows >= this.batch_size {
-                                        return Poll::Ready(Some(this.flush_builders(
-                                            &mut contig_builder,
-                                            &mut start_builder,
-                                            &mut end_builder,
-                                        )));
-                                    }
+                                // Flush after processing the entire batch
+                                if this.pending_rows >= this.batch_size {
+                                    return Poll::Ready(Some(this.flush_builders()));
                                 }
                             }
                             Some(Err(e)) => {
@@ -492,12 +490,8 @@ impl Stream for SubtractStream {
                             }
                             None => {
                                 this.phase = SubtractPhase::Done;
-                                if pending_rows > 0 {
-                                    return Poll::Ready(Some(this.flush_builders(
-                                        &mut contig_builder,
-                                        &mut start_builder,
-                                        &mut end_builder,
-                                    )));
+                                if this.pending_rows > 0 {
+                                    return Poll::Ready(Some(this.flush_builders()));
                                 }
                                 return Poll::Ready(None);
                             }

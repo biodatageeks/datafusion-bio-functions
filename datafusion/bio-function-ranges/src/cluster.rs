@@ -107,12 +107,13 @@ impl TableProvider for ClusterProvider {
             &self.columns.2,
         ])?;
         let input_plan = input_df.create_physical_plan().await?;
-        let input_plan: Arc<dyn ExecutionPlan> = if target_partitions > 1 {
+        let input_partitions = input_plan.output_partitioning().partition_count();
+        let input_plan: Arc<dyn ExecutionPlan> = if input_partitions > 1 || target_partitions > 1 {
             Arc::new(RepartitionExec::try_new(
                 input_plan,
                 Partitioning::Hash(
                     vec![Arc::new(Column::new(self.columns.0.as_str(), 0))],
-                    target_partitions,
+                    target_partitions.max(1),
                 ),
             )?)
         } else {
@@ -244,6 +245,13 @@ impl ExecutionPlan for ClusterExec {
             cluster_end: 0,
             pending_intervals: Vec::new(),
             done: false,
+            contig_builder: StringBuilder::new(),
+            start_builder: Int64Builder::new(),
+            end_builder: Int64Builder::new(),
+            cluster_builder: Int64Builder::new(),
+            cluster_start_builder: Int64Builder::new(),
+            cluster_end_builder: Int64Builder::new(),
+            pending_rows: 0,
         }))
     }
 }
@@ -261,18 +269,18 @@ struct ClusterStream {
     cluster_end: i64,
     pending_intervals: Vec<(i64, i64)>,
     done: bool,
+    contig_builder: StringBuilder,
+    start_builder: Int64Builder,
+    end_builder: Int64Builder,
+    cluster_builder: Int64Builder,
+    cluster_start_builder: Int64Builder,
+    cluster_end_builder: Int64Builder,
+    pending_rows: usize,
 }
 
 impl ClusterStream {
-    #[allow(clippy::too_many_arguments)]
     fn emit_cluster(
-        &self,
-        contig_builder: &mut StringBuilder,
-        start_builder: &mut Int64Builder,
-        end_builder: &mut Int64Builder,
-        cluster_builder: &mut Int64Builder,
-        cluster_start_builder: &mut Int64Builder,
-        cluster_end_builder: &mut Int64Builder,
+        &mut self,
         contig: &str,
         pending: &[(i64, i64)],
         cluster_id: i64,
@@ -280,33 +288,26 @@ impl ClusterStream {
         cluster_end: i64,
     ) {
         for &(s, e) in pending {
-            contig_builder.append_value(contig);
-            start_builder.append_value(s);
-            end_builder.append_value(e);
-            cluster_builder.append_value(cluster_id);
-            cluster_start_builder.append_value(cluster_start);
-            cluster_end_builder.append_value(cluster_end);
+            self.contig_builder.append_value(contig);
+            self.start_builder.append_value(s);
+            self.end_builder.append_value(e);
+            self.cluster_builder.append_value(cluster_id);
+            self.cluster_start_builder.append_value(cluster_start);
+            self.cluster_end_builder.append_value(cluster_end);
         }
     }
 
-    fn flush_builders(
-        &self,
-        contig_builder: &mut StringBuilder,
-        start_builder: &mut Int64Builder,
-        end_builder: &mut Int64Builder,
-        cluster_builder: &mut Int64Builder,
-        cluster_start_builder: &mut Int64Builder,
-        cluster_end_builder: &mut Int64Builder,
-    ) -> Result<RecordBatch> {
+    fn flush_builders(&mut self) -> Result<RecordBatch> {
+        self.pending_rows = 0;
         RecordBatch::try_new(
             self.schema.clone(),
             vec![
-                Arc::new(contig_builder.finish()),
-                Arc::new(start_builder.finish()),
-                Arc::new(end_builder.finish()),
-                Arc::new(cluster_builder.finish()),
-                Arc::new(cluster_start_builder.finish()),
-                Arc::new(cluster_end_builder.finish()),
+                Arc::new(self.contig_builder.finish()),
+                Arc::new(self.start_builder.finish()),
+                Arc::new(self.end_builder.finish()),
+                Arc::new(self.cluster_builder.finish()),
+                Arc::new(self.cluster_start_builder.finish()),
+                Arc::new(self.cluster_end_builder.finish()),
             ],
         )
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
@@ -322,14 +323,6 @@ impl Stream for ClusterStream {
         if this.done {
             return Poll::Ready(None);
         }
-
-        let mut contig_builder = StringBuilder::new();
-        let mut start_builder = Int64Builder::new();
-        let mut end_builder = Int64Builder::new();
-        let mut cluster_builder = Int64Builder::new();
-        let mut cluster_start_builder = Int64Builder::new();
-        let mut cluster_end_builder = Int64Builder::new();
-        let mut pending_rows = 0usize;
 
         loop {
             let batch_opt = ready!(this.input.poll_next_unpin(cx));
@@ -392,20 +385,15 @@ impl Stream for ClusterStream {
                             } else {
                                 // Emit current cluster
                                 let pending = std::mem::take(&mut this.pending_intervals);
+                                let contig_ref = this.current_contig.as_ref().unwrap().clone();
                                 this.emit_cluster(
-                                    &mut contig_builder,
-                                    &mut start_builder,
-                                    &mut end_builder,
-                                    &mut cluster_builder,
-                                    &mut cluster_start_builder,
-                                    &mut cluster_end_builder,
-                                    this.current_contig.as_ref().unwrap(),
+                                    &contig_ref,
                                     &pending,
                                     this.cluster_id,
                                     this.cluster_start,
                                     this.cluster_end,
                                 );
-                                pending_rows += pending.len();
+                                this.pending_rows += pending.len();
                                 this.cluster_id += 1;
                                 this.cluster_start = s;
                                 this.cluster_end = e;
@@ -415,20 +403,15 @@ impl Stream for ClusterStream {
                             // Contig change: emit current cluster if any
                             if this.current_contig.is_some() {
                                 let pending = std::mem::take(&mut this.pending_intervals);
+                                let contig_ref = this.current_contig.as_ref().unwrap().clone();
                                 this.emit_cluster(
-                                    &mut contig_builder,
-                                    &mut start_builder,
-                                    &mut end_builder,
-                                    &mut cluster_builder,
-                                    &mut cluster_start_builder,
-                                    &mut cluster_end_builder,
-                                    this.current_contig.as_ref().unwrap(),
+                                    &contig_ref,
                                     &pending,
                                     this.cluster_id,
                                     this.cluster_start,
                                     this.cluster_end,
                                 );
-                                pending_rows += pending.len();
+                                this.pending_rows += pending.len();
                                 this.cluster_id += 1;
                             }
                             this.current_contig = Some(contig.to_string());
@@ -436,17 +419,11 @@ impl Stream for ClusterStream {
                             this.cluster_end = e;
                             this.pending_intervals.push((s, e));
                         }
+                    }
 
-                        if pending_rows >= this.batch_size {
-                            return Poll::Ready(Some(this.flush_builders(
-                                &mut contig_builder,
-                                &mut start_builder,
-                                &mut end_builder,
-                                &mut cluster_builder,
-                                &mut cluster_start_builder,
-                                &mut cluster_end_builder,
-                            )));
-                        }
+                    // Flush after processing the entire batch
+                    if this.pending_rows >= this.batch_size {
+                        return Poll::Ready(Some(this.flush_builders()));
                     }
                 }
                 Some(Err(e)) => {
@@ -458,30 +435,18 @@ impl Stream for ClusterStream {
                     this.done = true;
                     if this.current_contig.is_some() {
                         let pending = std::mem::take(&mut this.pending_intervals);
+                        let contig_ref = this.current_contig.as_ref().unwrap().clone();
                         this.emit_cluster(
-                            &mut contig_builder,
-                            &mut start_builder,
-                            &mut end_builder,
-                            &mut cluster_builder,
-                            &mut cluster_start_builder,
-                            &mut cluster_end_builder,
-                            this.current_contig.as_ref().unwrap(),
+                            &contig_ref,
                             &pending,
                             this.cluster_id,
                             this.cluster_start,
                             this.cluster_end,
                         );
-                        pending_rows += pending.len();
+                        this.pending_rows += pending.len();
                     }
-                    if pending_rows > 0 {
-                        return Poll::Ready(Some(this.flush_builders(
-                            &mut contig_builder,
-                            &mut start_builder,
-                            &mut end_builder,
-                            &mut cluster_builder,
-                            &mut cluster_start_builder,
-                            &mut cluster_end_builder,
-                        )));
+                    if this.pending_rows > 0 {
+                        return Poll::Ready(Some(this.flush_builders()));
                     }
                     return Poll::Ready(None);
                 }

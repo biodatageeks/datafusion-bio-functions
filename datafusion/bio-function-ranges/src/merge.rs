@@ -105,12 +105,13 @@ impl TableProvider for MergeProvider {
             &self.columns.2,
         ])?;
         let input_plan = input_df.create_physical_plan().await?;
-        let input_plan: Arc<dyn ExecutionPlan> = if target_partitions > 1 {
+        let input_partitions = input_plan.output_partitioning().partition_count();
+        let input_plan: Arc<dyn ExecutionPlan> = if input_partitions > 1 || target_partitions > 1 {
             Arc::new(RepartitionExec::try_new(
                 input_plan,
                 Partitioning::Hash(
                     vec![Arc::new(Column::new(self.columns.0.as_str(), 0))],
-                    target_partitions,
+                    target_partitions.max(1),
                 ),
             )?)
         } else {
@@ -242,6 +243,11 @@ impl ExecutionPlan for MergeExec {
             cur_end: 0,
             cur_count: 0,
             done: false,
+            contig_builder: StringBuilder::new(),
+            start_builder: Int64Builder::new(),
+            end_builder: Int64Builder::new(),
+            count_builder: Int64Builder::new(),
+            pending_rows: 0,
         }))
     }
 }
@@ -258,23 +264,23 @@ struct MergeStream {
     cur_end: i64,
     cur_count: i64,
     done: bool,
+    contig_builder: StringBuilder,
+    start_builder: Int64Builder,
+    end_builder: Int64Builder,
+    count_builder: Int64Builder,
+    pending_rows: usize,
 }
 
 impl MergeStream {
-    fn flush_builders(
-        &self,
-        contig_builder: &mut StringBuilder,
-        start_builder: &mut Int64Builder,
-        end_builder: &mut Int64Builder,
-        count_builder: &mut Int64Builder,
-    ) -> Result<RecordBatch> {
+    fn flush_builders(&mut self) -> Result<RecordBatch> {
+        self.pending_rows = 0;
         RecordBatch::try_new(
             self.schema.clone(),
             vec![
-                Arc::new(contig_builder.finish()),
-                Arc::new(start_builder.finish()),
-                Arc::new(end_builder.finish()),
-                Arc::new(count_builder.finish()),
+                Arc::new(self.contig_builder.finish()),
+                Arc::new(self.start_builder.finish()),
+                Arc::new(self.end_builder.finish()),
+                Arc::new(self.count_builder.finish()),
             ],
         )
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
@@ -290,12 +296,6 @@ impl Stream for MergeStream {
         if this.done {
             return Poll::Ready(None);
         }
-
-        let mut contig_builder = StringBuilder::new();
-        let mut start_builder = Int64Builder::new();
-        let mut end_builder = Int64Builder::new();
-        let mut count_builder = Int64Builder::new();
-        let mut pending_rows = 0usize;
 
         loop {
             let batch_opt = ready!(this.input.poll_next_unpin(cx));
@@ -356,11 +356,12 @@ impl Stream for MergeStream {
                                 this.cur_count += 1;
                             } else {
                                 // Emit current interval
-                                contig_builder.append_value(this.current_contig.as_ref().unwrap());
-                                start_builder.append_value(this.cur_start);
-                                end_builder.append_value(this.cur_end);
-                                count_builder.append_value(this.cur_count);
-                                pending_rows += 1;
+                                this.contig_builder
+                                    .append_value(this.current_contig.as_ref().unwrap());
+                                this.start_builder.append_value(this.cur_start);
+                                this.end_builder.append_value(this.cur_end);
+                                this.count_builder.append_value(this.cur_count);
+                                this.pending_rows += 1;
 
                                 this.cur_start = s;
                                 this.cur_end = e;
@@ -369,26 +370,23 @@ impl Stream for MergeStream {
                         } else {
                             // Contig change: emit current interval if any
                             if this.current_contig.is_some() {
-                                contig_builder.append_value(this.current_contig.as_ref().unwrap());
-                                start_builder.append_value(this.cur_start);
-                                end_builder.append_value(this.cur_end);
-                                count_builder.append_value(this.cur_count);
-                                pending_rows += 1;
+                                this.contig_builder
+                                    .append_value(this.current_contig.as_ref().unwrap());
+                                this.start_builder.append_value(this.cur_start);
+                                this.end_builder.append_value(this.cur_end);
+                                this.count_builder.append_value(this.cur_count);
+                                this.pending_rows += 1;
                             }
                             this.current_contig = Some(contig.to_string());
                             this.cur_start = s;
                             this.cur_end = e;
                             this.cur_count = 1;
                         }
+                    }
 
-                        if pending_rows >= this.batch_size {
-                            return Poll::Ready(Some(this.flush_builders(
-                                &mut contig_builder,
-                                &mut start_builder,
-                                &mut end_builder,
-                                &mut count_builder,
-                            )));
-                        }
+                    // Flush after processing the entire batch
+                    if this.pending_rows >= this.batch_size {
+                        return Poll::Ready(Some(this.flush_builders()));
                     }
                 }
                 Some(Err(e)) => {
@@ -399,19 +397,15 @@ impl Stream for MergeStream {
                     // Input exhausted — emit final interval
                     this.done = true;
                     if this.current_contig.is_some() {
-                        contig_builder.append_value(this.current_contig.as_ref().unwrap());
-                        start_builder.append_value(this.cur_start);
-                        end_builder.append_value(this.cur_end);
-                        count_builder.append_value(this.cur_count);
-                        pending_rows += 1;
+                        this.contig_builder
+                            .append_value(this.current_contig.as_ref().unwrap());
+                        this.start_builder.append_value(this.cur_start);
+                        this.end_builder.append_value(this.cur_end);
+                        this.count_builder.append_value(this.cur_count);
+                        this.pending_rows += 1;
                     }
-                    if pending_rows > 0 {
-                        return Poll::Ready(Some(this.flush_builders(
-                            &mut contig_builder,
-                            &mut start_builder,
-                            &mut end_builder,
-                            &mut count_builder,
-                        )));
+                    if this.pending_rows > 0 {
+                        return Poll::Ready(Some(this.flush_builders()));
                     }
                     return Poll::Ready(None);
                 }

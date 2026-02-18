@@ -3142,3 +3142,284 @@ async fn test_range_udtfs_target_partitions_invariant() -> Result<()> {
 
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scaling benchmark (large Parquet dataset, run with --ignored)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CHAIN_PATH: &str = "/tmp/polars-bio-bench/databio/chainXenTro3Link/";
+
+async fn bench_merge_with_partitions(
+    target_partitions: usize,
+) -> Result<(usize, usize, std::time::Duration)> {
+    let ctx = create_bio_session_with_target_partitions(target_partitions);
+    let create = format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
+    ctx.sql(&create).await?;
+
+    let input_count: usize = ctx
+        .sql("SELECT count(*) AS c FROM chain")
+        .await?
+        .collect()
+        .await?
+        .iter()
+        .map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0) as usize
+        })
+        .sum();
+
+    let start = std::time::Instant::now();
+    let result = ctx
+        .sql("SELECT * FROM merge('chain')")
+        .await?
+        .collect()
+        .await?;
+    let elapsed = start.elapsed();
+    let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    let n_intervals_sum: i64 = result
+        .iter()
+        .map(|b| {
+            b.column_by_name("n_intervals")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .sum::<i64>()
+        })
+        .sum();
+    eprintln!(
+        "    sum(n_intervals)={} (expected {}), match={}",
+        n_intervals_sum,
+        input_count,
+        n_intervals_sum == input_count as i64
+    );
+    Ok((input_count, rows, elapsed))
+}
+
+async fn bench_cluster_with_partitions(
+    target_partitions: usize,
+) -> Result<(usize, std::time::Duration)> {
+    let ctx = create_bio_session_with_target_partitions(target_partitions);
+    let create = format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
+    ctx.sql(&create).await?;
+
+    let start = std::time::Instant::now();
+    let result = ctx
+        .sql("SELECT * FROM cluster('chain')")
+        .await?
+        .collect()
+        .await?;
+    let elapsed = start.elapsed();
+    let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    Ok((rows, elapsed))
+}
+
+async fn bench_complement_with_partitions(
+    target_partitions: usize,
+) -> Result<(usize, std::time::Duration)> {
+    let ctx = create_bio_session_with_target_partitions(target_partitions);
+    let create = format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
+    ctx.sql(&create).await?;
+
+    let start = std::time::Instant::now();
+    let result = ctx
+        .sql("SELECT * FROM complement('chain')")
+        .await?
+        .collect()
+        .await?;
+    let elapsed = start.elapsed();
+    let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    Ok((rows, elapsed))
+}
+
+async fn bench_subtract_with_partitions(
+    target_partitions: usize,
+) -> Result<(usize, std::time::Duration)> {
+    let ctx = create_bio_session_with_target_partitions(target_partitions);
+    let create_left =
+        format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
+    ctx.sql(&create_left).await?;
+
+    // Use the first Parquet file as the right (subtraction mask)
+    ctx.sql(
+        "CREATE EXTERNAL TABLE mask STORED AS PARQUET LOCATION '/tmp/polars-bio-bench/databio/chainXenTro3Link/part-00000-d999dd06-a0e2-4b31-80e5-2acf71fcebc7-c000.snappy.parquet'"
+    ).await?;
+
+    let start = std::time::Instant::now();
+    let result = ctx
+        .sql("SELECT * FROM subtract('chain', 'mask')")
+        .await?
+        .collect()
+        .await?;
+    let elapsed = start.elapsed();
+    let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    Ok((rows, elapsed))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Run with: cargo test bench_scaling -- --ignored --nocapture
+async fn bench_scaling_merge() -> Result<()> {
+    eprintln!("\n=== MERGE scaling (chainXenTro3Link, ~51M rows) ===");
+    for partitions in [1, 2, 4, 8] {
+        let (input_rows, rows, elapsed) = bench_merge_with_partitions(partitions).await?;
+        eprintln!(
+            "  partitions={:<2}  input={:<12}  output={:<10}  time={:.3}s",
+            partitions,
+            input_rows,
+            rows,
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_debug_merge_correctness() -> Result<()> {
+    // Test 1: single Parquet file (5.6M rows, single partition, no repartition)
+    eprintln!("\n--- Single Parquet file (no repartition) ---");
+    let ctx = create_bio_session_with_target_partitions(1);
+    ctx.sql(
+        "CREATE EXTERNAL TABLE single_file STORED AS PARQUET LOCATION '/tmp/polars-bio-bench/databio/chainXenTro3Link/part-00000-d999dd06-a0e2-4b31-80e5-2acf71fcebc7-c000.snappy.parquet'"
+    ).await?;
+
+    let input_count: i64 = ctx
+        .sql("SELECT count(*) AS c FROM single_file")
+        .await?
+        .collect()
+        .await?[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+
+    for run in 0..3 {
+        let result = ctx
+            .sql("SELECT * FROM merge('single_file')")
+            .await?
+            .collect()
+            .await?;
+        let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        let n_sum: i64 = result
+            .iter()
+            .map(|b| {
+                b.column_by_name("n_intervals")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .sum::<i64>()
+            })
+            .sum();
+        eprintln!(
+            "  run={} rows={} sum(n_intervals)={} input={} match={}",
+            run,
+            rows,
+            n_sum,
+            input_count,
+            n_sum == input_count
+        );
+    }
+
+    // Test 2: full directory with repartition into 1
+    eprintln!("\n--- Full directory (128M rows, hash repartition into 1) ---");
+    let ctx2 = create_bio_session_with_target_partitions(1);
+    let create = format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
+    ctx2.sql(&create).await?;
+
+    let full_count: i64 = ctx2
+        .sql("SELECT count(*) AS c FROM chain")
+        .await?
+        .collect()
+        .await?[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+
+    let result = ctx2
+        .sql("SELECT * FROM merge('chain')")
+        .await?
+        .collect()
+        .await?;
+    let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    let n_sum: i64 = result
+        .iter()
+        .map(|b| {
+            b.column_by_name("n_intervals")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .sum::<i64>()
+        })
+        .sum();
+    eprintln!(
+        "  rows={} sum(n_intervals)={} input={} match={}",
+        rows,
+        n_sum,
+        full_count,
+        n_sum == full_count
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scaling_cluster() -> Result<()> {
+    eprintln!("\n=== CLUSTER scaling (chainXenTro3Link, ~51M rows) ===");
+    for partitions in [1, 2, 4, 8] {
+        let (rows, elapsed) = bench_cluster_with_partitions(partitions).await?;
+        eprintln!(
+            "  partitions={:<2}  rows={:<10}  time={:.3}s",
+            partitions,
+            rows,
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scaling_complement() -> Result<()> {
+    eprintln!("\n=== COMPLEMENT scaling (chainXenTro3Link, ~51M rows) ===");
+    for partitions in [1, 2, 4, 8] {
+        let (rows, elapsed) = bench_complement_with_partitions(partitions).await?;
+        eprintln!(
+            "  partitions={:<2}  rows={:<10}  time={:.3}s",
+            partitions,
+            rows,
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scaling_subtract() -> Result<()> {
+    eprintln!("\n=== SUBTRACT scaling (chainXenTro3Link, ~51M rows) ===");
+    for partitions in [1, 2, 4, 8] {
+        let (rows, elapsed) = bench_subtract_with_partitions(partitions).await?;
+        eprintln!(
+            "  partitions={:<2}  rows={:<10}  time={:.3}s",
+            partitions,
+            rows,
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
