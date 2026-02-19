@@ -3164,10 +3164,7 @@ async fn bench_merge_with_partitions(
             .collect()
             .await?;
         let formatted = pretty_format_batches(&plan)?.to_string();
-        eprintln!(
-            "\n  EXPLAIN VERBOSE (partitions={}):\n{}",
-            target_partitions, formatted
-        );
+        eprintln!("\n  EXPLAIN VERBOSE (partitions={target_partitions}):\n{formatted}");
     }
 
     let input_count: usize = ctx
@@ -3230,10 +3227,7 @@ async fn bench_cluster_with_partitions(
             .collect()
             .await?;
         let formatted = pretty_format_batches(&plan)?.to_string();
-        eprintln!(
-            "\n  EXPLAIN VERBOSE (partitions={}):\n{}",
-            target_partitions, formatted
-        );
+        eprintln!("\n  EXPLAIN VERBOSE (partitions={target_partitions}):\n{formatted}");
     }
 
     let start = std::time::Instant::now();
@@ -3262,10 +3256,7 @@ async fn bench_complement_with_partitions(
             .collect()
             .await?;
         let formatted = pretty_format_batches(&plan)?.to_string();
-        eprintln!(
-            "\n  EXPLAIN VERBOSE (partitions={}):\n{}",
-            target_partitions, formatted
-        );
+        eprintln!("\n  EXPLAIN VERBOSE (partitions={target_partitions}):\n{formatted}");
     }
 
     let start = std::time::Instant::now();
@@ -3300,10 +3291,7 @@ async fn bench_subtract_with_partitions(
             .collect()
             .await?;
         let formatted = pretty_format_batches(&plan)?.to_string();
-        eprintln!(
-            "\n  EXPLAIN VERBOSE (partitions={}):\n{}",
-            target_partitions, formatted
-        );
+        eprintln!("\n  EXPLAIN VERBOSE (partitions={target_partitions}):\n{formatted}");
     }
 
     let start = std::time::Instant::now();
