@@ -171,9 +171,7 @@ fn extract_min_dist<'a>(extra: &'a [Expr], fn_name: &str) -> Result<(i64, &'a [E
         }
         Expr::Literal(ScalarValue::UInt64(Some(v)), _) => Ok((
             i64::try_from(*v).map_err(|_| {
-                DataFusionError::Plan(format!(
-                    "{fn_name}() min_dist value {v} does not fit i64"
-                ))
+                DataFusionError::Plan(format!("{fn_name}() min_dist value {v} does not fit i64"))
             })?,
             &extra[1..],
         )),
