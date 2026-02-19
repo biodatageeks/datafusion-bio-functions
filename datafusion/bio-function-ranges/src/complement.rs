@@ -13,11 +13,9 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, Partitioning};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -26,6 +24,7 @@ use futures::{Stream, StreamExt, ready};
 
 use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
+use crate::grouped_stream::{DEFAULT_BATCH_SIZE, StreamCollector};
 
 pub struct ComplementProvider {
     session: Arc<SessionContext>,
@@ -175,27 +174,6 @@ struct ComplementExec {
     cache: PlanProperties,
 }
 
-impl ComplementExec {
-    fn sort_ordering(&self) -> LexOrdering {
-        let schema = self.input.schema();
-        [
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.columns.0,
-                schema.index_of(&self.columns.0).unwrap(),
-            ))),
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.columns.1,
-                schema.index_of(&self.columns.1).unwrap(),
-            ))),
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.columns.2,
-                schema.index_of(&self.columns.2).unwrap(),
-            ))),
-        ]
-        .into()
-    }
-}
-
 impl DisplayAs for ComplementExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "ComplementExec: strict={}", self.strict)
@@ -263,10 +241,7 @@ impl ExecutionPlan for ComplementExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let batch_size = context.session_config().batch_size();
-        let sort_exec = SortExec::new(self.sort_ordering(), Arc::clone(&self.input))
-            .with_preserve_partitioning(true);
-        let input = sort_exec.execute(partition, Arc::clone(&context))?;
+        let input = self.input.execute(partition, Arc::clone(&context))?;
         let view_stream = self
             .view
             .as_ref()
@@ -274,20 +249,16 @@ impl ExecutionPlan for ComplementExec {
             .transpose()?;
         Ok(Box::pin(ComplementStream {
             schema: self.schema.clone(),
-            input,
+            collector: StreamCollector::new(input, Arc::clone(&self.columns)),
             view_stream,
-            columns: Arc::clone(&self.columns),
             view_columns: Arc::clone(&self.view_columns),
             strict: self.strict,
-            batch_size,
             phase: ComplementPhase::CollectView,
             view_bounds: BTreeMap::new(),
-            current_contig: None,
-            cur_merged_start: 0,
-            cur_merged_end: 0,
-            merged_intervals: Vec::new(),
-            seen_contigs: Vec::new(),
+            input_groups: Vec::new(),
+            group_idx: 0,
             trailing_iter_idx: 0,
+            seen_contigs: Vec::new(),
             contig_builder: StringBuilder::new(),
             start_builder: Int64Builder::new(),
             end_builder: Int64Builder::new(),
@@ -298,29 +269,24 @@ impl ExecutionPlan for ComplementExec {
 
 enum ComplementPhase {
     CollectView,
-    StreamInput,
+    CollectInput,
+    Emit,
     EmitTrailingGaps,
     Done,
 }
 
 struct ComplementStream {
     schema: SchemaRef,
-    input: SendableRecordBatchStream,
+    collector: StreamCollector,
     view_stream: Option<SendableRecordBatchStream>,
-    columns: Arc<(String, String, String)>,
     view_columns: Arc<(String, String, String)>,
     strict: bool,
-    batch_size: usize,
     phase: ComplementPhase,
     view_bounds: BTreeMap<String, Vec<(i64, i64)>>,
-    current_contig: Option<String>,
-    cur_merged_start: i64,
-    cur_merged_end: i64,
-    /// Collected merged (non-overlapping) intervals for the current contig.
-    /// Typically small: one entry per contiguous coverage region.
-    merged_intervals: Vec<(i64, i64)>,
-    seen_contigs: Vec<String>,
+    input_groups: Vec<(String, Vec<(i64, i64)>)>,
+    group_idx: usize,
     trailing_iter_idx: usize,
+    seen_contigs: Vec<String>,
     contig_builder: StringBuilder,
     start_builder: Int64Builder,
     end_builder: Int64Builder,
@@ -339,6 +305,30 @@ impl ComplementStream {
             ],
         )
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+
+    /// Merge overlapping/touching intervals in a sorted slice, respecting `strict` mode.
+    fn merge_intervals(intervals: &[(i64, i64)], strict: bool) -> Vec<(i64, i64)> {
+        if intervals.is_empty() {
+            return Vec::new();
+        }
+        let mut merged = Vec::new();
+        let mut cur_start = intervals[0].0;
+        let mut cur_end = intervals[0].1;
+        for &(s, e) in &intervals[1..] {
+            let merge_condition = if strict { s < cur_end } else { s <= cur_end };
+            if merge_condition {
+                if e > cur_end {
+                    cur_end = e;
+                }
+            } else {
+                merged.push((cur_start, cur_end));
+                cur_start = s;
+                cur_end = e;
+            }
+        }
+        merged.push((cur_start, cur_end));
+        merged
     }
 
     /// Compute complement of merged intervals against view intervals for a contig.
@@ -378,36 +368,6 @@ impl ComplementStream {
             }
         }
         rows
-    }
-
-    /// Finalize the current contig: push last merged interval, compute complement, clear state.
-    fn finalize_contig(&mut self) -> usize {
-        if let Some(prev_contig) = self.current_contig.take() {
-            // Push the last in-progress merged interval
-            self.merged_intervals
-                .push((self.cur_merged_start, self.cur_merged_end));
-
-            let view_intervals = self
-                .view_bounds
-                .get(&prev_contig)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-
-            let rows = Self::emit_contig_complement(
-                &prev_contig,
-                &self.merged_intervals,
-                view_intervals,
-                &mut self.contig_builder,
-                &mut self.start_builder,
-                &mut self.end_builder,
-            );
-
-            self.merged_intervals.clear();
-            self.seen_contigs.push(prev_contig);
-            rows
-        } else {
-            0
-        }
     }
 }
 
@@ -456,10 +416,15 @@ impl Stream for ComplementStream {
                                     let starts = &*start_resolved;
                                     let ends = &*end_resolved;
                                     for i in 0..batch.num_rows() {
-                                        this.view_bounds
-                                            .entry(contig_arr.value(i).to_string())
-                                            .or_default()
-                                            .push((starts[i], ends[i]));
+                                        let contig = contig_arr.value(i);
+                                        if let Some(vec) = this.view_bounds.get_mut(contig) {
+                                            vec.push((starts[i], ends[i]));
+                                        } else {
+                                            this.view_bounds.insert(
+                                                contig.to_string(),
+                                                vec![(starts[i], ends[i])],
+                                            );
+                                        }
                                     }
                                 }
                                 Some(Err(e)) => {
@@ -474,113 +439,58 @@ impl Stream for ComplementStream {
                         }
                     }
                     this.view_stream = None;
-                    this.phase = ComplementPhase::StreamInput;
+                    this.phase = ComplementPhase::CollectInput;
                 }
-                ComplementPhase::StreamInput => {
-                    loop {
-                        let batch_opt = ready!(this.input.poll_next_unpin(cx));
+                ComplementPhase::CollectInput => match ready!(this.collector.poll_collect(cx)) {
+                    Ok(true) => {
+                        this.input_groups = this.collector.take_groups().into_iter().collect();
+                        this.group_idx = 0;
+                        this.phase = ComplementPhase::Emit;
+                    }
+                    Ok(false) => unreachable!(),
+                    Err(e) => {
+                        this.phase = ComplementPhase::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                },
+                ComplementPhase::Emit => {
+                    while this.group_idx < this.input_groups.len() {
+                        let (ref contig, ref intervals) = this.input_groups[this.group_idx];
 
-                        match batch_opt {
-                            Some(Ok(batch)) => {
-                                if batch.num_rows() == 0 {
-                                    continue;
-                                }
-                                let (contig_arr, start_arr, end_arr) = match get_join_col_arrays(
-                                    &batch,
-                                    (&this.columns.0, &this.columns.1, &this.columns.2),
-                                ) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        this.phase = ComplementPhase::Done;
-                                        return Poll::Ready(Some(Err(e)));
-                                    }
-                                };
-                                let start_resolved = match start_arr.resolve_i64() {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        this.phase = ComplementPhase::Done;
-                                        return Poll::Ready(Some(Err(e)));
-                                    }
-                                };
-                                let end_resolved = match end_arr.resolve_i64() {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        this.phase = ComplementPhase::Done;
-                                        return Poll::Ready(Some(Err(e)));
-                                    }
-                                };
-                                let starts = &*start_resolved;
-                                let ends = &*end_resolved;
+                        // For contigs with no explicit view, add implicit (0, i64::MAX)
+                        if this.view_bounds.is_empty() {
+                            this.view_bounds.insert(contig.clone(), vec![(0, i64::MAX)]);
+                        }
 
-                                for i in 0..batch.num_rows() {
-                                    let contig = contig_arr.value(i);
-                                    let s = starts[i];
-                                    let e = ends[i];
+                        let merged = Self::merge_intervals(intervals, this.strict);
 
-                                    let same_contig = this
-                                        .current_contig
-                                        .as_ref()
-                                        .is_some_and(|c| c.as_str() == contig);
+                        let view_intervals = this
+                            .view_bounds
+                            .get(contig)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
 
-                                    if same_contig {
-                                        let merge_condition = if this.strict {
-                                            s < this.cur_merged_end
-                                        } else {
-                                            s <= this.cur_merged_end
-                                        };
-                                        if merge_condition {
-                                            if e > this.cur_merged_end {
-                                                this.cur_merged_end = e;
-                                            }
-                                        } else {
-                                            // Finalize current merged interval, start new
-                                            this.merged_intervals
-                                                .push((this.cur_merged_start, this.cur_merged_end));
-                                            this.cur_merged_start = s;
-                                            this.cur_merged_end = e;
-                                        }
-                                    } else {
-                                        // Contig change: compute complement for previous contig
-                                        this.pending_rows += this.finalize_contig();
+                        this.pending_rows += Self::emit_contig_complement(
+                            contig,
+                            &merged,
+                            view_intervals,
+                            &mut this.contig_builder,
+                            &mut this.start_builder,
+                            &mut this.end_builder,
+                        );
 
-                                        // If no explicit view, add implicit (0, i64::MAX)
-                                        if this.view_bounds.is_empty() {
-                                            this.view_bounds
-                                                .insert(contig.to_string(), vec![(0, i64::MAX)]);
-                                        }
+                        this.seen_contigs.push(contig.clone());
+                        this.group_idx += 1;
 
-                                        this.current_contig = Some(contig.to_string());
-                                        this.cur_merged_start = s;
-                                        this.cur_merged_end = e;
-                                    }
-                                }
-
-                                // Flush after processing the entire batch
-                                if this.pending_rows >= this.batch_size {
-                                    return Poll::Ready(Some(this.flush_builders()));
-                                }
-                            }
-                            Some(Err(e)) => {
-                                this.phase = ComplementPhase::Done;
-                                return Poll::Ready(Some(Err(e)));
-                            }
-                            None => {
-                                // Input exhausted: finalize last contig
-                                this.pending_rows += this.finalize_contig();
-
-                                this.phase = ComplementPhase::EmitTrailingGaps;
-
-                                if this.pending_rows > 0 {
-                                    return Poll::Ready(Some(this.flush_builders()));
-                                }
-                                break;
-                            }
+                        if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                            return Poll::Ready(Some(this.flush_builders()));
                         }
                     }
-                    // Fall through to EmitTrailingGaps
+
+                    this.phase = ComplementPhase::EmitTrailingGaps;
+                    // Fall through
                 }
                 ComplementPhase::EmitTrailingGaps => {
-                    // Emit full view ranges for contigs never seen in input
                     let view_contigs: Vec<String> = this.view_bounds.keys().cloned().collect();
 
                     while this.trailing_iter_idx < view_contigs.len() {
@@ -599,12 +509,13 @@ impl Stream for ComplementStream {
                             this.pending_rows += 1;
                         }
 
-                        if this.pending_rows >= this.batch_size {
+                        if this.pending_rows >= DEFAULT_BATCH_SIZE {
                             return Poll::Ready(Some(this.flush_builders()));
                         }
                     }
 
                     this.phase = ComplementPhase::Done;
+                    this.input_groups.clear();
                     if this.pending_rows > 0 {
                         return Poll::Ready(Some(this.flush_builders()));
                     }

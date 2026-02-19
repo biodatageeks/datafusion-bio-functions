@@ -3151,10 +3151,24 @@ const CHAIN_PATH: &str = "/tmp/polars-bio-bench/databio/chainXenTro3Link/";
 
 async fn bench_merge_with_partitions(
     target_partitions: usize,
+    show_plan: bool,
 ) -> Result<(usize, usize, std::time::Duration)> {
     let ctx = create_bio_session_with_target_partitions(target_partitions);
     let create = format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
     ctx.sql(&create).await?;
+
+    if show_plan {
+        let plan = ctx
+            .sql("EXPLAIN VERBOSE SELECT * FROM merge('chain')")
+            .await?
+            .collect()
+            .await?;
+        let formatted = pretty_format_batches(&plan)?.to_string();
+        eprintln!(
+            "\n  EXPLAIN VERBOSE (partitions={}):\n{}",
+            target_partitions, formatted
+        );
+    }
 
     let input_count: usize = ctx
         .sql("SELECT count(*) AS c FROM chain")
@@ -3203,10 +3217,24 @@ async fn bench_merge_with_partitions(
 
 async fn bench_cluster_with_partitions(
     target_partitions: usize,
+    show_plan: bool,
 ) -> Result<(usize, std::time::Duration)> {
     let ctx = create_bio_session_with_target_partitions(target_partitions);
     let create = format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
     ctx.sql(&create).await?;
+
+    if show_plan {
+        let plan = ctx
+            .sql("EXPLAIN VERBOSE SELECT * FROM cluster('chain')")
+            .await?
+            .collect()
+            .await?;
+        let formatted = pretty_format_batches(&plan)?.to_string();
+        eprintln!(
+            "\n  EXPLAIN VERBOSE (partitions={}):\n{}",
+            target_partitions, formatted
+        );
+    }
 
     let start = std::time::Instant::now();
     let result = ctx
@@ -3221,10 +3249,24 @@ async fn bench_cluster_with_partitions(
 
 async fn bench_complement_with_partitions(
     target_partitions: usize,
+    show_plan: bool,
 ) -> Result<(usize, std::time::Duration)> {
     let ctx = create_bio_session_with_target_partitions(target_partitions);
     let create = format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
     ctx.sql(&create).await?;
+
+    if show_plan {
+        let plan = ctx
+            .sql("EXPLAIN VERBOSE SELECT * FROM complement('chain')")
+            .await?
+            .collect()
+            .await?;
+        let formatted = pretty_format_batches(&plan)?.to_string();
+        eprintln!(
+            "\n  EXPLAIN VERBOSE (partitions={}):\n{}",
+            target_partitions, formatted
+        );
+    }
 
     let start = std::time::Instant::now();
     let result = ctx
@@ -3239,6 +3281,7 @@ async fn bench_complement_with_partitions(
 
 async fn bench_subtract_with_partitions(
     target_partitions: usize,
+    show_plan: bool,
 ) -> Result<(usize, std::time::Duration)> {
     let ctx = create_bio_session_with_target_partitions(target_partitions);
     let create_left =
@@ -3249,6 +3292,19 @@ async fn bench_subtract_with_partitions(
     ctx.sql(
         "CREATE EXTERNAL TABLE mask STORED AS PARQUET LOCATION '/tmp/polars-bio-bench/databio/chainXenTro3Link/part-00000-d999dd06-a0e2-4b31-80e5-2acf71fcebc7-c000.snappy.parquet'"
     ).await?;
+
+    if show_plan {
+        let plan = ctx
+            .sql("EXPLAIN VERBOSE SELECT * FROM subtract('chain', 'mask')")
+            .await?
+            .collect()
+            .await?;
+        let formatted = pretty_format_batches(&plan)?.to_string();
+        eprintln!(
+            "\n  EXPLAIN VERBOSE (partitions={}):\n{}",
+            target_partitions, formatted
+        );
+    }
 
     let start = std::time::Instant::now();
     let result = ctx
@@ -3265,8 +3321,11 @@ async fn bench_subtract_with_partitions(
 #[ignore] // Run with: cargo test bench_scaling -- --ignored --nocapture
 async fn bench_scaling_merge() -> Result<()> {
     eprintln!("\n=== MERGE scaling (chainXenTro3Link, ~51M rows) ===");
-    for partitions in [1, 2, 4, 8] {
-        let (input_rows, rows, elapsed) = bench_merge_with_partitions(partitions).await?;
+    let partition_counts = [1, 2, 4, 8];
+    for (i, partitions) in partition_counts.iter().enumerate() {
+        let show_plan = i == 0;
+        let (input_rows, rows, elapsed) =
+            bench_merge_with_partitions(*partitions, show_plan).await?;
         eprintln!(
             "  partitions={:<2}  input={:<12}  output={:<10}  time={:.3}s",
             partitions,
@@ -3380,8 +3439,10 @@ async fn bench_debug_merge_correctness() -> Result<()> {
 #[ignore]
 async fn bench_scaling_cluster() -> Result<()> {
     eprintln!("\n=== CLUSTER scaling (chainXenTro3Link, ~51M rows) ===");
-    for partitions in [1, 2, 4, 8] {
-        let (rows, elapsed) = bench_cluster_with_partitions(partitions).await?;
+    let partition_counts = [1, 2, 4, 8];
+    for (i, partitions) in partition_counts.iter().enumerate() {
+        let show_plan = i == 0;
+        let (rows, elapsed) = bench_cluster_with_partitions(*partitions, show_plan).await?;
         eprintln!(
             "  partitions={:<2}  rows={:<10}  time={:.3}s",
             partitions,
@@ -3396,8 +3457,10 @@ async fn bench_scaling_cluster() -> Result<()> {
 #[ignore]
 async fn bench_scaling_complement() -> Result<()> {
     eprintln!("\n=== COMPLEMENT scaling (chainXenTro3Link, ~51M rows) ===");
-    for partitions in [1, 2, 4, 8] {
-        let (rows, elapsed) = bench_complement_with_partitions(partitions).await?;
+    let partition_counts = [1, 2, 4, 8];
+    for (i, partitions) in partition_counts.iter().enumerate() {
+        let show_plan = i == 0;
+        let (rows, elapsed) = bench_complement_with_partitions(*partitions, show_plan).await?;
         eprintln!(
             "  partitions={:<2}  rows={:<10}  time={:.3}s",
             partitions,
@@ -3412,8 +3475,10 @@ async fn bench_scaling_complement() -> Result<()> {
 #[ignore]
 async fn bench_scaling_subtract() -> Result<()> {
     eprintln!("\n=== SUBTRACT scaling (chainXenTro3Link, ~51M rows) ===");
-    for partitions in [1, 2, 4, 8] {
-        let (rows, elapsed) = bench_subtract_with_partitions(partitions).await?;
+    let partition_counts = [1, 2, 4, 8];
+    for (i, partitions) in partition_counts.iter().enumerate() {
+        let show_plan = i == 0;
+        let (rows, elapsed) = bench_subtract_with_partitions(*partitions, show_plan).await?;
         eprintln!(
             "  partitions={:<2}  rows={:<10}  time={:.3}s",
             partitions,

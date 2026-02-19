@@ -3,6 +3,7 @@ pub mod cluster;
 pub mod complement;
 pub mod count_overlaps;
 pub mod filter_op;
+pub mod grouped_stream;
 pub mod interval_tree;
 pub mod merge;
 pub mod nearest;

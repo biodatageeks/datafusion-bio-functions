@@ -12,19 +12,17 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, Partitioning};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, SessionContext};
-use futures::{Stream, StreamExt, ready};
+use futures::{Stream, ready};
 
-use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
+use crate::grouped_stream::{DEFAULT_BATCH_SIZE, StreamCollector};
 
 pub struct MergeProvider {
     session: Arc<SessionContext>,
@@ -146,27 +144,6 @@ struct MergeExec {
     cache: PlanProperties,
 }
 
-impl MergeExec {
-    fn sort_ordering(&self) -> LexOrdering {
-        let schema = self.input.schema();
-        [
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.columns.0,
-                schema.index_of(&self.columns.0).unwrap(),
-            ))),
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.columns.1,
-                schema.index_of(&self.columns.1).unwrap(),
-            ))),
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.columns.2,
-                schema.index_of(&self.columns.2).unwrap(),
-            ))),
-        ]
-        .into()
-    }
-}
-
 impl DisplayAs for MergeExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -226,23 +203,20 @@ impl ExecutionPlan for MergeExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let batch_size = context.session_config().batch_size();
-        // Sort at execution time to avoid optimizer stripping the SortExec
-        let sort_exec = SortExec::new(self.sort_ordering(), Arc::clone(&self.input))
-            .with_preserve_partitioning(true);
-        let input = sort_exec.execute(partition, context)?;
+        let input = self.input.execute(partition, context)?;
         Ok(Box::pin(MergeStream {
             schema: self.schema.clone(),
-            input,
-            columns: Arc::clone(&self.columns),
+            collector: StreamCollector::new(input, Arc::clone(&self.columns)),
             min_dist: self.min_dist,
             strict: self.strict,
-            batch_size,
-            current_contig: None,
+            phase: MergePhase::Collecting,
+            groups: Vec::new(),
+            group_idx: 0,
+            interval_idx: 0,
             cur_start: 0,
             cur_end: 0,
             cur_count: 0,
-            done: false,
+            has_current: false,
             contig_builder: StringBuilder::new(),
             start_builder: Int64Builder::new(),
             end_builder: Int64Builder::new(),
@@ -252,18 +226,26 @@ impl ExecutionPlan for MergeExec {
     }
 }
 
+enum MergePhase {
+    Collecting,
+    Emitting,
+    Done,
+}
+
 struct MergeStream {
     schema: SchemaRef,
-    input: SendableRecordBatchStream,
-    columns: Arc<(String, String, String)>,
+    collector: StreamCollector,
     min_dist: i64,
     strict: bool,
-    batch_size: usize,
-    current_contig: Option<String>,
+    phase: MergePhase,
+    /// Sorted groups: Vec of (contig, intervals) in BTreeMap order.
+    groups: Vec<(String, Vec<(i64, i64)>)>,
+    group_idx: usize,
+    interval_idx: usize,
     cur_start: i64,
     cur_end: i64,
     cur_count: i64,
-    done: bool,
+    has_current: bool,
     contig_builder: StringBuilder,
     start_builder: Int64Builder,
     end_builder: Int64Builder,
@@ -293,120 +275,92 @@ impl Stream for MergeStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        if this.done {
-            return Poll::Ready(None);
-        }
-
         loop {
-            let batch_opt = ready!(this.input.poll_next_unpin(cx));
-
-            match batch_opt {
-                Some(Ok(batch)) => {
-                    if batch.num_rows() == 0 {
-                        continue;
+            match this.phase {
+                MergePhase::Collecting => match ready!(this.collector.poll_collect(cx)) {
+                    Ok(true) => {
+                        this.groups = this.collector.take_groups().into_iter().collect();
+                        this.group_idx = 0;
+                        this.interval_idx = 0;
+                        this.has_current = false;
+                        this.phase = MergePhase::Emitting;
                     }
-                    let (contig_arr, start_arr, end_arr) = match get_join_col_arrays(
-                        &batch,
-                        (&this.columns.0, &this.columns.1, &this.columns.2),
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            this.done = true;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                    };
-                    let start_resolved = match start_arr.resolve_i64() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            this.done = true;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                    };
-                    let end_resolved = match end_arr.resolve_i64() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            this.done = true;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                    };
-                    let starts = &*start_resolved;
-                    let ends = &*end_resolved;
+                    Ok(false) => unreachable!(),
+                    Err(e) => {
+                        this.phase = MergePhase::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                },
+                MergePhase::Emitting => {
+                    while this.group_idx < this.groups.len() {
+                        let (ref contig, ref intervals) = this.groups[this.group_idx];
 
-                    for i in 0..batch.num_rows() {
-                        let contig = contig_arr.value(i);
-                        let s = starts[i];
-                        let e = ends[i];
+                        while this.interval_idx < intervals.len() {
+                            let (s, e) = intervals[this.interval_idx];
+                            this.interval_idx += 1;
 
-                        let same_contig = this
-                            .current_contig
-                            .as_ref()
-                            .is_some_and(|c| c.as_str() == contig);
-
-                        if same_contig {
-                            let boundary = this.cur_end.saturating_add(this.min_dist);
-                            let merge_condition = if this.strict {
-                                s < boundary
-                            } else {
-                                s <= boundary
-                            };
-                            if merge_condition {
-                                if e > this.cur_end {
+                            if this.has_current {
+                                let boundary = this.cur_end.saturating_add(this.min_dist);
+                                let merge_condition = if this.strict {
+                                    s < boundary
+                                } else {
+                                    s <= boundary
+                                };
+                                if merge_condition {
+                                    if e > this.cur_end {
+                                        this.cur_end = e;
+                                    }
+                                    this.cur_count += 1;
+                                } else {
+                                    this.contig_builder.append_value(contig);
+                                    this.start_builder.append_value(this.cur_start);
+                                    this.end_builder.append_value(this.cur_end);
+                                    this.count_builder.append_value(this.cur_count);
+                                    this.pending_rows += 1;
+                                    this.cur_start = s;
                                     this.cur_end = e;
+                                    this.cur_count = 1;
                                 }
-                                this.cur_count += 1;
                             } else {
-                                // Emit current interval
-                                this.contig_builder
-                                    .append_value(this.current_contig.as_ref().unwrap());
-                                this.start_builder.append_value(this.cur_start);
-                                this.end_builder.append_value(this.cur_end);
-                                this.count_builder.append_value(this.cur_count);
-                                this.pending_rows += 1;
-
                                 this.cur_start = s;
                                 this.cur_end = e;
                                 this.cur_count = 1;
+                                this.has_current = true;
                             }
-                        } else {
-                            // Contig change: emit current interval if any
-                            if this.current_contig.is_some() {
-                                this.contig_builder
-                                    .append_value(this.current_contig.as_ref().unwrap());
-                                this.start_builder.append_value(this.cur_start);
-                                this.end_builder.append_value(this.cur_end);
-                                this.count_builder.append_value(this.cur_count);
-                                this.pending_rows += 1;
+
+                            if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                                return Poll::Ready(Some(this.flush_builders()));
                             }
-                            this.current_contig = Some(contig.to_string());
-                            this.cur_start = s;
-                            this.cur_end = e;
-                            this.cur_count = 1;
+                        }
+
+                        // Contig done — emit current interval
+                        if this.has_current {
+                            let contig = &this.groups[this.group_idx].0;
+                            this.contig_builder.append_value(contig);
+                            this.start_builder.append_value(this.cur_start);
+                            this.end_builder.append_value(this.cur_end);
+                            this.count_builder.append_value(this.cur_count);
+                            this.pending_rows += 1;
+                            this.has_current = false;
+                        }
+
+                        this.group_idx += 1;
+                        this.interval_idx = 0;
+
+                        if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                            return Poll::Ready(Some(this.flush_builders()));
                         }
                     }
 
-                    // Flush after processing the entire batch
-                    if this.pending_rows >= this.batch_size {
-                        return Poll::Ready(Some(this.flush_builders()));
-                    }
-                }
-                Some(Err(e)) => {
-                    this.done = true;
-                    return Poll::Ready(Some(Err(e)));
-                }
-                None => {
-                    // Input exhausted — emit final interval
-                    this.done = true;
-                    if this.current_contig.is_some() {
-                        this.contig_builder
-                            .append_value(this.current_contig.as_ref().unwrap());
-                        this.start_builder.append_value(this.cur_start);
-                        this.end_builder.append_value(this.cur_end);
-                        this.count_builder.append_value(this.cur_count);
-                        this.pending_rows += 1;
-                    }
+                    // All groups done
+                    this.phase = MergePhase::Done;
+                    this.groups.clear();
                     if this.pending_rows > 0 {
                         return Poll::Ready(Some(this.flush_builders()));
                     }
+                    return Poll::Ready(None);
+                }
+                MergePhase::Done => {
                     return Poll::Ready(None);
                 }
             }

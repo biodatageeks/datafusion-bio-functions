@@ -13,11 +13,9 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, Partitioning};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -26,6 +24,7 @@ use futures::{Stream, StreamExt, ready};
 
 use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
+use crate::grouped_stream::{DEFAULT_BATCH_SIZE, StreamCollector};
 
 pub struct SubtractProvider {
     session: Arc<SessionContext>,
@@ -178,27 +177,6 @@ struct SubtractExec {
     cache: PlanProperties,
 }
 
-impl SubtractExec {
-    fn left_sort_ordering(&self) -> LexOrdering {
-        let schema = self.left.schema();
-        [
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.left_columns.0,
-                schema.index_of(&self.left_columns.0).unwrap(),
-            ))),
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.left_columns.1,
-                schema.index_of(&self.left_columns.1).unwrap(),
-            ))),
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.left_columns.2,
-                schema.index_of(&self.left_columns.2).unwrap(),
-            ))),
-        ]
-        .into()
-    }
-}
-
 impl DisplayAs for SubtractExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "SubtractExec: strict={}", self.strict)
@@ -255,23 +233,19 @@ impl ExecutionPlan for SubtractExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let batch_size = context.session_config().batch_size();
-        // Sort left at execution time to avoid optimizer stripping SortExec
-        let left_sort = SortExec::new(self.left_sort_ordering(), Arc::clone(&self.left))
-            .with_preserve_partitioning(true);
-        let left = left_sort.execute(partition, Arc::clone(&context))?;
+        let left = self.left.execute(partition, Arc::clone(&context))?;
         let right = self.right.execute(partition, context)?;
         Ok(Box::pin(SubtractStream {
             schema: self.schema.clone(),
-            left,
+            left_collector: StreamCollector::new(left, Arc::clone(&self.left_columns)),
             right: Some(right),
-            left_columns: Arc::clone(&self.left_columns),
             right_columns: Arc::clone(&self.right_columns),
             strict: self.strict,
-            batch_size,
             phase: SubtractPhase::CollectRight,
             right_groups: BTreeMap::new(),
-            right_cursors: BTreeMap::new(),
+            left_groups: Vec::new(),
+            group_idx: 0,
+            interval_idx: 0,
             contig_builder: StringBuilder::new(),
             start_builder: Int64Builder::new(),
             end_builder: Int64Builder::new(),
@@ -282,21 +256,22 @@ impl ExecutionPlan for SubtractExec {
 
 enum SubtractPhase {
     CollectRight,
-    StreamLeft,
+    CollectLeft,
+    Emit,
     Done,
 }
 
 struct SubtractStream {
     schema: SchemaRef,
-    left: SendableRecordBatchStream,
+    left_collector: StreamCollector,
     right: Option<SendableRecordBatchStream>,
-    left_columns: Arc<(String, String, String)>,
     right_columns: Arc<(String, String, String)>,
     strict: bool,
-    batch_size: usize,
     phase: SubtractPhase,
     right_groups: BTreeMap<String, Vec<(i64, i64)>>,
-    right_cursors: BTreeMap<String, usize>,
+    left_groups: Vec<(String, Vec<(i64, i64)>)>,
+    group_idx: usize,
+    interval_idx: usize,
     contig_builder: StringBuilder,
     start_builder: Int64Builder,
     end_builder: Int64Builder,
@@ -363,10 +338,15 @@ impl Stream for SubtractStream {
                                     let starts = &*start_resolved;
                                     let ends = &*end_resolved;
                                     for i in 0..batch.num_rows() {
-                                        this.right_groups
-                                            .entry(contig_arr.value(i).to_string())
-                                            .or_default()
-                                            .push((starts[i], ends[i]));
+                                        let contig = contig_arr.value(i);
+                                        if let Some(vec) = this.right_groups.get_mut(contig) {
+                                            vec.push((starts[i], ends[i]));
+                                        } else {
+                                            this.right_groups.insert(
+                                                contig.to_string(),
+                                                vec![(starts[i], ends[i])],
+                                            );
+                                        }
                                     }
                                 }
                                 Some(Err(e)) => {
@@ -381,122 +361,96 @@ impl Stream for SubtractStream {
                     for intervals in this.right_groups.values_mut() {
                         intervals.sort_unstable();
                     }
-                    this.phase = SubtractPhase::StreamLeft;
+                    this.phase = SubtractPhase::CollectLeft;
                 }
-                SubtractPhase::StreamLeft => {
-                    loop {
-                        let batch_opt = ready!(this.left.poll_next_unpin(cx));
+                SubtractPhase::CollectLeft => match ready!(this.left_collector.poll_collect(cx)) {
+                    Ok(true) => {
+                        this.left_groups = this.left_collector.take_groups().into_iter().collect();
+                        this.group_idx = 0;
+                        this.interval_idx = 0;
+                        this.phase = SubtractPhase::Emit;
+                    }
+                    Ok(false) => unreachable!(),
+                    Err(e) => {
+                        this.phase = SubtractPhase::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                },
+                SubtractPhase::Emit => {
+                    let empty = Vec::new();
 
-                        match batch_opt {
-                            Some(Ok(batch)) => {
-                                if batch.num_rows() == 0 {
-                                    continue;
-                                }
-                                let (contig_arr, start_arr, end_arr) = match get_join_col_arrays(
-                                    &batch,
-                                    (
-                                        &this.left_columns.0,
-                                        &this.left_columns.1,
-                                        &this.left_columns.2,
-                                    ),
-                                ) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        this.phase = SubtractPhase::Done;
-                                        return Poll::Ready(Some(Err(e)));
-                                    }
+                    while this.group_idx < this.left_groups.len() {
+                        let (ref contig, ref left_intervals) = this.left_groups[this.group_idx];
+                        let right_intervals = this.right_groups.get(contig).unwrap_or(&empty);
+
+                        let mut right_cursor: usize = 0;
+
+                        while this.interval_idx < left_intervals.len() {
+                            let (ls, le) = left_intervals[this.interval_idx];
+                            this.interval_idx += 1;
+
+                            // Advance cursor past right intervals that end before left start
+                            while right_cursor < right_intervals.len() {
+                                let skip = if this.strict {
+                                    right_intervals[right_cursor].1 <= ls
+                                } else {
+                                    right_intervals[right_cursor].1 < ls
                                 };
-                                let start_resolved = match start_arr.resolve_i64() {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        this.phase = SubtractPhase::Done;
-                                        return Poll::Ready(Some(Err(e)));
-                                    }
-                                };
-                                let end_resolved = match end_arr.resolve_i64() {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        this.phase = SubtractPhase::Done;
-                                        return Poll::Ready(Some(Err(e)));
-                                    }
-                                };
-                                let starts = &*start_resolved;
-                                let ends = &*end_resolved;
-
-                                let empty = Vec::new();
-                                for i in 0..batch.num_rows() {
-                                    let contig = contig_arr.value(i);
-                                    let ls = starts[i];
-                                    let le = ends[i];
-
-                                    let right_intervals =
-                                        this.right_groups.get(contig).unwrap_or(&empty);
-                                    let right_idx =
-                                        this.right_cursors.entry(contig.to_string()).or_insert(0);
-
-                                    // Advance cursor past right intervals that end before
-                                    // left start
-                                    while *right_idx < right_intervals.len() {
-                                        let skip = if this.strict {
-                                            right_intervals[*right_idx].1 <= ls
-                                        } else {
-                                            right_intervals[*right_idx].1 < ls
-                                        };
-                                        if skip {
-                                            *right_idx += 1;
-                                        } else {
-                                            break;
-                                        }
-                                    }
-
-                                    let mut cursor = ls;
-                                    let mut j = *right_idx;
-                                    while j < right_intervals.len() {
-                                        let (rs, re) = right_intervals[j];
-                                        let no_overlap =
-                                            if this.strict { rs >= le } else { rs > le };
-                                        if no_overlap {
-                                            break;
-                                        }
-
-                                        if rs > cursor {
-                                            this.contig_builder.append_value(contig);
-                                            this.start_builder.append_value(cursor);
-                                            this.end_builder.append_value(rs);
-                                            this.pending_rows += 1;
-                                        }
-                                        if re > cursor {
-                                            cursor = re;
-                                        }
-                                        j += 1;
-                                    }
-
-                                    if cursor < le {
-                                        this.contig_builder.append_value(contig);
-                                        this.start_builder.append_value(cursor);
-                                        this.end_builder.append_value(le);
-                                        this.pending_rows += 1;
-                                    }
-                                }
-
-                                // Flush after processing the entire batch
-                                if this.pending_rows >= this.batch_size {
-                                    return Poll::Ready(Some(this.flush_builders()));
+                                if skip {
+                                    right_cursor += 1;
+                                } else {
+                                    break;
                                 }
                             }
-                            Some(Err(e)) => {
-                                this.phase = SubtractPhase::Done;
-                                return Poll::Ready(Some(Err(e)));
-                            }
-                            None => {
-                                this.phase = SubtractPhase::Done;
-                                if this.pending_rows > 0 {
-                                    return Poll::Ready(Some(this.flush_builders()));
+
+                            let mut cursor = ls;
+                            let mut j = right_cursor;
+                            while j < right_intervals.len() {
+                                let (rs, re) = right_intervals[j];
+                                let no_overlap = if this.strict { rs >= le } else { rs > le };
+                                if no_overlap {
+                                    break;
                                 }
-                                return Poll::Ready(None);
+
+                                if rs > cursor {
+                                    this.contig_builder.append_value(contig);
+                                    this.start_builder.append_value(cursor);
+                                    this.end_builder.append_value(rs);
+                                    this.pending_rows += 1;
+                                }
+                                if re > cursor {
+                                    cursor = re;
+                                }
+                                j += 1;
+                            }
+
+                            if cursor < le {
+                                this.contig_builder.append_value(contig);
+                                this.start_builder.append_value(cursor);
+                                this.end_builder.append_value(le);
+                                this.pending_rows += 1;
+                            }
+
+                            if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                                return Poll::Ready(Some(this.flush_builders()));
                             }
                         }
+
+                        this.group_idx += 1;
+                        this.interval_idx = 0;
+
+                        if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                            return Poll::Ready(Some(this.flush_builders()));
+                        }
                     }
+
+                    // All groups done
+                    this.phase = SubtractPhase::Done;
+                    this.left_groups.clear();
+                    if this.pending_rows > 0 {
+                        return Poll::Ready(Some(this.flush_builders()));
+                    }
+                    return Poll::Ready(None);
                 }
                 SubtractPhase::Done => {
                     return Poll::Ready(None);

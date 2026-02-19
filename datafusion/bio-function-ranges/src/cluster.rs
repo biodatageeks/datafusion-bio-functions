@@ -12,19 +12,17 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, Partitioning};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, SessionContext};
-use futures::{Stream, StreamExt, ready};
+use futures::{Stream, ready};
 
-use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
+use crate::grouped_stream::{DEFAULT_BATCH_SIZE, StreamCollector};
 
 pub struct ClusterProvider {
     session: Arc<SessionContext>,
@@ -148,27 +146,6 @@ struct ClusterExec {
     cache: PlanProperties,
 }
 
-impl ClusterExec {
-    fn sort_ordering(&self) -> LexOrdering {
-        let schema = self.input.schema();
-        [
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.columns.0,
-                schema.index_of(&self.columns.0).unwrap(),
-            ))),
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.columns.1,
-                schema.index_of(&self.columns.1).unwrap(),
-            ))),
-            PhysicalSortExpr::new_default(Arc::new(Column::new(
-                &self.columns.2,
-                schema.index_of(&self.columns.2).unwrap(),
-            ))),
-        ]
-        .into()
-    }
-}
-
 impl DisplayAs for ClusterExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -228,23 +205,20 @@ impl ExecutionPlan for ClusterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let batch_size = context.session_config().batch_size();
-        let sort_exec = SortExec::new(self.sort_ordering(), Arc::clone(&self.input))
-            .with_preserve_partitioning(true);
-        let input = sort_exec.execute(partition, context)?;
+        let input = self.input.execute(partition, context)?;
         Ok(Box::pin(ClusterStream {
             schema: self.schema.clone(),
-            input,
-            columns: Arc::clone(&self.columns),
+            collector: StreamCollector::new(input, Arc::clone(&self.columns)),
             min_dist: self.min_dist,
             strict: self.strict,
-            batch_size,
-            current_contig: None,
+            phase: ClusterPhase::Collecting,
+            groups: Vec::new(),
+            group_idx: 0,
+            interval_idx: 0,
             cluster_id: 0,
             cluster_start: 0,
             cluster_end: 0,
             pending_intervals: Vec::new(),
-            done: false,
             contig_builder: StringBuilder::new(),
             start_builder: Int64Builder::new(),
             end_builder: Int64Builder::new(),
@@ -256,19 +230,26 @@ impl ExecutionPlan for ClusterExec {
     }
 }
 
+enum ClusterPhase {
+    Collecting,
+    Emitting,
+    Done,
+}
+
 struct ClusterStream {
     schema: SchemaRef,
-    input: SendableRecordBatchStream,
-    columns: Arc<(String, String, String)>,
+    collector: StreamCollector,
     min_dist: i64,
     strict: bool,
-    batch_size: usize,
-    current_contig: Option<String>,
+    phase: ClusterPhase,
+    /// Sorted groups: Vec of (contig, intervals) in BTreeMap order.
+    groups: Vec<(String, Vec<(i64, i64)>)>,
+    group_idx: usize,
+    interval_idx: usize,
     cluster_id: i64,
     cluster_start: i64,
     cluster_end: i64,
     pending_intervals: Vec<(i64, i64)>,
-    done: bool,
     contig_builder: StringBuilder,
     start_builder: Int64Builder,
     end_builder: Int64Builder,
@@ -279,15 +260,11 @@ struct ClusterStream {
 }
 
 impl ClusterStream {
-    fn emit_cluster(
-        &mut self,
-        contig: &str,
-        pending: &[(i64, i64)],
-        cluster_id: i64,
-        cluster_start: i64,
-        cluster_end: i64,
-    ) {
-        for &(s, e) in pending {
+    fn flush_pending_cluster(&mut self, contig: &str) {
+        let cluster_id = self.cluster_id;
+        let cluster_start = self.cluster_start;
+        let cluster_end = self.cluster_end;
+        for &(s, e) in &self.pending_intervals {
             self.contig_builder.append_value(contig);
             self.start_builder.append_value(s);
             self.end_builder.append_value(e);
@@ -295,6 +272,9 @@ impl ClusterStream {
             self.cluster_start_builder.append_value(cluster_start);
             self.cluster_end_builder.append_value(cluster_end);
         }
+        self.pending_rows += self.pending_intervals.len();
+        self.pending_intervals.clear();
+        self.cluster_id += 1;
     }
 
     fn flush_builders(&mut self) -> Result<RecordBatch> {
@@ -320,134 +300,82 @@ impl Stream for ClusterStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        if this.done {
-            return Poll::Ready(None);
-        }
-
         loop {
-            let batch_opt = ready!(this.input.poll_next_unpin(cx));
-
-            match batch_opt {
-                Some(Ok(batch)) => {
-                    if batch.num_rows() == 0 {
-                        continue;
+            match this.phase {
+                ClusterPhase::Collecting => match ready!(this.collector.poll_collect(cx)) {
+                    Ok(true) => {
+                        this.groups = this.collector.take_groups().into_iter().collect();
+                        this.group_idx = 0;
+                        this.interval_idx = 0;
+                        this.phase = ClusterPhase::Emitting;
                     }
-                    let (contig_arr, start_arr, end_arr) = match get_join_col_arrays(
-                        &batch,
-                        (&this.columns.0, &this.columns.1, &this.columns.2),
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            this.done = true;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                    };
-                    let start_resolved = match start_arr.resolve_i64() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            this.done = true;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                    };
-                    let end_resolved = match end_arr.resolve_i64() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            this.done = true;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                    };
-                    let starts = &*start_resolved;
-                    let ends = &*end_resolved;
+                    Ok(false) => unreachable!(),
+                    Err(e) => {
+                        this.phase = ClusterPhase::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                },
+                ClusterPhase::Emitting => {
+                    while this.group_idx < this.groups.len() {
+                        // Clone contig name up front to avoid borrow conflicts
+                        let contig = this.groups[this.group_idx].0.clone();
+                        let interval_count = this.groups[this.group_idx].1.len();
 
-                    for i in 0..batch.num_rows() {
-                        let contig = contig_arr.value(i);
-                        let s = starts[i];
-                        let e = ends[i];
+                        while this.interval_idx < interval_count {
+                            let (s, e) = this.groups[this.group_idx].1[this.interval_idx];
+                            this.interval_idx += 1;
 
-                        let same_contig = this
-                            .current_contig
-                            .as_ref()
-                            .is_some_and(|c| c.as_str() == contig);
-
-                        if same_contig {
-                            let boundary = this.cluster_end.saturating_add(this.min_dist);
-                            let merge_condition = if this.strict {
-                                s < boundary
-                            } else {
-                                s <= boundary
-                            };
-                            if merge_condition {
-                                // Extend cluster
-                                if e > this.cluster_end {
-                                    this.cluster_end = e;
-                                }
-                                this.pending_intervals.push((s, e));
-                            } else {
-                                // Emit current cluster
-                                let pending = std::mem::take(&mut this.pending_intervals);
-                                let contig_ref = this.current_contig.as_ref().unwrap().clone();
-                                this.emit_cluster(
-                                    &contig_ref,
-                                    &pending,
-                                    this.cluster_id,
-                                    this.cluster_start,
-                                    this.cluster_end,
-                                );
-                                this.pending_rows += pending.len();
-                                this.cluster_id += 1;
+                            if this.pending_intervals.is_empty() {
                                 this.cluster_start = s;
                                 this.cluster_end = e;
                                 this.pending_intervals.push((s, e));
+                            } else {
+                                let boundary = this.cluster_end.saturating_add(this.min_dist);
+                                let merge_condition = if this.strict {
+                                    s < boundary
+                                } else {
+                                    s <= boundary
+                                };
+                                if merge_condition {
+                                    if e > this.cluster_end {
+                                        this.cluster_end = e;
+                                    }
+                                    this.pending_intervals.push((s, e));
+                                } else {
+                                    this.flush_pending_cluster(&contig);
+                                    this.cluster_start = s;
+                                    this.cluster_end = e;
+                                    this.pending_intervals.push((s, e));
+                                }
                             }
-                        } else {
-                            // Contig change: emit current cluster if any
-                            if this.current_contig.is_some() {
-                                let pending = std::mem::take(&mut this.pending_intervals);
-                                let contig_ref = this.current_contig.as_ref().unwrap().clone();
-                                this.emit_cluster(
-                                    &contig_ref,
-                                    &pending,
-                                    this.cluster_id,
-                                    this.cluster_start,
-                                    this.cluster_end,
-                                );
-                                this.pending_rows += pending.len();
-                                this.cluster_id += 1;
+
+                            if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                                return Poll::Ready(Some(this.flush_builders()));
                             }
-                            this.current_contig = Some(contig.to_string());
-                            this.cluster_start = s;
-                            this.cluster_end = e;
-                            this.pending_intervals.push((s, e));
+                        }
+
+                        // Contig done — emit final cluster
+                        if !this.pending_intervals.is_empty() {
+                            this.flush_pending_cluster(&contig);
+                        }
+
+                        this.group_idx += 1;
+                        this.interval_idx = 0;
+
+                        if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                            return Poll::Ready(Some(this.flush_builders()));
                         }
                     }
 
-                    // Flush after processing the entire batch
-                    if this.pending_rows >= this.batch_size {
-                        return Poll::Ready(Some(this.flush_builders()));
-                    }
-                }
-                Some(Err(e)) => {
-                    this.done = true;
-                    return Poll::Ready(Some(Err(e)));
-                }
-                None => {
-                    // Input exhausted — emit final cluster
-                    this.done = true;
-                    if this.current_contig.is_some() {
-                        let pending = std::mem::take(&mut this.pending_intervals);
-                        let contig_ref = this.current_contig.as_ref().unwrap().clone();
-                        this.emit_cluster(
-                            &contig_ref,
-                            &pending,
-                            this.cluster_id,
-                            this.cluster_start,
-                            this.cluster_end,
-                        );
-                        this.pending_rows += pending.len();
-                    }
+                    // All groups done
+                    this.phase = ClusterPhase::Done;
+                    this.groups.clear();
                     if this.pending_rows > 0 {
                         return Poll::Ready(Some(this.flush_builders()));
                     }
+                    return Poll::Ready(None);
+                }
+                ClusterPhase::Done => {
                     return Poll::Ready(None);
                 }
             }
