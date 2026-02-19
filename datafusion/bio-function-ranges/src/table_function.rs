@@ -6,11 +6,14 @@ use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::SessionContext;
 
+use crate::cluster::ClusterProvider;
+use crate::complement::ComplementProvider;
 use crate::count_overlaps::CountOverlapsProvider;
 use crate::filter_op::FilterOp;
 use crate::merge::MergeProvider;
 use crate::nearest::NearestProvider;
 use crate::overlap::OverlapProvider;
+use crate::subtract::SubtractProvider;
 
 const DEFAULT_COLS: [&str; 3] = ["contig", "pos_start", "pos_end"];
 
@@ -138,6 +141,42 @@ fn extract_bool_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<bool> {
         _ => Err(DataFusionError::Plan(format!(
             "{fn_name}() {name} must be a boolean literal"
         ))),
+    }
+}
+
+/// Extract an optional leading `min_dist` integer argument from an argument slice.
+///
+/// Returns `(min_dist, remaining_args)`. If the first argument is not a numeric literal,
+/// returns `(0, original_args)`.
+fn extract_min_dist<'a>(extra: &'a [Expr], fn_name: &str) -> Result<(i64, &'a [Expr])> {
+    if extra.is_empty() {
+        return Ok((0i64, extra));
+    }
+    match &extra[0] {
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
+            if *v < 0 {
+                return Err(DataFusionError::Plan(format!(
+                    "{fn_name}() min_dist must be >= 0, got {v}"
+                )));
+            }
+            Ok((*v, &extra[1..]))
+        }
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
+            if *v < 0 {
+                return Err(DataFusionError::Plan(format!(
+                    "{fn_name}() min_dist must be >= 0, got {v}"
+                )));
+            }
+            Ok((i64::from(*v), &extra[1..]))
+        }
+        Expr::Literal(ScalarValue::UInt64(Some(v)), _) => Ok((
+            i64::try_from(*v).map_err(|_| {
+                DataFusionError::Plan(format!("{fn_name}() min_dist value {v} does not fit i64"))
+            })?,
+            &extra[1..],
+        )),
+        Expr::Literal(ScalarValue::UInt32(Some(v)), _) => Ok((i64::from(*v), &extra[1..])),
+        _ => Ok((0i64, extra)),
     }
 }
 
@@ -331,52 +370,8 @@ impl TableFunctionImpl for MergeTableFunction {
 
         let table = extract_string_arg(&args[0], "table", self.name)?;
 
-        // Parse optional min_dist and column args.
-        // Patterns:
-        //   merge('t')
-        //   merge('t', 10)
-        //   merge('t', 0, 'c', 's', 'e')
-        //   merge('t', 'c', 's', 'e')
-        //   merge('t', 0, 'c', 's', 'e', 'strict')
-        //   merge('t', 'c', 's', 'e', 'strict')
         let extra = &args[1..];
-        let (min_dist, col_extra) = if extra.is_empty() {
-            (0i64, extra)
-        } else {
-            match &extra[0] {
-                Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
-                    if *v < 0 {
-                        return Err(DataFusionError::Plan(format!(
-                            "{}() min_dist must be >= 0, got {}",
-                            self.name, v
-                        )));
-                    }
-                    (*v, &extra[1..])
-                }
-                Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
-                    if *v < 0 {
-                        return Err(DataFusionError::Plan(format!(
-                            "{}() min_dist must be >= 0, got {}",
-                            self.name, v
-                        )));
-                    }
-                    (i64::from(*v), &extra[1..])
-                }
-                Expr::Literal(ScalarValue::UInt64(Some(v)), _) => (
-                    i64::try_from(*v).map_err(|_| {
-                        DataFusionError::Plan(format!(
-                            "{}() min_dist value {} does not fit i64",
-                            self.name, v
-                        ))
-                    })?,
-                    &extra[1..],
-                ),
-                Expr::Literal(ScalarValue::UInt32(Some(v)), _) => (i64::from(*v), &extra[1..]),
-                _ => (0i64, extra),
-            }
-        };
-
-        // col_extra now contains column names + optional filter_op
+        let (min_dist, col_extra) = extract_min_dist(extra, self.name)?;
         let (cols, filter_op) = parse_merge_col_args(col_extra, self.name)?;
 
         Ok(Arc::new(MergeProvider::new(
@@ -485,6 +480,253 @@ impl TableFunctionImpl for RangeTableFunction {
     }
 }
 
+/// Internal table function for cluster (annotate intervals with cluster membership).
+struct ClusterTableFunction {
+    session: Arc<SessionContext>,
+    name: &'static str,
+}
+
+impl std::fmt::Debug for ClusterTableFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}Function", self.name)
+    }
+}
+
+impl TableFunctionImpl for ClusterTableFunction {
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        if args.is_empty() {
+            return Err(DataFusionError::Plan(format!(
+                "{}() requires at least 1 argument: table name",
+                self.name
+            )));
+        }
+
+        let table = extract_string_arg(&args[0], "table", self.name)?;
+
+        let extra = &args[1..];
+        let (min_dist, col_extra) = extract_min_dist(extra, self.name)?;
+        let (cols, filter_op) = parse_merge_col_args(col_extra, self.name)?;
+
+        Ok(Arc::new(ClusterProvider::new(
+            Arc::clone(&self.session),
+            table,
+            cols,
+            min_dist,
+            filter_op,
+        )))
+    }
+}
+
+/// Internal table function for complement (find gaps / uncovered regions).
+struct ComplementTableFunction {
+    session: Arc<SessionContext>,
+    name: &'static str,
+}
+
+impl std::fmt::Debug for ComplementTableFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}Function", self.name)
+    }
+}
+
+impl TableFunctionImpl for ComplementTableFunction {
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        if args.is_empty() {
+            return Err(DataFusionError::Plan(format!(
+                "{}() requires at least 1 argument: table name",
+                self.name
+            )));
+        }
+
+        let table = extract_string_arg(&args[0], "table", self.name)?;
+        let extra = &args[1..];
+
+        // Distinguish between 1-table and 2-table patterns:
+        // 1 arg:  complement('table')
+        // 2 args: complement('table', 'view_table')
+        // 4 args: complement('table', 'c', 's', 'e') or complement('table', 'c', 's', 'e')
+        // 5 args: complement('table', 'c', 's', 'e', 'strict')
+        //         OR complement('table', 'view_table', 'c', 's', 'e')
+        // 8 args: complement('table', 'view_table', 'c1', 's1', 'e1', 'vc', 'vs', 've')
+        // etc.
+        //
+        // Strategy: if extra[0] is a string, check if extra has enough args for
+        // a 2-table pattern. We detect "view_table" by checking if the second
+        // arg looks like a table name (string) and the total arg count >= 2.
+
+        if extra.is_empty() {
+            // complement('table') — no view, default columns
+            let cols = (
+                DEFAULT_COLS[0].to_string(),
+                DEFAULT_COLS[1].to_string(),
+                DEFAULT_COLS[2].to_string(),
+            );
+            return Ok(Arc::new(ComplementProvider::new(
+                Arc::clone(&self.session),
+                table,
+                None,
+                cols.clone(),
+                cols,
+                FilterOp::Weak,
+            )));
+        }
+
+        // Try to extract the second argument as a potential view table name.
+        // If the second arg is a string, it could be either a view_table name
+        // or a column name. We disambiguate by count:
+        //   - 1 extra + possible filter_op → view_table (no custom cols)
+        //   - 3 extra + possible filter_op → custom cols, no view
+        //   - 4+ extra where first is string → view_table + cols
+        let second_is_string = matches!(&extra[0], Expr::Literal(ScalarValue::Utf8(Some(_)), _));
+
+        if !second_is_string {
+            return Err(DataFusionError::Plan(format!(
+                "{}() unexpected argument type at position 2",
+                self.name
+            )));
+        }
+
+        // Check for trailing filter_op in extra
+        let (work_args, filter_op) =
+            if let Some(Expr::Literal(ScalarValue::Utf8(Some(val)), _)) = extra.last() {
+                match val.to_lowercase().as_str() {
+                    "strict" => (&extra[..extra.len() - 1], FilterOp::Strict),
+                    "weak" => (&extra[..extra.len() - 1], FilterOp::Weak),
+                    _ => (extra, FilterOp::Weak),
+                }
+            } else {
+                (extra, FilterOp::Weak)
+            };
+
+        match work_args.len() {
+            0 => {
+                // Just filter_op was the only thing
+                let cols = (
+                    DEFAULT_COLS[0].to_string(),
+                    DEFAULT_COLS[1].to_string(),
+                    DEFAULT_COLS[2].to_string(),
+                );
+                Ok(Arc::new(ComplementProvider::new(
+                    Arc::clone(&self.session),
+                    table,
+                    None,
+                    cols.clone(),
+                    cols,
+                    filter_op,
+                )))
+            }
+            1 => {
+                // complement('table', 'view_table')
+                let view_table = extract_string_arg(&work_args[0], "view_table", self.name)?;
+                let cols = (
+                    DEFAULT_COLS[0].to_string(),
+                    DEFAULT_COLS[1].to_string(),
+                    DEFAULT_COLS[2].to_string(),
+                );
+                Ok(Arc::new(ComplementProvider::new(
+                    Arc::clone(&self.session),
+                    table,
+                    Some(view_table),
+                    cols.clone(),
+                    cols,
+                    filter_op,
+                )))
+            }
+            3 => {
+                // complement('table', 'c', 's', 'e')
+                let c = extract_string_arg(&work_args[0], "column name", self.name)?;
+                let s = extract_string_arg(&work_args[1], "column name", self.name)?;
+                let e = extract_string_arg(&work_args[2], "column name", self.name)?;
+                let cols = (c, s, e);
+                Ok(Arc::new(ComplementProvider::new(
+                    Arc::clone(&self.session),
+                    table,
+                    None,
+                    cols.clone(),
+                    cols,
+                    filter_op,
+                )))
+            }
+            4 => {
+                // complement('table', 'view_table', 'c', 's', 'e')
+                let view_table = extract_string_arg(&work_args[0], "view_table", self.name)?;
+                let c = extract_string_arg(&work_args[1], "column name", self.name)?;
+                let s = extract_string_arg(&work_args[2], "column name", self.name)?;
+                let e = extract_string_arg(&work_args[3], "column name", self.name)?;
+                let cols = (c, s, e);
+                Ok(Arc::new(ComplementProvider::new(
+                    Arc::clone(&self.session),
+                    table,
+                    Some(view_table),
+                    cols.clone(),
+                    cols,
+                    filter_op,
+                )))
+            }
+            7 => {
+                // complement('table', 'view_table', 'c1', 's1', 'e1', 'vc', 'vs', 've')
+                let view_table = extract_string_arg(&work_args[0], "view_table", self.name)?;
+                let c1 = extract_string_arg(&work_args[1], "column name", self.name)?;
+                let s1 = extract_string_arg(&work_args[2], "column name", self.name)?;
+                let e1 = extract_string_arg(&work_args[3], "column name", self.name)?;
+                let vc = extract_string_arg(&work_args[4], "view column name", self.name)?;
+                let vs = extract_string_arg(&work_args[5], "view column name", self.name)?;
+                let ve = extract_string_arg(&work_args[6], "view column name", self.name)?;
+                Ok(Arc::new(ComplementProvider::new(
+                    Arc::clone(&self.session),
+                    table,
+                    Some(view_table),
+                    (c1, s1, e1),
+                    (vc, vs, ve),
+                    filter_op,
+                )))
+            }
+            n => Err(DataFusionError::Plan(format!(
+                "{}() unexpected number of arguments ({n} extra args after table name). \
+                 Usage: {name}('table' [, 'view_table'] [, col1, col2, col3 [, vcol1, vcol2, vcol3]] [, 'strict'|'weak'])",
+                self.name,
+                name = self.name
+            ))),
+        }
+    }
+}
+
+/// Internal table function for subtract (basepair-level set difference).
+struct SubtractTableFunction {
+    session: Arc<SessionContext>,
+    name: &'static str,
+}
+
+impl std::fmt::Debug for SubtractTableFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}Function", self.name)
+    }
+}
+
+impl TableFunctionImpl for SubtractTableFunction {
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        if args.len() < 2 {
+            return Err(DataFusionError::Plan(format!(
+                "{}() requires at least 2 arguments: left_table and right_table names",
+                self.name
+            )));
+        }
+
+        let left_table = extract_string_arg(&args[0], "left_table", self.name)?;
+        let right_table = extract_string_arg(&args[1], "right_table", self.name)?;
+        let (cols_left, cols_right, filter_op) = parse_col_args(args, self.name)?;
+
+        Ok(Arc::new(SubtractProvider::new(
+            Arc::clone(&self.session),
+            left_table,
+            right_table,
+            cols_left,
+            cols_right,
+            filter_op,
+        )))
+    }
+}
+
 /// Register coverage and count_overlaps table functions on a [`SessionContext`].
 ///
 /// After registration, these SQL table functions are available:
@@ -540,8 +782,29 @@ pub fn register_ranges_functions(ctx: &SessionContext) {
     ctx.register_udtf(
         "merge",
         Arc::new(MergeTableFunction {
-            session,
+            session: Arc::clone(&session),
             name: "merge",
+        }),
+    );
+    ctx.register_udtf(
+        "cluster",
+        Arc::new(ClusterTableFunction {
+            session: Arc::clone(&session),
+            name: "cluster",
+        }),
+    );
+    ctx.register_udtf(
+        "complement",
+        Arc::new(ComplementTableFunction {
+            session: Arc::clone(&session),
+            name: "complement",
+        }),
+    );
+    ctx.register_udtf(
+        "subtract",
+        Arc::new(SubtractTableFunction {
+            session,
+            name: "subtract",
         }),
     );
 }
