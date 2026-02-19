@@ -37,7 +37,6 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt, TryStreamExt, ready};
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -627,7 +626,7 @@ async fn collect_left_input(
     reservation.try_grow(estimated_hastable_size)?;
     metrics.build_mem_used.add(estimated_hastable_size);
 
-    let mut hashmap = HashMap::<u64, Vec<BioInterval>>::with_capacity(16);
+    let mut hashmap = AHashMap::<u64, Vec<BioInterval>>::with_capacity(16);
     let mut hashes_buffer = Vec::new();
     let mut offset = 0;
 
@@ -705,7 +704,7 @@ impl Debug for IntervalJoinAlgorithm {
                 let q = m
                     .iter()
                     .map(|(key, val)| (*key, val.iter().collect::<Vec<_>>()))
-                    .collect::<HashMap<_, _>>();
+                    .collect::<AHashMap<_, _>>();
                 f.debug_struct("Coitrees").field("0", &q).finish()
             }
             IntervalJoinAlgorithm::CoitreesNearest(m) => f
@@ -732,7 +731,7 @@ impl Debug for IntervalJoinAlgorithm {
 }
 
 impl IntervalJoinAlgorithm {
-    fn new(alg: &Algorithm, hash_map: HashMap<u64, Vec<BioInterval>>) -> IntervalJoinAlgorithm {
+    fn new(alg: &Algorithm, hash_map: AHashMap<u64, Vec<BioInterval>>) -> IntervalJoinAlgorithm {
         match alg {
             Algorithm::Coitrees | Algorithm::CoitreesCountOverlaps => {
                 use coitrees::{COITree, Interval, IntervalTree};
@@ -893,7 +892,7 @@ fn update_hashmap(
     on: &[PhysicalExprRef],
     left_interval: &ColInterval,
     batch: &RecordBatch,
-    hash_map: &mut HashMap<u64, Vec<BioInterval>>,
+    hash_map: &mut AHashMap<u64, Vec<BioInterval>>,
     offset: usize,
     random_state: &RandomState,
     hashes_buffer: &mut Vec<u64>,
