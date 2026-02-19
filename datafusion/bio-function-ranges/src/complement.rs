@@ -410,7 +410,7 @@ impl Stream for ComplementStream {
                         let (ref contig, ref intervals) = this.input_groups[this.group_idx];
 
                         // For contigs with no explicit view, add implicit (0, i64::MAX)
-                        if this.view_bounds.is_empty() {
+                        if !this.view_bounds.contains_key(contig) {
                             this.view_bounds.insert(contig.clone(), vec![(0, i64::MAX)]);
                         }
 
@@ -443,7 +443,8 @@ impl Stream for ComplementStream {
                     // Fall through
                 }
                 ComplementPhase::EmitTrailingGaps => {
-                    let view_contigs: Vec<String> = this.view_bounds.keys().cloned().collect();
+                    let mut view_contigs: Vec<String> = this.view_bounds.keys().cloned().collect();
+                    view_contigs.sort();
 
                     while this.trailing_iter_idx < view_contigs.len() {
                         let contig = &view_contigs[this.trailing_iter_idx];

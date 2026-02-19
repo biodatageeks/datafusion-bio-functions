@@ -2409,6 +2409,41 @@ async fn test_complement_udtf_basic_no_view() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_complement_udtf_multi_contig_no_view() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200),
+        ('b', 300, 400)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM complement('intervals') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    // Without view: each contig gets implicit [0, i64::MAX)
+    let expected = [
+        "+--------+-----------+---------------------+",
+        "| contig | pos_start | pos_end             |",
+        "+--------+-----------+---------------------+",
+        "| a      | 0         | 100                 |",
+        "| a      | 200       | 9223372036854775807 |",
+        "| b      | 0         | 300                 |",
+        "| b      | 400       | 9223372036854775807 |",
+        "+--------+-----------+---------------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_complement_udtf_with_view() -> Result<()> {
     let ctx = create_bio_session();
 

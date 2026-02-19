@@ -144,6 +144,44 @@ fn extract_bool_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<bool> {
     }
 }
 
+/// Extract an optional leading `min_dist` integer argument from an argument slice.
+///
+/// Returns `(min_dist, remaining_args)`. If the first argument is not a numeric literal,
+/// returns `(0, original_args)`.
+fn extract_min_dist<'a>(extra: &'a [Expr], fn_name: &str) -> Result<(i64, &'a [Expr])> {
+    if extra.is_empty() {
+        return Ok((0i64, extra));
+    }
+    match &extra[0] {
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
+            if *v < 0 {
+                return Err(DataFusionError::Plan(format!(
+                    "{fn_name}() min_dist must be >= 0, got {v}"
+                )));
+            }
+            Ok((*v, &extra[1..]))
+        }
+        Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
+            if *v < 0 {
+                return Err(DataFusionError::Plan(format!(
+                    "{fn_name}() min_dist must be >= 0, got {v}"
+                )));
+            }
+            Ok((i64::from(*v), &extra[1..]))
+        }
+        Expr::Literal(ScalarValue::UInt64(Some(v)), _) => Ok((
+            i64::try_from(*v).map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "{fn_name}() min_dist value {v} does not fit i64"
+                ))
+            })?,
+            &extra[1..],
+        )),
+        Expr::Literal(ScalarValue::UInt32(Some(v)), _) => Ok((i64::from(*v), &extra[1..])),
+        _ => Ok((0i64, extra)),
+    }
+}
+
 /// Internal table function that implements both coverage and count_overlaps.
 struct RangeTableFunction {
     session: Arc<SessionContext>,
@@ -334,52 +372,8 @@ impl TableFunctionImpl for MergeTableFunction {
 
         let table = extract_string_arg(&args[0], "table", self.name)?;
 
-        // Parse optional min_dist and column args.
-        // Patterns:
-        //   merge('t')
-        //   merge('t', 10)
-        //   merge('t', 0, 'c', 's', 'e')
-        //   merge('t', 'c', 's', 'e')
-        //   merge('t', 0, 'c', 's', 'e', 'strict')
-        //   merge('t', 'c', 's', 'e', 'strict')
         let extra = &args[1..];
-        let (min_dist, col_extra) = if extra.is_empty() {
-            (0i64, extra)
-        } else {
-            match &extra[0] {
-                Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
-                    if *v < 0 {
-                        return Err(DataFusionError::Plan(format!(
-                            "{}() min_dist must be >= 0, got {}",
-                            self.name, v
-                        )));
-                    }
-                    (*v, &extra[1..])
-                }
-                Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
-                    if *v < 0 {
-                        return Err(DataFusionError::Plan(format!(
-                            "{}() min_dist must be >= 0, got {}",
-                            self.name, v
-                        )));
-                    }
-                    (i64::from(*v), &extra[1..])
-                }
-                Expr::Literal(ScalarValue::UInt64(Some(v)), _) => (
-                    i64::try_from(*v).map_err(|_| {
-                        DataFusionError::Plan(format!(
-                            "{}() min_dist value {} does not fit i64",
-                            self.name, v
-                        ))
-                    })?,
-                    &extra[1..],
-                ),
-                Expr::Literal(ScalarValue::UInt32(Some(v)), _) => (i64::from(*v), &extra[1..]),
-                _ => (0i64, extra),
-            }
-        };
-
-        // col_extra now contains column names + optional filter_op
+        let (min_dist, col_extra) = extract_min_dist(extra, self.name)?;
         let (cols, filter_op) = parse_merge_col_args(col_extra, self.name)?;
 
         Ok(Arc::new(MergeProvider::new(
@@ -511,44 +505,8 @@ impl TableFunctionImpl for ClusterTableFunction {
 
         let table = extract_string_arg(&args[0], "table", self.name)?;
 
-        // Parse optional min_dist and column args (same pattern as MergeTableFunction)
         let extra = &args[1..];
-        let (min_dist, col_extra) = if extra.is_empty() {
-            (0i64, extra)
-        } else {
-            match &extra[0] {
-                Expr::Literal(ScalarValue::Int64(Some(v)), _) => {
-                    if *v < 0 {
-                        return Err(DataFusionError::Plan(format!(
-                            "{}() min_dist must be >= 0, got {}",
-                            self.name, v
-                        )));
-                    }
-                    (*v, &extra[1..])
-                }
-                Expr::Literal(ScalarValue::Int32(Some(v)), _) => {
-                    if *v < 0 {
-                        return Err(DataFusionError::Plan(format!(
-                            "{}() min_dist must be >= 0, got {}",
-                            self.name, v
-                        )));
-                    }
-                    (i64::from(*v), &extra[1..])
-                }
-                Expr::Literal(ScalarValue::UInt64(Some(v)), _) => (
-                    i64::try_from(*v).map_err(|_| {
-                        DataFusionError::Plan(format!(
-                            "{}() min_dist value {} does not fit i64",
-                            self.name, v
-                        ))
-                    })?,
-                    &extra[1..],
-                ),
-                Expr::Literal(ScalarValue::UInt32(Some(v)), _) => (i64::from(*v), &extra[1..]),
-                _ => (0i64, extra),
-            }
-        };
-
+        let (min_dist, col_extra) = extract_min_dist(extra, self.name)?;
         let (cols, filter_op) = parse_merge_col_args(col_extra, self.name)?;
 
         Ok(Arc::new(ClusterProvider::new(
