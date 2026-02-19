@@ -304,7 +304,7 @@ impl Stream for ClusterStream {
             match this.phase {
                 ClusterPhase::Collecting => match ready!(this.collector.poll_collect(cx)) {
                     Ok(true) => {
-                        this.groups = this.collector.take_groups().into_iter().collect();
+                        this.groups = this.collector.take_groups();
                         this.group_idx = 0;
                         this.interval_idx = 0;
                         this.phase = ClusterPhase::Emitting;

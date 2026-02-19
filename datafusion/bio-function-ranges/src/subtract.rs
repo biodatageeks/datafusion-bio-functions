@@ -1,10 +1,10 @@
 use std::any::Any;
-use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use ahash::AHashMap;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Int64Builder, RecordBatch, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -20,9 +20,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, SessionContext};
-use futures::{Stream, StreamExt, ready};
+use futures::{Stream, ready};
 
-use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
 use crate::grouped_stream::{DEFAULT_BATCH_SIZE, StreamCollector};
 
@@ -234,15 +233,14 @@ impl ExecutionPlan for SubtractExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let left = self.left.execute(partition, Arc::clone(&context))?;
-        let right = self.right.execute(partition, context)?;
+        let right = self.right.execute(partition, Arc::clone(&context))?;
         Ok(Box::pin(SubtractStream {
             schema: self.schema.clone(),
             left_collector: StreamCollector::new(left, Arc::clone(&self.left_columns)),
-            right: Some(right),
-            right_columns: Arc::clone(&self.right_columns),
+            right_collector: Some(StreamCollector::new(right, Arc::clone(&self.right_columns))),
             strict: self.strict,
             phase: SubtractPhase::CollectRight,
-            right_groups: BTreeMap::new(),
+            right_groups: AHashMap::new(),
             left_groups: Vec::new(),
             group_idx: 0,
             interval_idx: 0,
@@ -264,11 +262,10 @@ enum SubtractPhase {
 struct SubtractStream {
     schema: SchemaRef,
     left_collector: StreamCollector,
-    right: Option<SendableRecordBatchStream>,
-    right_columns: Arc<(String, String, String)>,
+    right_collector: Option<StreamCollector>,
     strict: bool,
     phase: SubtractPhase,
-    right_groups: BTreeMap<String, Vec<(i64, i64)>>,
+    right_groups: AHashMap<String, Vec<(i64, i64)>>,
     left_groups: Vec<(String, Vec<(i64, i64)>)>,
     group_idx: usize,
     interval_idx: usize,
@@ -302,70 +299,23 @@ impl Stream for SubtractStream {
         loop {
             match this.phase {
                 SubtractPhase::CollectRight => {
-                    if let Some(ref mut right_stream) = this.right {
-                        loop {
-                            let batch_opt = ready!(right_stream.poll_next_unpin(cx));
-                            match batch_opt {
-                                Some(Ok(batch)) => {
-                                    if batch.num_rows() == 0 {
-                                        continue;
-                                    }
-                                    let right_cols = &this.right_columns;
-                                    let (contig_arr, start_arr, end_arr) = match get_join_col_arrays(
-                                        &batch,
-                                        (&right_cols.0, &right_cols.1, &right_cols.2),
-                                    ) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            this.phase = SubtractPhase::Done;
-                                            return Poll::Ready(Some(Err(e)));
-                                        }
-                                    };
-                                    let start_resolved = match start_arr.resolve_i64() {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            this.phase = SubtractPhase::Done;
-                                            return Poll::Ready(Some(Err(e)));
-                                        }
-                                    };
-                                    let end_resolved = match end_arr.resolve_i64() {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            this.phase = SubtractPhase::Done;
-                                            return Poll::Ready(Some(Err(e)));
-                                        }
-                                    };
-                                    let starts = &*start_resolved;
-                                    let ends = &*end_resolved;
-                                    for i in 0..batch.num_rows() {
-                                        let contig = contig_arr.value(i);
-                                        if let Some(vec) = this.right_groups.get_mut(contig) {
-                                            vec.push((starts[i], ends[i]));
-                                        } else {
-                                            this.right_groups.insert(
-                                                contig.to_string(),
-                                                vec![(starts[i], ends[i])],
-                                            );
-                                        }
-                                    }
-                                }
-                                Some(Err(e)) => {
-                                    this.phase = SubtractPhase::Done;
-                                    return Poll::Ready(Some(Err(e)));
-                                }
-                                None => break,
+                    if let Some(ref mut rc) = this.right_collector {
+                        match ready!(rc.poll_collect(cx)) {
+                            Ok(true) => {}
+                            Ok(false) => unreachable!(),
+                            Err(e) => {
+                                this.phase = SubtractPhase::Done;
+                                return Poll::Ready(Some(Err(e)));
                             }
                         }
-                    }
-                    this.right = None;
-                    for intervals in this.right_groups.values_mut() {
-                        intervals.sort_unstable();
+                        this.right_groups =
+                            this.right_collector.take().unwrap().take_groups_as_map();
                     }
                     this.phase = SubtractPhase::CollectLeft;
                 }
                 SubtractPhase::CollectLeft => match ready!(this.left_collector.poll_collect(cx)) {
                     Ok(true) => {
-                        this.left_groups = this.left_collector.take_groups().into_iter().collect();
+                        this.left_groups = this.left_collector.take_groups();
                         this.group_idx = 0;
                         this.interval_idx = 0;
                         this.phase = SubtractPhase::Emit;

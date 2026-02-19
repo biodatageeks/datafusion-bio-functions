@@ -1,27 +1,29 @@
-use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use ahash::AHashMap;
 use datafusion::common::Result;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, ready};
 
 use crate::array_utils::get_join_col_arrays;
 
-/// Intervals grouped by contig, sorted by (start, end) within each group.
-pub type GroupedIntervals = BTreeMap<String, Vec<(i64, i64)>>;
-
 /// Default output batch size for collect-then-emit streams.
 /// Larger than DataFusion's default 8192 to reduce flush overhead.
 pub const DEFAULT_BATCH_SIZE: usize = 65_536;
 
-/// Collects input batches into [`GroupedIntervals`], grouping by contig
-/// and sorting each group by (start, end) once the input is exhausted.
+/// Collects input batches into per-contig interval groups, sorting each group
+/// by (start, end) once the input is exhausted.
+///
+/// Uses `AHashMap<String, usize>` (contig→index) + `Vec<Vec<(i64, i64)>>`
+/// for O(1) amortized lookups instead of O(log n) BTreeMap string comparisons.
 pub struct StreamCollector {
     input: SendableRecordBatchStream,
     columns: Arc<(String, String, String)>,
-    groups: GroupedIntervals,
+    contig_to_idx: AHashMap<String, usize>,
+    groups: Vec<Vec<(i64, i64)>>,
+    contig_names: Vec<String>,
     done: bool,
 }
 
@@ -30,7 +32,9 @@ impl StreamCollector {
         Self {
             input,
             columns,
-            groups: BTreeMap::new(),
+            contig_to_idx: AHashMap::new(),
+            groups: Vec::new(),
+            contig_names: Vec::new(),
             done: false,
         }
     }
@@ -64,12 +68,17 @@ impl StreamCollector {
 
                     for i in 0..batch.num_rows() {
                         let contig = contig_arr.value(i);
-                        if let Some(vec) = self.groups.get_mut(contig) {
-                            vec.push((starts[i], ends[i]));
-                        } else {
-                            self.groups
-                                .insert(contig.to_string(), vec![(starts[i], ends[i])]);
-                        }
+                        let idx = match self.contig_to_idx.get(contig) {
+                            Some(&idx) => idx,
+                            None => {
+                                let idx = self.groups.len();
+                                self.groups.push(Vec::with_capacity(1024));
+                                self.contig_names.push(contig.to_string());
+                                self.contig_to_idx.insert(contig.to_string(), idx);
+                                idx
+                            }
+                        };
+                        self.groups[idx].push((starts[i], ends[i]));
                     }
                 }
                 Some(Err(e)) => {
@@ -78,7 +87,7 @@ impl StreamCollector {
                 }
                 None => {
                     self.done = true;
-                    for intervals in self.groups.values_mut() {
+                    for intervals in &mut self.groups {
                         intervals.sort_unstable();
                     }
                     return Poll::Ready(Ok(true));
@@ -87,9 +96,26 @@ impl StreamCollector {
         }
     }
 
-    /// Take ownership of the collected groups. Returns an empty map if called
-    /// before collection is complete.
-    pub fn take_groups(&mut self) -> GroupedIntervals {
-        std::mem::take(&mut self.groups)
+    /// Take ownership of the collected groups as a `Vec<(contig, intervals)>`,
+    /// sorted by contig name. Used by merge, cluster, complement, subtract
+    /// when iterating groups in deterministic order.
+    pub fn take_groups(&mut self) -> Vec<(String, Vec<(i64, i64)>)> {
+        let names = std::mem::take(&mut self.contig_names);
+        let groups = std::mem::take(&mut self.groups);
+        self.contig_to_idx.clear();
+
+        let mut pairs: Vec<(String, Vec<(i64, i64)>)> = names.into_iter().zip(groups).collect();
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    }
+
+    /// Take ownership of the collected groups as an `AHashMap<String, Vec<(i64, i64)>>`.
+    /// Used by callers that need O(1) key lookup (complement view_bounds, subtract right_groups).
+    pub fn take_groups_as_map(&mut self) -> AHashMap<String, Vec<(i64, i64)>> {
+        let names = std::mem::take(&mut self.contig_names);
+        let groups = std::mem::take(&mut self.groups);
+        self.contig_to_idx.clear();
+
+        names.into_iter().zip(groups).collect()
     }
 }

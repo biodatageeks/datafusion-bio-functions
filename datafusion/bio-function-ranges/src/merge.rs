@@ -279,7 +279,7 @@ impl Stream for MergeStream {
             match this.phase {
                 MergePhase::Collecting => match ready!(this.collector.poll_collect(cx)) {
                     Ok(true) => {
-                        this.groups = this.collector.take_groups().into_iter().collect();
+                        this.groups = this.collector.take_groups();
                         this.group_idx = 0;
                         this.interval_idx = 0;
                         this.has_current = false;

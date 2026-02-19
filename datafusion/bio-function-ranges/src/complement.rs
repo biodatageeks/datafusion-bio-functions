@@ -1,10 +1,10 @@
 use std::any::Any;
-use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use ahash::AHashMap;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Int64Builder, RecordBatch, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -20,9 +20,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, SessionContext};
-use futures::{Stream, StreamExt, ready};
+use futures::{Stream, ready};
 
-use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
 use crate::grouped_stream::{DEFAULT_BATCH_SIZE, StreamCollector};
 
@@ -242,19 +241,21 @@ impl ExecutionPlan for ComplementExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input = self.input.execute(partition, Arc::clone(&context))?;
-        let view_stream = self
+        let view_collector = self
             .view
             .as_ref()
-            .map(|v| v.execute(partition, context))
+            .map(|v| -> Result<StreamCollector> {
+                let stream = v.execute(partition, Arc::clone(&context))?;
+                Ok(StreamCollector::new(stream, Arc::clone(&self.view_columns)))
+            })
             .transpose()?;
         Ok(Box::pin(ComplementStream {
             schema: self.schema.clone(),
             collector: StreamCollector::new(input, Arc::clone(&self.columns)),
-            view_stream,
-            view_columns: Arc::clone(&self.view_columns),
+            view_collector,
             strict: self.strict,
             phase: ComplementPhase::CollectView,
-            view_bounds: BTreeMap::new(),
+            view_bounds: AHashMap::new(),
             input_groups: Vec::new(),
             group_idx: 0,
             trailing_iter_idx: 0,
@@ -278,11 +279,10 @@ enum ComplementPhase {
 struct ComplementStream {
     schema: SchemaRef,
     collector: StreamCollector,
-    view_stream: Option<SendableRecordBatchStream>,
-    view_columns: Arc<(String, String, String)>,
+    view_collector: Option<StreamCollector>,
     strict: bool,
     phase: ComplementPhase,
-    view_bounds: BTreeMap<String, Vec<(i64, i64)>>,
+    view_bounds: AHashMap<String, Vec<(i64, i64)>>,
     input_groups: Vec<(String, Vec<(i64, i64)>)>,
     group_idx: usize,
     trailing_iter_idx: usize,
@@ -380,70 +380,22 @@ impl Stream for ComplementStream {
         loop {
             match this.phase {
                 ComplementPhase::CollectView => {
-                    if let Some(ref mut view_stream) = this.view_stream {
-                        loop {
-                            let batch_opt = ready!(view_stream.poll_next_unpin(cx));
-                            match batch_opt {
-                                Some(Ok(batch)) => {
-                                    if batch.num_rows() == 0 {
-                                        continue;
-                                    }
-                                    let view_cols = &this.view_columns;
-                                    let (contig_arr, start_arr, end_arr) = match get_join_col_arrays(
-                                        &batch,
-                                        (&view_cols.0, &view_cols.1, &view_cols.2),
-                                    ) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            this.phase = ComplementPhase::Done;
-                                            return Poll::Ready(Some(Err(e)));
-                                        }
-                                    };
-                                    let start_resolved = match start_arr.resolve_i64() {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            this.phase = ComplementPhase::Done;
-                                            return Poll::Ready(Some(Err(e)));
-                                        }
-                                    };
-                                    let end_resolved = match end_arr.resolve_i64() {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            this.phase = ComplementPhase::Done;
-                                            return Poll::Ready(Some(Err(e)));
-                                        }
-                                    };
-                                    let starts = &*start_resolved;
-                                    let ends = &*end_resolved;
-                                    for i in 0..batch.num_rows() {
-                                        let contig = contig_arr.value(i);
-                                        if let Some(vec) = this.view_bounds.get_mut(contig) {
-                                            vec.push((starts[i], ends[i]));
-                                        } else {
-                                            this.view_bounds.insert(
-                                                contig.to_string(),
-                                                vec![(starts[i], ends[i])],
-                                            );
-                                        }
-                                    }
-                                }
-                                Some(Err(e)) => {
-                                    this.phase = ComplementPhase::Done;
-                                    return Poll::Ready(Some(Err(e)));
-                                }
-                                None => break,
+                    if let Some(ref mut vc) = this.view_collector {
+                        match ready!(vc.poll_collect(cx)) {
+                            Ok(true) => {}
+                            Ok(false) => unreachable!(),
+                            Err(e) => {
+                                this.phase = ComplementPhase::Done;
+                                return Poll::Ready(Some(Err(e)));
                             }
                         }
-                        for intervals in this.view_bounds.values_mut() {
-                            intervals.sort_unstable();
-                        }
+                        this.view_bounds = this.view_collector.take().unwrap().take_groups_as_map();
                     }
-                    this.view_stream = None;
                     this.phase = ComplementPhase::CollectInput;
                 }
                 ComplementPhase::CollectInput => match ready!(this.collector.poll_collect(cx)) {
                     Ok(true) => {
-                        this.input_groups = this.collector.take_groups().into_iter().collect();
+                        this.input_groups = this.collector.take_groups();
                         this.group_idx = 0;
                         this.phase = ComplementPhase::Emit;
                     }
