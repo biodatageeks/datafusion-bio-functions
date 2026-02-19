@@ -22,7 +22,7 @@ use datafusion::prelude::{Expr, SessionContext};
 use futures::{Stream, ready};
 
 use crate::filter_op::FilterOp;
-use crate::grouped_stream::{DEFAULT_BATCH_SIZE, StreamCollector};
+use crate::grouped_stream::StreamCollector;
 
 pub struct ClusterProvider {
     session: Arc<SessionContext>,
@@ -205,6 +205,7 @@ impl ExecutionPlan for ClusterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let batch_size = context.session_config().batch_size();
         let input = self.input.execute(partition, context)?;
         Ok(Box::pin(ClusterStream {
             schema: self.schema.clone(),
@@ -226,6 +227,7 @@ impl ExecutionPlan for ClusterExec {
             cluster_start_builder: Int64Builder::new(),
             cluster_end_builder: Int64Builder::new(),
             pending_rows: 0,
+            batch_size,
         }))
     }
 }
@@ -257,6 +259,7 @@ struct ClusterStream {
     cluster_start_builder: Int64Builder,
     cluster_end_builder: Int64Builder,
     pending_rows: usize,
+    batch_size: usize,
 }
 
 impl ClusterStream {
@@ -349,7 +352,7 @@ impl Stream for ClusterStream {
                                 }
                             }
 
-                            if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                            if this.pending_rows >= this.batch_size {
                                 return Poll::Ready(Some(this.flush_builders()));
                             }
                         }
@@ -362,7 +365,7 @@ impl Stream for ClusterStream {
                         this.group_idx += 1;
                         this.interval_idx = 0;
 
-                        if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                        if this.pending_rows >= this.batch_size {
                             return Poll::Ready(Some(this.flush_builders()));
                         }
                     }

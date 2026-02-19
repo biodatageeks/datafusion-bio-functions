@@ -23,7 +23,7 @@ use datafusion::prelude::{Expr, SessionContext};
 use futures::{Stream, ready};
 
 use crate::filter_op::FilterOp;
-use crate::grouped_stream::{DEFAULT_BATCH_SIZE, StreamCollector};
+use crate::grouped_stream::StreamCollector;
 
 pub struct SubtractProvider {
     session: Arc<SessionContext>,
@@ -232,6 +232,7 @@ impl ExecutionPlan for SubtractExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let batch_size = context.session_config().batch_size();
         let left = self.left.execute(partition, Arc::clone(&context))?;
         let right = self.right.execute(partition, Arc::clone(&context))?;
         Ok(Box::pin(SubtractStream {
@@ -244,10 +245,12 @@ impl ExecutionPlan for SubtractExec {
             left_groups: Vec::new(),
             group_idx: 0,
             interval_idx: 0,
+            right_cursor: 0,
             contig_builder: StringBuilder::new(),
             start_builder: Int64Builder::new(),
             end_builder: Int64Builder::new(),
             pending_rows: 0,
+            batch_size,
         }))
     }
 }
@@ -269,10 +272,12 @@ struct SubtractStream {
     left_groups: Vec<(String, Vec<(i64, i64)>)>,
     group_idx: usize,
     interval_idx: usize,
+    right_cursor: usize,
     contig_builder: StringBuilder,
     start_builder: Int64Builder,
     end_builder: Int64Builder,
     pending_rows: usize,
+    batch_size: usize,
 }
 
 impl SubtractStream {
@@ -333,28 +338,26 @@ impl Stream for SubtractStream {
                         let (ref contig, ref left_intervals) = this.left_groups[this.group_idx];
                         let right_intervals = this.right_groups.get(contig).unwrap_or(&empty);
 
-                        let mut right_cursor: usize = 0;
-
                         while this.interval_idx < left_intervals.len() {
                             let (ls, le) = left_intervals[this.interval_idx];
                             this.interval_idx += 1;
 
                             // Advance cursor past right intervals that end before left start
-                            while right_cursor < right_intervals.len() {
+                            while this.right_cursor < right_intervals.len() {
                                 let skip = if this.strict {
-                                    right_intervals[right_cursor].1 <= ls
+                                    right_intervals[this.right_cursor].1 <= ls
                                 } else {
-                                    right_intervals[right_cursor].1 < ls
+                                    right_intervals[this.right_cursor].1 < ls
                                 };
                                 if skip {
-                                    right_cursor += 1;
+                                    this.right_cursor += 1;
                                 } else {
                                     break;
                                 }
                             }
 
                             let mut cursor = ls;
-                            let mut j = right_cursor;
+                            let mut j = this.right_cursor;
                             while j < right_intervals.len() {
                                 let (rs, re) = right_intervals[j];
                                 let no_overlap = if this.strict { rs >= le } else { rs > le };
@@ -381,15 +384,16 @@ impl Stream for SubtractStream {
                                 this.pending_rows += 1;
                             }
 
-                            if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                            if this.pending_rows >= this.batch_size {
                                 return Poll::Ready(Some(this.flush_builders()));
                             }
                         }
 
                         this.group_idx += 1;
                         this.interval_idx = 0;
+                        this.right_cursor = 0;
 
-                        if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                        if this.pending_rows >= this.batch_size {
                             return Poll::Ready(Some(this.flush_builders()));
                         }
                     }

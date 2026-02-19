@@ -23,7 +23,7 @@ use datafusion::prelude::{Expr, SessionContext};
 use futures::{Stream, ready};
 
 use crate::filter_op::FilterOp;
-use crate::grouped_stream::{DEFAULT_BATCH_SIZE, StreamCollector};
+use crate::grouped_stream::StreamCollector;
 
 pub struct ComplementProvider {
     session: Arc<SessionContext>,
@@ -240,6 +240,7 @@ impl ExecutionPlan for ComplementExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let batch_size = context.session_config().batch_size();
         let input = self.input.execute(partition, Arc::clone(&context))?;
         let view_collector = self
             .view
@@ -259,11 +260,13 @@ impl ExecutionPlan for ComplementExec {
             input_groups: Vec::new(),
             group_idx: 0,
             trailing_iter_idx: 0,
+            trailing_contigs: Vec::new(),
             seen_contigs: Vec::new(),
             contig_builder: StringBuilder::new(),
             start_builder: Int64Builder::new(),
             end_builder: Int64Builder::new(),
             pending_rows: 0,
+            batch_size,
         }))
     }
 }
@@ -286,11 +289,13 @@ struct ComplementStream {
     input_groups: Vec<(String, Vec<(i64, i64)>)>,
     group_idx: usize,
     trailing_iter_idx: usize,
+    trailing_contigs: Vec<String>,
     seen_contigs: Vec<String>,
     contig_builder: StringBuilder,
     start_builder: Int64Builder,
     end_builder: Int64Builder,
     pending_rows: usize,
+    batch_size: usize,
 }
 
 impl ComplementStream {
@@ -434,35 +439,38 @@ impl Stream for ComplementStream {
                         this.seen_contigs.push(contig.clone());
                         this.group_idx += 1;
 
-                        if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                        if this.pending_rows >= this.batch_size {
                             return Poll::Ready(Some(this.flush_builders()));
                         }
                     }
 
+                    // Build sorted trailing contigs list once on transition
+                    this.trailing_contigs = this.view_bounds.keys().cloned().collect();
+                    this.trailing_contigs.sort();
                     this.phase = ComplementPhase::EmitTrailingGaps;
                     // Fall through
                 }
                 ComplementPhase::EmitTrailingGaps => {
-                    let mut view_contigs: Vec<String> = this.view_bounds.keys().cloned().collect();
-                    view_contigs.sort();
-
-                    while this.trailing_iter_idx < view_contigs.len() {
-                        let contig = &view_contigs[this.trailing_iter_idx];
+                    while this.trailing_iter_idx < this.trailing_contigs.len() {
+                        let contig = &this.trailing_contigs[this.trailing_iter_idx];
                         this.trailing_iter_idx += 1;
 
                         if this.seen_contigs.contains(contig) {
                             continue;
                         }
 
-                        let view_intervals = this.view_bounds.get(contig).unwrap();
+                        // Clone to break the borrow on this.trailing_contigs so we can
+                        // mutably access builders below.
+                        let contig = contig.clone();
+                        let view_intervals = this.view_bounds.get(&contig).unwrap();
                         for &(view_start, view_end) in view_intervals {
-                            this.contig_builder.append_value(contig);
+                            this.contig_builder.append_value(&contig);
                             this.start_builder.append_value(view_start);
                             this.end_builder.append_value(view_end);
                             this.pending_rows += 1;
                         }
 
-                        if this.pending_rows >= DEFAULT_BATCH_SIZE {
+                        if this.pending_rows >= this.batch_size {
                             return Poll::Ready(Some(this.flush_builders()));
                         }
                     }

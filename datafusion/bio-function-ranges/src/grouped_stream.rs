@@ -9,10 +9,6 @@ use futures::{StreamExt, ready};
 
 use crate::array_utils::get_join_col_arrays;
 
-/// Default output batch size for collect-then-emit streams.
-/// Larger than DataFusion's default 8192 to reduce flush overhead.
-pub const DEFAULT_BATCH_SIZE: usize = 65_536;
-
 /// Collects input batches into per-contig interval groups, sorting each group
 /// by (start, end) once the input is exhausted.
 ///
