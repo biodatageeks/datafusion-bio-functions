@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::Schema;
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::datasource::TableProvider;
@@ -14,6 +15,23 @@ use crate::merge::MergeProvider;
 use crate::nearest::NearestProvider;
 use crate::overlap::OverlapProvider;
 use crate::subtract::SubtractProvider;
+
+/// Resolve a table's Arrow schema synchronously, handling both inside and
+/// outside a tokio runtime.
+fn resolve_table_schema(session: &SessionContext, table_name: &str) -> Result<Schema> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            let df = handle.block_on(session.table(table_name))?;
+            Ok::<_, DataFusionError>(df.schema().as_arrow().clone())
+        }),
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let df = rt.block_on(session.table(table_name))?;
+            Ok(df.schema().as_arrow().clone())
+        }
+    }
+}
 
 const DEFAULT_COLS: [&str; 3] = ["contig", "pos_start", "pos_end"];
 
@@ -507,12 +525,15 @@ impl TableFunctionImpl for ClusterTableFunction {
         let (min_dist, col_extra) = extract_min_dist(extra, self.name)?;
         let (cols, filter_op) = parse_merge_col_args(col_extra, self.name)?;
 
+        let input_schema = resolve_table_schema(&self.session, &table)?;
+
         Ok(Arc::new(ClusterProvider::new(
             Arc::clone(&self.session),
             table,
             cols,
             min_dist,
             filter_op,
+            input_schema,
         )))
     }
 }
@@ -716,6 +737,8 @@ impl TableFunctionImpl for SubtractTableFunction {
         let right_table = extract_string_arg(&args[1], "right_table", self.name)?;
         let (cols_left, cols_right, filter_op) = parse_col_args(args, self.name)?;
 
+        let left_schema = resolve_table_schema(&self.session, &left_table)?;
+
         Ok(Arc::new(SubtractProvider::new(
             Arc::clone(&self.session),
             left_table,
@@ -723,6 +746,7 @@ impl TableFunctionImpl for SubtractTableFunction {
             cols_left,
             cols_right,
             filter_op,
+            left_schema,
         )))
     }
 }
