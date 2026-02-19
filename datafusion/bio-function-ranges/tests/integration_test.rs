@@ -3143,6 +3143,121 @@ async fn test_subtract_udtf_overlapping_right() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_cluster_udtf_preserves_extra_columns() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals_extra (contig TEXT, pos_start INTEGER, pos_end INTEGER, gene TEXT, score DOUBLE) AS VALUES
+        ('a', 100, 200, 'BRCA1', 0.95),
+        ('a', 150, 250, 'BRCA2', 0.85),
+        ('a', 400, 500, 'TP53', 0.75)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM cluster('intervals_extra') ORDER BY contig, pos_start, pos_end")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------+-------+---------+---------------+-------------+",
+        "| contig | pos_start | pos_end | gene  | score | cluster | cluster_start | cluster_end |",
+        "+--------+-----------+---------+-------+-------+---------+---------------+-------------+",
+        "| a      | 100       | 200     | BRCA1 | 0.95  | 0       | 100           | 250         |",
+        "| a      | 150       | 250     | BRCA2 | 0.85  | 0       | 100           | 250         |",
+        "| a      | 400       | 500     | TP53  | 0.75  | 1       | 400           | 500         |",
+        "+--------+-----------+---------+-------+-------+---------+---------------+-------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_subtract_udtf_preserves_extra_columns() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE left_extra (contig TEXT, pos_start INTEGER, pos_end INTEGER, gene TEXT, score DOUBLE) AS VALUES
+        ('a', 100, 400, 'BRCA1', 0.95)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE right_mask (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 200, 300)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM subtract('left_extra', 'right_mask') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------+-------+",
+        "| contig | pos_start | pos_end | gene  | score |",
+        "+--------+-----------+---------+-------+-------+",
+        "| a      | 100       | 200     | BRCA1 | 0.95  |",
+        "| a      | 300       | 400     | BRCA1 | 0.95  |",
+        "+--------+-----------+---------+-------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_subtract_udtf_extra_cols_multiple_splits() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE left_multi (contig TEXT, pos_start INTEGER, pos_end INTEGER, gene TEXT) AS VALUES
+        ('a', 100, 600, 'BRCA1')
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE right_multi (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 200, 300),
+        ('a', 400, 500)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM subtract('left_multi', 'right_multi') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    // Interval [100,600) split by [200,300) and [400,500) → three fragments
+    let expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | gene  |",
+        "+--------+-----------+---------+-------+",
+        "| a      | 100       | 200     | BRCA1 |",
+        "| a      | 300       | 400     | BRCA1 |",
+        "| a      | 500       | 600     | BRCA1 |",
+        "+--------+-----------+---------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_range_udtfs_target_partitions_invariant() -> Result<()> {
     let cases = [
         (
