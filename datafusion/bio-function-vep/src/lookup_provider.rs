@@ -206,10 +206,18 @@ impl TableProvider for LookupProvider {
         // VCF is the left (build) side — small, fully indexed in memory.
         // Cache is the right (probe) side — potentially huge, streamed.
         // LEFT JOIN ensures all VCF variants appear in output.
+        //
+        // The cache subquery deduplicates on (chrom, start, end, allele_string)
+        // because VEP caches may contain duplicate rows for the same variant
+        // (e.g. multiple variation_name entries). Annotation columns are
+        // aggregated with MAX() to pick a non-null value.
+        let dedup_group_by = "`chrom`, `start`, `end`, `allele_string`";
+
         let query = if select_cache.is_empty() {
             format!(
                 "SELECT {select_vcf} \
-                 FROM {vcf_from} LEFT JOIN `{}` AS b \
+                 FROM {vcf_from} LEFT JOIN \
+                 (SELECT DISTINCT {dedup_group_by} FROM `{}`) AS b \
                  ON {on_clause}",
                 self.cache_table,
             )
@@ -222,10 +230,45 @@ impl TableProvider for LookupProvider {
                 .collect::<Vec<_>>()
                 .join(" OR ");
 
+            // Aggregate annotation columns to collapse duplicates.
+            // `variation_name` uses STRING_AGG (comma-separated) to preserve all
+            // co-located variant IDs — matching VEP's Existing_variation output.
+            // Other annotation columns use MAX (values are nearly always identical
+            // across duplicates sharing the same position + allele).
+            // Skip columns already in the GROUP BY key.
+            let dedup_key_cols: &[&str] = &["chrom", "start", "end", "allele_string"];
+            let agg_cols = self
+                .cache_columns
+                .iter()
+                .filter(|col_name| !dedup_key_cols.contains(&col_name.as_str()))
+                .filter_map(|col_name| {
+                    self.cache_schema.field_with_name(col_name).ok().map(|_| {
+                        if col_name == "variation_name" {
+                            format!(
+                                "STRING_AGG(DISTINCT `{col_name}`, ',' \
+                                 ORDER BY `{col_name}`) AS `{col_name}`"
+                            )
+                        } else {
+                            format!("MAX(`{col_name}`) AS `{col_name}`")
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            // Build inner SELECT: GROUP BY key columns + aggregated annotation columns
+            let inner_select = if agg_cols.is_empty() {
+                dedup_group_by.to_string()
+            } else {
+                format!("{dedup_group_by}, {agg_cols}")
+            };
+
             format!(
                 "SELECT {select_vcf}, {select_cache} \
                  FROM {vcf_from} LEFT JOIN \
-                 (SELECT * FROM `{}` WHERE {null_filter}) AS b \
+                 (SELECT {inner_select} \
+                  FROM `{}` WHERE {null_filter} \
+                  GROUP BY {dedup_group_by}) AS b \
                  ON {on_clause}",
                 self.cache_table,
             )
@@ -239,11 +282,54 @@ impl TableProvider for LookupProvider {
 #[cfg(test)]
 mod tests {
     use crate::create_vep_session;
-    use datafusion::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+    use datafusion::arrow::array::{
+        Array, ArrayRef, Int64Array, RecordBatch, StringArray, StringViewArray,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
     use datafusion::physical_plan::displayable;
     use std::sync::Arc;
+
+    /// Extract string values from an array that may be Utf8, Utf8View, or LargeUtf8.
+    fn string_values(col: &ArrayRef) -> Vec<Option<String>> {
+        use datafusion::arrow::array::LargeStringArray;
+        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+            (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                })
+                .collect()
+        } else if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+            (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                })
+                .collect()
+        } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+            (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                })
+                .collect()
+        } else {
+            panic!(
+                "expected Utf8, Utf8View, or LargeUtf8, got {:?}",
+                col.data_type()
+            );
+        }
+    }
 
     fn vcf_table() -> MemTable {
         let schema = Arc::new(Schema::new(vec![
@@ -477,15 +563,10 @@ mod tests {
         // Verify only the true matches appear (not the decoys)
         let mut var_names = Vec::new();
         for batch in &batches {
-            let col = batch
-                .column_by_name("cache_variation_name")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            for i in 0..batch.num_rows() {
-                if !col.is_null(i) {
-                    var_names.push(col.value(i).to_string());
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
                 }
             }
         }
@@ -504,6 +585,96 @@ mod tests {
         assert!(
             !var_names.contains(&"rs201".to_string()),
             "Decoy rs201 should NOT appear in output, got: {var_names:?}"
+        );
+    }
+
+    /// Cache deduplication: duplicate rows on (chrom, start, end, allele_string)
+    /// must be collapsed so each VCF variant matches at most once per unique
+    /// cache entry. `variation_name` values are comma-concatenated (matching
+    /// VEP's `Existing_variation` output), other columns use MAX.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_deduplicates_cache_entries() {
+        let ctx = create_vep_session();
+
+        // Single VCF variant
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![101])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        // Cache with THREE duplicate rows at the same position + allele.
+        // Only variation_name differs — this simulates real VEP cache duplication
+        // (e.g. dbSNP + COSMIC entries at the same position).
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(StringArray::from(vec!["rs100", "COSM123", "rs100_dup"])),
+                Arc::new(StringArray::from(vec!["A/G", "A/G", "A/G"])),
+                Arc::new(StringArray::from(vec!["benign", "benign", "benign"])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_dedup", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_dedup", Arc::new(cache)).unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_dedup', 'cache_dedup', 'variation_name,clin_sig')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 1,
+            "Expected exactly 1 row after cache deduplication, got {total_rows}"
+        );
+
+        // Verify variation_name is comma-concatenated (sorted alphabetically)
+        let col = batches[0]
+            .column_by_name("cache_variation_name")
+            .expect("cache_variation_name column should exist");
+        let var_names = string_values(col)[0]
+            .clone()
+            .expect("variation_name should not be null");
+        assert!(
+            var_names.contains("rs100"),
+            "Expected 'rs100' in concatenated variation_name, got: {var_names}"
+        );
+        assert!(
+            var_names.contains("COSM123"),
+            "Expected 'COSM123' in concatenated variation_name, got: {var_names}"
+        );
+        assert!(
+            var_names.contains("rs100_dup"),
+            "Expected 'rs100_dup' in concatenated variation_name, got: {var_names}"
         );
     }
 }
