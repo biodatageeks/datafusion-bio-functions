@@ -8,6 +8,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::Result;
@@ -85,6 +86,25 @@ impl LookupProvider {
     }
 }
 
+/// Check whether the chrom column in the given table uses "chr" prefix (e.g. "chr1").
+async fn has_chr_prefix(session: &SessionContext, table: &str) -> Result<bool> {
+    let batches = session
+        .sql(&format!("SELECT `chrom` FROM `{table}` LIMIT 1"))
+        .await?
+        .collect()
+        .await?;
+    if let Some(batch) = batches.first() {
+        if batch.num_rows() > 0 {
+            if let Some(arr) = batch.column(0).as_any().downcast_ref::<StringArray>() {
+                if !arr.is_null(0) {
+                    return Ok(arr.value(0).starts_with("chr"));
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 impl Debug for LookupProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -116,6 +136,35 @@ impl TableProvider for LookupProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Detect whether VCF uses "chr"-prefixed chromosome names.
+        // Ensembl VEP cache always uses bare names (e.g. "1", "22").
+        let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
+
+        // Build the VCF FROM source — strip "chr" prefix if needed so the
+        // equi-join on chrom matches the cache's bare chromosome names.
+        let vcf_from = if vcf_has_chr {
+            let inner_cols = self
+                .vcf_schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    let name = f.name();
+                    if name == "chrom" {
+                        "replace(`chrom`, 'chr', '') AS `chrom`".to_string()
+                    } else {
+                        format!("`{name}`")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "(SELECT {inner_cols} FROM `{}`) AS a",
+                self.vcf_table
+            )
+        } else {
+            format!("`{}` AS a", self.vcf_table)
+        };
+
         // Build SELECT list for VCF columns
         let select_vcf = self
             .vcf_schema
@@ -163,9 +212,9 @@ impl TableProvider for LookupProvider {
         let query = if select_cache.is_empty() {
             format!(
                 "SELECT {select_vcf} \
-                 FROM `{}` AS a LEFT JOIN `{}` AS b \
+                 FROM {vcf_from} LEFT JOIN `{}` AS b \
                  ON {on_clause}",
-                self.vcf_table, self.cache_table,
+                self.cache_table,
             )
         } else {
             // Pre-filter cache rows where all selected annotation columns are NULL
@@ -178,10 +227,10 @@ impl TableProvider for LookupProvider {
 
             format!(
                 "SELECT {select_vcf}, {select_cache} \
-                 FROM `{}` AS a LEFT JOIN \
+                 FROM {vcf_from} LEFT JOIN \
                  (SELECT * FROM `{}` WHERE {null_filter}) AS b \
                  ON {on_clause}",
-                self.vcf_table, self.cache_table,
+                self.cache_table,
             )
         };
 
@@ -234,7 +283,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["chr1", "chr1"])),
+                Arc::new(StringArray::from(vec!["1", "1"])),
                 Arc::new(Int64Array::from(vec![99, 199])),
                 Arc::new(Int64Array::from(vec![102, 202])),
                 Arc::new(StringArray::from(vec!["rs123", "rs456"])),
@@ -332,13 +381,14 @@ mod tests {
             }
         }
 
-        // The chr2 variant has no cache match — it should appear with NULL annotation
+        // The chr2 variant has no cache match — it should appear with NULL annotation.
+        // Chrom is "2" (not "chr2") because the chr prefix was stripped for the join.
         assert!(
-            chroms.contains(&"chr2".to_string()),
-            "Expected chr2 (unmatched VCF row) in output, got chroms: {chroms:?}"
+            chroms.contains(&"2".to_string()),
+            "Expected '2' (unmatched VCF row, chr-stripped) in output, got chroms: {chroms:?}"
         );
 
-        let chr2_idx = chroms.iter().position(|c| c == "chr2").unwrap();
+        let chr2_idx = chroms.iter().position(|c| c == "2").unwrap();
         assert_eq!(
             clin_sigs[chr2_idx], "NULL",
             "Expected NULL clin_sig for unmatched chr2 row, got: {}",
