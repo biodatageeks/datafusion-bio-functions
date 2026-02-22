@@ -207,18 +207,29 @@ impl TableProvider for LookupProvider {
         // Cache is the right (probe) side — potentially huge, streamed.
         // LEFT JOIN ensures all VCF variants appear in output.
         //
-        // The cache subquery deduplicates on (chrom, start, end, allele_string)
-        // because VEP caches may contain duplicate rows for the same variant
-        // (e.g. multiple variation_name entries). Annotation columns are
-        // aggregated with MAX() to pick a non-null value.
-        let dedup_group_by = "`chrom`, `start`, `end`, `allele_string`";
+        // A VCF variant may match multiple cache entries (duplicates with
+        // different variation_name, or multi-allelic entries like "A/G" and
+        // "A/G/T" at the same position). VEP outputs one row per VCF variant
+        // with all matched variation_names comma-concatenated.
+        //
+        // We achieve this by GROUP BY on all VCF columns AFTER the join,
+        // aggregating cache columns with STRING_AGG (variation_name) or MAX.
+
+        // VCF GROUP BY key — all VCF columns
+        let group_by_vcf = self
+            .vcf_schema
+            .fields()
+            .iter()
+            .map(|f| format!("a.`{}`", f.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let query = if select_cache.is_empty() {
             format!(
                 "SELECT {select_vcf} \
-                 FROM {vcf_from} LEFT JOIN \
-                 (SELECT DISTINCT {dedup_group_by} FROM `{}`) AS b \
-                 ON {on_clause}",
+                 FROM {vcf_from} LEFT JOIN `{}` AS b \
+                 ON {on_clause} \
+                 GROUP BY {group_by_vcf}",
                 self.cache_table,
             )
         } else {
@@ -230,46 +241,35 @@ impl TableProvider for LookupProvider {
                 .collect::<Vec<_>>()
                 .join(" OR ");
 
-            // Aggregate annotation columns to collapse duplicates.
+            // Aggregate cache columns after the join.
             // `variation_name` uses STRING_AGG (comma-separated) to preserve all
             // co-located variant IDs — matching VEP's Existing_variation output.
             // Other annotation columns use MAX (values are nearly always identical
             // across duplicates sharing the same position + allele).
-            // Skip columns already in the GROUP BY key.
-            let dedup_key_cols: &[&str] = &["chrom", "start", "end", "allele_string"];
-            let agg_cols = self
+            let select_cache_agg = self
                 .cache_columns
                 .iter()
-                .filter(|col_name| !dedup_key_cols.contains(&col_name.as_str()))
                 .filter_map(|col_name| {
                     self.cache_schema.field_with_name(col_name).ok().map(|_| {
                         if col_name == "variation_name" {
                             format!(
-                                "STRING_AGG(DISTINCT `{col_name}`, ',' \
-                                 ORDER BY `{col_name}`) AS `{col_name}`"
+                                "STRING_AGG(DISTINCT b.`{col_name}`, ',' \
+                                 ORDER BY b.`{col_name}`) AS `cache_{col_name}`"
                             )
                         } else {
-                            format!("MAX(`{col_name}`) AS `{col_name}`")
+                            format!("MAX(b.`{col_name}`) AS `cache_{col_name}`")
                         }
                     })
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            // Build inner SELECT: GROUP BY key columns + aggregated annotation columns
-            let inner_select = if agg_cols.is_empty() {
-                dedup_group_by.to_string()
-            } else {
-                format!("{dedup_group_by}, {agg_cols}")
-            };
-
             format!(
-                "SELECT {select_vcf}, {select_cache} \
+                "SELECT {select_vcf}, {select_cache_agg} \
                  FROM {vcf_from} LEFT JOIN \
-                 (SELECT {inner_select} \
-                  FROM `{}` WHERE {null_filter} \
-                  GROUP BY {dedup_group_by}) AS b \
-                 ON {on_clause}",
+                 (SELECT * FROM `{}` WHERE {null_filter}) AS b \
+                 ON {on_clause} \
+                 GROUP BY {group_by_vcf}",
                 self.cache_table,
             )
         };
@@ -402,6 +402,16 @@ mod tests {
         assert!(
             plan_str.contains("Left"),
             "Expected LEFT join type in plan, got:\n{plan_str}"
+        );
+
+        // Verify aggregate is ABOVE the join (dedup happens after joining)
+        let agg_pos = plan_str.find("AggregateExec").expect(
+            &format!("Expected AggregateExec in plan for post-join dedup, got:\n{plan_str}")
+        );
+        let join_pos = plan_str.find("IntervalJoinExec").unwrap();
+        assert!(
+            agg_pos < join_pos,
+            "AggregateExec must appear above IntervalJoinExec in plan:\n{plan_str}"
         );
     }
 
