@@ -4,6 +4,7 @@
 //! reusing the `IntervalJoinExec` from `bio-function-ranges`.
 
 use std::any::Any;
+use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
-use datafusion::common::Result;
+use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
@@ -29,7 +30,6 @@ pub struct LookupProvider {
     vcf_table: String,
     cache_table: String,
     vcf_schema: Schema,
-    cache_schema: Schema,
     /// Columns to select from the cache table.
     cache_columns: Vec<String>,
     /// Whether to auto-prune all-null columns from output.
@@ -78,7 +78,6 @@ impl LookupProvider {
             vcf_table,
             cache_table,
             vcf_schema,
-            cache_schema,
             cache_columns,
             prune_nulls,
             coord_normalizer,
@@ -133,58 +132,82 @@ impl TableProvider for LookupProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let total_output_fields = self.schema.fields().len();
+        let vcf_output_fields = self.vcf_schema.fields().len();
+        let projected_indices: Vec<usize> = projection
+            .cloned()
+            .unwrap_or_else(|| (0..total_output_fields).collect());
+
+        let mut projected_output_exprs = Vec::with_capacity(projected_indices.len());
+        let mut required_vcf_columns = BTreeSet::<String>::new();
+
+        for idx in projected_indices {
+            if idx >= total_output_fields {
+                return Err(DataFusionError::Execution(format!(
+                    "lookup_variants(): projection index {idx} out of bounds for schema with {total_output_fields} fields"
+                )));
+            }
+
+            if idx < vcf_output_fields {
+                let name = self.schema.field(idx).name().clone();
+                projected_output_exprs.push(format!("a.`{name}` AS `{name}`"));
+                required_vcf_columns.insert(name);
+            } else {
+                // Output schema appends cache columns in the same order as `self.cache_columns`.
+                let cache_idx = idx - vcf_output_fields;
+                let cache_col_name = self.cache_columns.get(cache_idx).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "lookup_variants(): cache projection index {cache_idx} out of bounds for {} cache columns",
+                        self.cache_columns.len()
+                    ))
+                })?;
+                projected_output_exprs
+                    .push(format!("b.`{cache_col_name}` AS `cache_{cache_col_name}`"));
+            }
+        }
+
+        // Join and allele-match columns are always required from the VCF side.
+        for col in ["chrom", "start", "end", "ref", "alt"] {
+            required_vcf_columns.insert(col.to_string());
+        }
+
         // Detect whether VCF uses "chr"-prefixed chromosome names.
         // Ensembl VEP cache always uses bare names (e.g. "1", "22").
         let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
 
-        // Build the VCF FROM source — strip "chr" prefix if needed so the
-        // equi-join on chrom matches the cache's bare chromosome names.
-        let vcf_from = if vcf_has_chr {
-            let inner_cols = self
-                .vcf_schema
-                .fields()
-                .iter()
-                .map(|f| {
-                    let name = f.name();
-                    if name == "chrom" {
-                        "replace(`chrom`, 'chr', '') AS `chrom`".to_string()
-                    } else {
-                        format!("`{name}`")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("(SELECT {inner_cols} FROM `{}`) AS a", self.vcf_table)
-        } else {
-            format!("`{}` AS a", self.vcf_table)
-        };
-
-        // Build SELECT list for VCF columns
-        let select_vcf = self
-            .vcf_schema
-            .fields()
+        // Build the VCF FROM source.
+        // Always project only required columns so table scans can prune aggressively.
+        // Strip "chr" prefix on chrom if needed so join keys match cache naming.
+        let vcf_inner_cols = required_vcf_columns
             .iter()
-            .map(|f| {
-                let name = f.name();
-                format!("a.`{name}` AS `{name}`")
+            .map(|name| {
+                if vcf_has_chr && name == "chrom" {
+                    "replace(`chrom`, 'chr', '') AS `chrom`".to_string()
+                } else {
+                    format!("`{name}`")
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let vcf_from = format!("(SELECT {vcf_inner_cols} FROM `{}`) AS a", self.vcf_table);
 
-        // Build SELECT list for cache columns
-        let select_cache = self
-            .cache_columns
+        // Build cache-side source with explicit columns only:
+        // join keys + allele string + annotation columns involved in output/null-filter.
+        let mut required_cache_columns = BTreeSet::<String>::from([
+            "chrom".to_string(),
+            "start".to_string(),
+            "end".to_string(),
+            "allele_string".to_string(),
+        ]);
+        required_cache_columns.extend(self.cache_columns.iter().cloned());
+
+        let cache_inner_cols = required_cache_columns
             .iter()
-            .filter_map(|col_name| {
-                self.cache_schema
-                    .field_with_name(col_name)
-                    .ok()
-                    .map(|_| format!("b.`{col_name}` AS `cache_{col_name}`"))
-            })
+            .map(|c| format!("`{c}`"))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -214,12 +237,14 @@ impl TableProvider for LookupProvider {
         // A post-join GROUP BY would fix this but turns the streaming
         // pipeline into a blocking operation with high memory usage, so
         // we accept the minor discrepancy for performance.
-        let query = if select_cache.is_empty() {
+        let select_output = projected_output_exprs.join(", ");
+        let query = if self.cache_columns.is_empty() {
             format!(
-                "SELECT {select_vcf} \
-                 FROM {vcf_from} LEFT JOIN `{}` AS b \
+                "SELECT {select_output} \
+                 FROM {vcf_from} LEFT JOIN \
+                 (SELECT {cache_inner_cols} FROM `{}`) AS b \
                  ON {on_clause}",
-                self.cache_table,
+                self.cache_table
             )
         } else {
             // Pre-filter cache rows where all selected annotation columns are NULL
@@ -231,9 +256,9 @@ impl TableProvider for LookupProvider {
                 .join(" OR ");
 
             format!(
-                "SELECT {select_vcf}, {select_cache} \
+                "SELECT {select_output} \
                  FROM {vcf_from} LEFT JOIN \
-                 (SELECT * FROM `{}` WHERE {null_filter}) AS b \
+                 (SELECT {cache_inner_cols} FROM `{}` WHERE {null_filter}) AS b \
                  ON {on_clause}",
                 self.cache_table,
             )
@@ -368,7 +393,6 @@ mod tests {
             plan_str.contains("Left"),
             "Expected LEFT join type in plan, got:\n{plan_str}"
         );
-
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -495,9 +519,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["1", "1", "1", "1"])),
                 Arc::new(Int64Array::from(vec![100, 101, 200, 201])),
                 Arc::new(Int64Array::from(vec![100, 101, 200, 201])),
-                Arc::new(StringArray::from(vec![
-                    "rs100", "rs101", "rs200", "rs201",
-                ])),
+                Arc::new(StringArray::from(vec!["rs100", "rs101", "rs200", "rs201"])),
                 // True match alleles + decoy alleles (same ALT, different REF)
                 Arc::new(StringArray::from(vec!["A/G", "T/G", "C/T", "G/T"])),
                 Arc::new(StringArray::from(vec![

@@ -22,8 +22,8 @@ use datafusion::common::{
 };
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::equivalence::{ProjectionMapping, join_equivalence_properties};
 use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::equivalence::{ProjectionMapping, join_equivalence_properties};
 use datafusion::physical_expr::expressions::{BinaryExpr, CastExpr};
 use datafusion::physical_expr::{Distribution, Partitioning, PhysicalExpr, PhysicalExprRef};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -1861,6 +1861,7 @@ mod tests {
     use datafusion::assert_batches_sorted_eq;
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::SortExpr;
+    use datafusion::physical_plan::displayable;
     use datafusion::prelude::{CsvReadOptions, Expr, SessionConfig, SessionContext, col};
     use datafusion::test_util::plan_and_collect;
 
@@ -2020,6 +2021,56 @@ mod tests {
         for q in [q0, q1, q2, q3] {
             ctx.sql(q).await?;
         }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_left_join_partitioned_mode_opt_in() -> Result<()> {
+        let schema = &schema();
+        let options = ConfigOptions::new();
+
+        let bio_config = BioConfig {
+            prefer_interval_join: true,
+            interval_join_algorithm: Algorithm::Coitrees,
+            interval_join_partitioned_left_join: true,
+            ..Default::default()
+        };
+
+        let config = SessionConfig::from(options)
+            .with_option_extension(bio_config)
+            .with_information_schema(true)
+            .with_target_partitions(4)
+            .with_repartition_joins(true);
+
+        let ctx = SessionContext::new_with_bio(config);
+
+        let reads = ctx.read_csv(READS_PATH, csv_options(schema)).await?;
+        let targets = ctx.read_csv(TARGETS_PATH, csv_options(schema)).await?;
+
+        let on_expr = [
+            col("reads_contig").eq(col("target_contig")),
+            col("reads_pos_start").lt_eq(col("target_pos_end")),
+            col("reads_pos_end").gt_eq(col("target_pos_start")),
+        ];
+
+        let res = reads.select(reads_renames())?.join_on(
+            targets.select(target_renames())?,
+            JoinType::Left,
+            on_expr,
+        )?;
+
+        let plan = res.create_physical_plan().await?;
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+
+        assert!(
+            plan_str.contains("IntervalJoinExec"),
+            "Expected IntervalJoinExec in plan, got:\n{plan_str}"
+        );
+        assert!(
+            plan_str.contains("mode=Partitioned"),
+            "Expected partitioned LEFT interval join mode, got:\n{plan_str}"
+        );
 
         Ok(())
     }
