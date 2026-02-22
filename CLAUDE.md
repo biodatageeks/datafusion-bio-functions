@@ -15,8 +15,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Dependency Versions (must stay in sync with polars-bio)
 
 As of polars-bio latest:
-- **DataFusion**: 52.1.0
-- **Arrow**: 57.3.0
+- **DataFusion**: 50.3.0
+- **Arrow**: 56.1.0
 - **Rust edition**: 2024
 
 When updating DataFusion or Arrow versions, coordinate with `datafusion-bio-formats` and `polars-bio` to ensure all three repos use the same major versions.

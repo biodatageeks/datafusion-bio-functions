@@ -917,14 +917,14 @@ fn update_hashmap(
     hash_map: &mut AHashMap<u64, Vec<BioInterval>>,
     offset: usize,
     random_state: &RandomState,
-    hashes_buffer: &mut [u64],
+    hashes_buffer: &mut Vec<u64>,
 ) -> Result<()> {
     let keys_values = on
         .iter()
         .map(|c| c.evaluate(batch)?.into_array(batch.num_rows()))
         .collect::<Result<Vec<_>>>()?;
 
-    let hash_values: &mut [u64] = create_hashes(&keys_values, random_state, hashes_buffer)?;
+    let hash_values = create_hashes(&keys_values, random_state, hashes_buffer)?;
 
     let start = evaluate_as_i32(left_interval.start(), batch)?;
     let end = evaluate_as_i32(left_interval.end(), batch)?;
