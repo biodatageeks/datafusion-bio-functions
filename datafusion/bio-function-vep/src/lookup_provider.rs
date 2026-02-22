@@ -213,17 +213,31 @@ impl TableProvider for LookupProvider {
 
         // Build the ON clause for the interval join.
         //
-        // VCF uses half-open intervals: end = start + len(REF), so a SNV at
-        // position 100 has [100, 101).  VEP cache uses 1-based closed intervals
-        // where a SNV at position 100 has [100, 100].
+        // Normalize both tables to 1-based closed coordinates based on
+        // `bio.coordinate_system_zero_based` metadata:
+        // - zero-based half-open [start, end) -> [start + 1, end]
+        // - one-based closed [start, end]     -> [start, end]
         //
-        // The correct overlap for [start, end) vs [start, end] is:
-        //   a.end > b.start   (strict — VCF end is exclusive)
-        //   a.start <= b.end  (weak   — VCF start is inclusive)
-        let on_clause = "a.`chrom` = b.`chrom` \
-             AND CAST(a.`end` AS INTEGER) > CAST(b.`start` AS INTEGER) \
-             AND CAST(a.`start` AS INTEGER) <= CAST(b.`end` AS INTEGER) \
-             AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)";
+        // After normalization, overlap is standard inclusive overlap.
+        let vcf_start_expr = if self.coord_normalizer.input_zero_based {
+            "CAST(a.`start` AS BIGINT) + 1"
+        } else {
+            "CAST(a.`start` AS BIGINT)"
+        };
+        let cache_start_expr = if self.coord_normalizer.cache_zero_based {
+            "CAST(b.`start` AS BIGINT) + 1"
+        } else {
+            "CAST(b.`start` AS BIGINT)"
+        };
+        let vcf_end_expr = "CAST(a.`end` AS BIGINT)";
+        let cache_end_expr = "CAST(b.`end` AS BIGINT)";
+
+        let on_clause = format!(
+            "a.`chrom` = b.`chrom` \
+             AND {vcf_end_expr} >= {cache_start_expr} \
+             AND {vcf_start_expr} <= {cache_end_expr} \
+             AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
+        );
 
         // Build the LEFT JOIN query.
         // VCF is the left (build) side — small, fully indexed in memory.
@@ -278,6 +292,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
     use datafusion::physical_plan::displayable;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     /// Extract string values from an array that may be Utf8, Utf8View, or LargeUtf8.
@@ -319,6 +334,15 @@ mod tests {
                 col.data_type()
             );
         }
+    }
+
+    fn schema_with_coord_metadata(fields: Vec<Field>, zero_based: bool) -> Arc<Schema> {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "bio.coordinate_system_zero_based".to_string(),
+            zero_based.to_string(),
+        );
+        Arc::new(Schema::new_with_metadata(fields, metadata))
     }
 
     fn vcf_table() -> MemTable {
@@ -574,6 +598,253 @@ mod tests {
             !var_names.contains(&"rs201".to_string()),
             "Decoy rs201 should NOT appear in output, got: {var_names:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_one_based_metadata_matches_point_variants() {
+        let ctx = create_vep_session();
+
+        // Explicitly mark both tables as 1-based closed.
+        let vcf_schema = schema_with_coord_metadata(
+            vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+            ],
+            false,
+        );
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        let cache_schema = schema_with_coord_metadata(
+            vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("variation_name", DataType::Utf8, true),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("clin_sig", DataType::Utf8, true),
+            ],
+            false,
+        );
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["rs100"])),
+                Arc::new(StringArray::from(vec!["A/G"])),
+                Arc::new(StringArray::from(vec!["benign"])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_one_based", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_one_based", Arc::new(cache))
+            .unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_one_based', 'cache_one_based', 'variation_name')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "Expected a single joined row");
+
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+        assert_eq!(var_names, vec!["rs100"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_zero_based_input_to_one_based_cache_uses_metadata() {
+        let ctx = create_vep_session();
+
+        // VCF is 0-based half-open: position 100 is [99, 100).
+        let vcf_schema = schema_with_coord_metadata(
+            vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+            ],
+            true,
+        );
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![99])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        // Cache is 1-based closed. Both rows share allele_string, so the
+        // interval condition must discriminate the true position.
+        let cache_schema = schema_with_coord_metadata(
+            vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("variation_name", DataType::Utf8, true),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("clin_sig", DataType::Utf8, true),
+            ],
+            false,
+        );
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 101])),
+                Arc::new(Int64Array::from(vec![100, 101])),
+                Arc::new(StringArray::from(vec!["rs100", "rs101"])),
+                Arc::new(StringArray::from(vec!["A/G", "A/G"])),
+                Arc::new(StringArray::from(vec!["benign", "benign"])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_zero_based", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_closed", Arc::new(cache)).unwrap();
+
+        let df = ctx
+            .sql(
+                "SELECT * FROM lookup_variants('vcf_zero_based', 'cache_closed', 'variation_name')",
+            )
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 1,
+            "Expected exactly one match after 0-based->1-based normalization"
+        );
+
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+        assert_eq!(var_names, vec!["rs100"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_one_based_input_to_zero_based_cache_uses_metadata() {
+        let ctx = create_vep_session();
+
+        // VCF is 1-based closed: position 100 is [100, 100].
+        let vcf_schema = schema_with_coord_metadata(
+            vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+            ],
+            false,
+        );
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        // Cache is 0-based half-open:
+        // pos 100 -> [99, 100), pos 101 -> [100, 101).
+        let cache_schema = schema_with_coord_metadata(
+            vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("variation_name", DataType::Utf8, true),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("clin_sig", DataType::Utf8, true),
+            ],
+            true,
+        );
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![99, 100])),
+                Arc::new(Int64Array::from(vec![100, 101])),
+                Arc::new(StringArray::from(vec!["rs100", "rs101"])),
+                Arc::new(StringArray::from(vec!["A/G", "A/G"])),
+                Arc::new(StringArray::from(vec!["benign", "benign"])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_closed", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_zero_based", Arc::new(cache))
+            .unwrap();
+
+        let df = ctx
+            .sql(
+                "SELECT * FROM lookup_variants('vcf_closed', 'cache_zero_based', 'variation_name')",
+            )
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 1,
+            "Expected exactly one match after 1-based->0-based normalization"
+        );
+
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+        assert_eq!(var_names, vec!["rs100"]);
     }
 
     /// Duplicate cache rows on (chrom, start, end, allele_string) with different
