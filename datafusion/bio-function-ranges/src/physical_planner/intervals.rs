@@ -83,7 +83,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (le, JoinSide::Left) => {
                     let le = if is_lt { minus_one(le) } else { le };
-                    inner.with_rs(rs).with_le(le);
+                    inner.with_rs(rs)?.with_le(le)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as rs </<= le".to_string()),
@@ -93,7 +93,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (re, JoinSide::Right) => {
                     let re = if is_lt { minus_one(re) } else { re };
-                    inner.with_re(re).with_ls(ls);
+                    inner.with_re(re)?.with_ls(ls)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as ls </<= re".to_string()),
@@ -103,7 +103,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (ls, JoinSide::Left) => {
                     let re = if is_gt { minus_one(re) } else { re };
-                    inner.with_re(re).with_ls(ls);
+                    inner.with_re(re)?.with_ls(ls)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as re >/>= ls".to_string()),
@@ -113,7 +113,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (rs, JoinSide::Right) => {
                     let le = if is_gt { minus_one(le) } else { le };
-                    inner.with_rs(rs).with_le(le);
+                    inner.with_rs(rs)?.with_le(le)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as le >/>= rs".to_string()),
@@ -140,81 +140,82 @@ impl IntervalBuilder {
         }
     }
 
-    fn with_ls(&mut self, ls: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_ls(&mut self, ls: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.ls.is_some() {
-            panic!("ls must not be called twice")
+            return Err("ls already set".to_string());
         }
         self.ls = Some(ls);
-        self
+        Ok(self)
     }
-    fn with_le(&mut self, le: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_le(&mut self, le: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.le.is_some() {
-            panic!("le must not be called twice")
+            return Err("le already set".to_string());
         }
         self.le = Some(le);
-        self
+        Ok(self)
     }
-    fn with_rs(&mut self, rs: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_rs(&mut self, rs: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.rs.is_some() {
-            panic!("rs must not be called twice")
+            return Err("rs already set".to_string());
         }
         self.rs = Some(rs);
-        self
+        Ok(self)
     }
-    fn with_re(&mut self, re: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_re(&mut self, re: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.re.is_some() {
-            panic!("re must not be called twice")
+            return Err("re already set".to_string());
         }
         self.re = Some(re);
-        self
+        Ok(self)
     }
 
-    fn finish(self) -> ColIntervals {
+    fn finish(self) -> Result<ColIntervals, String> {
         let l_interval = ColInterval {
-            start: self.ls.expect("ls must be set"),
-            end: self.le.expect("le must be set"),
+            start: self.ls.ok_or("left start bound not found")?,
+            end: self.le.ok_or("left end bound not found")?,
         };
         let r_interval = ColInterval {
-            start: self.rs.expect("rs must be set"),
-            end: self.re.expect("re must be set"),
+            start: self.rs.ok_or("right start bound not found")?,
+            end: self.re.ok_or("right end bound not found")?,
         };
 
-        ColIntervals {
+        Ok(ColIntervals {
             left_interval: l_interval,
             right_interval: r_interval,
+        })
+    }
+}
+
+/// Recursively flatten a tree of `AND` expressions into leaf predicates.
+fn flatten_and(expr: &Arc<dyn PhysicalExpr>, out: &mut Vec<Arc<dyn PhysicalExpr>>) {
+    if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        if matches!(binary.op(), Operator::And) {
+            flatten_and(&binary.left(), out);
+            flatten_and(&binary.right(), out);
+            return;
         }
     }
+    out.push(expr.clone());
 }
 
 fn try_parse(filter: &JoinFilter) -> Result<ColIntervals, String> {
     let mut inner = IntervalBuilder::empty();
-
-    let expr = filter
-        .expression()
-        .as_any()
-        .downcast_ref::<BinaryExpr>()
-        .ok_or("couldn't cast filter to BinaryExpr")?;
-
-    if !matches!(expr.op(), Operator::And) {
-        return Err("expr.op() is not AND".to_string());
-    }
-
-    let left = expr
-        .left()
-        .as_any()
-        .downcast_ref::<BinaryExpr>()
-        .ok_or("couldn't cast left side to BinaryExpr")?;
-    let right = expr
-        .right()
-        .as_any()
-        .downcast_ref::<BinaryExpr>()
-        .ok_or("couldn't cast right side to BinaryExpr")?;
     let indices = filter.column_indices();
 
-    parse_condition(left, indices, &mut inner)?;
-    parse_condition(right, indices, &mut inner)?;
+    // Collect all leaf predicates from the (possibly nested) AND tree.
+    let mut leaves = Vec::new();
+    flatten_and(filter.expression(), &mut leaves);
 
-    Ok(inner.finish())
+    // Try each leaf as a range condition; skip non-range predicates
+    // (e.g. UDF calls like match_allele).
+    for leaf in &leaves {
+        if let Some(binary) = leaf.as_any().downcast_ref::<BinaryExpr>() {
+            // Silently ignore predicates that are not range comparisons.
+            let _ = parse_condition(binary, indices, &mut inner);
+        }
+    }
+
+    inner.finish()
 }
 
 #[cfg(test)]
@@ -513,6 +514,73 @@ mod tests {
             )
         })
         .map(|_| filter.expect("filter not found"))
+    }
+
+    #[tokio::test]
+    async fn test_range_conditions_with_extra_predicate() -> Result<()> {
+        // Use a fresh session with tables that include an extra column
+        // and a non-equality predicate that DataFusion keeps in the filter.
+        let ctx = SessionContext::new();
+        ctx.sql(
+            "CREATE TABLE t1 \
+             (contig TEXT, l_start INT, l_end INT, score INT) \
+             AS VALUES ('a', 1, 2, 10), ('b', 3, 4, 20)",
+        )
+        .await?;
+        ctx.sql(
+            "CREATE TABLE t2 \
+             (contig TEXT, name TEXT, r_end INT, r_start INT, min_score INT) \
+             AS VALUES ('a','x', 1, 2, 5), ('b','x', 3, 4, 15)",
+        )
+        .await?;
+
+        // Extra non-range predicate: t1.score > t2.min_score
+        let query = "SELECT * FROM t1 JOIN t2 \
+                     ON t1.contig = t2.contig \
+                     AND t2.r_end >= t1.l_start \
+                     AND t1.l_end >= t2.r_start \
+                     AND t1.score > t2.min_score";
+        let ds = ctx.sql(query).await?;
+        let plan = ds.create_physical_plan().await?;
+        let filter = find_join_filter(&plan)?;
+        let intervals = try_parse(filter).map_err(DataFusionError::Internal)?;
+
+        let l_start = Column::new("l_start", 1);
+        let l_end = Column::new("l_end", 2);
+
+        assert_eq!(to_column(intervals.left_interval.start), l_start);
+        assert_eq!(to_column(intervals.left_interval.end), l_end);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_only_non_range_predicates_returns_error() -> Result<()> {
+        // Use a non-equality predicate so DataFusion keeps it in the
+        // join filter rather than extracting it as an equi-condition.
+        let ctx = SessionContext::new();
+        ctx.sql(
+            "CREATE TABLE s1 (contig TEXT, val INT) \
+             AS VALUES ('a', 1)",
+        )
+        .await?;
+        ctx.sql(
+            "CREATE TABLE s2 (contig TEXT, val INT) \
+             AS VALUES ('a', 2)",
+        )
+        .await?;
+
+        let query = "SELECT * FROM s1 JOIN s2 \
+                     ON s1.contig = s2.contig \
+                     AND s1.val != s2.val";
+        let ds = ctx.sql(query).await?;
+        let plan = ds.create_physical_plan().await?;
+        let filter = find_join_filter(&plan)?;
+        let result = try_parse(filter);
+
+        assert!(result.is_err());
+
+        Ok(())
     }
 
     fn to_column(expr: Arc<dyn PhysicalExpr>) -> Column {

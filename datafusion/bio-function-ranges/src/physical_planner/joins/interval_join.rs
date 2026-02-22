@@ -10,7 +10,10 @@ use crate::session_context::Algorithm;
 use ahash::AHashMap;
 use ahash::RandomState;
 use bio::data_structures::interval_tree as rust_bio;
-use datafusion::arrow::array::{Array, AsArray, PrimitiveArray, PrimitiveBuilder, RecordBatch};
+use datafusion::arrow::array::{
+    Array, AsArray, BooleanArray, PrimitiveArray, PrimitiveBuilder, RecordBatch, UInt64Array,
+    new_null_array,
+};
 use datafusion::arrow::compute;
 use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, UInt32Type};
 use datafusion::common::hash_utils::create_hashes;
@@ -19,8 +22,9 @@ use datafusion::common::{
 };
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::equivalence::{ProjectionMapping, join_equivalence_properties};
-use datafusion::physical_expr::expressions::CastExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, CastExpr};
 use datafusion::physical_expr::{Distribution, Partitioning, PhysicalExpr, PhysicalExprRef};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::can_project;
@@ -361,7 +365,19 @@ impl DisplayAs for IntervalJoinExec {
                     self.algorithm
                 )
             }
-            DisplayFormatType::TreeRender => todo!(),
+            DisplayFormatType::TreeRender => {
+                let on = self
+                    .on
+                    .iter()
+                    .map(|(c1, c2)| format!("({c1}, {c2})"))
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "IntervalJoinExec: mode={:?}, join_type={:?}, on=[{}], alg={}",
+                    self.mode, self.join_type, on, self.algorithm
+                )
+            }
         }
     }
 }
@@ -383,7 +399,14 @@ impl ExecutionPlan for IntervalJoinExec {
         match self.mode {
             PartitionMode::CollectLeft => vec![
                 Distribution::SinglePartition,
-                Distribution::UnspecifiedDistribution,
+                // LEFT joins need single partition on probe side too, because
+                // the unmatched-build-row bitmap is per-stream and can't
+                // coordinate across multiple probe partitions.
+                if self.join_type == JoinType::Left {
+                    Distribution::SinglePartition
+                } else {
+                    Distribution::UnspecifiedDistribution
+                },
             ],
             PartitionMode::Partitioned => {
                 let (left_expr, right_expr) =
@@ -534,6 +557,7 @@ impl ExecutionPlan for IntervalJoinExec {
                 .unwrap_or_else(|_| "100000".to_string())
                 .parse()
                 .unwrap_or(100_000),
+            matched_build_rows: None,
         }))
     }
 
@@ -902,7 +926,7 @@ fn update_hashmap(
         .map(|c| c.evaluate(batch)?.into_array(batch.num_rows()))
         .collect::<Result<Vec<_>>>()?;
 
-    let hash_values: &mut Vec<u64> = create_hashes(&keys_values, random_state, hashes_buffer)?;
+    let hash_values = create_hashes(&keys_values, random_state, hashes_buffer)?;
 
     let start = evaluate_as_i32(left_interval.start(), batch)?;
     let end = evaluate_as_i32(left_interval.end(), batch)?;
@@ -916,6 +940,161 @@ fn update_hashmap(
     });
 
     Ok(())
+}
+
+/// Returns the effective filter to apply, or `None` for algorithms whose
+/// semantics conflict with the range overlap conditions in the filter.
+///
+/// CoitreesNearest finds the *nearest* interval regardless of overlap, and
+/// CoitreesCountOverlaps counts overlapping intervals without emitting pairs,
+/// so the JoinFilter (which typically contains range overlap predicates)
+/// must NOT be evaluated for these algorithms.
+///
+/// For other algorithms (Coitrees, IntervalTree, etc.), the filter is only
+/// applied when it contains non-range predicates (e.g. UDF calls like
+/// `match_allele`).  The range overlap conditions are already enforced by
+/// the interval tree, so re-evaluating them is pure overhead.
+fn effective_filter<'a>(
+    hash_map: &IntervalJoinAlgorithm,
+    filter: Option<&'a JoinFilter>,
+) -> Option<&'a JoinFilter> {
+    match hash_map {
+        IntervalJoinAlgorithm::CoitreesNearest(_)
+        | IntervalJoinAlgorithm::CoitreesCountOverlaps(_) => None,
+        _ => filter.filter(|f| has_non_range_predicates(f)),
+    }
+}
+
+/// Check whether the filter expression tree contains predicates beyond simple
+/// binary comparisons (which the interval tree already handles).
+///
+/// Walks the AND-tree and returns `true` if any leaf node is **not** a
+/// `BinaryExpr` with a comparison operator — e.g. a scalar UDF call like
+/// `match_allele(...)`.
+fn has_non_range_predicates(filter: &JoinFilter) -> bool {
+    has_non_binary_leaf(filter.expression())
+}
+
+fn has_non_binary_leaf(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        if matches!(binary.op(), &Operator::And) {
+            return has_non_binary_leaf(binary.left()) || has_non_binary_leaf(binary.right());
+        }
+        // Any other BinaryExpr operator (Lt, LtEq, Gt, GtEq, Eq, …) is a
+        // range-like condition already covered by the interval tree.
+        false
+    } else {
+        // Not a BinaryExpr → non-range predicate (UDF, etc.)
+        true
+    }
+}
+
+/// Evaluate a [`JoinFilter`] on matched row pairs, returning a boolean mask.
+///
+/// For each pair `(build_indices[i], probe_indices[i])`, takes the referenced
+/// columns from the build and probe batches, assembles an intermediate batch
+/// using the filter's schema, evaluates the filter expression, and returns
+/// the resulting `BooleanArray`.
+fn apply_join_filter(
+    filter: &JoinFilter,
+    build_batch: &RecordBatch,
+    probe_batch: &RecordBatch,
+    build_indices: &PrimitiveArray<UInt32Type>,
+    probe_indices: &PrimitiveArray<UInt32Type>,
+) -> Result<BooleanArray> {
+    // Cast u32 indices to u64 for take()
+    let build_indices_u64: UInt64Array =
+        build_indices.iter().map(|v| v.map(|x| x as u64)).collect();
+    let probe_indices_u64: UInt64Array =
+        probe_indices.iter().map(|v| v.map(|x| x as u64)).collect();
+
+    let mut intermediate_columns: Vec<Arc<dyn Array>> =
+        Vec::with_capacity(filter.column_indices().len());
+
+    for col_idx in filter.column_indices() {
+        let array = match col_idx.side {
+            JoinSide::Left => {
+                let col = build_batch.column(col_idx.index);
+                compute::take(col, &build_indices_u64, None)?
+            }
+            JoinSide::Right => {
+                let col = probe_batch.column(col_idx.index);
+                compute::take(col, &probe_indices_u64, None)?
+            }
+            _ => {
+                return internal_err!(
+                    "Unsupported join side {:?} in apply_join_filter",
+                    col_idx.side
+                );
+            }
+        };
+        intermediate_columns.push(array);
+    }
+
+    let intermediate_batch = RecordBatch::try_new(filter.schema().clone(), intermediate_columns)?;
+
+    let result = filter
+        .expression()
+        .evaluate(&intermediate_batch)?
+        .into_array(intermediate_batch.num_rows())?;
+
+    Ok(result
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("JoinFilter expression must evaluate to BooleanArray")
+        .clone())
+}
+
+/// Apply a [`JoinFilter`] (if present) to a result batch and update the
+/// LEFT JOIN bitmap.
+///
+/// When `filter` is `None`, updates the bitmap for all left indices and
+/// returns the batch unchanged.  When `filter` is `Some`, evaluates the
+/// filter, keeps only rows that pass, and updates the bitmap only for
+/// surviving left indices.
+fn filter_result_batch(
+    result: RecordBatch,
+    filter: Option<&JoinFilter>,
+    build_batch: &RecordBatch,
+    probe_batch: &RecordBatch,
+    left_indices: &PrimitiveArray<UInt32Type>,
+    right_indices: &PrimitiveArray<UInt32Type>,
+    matched_build_rows: &mut Option<Vec<bool>>,
+) -> Result<RecordBatch> {
+    match filter {
+        None => {
+            // No filter — mark all non-null left indices as matched
+            if let Some(matched) = matched_build_rows {
+                for i in 0..left_indices.len() {
+                    if !left_indices.is_null(i) {
+                        matched[left_indices.value(i) as usize] = true;
+                    }
+                }
+            }
+            Ok(result)
+        }
+        Some(filter) => {
+            let mask = apply_join_filter(
+                filter,
+                build_batch,
+                probe_batch,
+                left_indices,
+                right_indices,
+            )?;
+
+            // Update bitmap only for surviving matches
+            if let Some(matched) = matched_build_rows {
+                for i in 0..mask.len() {
+                    if mask.value(i) && !left_indices.is_null(i) {
+                        matched[left_indices.value(i) as usize] = true;
+                    }
+                }
+            }
+
+            let filtered = compute::filter_record_batch(&result, &mask)?;
+            Ok(filtered)
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -961,6 +1140,9 @@ struct IntervalJoinStream {
     reusable_index_buffer: Vec<u32>,
     /// Maximum output batch size to emit when streaming
     max_output_batch_size: usize,
+    /// Bitmap tracking which build (left) rows were matched during probing.
+    /// Only populated for LEFT joins; None for INNER joins.
+    matched_build_rows: Option<Vec<bool>>,
 }
 
 struct ProcessProbeBatchState {
@@ -985,6 +1167,8 @@ enum IntervalJoinStreamState {
     EmitAccumulatedMatches(ProcessProbeBatchState),
     /// Indicates that probe-side has been fully processed
     ExhaustedProbeSide,
+    /// Emit unmatched build (left) rows for LEFT JOIN (offset tracks progress)
+    EmitUnmatchedBuild { offset: usize },
 }
 
 impl IntervalJoinStreamState {
@@ -1029,7 +1213,16 @@ impl IntervalJoinStream {
                         self.join_metrics.join_time.value() / usize::pow(10, 6)
                     );
 
+                    // For LEFT joins, emit unmatched build rows before finishing
+                    if self.join_type == JoinType::Left && self.matched_build_rows.is_some() {
+                        self.state = IntervalJoinStreamState::EmitUnmatchedBuild { offset: 0 };
+                        continue;
+                    }
+
                     Poll::Ready(None)
+                }
+                IntervalJoinStreamState::EmitUnmatchedBuild { .. } => {
+                    handle_state!(self.emit_unmatched_build())
                 }
             };
         }
@@ -1051,6 +1244,12 @@ impl IntervalJoinStream {
             self.join_metrics.build_input_rows.value(),
             self.join_metrics.build_time.value() / usize::pow(10, 6)
         );
+
+        // For LEFT joins, allocate a bitmap to track which build rows are matched
+        if self.join_type == JoinType::Left {
+            let num_rows = left_data.batch.num_rows();
+            self.matched_build_rows = Some(vec![false; num_rows]);
+        }
 
         self.state = IntervalJoinStreamState::FetchProbeBatch;
         self.build_side = Some(left_data);
@@ -1271,6 +1470,17 @@ impl IntervalJoinStream {
 
         let result = RecordBatch::try_new(self.schema.clone(), columns)?;
 
+        // Apply join filter and update LEFT JOIN bitmap
+        let result = filter_result_batch(
+            result,
+            effective_filter(&build_side.hash_map, self.filter.as_ref()),
+            &build_side.batch,
+            &state.batch,
+            &left_indexes,
+            &right_indexes,
+            &mut self.matched_build_rows,
+        )?;
+
         self.join_metrics.output_batches.add(1);
         self.join_metrics.output_rows.add(result.num_rows());
 
@@ -1287,6 +1497,73 @@ impl IntervalJoinStream {
 
         Ok(StatefulStreamResult::Ready(Some(result)))
     }
+    /// Emit build (left) rows that were never matched during probing.
+    /// Called only for LEFT joins after the probe side is exhausted.
+    fn emit_unmatched_build(&mut self) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+        let offset = match &self.state {
+            IntervalJoinStreamState::EmitUnmatchedBuild { offset } => *offset,
+            _ => return internal_err!("Expected EmitUnmatchedBuild state"),
+        };
+
+        let build_side = match self.build_side.as_ref() {
+            Some(build_side) => build_side,
+            None => return internal_err!("Expected build side in ready state"),
+        };
+
+        let matched = match &self.matched_build_rows {
+            Some(m) => m,
+            None => return internal_err!("Expected matched_build_rows for LEFT join"),
+        };
+
+        let num_build_rows = matched.len();
+        if offset >= num_build_rows {
+            return Ok(StatefulStreamResult::Ready(None));
+        }
+
+        // Collect unmatched indices from offset, up to max_output_batch_size
+        let mut unmatched_indices: Vec<u32> = Vec::new();
+        let mut new_offset = num_build_rows;
+        for (i, is_matched) in matched.iter().enumerate().skip(offset) {
+            if !is_matched {
+                unmatched_indices.push(i as u32);
+                if unmatched_indices.len() >= self.max_output_batch_size {
+                    new_offset = i + 1;
+                    break;
+                }
+            }
+        }
+
+        if unmatched_indices.is_empty() {
+            return Ok(StatefulStreamResult::Ready(None));
+        }
+
+        let num_unmatched = unmatched_indices.len();
+        let take_indices = PrimitiveArray::<UInt32Type>::from(unmatched_indices);
+
+        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(self.schema.fields().len());
+
+        for (col_pos, column_index) in self.column_indices.iter().enumerate() {
+            let array: Arc<dyn Array> = if column_index.side == JoinSide::Left {
+                let array = build_side.batch.column(column_index.index);
+                compute::take(array, &take_indices, None)?
+            } else {
+                // Right (probe) side: emit NULLs
+                let data_type = self.schema.field(col_pos).data_type();
+                new_null_array(data_type, num_unmatched)
+            };
+            columns.push(array);
+        }
+
+        let result = RecordBatch::try_new(self.schema.clone(), columns)?;
+
+        self.join_metrics.output_batches.add(1);
+        self.join_metrics.output_rows.add(result.num_rows());
+
+        self.state = IntervalJoinStreamState::EmitUnmatchedBuild { offset: new_offset };
+
+        Ok(StatefulStreamResult::Ready(Some(result)))
+    }
+
     fn process_probe_batch(&mut self) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
         let state = self.state.try_as_process_probe_batch_mut()?;
         let build_side = match self.build_side.as_ref() {
@@ -1343,6 +1620,7 @@ impl IntervalJoinStream {
                         total_output_rows += matches_for_this_row;
                     }
                 }
+
                 pos_vect.clear();
                 processed_input_rows += 1;
             }
@@ -1387,6 +1665,17 @@ impl IntervalJoinStream {
                 }
 
                 let result = RecordBatch::try_new(self.schema.clone(), columns)?;
+
+                // Apply join filter and update LEFT JOIN bitmap
+                let result = filter_result_batch(
+                    result,
+                    effective_filter(&build_side.hash_map, self.filter.as_ref()),
+                    &build_side.batch,
+                    &state.batch,
+                    &left_indexes,
+                    &right_indexes,
+                    &mut self.matched_build_rows,
+                )?;
 
                 // Update state for continuation
                 if let Some((remaining_batch, remaining_hashes)) = continuation {
@@ -1433,6 +1722,17 @@ impl IntervalJoinStream {
 
             let result = RecordBatch::try_new(self.schema.clone(), columns)?;
 
+            // Apply join filter and update LEFT JOIN bitmap
+            let result = filter_result_batch(
+                result,
+                effective_filter(&build_side.hash_map, self.filter.as_ref()),
+                &build_side.batch,
+                &state.batch,
+                &left_indexes,
+                &right_indexes,
+                &mut self.matched_build_rows,
+            )?;
+
             self.join_metrics.output_batches.add(1);
             self.join_metrics.output_rows.add(result.num_rows());
             timer.done();
@@ -1474,6 +1774,7 @@ impl IntervalJoinStream {
                         builder_left.append_slice(&pos_vect);
                     }
                 }
+
                 pos_vect.clear();
             }
 
@@ -1501,6 +1802,18 @@ impl IntervalJoinStream {
             }
 
             let result = RecordBatch::try_new(self.schema.clone(), columns)?;
+
+            // Apply join filter and update LEFT JOIN bitmap
+            let result = filter_result_batch(
+                result,
+                effective_filter(&build_side.hash_map, self.filter.as_ref()),
+                &build_side.batch,
+                &state.batch,
+                &left_indexes,
+                &right_indexes,
+                &mut self.matched_build_rows,
+            )?;
+
             self.join_metrics.output_batches.add(1);
             self.join_metrics.output_rows.add(result.num_rows());
             timer.done();
@@ -1548,6 +1861,7 @@ mod tests {
     use datafusion::assert_batches_sorted_eq;
     use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::SortExpr;
+    use datafusion::physical_plan::displayable;
     use datafusion::prelude::{CsvReadOptions, Expr, SessionConfig, SessionContext, col};
     use datafusion::test_util::plan_and_collect;
 
@@ -1712,6 +2026,56 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_left_join_partitioned_mode_opt_in() -> Result<()> {
+        let schema = &schema();
+        let options = ConfigOptions::new();
+
+        let bio_config = BioConfig {
+            prefer_interval_join: true,
+            interval_join_algorithm: Algorithm::Coitrees,
+            interval_join_partitioned_left_join: true,
+            ..Default::default()
+        };
+
+        let config = SessionConfig::from(options)
+            .with_option_extension(bio_config)
+            .with_information_schema(true)
+            .with_target_partitions(4)
+            .with_repartition_joins(true);
+
+        let ctx = SessionContext::new_with_bio(config);
+
+        let reads = ctx.read_csv(READS_PATH, csv_options(schema)).await?;
+        let targets = ctx.read_csv(TARGETS_PATH, csv_options(schema)).await?;
+
+        let on_expr = [
+            col("reads_contig").eq(col("target_contig")),
+            col("reads_pos_start").lt_eq(col("target_pos_end")),
+            col("reads_pos_end").gt_eq(col("target_pos_start")),
+        ];
+
+        let res = reads.select(reads_renames())?.join_on(
+            targets.select(target_renames())?,
+            JoinType::Left,
+            on_expr,
+        )?;
+
+        let plan = res.create_physical_plan().await?;
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+
+        assert!(
+            plan_str.contains("IntervalJoinExec"),
+            "Expected IntervalJoinExec in plan, got:\n{plan_str}"
+        );
+        assert!(
+            plan_str.contains("mode=Partitioned"),
+            "Expected partitioned LEFT interval join mode, got:\n{plan_str}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_all_interval_join_algorithms_without_equi_condition() -> Result<()> {
         let algs = [
             None,
@@ -1828,6 +2192,68 @@ mod tests {
             format!("Arrow error: Cast error: Can't cast value {max_plus_one} to type Int32"),
             err.unwrap_err().to_string(),
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_left_join_emits_unmatched_build_rows() -> Result<()> {
+        let ctx = create_context(Some(Algorithm::Coitrees));
+
+        // Left (build) table: 3 rows, one has no match on right side
+        ctx.sql(
+            "CREATE TABLE a (contig TEXT, start INT, end INT) AS VALUES \
+             ('chr1', 100, 200), ('chr1', 300, 400), ('chr2', 500, 600)",
+        )
+        .await?;
+
+        // Right (probe) table: 2 rows, only matching chr1 intervals
+        ctx.sql(
+            "CREATE TABLE b (contig TEXT, start INT, end INT) AS VALUES \
+             ('chr1', 150, 250), ('chr1', 350, 450)",
+        )
+        .await?;
+
+        // LEFT JOIN: all left rows must appear; chr2 row gets NULLs for right columns
+        let left_result = plan_and_collect(
+            &ctx,
+            "SELECT a.contig, a.start, a.end, b.contig, b.start, b.end \
+             FROM a LEFT JOIN b \
+             ON a.contig = b.contig AND a.start <= b.end AND a.end >= b.start \
+             ORDER BY a.contig, a.start",
+        )
+        .await?;
+
+        let expected_left = [
+            "+--------+-------+-----+--------+-------+-----+",
+            "| contig | start | end | contig | start | end |",
+            "+--------+-------+-----+--------+-------+-----+",
+            "| chr1   | 100   | 200 | chr1   | 150   | 250 |",
+            "| chr1   | 300   | 400 | chr1   | 350   | 450 |",
+            "| chr2   | 500   | 600 |        |       |     |",
+            "+--------+-------+-----+--------+-------+-----+",
+        ];
+        assert_batches_sorted_eq!(expected_left, &left_result);
+
+        // INNER JOIN: unmatched row should be dropped
+        let inner_result = plan_and_collect(
+            &ctx,
+            "SELECT a.contig, a.start, a.end, b.contig, b.start, b.end \
+             FROM a INNER JOIN b \
+             ON a.contig = b.contig AND a.start <= b.end AND a.end >= b.start \
+             ORDER BY a.contig, a.start",
+        )
+        .await?;
+
+        let expected_inner = [
+            "+--------+-------+-----+--------+-------+-----+",
+            "| contig | start | end | contig | start | end |",
+            "+--------+-------+-----+--------+-------+-----+",
+            "| chr1   | 100   | 200 | chr1   | 150   | 250 |",
+            "| chr1   | 300   | 400 | chr1   | 350   | 450 |",
+            "+--------+-------+-----+--------+-------+-----+",
+        ];
+        assert_batches_sorted_eq!(expected_inner, &inner_result);
 
         Ok(())
     }

@@ -1010,6 +1010,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-bio-function-vep"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-bio-function-ranges",
+ "futures",
+ "log",
+ "tokio",
+]
+
+[[package]]
 name = "datafusion-catalog"
 version = "50.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
