@@ -23,7 +23,8 @@ use datafusion::common::{
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::equivalence::{ProjectionMapping, join_equivalence_properties};
-use datafusion::physical_expr::expressions::CastExpr;
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::expressions::{BinaryExpr, CastExpr};
 use datafusion::physical_expr::{Distribution, Partitioning, PhysicalExpr, PhysicalExprRef};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::can_project;
@@ -948,6 +949,11 @@ fn update_hashmap(
 /// CoitreesCountOverlaps counts overlapping intervals without emitting pairs,
 /// so the JoinFilter (which typically contains range overlap predicates)
 /// must NOT be evaluated for these algorithms.
+///
+/// For other algorithms (Coitrees, IntervalTree, etc.), the filter is only
+/// applied when it contains non-range predicates (e.g. UDF calls like
+/// `match_allele`).  The range overlap conditions are already enforced by
+/// the interval tree, so re-evaluating them is pure overhead.
 fn effective_filter<'a>(
     hash_map: &IntervalJoinAlgorithm,
     filter: Option<&'a JoinFilter>,
@@ -955,7 +961,31 @@ fn effective_filter<'a>(
     match hash_map {
         IntervalJoinAlgorithm::CoitreesNearest(_)
         | IntervalJoinAlgorithm::CoitreesCountOverlaps(_) => None,
-        _ => filter,
+        _ => filter.filter(|f| has_non_range_predicates(f)),
+    }
+}
+
+/// Check whether the filter expression tree contains predicates beyond simple
+/// binary comparisons (which the interval tree already handles).
+///
+/// Walks the AND-tree and returns `true` if any leaf node is **not** a
+/// `BinaryExpr` with a comparison operator — e.g. a scalar UDF call like
+/// `match_allele(...)`.
+fn has_non_range_predicates(filter: &JoinFilter) -> bool {
+    has_non_binary_leaf(filter.expression())
+}
+
+fn has_non_binary_leaf(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        if matches!(binary.op(), &Operator::And) {
+            return has_non_binary_leaf(binary.left()) || has_non_binary_leaf(binary.right());
+        }
+        // Any other BinaryExpr operator (Lt, LtEq, Gt, GtEq, Eq, …) is a
+        // range-like condition already covered by the interval tree.
+        false
+    } else {
+        // Not a BinaryExpr → non-range predicate (UDF, etc.)
+        true
     }
 }
 
