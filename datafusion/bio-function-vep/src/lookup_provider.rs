@@ -175,3 +175,83 @@ impl TableProvider for LookupProvider {
         df.create_physical_plan().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::create_vep_session;
+    use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::physical_plan::displayable;
+    use std::sync::Arc;
+
+    fn vcf_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["chr1", "chr1"])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Int64Array::from(vec![101, 201])),
+                Arc::new(StringArray::from(vec!["A", "C"])),
+                Arc::new(StringArray::from(vec!["G", "T"])),
+            ],
+        )
+        .unwrap();
+        MemTable::try_new(schema, vec![vec![batch]]).unwrap()
+    }
+
+    fn cache_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["chr1", "chr1"])),
+                Arc::new(Int64Array::from(vec![99, 199])),
+                Arc::new(Int64Array::from(vec![102, 202])),
+                Arc::new(StringArray::from(vec!["rs123", "rs456"])),
+                Arc::new(StringArray::from(vec!["A/G", "C/T"])),
+                Arc::new(StringArray::from(vec!["benign", "pathogenic"])),
+            ],
+        )
+        .unwrap();
+        MemTable::try_new(schema, vec![vec![batch]]).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_generates_interval_join() {
+        let ctx = create_vep_session();
+
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .unwrap();
+        ctx.register_table("var_cache", Arc::new(cache_table()))
+            .unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache')")
+            .await
+            .unwrap();
+
+        let plan = df.create_physical_plan().await.unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+
+        assert!(
+            plan_str.contains("IntervalJoinExec"),
+            "Expected IntervalJoinExec in plan, got:\n{plan_str}"
+        );
+    }
+}
+
