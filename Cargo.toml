@@ -11,7 +11,18 @@ homepage = "https://github.com/biodatageeks/datafusion-bio-functions"
 edition = "2024"
 
 [workspace.dependencies]
-datafusion = { version = "50.3.0" }
+datafusion = { version = "52.1.0", default-features = false, features = [
+    "nested_expressions",
+    "crypto_expressions",
+    "datetime_expressions",
+    "encoding_expressions",
+    "regex_expressions",
+    "string_expressions",
+    "unicode_expressions",
+    "parquet",
+    "recursive_protection",
+    "sql",
+] }
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "rt", "macros"] }
 futures = "0.3.31"
 log = "0.4.27"

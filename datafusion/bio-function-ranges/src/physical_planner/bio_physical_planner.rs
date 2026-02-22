@@ -135,7 +135,7 @@ fn from_nested_loop_join(
         join_exec.filter().cloned(),
         intervals,
         join_exec.join_type(),
-        None,
+        join_exec.projection().cloned(),
         PartitionMode::CollectLeft,
         true,
         algorithm,

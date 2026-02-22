@@ -148,26 +148,40 @@ impl TableProvider for LookupProvider {
             ""
         };
 
-        // Build the interval join query
+        // Build the ON clause for the interval join
+        let on_clause = format!(
+            "a.`chrom` = b.`chrom` \
+             AND CAST(a.`end` AS INTEGER) >{sign} CAST(b.`start` AS INTEGER) \
+             AND CAST(a.`start` AS INTEGER) <{sign} CAST(b.`end` AS INTEGER) \
+             AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
+        );
+
+        // Build the LEFT JOIN query.
+        // VCF is the left (build) side — small, fully indexed in memory.
+        // Cache is the right (probe) side — potentially huge, streamed.
+        // LEFT JOIN ensures all VCF variants appear in output.
         let query = if select_cache.is_empty() {
             format!(
                 "SELECT {select_vcf} \
-                 FROM `{}` AS b, `{}` AS a \
-                 WHERE a.`chrom` = b.`chrom` \
-                 AND CAST(a.`end` AS INTEGER) >{sign} CAST(b.`start` AS INTEGER) \
-                 AND CAST(a.`start` AS INTEGER) <{sign} CAST(b.`end` AS INTEGER) \
-                 AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)",
-                self.cache_table, self.vcf_table,
+                 FROM `{}` AS a LEFT JOIN `{}` AS b \
+                 ON {on_clause}",
+                self.vcf_table, self.cache_table,
             )
         } else {
+            // Pre-filter cache rows where all selected annotation columns are NULL
+            let null_filter = self
+                .cache_columns
+                .iter()
+                .map(|c| format!("`{c}` IS NOT NULL"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+
             format!(
                 "SELECT {select_vcf}, {select_cache} \
-                 FROM `{}` AS b, `{}` AS a \
-                 WHERE a.`chrom` = b.`chrom` \
-                 AND CAST(a.`end` AS INTEGER) >{sign} CAST(b.`start` AS INTEGER) \
-                 AND CAST(a.`start` AS INTEGER) <{sign} CAST(b.`end` AS INTEGER) \
-                 AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)",
-                self.cache_table, self.vcf_table,
+                 FROM `{}` AS a LEFT JOIN \
+                 (SELECT * FROM `{}` WHERE {null_filter}) AS b \
+                 ON {on_clause}",
+                self.vcf_table, self.cache_table,
             )
         };
 
@@ -179,7 +193,7 @@ impl TableProvider for LookupProvider {
 #[cfg(test)]
 mod tests {
     use crate::create_vep_session;
-    use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+    use datafusion::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
     use datafusion::physical_plan::displayable;
@@ -196,11 +210,12 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["chr1", "chr1"])),
-                Arc::new(Int64Array::from(vec![100, 200])),
-                Arc::new(Int64Array::from(vec![101, 201])),
-                Arc::new(StringArray::from(vec!["A", "C"])),
-                Arc::new(StringArray::from(vec!["G", "T"])),
+                // Three VCF rows: first two match cache, third has no match
+                Arc::new(StringArray::from(vec!["chr1", "chr1", "chr2"])),
+                Arc::new(Int64Array::from(vec![100, 200, 500])),
+                Arc::new(Int64Array::from(vec![101, 201, 501])),
+                Arc::new(StringArray::from(vec!["A", "C", "G"])),
+                Arc::new(StringArray::from(vec!["G", "T", "A"])),
             ],
         )
         .unwrap();
@@ -251,6 +266,83 @@ mod tests {
         assert!(
             plan_str.contains("IntervalJoinExec"),
             "Expected IntervalJoinExec in plan, got:\n{plan_str}"
+        );
+        assert!(
+            plan_str.contains("Left"),
+            "Expected LEFT join type in plan, got:\n{plan_str}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_left_join_preserves_unmatched_vcf_rows() {
+        let ctx = create_vep_session();
+
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .unwrap();
+        ctx.register_table("var_cache", Arc::new(cache_table()))
+            .unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'clin_sig')")
+            .await
+            .unwrap();
+
+        // Verify NOT NULL pre-filter is pushed down before the join
+        let plan = df.clone().create_physical_plan().await.unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        let interval_pos = plan_str.find("IntervalJoinExec").unwrap();
+        let filter_pos = plan_str.find("IS NOT NULL").unwrap();
+        assert!(
+            filter_pos > interval_pos,
+            "Expected IS NOT NULL filter below IntervalJoinExec (pushed down before probing), got:\n{plan_str}"
+        );
+
+        let batches = df.collect().await.unwrap();
+
+        // Count total rows — should be 3 (two matches + one unmatched VCF row)
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 3,
+            "Expected 3 rows (2 matched + 1 unmatched), got {total_rows}"
+        );
+
+        // Collect all chrom values and cache_clin_sig values
+        let mut chroms = Vec::new();
+        let mut clin_sigs = Vec::new();
+        for batch in &batches {
+            let chrom_col = batch
+                .column_by_name("chrom")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let clin_sig_col = batch
+                .column_by_name("cache_clin_sig")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                chroms.push(chrom_col.value(i).to_string());
+                clin_sigs.push(if clin_sig_col.is_null(i) {
+                    "NULL".to_string()
+                } else {
+                    clin_sig_col.value(i).to_string()
+                });
+            }
+        }
+
+        // The chr2 variant has no cache match — it should appear with NULL annotation
+        assert!(
+            chroms.contains(&"chr2".to_string()),
+            "Expected chr2 (unmatched VCF row) in output, got chroms: {chroms:?}"
+        );
+
+        let chr2_idx = chroms.iter().position(|c| c == "chr2").unwrap();
+        assert_eq!(
+            clin_sigs[chr2_idx], "NULL",
+            "Expected NULL clin_sig for unmatched chr2 row, got: {}",
+            clin_sigs[chr2_idx]
         );
     }
 }

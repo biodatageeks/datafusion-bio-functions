@@ -10,7 +10,9 @@ use crate::session_context::Algorithm;
 use ahash::AHashMap;
 use ahash::RandomState;
 use bio::data_structures::interval_tree as rust_bio;
-use datafusion::arrow::array::{Array, AsArray, PrimitiveArray, PrimitiveBuilder, RecordBatch};
+use datafusion::arrow::array::{
+    Array, AsArray, PrimitiveArray, PrimitiveBuilder, RecordBatch, new_null_array,
+};
 use datafusion::arrow::compute;
 use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, UInt32Type};
 use datafusion::common::hash_utils::create_hashes;
@@ -361,7 +363,19 @@ impl DisplayAs for IntervalJoinExec {
                     self.algorithm
                 )
             }
-            DisplayFormatType::TreeRender => todo!(),
+            DisplayFormatType::TreeRender => {
+                let on = self
+                    .on
+                    .iter()
+                    .map(|(c1, c2)| format!("({c1}, {c2})"))
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "IntervalJoinExec: mode={:?}, join_type={:?}, on=[{}], alg={}",
+                    self.mode, self.join_type, on, self.algorithm
+                )
+            }
         }
     }
 }
@@ -383,7 +397,14 @@ impl ExecutionPlan for IntervalJoinExec {
         match self.mode {
             PartitionMode::CollectLeft => vec![
                 Distribution::SinglePartition,
-                Distribution::UnspecifiedDistribution,
+                // LEFT joins need single partition on probe side too, because
+                // the unmatched-build-row bitmap is per-stream and can't
+                // coordinate across multiple probe partitions.
+                if self.join_type == JoinType::Left {
+                    Distribution::SinglePartition
+                } else {
+                    Distribution::UnspecifiedDistribution
+                },
             ],
             PartitionMode::Partitioned => {
                 let (left_expr, right_expr) =
@@ -534,6 +555,7 @@ impl ExecutionPlan for IntervalJoinExec {
                 .unwrap_or_else(|_| "100000".to_string())
                 .parse()
                 .unwrap_or(100_000),
+            matched_build_rows: None,
         }))
     }
 
@@ -895,14 +917,14 @@ fn update_hashmap(
     hash_map: &mut AHashMap<u64, Vec<BioInterval>>,
     offset: usize,
     random_state: &RandomState,
-    hashes_buffer: &mut Vec<u64>,
+    hashes_buffer: &mut [u64],
 ) -> Result<()> {
     let keys_values = on
         .iter()
         .map(|c| c.evaluate(batch)?.into_array(batch.num_rows()))
         .collect::<Result<Vec<_>>>()?;
 
-    let hash_values: &mut Vec<u64> = create_hashes(&keys_values, random_state, hashes_buffer)?;
+    let hash_values: &mut [u64] = create_hashes(&keys_values, random_state, hashes_buffer)?;
 
     let start = evaluate_as_i32(left_interval.start(), batch)?;
     let end = evaluate_as_i32(left_interval.end(), batch)?;
@@ -961,6 +983,9 @@ struct IntervalJoinStream {
     reusable_index_buffer: Vec<u32>,
     /// Maximum output batch size to emit when streaming
     max_output_batch_size: usize,
+    /// Bitmap tracking which build (left) rows were matched during probing.
+    /// Only populated for LEFT joins; None for INNER joins.
+    matched_build_rows: Option<Vec<bool>>,
 }
 
 struct ProcessProbeBatchState {
@@ -985,6 +1010,8 @@ enum IntervalJoinStreamState {
     EmitAccumulatedMatches(ProcessProbeBatchState),
     /// Indicates that probe-side has been fully processed
     ExhaustedProbeSide,
+    /// Emit unmatched build (left) rows for LEFT JOIN (offset tracks progress)
+    EmitUnmatchedBuild { offset: usize },
 }
 
 impl IntervalJoinStreamState {
@@ -1029,7 +1056,16 @@ impl IntervalJoinStream {
                         self.join_metrics.join_time.value() / usize::pow(10, 6)
                     );
 
+                    // For LEFT joins, emit unmatched build rows before finishing
+                    if self.join_type == JoinType::Left && self.matched_build_rows.is_some() {
+                        self.state = IntervalJoinStreamState::EmitUnmatchedBuild { offset: 0 };
+                        continue;
+                    }
+
                     Poll::Ready(None)
+                }
+                IntervalJoinStreamState::EmitUnmatchedBuild { .. } => {
+                    handle_state!(self.emit_unmatched_build())
                 }
             };
         }
@@ -1051,6 +1087,12 @@ impl IntervalJoinStream {
             self.join_metrics.build_input_rows.value(),
             self.join_metrics.build_time.value() / usize::pow(10, 6)
         );
+
+        // For LEFT joins, allocate a bitmap to track which build rows are matched
+        if self.join_type == JoinType::Left {
+            let num_rows = left_data.batch.num_rows();
+            self.matched_build_rows = Some(vec![false; num_rows]);
+        }
 
         self.state = IntervalJoinStreamState::FetchProbeBatch;
         self.build_side = Some(left_data);
@@ -1155,6 +1197,13 @@ impl IntervalJoinStream {
                         state.accumulated_right_indices.push(i as u32);
                     }
                     total_output_rows += temp_matches.len();
+                }
+            }
+
+            // Mark matched build rows for LEFT JOIN bitmap
+            if let Some(ref mut matched) = self.matched_build_rows {
+                for &idx in &temp_matches {
+                    matched[idx as usize] = true;
                 }
             }
 
@@ -1287,6 +1336,75 @@ impl IntervalJoinStream {
 
         Ok(StatefulStreamResult::Ready(Some(result)))
     }
+    /// Emit build (left) rows that were never matched during probing.
+    /// Called only for LEFT joins after the probe side is exhausted.
+    fn emit_unmatched_build(&mut self) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+        let offset = match &self.state {
+            IntervalJoinStreamState::EmitUnmatchedBuild { offset } => *offset,
+            _ => return internal_err!("Expected EmitUnmatchedBuild state"),
+        };
+
+        let build_side = match self.build_side.as_ref() {
+            Some(build_side) => build_side,
+            None => return internal_err!("Expected build side in ready state"),
+        };
+
+        let matched = match &self.matched_build_rows {
+            Some(m) => m,
+            None => return internal_err!("Expected matched_build_rows for LEFT join"),
+        };
+
+        let num_build_rows = matched.len();
+        if offset >= num_build_rows {
+            return Ok(StatefulStreamResult::Ready(None));
+        }
+
+        // Collect unmatched indices from offset, up to max_output_batch_size
+        let mut unmatched_indices: Vec<u32> = Vec::new();
+        let mut new_offset = num_build_rows;
+        for (i, is_matched) in matched.iter().enumerate().skip(offset) {
+            if !is_matched {
+                unmatched_indices.push(i as u32);
+                if unmatched_indices.len() >= self.max_output_batch_size {
+                    new_offset = i + 1;
+                    break;
+                }
+            }
+        }
+
+        if unmatched_indices.is_empty() {
+            return Ok(StatefulStreamResult::Ready(None));
+        }
+
+        let num_unmatched = unmatched_indices.len();
+        let take_indices = PrimitiveArray::<UInt32Type>::from(unmatched_indices);
+
+        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(self.schema.fields().len());
+
+        for (col_pos, column_index) in self.column_indices.iter().enumerate() {
+            let array: Arc<dyn Array> = if column_index.side == JoinSide::Left {
+                let array = build_side.batch.column(column_index.index);
+                compute::take(array, &take_indices, None)?
+            } else {
+                // Right (probe) side: emit NULLs
+                let data_type = self.schema.field(col_pos).data_type();
+                new_null_array(data_type, num_unmatched)
+            };
+            columns.push(array);
+        }
+
+        let result = RecordBatch::try_new(self.schema.clone(), columns)?;
+
+        self.join_metrics.output_batches.add(1);
+        self.join_metrics.output_rows.add(result.num_rows());
+
+        self.state = IntervalJoinStreamState::EmitUnmatchedBuild {
+            offset: new_offset,
+        };
+
+        Ok(StatefulStreamResult::Ready(Some(result)))
+    }
+
     fn process_probe_batch(&mut self) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
         let state = self.state.try_as_process_probe_batch_mut()?;
         let build_side = match self.build_side.as_ref() {
@@ -1343,6 +1461,14 @@ impl IntervalJoinStream {
                         total_output_rows += matches_for_this_row;
                     }
                 }
+
+                // Mark matched build rows for LEFT JOIN bitmap
+                if let Some(ref mut matched) = self.matched_build_rows {
+                    for &idx in &pos_vect {
+                        matched[idx as usize] = true;
+                    }
+                }
+
                 pos_vect.clear();
                 processed_input_rows += 1;
             }
@@ -1474,6 +1600,14 @@ impl IntervalJoinStream {
                         builder_left.append_slice(&pos_vect);
                     }
                 }
+
+                // Mark matched build rows for LEFT JOIN bitmap
+                if let Some(ref mut matched) = self.matched_build_rows {
+                    for &idx in &pos_vect {
+                        matched[idx as usize] = true;
+                    }
+                }
+
                 pos_vect.clear();
             }
 
@@ -1828,6 +1962,68 @@ mod tests {
             format!("Arrow error: Cast error: Can't cast value {max_plus_one} to type Int32"),
             err.unwrap_err().to_string(),
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_left_join_emits_unmatched_build_rows() -> Result<()> {
+        let ctx = create_context(Some(Algorithm::Coitrees));
+
+        // Left (build) table: 3 rows, one has no match on right side
+        ctx.sql(
+            "CREATE TABLE a (contig TEXT, start INT, end INT) AS VALUES \
+             ('chr1', 100, 200), ('chr1', 300, 400), ('chr2', 500, 600)",
+        )
+        .await?;
+
+        // Right (probe) table: 2 rows, only matching chr1 intervals
+        ctx.sql(
+            "CREATE TABLE b (contig TEXT, start INT, end INT) AS VALUES \
+             ('chr1', 150, 250), ('chr1', 350, 450)",
+        )
+        .await?;
+
+        // LEFT JOIN: all left rows must appear; chr2 row gets NULLs for right columns
+        let left_result = plan_and_collect(
+            &ctx,
+            "SELECT a.contig, a.start, a.end, b.contig, b.start, b.end \
+             FROM a LEFT JOIN b \
+             ON a.contig = b.contig AND a.start <= b.end AND a.end >= b.start \
+             ORDER BY a.contig, a.start",
+        )
+        .await?;
+
+        let expected_left = [
+            "+--------+-------+-----+--------+-------+-----+",
+            "| contig | start | end | contig | start | end |",
+            "+--------+-------+-----+--------+-------+-----+",
+            "| chr1   | 100   | 200 | chr1   | 150   | 250 |",
+            "| chr1   | 300   | 400 | chr1   | 350   | 450 |",
+            "| chr2   | 500   | 600 |        |       |     |",
+            "+--------+-------+-----+--------+-------+-----+",
+        ];
+        assert_batches_sorted_eq!(expected_left, &left_result);
+
+        // INNER JOIN: unmatched row should be dropped
+        let inner_result = plan_and_collect(
+            &ctx,
+            "SELECT a.contig, a.start, a.end, b.contig, b.start, b.end \
+             FROM a INNER JOIN b \
+             ON a.contig = b.contig AND a.start <= b.end AND a.end >= b.start \
+             ORDER BY a.contig, a.start",
+        )
+        .await?;
+
+        let expected_inner = [
+            "+--------+-------+-----+--------+-------+-----+",
+            "| contig | start | end | contig | start | end |",
+            "+--------+-------+-----+--------+-------+-----+",
+            "| chr1   | 100   | 200 | chr1   | 150   | 250 |",
+            "| chr1   | 300   | 400 | chr1   | 350   | 450 |",
+            "+--------+-------+-----+--------+-------+-----+",
+        ];
+        assert_batches_sorted_eq!(expected_inner, &inner_result);
 
         Ok(())
     }
