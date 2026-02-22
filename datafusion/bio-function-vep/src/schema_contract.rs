@@ -18,12 +18,25 @@ pub const REQUIRED_VARIATION_COLUMNS: &[(&str, DataType)] = &[
 /// Default columns returned by `lookup_variants()` when no explicit column list is provided.
 pub const DEFAULT_LOOKUP_COLUMNS: &[&str] = &["variation_name", "allele_string", "clin_sig"];
 
+/// Check if two data types are compatible (treating Utf8/Utf8View/LargeUtf8 as
+/// interchangeable, since DataFusion 50+ reads parquet strings as Utf8View).
+fn types_compatible(actual: &DataType, expected: &DataType) -> bool {
+    if actual == expected {
+        return true;
+    }
+    matches!(
+        (actual, expected),
+        (DataType::Utf8View | DataType::LargeUtf8, DataType::Utf8)
+            | (DataType::Utf8, DataType::Utf8View | DataType::LargeUtf8)
+    )
+}
+
 /// Validate that a variation cache table schema contains all required columns.
 pub fn validate_variation_schema(schema: &SchemaRef) -> Result<()> {
     for (name, expected_type) in REQUIRED_VARIATION_COLUMNS {
         match schema.field_with_name(name) {
             Ok(field) => {
-                if field.data_type() != expected_type {
+                if !types_compatible(field.data_type(), expected_type) {
                     return Err(DataFusionError::Plan(format!(
                         "Variation cache column '{}' has type {:?}, expected {:?}",
                         name,
@@ -95,6 +108,19 @@ mod tests {
     #[test]
     fn validate_valid_schema() {
         let schema = valid_variation_schema();
+        assert!(validate_variation_schema(&schema).is_ok());
+    }
+
+    #[test]
+    fn validate_utf8view_accepted() {
+        // DataFusion 50+ reads parquet strings as Utf8View
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8View, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8View, false),
+            Field::new("allele_string", DataType::Utf8View, false),
+        ]));
         assert!(validate_variation_schema(&schema).is_ok());
     }
 
