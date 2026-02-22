@@ -43,16 +43,26 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
     (vep_ref, vep_alt)
 }
 
-/// Check if an ALT allele matches any allele in a VEP-format allele_string.
+/// Check if a VCF variant matches a VEP-format allele_string.
 ///
-/// The cache `allele_string` is formatted as "REF/ALT1/ALT2" (e.g. "A/G", "A/G/T", "ACGT/-").
-/// This function converts the VCF ALT to VEP format and checks for a match.
+/// The cache `allele_string` is formatted as "REF/ALT1/ALT2" (e.g. "A/G", "A/G/T", "CGT/-").
+/// This function converts the VCF REF/ALT to VEP format and checks that:
+/// 1. The reference allele in `allele_string` matches the VEP-converted REF
+///    (or the original VCF REF, for caches using VCF-format allele strings).
+/// 2. At least one ALT allele in `allele_string` matches the VEP-converted ALT.
 pub fn allele_matches(vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool {
-    let (_, vep_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
-    allele_string
-        .split('/')
-        .skip(1) // skip the reference allele
-        .any(|a| a == vep_alt)
+    let (vep_ref, vep_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
+    let mut parts = allele_string.split('/');
+
+    // Verify reference allele: accept either VEP-format (prefix-stripped) or
+    // VCF-format (full REF) since caches may use either convention.
+    match parts.next() {
+        Some(ref_allele) if ref_allele == vep_ref || ref_allele == vcf_ref => {}
+        _ => return false,
+    }
+
+    // Check if any ALT allele matches
+    parts.any(|a| a == vep_alt)
 }
 
 /// Create the `match_allele(vcf_ref, vcf_alt, allele_string)` scalar UDF.
@@ -216,8 +226,15 @@ mod tests {
     }
 
     #[test]
-    fn test_allele_matches_deletion() {
-        // VCF: REF=ACGT, ALT=A → VEP alt = "-"
+    fn test_allele_matches_deletion_vep_format() {
+        // VCF: REF=ACGT, ALT=A → VEP: ref="CGT", alt="-"
+        // VEP cache stores prefix-stripped alleles: "CGT/-"
+        assert!(allele_matches("ACGT", "A", "CGT/-"));
+    }
+
+    #[test]
+    fn test_allele_matches_deletion_vcf_format() {
+        // Some caches store the full VCF REF in allele_string: "ACGT/-"
         assert!(allele_matches("ACGT", "A", "ACGT/-"));
     }
 
@@ -231,5 +248,22 @@ mod tests {
     fn test_allele_does_not_match_ref() {
         // The first allele in allele_string is the reference — should not match
         assert!(!allele_matches("A", "A", "A/G"));
+    }
+
+    #[test]
+    fn test_allele_rejects_ref_mismatch() {
+        // Same ALT allele but different REF — should not match.
+        // This catches false positives at adjacent positions with the same
+        // common allele (e.g. "A/G" at position 100 and "C/G" at position 101).
+        assert!(!allele_matches("A", "G", "C/G"));
+        assert!(!allele_matches("A", "G", "T/G"));
+    }
+
+    #[test]
+    fn test_allele_matches_mnv() {
+        // MNV: REF=AC, ALT=GT → VEP: ref="AC", alt="GT"
+        assert!(allele_matches("AC", "GT", "AC/GT"));
+        // Wrong ref
+        assert!(!allele_matches("AC", "GT", "TC/GT"));
     }
 }

@@ -36,6 +36,7 @@ pub struct LookupProvider {
     #[allow(dead_code)]
     prune_nulls: bool,
     /// Coordinate normalizer for handling different coordinate systems.
+    #[allow(dead_code)]
     coord_normalizer: CoordinateNormalizer,
     /// Output schema.
     schema: SchemaRef,
@@ -157,10 +158,7 @@ impl TableProvider for LookupProvider {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
-                "(SELECT {inner_cols} FROM `{}`) AS a",
-                self.vcf_table
-            )
+            format!("(SELECT {inner_cols} FROM `{}`) AS a", self.vcf_table)
         } else {
             format!("`{}` AS a", self.vcf_table)
         };
@@ -190,20 +188,19 @@ impl TableProvider for LookupProvider {
             .collect::<Vec<_>>()
             .join(", ");
 
-        // Determine overlap sign based on coordinate systems
-        let sign = if self.coord_normalizer.same_system() {
-            "="
-        } else {
-            ""
-        };
-
-        // Build the ON clause for the interval join
-        let on_clause = format!(
-            "a.`chrom` = b.`chrom` \
-             AND CAST(a.`end` AS INTEGER) >{sign} CAST(b.`start` AS INTEGER) \
-             AND CAST(a.`start` AS INTEGER) <{sign} CAST(b.`end` AS INTEGER) \
-             AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
-        );
+        // Build the ON clause for the interval join.
+        //
+        // VCF uses half-open intervals: end = start + len(REF), so a SNV at
+        // position 100 has [100, 101).  VEP cache uses 1-based closed intervals
+        // where a SNV at position 100 has [100, 100].
+        //
+        // The correct overlap for [start, end) vs [start, end] is:
+        //   a.end > b.start   (strict — VCF end is exclusive)
+        //   a.start <= b.end  (weak   — VCF start is inclusive)
+        let on_clause = "a.`chrom` = b.`chrom` \
+             AND CAST(a.`end` AS INTEGER) > CAST(b.`start` AS INTEGER) \
+             AND CAST(a.`start` AS INTEGER) <= CAST(b.`end` AS INTEGER) \
+             AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)";
 
         // Build the LEFT JOIN query.
         // VCF is the left (build) side — small, fully indexed in memory.
@@ -395,5 +392,118 @@ mod tests {
             clin_sigs[chr2_idx]
         );
     }
-}
 
+    /// Regression test: VCF half-open [start, end) must NOT match VEP cache
+    /// entries at the adjacent position (start=end, 1-based closed).
+    ///
+    /// Before the fix, VCF [100, 101) with weak overlap (>=) would match
+    /// cache entries at BOTH position 100 AND position 101, producing
+    /// duplicate/false rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_no_false_matches_at_adjacent_positions() {
+        let ctx = create_vep_session();
+
+        // VCF: half-open intervals (end = start + 1 for SNVs)
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Int64Array::from(vec![101, 201])),
+                Arc::new(StringArray::from(vec!["A", "C"])),
+                Arc::new(StringArray::from(vec!["G", "T"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        // VEP cache: 1-based closed intervals (start=end for SNVs).
+        // Includes TRUE matches at positions 100 and 200, PLUS decoy entries
+        // at adjacent positions (101, 201) with the same ALT allele but
+        // different REF — these must NOT produce output rows.
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                // chrom:  100 match, 101 decoy, 200 match, 201 decoy
+                Arc::new(StringArray::from(vec!["1", "1", "1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 101, 200, 201])),
+                Arc::new(Int64Array::from(vec![100, 101, 200, 201])),
+                Arc::new(StringArray::from(vec![
+                    "rs100", "rs101", "rs200", "rs201",
+                ])),
+                // True match alleles + decoy alleles (same ALT, different REF)
+                Arc::new(StringArray::from(vec!["A/G", "T/G", "C/T", "G/T"])),
+                Arc::new(StringArray::from(vec![
+                    "benign",
+                    "decoy_101",
+                    "pathogenic",
+                    "decoy_201",
+                ])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_narrow", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_narrow", Arc::new(cache)).unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_narrow', 'cache_narrow', 'variation_name,clin_sig')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 2,
+            "Expected exactly 2 rows (one match per VCF variant, no decoy matches), got {total_rows}"
+        );
+
+        // Verify only the true matches appear (not the decoys)
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch
+                .column_by_name("cache_variation_name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                if !col.is_null(i) {
+                    var_names.push(col.value(i).to_string());
+                }
+            }
+        }
+        assert!(
+            var_names.contains(&"rs100".to_string()),
+            "Expected rs100 in output, got: {var_names:?}"
+        );
+        assert!(
+            var_names.contains(&"rs200".to_string()),
+            "Expected rs200 in output, got: {var_names:?}"
+        );
+        assert!(
+            !var_names.contains(&"rs101".to_string()),
+            "Decoy rs101 should NOT appear in output, got: {var_names:?}"
+        );
+        assert!(
+            !var_names.contains(&"rs201".to_string()),
+            "Decoy rs201 should NOT appear in output, got: {var_names:?}"
+        );
+    }
+}
