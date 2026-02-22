@@ -207,29 +207,18 @@ impl TableProvider for LookupProvider {
         // Cache is the right (probe) side — potentially huge, streamed.
         // LEFT JOIN ensures all VCF variants appear in output.
         //
-        // A VCF variant may match multiple cache entries (duplicates with
-        // different variation_name, or multi-allelic entries like "A/G" and
-        // "A/G/T" at the same position). VEP outputs one row per VCF variant
-        // with all matched variation_names comma-concatenated.
-        //
-        // We achieve this by GROUP BY on all VCF columns AFTER the join,
-        // aggregating cache columns with STRING_AGG (variation_name) or MAX.
-
-        // VCF GROUP BY key — all VCF columns
-        let group_by_vcf = self
-            .vcf_schema
-            .fields()
-            .iter()
-            .map(|f| format!("a.`{}`", f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
-
+        // Note: VEP caches may contain duplicate rows at the same
+        // (chrom, start, end, allele_string) with different variation_name
+        // values (e.g. dbSNP + COSMIC IDs). These produce ~0.03% extra
+        // output rows compared to VEP (which deduplicates internally).
+        // A post-join GROUP BY would fix this but turns the streaming
+        // pipeline into a blocking operation with high memory usage, so
+        // we accept the minor discrepancy for performance.
         let query = if select_cache.is_empty() {
             format!(
                 "SELECT {select_vcf} \
                  FROM {vcf_from} LEFT JOIN `{}` AS b \
-                 ON {on_clause} \
-                 GROUP BY {group_by_vcf}",
+                 ON {on_clause}",
                 self.cache_table,
             )
         } else {
@@ -241,35 +230,11 @@ impl TableProvider for LookupProvider {
                 .collect::<Vec<_>>()
                 .join(" OR ");
 
-            // Aggregate cache columns after the join.
-            // `variation_name` uses STRING_AGG (comma-separated) to preserve all
-            // co-located variant IDs — matching VEP's Existing_variation output.
-            // Other annotation columns use MAX (values are nearly always identical
-            // across duplicates sharing the same position + allele).
-            let select_cache_agg = self
-                .cache_columns
-                .iter()
-                .filter_map(|col_name| {
-                    self.cache_schema.field_with_name(col_name).ok().map(|_| {
-                        if col_name == "variation_name" {
-                            format!(
-                                "STRING_AGG(DISTINCT b.`{col_name}`, ',' \
-                                 ORDER BY b.`{col_name}`) AS `cache_{col_name}`"
-                            )
-                        } else {
-                            format!("MAX(b.`{col_name}`) AS `cache_{col_name}`")
-                        }
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-
             format!(
-                "SELECT {select_vcf}, {select_cache_agg} \
+                "SELECT {select_vcf}, {select_cache} \
                  FROM {vcf_from} LEFT JOIN \
                  (SELECT * FROM `{}` WHERE {null_filter}) AS b \
-                 ON {on_clause} \
-                 GROUP BY {group_by_vcf}",
+                 ON {on_clause}",
                 self.cache_table,
             )
         };
@@ -404,15 +369,6 @@ mod tests {
             "Expected LEFT join type in plan, got:\n{plan_str}"
         );
 
-        // Verify aggregate is ABOVE the join (dedup happens after joining)
-        let agg_pos = plan_str.find("AggregateExec").expect(
-            &format!("Expected AggregateExec in plan for post-join dedup, got:\n{plan_str}")
-        );
-        let join_pos = plan_str.find("IntervalJoinExec").unwrap();
-        assert!(
-            agg_pos < join_pos,
-            "AggregateExec must appear above IntervalJoinExec in plan:\n{plan_str}"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -598,15 +554,15 @@ mod tests {
         );
     }
 
-    /// Cache deduplication: duplicate rows on (chrom, start, end, allele_string)
-    /// must be collapsed so each VCF variant matches at most once per unique
-    /// cache entry. `variation_name` values are comma-concatenated (matching
-    /// VEP's `Existing_variation` output), other columns use MAX.
+    /// Duplicate cache rows on (chrom, start, end, allele_string) with different
+    /// variation_names each produce a separate output row. This is a conscious
+    /// trade-off: a post-join GROUP BY would match VEP's one-row-per-variant
+    /// semantics but turns the streaming pipeline into a blocking operation.
+    /// The ~0.03% extra rows from cache duplicates are acceptable.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_lookup_deduplicates_cache_entries() {
+    async fn test_lookup_cache_duplicates_produce_separate_rows() {
         let ctx = create_vep_session();
 
-        // Single VCF variant
         let vcf_schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -628,8 +584,7 @@ mod tests {
         let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
 
         // Cache with THREE duplicate rows at the same position + allele.
-        // Only variation_name differs — this simulates real VEP cache duplication
-        // (e.g. dbSNP + COSMIC entries at the same position).
+        // Only variation_name differs (e.g. dbSNP + COSMIC at same position).
         let cache_schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -661,30 +616,28 @@ mod tests {
             .unwrap();
         let batches = df.collect().await.unwrap();
 
+        // Each cache duplicate produces a separate row (no post-join aggregation)
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
-            total_rows, 1,
-            "Expected exactly 1 row after cache deduplication, got {total_rows}"
+            total_rows, 3,
+            "Expected 3 rows (one per cache duplicate), got {total_rows}"
         );
 
-        // Verify variation_name is comma-concatenated (sorted alphabetically)
-        let col = batches[0]
-            .column_by_name("cache_variation_name")
-            .expect("cache_variation_name column should exist");
-        let var_names = string_values(col)[0]
-            .clone()
-            .expect("variation_name should not be null");
-        assert!(
-            var_names.contains("rs100"),
-            "Expected 'rs100' in concatenated variation_name, got: {var_names}"
-        );
-        assert!(
-            var_names.contains("COSM123"),
-            "Expected 'COSM123' in concatenated variation_name, got: {var_names}"
-        );
-        assert!(
-            var_names.contains("rs100_dup"),
-            "Expected 'rs100_dup' in concatenated variation_name, got: {var_names}"
+        // All three variation_names should appear
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+        var_names.sort();
+        assert_eq!(
+            var_names,
+            vec!["COSM123", "rs100", "rs100_dup"],
+            "Expected all three variation_names in output"
         );
     }
 }
