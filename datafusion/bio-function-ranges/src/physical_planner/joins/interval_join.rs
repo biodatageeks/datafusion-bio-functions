@@ -11,7 +11,8 @@ use ahash::AHashMap;
 use ahash::RandomState;
 use bio::data_structures::interval_tree as rust_bio;
 use datafusion::arrow::array::{
-    Array, AsArray, PrimitiveArray, PrimitiveBuilder, RecordBatch, new_null_array,
+    Array, AsArray, BooleanArray, PrimitiveArray, PrimitiveBuilder, RecordBatch, UInt64Array,
+    new_null_array,
 };
 use datafusion::arrow::compute;
 use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, UInt32Type};
@@ -940,6 +941,132 @@ fn update_hashmap(
     Ok(())
 }
 
+/// Returns the effective filter to apply, or `None` for algorithms whose
+/// semantics conflict with the range overlap conditions in the filter.
+///
+/// CoitreesNearest finds the *nearest* interval regardless of overlap, and
+/// CoitreesCountOverlaps counts overlapping intervals without emitting pairs,
+/// so the JoinFilter (which typically contains range overlap predicates)
+/// must NOT be evaluated for these algorithms.
+fn effective_filter<'a>(
+    hash_map: &IntervalJoinAlgorithm,
+    filter: Option<&'a JoinFilter>,
+) -> Option<&'a JoinFilter> {
+    match hash_map {
+        IntervalJoinAlgorithm::CoitreesNearest(_)
+        | IntervalJoinAlgorithm::CoitreesCountOverlaps(_) => None,
+        _ => filter,
+    }
+}
+
+/// Evaluate a [`JoinFilter`] on matched row pairs, returning a boolean mask.
+///
+/// For each pair `(build_indices[i], probe_indices[i])`, takes the referenced
+/// columns from the build and probe batches, assembles an intermediate batch
+/// using the filter's schema, evaluates the filter expression, and returns
+/// the resulting `BooleanArray`.
+fn apply_join_filter(
+    filter: &JoinFilter,
+    build_batch: &RecordBatch,
+    probe_batch: &RecordBatch,
+    build_indices: &PrimitiveArray<UInt32Type>,
+    probe_indices: &PrimitiveArray<UInt32Type>,
+) -> Result<BooleanArray> {
+    // Cast u32 indices to u64 for take()
+    let build_indices_u64: UInt64Array =
+        build_indices.iter().map(|v| v.map(|x| x as u64)).collect();
+    let probe_indices_u64: UInt64Array =
+        probe_indices.iter().map(|v| v.map(|x| x as u64)).collect();
+
+    let mut intermediate_columns: Vec<Arc<dyn Array>> =
+        Vec::with_capacity(filter.column_indices().len());
+
+    for col_idx in filter.column_indices() {
+        let array = match col_idx.side {
+            JoinSide::Left => {
+                let col = build_batch.column(col_idx.index);
+                compute::take(col, &build_indices_u64, None)?
+            }
+            JoinSide::Right => {
+                let col = probe_batch.column(col_idx.index);
+                compute::take(col, &probe_indices_u64, None)?
+            }
+            _ => {
+                return internal_err!(
+                    "Unsupported join side {:?} in apply_join_filter",
+                    col_idx.side
+                );
+            }
+        };
+        intermediate_columns.push(array);
+    }
+
+    let intermediate_batch = RecordBatch::try_new(filter.schema().clone(), intermediate_columns)?;
+
+    let result = filter
+        .expression()
+        .evaluate(&intermediate_batch)?
+        .into_array(intermediate_batch.num_rows())?;
+
+    Ok(result
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("JoinFilter expression must evaluate to BooleanArray")
+        .clone())
+}
+
+/// Apply a [`JoinFilter`] (if present) to a result batch and update the
+/// LEFT JOIN bitmap.
+///
+/// When `filter` is `None`, updates the bitmap for all left indices and
+/// returns the batch unchanged.  When `filter` is `Some`, evaluates the
+/// filter, keeps only rows that pass, and updates the bitmap only for
+/// surviving left indices.
+fn filter_result_batch(
+    result: RecordBatch,
+    filter: Option<&JoinFilter>,
+    build_batch: &RecordBatch,
+    probe_batch: &RecordBatch,
+    left_indices: &PrimitiveArray<UInt32Type>,
+    right_indices: &PrimitiveArray<UInt32Type>,
+    matched_build_rows: &mut Option<Vec<bool>>,
+) -> Result<RecordBatch> {
+    match filter {
+        None => {
+            // No filter — mark all non-null left indices as matched
+            if let Some(matched) = matched_build_rows {
+                for i in 0..left_indices.len() {
+                    if !left_indices.is_null(i) {
+                        matched[left_indices.value(i) as usize] = true;
+                    }
+                }
+            }
+            Ok(result)
+        }
+        Some(filter) => {
+            let mask = apply_join_filter(
+                filter,
+                build_batch,
+                probe_batch,
+                left_indices,
+                right_indices,
+            )?;
+
+            // Update bitmap only for surviving matches
+            if let Some(matched) = matched_build_rows {
+                for i in 0..mask.len() {
+                    if mask.value(i) && !left_indices.is_null(i) {
+                        matched[left_indices.value(i) as usize] = true;
+                    }
+                }
+            }
+
+            let filtered = compute::filter_record_batch(&result, &mask)?;
+            Ok(filtered)
+        }
+    }
+}
+
 #[allow(dead_code)]
 struct IntervalJoinStream {
     /// Input schema
@@ -1200,13 +1327,6 @@ impl IntervalJoinStream {
                 }
             }
 
-            // Mark matched build rows for LEFT JOIN bitmap
-            if let Some(ref mut matched) = self.matched_build_rows {
-                for &idx in &temp_matches {
-                    matched[idx as usize] = true;
-                }
-            }
-
             if total_output_rows >= self.max_output_batch_size {
                 state.probe_row_idx = i + 1;
                 self.state =
@@ -1320,6 +1440,17 @@ impl IntervalJoinStream {
 
         let result = RecordBatch::try_new(self.schema.clone(), columns)?;
 
+        // Apply join filter and update LEFT JOIN bitmap
+        let result = filter_result_batch(
+            result,
+            effective_filter(&build_side.hash_map, self.filter.as_ref()),
+            &build_side.batch,
+            &state.batch,
+            &left_indexes,
+            &right_indexes,
+            &mut self.matched_build_rows,
+        )?;
+
         self.join_metrics.output_batches.add(1);
         self.join_metrics.output_rows.add(result.num_rows());
 
@@ -1398,9 +1529,7 @@ impl IntervalJoinStream {
         self.join_metrics.output_batches.add(1);
         self.join_metrics.output_rows.add(result.num_rows());
 
-        self.state = IntervalJoinStreamState::EmitUnmatchedBuild {
-            offset: new_offset,
-        };
+        self.state = IntervalJoinStreamState::EmitUnmatchedBuild { offset: new_offset };
 
         Ok(StatefulStreamResult::Ready(Some(result)))
     }
@@ -1462,13 +1591,6 @@ impl IntervalJoinStream {
                     }
                 }
 
-                // Mark matched build rows for LEFT JOIN bitmap
-                if let Some(ref mut matched) = self.matched_build_rows {
-                    for &idx in &pos_vect {
-                        matched[idx as usize] = true;
-                    }
-                }
-
                 pos_vect.clear();
                 processed_input_rows += 1;
             }
@@ -1513,6 +1635,17 @@ impl IntervalJoinStream {
                 }
 
                 let result = RecordBatch::try_new(self.schema.clone(), columns)?;
+
+                // Apply join filter and update LEFT JOIN bitmap
+                let result = filter_result_batch(
+                    result,
+                    effective_filter(&build_side.hash_map, self.filter.as_ref()),
+                    &build_side.batch,
+                    &state.batch,
+                    &left_indexes,
+                    &right_indexes,
+                    &mut self.matched_build_rows,
+                )?;
 
                 // Update state for continuation
                 if let Some((remaining_batch, remaining_hashes)) = continuation {
@@ -1559,6 +1692,17 @@ impl IntervalJoinStream {
 
             let result = RecordBatch::try_new(self.schema.clone(), columns)?;
 
+            // Apply join filter and update LEFT JOIN bitmap
+            let result = filter_result_batch(
+                result,
+                effective_filter(&build_side.hash_map, self.filter.as_ref()),
+                &build_side.batch,
+                &state.batch,
+                &left_indexes,
+                &right_indexes,
+                &mut self.matched_build_rows,
+            )?;
+
             self.join_metrics.output_batches.add(1);
             self.join_metrics.output_rows.add(result.num_rows());
             timer.done();
@@ -1601,13 +1745,6 @@ impl IntervalJoinStream {
                     }
                 }
 
-                // Mark matched build rows for LEFT JOIN bitmap
-                if let Some(ref mut matched) = self.matched_build_rows {
-                    for &idx in &pos_vect {
-                        matched[idx as usize] = true;
-                    }
-                }
-
                 pos_vect.clear();
             }
 
@@ -1635,6 +1772,18 @@ impl IntervalJoinStream {
             }
 
             let result = RecordBatch::try_new(self.schema.clone(), columns)?;
+
+            // Apply join filter and update LEFT JOIN bitmap
+            let result = filter_result_batch(
+                result,
+                effective_filter(&build_side.hash_map, self.filter.as_ref()),
+                &build_side.batch,
+                &state.batch,
+                &left_indexes,
+                &right_indexes,
+                &mut self.matched_build_rows,
+            )?;
+
             self.join_metrics.output_batches.add(1);
             self.join_metrics.output_rows.add(result.num_rows());
             timer.done();
