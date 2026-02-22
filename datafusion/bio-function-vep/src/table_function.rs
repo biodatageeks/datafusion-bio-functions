@@ -11,7 +11,7 @@ use datafusion::prelude::SessionContext;
 
 use crate::lookup_provider::LookupProvider;
 use crate::schema_contract::{
-    DEFAULT_LOOKUP_COLUMNS, parse_column_list, validate_requested_columns,
+    COORDINATE_COLUMNS, parse_column_list, validate_requested_columns,
 };
 
 /// Table function implementing `lookup_variants(vcf_table, cache_table [, columns [, prune]])`.
@@ -44,14 +44,24 @@ impl TableFunctionImpl for LookupFunction {
         let vcf_table = extract_string_arg(&args[0], "vcf_table", "lookup_variants")?;
         let cache_table = extract_string_arg(&args[1], "cache_table", "lookup_variants")?;
 
-        // Optional third argument: comma-separated column list
+        // Resolve schemas first — needed for default column derivation
+        let (vcf_schema, cache_schema) = resolve_schemas(&self.session, &vcf_table, &cache_table)?;
+
+        // Optional third argument: comma-separated column list.
+        // Default: all cache columns except coordinate columns (chrom, start, end)
+        // which are already present on the VCF side.
         let columns = if args.len() > 2 {
             let col_str = extract_string_arg(&args[2], "columns", "lookup_variants")?;
             parse_column_list(&col_str)
         } else {
-            DEFAULT_LOOKUP_COLUMNS
+            cache_schema
+                .fields()
                 .iter()
-                .map(|s| s.to_string())
+                .map(|f| f.name().clone())
+                .filter(|name| {
+                    !COORDINATE_COLUMNS.contains(&name.as_str())
+                        && !name.starts_with("source_")
+                })
                 .collect()
         };
 
@@ -61,9 +71,6 @@ impl TableFunctionImpl for LookupFunction {
         } else {
             false
         };
-
-        // Resolve schemas from registered tables
-        let (vcf_schema, cache_schema) = resolve_schemas(&self.session, &vcf_table, &cache_table)?;
 
         // Validate requested columns exist in cache schema
         let cache_schema_ref = Arc::new(cache_schema.clone());

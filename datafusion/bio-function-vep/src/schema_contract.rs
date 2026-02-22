@@ -15,8 +15,9 @@ pub const REQUIRED_VARIATION_COLUMNS: &[(&str, DataType)] = &[
     ("allele_string", DataType::Utf8),
 ];
 
-/// Default columns returned by `lookup_variants()` when no explicit column list is provided.
-pub const DEFAULT_LOOKUP_COLUMNS: &[&str] = &["variation_name", "allele_string", "clin_sig"];
+/// Columns excluded from the default output: coordinate columns (already on the VCF
+/// side) and `source_*` internal bookkeeping columns.
+pub const COORDINATE_COLUMNS: &[&str] = &["chrom", "start", "end"];
 
 /// Check if two data types are compatible (treating Utf8/Utf8View/LargeUtf8 as
 /// interchangeable, since DataFusion 50+ reads parquet strings as Utf8View).
