@@ -74,6 +74,9 @@ impl TableFunctionImpl for LookupFunction {
         // - exact: interval overlap + exact allele matching
         // - exact_or_colocated_ids: exact mode, but for unmatched rows also fills
         //   `variation_name` from co-located overlap IDs.
+        // - exact_or_vep_existing: exact mode, but for unmatched rows fills
+        //   `variation_name` from indel-aware relaxed allele-compatible co-located
+        //   IDs and prefers rs* identifiers.
         let match_mode = if args.len() > 4 {
             let mode = extract_string_arg(&args[4], "match_mode", "lookup_variants")?;
             parse_match_mode(&mode)?
@@ -102,8 +105,9 @@ fn parse_match_mode(value: &str) -> Result<MatchMode> {
     match value {
         "exact" => Ok(MatchMode::Exact),
         "exact_or_colocated_ids" => Ok(MatchMode::ExactOrColocatedIds),
+        "exact_or_vep_existing" => Ok(MatchMode::ExactOrVepExisting),
         other => Err(DataFusionError::Plan(format!(
-            "lookup_variants() match_mode must be one of: exact, exact_or_colocated_ids; got: {other}"
+            "lookup_variants() match_mode must be one of: exact, exact_or_colocated_ids, exact_or_vep_existing; got: {other}"
         ))),
     }
 }

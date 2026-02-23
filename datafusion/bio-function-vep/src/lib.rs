@@ -16,17 +16,19 @@ use std::sync::Arc;
 use datafusion::prelude::SessionContext;
 use datafusion_bio_function_ranges::create_bio_session;
 
-use crate::allele::{match_allele_udf, vep_allele_udf};
+use crate::allele::{match_allele_relaxed_udf, match_allele_udf, vep_allele_udf};
 use crate::table_function::LookupFunction;
 
 /// Register all VEP functions on the given session context.
 ///
 /// Registers:
 /// - `match_allele(ref, alt, allele_string)` — scalar UDF
+/// - `match_allele_relaxed(ref, alt, allele_string)` — scalar UDF
 /// - `vep_allele(ref, alt)` — scalar UDF
 /// - `lookup_variants(vcf_table, cache_table [, columns [, prune]])` — table function
 pub fn register_vep_functions(ctx: &SessionContext) {
     ctx.register_udf(match_allele_udf());
+    ctx.register_udf(match_allele_relaxed_udf());
     ctx.register_udf(vep_allele_udf());
 
     let session = Arc::new(ctx.clone());

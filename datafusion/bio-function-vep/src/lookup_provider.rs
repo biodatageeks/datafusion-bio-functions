@@ -24,6 +24,7 @@ use crate::schema_contract::validate_variation_schema;
 pub enum MatchMode {
     Exact,
     ExactOrColocatedIds,
+    ExactOrVepExisting,
 }
 
 /// Table provider that implements variant lookup via interval join.
@@ -157,6 +158,8 @@ impl TableProvider for LookupProvider {
         let has_variation_name_column = self.cache_columns.iter().any(|c| c == "variation_name");
         let colocated_mode_enabled =
             self.match_mode == MatchMode::ExactOrColocatedIds && has_variation_name_column;
+        let vep_existing_mode_enabled =
+            self.match_mode == MatchMode::ExactOrVepExisting && has_variation_name_column;
         let mut projects_cache_variation_name = false;
 
         for idx in projected_indices {
@@ -181,7 +184,7 @@ impl TableProvider for LookupProvider {
                 })?;
                 if cache_col_name == "variation_name" {
                     projects_cache_variation_name = true;
-                    if colocated_mode_enabled {
+                    if colocated_mode_enabled || vep_existing_mode_enabled {
                         projected_output_exprs.push(
                             "COALESCE(b.`variation_name`, f.`__lookup_fallback_variation_name`) \
                              AS `cache_variation_name`"
@@ -198,6 +201,7 @@ impl TableProvider for LookupProvider {
             }
         }
         let use_colocated_id_fallback = colocated_mode_enabled && projects_cache_variation_name;
+        let use_vep_existing_fallback = vep_existing_mode_enabled && projects_cache_variation_name;
 
         // Join and allele-match columns are always required from the VCF side.
         for col in ["chrom", "start", "end", "ref", "alt"] {
@@ -311,21 +315,47 @@ impl TableProvider for LookupProvider {
         };
 
         let select_output = projected_output_exprs.join(", ");
-        let query = if use_colocated_id_fallback {
+        let query = if use_colocated_id_fallback || use_vep_existing_fallback {
             let vcf_start_expr_fa = vcf_start_expr("fa");
             let vcf_end_expr_fa = vcf_end_expr("fa");
-            let fallback_join_on = format!(
-                "fa.`chrom` = c.`chrom` \
-                 AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
-                 AND {vcf_start_expr_fa} <= c.`__lookup_join_end`"
-            );
-            let fallback_cache_inner_cols = format!(
-                "`chrom`, `variation_name`, {cache_join_start_expr} AS `__lookup_join_start`, \
-                 {cache_normalized_end_expr} AS `__lookup_join_end`"
-            );
+            let fallback_join_on = if use_vep_existing_fallback {
+                format!(
+                    "fa.`chrom` = c.`chrom` \
+                     AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
+                     AND {vcf_start_expr_fa} <= c.`__lookup_join_end` \
+                     AND match_allele_relaxed(fa.`ref`, fa.`alt`, c.`allele_string`)"
+                )
+            } else {
+                format!(
+                    "fa.`chrom` = c.`chrom` \
+                     AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
+                     AND {vcf_start_expr_fa} <= c.`__lookup_join_end`"
+                )
+            };
+            let fallback_cache_inner_cols = if use_vep_existing_fallback {
+                format!(
+                    "`chrom`, `variation_name`, `allele_string`, \
+                     {cache_join_start_expr} AS `__lookup_join_start`, \
+                     {cache_normalized_end_expr} AS `__lookup_join_end`"
+                )
+            } else {
+                format!(
+                    "`chrom`, `variation_name`, {cache_join_start_expr} AS `__lookup_join_start`, \
+                     {cache_normalized_end_expr} AS `__lookup_join_end`"
+                )
+            };
+            let fallback_variation_name_expr = if use_vep_existing_fallback {
+                "COALESCE(\
+                 MIN(CASE WHEN c.`variation_name` LIKE 'rs%' THEN c.`variation_name` END), \
+                 MIN(c.`variation_name`)) AS `__lookup_fallback_variation_name`"
+                    .to_string()
+            } else {
+                "STRING_AGG(DISTINCT c.`variation_name`, '&') AS `__lookup_fallback_variation_name`"
+                    .to_string()
+            };
             let fallback_subquery = format!(
                 "(SELECT fa.`chrom`, fa.`start`, fa.`end`, fa.`ref`, fa.`alt`, \
-                        STRING_AGG(DISTINCT c.`variation_name`, '&') AS `__lookup_fallback_variation_name` \
+                        {fallback_variation_name_expr} \
                  FROM {vcf_from_subquery} AS fa \
                  LEFT JOIN \
                  (SELECT {fallback_cache_inner_cols} FROM `{}` WHERE `variation_name` IS NOT NULL) AS c \
@@ -907,6 +937,90 @@ mod tests {
             .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
             .collect();
         assert_eq!(coloc_values, vec![Some("rs_coloc_only".to_string())]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_exact_or_vep_existing_uses_relaxed_indel_and_prefers_rs() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["AA"])),
+                Arc::new(StringArray::from(vec!["A"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        // Two co-located deletion-like rows have ref mismatch for strict matching,
+        // but both are indel-length compatible under relaxed matching.
+        // Mode should prefer rs* IDs over other namespaces.
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(StringArray::from(vec!["COSM_relaxed", "rs_relaxed"])),
+                Arc::new(StringArray::from(vec!["C/-", "T/-"])),
+                Arc::new(StringArray::from(vec!["benign", "benign"])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_vep_existing_mode", Arc::new(vcf))
+            .unwrap();
+        ctx.register_table("cache_vep_existing_mode", Arc::new(cache))
+            .unwrap();
+
+        // Exact mode must miss because both cache refs mismatch ("C/-", "T/-").
+        let exact_df = ctx
+            .sql(
+                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name', false, 'exact')",
+            )
+            .await
+            .unwrap();
+        let exact_batches = exact_df.collect().await.unwrap();
+        let exact_values: Vec<Option<String>> = exact_batches
+            .iter()
+            .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
+            .collect();
+        assert_eq!(exact_values, vec![None]);
+
+        // VEP-existing mode: relaxed indel compatibility fills fallback ID,
+        // preferring rs* when multiple candidates exist.
+        let vep_existing_df = ctx
+            .sql(
+                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name', false, 'exact_or_vep_existing')",
+            )
+            .await
+            .unwrap();
+        let vep_existing_batches = vep_existing_df.collect().await.unwrap();
+        let vep_existing_values: Vec<Option<String>> = vep_existing_batches
+            .iter()
+            .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
+            .collect();
+        assert_eq!(vep_existing_values, vec![Some("rs_relaxed".to_string())]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

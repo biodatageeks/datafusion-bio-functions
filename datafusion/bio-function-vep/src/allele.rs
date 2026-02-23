@@ -78,6 +78,82 @@ pub fn allele_matches(vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool
     false
 }
 
+/// Relaxed allele matching for Existing_variation-style fallback.
+///
+/// This matcher first applies strict `allele_matches()`. If strict matching fails,
+/// it allows indel-only compatibility by event type + event length after
+/// canonical trimming (common prefix/suffix), which helps bridge representation
+/// differences for co-located indel IDs without consequence computation.
+pub fn allele_matches_relaxed(vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool {
+    if allele_matches(vcf_ref, vcf_alt, allele_string) {
+        return true;
+    }
+
+    let mut parts = allele_string.split('/');
+    let Some(cache_ref_allele) = parts.next() else {
+        return false;
+    };
+    let cache_alt_alleles: Vec<&str> = parts.filter(|a| !a.is_empty()).collect();
+    if cache_alt_alleles.is_empty() {
+        return false;
+    }
+
+    for alt in vcf_alt.split(['|', ',']).filter(|alt| !alt.is_empty()) {
+        let (vcf_ref_len, vcf_alt_len) = canonical_event_lengths(vcf_ref, alt);
+        let vcf_is_insertion = vcf_ref_len == 0 && vcf_alt_len > 0;
+        let vcf_is_deletion = vcf_ref_len > 0 && vcf_alt_len == 0;
+        if !vcf_is_insertion && !vcf_is_deletion {
+            continue;
+        }
+
+        for cache_alt in &cache_alt_alleles {
+            let (cache_ref_len, cache_alt_len) =
+                canonical_event_lengths(cache_ref_allele, cache_alt);
+            let cache_is_insertion = cache_ref_len == 0 && cache_alt_len > 0;
+            let cache_is_deletion = cache_ref_len > 0 && cache_alt_len == 0;
+
+            if vcf_is_insertion && cache_is_insertion && vcf_alt_len == cache_alt_len {
+                return true;
+            }
+            if vcf_is_deletion && cache_is_deletion && vcf_ref_len == cache_ref_len {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn canonical_event_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
+    let ref_allele = if ref_allele == "-" { "" } else { ref_allele };
+    let alt_allele = if alt_allele == "-" { "" } else { alt_allele };
+
+    let ref_bytes = ref_allele.as_bytes();
+    let alt_bytes = alt_allele.as_bytes();
+
+    let mut ref_start = 0usize;
+    let mut alt_start = 0usize;
+    while ref_start < ref_bytes.len()
+        && alt_start < alt_bytes.len()
+        && ref_bytes[ref_start] == alt_bytes[alt_start]
+    {
+        ref_start += 1;
+        alt_start += 1;
+    }
+
+    let mut ref_end = ref_bytes.len();
+    let mut alt_end = alt_bytes.len();
+    while ref_end > ref_start
+        && alt_end > alt_start
+        && ref_bytes[ref_end - 1] == alt_bytes[alt_end - 1]
+    {
+        ref_end -= 1;
+        alt_end -= 1;
+    }
+
+    (ref_end - ref_start, alt_end - alt_start)
+}
+
 /// Create the `match_allele(vcf_ref, vcf_alt, allele_string)` scalar UDF.
 ///
 /// Returns true if the VCF ALT allele matches any allele in the cache allele_string.
@@ -92,27 +168,49 @@ pub fn match_allele_udf() -> ScalarUDF {
 }
 
 fn match_allele_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    match_allele_impl_with(args, allele_matches, "match_allele")
+}
+
+/// Create the `match_allele_relaxed(vcf_ref, vcf_alt, allele_string)` scalar UDF.
+///
+/// Returns true if strict allele matching succeeds, or if indel event type/length
+/// are compatible under relaxed canonicalization.
+pub fn match_allele_relaxed_udf() -> ScalarUDF {
+    create_udf(
+        "match_allele_relaxed",
+        vec![DataType::Utf8, DataType::Utf8, DataType::Utf8],
+        DataType::Boolean,
+        Volatility::Immutable,
+        Arc::new(match_allele_relaxed_impl),
+    )
+}
+
+fn match_allele_relaxed_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    match_allele_impl_with(args, allele_matches_relaxed, "match_allele_relaxed")
+}
+
+fn match_allele_impl_with(
+    args: &[ColumnarValue],
+    matcher: fn(&str, &str, &str) -> bool,
+    fn_name: &str,
+) -> Result<ColumnarValue> {
     let refs = args[0].to_owned().into_array(1)?;
     let alts = args[1].to_owned().into_array(1)?;
     let allele_strs = args[2].to_owned().into_array(1)?;
 
     let refs = refs.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        datafusion::common::DataFusionError::Internal(
-            "match_allele: first arg must be Utf8".to_string(),
-        )
+        datafusion::common::DataFusionError::Internal(format!("{fn_name}: first arg must be Utf8"))
     })?;
     let alts = alts.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        datafusion::common::DataFusionError::Internal(
-            "match_allele: second arg must be Utf8".to_string(),
-        )
+        datafusion::common::DataFusionError::Internal(format!("{fn_name}: second arg must be Utf8"))
     })?;
     let allele_strings = allele_strs
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| {
-            datafusion::common::DataFusionError::Internal(
-                "match_allele: third arg must be Utf8".to_string(),
-            )
+            datafusion::common::DataFusionError::Internal(format!(
+                "{fn_name}: third arg must be Utf8"
+            ))
         })?;
 
     let len = refs.len().max(alts.len()).max(allele_strings.len());
@@ -126,7 +224,7 @@ fn match_allele_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
         if refs.is_null(ref_idx) || alts.is_null(alt_idx) || allele_strings.is_null(as_idx) {
             builder.append_null();
         } else {
-            builder.append_value(allele_matches(
+            builder.append_value(matcher(
                 refs.value(ref_idx),
                 alts.value(alt_idx),
                 allele_strings.value(as_idx),
@@ -292,5 +390,22 @@ mod tests {
         assert!(allele_matches("A", "G,T", "A/G"));
         assert!(allele_matches("A", "G,T", "A/T"));
         assert!(!allele_matches("A", "G,T", "A/C"));
+    }
+
+    #[test]
+    fn test_relaxed_insertion_length_match() {
+        assert!(!allele_matches("A", "AT", "-/G"));
+        assert!(allele_matches_relaxed("A", "AT", "-/G"));
+    }
+
+    #[test]
+    fn test_relaxed_deletion_length_match() {
+        assert!(!allele_matches("AA", "A", "C/-"));
+        assert!(allele_matches_relaxed("AA", "A", "C/-"));
+    }
+
+    #[test]
+    fn test_relaxed_does_not_relax_snv() {
+        assert!(!allele_matches_relaxed("A", "G", "C/T"));
     }
 }
