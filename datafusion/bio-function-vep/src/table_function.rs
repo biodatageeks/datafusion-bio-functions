@@ -48,7 +48,8 @@ impl TableFunctionImpl for LookupFunction {
         // Optional third argument: comma-separated column list.
         // Default: all cache columns except coordinate columns (chrom, start, end)
         // which are already present on the VCF side.
-        let columns = if args.len() > 2 {
+        let explicit_columns = args.len() > 2;
+        let columns = if explicit_columns {
             let col_str = extract_string_arg(&args[2], "columns", "lookup_variants")?;
             parse_column_list(&col_str)
         } else {
@@ -80,6 +81,7 @@ impl TableFunctionImpl for LookupFunction {
             vcf_schema,
             cache_schema,
             columns,
+            explicit_columns,
             prune_nulls,
         )?))
     }
