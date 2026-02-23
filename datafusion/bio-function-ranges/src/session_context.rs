@@ -27,8 +27,15 @@ impl BioSessionExt for SessionContext {
 
     fn with_config_rt_bio(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
         let mut rules = PhysicalOptimizer::new().rules;
-        rules.retain(|rule| rule.name() != "join_selection");
-        rules.push(Arc::new(IntervalJoinPhysicalOptimizationRule));
+        // Insert IntervalJoinExec rule BEFORE join_selection so range joins
+        // are replaced first, then join_selection handles remaining joins
+        // (e.g., insertion fallback, colocated fallback) by resolving
+        // PartitionMode::Auto to a concrete mode.
+        let pos = rules
+            .iter()
+            .position(|r| r.name() == "join_selection")
+            .unwrap_or(rules.len());
+        rules.insert(pos, Arc::new(IntervalJoinPhysicalOptimizationRule));
 
         let ctx: SessionContext = SessionStateBuilder::new()
             .with_config(config)
