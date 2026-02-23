@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_bio_function_vep_cache::kv_store::{FORMAT_V0, FORMAT_V1};
 use datafusion_bio_function_vep_cache::{CacheLoader, VepKvStore};
 
@@ -12,11 +12,11 @@ async fn main() -> datafusion::common::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Usage: {} <parquet_path> <fjall_output_path> [chrom_filter] [window_size_kb] [format: v0|v1]",
+            "Usage: {} <parquet_path> <fjall_output_path> [chrom_filter] [window_size_kb] [format: v0|v1] [partitions]",
             args[0]
         );
         eprintln!(
-            "Example: {} /data/vep/115_GRCh38.parquet /tmp/vep_cache 22 1000 v1",
+            "Example: {} /data/vep/115_GRCh38.parquet /tmp/vep_cache 22 1000 v1 8",
             args[0]
         );
         std::process::exit(1);
@@ -31,8 +31,14 @@ async fn main() -> datafusion::common::Result<()> {
         Some("v0") => FORMAT_V0,
         _ => FORMAT_V1,
     };
+    let target_partitions: Option<usize> = args.get(6).and_then(|s| s.parse().ok());
 
-    let ctx = SessionContext::new();
+    let ctx = if let Some(partitions) = target_partitions {
+        let config = SessionConfig::new().with_target_partitions(partitions);
+        SessionContext::new_with_config(config)
+    } else {
+        SessionContext::new()
+    };
 
     // Register parquet source
     ctx.register_parquet("vep_source", parquet_path, Default::default())
