@@ -20,6 +20,12 @@ use datafusion::prelude::{Expr, SessionContext};
 use crate::coordinate::CoordinateNormalizer;
 use crate::schema_contract::validate_variation_schema;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchMode {
+    Exact,
+    ExactOrColocatedIds,
+}
+
 /// Table provider that implements variant lookup via interval join.
 ///
 /// Generates an internal SQL plan that joins VCF variants against the variation
@@ -32,6 +38,8 @@ pub struct LookupProvider {
     vcf_schema: Schema,
     /// Columns to select from the cache table.
     cache_columns: Vec<String>,
+    /// Lookup matching strategy.
+    match_mode: MatchMode,
     /// Whether to auto-prune all-null columns from output.
     #[allow(dead_code)]
     prune_nulls: bool,
@@ -51,6 +59,7 @@ impl LookupProvider {
         vcf_schema: Schema,
         cache_schema: Schema,
         cache_columns: Vec<String>,
+        match_mode: MatchMode,
         prune_nulls: bool,
     ) -> Result<Self> {
         let cache_schema_ref: SchemaRef = Arc::new(cache_schema.clone());
@@ -79,6 +88,7 @@ impl LookupProvider {
             cache_table,
             vcf_schema,
             cache_columns,
+            match_mode,
             prune_nulls,
             coord_normalizer,
             schema,
@@ -144,6 +154,10 @@ impl TableProvider for LookupProvider {
 
         let mut projected_output_exprs = Vec::with_capacity(projected_indices.len());
         let mut required_vcf_columns = BTreeSet::<String>::new();
+        let has_variation_name_column = self.cache_columns.iter().any(|c| c == "variation_name");
+        let colocated_mode_enabled =
+            self.match_mode == MatchMode::ExactOrColocatedIds && has_variation_name_column;
+        let mut projects_cache_variation_name = false;
 
         for idx in projected_indices {
             if idx >= total_output_fields {
@@ -165,10 +179,25 @@ impl TableProvider for LookupProvider {
                         self.cache_columns.len()
                     ))
                 })?;
-                projected_output_exprs
-                    .push(format!("b.`{cache_col_name}` AS `cache_{cache_col_name}`"));
+                if cache_col_name == "variation_name" {
+                    projects_cache_variation_name = true;
+                    if colocated_mode_enabled {
+                        projected_output_exprs.push(
+                            "COALESCE(b.`variation_name`, f.`__lookup_fallback_variation_name`) \
+                             AS `cache_variation_name`"
+                                .to_string(),
+                        );
+                    } else {
+                        projected_output_exprs
+                            .push("b.`variation_name` AS `cache_variation_name`".to_string());
+                    }
+                } else {
+                    projected_output_exprs
+                        .push(format!("b.`{cache_col_name}` AS `cache_{cache_col_name}`"));
+                }
             }
         }
+        let use_colocated_id_fallback = colocated_mode_enabled && projects_cache_variation_name;
 
         // Join and allele-match columns are always required from the VCF side.
         for col in ["chrom", "start", "end", "ref", "alt"] {
@@ -193,7 +222,8 @@ impl TableProvider for LookupProvider {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let vcf_from = format!("(SELECT {vcf_inner_cols} FROM `{}`) AS a", self.vcf_table);
+        let vcf_from_subquery = format!("(SELECT {vcf_inner_cols} FROM `{}`)", self.vcf_table);
+        let vcf_from = format!("{vcf_from_subquery} AS a");
 
         // Build cache-side source with explicit columns only:
         // join keys + allele string + annotation columns involved in output/null-filter.
@@ -237,17 +267,21 @@ impl TableProvider for LookupProvider {
         // - one-based closed [start, end]     -> [start, end]
         //
         // After normalization, overlap is standard inclusive overlap.
-        let vcf_start_expr = if self.coord_normalizer.input_zero_based {
-            "CAST(a.`start` AS BIGINT) + 1"
-        } else {
-            "CAST(a.`start` AS BIGINT)"
+        let vcf_start_expr = |alias: &str| -> String {
+            if self.coord_normalizer.input_zero_based {
+                format!("CAST({alias}.`start` AS BIGINT) + 1")
+            } else {
+                format!("CAST({alias}.`start` AS BIGINT)")
+            }
         };
-        let vcf_end_expr = "CAST(a.`end` AS BIGINT)";
+        let vcf_end_expr = |alias: &str| -> String { format!("CAST({alias}.`end` AS BIGINT)") };
+        let vcf_start_expr_a = vcf_start_expr("a");
+        let vcf_end_expr_a = vcf_end_expr("a");
 
         let on_clause = format!(
             "a.`chrom` = b.`chrom` \
-             AND {vcf_end_expr} >= b.`__lookup_join_start` \
-             AND {vcf_start_expr} <= b.`__lookup_join_end` \
+             AND {vcf_end_expr_a} >= b.`__lookup_join_start` \
+             AND {vcf_start_expr_a} <= b.`__lookup_join_end` \
              AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
         );
 
@@ -263,15 +297,8 @@ impl TableProvider for LookupProvider {
         // A post-join GROUP BY would fix this but turns the streaming
         // pipeline into a blocking operation with high memory usage, so
         // we accept the minor discrepancy for performance.
-        let select_output = projected_output_exprs.join(", ");
-        let query = if self.cache_columns.is_empty() {
-            format!(
-                "SELECT {select_output} \
-                 FROM {vcf_from} LEFT JOIN \
-                 (SELECT {cache_inner_cols} FROM `{}`) AS b \
-                 ON {on_clause}",
-                self.cache_table
-            )
+        let cache_where = if self.cache_columns.is_empty() {
+            String::new()
         } else {
             // Pre-filter cache rows where all selected annotation columns are NULL
             let null_filter = self
@@ -280,11 +307,53 @@ impl TableProvider for LookupProvider {
                 .map(|c| format!("`{c}` IS NOT NULL"))
                 .collect::<Vec<_>>()
                 .join(" OR ");
+            format!(" WHERE {null_filter}")
+        };
+
+        let select_output = projected_output_exprs.join(", ");
+        let query = if use_colocated_id_fallback {
+            let vcf_start_expr_fa = vcf_start_expr("fa");
+            let vcf_end_expr_fa = vcf_end_expr("fa");
+            let fallback_join_on = format!(
+                "fa.`chrom` = c.`chrom` \
+                 AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
+                 AND {vcf_start_expr_fa} <= c.`__lookup_join_end`"
+            );
+            let fallback_cache_inner_cols = format!(
+                "`chrom`, `variation_name`, {cache_join_start_expr} AS `__lookup_join_start`, \
+                 {cache_normalized_end_expr} AS `__lookup_join_end`"
+            );
+            let fallback_subquery = format!(
+                "(SELECT fa.`chrom`, fa.`start`, fa.`end`, fa.`ref`, fa.`alt`, \
+                        STRING_AGG(DISTINCT c.`variation_name`, '&') AS `__lookup_fallback_variation_name` \
+                 FROM {vcf_from_subquery} AS fa \
+                 LEFT JOIN \
+                 (SELECT {fallback_cache_inner_cols} FROM `{}` WHERE `variation_name` IS NOT NULL) AS c \
+                 ON {fallback_join_on} \
+                 GROUP BY fa.`chrom`, fa.`start`, fa.`end`, fa.`ref`, fa.`alt`) AS f",
+                self.cache_table,
+            );
+            let fallback_key_join = "\
+a.`chrom` = f.`chrom` \
+AND CAST(a.`start` AS BIGINT) = CAST(f.`start` AS BIGINT) \
+AND CAST(a.`end` AS BIGINT) = CAST(f.`end` AS BIGINT) \
+AND a.`ref` = f.`ref` \
+AND a.`alt` = f.`alt`";
 
             format!(
                 "SELECT {select_output} \
                  FROM {vcf_from} LEFT JOIN \
-                 (SELECT {cache_inner_cols} FROM `{}` WHERE {null_filter}) AS b \
+                 (SELECT {cache_inner_cols} FROM `{}`{cache_where}) AS b \
+                 ON {on_clause} \
+                 LEFT JOIN {fallback_subquery} \
+                 ON {fallback_key_join}",
+                self.cache_table,
+            )
+        } else {
+            format!(
+                "SELECT {select_output} \
+                 FROM {vcf_from} LEFT JOIN \
+                 (SELECT {cache_inner_cols} FROM `{}`{cache_where}) AS b \
                  ON {on_clause}",
                 self.cache_table,
             )
@@ -758,6 +827,86 @@ mod tests {
             }
         }
         assert_eq!(var_names, vec!["rs_ins_match"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_exact_or_colocated_ids_fills_variation_name_on_exact_miss() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        // Co-located cache row with allele mismatch: exact mode should miss.
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["rs_coloc_only"])),
+                Arc::new(StringArray::from(vec!["C/T"])),
+                Arc::new(StringArray::from(vec!["benign"])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_coloc_mode", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_coloc_mode", Arc::new(cache))
+            .unwrap();
+
+        // Exact mode: no allele match => NULL variation_name.
+        let exact_df = ctx
+            .sql(
+                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name', false, 'exact')",
+            )
+            .await
+            .unwrap();
+        let exact_batches = exact_df.collect().await.unwrap();
+        let exact_values: Vec<Option<String>> = exact_batches
+            .iter()
+            .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
+            .collect();
+        assert_eq!(exact_values, vec![None]);
+
+        // Fallback mode: fill variation_name from co-located overlap IDs.
+        let coloc_df = ctx
+            .sql(
+                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name', false, 'exact_or_colocated_ids')",
+            )
+            .await
+            .unwrap();
+        let coloc_batches = coloc_df.collect().await.unwrap();
+        let coloc_values: Vec<Option<String>> = coloc_batches
+            .iter()
+            .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
+            .collect();
+        assert_eq!(coloc_values, vec![Some("rs_coloc_only".to_string())]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

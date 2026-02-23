@@ -60,7 +60,7 @@ pub fn allele_matches(vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool
         return false;
     };
 
-    for alt in vcf_alt.split('|').filter(|alt| !alt.is_empty()) {
+    for alt in vcf_alt.split(['|', ',']).filter(|alt| !alt.is_empty()) {
         let (vep_ref, vep_alt) = vcf_to_vep_allele(vcf_ref, alt);
 
         // Verify reference allele: accept either VEP-format (prefix-stripped)
@@ -285,5 +285,12 @@ mod tests {
         assert!(allele_matches("A", "G|T", "A/G"));
         assert!(allele_matches("A", "G|T", "A/T"));
         assert!(!allele_matches("A", "G|T", "A/C"));
+    }
+
+    #[test]
+    fn test_allele_matches_comma_joined_multi_alt_vcf_input() {
+        assert!(allele_matches("A", "G,T", "A/G"));
+        assert!(allele_matches("A", "G,T", "A/T"));
+        assert!(!allele_matches("A", "G,T", "A/C"));
     }
 }

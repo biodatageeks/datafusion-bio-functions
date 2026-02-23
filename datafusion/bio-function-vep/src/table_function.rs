@@ -9,10 +9,11 @@ use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::SessionContext;
 
-use crate::lookup_provider::LookupProvider;
+use crate::lookup_provider::{LookupProvider, MatchMode};
 use crate::schema_contract::{COORDINATE_COLUMNS, parse_column_list, validate_requested_columns};
 
-/// Table function implementing `lookup_variants(vcf_table, cache_table [, columns [, prune]])`.
+/// Table function implementing
+/// `lookup_variants(vcf_table, cache_table [, columns [, prune [, match_mode]]])`.
 pub struct LookupFunction {
     session: Arc<SessionContext>,
 }
@@ -69,6 +70,17 @@ impl TableFunctionImpl for LookupFunction {
             false
         };
 
+        // Optional fifth argument: match mode (default: "exact")
+        // - exact: interval overlap + exact allele matching
+        // - exact_or_colocated_ids: exact mode, but for unmatched rows also fills
+        //   `variation_name` from co-located overlap IDs.
+        let match_mode = if args.len() > 4 {
+            let mode = extract_string_arg(&args[4], "match_mode", "lookup_variants")?;
+            parse_match_mode(&mode)?
+        } else {
+            MatchMode::Exact
+        };
+
         // Validate requested columns exist in cache schema
         let cache_schema_ref = Arc::new(cache_schema.clone());
         validate_requested_columns(&cache_schema_ref, &columns)?;
@@ -80,8 +92,19 @@ impl TableFunctionImpl for LookupFunction {
             vcf_schema,
             cache_schema,
             columns,
+            match_mode,
             prune_nulls,
         )?))
+    }
+}
+
+fn parse_match_mode(value: &str) -> Result<MatchMode> {
+    match value {
+        "exact" => Ok(MatchMode::Exact),
+        "exact_or_colocated_ids" => Ok(MatchMode::ExactOrColocatedIds),
+        other => Err(DataFusionError::Plan(format!(
+            "lookup_variants() match_mode must be one of: exact, exact_or_colocated_ids; got: {other}"
+        ))),
     }
 }
 
