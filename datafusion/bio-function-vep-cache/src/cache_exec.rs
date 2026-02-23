@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion::arrow::array::builder::{Int8Builder, Int64Builder, StringBuilder};
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, NullArray, RecordBatch};
-use datafusion::arrow::datatypes::{DataType, Field, Int64Type, SchemaRef};
+use datafusion::arrow::array::{Array, ArrayRef, Int8Array, Int64Array, NullArray, RecordBatch};
+use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -22,7 +22,7 @@ use futures::{Stream, StreamExt};
 
 use crate::allele_index::{AlleleMatcher, WindowAlleleIndex};
 use crate::key_encoding::window_id_for_position;
-use crate::kv_store::{FORMAT_V1, VepKvStore};
+use crate::kv_store::{FORMAT_V1, VepKvStore, to_v1_column_index, validate_v1_schema_width};
 
 /// Lookup match mode (mirrors MatchMode from bio-function-vep).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,9 @@ impl KvLookupExec {
     ) -> Result<Self> {
         let input_schema = input.schema();
         let cache_schema = store.schema();
+        if store.format_version() >= FORMAT_V1 {
+            validate_v1_schema_width(cache_schema.fields().len())?;
+        }
 
         // Compute output column indices for v1 format.
         let mut output_col_indices = Vec::new();
@@ -81,8 +84,10 @@ impl KvLookupExec {
                     field.data_type().clone(),
                     true,
                 )));
-                if let Ok(idx) = cache_schema.index_of(col_name) {
-                    output_col_indices.push(idx as u8);
+                if store.format_version() >= FORMAT_V1 {
+                    if let Ok(idx) = cache_schema.index_of(col_name) {
+                        output_col_indices.push(to_v1_column_index(idx)?);
+                    }
                 }
             }
         }
@@ -286,11 +291,11 @@ impl KvLookupStream {
         let ref_idx = vcf_schema.index_of("ref")?;
         let alt_idx = vcf_schema.index_of("alt")?;
 
-        let chroms = get_string_column(vcf_batch.column(chrom_idx));
-        let starts = vcf_batch.column(start_idx).as_primitive::<Int64Type>();
-        let ends = vcf_batch.column(end_idx).as_primitive::<Int64Type>();
-        let refs = get_string_column(vcf_batch.column(ref_idx));
-        let alts = get_string_column(vcf_batch.column(alt_idx));
+        let chroms = get_string_column(vcf_batch.column(chrom_idx), "chrom")?;
+        let starts = get_int64_column(vcf_batch.column(start_idx), "start")?;
+        let ends = get_int64_column(vcf_batch.column(end_idx), "end")?;
+        let refs = get_string_column(vcf_batch.column(ref_idx), "ref")?;
+        let alts = get_string_column(vcf_batch.column(alt_idx), "alt")?;
 
         let cache_schema = self.store.schema().clone();
         let num_vcf_cols = vcf_schema.fields().len();
@@ -492,6 +497,7 @@ impl KvLookupStream {
                     out_idx,
                     &data_type,
                     total_output_rows,
+                    cache_col_name,
                 )?;
                 output_columns.push(output_col);
             }
@@ -540,6 +546,7 @@ fn build_cache_column_v1(
     out_col_idx: usize,
     data_type: &DataType,
     total_rows: usize,
+    cache_col_name: &str,
 ) -> Result<ArrayRef> {
     match data_type {
         DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => {
@@ -556,7 +563,7 @@ fn build_cache_column_v1(
                                 if col.is_null(i) {
                                     builder.append_null();
                                 } else {
-                                    builder.append_value(get_string_value(col, i));
+                                    builder.append_value(get_string_value(col, i, cache_col_name)?);
                                 }
                             } else {
                                 builder.append_null();
@@ -582,7 +589,9 @@ fn build_cache_column_v1(
                                 if col.is_null(i) {
                                     builder.append_null();
                                 } else {
-                                    builder.append_value(col.as_primitive::<Int64Type>().value(i));
+                                    builder.append_value(
+                                        get_int64_column(col, cache_col_name)?.value(i),
+                                    );
                                 }
                             } else {
                                 builder.append_null();
@@ -609,9 +618,7 @@ fn build_cache_column_v1(
                                     builder.append_null();
                                 } else {
                                     builder.append_value(
-                                        col.as_primitive::<datafusion::arrow::datatypes::Int8Type>(
-                                        )
-                                        .value(i),
+                                        get_int8_column(col, cache_col_name)?.value(i),
                                     );
                                 }
                             } else {
@@ -665,7 +672,7 @@ fn build_cache_column_v0_fallback(
                                     if col.is_null(i) {
                                         builder.append_null();
                                     } else {
-                                        builder.append_value(get_string_value(col, i));
+                                        builder.append_value(get_string_value(col, i, col_name)?);
                                     }
                                 } else {
                                     builder.append_null();
@@ -699,8 +706,9 @@ fn build_cache_column_v0_fallback(
                                     if col.is_null(i) {
                                         builder.append_null();
                                     } else {
-                                        builder
-                                            .append_value(col.as_primitive::<Int64Type>().value(i));
+                                        builder.append_value(
+                                            get_int64_column(col, col_name)?.value(i),
+                                        );
                                     }
                                 } else {
                                     builder.append_null();
@@ -734,12 +742,8 @@ fn build_cache_column_v0_fallback(
                                     if col.is_null(i) {
                                         builder.append_null();
                                     } else {
-                                        builder.append_value(
-                                            col.as_primitive::<
-                                                datafusion::arrow::datatypes::Int8Type,
-                                            >()
-                                            .value(i),
-                                        );
+                                        builder
+                                            .append_value(get_int8_column(col, col_name)?.value(i));
                                     }
                                 } else {
                                     builder.append_null();
@@ -758,33 +762,54 @@ fn build_cache_column_v0_fallback(
     }
 }
 
-fn get_string_value(col: &ArrayRef, i: usize) -> &str {
+fn get_int64_column<'a>(col: &'a ArrayRef, column_name: &str) -> Result<&'a Int64Array> {
+    col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "column '{column_name}' expected Int64 array, got {:?}",
+            col.data_type()
+        ))
+    })
+}
+
+fn get_int8_column<'a>(col: &'a ArrayRef, column_name: &str) -> Result<&'a Int8Array> {
+    col.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "column '{column_name}' expected Int8 array, got {:?}",
+            col.data_type()
+        ))
+    })
+}
+
+fn get_string_value<'a>(col: &'a ArrayRef, i: usize, column_name: &str) -> Result<&'a str> {
     if let Some(arr) = col
         .as_any()
         .downcast_ref::<datafusion::arrow::array::StringArray>()
     {
-        arr.value(i)
+        Ok(arr.value(i))
     } else if let Some(arr) = col
         .as_any()
         .downcast_ref::<datafusion::arrow::array::StringViewArray>()
     {
-        arr.value(i)
+        Ok(arr.value(i))
     } else if let Some(arr) = col
         .as_any()
         .downcast_ref::<datafusion::arrow::array::LargeStringArray>()
     {
-        arr.value(i)
+        Ok(arr.value(i))
     } else {
-        ""
+        Err(DataFusionError::Execution(format!(
+            "column '{column_name}' expected string array, got {:?}",
+            col.data_type()
+        )))
     }
 }
 
-fn get_string_column(col: &ArrayRef) -> Vec<Option<String>> {
+fn get_string_column(col: &ArrayRef, column_name: &str) -> Result<Vec<Option<String>>> {
     if let Some(arr) = col
         .as_any()
         .downcast_ref::<datafusion::arrow::array::StringArray>()
     {
-        (0..arr.len())
+        Ok((0..arr.len())
             .map(|i| {
                 if arr.is_null(i) {
                     None
@@ -792,12 +817,12 @@ fn get_string_column(col: &ArrayRef) -> Vec<Option<String>> {
                     Some(arr.value(i).to_string())
                 }
             })
-            .collect()
+            .collect())
     } else if let Some(arr) = col
         .as_any()
         .downcast_ref::<datafusion::arrow::array::StringViewArray>()
     {
-        (0..arr.len())
+        Ok((0..arr.len())
             .map(|i| {
                 if arr.is_null(i) {
                     None
@@ -805,12 +830,12 @@ fn get_string_column(col: &ArrayRef) -> Vec<Option<String>> {
                     Some(arr.value(i).to_string())
                 }
             })
-            .collect()
+            .collect())
     } else if let Some(arr) = col
         .as_any()
         .downcast_ref::<datafusion::arrow::array::LargeStringArray>()
     {
-        (0..arr.len())
+        Ok((0..arr.len())
             .map(|i| {
                 if arr.is_null(i) {
                     None
@@ -818,9 +843,12 @@ fn get_string_column(col: &ArrayRef) -> Vec<Option<String>> {
                     Some(arr.value(i).to_string())
                 }
             })
-            .collect()
+            .collect())
     } else {
-        vec![None; col.len()]
+        Err(DataFusionError::Execution(format!(
+            "column '{column_name}' expected string array, got {:?}",
+            col.data_type()
+        )))
     }
 }
 
@@ -858,5 +886,108 @@ impl Stream for KvLookupStream {
 impl RecordBatchStream for KvLookupStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
+
+    fn passthrough_matcher(_: &str, _: &str, _: &str) -> bool {
+        true
+    }
+
+    fn empty_stream(schema: SchemaRef) -> SendableRecordBatchStream {
+        let stream = stream::iter(Vec::<Result<RecordBatch>>::new());
+        Box::pin(RecordBatchStreamAdapter::new(schema, Box::pin(stream)))
+    }
+
+    fn minimal_cache_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+        ]))
+    }
+
+    #[test]
+    fn test_build_cache_column_v1_type_mismatch_returns_error() {
+        let matched = MatchInfoStatic {
+            vcf_row: 0,
+            chrom: "1".to_string(),
+            window_id: 0,
+            cache_rows: vec![0],
+        };
+        let entries = vec![OutputEntry::Matched(&matched)];
+        let mut window_columns: HashMap<(String, u64), Vec<ArrayRef>> = HashMap::new();
+        window_columns.insert(
+            ("1".to_string(), 0),
+            vec![Arc::new(StringArray::from(vec!["not_an_int64"])) as ArrayRef],
+        );
+
+        let err = build_cache_column_v1(
+            &entries,
+            &window_columns,
+            0,
+            &DataType::Int64,
+            1,
+            "cache_test_col",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cache_test_col"));
+        assert!(err.contains("Int64"));
+    }
+
+    #[test]
+    fn test_process_batch_rejects_non_int64_start_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(VepKvStore::create(dir.path(), minimal_cache_schema(), 1_000_000).unwrap());
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int32, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int32Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+
+        let mut stream = KvLookupStream::new(
+            empty_stream(vcf_schema.clone()),
+            store,
+            vcf_schema,
+            vec![],
+            KvMatchMode::Exact,
+            passthrough_matcher,
+            None,
+            false,
+            false,
+            false,
+            1_000_000,
+            FORMAT_V1,
+            vec![],
+        );
+
+        let err = stream.process_batch(&vcf_batch).unwrap_err().to_string();
+        assert!(err.contains("start"));
+        assert!(err.contains("Int64"));
     }
 }

@@ -41,6 +41,41 @@ fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
     DataFusionError::ArrowError(Box::new(e), None)
 }
 
+pub(crate) fn max_v1_columns() -> usize {
+    EntryType::MAX_COLUMN_INDEX as usize + 1
+}
+
+pub(crate) fn validate_v1_schema_width(num_columns: usize) -> Result<()> {
+    let max_cols = max_v1_columns();
+    if num_columns > max_cols {
+        return Err(DataFusionError::Execution(format!(
+            "v1 cache supports at most {max_cols} columns (max encoded index {}). got {num_columns}",
+            EntryType::MAX_COLUMN_INDEX
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn to_v1_column_index(column_index: usize) -> Result<u8> {
+    let max_idx = EntryType::MAX_COLUMN_INDEX as usize;
+    if column_index > max_idx {
+        return Err(DataFusionError::Execution(format!(
+            "v1 cache column index {column_index} exceeds max encoded index {max_idx}"
+        )));
+    }
+    Ok(column_index as u8)
+}
+
+pub(crate) fn validate_v1_column_index(column_index: u8) -> Result<()> {
+    if column_index > EntryType::MAX_COLUMN_INDEX {
+        return Err(DataFusionError::Execution(format!(
+            "v1 cache column index {column_index} exceeds max encoded index {}",
+            EntryType::MAX_COLUMN_INDEX
+        )));
+    }
+    Ok(())
+}
+
 impl VepKvStore {
     /// Open an existing KV store with default settings (256 MB block cache).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -108,6 +143,10 @@ impl VepKvStore {
         cache_size_bytes: u64,
         partition_opts: PartitionCreateOptions,
     ) -> Result<Self> {
+        if format_version >= FORMAT_V1 {
+            validate_v1_schema_width(schema.fields().len())?;
+        }
+
         let keyspace = Config::new(path)
             .cache_size(cache_size_bytes)
             .open()
@@ -197,6 +236,7 @@ impl VepKvStore {
         array: &ArrayRef,
         field: &Field,
     ) -> Result<()> {
+        validate_v1_column_index(col_idx)?;
         let key = encode_entry_key(chrom, window_id, EntryType::Column(col_idx));
         let batch = RecordBatch::try_new(
             Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
@@ -224,6 +264,7 @@ impl VepKvStore {
     ) -> Result<Option<Vec<(ArrayRef, Field)>>> {
         let mut results = Vec::with_capacity(col_indices.len());
         for &col_idx in col_indices {
+            validate_v1_column_index(col_idx)?;
             let key = encode_entry_key(chrom, window_id, EntryType::Column(col_idx));
             match self.data.get(&key) {
                 Ok(Some(value)) => {
@@ -492,7 +533,13 @@ mod tests {
         // Write columns
         for (col_idx, field) in batch.schema().fields().iter().enumerate() {
             store
-                .put_column("1", 0, col_idx as u8, batch.column(col_idx), field)
+                .put_column(
+                    "1",
+                    0,
+                    to_v1_column_index(col_idx).unwrap(),
+                    batch.column(col_idx),
+                    field,
+                )
                 .unwrap();
         }
         store.persist().unwrap();
@@ -511,6 +558,39 @@ mod tests {
         // Missing window returns None
         assert!(store.get_position_index("1", 999).unwrap().is_none());
         assert!(store.get_columns("1", 999, &[0]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_put_column_rejects_out_of_range_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let batch = test_batch(&schema);
+        let store = VepKvStore::create(dir.path(), schema, 1_000_000).unwrap();
+
+        let err = store
+            .put_column(
+                "1",
+                0,
+                EntryType::MAX_COLUMN_INDEX + 1,
+                batch.column(0),
+                batch.schema().field(0),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max encoded index"));
+    }
+
+    #[test]
+    fn test_get_columns_rejects_out_of_range_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let store = VepKvStore::create(dir.path(), schema, 1_000_000).unwrap();
+
+        let err = store
+            .get_columns("1", 0, &[EntryType::MAX_COLUMN_INDEX + 1])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max encoded index"));
     }
 
     #[test]

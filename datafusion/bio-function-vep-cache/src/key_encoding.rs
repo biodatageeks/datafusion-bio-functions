@@ -54,13 +54,20 @@ pub enum EntryType {
 }
 
 impl EntryType {
-    /// Maximum column index supported (0x00 through 0x4E = 79 columns).
-    pub const MAX_COLUMN_INDEX: u8 = 0x4E;
+    /// Maximum column index supported by v1 key encoding.
+    ///
+    /// `entry_type` byte reserves:
+    /// - `0x00` for `PositionIndex`
+    /// - `0xFF` for `LegacyMonolithic`
+    ///
+    /// So column entries can use `0x01..=0xFE`, which maps to
+    /// column indices `0..=253` (254 total columns).
+    pub const MAX_COLUMN_INDEX: u8 = 0xFD;
 
     fn to_byte(self) -> u8 {
         match self {
             Self::PositionIndex => 0x00,
-            Self::Column(idx) => idx + 1, // 0x01..0x4F
+            Self::Column(idx) => idx + 1, // 0x01..=0xFE
             Self::LegacyMonolithic => 0xFF,
         }
     }
@@ -69,7 +76,7 @@ impl EntryType {
         match b {
             0x00 => Self::PositionIndex,
             0xFF => Self::LegacyMonolithic,
-            col => Self::Column(col - 1), // 0x01..0x4F → column 0..0x4E
+            col => Self::Column(col - 1), // 0x01..=0xFE → column 0..=253
         }
     }
 }
@@ -249,6 +256,18 @@ mod tests {
         for et in types {
             assert_eq!(EntryType::from_byte(et.to_byte()), et);
         }
+    }
+
+    #[test]
+    fn test_max_column_index_maps_to_last_non_reserved_byte() {
+        assert_eq!(
+            EntryType::Column(EntryType::MAX_COLUMN_INDEX).to_byte(),
+            0xFE
+        );
+        assert_eq!(
+            EntryType::from_byte(0xFE),
+            EntryType::Column(EntryType::MAX_COLUMN_INDEX)
+        );
     }
 
     #[test]

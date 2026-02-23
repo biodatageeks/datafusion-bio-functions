@@ -20,7 +20,7 @@ use futures::StreamExt;
 use log::info;
 
 use crate::key_encoding::{DEFAULT_WINDOW_SIZE, window_id_for_position};
-use crate::kv_store::{FORMAT_V1, VepKvStore};
+use crate::kv_store::{FORMAT_V1, VepKvStore, to_v1_column_index, validate_v1_schema_width};
 use crate::position_index::PositionIndex;
 
 /// Statistics returned after loading.
@@ -110,6 +110,10 @@ impl CacheLoader {
         // Get the source schema.
         let source_df = session.table(&self.source_table).await?;
         let schema: SchemaRef = Arc::new(source_df.schema().as_arrow().clone());
+
+        if self.format_version >= FORMAT_V1 {
+            validate_v1_schema_width(schema.fields().len())?;
+        }
 
         // Create the KV store with the chosen format version.
         let store = Arc::new(VepKvStore::create_with_version(
@@ -441,7 +445,9 @@ fn flush_to_store_v1(
     // Check if window already exists (cross-window indel or another partition merge).
     let merged = if let Some(existing_idx) = store.get_position_index(chrom, window_id)? {
         // Merge: read existing columns back, concat with new batch.
-        let all_col_indices: Vec<u8> = (0..store.schema().fields().len() as u8).collect();
+        let all_col_indices: Vec<u8> = (0..store.schema().fields().len())
+            .map(to_v1_column_index)
+            .collect::<Result<Vec<_>>>()?;
         if let Some(existing_cols) = store.get_columns(chrom, window_id, &all_col_indices)? {
             let existing_arrays: Vec<datafusion::arrow::array::ArrayRef> =
                 existing_cols.into_iter().map(|(a, _)| a).collect();
@@ -470,7 +476,7 @@ fn flush_to_store_v1(
         store.put_column(
             chrom,
             window_id,
-            col_idx as u8,
+            to_v1_column_index(col_idx)?,
             merged.column(col_idx),
             field,
         )?;
@@ -483,8 +489,9 @@ fn flush_to_store_v1(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::key_encoding::EntryType;
     use crate::kv_store::FORMAT_V0;
-    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
     use std::sync::Arc;
@@ -508,6 +515,37 @@ mod tests {
             ],
         )
         .unwrap();
+        let table = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+        (schema, table)
+    }
+
+    fn make_wide_test_table(total_cols: usize) -> (SchemaRef, MemTable) {
+        assert!(total_cols >= 5);
+
+        let mut fields = vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+        ];
+        for idx in 5..total_cols {
+            fields.push(Field::new(format!("extra_{idx}"), DataType::Utf8, true));
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["1"])),
+            Arc::new(Int64Array::from(vec![100])),
+            Arc::new(Int64Array::from(vec![100])),
+            Arc::new(StringArray::from(vec![Some("rs_test")])),
+            Arc::new(StringArray::from(vec!["A/G"])),
+        ];
+        for idx in 5..total_cols {
+            columns.push(Arc::new(StringArray::from(vec![format!("v{idx}")])));
+        }
+
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
         let table = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
         (schema, table)
     }
@@ -698,5 +736,44 @@ mod tests {
 
         // Total: 2 windows
         assert_eq!(stats.total_windows, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_v1_accepts_max_supported_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+
+        let max_cols = EntryType::MAX_COLUMN_INDEX as usize + 1;
+        let (schema, table) = make_wide_test_table(max_cols);
+        ctx.register_table("source", Arc::new(table)).unwrap();
+
+        let loader =
+            CacheLoader::new("source", dir.path().to_str().unwrap()).with_window_size(1_000_000);
+        let stats = loader.load(&ctx).await.unwrap();
+        assert_eq!(stats.total_variants, 1);
+
+        let store = VepKvStore::open(dir.path()).unwrap();
+        assert_eq!(store.schema().fields().len(), schema.fields().len());
+
+        let cols = store
+            .get_columns("1", 0, &[0, EntryType::MAX_COLUMN_INDEX])
+            .unwrap()
+            .unwrap();
+        assert_eq!(cols.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_v1_rejects_too_wide_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+
+        let too_wide_cols = EntryType::MAX_COLUMN_INDEX as usize + 2;
+        let (_, table) = make_wide_test_table(too_wide_cols);
+        ctx.register_table("source", Arc::new(table)).unwrap();
+
+        let loader =
+            CacheLoader::new("source", dir.path().to_str().unwrap()).with_window_size(1_000_000);
+        let err = loader.load(&ctx).await.unwrap_err().to_string();
+        assert!(err.contains("supports at most"));
     }
 }
