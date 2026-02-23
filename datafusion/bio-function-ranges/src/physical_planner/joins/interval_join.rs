@@ -43,7 +43,7 @@ use futures::{Stream, StreamExt, TryStreamExt, ready};
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 #[derive(Debug)]
@@ -106,6 +106,12 @@ pub struct IntervalJoinExec {
 
     algorithm: Algorithm,
     low_memory: bool,
+
+    /// For CollectLeft + LEFT joins: shared bitmap collection so multiple
+    /// probe-partition streams can coordinate which build rows were matched.
+    /// The last stream to finish merges all per-stream bitmaps and emits
+    /// unmatched build rows.
+    left_join_bitmaps: Arc<Mutex<Vec<Vec<bool>>>>,
 }
 
 impl IntervalJoinExec {
@@ -168,6 +174,7 @@ impl IntervalJoinExec {
             null_equals_null,
             cache,
             algorithm,
+            left_join_bitmaps: Arc::new(Mutex::new(Vec::new())),
             low_memory,
         })
     }
@@ -399,14 +406,13 @@ impl ExecutionPlan for IntervalJoinExec {
         match self.mode {
             PartitionMode::CollectLeft => vec![
                 Distribution::SinglePartition,
-                // LEFT joins need single partition on probe side too, because
-                // the unmatched-build-row bitmap is per-stream and can't
-                // coordinate across multiple probe partitions.
-                if self.join_type == JoinType::Left {
-                    Distribution::SinglePartition
-                } else {
-                    Distribution::UnspecifiedDistribution
-                },
+                // Probe side stays multi-partition: each output stream shares
+                // the same collected build data and independently processes its
+                // own probe partition.  For LEFT joins a shared bitmap
+                // (`left_join_bitmaps`) coordinates which build rows were
+                // matched so unmatched rows are emitted exactly once by the
+                // last stream to finish.
+                Distribution::UnspecifiedDistribution,
             ],
             PartitionMode::Partitioned => {
                 let (left_expr, right_expr) =
@@ -520,6 +526,18 @@ impl ExecutionPlan for IntervalJoinExec {
         // over the right that uses this information to issue new batches.
         let right_stream = self.right.execute(partition, context.clone())?;
 
+        // For CollectLeft + LEFT joins: share the bitmap collection across
+        // all probe partition streams so the last one to finish can merge
+        // bitmaps and emit unmatched build rows exactly once.
+        let left_join_shared = if self.mode == PartitionMode::CollectLeft
+            && self.join_type == JoinType::Left
+        {
+            let total = self.right.output_partitioning().partition_count();
+            Some((self.left_join_bitmaps.clone(), total))
+        } else {
+            None
+        };
+
         // update column indices to reflect the projection
         let column_indices_after_projection = match &self.projection {
             Some(projection) => projection
@@ -558,6 +576,7 @@ impl ExecutionPlan for IntervalJoinExec {
                 .parse()
                 .unwrap_or(100_000),
             matched_build_rows: None,
+            left_join_shared,
         }))
     }
 
@@ -1143,6 +1162,11 @@ struct IntervalJoinStream {
     /// Bitmap tracking which build (left) rows were matched during probing.
     /// Only populated for LEFT joins; None for INNER joins.
     matched_build_rows: Option<Vec<bool>>,
+    /// For CollectLeft + LEFT: shared bitmap collection and total probe
+    /// partition count.  The last stream to finish merges bitmaps and emits
+    /// unmatched rows; all other streams return `None` immediately.
+    #[allow(clippy::type_complexity)]
+    left_join_shared: Option<(Arc<Mutex<Vec<Vec<bool>>>>, usize)>,
 }
 
 struct ProcessProbeBatchState {
@@ -1154,6 +1178,28 @@ struct ProcessProbeBatchState {
     accumulated_left_matches: Vec<u32>,
     /// Accumulated right indices for streaming output
     accumulated_right_indices: Vec<u32>,
+}
+
+/// Merge per-stream LEFT-join bitmaps into a single bitmap via bitwise OR.
+///
+/// Each stream in a CollectLeft + LEFT join maintains its own `Vec<bool>`
+/// tracking which build rows it matched.  The merged bitmap marks a build
+/// row as matched if ANY stream matched it, ensuring unmatched rows are
+/// emitted exactly once by the last stream to finish.
+fn merge_left_join_bitmaps(bitmaps: &[Vec<bool>]) -> Vec<bool> {
+    if bitmaps.is_empty() {
+        return Vec::new();
+    }
+    let len = bitmaps[0].len();
+    let mut merged = vec![false; len];
+    for bitmap in bitmaps {
+        for (i, &matched) in bitmap.iter().enumerate() {
+            if matched {
+                merged[i] = true;
+            }
+        }
+    }
+    merged
 }
 
 enum IntervalJoinStreamState {
@@ -1213,10 +1259,31 @@ impl IntervalJoinStream {
                         self.join_metrics.join_time.value() / usize::pow(10, 6)
                     );
 
-                    // For LEFT joins, emit unmatched build rows before finishing
+                    // For LEFT joins, emit unmatched build rows before finishing.
                     if self.join_type == JoinType::Left && self.matched_build_rows.is_some() {
-                        self.state = IntervalJoinStreamState::EmitUnmatchedBuild { offset: 0 };
-                        continue;
+                        if let Some((shared, total)) = &self.left_join_shared {
+                            // CollectLeft + LEFT with multi-partition probe:
+                            // push this stream's bitmap to the shared collection.
+                            let my_bitmap = self.matched_build_rows.take().unwrap();
+                            let mut bitmaps = shared.lock().unwrap();
+                            bitmaps.push(my_bitmap);
+
+                            if bitmaps.len() == *total {
+                                // Last stream — merge all bitmaps and emit unmatched rows.
+                                let merged = merge_left_join_bitmaps(&bitmaps);
+                                drop(bitmaps);
+                                self.matched_build_rows = Some(merged);
+                                self.state =
+                                    IntervalJoinStreamState::EmitUnmatchedBuild { offset: 0 };
+                                continue;
+                            }
+                            // Not the last stream — done (no unmatched rows to emit).
+                        } else {
+                            // Partitioned mode or single-partition probe — emit directly.
+                            self.state =
+                                IntervalJoinStreamState::EmitUnmatchedBuild { offset: 0 };
+                            continue;
+                        }
                     }
 
                     Poll::Ready(None)
