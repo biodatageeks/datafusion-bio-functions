@@ -205,11 +205,29 @@ impl TableProvider for LookupProvider {
         ]);
         required_cache_columns.extend(self.cache_columns.iter().cloned());
 
-        let cache_inner_cols = required_cache_columns
+        let cache_base_cols = required_cache_columns
             .iter()
             .map(|c| format!("`{c}`"))
             .collect::<Vec<_>>()
             .join(", ");
+
+        let cache_normalized_start_expr = if self.coord_normalizer.cache_zero_based {
+            "CAST(`start` AS BIGINT) + 1"
+        } else {
+            "CAST(`start` AS BIGINT)"
+        };
+        let cache_normalized_end_expr = "CAST(`end` AS BIGINT)";
+
+        // Some cache rows encode insertions as start=end+1.
+        // Normalize these rows to a point at `end` so they become joinable.
+        let cache_join_start_expr = format!(
+            "CASE WHEN {cache_normalized_start_expr} > {cache_normalized_end_expr} \
+             THEN {cache_normalized_end_expr} ELSE {cache_normalized_start_expr} END"
+        );
+        let cache_inner_cols = format!(
+            "{cache_base_cols}, {cache_join_start_expr} AS `__lookup_join_start`, \
+             {cache_normalized_end_expr} AS `__lookup_join_end`"
+        );
 
         // Build the ON clause for the interval join.
         //
@@ -224,18 +242,12 @@ impl TableProvider for LookupProvider {
         } else {
             "CAST(a.`start` AS BIGINT)"
         };
-        let cache_start_expr = if self.coord_normalizer.cache_zero_based {
-            "CAST(b.`start` AS BIGINT) + 1"
-        } else {
-            "CAST(b.`start` AS BIGINT)"
-        };
         let vcf_end_expr = "CAST(a.`end` AS BIGINT)";
-        let cache_end_expr = "CAST(b.`end` AS BIGINT)";
 
         let on_clause = format!(
             "a.`chrom` = b.`chrom` \
-             AND {vcf_end_expr} >= {cache_start_expr} \
-             AND {vcf_start_expr} <= {cache_end_expr} \
+             AND {vcf_end_expr} >= b.`__lookup_join_start` \
+             AND {vcf_start_expr} <= b.`__lookup_join_end` \
              AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
         );
 
@@ -598,6 +610,154 @@ mod tests {
             !var_names.contains(&"rs201".to_string()),
             "Decoy rs201 should NOT appear in output, got: {var_names:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_matches_pipe_joined_multi_alt_input() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G|T"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(StringArray::from(vec!["rs_g_match", "rs_c_miss"])),
+                Arc::new(StringArray::from(vec!["A/G", "A/C"])),
+                Arc::new(StringArray::from(vec!["benign", "benign"])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_multi_alt_pipe", Arc::new(vcf))
+            .unwrap();
+        ctx.register_table("cache_multi_alt_pipe", Arc::new(cache))
+            .unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_multi_alt_pipe', 'cache_multi_alt_pipe', 'variation_name')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "Expected one row from ALT=G|T matching A/G");
+
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+        assert_eq!(var_names, vec!["rs_g_match"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_matches_insertion_style_cache_coordinates() {
+        let ctx = create_vep_session();
+
+        // One-based closed insertion at position 100: REF=A ALT=AT.
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["AT"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        // Cache uses insertion-style coordinates: start=end+1.
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![101, 102])),
+                Arc::new(Int64Array::from(vec![100, 101])),
+                Arc::new(StringArray::from(vec!["rs_ins_match", "rs_ins_miss"])),
+                Arc::new(StringArray::from(vec!["-/T", "-/T"])),
+                Arc::new(StringArray::from(vec!["pathogenic", "pathogenic"])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_insertion", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_insertion_style", Arc::new(cache))
+            .unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_insertion', 'cache_insertion_style', 'variation_name')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 1,
+            "Expected one match against insertion-style cache coordinates"
+        );
+
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+        assert_eq!(var_names, vec!["rs_ins_match"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

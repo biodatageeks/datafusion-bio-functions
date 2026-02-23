@@ -49,20 +49,33 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
 /// This function converts the VCF REF/ALT to VEP format and checks that:
 /// 1. The reference allele in `allele_string` matches the VEP-converted REF
 ///    (or the original VCF REF, for caches using VCF-format allele strings).
-/// 2. At least one ALT allele in `allele_string` matches the VEP-converted ALT.
+/// 2. At least one ALT allele in `allele_string` matches one of the input ALT alleles.
+///
+/// Some VCF readers expose multi-allelic rows as a single pipe-joined string
+/// (`ALT = "A|T|..."`). We treat `|` as an ALT separator and match any ALT token.
 pub fn allele_matches(vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool {
-    let (vep_ref, vep_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
     let mut parts = allele_string.split('/');
 
-    // Verify reference allele: accept either VEP-format (prefix-stripped) or
-    // VCF-format (full REF) since caches may use either convention.
-    match parts.next() {
-        Some(ref_allele) if ref_allele == vep_ref || ref_allele == vcf_ref => {}
-        _ => return false,
+    let Some(ref_allele) = parts.next() else {
+        return false;
+    };
+
+    for alt in vcf_alt.split('|').filter(|alt| !alt.is_empty()) {
+        let (vep_ref, vep_alt) = vcf_to_vep_allele(vcf_ref, alt);
+
+        // Verify reference allele: accept either VEP-format (prefix-stripped)
+        // or VCF-format (full REF) since caches may use either convention.
+        if ref_allele != vep_ref && ref_allele != vcf_ref {
+            continue;
+        }
+
+        // Check if any ALT allele matches this ALT token.
+        if parts.clone().any(|a| a == vep_alt) {
+            return true;
+        }
     }
 
-    // Check if any ALT allele matches
-    parts.any(|a| a == vep_alt)
+    false
 }
 
 /// Create the `match_allele(vcf_ref, vcf_alt, allele_string)` scalar UDF.
@@ -265,5 +278,12 @@ mod tests {
         assert!(allele_matches("AC", "GT", "AC/GT"));
         // Wrong ref
         assert!(!allele_matches("AC", "GT", "TC/GT"));
+    }
+
+    #[test]
+    fn test_allele_matches_pipe_joined_multi_alt_vcf_input() {
+        assert!(allele_matches("A", "G|T", "A/G"));
+        assert!(allele_matches("A", "G|T", "A/T"));
+        assert!(!allele_matches("A", "G|T", "A/C"));
     }
 }
