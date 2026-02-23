@@ -156,11 +156,14 @@ impl TableProvider for LookupProvider {
         let mut projected_output_exprs = Vec::with_capacity(projected_indices.len());
         let mut required_vcf_columns = BTreeSet::<String>::new();
         let has_variation_name_column = self.cache_columns.iter().any(|c| c == "variation_name");
+        let has_somatic_column = self.cache_columns.iter().any(|c| c == "somatic");
+        let has_fallback_capable_column = has_variation_name_column || has_somatic_column;
         let colocated_mode_enabled =
-            self.match_mode == MatchMode::ExactOrColocatedIds && has_variation_name_column;
+            self.match_mode == MatchMode::ExactOrColocatedIds && has_fallback_capable_column;
         let vep_existing_mode_enabled =
-            self.match_mode == MatchMode::ExactOrVepExisting && has_variation_name_column;
+            self.match_mode == MatchMode::ExactOrVepExisting && has_fallback_capable_column;
         let mut projects_cache_variation_name = false;
+        let mut projects_cache_somatic = false;
 
         for idx in projected_indices {
             if idx >= total_output_fields {
@@ -194,14 +197,26 @@ impl TableProvider for LookupProvider {
                         projected_output_exprs
                             .push("b.`variation_name` AS `cache_variation_name`".to_string());
                     }
+                } else if cache_col_name == "somatic" {
+                    projects_cache_somatic = true;
+                    if colocated_mode_enabled || vep_existing_mode_enabled {
+                        projected_output_exprs.push(
+                            "COALESCE(b.`somatic`, CAST(f.`__lookup_fallback_somatic` AS TINYINT)) \
+                             AS `cache_somatic`"
+                                .to_string(),
+                        );
+                    } else {
+                        projected_output_exprs.push("b.`somatic` AS `cache_somatic`".to_string());
+                    }
                 } else {
                     projected_output_exprs
                         .push(format!("b.`{cache_col_name}` AS `cache_{cache_col_name}`"));
                 }
             }
         }
-        let use_colocated_id_fallback = colocated_mode_enabled && projects_cache_variation_name;
-        let use_vep_existing_fallback = vep_existing_mode_enabled && projects_cache_variation_name;
+        let projects_fallback_column = projects_cache_variation_name || projects_cache_somatic;
+        let use_colocated_id_fallback = colocated_mode_enabled && projects_fallback_column;
+        let use_vep_existing_fallback = vep_existing_mode_enabled && projects_fallback_column;
 
         // Join and allele-match columns are always required from the VCF side.
         for col in ["chrom", "start", "end", "ref", "alt"] {
@@ -332,33 +347,56 @@ impl TableProvider for LookupProvider {
                      AND {vcf_start_expr_fa} <= c.`__lookup_join_end`"
                 )
             };
-            let fallback_cache_inner_cols = if use_vep_existing_fallback {
-                format!(
-                    "`chrom`, `variation_name`, `allele_string`, \
-                     {cache_join_start_expr} AS `__lookup_join_start`, \
-                     {cache_normalized_end_expr} AS `__lookup_join_end`"
-                )
-            } else {
-                format!(
-                    "`chrom`, `variation_name`, {cache_join_start_expr} AS `__lookup_join_start`, \
-                     {cache_normalized_end_expr} AS `__lookup_join_end`"
-                )
-            };
-            let fallback_variation_name_expr = if use_vep_existing_fallback {
-                "COALESCE(\
-                 MIN(CASE WHEN c.`variation_name` LIKE 'rs%' THEN c.`variation_name` END), \
-                 MIN(c.`variation_name`)) AS `__lookup_fallback_variation_name`"
-                    .to_string()
-            } else {
-                "STRING_AGG(DISTINCT c.`variation_name`, '&') AS `__lookup_fallback_variation_name`"
-                    .to_string()
-            };
+            let mut fallback_cache_cols = vec!["`chrom`".to_string()];
+            if projects_cache_variation_name {
+                fallback_cache_cols.push("`variation_name`".to_string());
+            }
+            if projects_cache_somatic {
+                fallback_cache_cols.push("`somatic`".to_string());
+            }
+            if use_vep_existing_fallback {
+                fallback_cache_cols.push("`allele_string`".to_string());
+            }
+            fallback_cache_cols.push(format!("{cache_join_start_expr} AS `__lookup_join_start`"));
+            fallback_cache_cols.push(format!(
+                "{cache_normalized_end_expr} AS `__lookup_join_end`"
+            ));
+            let fallback_cache_inner_cols = fallback_cache_cols.join(", ");
+
+            let mut fallback_select_exprs = Vec::new();
+            if projects_cache_variation_name {
+                let fallback_variation_name_expr = if use_vep_existing_fallback {
+                    "COALESCE(\
+                     MIN(CASE WHEN c.`variation_name` LIKE 'rs%' THEN c.`variation_name` END), \
+                     MIN(c.`variation_name`)) AS `__lookup_fallback_variation_name`"
+                        .to_string()
+                } else {
+                    "STRING_AGG(DISTINCT c.`variation_name`, '&') AS `__lookup_fallback_variation_name`"
+                        .to_string()
+                };
+                fallback_select_exprs.push(fallback_variation_name_expr);
+            }
+            if projects_cache_somatic {
+                fallback_select_exprs.push(
+                    "MAX(CAST(c.`somatic` AS INTEGER)) AS `__lookup_fallback_somatic`".to_string(),
+                );
+            }
+            let fallback_select_expr_sql = fallback_select_exprs.join(", ");
+
+            let mut fallback_not_null_conditions = Vec::new();
+            if projects_cache_variation_name {
+                fallback_not_null_conditions.push("`variation_name` IS NOT NULL".to_string());
+            }
+            if projects_cache_somatic {
+                fallback_not_null_conditions.push("`somatic` IS NOT NULL".to_string());
+            }
+            let fallback_not_null_sql = fallback_not_null_conditions.join(" OR ");
             let fallback_subquery = format!(
                 "(SELECT fa.`chrom`, fa.`start`, fa.`end`, fa.`ref`, fa.`alt`, \
-                        {fallback_variation_name_expr} \
+                        {fallback_select_expr_sql} \
                  FROM {vcf_from_subquery} AS fa \
                  LEFT JOIN \
-                 (SELECT {fallback_cache_inner_cols} FROM `{}` WHERE `variation_name` IS NOT NULL) AS c \
+                 (SELECT {fallback_cache_inner_cols} FROM `{}` WHERE {fallback_not_null_sql}) AS c \
                  ON {fallback_join_on} \
                  GROUP BY fa.`chrom`, fa.`start`, fa.`end`, fa.`ref`, fa.`alt`) AS f",
                 self.cache_table,
@@ -398,7 +436,7 @@ AND a.`alt` = f.`alt`";
 mod tests {
     use crate::create_vep_session;
     use datafusion::arrow::array::{
-        Array, ArrayRef, Int64Array, RecordBatch, StringArray, StringViewArray,
+        Array, ArrayRef, Int8Array, Int64Array, RecordBatch, StringArray, StringViewArray,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
@@ -444,6 +482,22 @@ mod tests {
                 "expected Utf8, Utf8View, or LargeUtf8, got {:?}",
                 col.data_type()
             );
+        }
+    }
+
+    fn int8_values(col: &ArrayRef) -> Vec<Option<i8>> {
+        if let Some(arr) = col.as_any().downcast_ref::<Int8Array>() {
+            (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i))
+                    }
+                })
+                .collect()
+        } else {
+            panic!("expected Int8, got {:?}", col.data_type());
         }
     }
 
@@ -890,6 +944,7 @@ mod tests {
             Field::new("end", DataType::Int64, false),
             Field::new("variation_name", DataType::Utf8, true),
             Field::new("allele_string", DataType::Utf8, false),
+            Field::new("somatic", DataType::Int8, true),
             Field::new("clin_sig", DataType::Utf8, true),
         ]));
         let cache_batch = RecordBatch::try_new(
@@ -900,6 +955,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![100])),
                 Arc::new(StringArray::from(vec!["rs_coloc_only"])),
                 Arc::new(StringArray::from(vec!["C/T"])),
+                Arc::new(Int8Array::from(vec![Some(1)])),
                 Arc::new(StringArray::from(vec!["benign"])),
             ],
         )
@@ -913,30 +969,40 @@ mod tests {
         // Exact mode: no allele match => NULL variation_name.
         let exact_df = ctx
             .sql(
-                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name', false, 'exact')",
+                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name,somatic', false, 'exact')",
             )
             .await
             .unwrap();
         let exact_batches = exact_df.collect().await.unwrap();
-        let exact_values: Vec<Option<String>> = exact_batches
+        let exact_var_values: Vec<Option<String>> = exact_batches
             .iter()
             .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
             .collect();
-        assert_eq!(exact_values, vec![None]);
+        let exact_somatic_values: Vec<Option<i8>> = exact_batches
+            .iter()
+            .flat_map(|b| int8_values(b.column_by_name("cache_somatic").unwrap()))
+            .collect();
+        assert_eq!(exact_var_values, vec![None]);
+        assert_eq!(exact_somatic_values, vec![None]);
 
-        // Fallback mode: fill variation_name from co-located overlap IDs.
+        // Fallback mode: fill variation_name and somatic from co-located rows.
         let coloc_df = ctx
             .sql(
-                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name', false, 'exact_or_colocated_ids')",
+                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name,somatic', false, 'exact_or_colocated_ids')",
             )
             .await
             .unwrap();
         let coloc_batches = coloc_df.collect().await.unwrap();
-        let coloc_values: Vec<Option<String>> = coloc_batches
+        let coloc_var_values: Vec<Option<String>> = coloc_batches
             .iter()
             .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
             .collect();
-        assert_eq!(coloc_values, vec![Some("rs_coloc_only".to_string())]);
+        let coloc_somatic_values: Vec<Option<i8>> = coloc_batches
+            .iter()
+            .flat_map(|b| int8_values(b.column_by_name("cache_somatic").unwrap()))
+            .collect();
+        assert_eq!(coloc_var_values, vec![Some("rs_coloc_only".to_string())]);
+        assert_eq!(coloc_somatic_values, vec![Some(1)]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -972,6 +1038,7 @@ mod tests {
             Field::new("end", DataType::Int64, false),
             Field::new("variation_name", DataType::Utf8, true),
             Field::new("allele_string", DataType::Utf8, false),
+            Field::new("somatic", DataType::Int8, true),
             Field::new("clin_sig", DataType::Utf8, true),
         ]));
         let cache_batch = RecordBatch::try_new(
@@ -982,6 +1049,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![100, 100])),
                 Arc::new(StringArray::from(vec!["COSM_relaxed", "rs_relaxed"])),
                 Arc::new(StringArray::from(vec!["C/-", "T/-"])),
+                Arc::new(Int8Array::from(vec![Some(1), Some(1)])),
                 Arc::new(StringArray::from(vec!["benign", "benign"])),
             ],
         )
@@ -996,31 +1064,44 @@ mod tests {
         // Exact mode must miss because both cache refs mismatch ("C/-", "T/-").
         let exact_df = ctx
             .sql(
-                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name', false, 'exact')",
+                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name,somatic', false, 'exact')",
             )
             .await
             .unwrap();
         let exact_batches = exact_df.collect().await.unwrap();
-        let exact_values: Vec<Option<String>> = exact_batches
+        let exact_var_values: Vec<Option<String>> = exact_batches
             .iter()
             .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
             .collect();
-        assert_eq!(exact_values, vec![None]);
+        let exact_somatic_values: Vec<Option<i8>> = exact_batches
+            .iter()
+            .flat_map(|b| int8_values(b.column_by_name("cache_somatic").unwrap()))
+            .collect();
+        assert_eq!(exact_var_values, vec![None]);
+        assert_eq!(exact_somatic_values, vec![None]);
 
-        // VEP-existing mode: relaxed indel compatibility fills fallback ID,
-        // preferring rs* when multiple candidates exist.
+        // VEP-existing mode: relaxed indel compatibility fills fallback
+        // variation_name and somatic, preferring rs* IDs when available.
         let vep_existing_df = ctx
             .sql(
-                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name', false, 'exact_or_vep_existing')",
+                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name,somatic', false, 'exact_or_vep_existing')",
             )
             .await
             .unwrap();
         let vep_existing_batches = vep_existing_df.collect().await.unwrap();
-        let vep_existing_values: Vec<Option<String>> = vep_existing_batches
+        let vep_existing_var_values: Vec<Option<String>> = vep_existing_batches
             .iter()
             .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
             .collect();
-        assert_eq!(vep_existing_values, vec![Some("rs_relaxed".to_string())]);
+        let vep_existing_somatic_values: Vec<Option<i8>> = vep_existing_batches
+            .iter()
+            .flat_map(|b| int8_values(b.column_by_name("cache_somatic").unwrap()))
+            .collect();
+        assert_eq!(
+            vep_existing_var_values,
+            vec![Some("rs_relaxed".to_string())]
+        );
+        assert_eq!(vep_existing_somatic_values, vec![Some(1)]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -73,10 +73,11 @@ impl TableFunctionImpl for LookupFunction {
         // Optional fifth argument: match mode (default: "exact")
         // - exact: interval overlap + exact allele matching
         // - exact_or_colocated_ids: exact mode, but for unmatched rows also fills
-        //   `variation_name` from co-located overlap IDs.
+        //   fallback-capable columns (`variation_name`, `somatic`) from co-located
+        //   overlap IDs.
         // - exact_or_vep_existing: exact mode, but for unmatched rows fills
-        //   `variation_name` from indel-aware relaxed allele-compatible co-located
-        //   IDs and prefers rs* identifiers.
+        //   fallback-capable columns using indel-aware relaxed allele-compatible
+        //   co-located rows; for `variation_name` it prefers rs* identifiers.
         let match_mode = if args.len() > 4 {
             let mode = extract_string_arg(&args[4], "match_mode", "lookup_variants")?;
             parse_match_mode(&mode)?
