@@ -2,6 +2,7 @@
 //! a fjall KV store window-by-window for annotation.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use futures::{Stream, StreamExt};
 
 use crate::allele_index::{AlleleMatcher, WindowAlleleIndex};
 use crate::key_encoding::window_id_for_position;
-use crate::kv_store::VepKvStore;
+use crate::kv_store::{FORMAT_V1, VepKvStore};
 
 /// Lookup match mode (mirrors MatchMode from bio-function-vep).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,8 @@ pub struct KvLookupExec {
     vcf_zero_based: bool,
     cache_zero_based: bool,
     properties: PlanProperties,
+    /// For v1 format: which cache column indices to fetch for output.
+    output_col_indices: Vec<u8>,
 }
 
 impl KvLookupExec {
@@ -68,6 +71,8 @@ impl KvLookupExec {
         let input_schema = input.schema();
         let cache_schema = store.schema();
 
+        // Compute output column indices for v1 format.
+        let mut output_col_indices = Vec::new();
         let mut fields: Vec<Arc<Field>> = input_schema.fields().iter().cloned().collect();
         for col_name in &cache_columns {
             if let Ok(field) = cache_schema.field_with_name(col_name) {
@@ -76,6 +81,9 @@ impl KvLookupExec {
                     field.data_type().clone(),
                     true,
                 )));
+                if let Ok(idx) = cache_schema.index_of(col_name) {
+                    output_col_indices.push(idx as u8);
+                }
             }
         }
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
@@ -99,6 +107,7 @@ impl KvLookupExec {
             vcf_zero_based,
             cache_zero_based,
             properties,
+            output_col_indices,
         })
     }
 }
@@ -181,6 +190,8 @@ impl ExecutionPlan for KvLookupExec {
             self.vcf_zero_based,
             self.cache_zero_based,
             self.store.window_size(),
+            self.store.format_version(),
+            self.output_col_indices.clone(),
         )))
     }
 }
@@ -198,6 +209,8 @@ struct KvLookupStream {
     vcf_zero_based: bool,
     cache_zero_based: bool,
     window_size: u64,
+    format_version: u8,
+    output_col_indices: Vec<u8>,
     current_window: Option<(String, u64)>,
     current_index: Option<WindowAlleleIndex>,
 }
@@ -216,6 +229,8 @@ impl KvLookupStream {
         vcf_zero_based: bool,
         cache_zero_based: bool,
         window_size: u64,
+        format_version: u8,
+        output_col_indices: Vec<u8>,
     ) -> Self {
         Self {
             input,
@@ -229,11 +244,14 @@ impl KvLookupStream {
             vcf_zero_based,
             cache_zero_based,
             window_size,
+            format_version,
+            output_col_indices,
             current_window: None,
             current_index: None,
         }
     }
 
+    /// Phase A: Load only the position index (v1) or full batch (v0).
     fn ensure_window(&mut self, chrom: &str, pos: i64) -> Result<()> {
         let wid = window_id_for_position(pos, self.window_size);
         let need_load = match &self.current_window {
@@ -242,12 +260,20 @@ impl KvLookupStream {
         };
 
         if need_load {
-            let batch = self.store.get_window(chrom, wid)?;
-            self.current_window = Some((chrom.to_string(), wid));
-            self.current_index = match batch {
-                Some(b) => Some(WindowAlleleIndex::from_batch(b)?),
-                None => None,
-            };
+            if self.format_version >= FORMAT_V1 {
+                // v1 fast path: load only position index (~2-8KB)
+                let pos_index = self.store.get_position_index(chrom, wid)?;
+                self.current_window = Some((chrom.to_string(), wid));
+                self.current_index = pos_index.map(WindowAlleleIndex::from_position_index);
+            } else {
+                // v0 legacy path: load full monolithic batch
+                let batch = self.store.get_window(chrom, wid)?;
+                self.current_window = Some((chrom.to_string(), wid));
+                self.current_index = match batch {
+                    Some(b) => Some(WindowAlleleIndex::from_batch(b)?),
+                    None => None,
+                };
+            }
         }
         Ok(())
     }
@@ -270,9 +296,8 @@ impl KvLookupStream {
         let num_vcf_cols = vcf_schema.fields().len();
         let num_rows = vcf_batch.num_rows();
 
-        // (vcf_row_idx, Option<(cache_batch, matched_row_indices)>).
-        type MatchEntry = (usize, Option<(RecordBatch, Vec<usize>)>);
-        let mut output_entries: Vec<MatchEntry> = Vec::new();
+        let mut matched_entries: Vec<MatchInfoStatic> = Vec::new();
+        let mut unmatched_vcf_rows: Vec<usize> = Vec::new();
 
         for row in 0..num_rows {
             let raw_chrom = chroms[row].as_deref().unwrap_or("");
@@ -343,35 +368,100 @@ impl KvLookupStream {
                 if matches.is_empty() {
                     None
                 } else {
-                    Some((index.batch().clone(), matches))
+                    Some(matches)
                 }
             } else {
                 None
             };
 
-            output_entries.push((row, matched));
-        }
-
-        // Build output arrays.
-        let total_output_rows: usize = output_entries
-            .iter()
-            .map(|(_, m)| match m {
-                Some((_, indices)) => indices.len(),
-                None => 1,
-            })
-            .sum();
-
-        // Expand VCF row indices.
-        let mut vcf_output_indices: Vec<u32> = Vec::with_capacity(total_output_rows);
-        for (vcf_row, matched) in &output_entries {
             match matched {
-                Some((_, indices)) => {
-                    for _ in indices {
-                        vcf_output_indices.push(*vcf_row as u32);
-                    }
+                Some(cache_rows) => {
+                    let (c, wid) = self.current_window.as_ref().unwrap();
+                    matched_entries.push(MatchInfoStatic {
+                        vcf_row: row,
+                        chrom: c.clone(),
+                        window_id: *wid,
+                        cache_rows,
+                    });
                 }
                 None => {
-                    vcf_output_indices.push(*vcf_row as u32);
+                    unmatched_vcf_rows.push(row);
+                }
+            }
+        }
+
+        // Phase B: fetch needed columns for matched windows.
+        let total_output_rows: usize = matched_entries
+            .iter()
+            .map(|m| m.cache_rows.len())
+            .sum::<usize>()
+            + unmatched_vcf_rows.len();
+
+        // Build VCF output indices (expanded for matches).
+        let mut vcf_output_indices: Vec<u32> = Vec::with_capacity(total_output_rows);
+
+        // We'll interleave matched and unmatched in original VCF order.
+        // Build a combined list sorted by original vcf_row.
+        let mut combined: Vec<OutputEntry> =
+            Vec::with_capacity(matched_entries.len() + unmatched_vcf_rows.len());
+        let mut mi = 0;
+        let mut ui = 0;
+        while mi < matched_entries.len() || ui < unmatched_vcf_rows.len() {
+            let m_row = if mi < matched_entries.len() {
+                matched_entries[mi].vcf_row
+            } else {
+                usize::MAX
+            };
+            let u_row = if ui < unmatched_vcf_rows.len() {
+                unmatched_vcf_rows[ui]
+            } else {
+                usize::MAX
+            };
+            if m_row <= u_row {
+                combined.push(OutputEntry::Matched(&matched_entries[mi]));
+                mi += 1;
+            } else {
+                combined.push(OutputEntry::Unmatched(unmatched_vcf_rows[ui]));
+                ui += 1;
+            }
+        }
+
+        // Fetch columns for each matched window (batch-fetch per window).
+        // Cache: (chrom, window_id) -> fetched column arrays
+        let mut window_columns: HashMap<(String, u64), Vec<ArrayRef>> = HashMap::new();
+
+        if self.format_version >= FORMAT_V1 && !self.output_col_indices.is_empty() {
+            // Collect unique windows that have matches.
+            let mut needed_windows: Vec<(String, u64)> = Vec::new();
+            for entry in &matched_entries {
+                let key = (entry.chrom.clone(), entry.window_id);
+                if !needed_windows.contains(&key) {
+                    needed_windows.push(key);
+                }
+            }
+            for (chrom, wid) in &needed_windows {
+                if let Some(cols) = self
+                    .store
+                    .get_columns(chrom, *wid, &self.output_col_indices)?
+                {
+                    window_columns.insert(
+                        (chrom.clone(), *wid),
+                        cols.into_iter().map(|(a, _)| a).collect(),
+                    );
+                }
+            }
+        }
+
+        // Build expanded VCF indices.
+        for entry in &combined {
+            match entry {
+                OutputEntry::Matched(m) => {
+                    for _ in &m.cache_rows {
+                        vcf_output_indices.push(m.vcf_row as u32);
+                    }
+                }
+                OutputEntry::Unmatched(row) => {
+                    vcf_output_indices.push(*row as u32);
                 }
             }
         }
@@ -388,16 +478,42 @@ impl KvLookupStream {
         }
 
         // Build cache columns.
-        for cache_col_name in &self.cache_columns {
-            let cache_col_idx = cache_schema.index_of(cache_col_name).ok();
-            let output_col = build_cache_column(
-                &output_entries,
-                cache_col_idx,
-                cache_col_name,
-                cache_schema.as_ref(),
-                total_output_rows,
-            )?;
-            output_columns.push(output_col);
+        if self.format_version >= FORMAT_V1 {
+            // v1 path: use fetched column arrays directly.
+            for (out_idx, cache_col_name) in self.cache_columns.iter().enumerate() {
+                let data_type = cache_schema
+                    .field_with_name(cache_col_name)
+                    .map(|f| f.data_type().clone())
+                    .unwrap_or(DataType::Utf8);
+
+                let output_col = build_cache_column_v1(
+                    &combined,
+                    &window_columns,
+                    out_idx,
+                    &data_type,
+                    total_output_rows,
+                )?;
+                output_columns.push(output_col);
+            }
+        } else {
+            // v0 legacy path: we don't have column data in v0 through this path.
+            // For v0, we need to fall back to the old approach of reading from the batch.
+            // But since WindowAlleleIndex no longer holds a batch, we need to read the
+            // full batch from the store for v0 format.
+            // However, this code path only triggers for v0 stores, where we need to
+            // reconstruct the batch-based approach.
+            for cache_col_name in &self.cache_columns {
+                let cache_col_idx = cache_schema.index_of(cache_col_name).ok();
+                let output_col = build_cache_column_v0_fallback(
+                    &combined,
+                    &self.store,
+                    cache_col_idx,
+                    cache_col_name,
+                    cache_schema.as_ref(),
+                    total_output_rows,
+                )?;
+                output_columns.push(output_col);
+            }
         }
 
         RecordBatch::try_new(self.schema.clone(), output_columns)
@@ -405,28 +521,37 @@ impl KvLookupStream {
     }
 }
 
-type MatchEntry = (usize, Option<(RecordBatch, Vec<usize>)>);
+enum OutputEntry<'a> {
+    Matched(&'a MatchInfoStatic),
+    Unmatched(usize),
+}
 
-fn build_cache_column(
-    entries: &[MatchEntry],
-    cache_col_idx: Option<usize>,
-    col_name: &str,
-    cache_schema: &datafusion::arrow::datatypes::Schema,
+struct MatchInfoStatic {
+    vcf_row: usize,
+    chrom: String,
+    window_id: u64,
+    cache_rows: Vec<usize>,
+}
+
+/// Build a cache output column using v1 fetched column arrays.
+fn build_cache_column_v1(
+    entries: &[OutputEntry<'_>],
+    window_columns: &HashMap<(String, u64), Vec<ArrayRef>>,
+    out_col_idx: usize,
+    data_type: &DataType,
     total_rows: usize,
 ) -> Result<ArrayRef> {
-    let data_type = cache_schema
-        .field_with_name(col_name)
-        .map(|f| f.data_type().clone())
-        .unwrap_or(DataType::Utf8);
-
-    match &data_type {
+    match data_type {
         DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => {
             let mut builder = StringBuilder::with_capacity(total_rows, total_rows * 16);
-            for (_, matched) in entries {
-                match matched {
-                    Some((batch, indices)) => {
-                        let col = cache_col_idx.map(|idx| batch.column(idx));
-                        for &i in indices {
+            for entry in entries {
+                match entry {
+                    OutputEntry::Matched(m) => {
+                        let key = (m.chrom.clone(), m.window_id);
+                        let col = window_columns
+                            .get(&key)
+                            .and_then(|cols| cols.get(out_col_idx));
+                        for &i in &m.cache_rows {
                             if let Some(col) = col {
                                 if col.is_null(i) {
                                     builder.append_null();
@@ -438,18 +563,21 @@ fn build_cache_column(
                             }
                         }
                     }
-                    None => builder.append_null(),
+                    OutputEntry::Unmatched(_) => builder.append_null(),
                 }
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::Int64 => {
             let mut builder = Int64Builder::with_capacity(total_rows);
-            for (_, matched) in entries {
-                match matched {
-                    Some((batch, indices)) => {
-                        let col = cache_col_idx.map(|idx| batch.column(idx));
-                        for &i in indices {
+            for entry in entries {
+                match entry {
+                    OutputEntry::Matched(m) => {
+                        let key = (m.chrom.clone(), m.window_id);
+                        let col = window_columns
+                            .get(&key)
+                            .and_then(|cols| cols.get(out_col_idx));
+                        for &i in &m.cache_rows {
                             if let Some(col) = col {
                                 if col.is_null(i) {
                                     builder.append_null();
@@ -461,18 +589,21 @@ fn build_cache_column(
                             }
                         }
                     }
-                    None => builder.append_null(),
+                    OutputEntry::Unmatched(_) => builder.append_null(),
                 }
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::Int8 => {
             let mut builder = Int8Builder::with_capacity(total_rows);
-            for (_, matched) in entries {
-                match matched {
-                    Some((batch, indices)) => {
-                        let col = cache_col_idx.map(|idx| batch.column(idx));
-                        for &i in indices {
+            for entry in entries {
+                match entry {
+                    OutputEntry::Matched(m) => {
+                        let key = (m.chrom.clone(), m.window_id);
+                        let col = window_columns
+                            .get(&key)
+                            .and_then(|cols| cols.get(out_col_idx));
+                        for &i in &m.cache_rows {
                             if let Some(col) = col {
                                 if col.is_null(i) {
                                     builder.append_null();
@@ -488,7 +619,137 @@ fn build_cache_column(
                             }
                         }
                     }
-                    None => builder.append_null(),
+                    OutputEntry::Unmatched(_) => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        _ => Ok(Arc::new(NullArray::new(total_rows)) as ArrayRef),
+    }
+}
+
+/// Build a cache output column for v0 format (reads full window batch from store).
+fn build_cache_column_v0_fallback(
+    entries: &[OutputEntry<'_>],
+    store: &VepKvStore,
+    cache_col_idx: Option<usize>,
+    col_name: &str,
+    cache_schema: &datafusion::arrow::datatypes::Schema,
+    total_rows: usize,
+) -> Result<ArrayRef> {
+    let data_type = cache_schema
+        .field_with_name(col_name)
+        .map(|f| f.data_type().clone())
+        .unwrap_or(DataType::Utf8);
+
+    // Cache for loaded window batches.
+    let mut batch_cache: HashMap<(String, u64), RecordBatch> = HashMap::new();
+
+    match &data_type {
+        DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => {
+            let mut builder = StringBuilder::with_capacity(total_rows, total_rows * 16);
+            for entry in entries {
+                match entry {
+                    OutputEntry::Matched(m) => {
+                        let key = (m.chrom.clone(), m.window_id);
+                        if !batch_cache.contains_key(&key) {
+                            if let Some(batch) = store.get_window(&m.chrom, m.window_id)? {
+                                batch_cache.insert(key.clone(), batch);
+                            }
+                        }
+                        let batch = batch_cache.get(&key);
+                        for &i in &m.cache_rows {
+                            if let Some(batch) = batch {
+                                let col = cache_col_idx.map(|idx| batch.column(idx));
+                                if let Some(col) = col {
+                                    if col.is_null(i) {
+                                        builder.append_null();
+                                    } else {
+                                        builder.append_value(get_string_value(col, i));
+                                    }
+                                } else {
+                                    builder.append_null();
+                                }
+                            } else {
+                                builder.append_null();
+                            }
+                        }
+                    }
+                    OutputEntry::Unmatched(_) => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Int64 => {
+            let mut builder = Int64Builder::with_capacity(total_rows);
+            for entry in entries {
+                match entry {
+                    OutputEntry::Matched(m) => {
+                        let key = (m.chrom.clone(), m.window_id);
+                        if !batch_cache.contains_key(&key) {
+                            if let Some(batch) = store.get_window(&m.chrom, m.window_id)? {
+                                batch_cache.insert(key.clone(), batch);
+                            }
+                        }
+                        let batch = batch_cache.get(&key);
+                        for &i in &m.cache_rows {
+                            if let Some(batch) = batch {
+                                let col = cache_col_idx.map(|idx| batch.column(idx));
+                                if let Some(col) = col {
+                                    if col.is_null(i) {
+                                        builder.append_null();
+                                    } else {
+                                        builder
+                                            .append_value(col.as_primitive::<Int64Type>().value(i));
+                                    }
+                                } else {
+                                    builder.append_null();
+                                }
+                            } else {
+                                builder.append_null();
+                            }
+                        }
+                    }
+                    OutputEntry::Unmatched(_) => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Int8 => {
+            let mut builder = Int8Builder::with_capacity(total_rows);
+            for entry in entries {
+                match entry {
+                    OutputEntry::Matched(m) => {
+                        let key = (m.chrom.clone(), m.window_id);
+                        if !batch_cache.contains_key(&key) {
+                            if let Some(batch) = store.get_window(&m.chrom, m.window_id)? {
+                                batch_cache.insert(key.clone(), batch);
+                            }
+                        }
+                        let batch = batch_cache.get(&key);
+                        for &i in &m.cache_rows {
+                            if let Some(batch) = batch {
+                                let col = cache_col_idx.map(|idx| batch.column(idx));
+                                if let Some(col) = col {
+                                    if col.is_null(i) {
+                                        builder.append_null();
+                                    } else {
+                                        builder.append_value(
+                                            col.as_primitive::<
+                                                datafusion::arrow::datatypes::Int8Type,
+                                            >()
+                                            .value(i),
+                                        );
+                                    }
+                                } else {
+                                    builder.append_null();
+                                }
+                            } else {
+                                builder.append_null();
+                            }
+                        }
+                    }
+                    OutputEntry::Unmatched(_) => builder.append_null(),
                 }
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)

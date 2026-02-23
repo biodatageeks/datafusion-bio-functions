@@ -20,3 +20,17 @@ async-trait = "0.1.88"
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"
+env_logger = "0.11"
+datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "45562f3beb230c23008b19bfe6c172bd1c5923fa" }
+
+[[example]]
+name = "load_cache"
+required-features = []
+
+[[example]]
+name = "bench_annotate"
+required-features = []
+
+[[example]]
+name = "bench_window_read"
+required-features = []

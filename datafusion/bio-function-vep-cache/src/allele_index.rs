@@ -1,66 +1,41 @@
 //! Per-window in-memory position index for fast allele matching.
 //!
-//! Given a cache window (RecordBatch), builds a position-based index.
-//! Allele matching functions are injected as function pointers to avoid
+//! Given a cache window (RecordBatch or PositionIndex), builds a position-based
+//! index. Allele matching functions are injected as function pointers to avoid
 //! a cyclic dependency on bio-function-vep.
 
-use std::collections::HashMap;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::common::Result;
 
-use datafusion::arrow::array::{Array, AsArray, RecordBatch};
-use datafusion::common::{DataFusionError, Result};
+use crate::position_index::PositionIndex;
 
 /// Function signature for allele matching: `(vcf_ref, vcf_alt, allele_string) -> bool`.
 pub type AlleleMatcher = fn(&str, &str, &str) -> bool;
 
-/// Index over a cache window's RecordBatch for fast position-based lookup.
+/// Index over a cache window for fast position-based lookup.
 ///
-/// Maps `(start, end)` pairs to row indices in the batch, enabling
-/// O(1) lookup by position before applying allele matching.
+/// Maps `(start, end)` pairs to row indices, enabling O(1) lookup by
+/// position before applying allele matching.
+///
+/// Supports two construction paths:
+/// - `from_position_index`: v1 format (fast, no Arrow IPC decode)
+/// - `from_batch`: v0 legacy format (builds PositionIndex from RecordBatch)
 pub struct WindowAlleleIndex {
-    batch: RecordBatch,
-    position_index: HashMap<(i64, i64), Vec<usize>>,
-    allele_string_col: usize,
+    pos_index: PositionIndex,
 }
 
 impl WindowAlleleIndex {
-    /// Build an index from a cache window batch.
+    /// Construct from a pre-built PositionIndex (v1 format — fast, no IPC decode).
+    pub fn from_position_index(index: PositionIndex) -> Self {
+        Self { pos_index: index }
+    }
+
+    /// Build an index from a cache window batch (v0 legacy format).
     ///
     /// The batch must have `start` (Int64), `end` (Int64), and `allele_string` (Utf8) columns.
     pub fn from_batch(batch: RecordBatch) -> Result<Self> {
-        let schema = batch.schema();
-        let start_col = schema.index_of("start").map_err(|e| {
-            DataFusionError::Execution(format!("Cache batch missing 'start' column: {e}"))
-        })?;
-        let end_col = schema.index_of("end").map_err(|e| {
-            DataFusionError::Execution(format!("Cache batch missing 'end' column: {e}"))
-        })?;
-        let allele_string_col = schema.index_of("allele_string").map_err(|e| {
-            DataFusionError::Execution(format!("Cache batch missing 'allele_string' column: {e}"))
-        })?;
-
-        let starts = batch
-            .column(start_col)
-            .as_primitive_opt::<datafusion::arrow::datatypes::Int64Type>()
-            .ok_or_else(|| DataFusionError::Execution("'start' column is not Int64".to_string()))?;
-        let ends = batch
-            .column(end_col)
-            .as_primitive_opt::<datafusion::arrow::datatypes::Int64Type>()
-            .ok_or_else(|| DataFusionError::Execution("'end' column is not Int64".to_string()))?;
-
-        let mut position_index: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
-        for i in 0..batch.num_rows() {
-            if !starts.is_null(i) && !ends.is_null(i) {
-                let start = starts.value(i);
-                let end = ends.value(i);
-                position_index.entry((start, end)).or_default().push(i);
-            }
-        }
-
-        Ok(Self {
-            batch,
-            position_index,
-            allele_string_col,
-        })
+        let pos_index = PositionIndex::from_batch(&batch)?;
+        Ok(Self { pos_index })
     }
 
     /// Find rows matching with the given matcher function at a given position.
@@ -72,50 +47,18 @@ impl WindowAlleleIndex {
         vcf_alt: &str,
         matcher: AlleleMatcher,
     ) -> Vec<usize> {
-        let Some(row_indices) = self.position_index.get(&(start, end)) else {
-            return Vec::new();
-        };
-
-        let allele_col = self.batch.column(self.allele_string_col);
-        if let Some(arr) = allele_col
-            .as_any()
-            .downcast_ref::<datafusion::arrow::array::StringArray>()
-        {
-            row_indices
-                .iter()
-                .copied()
-                .filter(|&i| !arr.is_null(i) && matcher(vcf_ref, vcf_alt, arr.value(i)))
-                .collect()
-        } else if let Some(arr) = allele_col
-            .as_any()
-            .downcast_ref::<datafusion::arrow::array::StringViewArray>()
-        {
-            row_indices
-                .iter()
-                .copied()
-                .filter(|&i| !arr.is_null(i) && matcher(vcf_ref, vcf_alt, arr.value(i)))
-                .collect()
-        } else {
-            Vec::new()
-        }
+        self.pos_index
+            .find_matches(start, end, vcf_ref, vcf_alt, matcher)
     }
 
     /// Find all co-located rows (position match only, no allele check).
     pub fn find_colocated(&self, start: i64, end: i64) -> Vec<usize> {
-        self.position_index
-            .get(&(start, end))
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Get the underlying batch.
-    pub fn batch(&self) -> &RecordBatch {
-        &self.batch
+        self.pos_index.find_colocated(start, end)
     }
 
     /// Get the number of rows in the index.
     pub fn num_rows(&self) -> usize {
-        self.batch.num_rows()
+        self.pos_index.num_rows()
     }
 }
 
@@ -181,5 +124,20 @@ mod tests {
         assert_eq!(index.find_colocated(100, 100).len(), 3);
         assert_eq!(index.find_colocated(200, 200).len(), 1);
         assert!(index.find_colocated(300, 300).is_empty());
+    }
+
+    #[test]
+    fn test_from_position_index() {
+        let batch = make_cache_batch();
+        let pos_index = PositionIndex::from_batch(&batch).unwrap();
+        let bytes = pos_index.to_bytes();
+        let restored = PositionIndex::from_bytes(&bytes).unwrap();
+        let index = WindowAlleleIndex::from_position_index(restored);
+
+        let matches = index.find_matches(100, 100, "A", "G", test_exact_matcher);
+        assert_eq!(matches, vec![0]);
+
+        assert_eq!(index.find_colocated(100, 100).len(), 3);
+        assert_eq!(index.num_rows(), 4);
     }
 }

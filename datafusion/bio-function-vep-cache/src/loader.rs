@@ -15,7 +15,8 @@ use futures::StreamExt;
 use log::info;
 
 use crate::key_encoding::{DEFAULT_WINDOW_SIZE, window_id_for_position};
-use crate::kv_store::VepKvStore;
+use crate::kv_store::{FORMAT_V1, VepKvStore};
+use crate::position_index::PositionIndex;
 
 /// Statistics returned after loading.
 #[derive(Debug, Clone)]
@@ -32,6 +33,7 @@ pub struct CacheLoader {
     target_path: String,
     window_size: u64,
     parallelism: usize,
+    format_version: u8,
 }
 
 impl CacheLoader {
@@ -45,6 +47,7 @@ impl CacheLoader {
             target_path: target_path.into(),
             window_size: DEFAULT_WINDOW_SIZE,
             parallelism: 25,
+            format_version: FORMAT_V1,
         }
     }
 
@@ -60,6 +63,12 @@ impl CacheLoader {
         self
     }
 
+    /// Set the format version (default: FORMAT_V1 = columnar).
+    pub fn with_format_version(mut self, version: u8) -> Self {
+        self.format_version = version;
+        self
+    }
+
     /// Load the cache from the registered Parquet table into fjall.
     pub async fn load(&self, session: &SessionContext) -> Result<LoadStats> {
         let start_time = Instant::now();
@@ -68,11 +77,12 @@ impl CacheLoader {
         let source_df = session.table(&self.source_table).await?;
         let schema: SchemaRef = Arc::new(source_df.schema().as_arrow().clone());
 
-        // Create the KV store.
-        let store = Arc::new(VepKvStore::create(
+        // Create the KV store with the chosen format version.
+        let store = Arc::new(VepKvStore::create_with_version(
             Path::new(&self.target_path),
             schema.clone(),
             self.window_size,
+            self.format_version,
         )?);
 
         // Discover distinct chromosomes.
@@ -118,6 +128,7 @@ impl CacheLoader {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.parallelism));
         let mut handles = Vec::new();
         let window_size = self.window_size;
+        let format_version = self.format_version;
 
         for chrom in chromosomes {
             let session = session.clone();
@@ -131,7 +142,15 @@ impl CacheLoader {
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                load_chromosome(&session, &source_table, &chrom, &store, window_size).await
+                load_chromosome(
+                    &session,
+                    &source_table,
+                    &chrom,
+                    &store,
+                    window_size,
+                    format_version,
+                )
+                .await
             });
             handles.push(handle);
         }
@@ -173,6 +192,7 @@ async fn load_chromosome(
     chrom: &str,
     store: &VepKvStore,
     window_size: u64,
+    format_version: u8,
 ) -> Result<(u64, u64, u64)> {
     let query = format!("SELECT * FROM `{source_table}` WHERE chrom = '{chrom}' ORDER BY start");
     let df = session.sql(&query).await?;
@@ -220,6 +240,7 @@ async fn load_chromosome(
                         &[single],
                         &mut total_windows,
                         &mut total_bytes,
+                        format_version,
                     )?;
                 }
             }
@@ -237,6 +258,7 @@ async fn load_chromosome(
                         &window_batches,
                         &mut total_windows,
                         &mut total_bytes,
+                        format_version,
                     )?;
                     window_batches.clear();
                     current_window_id = Some(wid);
@@ -266,6 +288,7 @@ async fn load_chromosome(
                 &window_batches,
                 &mut total_windows,
                 &mut total_bytes,
+                format_version,
             )?;
         }
     }
@@ -283,6 +306,7 @@ fn flush_to_store(
     batches: &[RecordBatch],
     total_windows: &mut u64,
     total_bytes: &mut u64,
+    format_version: u8,
 ) -> Result<()> {
     if batches.is_empty() {
         return Ok(());
@@ -296,6 +320,26 @@ fn flush_to_store(
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
     };
 
+    if format_version >= FORMAT_V1 {
+        flush_to_store_v1(store, chrom, window_id, merged, total_windows, total_bytes)?;
+    } else {
+        flush_to_store_v0(store, chrom, window_id, merged, total_windows, total_bytes)?;
+    }
+
+    Ok(())
+}
+
+/// v0 (legacy monolithic): write all columns as a single Arrow IPC blob.
+fn flush_to_store_v0(
+    store: &VepKvStore,
+    chrom: &str,
+    window_id: u64,
+    merged: RecordBatch,
+    total_windows: &mut u64,
+    total_bytes: &mut u64,
+) -> Result<()> {
+    let mem_size = merged.get_array_memory_size() as u64;
+
     // If window already exists (from cross-window indel), merge with existing.
     if let Some(existing) = store.get_window(chrom, window_id)? {
         let schema = existing.schema();
@@ -307,16 +351,65 @@ fn flush_to_store(
         *total_windows += 1;
     }
 
-    *total_bytes += batches
-        .iter()
-        .map(|b| b.get_array_memory_size() as u64)
-        .sum::<u64>();
+    *total_bytes += mem_size;
+    Ok(())
+}
+
+/// v1 (columnar): write position index + per-column Arrow IPC entries.
+fn flush_to_store_v1(
+    store: &VepKvStore,
+    chrom: &str,
+    window_id: u64,
+    merged: RecordBatch,
+    total_windows: &mut u64,
+    total_bytes: &mut u64,
+) -> Result<()> {
+    // Check if window already exists (cross-window indel merge).
+    let merged = if let Some(existing_idx) = store.get_position_index(chrom, window_id)? {
+        // Merge: read existing columns back, concat with new batch.
+        let all_col_indices: Vec<u8> = (0..store.schema().fields().len() as u8).collect();
+        if let Some(existing_cols) = store.get_columns(chrom, window_id, &all_col_indices)? {
+            let existing_arrays: Vec<datafusion::arrow::array::ArrayRef> =
+                existing_cols.into_iter().map(|(a, _)| a).collect();
+            let existing_batch = RecordBatch::try_new(store.schema().clone(), existing_arrays)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            drop(existing_idx);
+            datafusion::arrow::compute::concat_batches(
+                &store.schema().clone(),
+                &[existing_batch, merged],
+            )
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+        } else {
+            merged
+        }
+    } else {
+        *total_windows += 1;
+        merged
+    };
+
+    // Build and write position index.
+    let pos_index = PositionIndex::from_batch(&merged)?;
+    store.put_position_index(chrom, window_id, &pos_index)?;
+
+    // Write each column separately.
+    for (col_idx, field) in merged.schema().fields().iter().enumerate() {
+        store.put_column(
+            chrom,
+            window_id,
+            col_idx as u8,
+            merged.column(col_idx),
+            field,
+        )?;
+    }
+
+    *total_bytes += merged.get_array_memory_size() as u64;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_store::FORMAT_V0;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
@@ -346,32 +439,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_loader_basic() {
+    async fn test_loader_basic_v0() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = SessionContext::new();
 
         let (schema, table) = make_test_table();
         ctx.register_table("source", Arc::new(table)).unwrap();
 
-        let loader = CacheLoader::new("source", dir.path().to_str().unwrap());
+        let loader = CacheLoader::new("source", dir.path().to_str().unwrap())
+            .with_window_size(1_000_000)
+            .with_format_version(FORMAT_V0);
         let stats = loader.load(&ctx).await.unwrap();
 
-        assert_eq!(stats.total_windows, 3); // chr1:window0, chr1:window1, chr2:window0
+        assert_eq!(stats.total_windows, 3);
 
-        // Verify data
         let store = VepKvStore::open(dir.path()).unwrap();
+        assert_eq!(store.format_version(), FORMAT_V0);
         assert_eq!(store.schema().as_ref(), schema.as_ref());
 
-        // Chr1 window 0 has 2 variants (pos 100, 500_000)
         let batch = store.get_window("1", 0).unwrap().unwrap();
         assert_eq!(batch.num_rows(), 2);
 
-        // Chr1 window 1 has 1 variant (pos 1_500_000)
         let batch = store.get_window("1", 1).unwrap().unwrap();
         assert_eq!(batch.num_rows(), 1);
 
-        // Chr2 window 0 has 1 variant
         let batch = store.get_window("2", 0).unwrap().unwrap();
         assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_basic_v1() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+
+        let (schema, table) = make_test_table();
+        ctx.register_table("source", Arc::new(table)).unwrap();
+
+        let loader =
+            CacheLoader::new("source", dir.path().to_str().unwrap()).with_window_size(1_000_000);
+        let stats = loader.load(&ctx).await.unwrap();
+
+        assert_eq!(stats.total_windows, 3);
+
+        let store = VepKvStore::open(dir.path()).unwrap();
+        assert_eq!(store.format_version(), FORMAT_V1);
+        assert_eq!(store.schema().as_ref(), schema.as_ref());
+
+        // v1: position index should be available
+        let idx = store.get_position_index("1", 0).unwrap().unwrap();
+        assert_eq!(idx.num_rows(), 2);
+
+        let idx = store.get_position_index("1", 1).unwrap().unwrap();
+        assert_eq!(idx.num_rows(), 1);
+
+        let idx = store.get_position_index("2", 0).unwrap().unwrap();
+        assert_eq!(idx.num_rows(), 1);
+
+        // v1: can read individual columns
+        let cols = store.get_columns("1", 0, &[0, 4]).unwrap().unwrap();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].0.len(), 2); // 2 rows in window 0
     }
 }

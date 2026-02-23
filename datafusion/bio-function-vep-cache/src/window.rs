@@ -92,13 +92,13 @@ pub fn window_end(window_id: u64, window_size: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key_encoding::DEFAULT_WINDOW_SIZE;
+    const W: u64 = 1_000_000; // Use explicit 1Mb for math tests
 
     #[test]
     fn test_group_single_window() {
         let chroms = vec!["1", "1", "1"];
         let starts = vec![100, 200, 300];
-        let groups = group_into_windows(&chroms, &starts, DEFAULT_WINDOW_SIZE);
+        let groups = group_into_windows(&chroms, &starts, W);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0.chrom, "1");
         assert_eq!(groups[0].0.window_id, 0);
@@ -109,7 +109,7 @@ mod tests {
     fn test_group_multiple_windows() {
         let chroms = vec!["1", "1", "1"];
         let starts = vec![500_000, 1_500_000, 2_500_000];
-        let groups = group_into_windows(&chroms, &starts, DEFAULT_WINDOW_SIZE);
+        let groups = group_into_windows(&chroms, &starts, W);
         assert_eq!(groups.len(), 3);
         assert_eq!(groups[0].0.window_id, 0);
         assert_eq!(groups[0].1, 0..1);
@@ -123,7 +123,7 @@ mod tests {
     fn test_group_chromosome_change() {
         let chroms = vec!["1", "1", "2"];
         let starts = vec![100, 200, 100];
-        let groups = group_into_windows(&chroms, &starts, DEFAULT_WINDOW_SIZE);
+        let groups = group_into_windows(&chroms, &starts, W);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].0.chrom, "1");
         assert_eq!(groups[1].0.chrom, "2");
@@ -133,21 +133,20 @@ mod tests {
     fn test_group_empty() {
         let chroms: Vec<&str> = Vec::new();
         let starts: Vec<i64> = Vec::new();
-        let groups = group_into_windows(&chroms, &starts, DEFAULT_WINDOW_SIZE);
+        let groups = group_into_windows(&chroms, &starts, W);
         assert!(groups.is_empty());
     }
 
     #[test]
     fn test_windows_for_variant_single_window() {
-        let windows = windows_for_variant("1", 100, 200, DEFAULT_WINDOW_SIZE);
+        let windows = windows_for_variant("1", 100, 200, W);
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].window_id, 0);
     }
 
     #[test]
     fn test_windows_for_variant_cross_boundary() {
-        // Variant spanning the 1Mb boundary
-        let windows = windows_for_variant("1", 999_990, 1_000_010, DEFAULT_WINDOW_SIZE);
+        let windows = windows_for_variant("1", 999_990, 1_000_010, W);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].window_id, 0);
         assert_eq!(windows[1].window_id, 1);
@@ -155,9 +154,9 @@ mod tests {
 
     #[test]
     fn test_window_start_end() {
-        assert_eq!(window_start(0, DEFAULT_WINDOW_SIZE), 0);
-        assert_eq!(window_end(0, DEFAULT_WINDOW_SIZE), 1_000_000);
-        assert_eq!(window_start(1, DEFAULT_WINDOW_SIZE), 1_000_000);
-        assert_eq!(window_end(1, DEFAULT_WINDOW_SIZE), 2_000_000);
+        assert_eq!(window_start(0, W), 0);
+        assert_eq!(window_end(0, W), 1_000_000);
+        assert_eq!(window_start(1, W), 1_000_000);
+        assert_eq!(window_end(1, W), 2_000_000);
     }
 }

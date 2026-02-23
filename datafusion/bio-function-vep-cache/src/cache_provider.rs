@@ -25,9 +25,14 @@ pub struct KvCacheTableProvider {
 }
 
 impl KvCacheTableProvider {
-    /// Open an existing KV cache at the given path.
+    /// Open an existing KV cache at the given path (default 256MB block cache).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let store = Arc::new(VepKvStore::open(path)?);
+        Self::open_with_cache_size(path, 256 * 1024 * 1024)
+    }
+
+    /// Open an existing KV cache with a custom fjall block cache size (bytes).
+    pub fn open_with_cache_size(path: impl AsRef<Path>, cache_size_bytes: u64) -> Result<Self> {
+        let store = Arc::new(VepKvStore::open_with_cache_size(path, cache_size_bytes)?);
         let schema = store.schema().clone();
         Ok(Self { store, schema })
     }

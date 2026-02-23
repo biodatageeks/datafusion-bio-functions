@@ -7,8 +7,13 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-/// Default window size in base pairs (1 Mb).
-pub const DEFAULT_WINDOW_SIZE: u64 = 1_000_000;
+/// Default window size in base pairs (10 Kb).
+///
+/// Benchmarked on chr22 (15.1M VEP variants, 78 columns):
+///   10kb → ~4K variants/window, 13ms read+index
+///  100kb → ~37K variants/window, 84ms read+index
+///    1Mb → ~369K variants/window, 453ms read+index
+pub const DEFAULT_WINDOW_SIZE: u64 = 10_000;
 
 /// Canonical chromosome order: 1-22, X, Y, MT.
 /// Maps chromosome name (without "chr" prefix) to a 2-byte big-endian code.
@@ -34,6 +39,72 @@ const CHROM_NAMES: &[&str] = &[
 /// Non-canonical chromosome code: used for contigs like "GL000220.1".
 /// These are sorted lexicographically after canonical chromosomes.
 const NON_CANONICAL_PREFIX: u16 = 0x8000;
+
+/// Entry type stored in the last byte of a v1 key.
+///
+/// v1 keys are 11 bytes: `[2B chrom][8B window_id][1B entry_type]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryType {
+    /// Compact binary position index (start, end, allele offsets).
+    PositionIndex,
+    /// Single column stored as Arrow IPC. The `u8` is the column index (0-based).
+    Column(u8),
+    /// Legacy monolithic Arrow IPC batch (all columns). Used for v0 backward compat reads.
+    LegacyMonolithic,
+}
+
+impl EntryType {
+    /// Maximum column index supported (0x00 through 0x4E = 79 columns).
+    pub const MAX_COLUMN_INDEX: u8 = 0x4E;
+
+    fn to_byte(self) -> u8 {
+        match self {
+            Self::PositionIndex => 0x00,
+            Self::Column(idx) => idx + 1, // 0x01..0x4F
+            Self::LegacyMonolithic => 0xFF,
+        }
+    }
+
+    fn from_byte(b: u8) -> Self {
+        match b {
+            0x00 => Self::PositionIndex,
+            0xFF => Self::LegacyMonolithic,
+            col => Self::Column(col - 1), // 0x01..0x4F → column 0..0x4E
+        }
+    }
+}
+
+/// Encode a (chrom, window_id, entry_type) triple into an 11-byte key.
+///
+/// Format: `[2-byte chrom code][8-byte big-endian window_id][1-byte entry_type]`
+pub fn encode_entry_key(chrom: &str, window_id: u64, entry: EntryType) -> Vec<u8> {
+    let chrom_bare = chrom.strip_prefix("chr").unwrap_or(chrom);
+    let code = CHROM_TO_CODE
+        .get(chrom_bare)
+        .copied()
+        .unwrap_or_else(|| non_canonical_code(chrom_bare));
+
+    let mut key = Vec::with_capacity(11);
+    key.extend_from_slice(&code.to_be_bytes());
+    key.extend_from_slice(&window_id.to_be_bytes());
+    key.push(entry.to_byte());
+    key
+}
+
+/// Decode an 11-byte key back into (chrom, window_id, entry_type).
+pub fn decode_entry_key(key: &[u8]) -> (String, u64, EntryType) {
+    assert!(key.len() >= 11, "entry key must be at least 11 bytes");
+    let code = u16::from_be_bytes([key[0], key[1]]);
+    let window_id = u64::from_be_bytes(key[2..10].try_into().unwrap());
+    let entry = EntryType::from_byte(key[10]);
+
+    let chrom = CODE_TO_CHROM
+        .get(&code)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("unk_{code:04x}"));
+
+    (chrom, window_id, entry)
+}
 
 /// Compute the window ID for a given genomic position.
 pub fn window_id_for_position(pos: i64, window_size: u64) -> u64 {
@@ -99,12 +170,18 @@ mod tests {
 
     #[test]
     fn test_window_id_for_position() {
+        const W: u64 = 1_000_000;
+        assert_eq!(window_id_for_position(0, W), 0);
+        assert_eq!(window_id_for_position(1, W), 0);
+        assert_eq!(window_id_for_position(999_999, W), 0);
+        assert_eq!(window_id_for_position(1_000_000, W), 1);
+        assert_eq!(window_id_for_position(1_500_000, W), 1);
+        assert_eq!(window_id_for_position(2_000_000, W), 2);
+
+        // Also test with the actual default
         assert_eq!(window_id_for_position(0, DEFAULT_WINDOW_SIZE), 0);
-        assert_eq!(window_id_for_position(1, DEFAULT_WINDOW_SIZE), 0);
-        assert_eq!(window_id_for_position(999_999, DEFAULT_WINDOW_SIZE), 0);
-        assert_eq!(window_id_for_position(1_000_000, DEFAULT_WINDOW_SIZE), 1);
-        assert_eq!(window_id_for_position(1_500_000, DEFAULT_WINDOW_SIZE), 1);
-        assert_eq!(window_id_for_position(2_000_000, DEFAULT_WINDOW_SIZE), 2);
+        assert_eq!(window_id_for_position(9_999, DEFAULT_WINDOW_SIZE), 0);
+        assert_eq!(window_id_for_position(10_000, DEFAULT_WINDOW_SIZE), 1);
     }
 
     #[test]
@@ -158,5 +235,47 @@ mod tests {
     #[test]
     fn test_negative_position() {
         assert_eq!(window_id_for_position(-1, DEFAULT_WINDOW_SIZE), 0);
+    }
+
+    #[test]
+    fn test_entry_type_roundtrip() {
+        let types = [
+            EntryType::PositionIndex,
+            EntryType::Column(0),
+            EntryType::Column(42),
+            EntryType::Column(EntryType::MAX_COLUMN_INDEX),
+            EntryType::LegacyMonolithic,
+        ];
+        for et in types {
+            assert_eq!(EntryType::from_byte(et.to_byte()), et);
+        }
+    }
+
+    #[test]
+    fn test_entry_key_roundtrip() {
+        let key = encode_entry_key("1", 42, EntryType::PositionIndex);
+        assert_eq!(key.len(), 11);
+        let (chrom, wid, entry) = decode_entry_key(&key);
+        assert_eq!(chrom, "1");
+        assert_eq!(wid, 42);
+        assert_eq!(entry, EntryType::PositionIndex);
+
+        let key = encode_entry_key("chr22", 100, EntryType::Column(5));
+        let (chrom, wid, entry) = decode_entry_key(&key);
+        assert_eq!(chrom, "22");
+        assert_eq!(wid, 100);
+        assert_eq!(entry, EntryType::Column(5));
+    }
+
+    #[test]
+    fn test_entry_key_ordering() {
+        // Same chrom + window, different entry types: position index < column < legacy
+        let k_pos = encode_entry_key("1", 0, EntryType::PositionIndex);
+        let k_col0 = encode_entry_key("1", 0, EntryType::Column(0));
+        let k_col5 = encode_entry_key("1", 0, EntryType::Column(5));
+        let k_legacy = encode_entry_key("1", 0, EntryType::LegacyMonolithic);
+        assert!(k_pos < k_col0);
+        assert!(k_col0 < k_col5);
+        assert!(k_col5 < k_legacy);
     }
 }

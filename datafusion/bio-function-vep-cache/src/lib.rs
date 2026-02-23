@@ -10,8 +10,10 @@ pub mod cache_provider;
 pub mod key_encoding;
 pub mod kv_store;
 pub mod loader;
+pub mod position_index;
 pub mod window;
 
 pub use cache_provider::KvCacheTableProvider;
 pub use kv_store::VepKvStore;
 pub use loader::CacheLoader;
+pub use position_index::PositionIndex;
