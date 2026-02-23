@@ -139,10 +139,17 @@ impl ConfigField for Algorithm {
 /// Equivalent to calling [`BioSessionExt::new_with_bio`] followed by
 /// [`register_ranges_functions`](crate::table_function::register_ranges_functions).
 pub fn create_bio_session() -> SessionContext {
-    let config = SessionConfig::from(ConfigOptions::new())
+    let mut config = SessionConfig::from(ConfigOptions::new())
         .with_option_extension(BioConfig::default())
         .with_information_schema(true)
         .with_repartition_joins(false);
+
+    // Enable parquet filter pushdown (late materialization): decode filter columns
+    // first, build a row selection mask, then decode projected columns only for
+    // matching rows. Critical for VEP cache where annotation columns are >95% null.
+    config.options_mut().execution.parquet.pushdown_filters = true;
+    config.options_mut().execution.parquet.reorder_filters = true;
+
     let ctx = SessionContext::new_with_bio(config);
     crate::table_function::register_ranges_functions(&ctx);
     ctx

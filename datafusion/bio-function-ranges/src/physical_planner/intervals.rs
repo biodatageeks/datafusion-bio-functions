@@ -41,15 +41,21 @@ fn map_column_to_source_schema(
     indices: &[ColumnIndex],
 ) -> (Arc<dyn PhysicalExpr>, JoinSide) {
     let mut side: Option<JoinSide> = None;
-    let message = format!("complex sub queries are not supported {expr:?}");
+    let message = format!("cross-side expression not supported {expr:?}");
 
     expr.transform_up(|node| {
         if let Some(column) = node.as_any().downcast_ref::<Column>() {
             let new_column = Column::new(column.name(), indices[column.index()].index);
-            if side.is_some() {
-                panic!("{}", message);
+            let col_side = indices[column.index()].side;
+            if let Some(existing) = side {
+                // Multiple columns are allowed if they come from the same side
+                // (e.g., CASE WHEN start > end THEN end ELSE start END).
+                if existing != col_side {
+                    panic!("{}", message);
+                }
+            } else {
+                side = Some(col_side);
             }
-            side = Some(indices[column.index()].side);
             Ok(Transformed::yes(Arc::new(new_column)))
         } else {
             Ok(Transformed::no(node))
@@ -190,8 +196,8 @@ impl IntervalBuilder {
 fn flatten_and(expr: &Arc<dyn PhysicalExpr>, out: &mut Vec<Arc<dyn PhysicalExpr>>) {
     if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
         if matches!(binary.op(), Operator::And) {
-            flatten_and(&binary.left(), out);
-            flatten_and(&binary.right(), out);
+            flatten_and(binary.left(), out);
+            flatten_and(binary.right(), out);
             return;
         }
     }

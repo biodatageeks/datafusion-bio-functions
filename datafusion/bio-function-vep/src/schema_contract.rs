@@ -19,6 +19,13 @@ pub const REQUIRED_VARIATION_COLUMNS: &[(&str, DataType)] = &[
 /// side) and `source_*` internal bookkeeping columns.
 pub const COORDINATE_COLUMNS: &[&str] = &["chrom", "start", "end"];
 
+/// Structurally non-null columns in the variation cache.
+///
+/// These must be excluded from the annotation null-filter (`WHERE col IS NOT NULL OR …`)
+/// because they are always populated. Including them makes the OR condition trivially
+/// true and defeats sparse-column pruning entirely.
+pub const STRUCTURAL_COLUMNS: &[&str] = &["chrom", "start", "end", "variation_name", "allele_string"];
+
 /// Check if two data types are compatible (treating Utf8/Utf8View/LargeUtf8 as
 /// interchangeable, since DataFusion 50+ reads parquet strings as Utf8View).
 fn types_compatible(actual: &DataType, expected: &DataType) -> bool {

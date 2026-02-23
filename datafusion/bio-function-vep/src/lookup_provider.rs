@@ -18,7 +18,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
 
 use crate::coordinate::CoordinateNormalizer;
-use crate::schema_contract::validate_variation_schema;
+use crate::schema_contract::{STRUCTURAL_COLUMNS, validate_variation_schema};
 
 /// Table provider that implements variant lookup via interval join.
 ///
@@ -142,6 +142,7 @@ impl TableProvider for LookupProvider {
             .cloned()
             .unwrap_or_else(|| (0..total_output_fields).collect());
 
+        let variation_name_requested = self.cache_columns.iter().any(|c| c == "variation_name");
         let mut projected_output_exprs = Vec::with_capacity(projected_indices.len());
         let mut required_vcf_columns = BTreeSet::<String>::new();
 
@@ -165,8 +166,16 @@ impl TableProvider for LookupProvider {
                         self.cache_columns.len()
                     ))
                 })?;
-                projected_output_exprs
-                    .push(format!("b.`{cache_col_name}` AS `cache_{cache_col_name}`"));
+                if variation_name_requested && cache_col_name == "variation_name" {
+                    projected_output_exprs.push(
+                        "COALESCE(b.`variation_name`, bi.`variation_name`, c.`variation_name`) AS `cache_variation_name`"
+                            .to_string(),
+                    );
+                } else {
+                    projected_output_exprs.push(format!(
+                        "COALESCE(b.`{cache_col_name}`, bi.`{cache_col_name}`) AS `cache_{cache_col_name}`"
+                    ));
+                }
             }
         }
 
@@ -217,27 +226,57 @@ impl TableProvider for LookupProvider {
         // `bio.coordinate_system_zero_based` metadata:
         // - zero-based half-open [start, end) -> [start + 1, end]
         // - one-based closed [start, end]     -> [start, end]
-        //
-        // After normalization, overlap is standard inclusive overlap.
         let vcf_start_expr = if self.coord_normalizer.input_zero_based {
             "CAST(a.`start` AS BIGINT) + 1"
         } else {
             "CAST(a.`start` AS BIGINT)"
         };
-        let cache_start_expr = if self.coord_normalizer.cache_zero_based {
+        let cache_start_expr_b = if self.coord_normalizer.cache_zero_based {
             "CAST(b.`start` AS BIGINT) + 1"
         } else {
             "CAST(b.`start` AS BIGINT)"
         };
         let vcf_end_expr = "CAST(a.`end` AS BIGINT)";
-        let cache_end_expr = "CAST(b.`end` AS BIGINT)";
+        let cache_end_expr_b = "CAST(b.`end` AS BIGINT)";
 
         let on_clause = format!(
             "a.`chrom` = b.`chrom` \
-             AND {vcf_end_expr} >= {cache_start_expr} \
-             AND {vcf_start_expr} <= {cache_end_expr} \
+             AND {vcf_end_expr} >= {cache_start_expr_b} \
+             AND {vcf_start_expr} <= {cache_end_expr_b} \
              AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
         );
+
+        // Insertion fallback: handle cache rows encoded with inverted coordinates
+        // (`start = end + 1`). The primary overlap join cannot match these rows,
+        // so we probe them in a secondary left join anchored on `end`.
+        let cache_end_expr_bi = "CAST(bi.`end` AS BIGINT)";
+        let insertion_on_clause = format!(
+            "b.`chrom` IS NULL \
+             AND a.`chrom` = bi.`chrom` \
+             AND {vcf_end_expr} = {cache_end_expr_bi} \
+             AND match_allele(a.`ref`, a.`alt`, bi.`allele_string`)"
+        );
+
+        // Optional co-located fallback for `variation_name`:
+        // when no exact allele match exists, emit variation IDs from any
+        // overlapping cache rows at the locus.
+        let coloc_on_clause = if variation_name_requested {
+            let cache_start_expr_c = if self.coord_normalizer.cache_zero_based {
+                "CAST(c.`start` AS BIGINT) + 1"
+            } else {
+                "CAST(c.`start` AS BIGINT)"
+            };
+            let cache_end_expr_c = "CAST(c.`end` AS BIGINT)";
+            Some(format!(
+                "b.`chrom` IS NULL \
+                 AND bi.`chrom` IS NULL \
+                 AND a.`chrom` = c.`chrom` \
+                 AND {vcf_end_expr} >= {cache_start_expr_c} \
+                 AND {vcf_start_expr} <= {cache_end_expr_c}"
+            ))
+        } else {
+            None
+        };
 
         // Build the LEFT JOIN query.
         // VCF is the left (build) side — small, fully indexed in memory.
@@ -248,6 +287,8 @@ impl TableProvider for LookupProvider {
         // (chrom, start, end, allele_string) with different variation_name
         // values (e.g. dbSNP + COSMIC IDs). These produce ~0.03% extra
         // output rows compared to VEP (which deduplicates internally).
+        // Secondary insertion and co-located fallbacks can add more rows for
+        // unmatched variants (improving coverage parity over strict exact-only matching).
         // A post-join GROUP BY would fix this but turns the streaming
         // pipeline into a blocking operation with high memory usage, so
         // we accept the minor discrepancy for performance.
@@ -261,21 +302,61 @@ impl TableProvider for LookupProvider {
                 self.cache_table
             )
         } else {
-            // Pre-filter cache rows where all selected annotation columns are NULL
-            let null_filter = self
+            // Pre-filter cache rows where ALL annotation columns are NULL.
+            //
+            // Only true annotation columns (sparse) participate in the filter.
+            // Structural columns like variation_name and allele_string are always
+            // non-null — including them would make the OR condition trivially true
+            // and defeat sparse-column pruning entirely.
+            let annotation_filter_cols: Vec<&String> = self
                 .cache_columns
                 .iter()
-                .map(|c| format!("`{c}` IS NOT NULL"))
-                .collect::<Vec<_>>()
-                .join(" OR ");
+                .filter(|c| !STRUCTURAL_COLUMNS.contains(&c.as_str()))
+                .collect();
 
-            format!(
-                "SELECT {select_output} \
-                 FROM {vcf_from} LEFT JOIN \
-                 (SELECT {cache_inner_cols} FROM `{}` WHERE {null_filter}) AS b \
-                 ON {on_clause}",
-                self.cache_table,
-            )
+            let cache_where = if annotation_filter_cols.is_empty() {
+                String::new()
+            } else {
+                let conditions = annotation_filter_cols
+                    .iter()
+                    .map(|c| format!("`{c}` IS NOT NULL"))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                format!(" WHERE {conditions}")
+            };
+            let insertion_filter = "CAST(`start` AS BIGINT) = CAST(`end` AS BIGINT) + 1";
+            let insertion_where = if cache_where.is_empty() {
+                format!(" WHERE {insertion_filter}")
+            } else {
+                format!("{cache_where} AND {insertion_filter}")
+            };
+
+            if let Some(coloc_on_clause) = coloc_on_clause {
+                format!(
+                    "SELECT {select_output} \
+                     FROM {vcf_from} LEFT JOIN \
+                     (SELECT {cache_inner_cols} FROM `{}`{cache_where}) AS b \
+                     ON {on_clause} \
+                     LEFT JOIN \
+                     (SELECT {cache_inner_cols} FROM `{}`{insertion_where}) AS bi \
+                     ON {insertion_on_clause} \
+                     LEFT JOIN \
+                     (SELECT `chrom`, `start`, `end`, `variation_name` FROM `{}` WHERE `variation_name` IS NOT NULL) AS c \
+                     ON {coloc_on_clause}",
+                    self.cache_table, self.cache_table, self.cache_table,
+                )
+            } else {
+                format!(
+                    "SELECT {select_output} \
+                     FROM {vcf_from} LEFT JOIN \
+                     (SELECT {cache_inner_cols} FROM `{}`{cache_where}) AS b \
+                     ON {on_clause} \
+                     LEFT JOIN \
+                     (SELECT {cache_inner_cols} FROM `{}`{insertion_where}) AS bi \
+                     ON {insertion_on_clause}",
+                    self.cache_table, self.cache_table,
+                )
+            }
         };
 
         let df = self.session.sql(&query).await?;
@@ -597,6 +678,225 @@ mod tests {
         assert!(
             !var_names.contains(&"rs201".to_string()),
             "Decoy rs201 should NOT appear in output, got: {var_names:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_matches_multi_alt_rows() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G|T"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(StringArray::from(vec!["rsG", "rsT"])),
+                Arc::new(StringArray::from(vec!["A/G", "A/T"])),
+                Arc::new(StringArray::from(vec!["benign", "benign"])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_multi_alt", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_multi_alt", Arc::new(cache))
+            .unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_multi_alt', 'cache_multi_alt', 'variation_name')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 2,
+            "Expected both ALT alleles to match cache rows"
+        );
+
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+        var_names.sort();
+        assert_eq!(var_names, vec!["rsG", "rsT"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_matches_insertion_rows_with_start_gt_end() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["AC"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![101, 100])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(StringArray::from(vec!["rsIns", "rsDecoy"])),
+                Arc::new(StringArray::from(vec!["-/C", "A/T"])),
+                Arc::new(StringArray::from(vec!["benign", "benign"])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_insertion", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_insertion", Arc::new(cache))
+            .unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_insertion', 'cache_insertion', 'variation_name')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+
+        assert_eq!(var_names, vec!["rsIns"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_variation_name_colocated_fallback() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![101])),
+                Arc::new(StringArray::from(vec!["AT"])),
+                Arc::new(StringArray::from(vec!["A"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["rs_coloc"])),
+                Arc::new(StringArray::from(vec!["A/G"])),
+                Arc::new(StringArray::from(vec!["pathogenic"])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_coloc", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_coloc", Arc::new(cache)).unwrap();
+
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_coloc', 'cache_coloc', 'variation_name,clin_sig')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "Expected one fallback row");
+
+        let mut var_names = Vec::new();
+        let mut clin_sigs = Vec::new();
+        for batch in &batches {
+            let var_col = batch.column_by_name("cache_variation_name").unwrap();
+            let clin_col = batch.column_by_name("cache_clin_sig").unwrap();
+            var_names.extend(string_values(var_col).into_iter());
+            clin_sigs.extend(string_values(clin_col).into_iter());
+        }
+
+        assert_eq!(var_names, vec![Some("rs_coloc".to_string())]);
+        assert_eq!(
+            clin_sigs,
+            vec![None],
+            "Fallback should not hydrate non-variation columns from non-allele matches"
         );
     }
 
@@ -931,6 +1231,176 @@ mod tests {
             var_names,
             vec!["COSM123", "rs100", "rs100_dup"],
             "Expected all three variation_names in output"
+        );
+    }
+
+    /// The null filter must exclude structural columns (variation_name, allele_string)
+    /// that are always non-null. Otherwise the OR filter is trivially true and
+    /// cache rows with NULL annotations are not pruned.
+    ///
+    /// Scenario: 3 cache rows at the same position. Only row 1 has clin_sig;
+    /// rows 2 and 3 have NULL clin_sig (bare variant entries).
+    /// When requesting `variation_name,clin_sig`, only the annotated row should
+    /// participate in the primary join — the bare entries add no annotation value.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_null_filter_prunes_bare_variants_with_dense_column() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![101])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        // Cache: 3 rows at position 100, same allele. Only first has clin_sig.
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(StringArray::from(vec!["rs100", "COSM123", "rs100_b"])),
+                Arc::new(StringArray::from(vec!["A/G", "A/G", "A/G"])),
+                Arc::new(StringArray::from(vec![
+                    Some("benign"),
+                    None, // bare entry
+                    None, // bare entry
+                ])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_sparse", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_sparse", Arc::new(cache))
+            .unwrap();
+
+        // Request variation_name (dense) alongside clin_sig (sparse).
+        // The null filter must exclude variation_name from the OR condition,
+        // otherwise all 3 cache rows pass and the primary join returns 3 rows.
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_sparse', 'cache_sparse', 'variation_name,clin_sig')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // Primary join matches rs100 (annotated). Bare entries are filtered.
+        // Colocated fallback may add 1 row with COSM123/rs100_b variation_name.
+        // Either way, clin_sig should only be "benign" (never NULL from bare).
+        let mut clin_sigs = Vec::new();
+        for batch in &batches {
+            let cs_col = batch.column_by_name("cache_clin_sig").unwrap();
+            for val in string_values(cs_col) {
+                clin_sigs.push(val.unwrap_or("NULL".to_string()));
+            }
+        }
+        assert!(
+            clin_sigs.contains(&"benign".to_string()),
+            "Expected 'benign' in output, got: {clin_sigs:?}"
+        );
+        // The key assertion: bare entries with NULL clin_sig should not produce
+        // extra "NULL" annotation rows in the output via the primary join.
+        let null_clin_sig_count = clin_sigs.iter().filter(|c| *c == "NULL").count();
+        assert!(
+            null_clin_sig_count <= 1,
+            "Expected at most 1 NULL clin_sig (from colocated fallback), got {null_clin_sig_count} NULLs in {clin_sigs:?}"
+        );
+        assert!(
+            total_rows <= 2,
+            "Expected at most 2 rows (1 annotated + up to 1 colocated fallback), got {total_rows}"
+        );
+    }
+
+    /// When requesting only variation_name (a structural column), no null filter
+    /// should be applied — all matching cache rows appear in the output.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_no_null_filter_for_structural_columns_only() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![101])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(StringArray::from(vec!["rs100", "COSM123", "rs100_b"])),
+                Arc::new(StringArray::from(vec!["A/G", "A/G", "A/G"])),
+                Arc::new(StringArray::from(vec![
+                    Some("benign"),
+                    None,
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_dense", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_dense", Arc::new(cache)).unwrap();
+
+        // Request ONLY variation_name — no annotation columns, no null filter.
+        // All 3 cache entries match and should appear.
+        let df = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_dense', 'cache_dense', 'variation_name')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 3,
+            "Expected 3 rows (all cache entries) when no annotation filter is applied, got {total_rows}"
         );
     }
 }

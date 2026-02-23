@@ -43,6 +43,17 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
     (vep_ref, vep_alt)
 }
 
+/// Split VCF ALT into per-allele values.
+///
+/// `bio-format-vcf` currently stores multi-allelic ALT with `|` separators, while
+/// other providers may preserve comma-separated ALT as in VCF text.
+fn split_alt_alleles(vcf_alt: &str) -> impl Iterator<Item = &str> {
+    vcf_alt
+        .split(['|', ','])
+        .map(str::trim)
+        .filter(|alt| !alt.is_empty() && *alt != ".")
+}
+
 /// Check if a VCF variant matches a VEP-format allele_string.
 ///
 /// The cache `allele_string` is formatted as "REF/ALT1/ALT2" (e.g. "A/G", "A/G/T", "CGT/-").
@@ -50,19 +61,32 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
 /// 1. The reference allele in `allele_string` matches the VEP-converted REF
 ///    (or the original VCF REF, for caches using VCF-format allele strings).
 /// 2. At least one ALT allele in `allele_string` matches the VEP-converted ALT.
+///
+/// `vcf_alt` can be a single allele (`"G"`) or a multi-allelic value
+/// (`"G|T"` or `"G,T"`). A match on any ALT allele is accepted.
 pub fn allele_matches(vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool {
-    let (vep_ref, vep_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
     let mut parts = allele_string.split('/');
+    let cache_ref = match parts.next() {
+        Some(ref_allele) => ref_allele,
+        None => return false,
+    };
+    let cache_alts: Vec<&str> = parts.collect();
 
-    // Verify reference allele: accept either VEP-format (prefix-stripped) or
-    // VCF-format (full REF) since caches may use either convention.
-    match parts.next() {
-        Some(ref_allele) if ref_allele == vep_ref || ref_allele == vcf_ref => {}
-        _ => return false,
+    for alt in split_alt_alleles(vcf_alt) {
+        let (vep_ref, vep_alt) = vcf_to_vep_allele(vcf_ref, alt);
+
+        // Verify reference allele: accept either VEP-format (prefix-stripped) or
+        // VCF-format (full REF) since caches may use either convention.
+        if cache_ref != vep_ref && cache_ref != vcf_ref {
+            continue;
+        }
+
+        if cache_alts.iter().any(|a| *a == vep_alt) {
+            return true;
+        }
     }
 
-    // Check if any ALT allele matches
-    parts.any(|a| a == vep_alt)
+    false
 }
 
 /// Create the `match_allele(vcf_ref, vcf_alt, allele_string)` scalar UDF.
@@ -223,6 +247,19 @@ mod tests {
         assert!(allele_matches("A", "G", "A/G/T"));
         assert!(allele_matches("A", "T", "A/G/T"));
         assert!(!allele_matches("A", "C", "A/G/T"));
+    }
+
+    #[test]
+    fn test_allele_matches_multi_allelic_alt_pipe_input() {
+        assert!(allele_matches("A", "G|T", "A/G/T"));
+        assert!(allele_matches("A", "C|T", "A/G/T"));
+        assert!(!allele_matches("A", "C|A", "A/G/T"));
+    }
+
+    #[test]
+    fn test_allele_matches_multi_allelic_alt_comma_input() {
+        assert!(allele_matches("A", "G,T", "A/G/T"));
+        assert!(!allele_matches("A", "C,A", "A/G/T"));
     }
 
     #[test]
