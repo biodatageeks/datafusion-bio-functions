@@ -11,6 +11,9 @@ pub mod lookup_provider;
 pub mod schema_contract;
 pub mod table_function;
 
+#[cfg(feature = "kv-cache")]
+pub use datafusion_bio_function_vep_cache as kv_cache;
+
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;

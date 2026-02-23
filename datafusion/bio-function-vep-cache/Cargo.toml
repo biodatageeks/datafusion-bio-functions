@@ -1,7 +1,7 @@
 [package]
-name = "datafusion-bio-function-vep"
+name = "datafusion-bio-function-vep-cache"
 version = "0.1.0"
-description = "VEP (Variant Effect Predictor) annotation functions for Apache DataFusion"
+description = "fjall KV cache backend for VEP variant lookup in Apache DataFusion"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -10,15 +10,13 @@ edition.workspace = true
 
 [dependencies]
 datafusion.workspace = true
-datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
-datafusion-bio-function-vep-cache = { path = "../bio-function-vep-cache", optional = true }
 tokio.workspace = true
 futures.workspace = true
 log.workspace = true
+fjall = "2"
+arrow-ipc = { version = "56", features = ["lz4"] }
 async-trait = "0.1.88"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-
-[features]
-kv-cache = ["dep:datafusion-bio-function-vep-cache"]
+tempfile = "3"

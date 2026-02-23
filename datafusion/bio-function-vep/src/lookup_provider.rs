@@ -147,6 +147,51 @@ impl TableProvider for LookupProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // KV cache dispatch: if the cache table is a KvCacheTableProvider,
+        // use the window-based KvLookupExec instead of SQL/IntervalJoinExec.
+        #[cfg(feature = "kv-cache")]
+        {
+            use crate::allele::{allele_matches, allele_matches_relaxed};
+            use datafusion_bio_function_vep_cache::KvCacheTableProvider;
+            use datafusion_bio_function_vep_cache::cache_exec::{KvLookupExec, KvMatchMode};
+
+            let table_ref = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(self.session.table_provider(&self.cache_table))
+            });
+            if let Ok(provider) = table_ref {
+                if let Some(kv_provider) = provider.as_any().downcast_ref::<KvCacheTableProvider>()
+                {
+                    let store = kv_provider.store().clone();
+
+                    let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
+
+                    let vcf_df = self.session.table(&self.vcf_table).await?;
+                    let vcf_plan = vcf_df.create_physical_plan().await?;
+
+                    let (kv_mode, relaxed) = match self.match_mode {
+                        MatchMode::Exact => (KvMatchMode::Exact, None),
+                        MatchMode::ExactOrColocatedIds => (KvMatchMode::ExactOrColocated, None),
+                        MatchMode::ExactOrVepExisting => (
+                            KvMatchMode::ExactOrRelaxed,
+                            Some(allele_matches_relaxed as fn(&str, &str, &str) -> bool),
+                        ),
+                    };
+
+                    return Ok(Arc::new(KvLookupExec::new(
+                        vcf_plan,
+                        store,
+                        self.cache_columns.clone(),
+                        kv_mode,
+                        allele_matches as fn(&str, &str, &str) -> bool,
+                        relaxed,
+                        vcf_has_chr,
+                        self.coord_normalizer.input_zero_based,
+                        self.coord_normalizer.cache_zero_based,
+                    )?));
+                }
+            }
+        }
         let total_output_fields = self.schema.fields().len();
         let vcf_output_fields = self.vcf_schema.fields().len();
         let projected_indices: Vec<usize> = projection
