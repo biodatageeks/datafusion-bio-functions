@@ -60,7 +60,7 @@ extensions_options! {
         pub prefer_interval_join: bool, default = true
         pub interval_join_algorithm: Algorithm, default = Algorithm::default()
         pub interval_join_low_memory: bool, default = false
-        pub interval_join_partitioned_left_join: bool, default = false
+        pub interval_join_partitioned_left_join: bool, default = true
     }
 }
 
@@ -151,8 +151,7 @@ impl ConfigField for Algorithm {
 pub fn create_bio_session() -> SessionContext {
     let mut config = SessionConfig::from(ConfigOptions::new())
         .with_option_extension(BioConfig::default())
-        .with_information_schema(true)
-        .with_repartition_joins(false);
+        .with_information_schema(true);
 
     // Enable parquet filter pushdown (late materialization): decode filter columns
     // first, build a row selection mask, then decode projected columns only for

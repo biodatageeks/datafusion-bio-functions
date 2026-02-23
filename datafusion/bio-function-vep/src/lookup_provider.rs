@@ -291,7 +291,8 @@ impl TableProvider for LookupProvider {
         );
 
         let df = self.session.sql(&query).await?;
-        df.create_physical_plan().await
+        let plan = df.create_physical_plan().await?;
+        Ok(plan)
     }
 }
 
