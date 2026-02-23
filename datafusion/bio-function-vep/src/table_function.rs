@@ -10,7 +10,9 @@ use datafusion::logical_expr::Expr;
 use datafusion::prelude::SessionContext;
 
 use crate::lookup_provider::LookupProvider;
-use crate::schema_contract::{COORDINATE_COLUMNS, parse_column_list, validate_requested_columns};
+use crate::schema_contract::{
+    CONSTANT_COLUMNS, COORDINATE_COLUMNS, parse_column_list, validate_requested_columns,
+};
 
 /// Table function implementing `lookup_variants(vcf_table, cache_table [, columns [, prune]])`.
 pub struct LookupFunction {
@@ -58,7 +60,9 @@ impl TableFunctionImpl for LookupFunction {
                 .iter()
                 .map(|f| f.name().clone())
                 .filter(|name| {
-                    !COORDINATE_COLUMNS.contains(&name.as_str()) && !name.starts_with("source_")
+                    !COORDINATE_COLUMNS.contains(&name.as_str())
+                        && !CONSTANT_COLUMNS.contains(&name.as_str())
+                        && !name.starts_with("source_")
                 })
                 .collect()
         };

@@ -16,8 +16,19 @@ pub const REQUIRED_VARIATION_COLUMNS: &[(&str, DataType)] = &[
 ];
 
 /// Columns excluded from the default output: coordinate columns (already on the VCF
-/// side) and `source_*` internal bookkeeping columns.
+/// side), `source_*` internal bookkeeping columns, and constant metadata columns
+/// that have the same value in every row of the VEP cache.
 pub const COORDINATE_COLUMNS: &[&str] = &["chrom", "start", "end"];
+
+/// Columns that are constant across all rows in the VEP cache (e.g. "homo_sapiens",
+/// "GRCh38", "115"). These carry no per-variant information and are excluded from
+/// the default column set to keep the output schema clean.
+pub const CONSTANT_COLUMNS: &[&str] = &[
+    "species",
+    "assembly",
+    "cache_version",
+    "serializer_type",
+];
 
 /// Structurally non-null columns in the variation cache.
 ///

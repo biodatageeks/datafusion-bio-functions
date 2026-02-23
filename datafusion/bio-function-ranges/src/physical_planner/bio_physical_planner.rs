@@ -2,6 +2,7 @@ use crate::physical_planner::intervals::{ColIntervals, parse};
 use crate::physical_planner::joins::interval_join::IntervalJoinExec;
 use crate::session_context::{Algorithm, BioConfig};
 use async_trait::async_trait;
+use datafusion::common::JoinType;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{DFSchema, NullEquality, Result};
 use datafusion::config::ConfigOptions;
@@ -116,7 +117,7 @@ fn from_hash_join(
     if partition_mode == PartitionMode::Auto {
         partition_mode = PartitionMode::CollectLeft;
     }
-    if partitioned_left_join && join_exec.join_type == datafusion::common::JoinType::Left {
+    if partitioned_left_join && join_exec.join_type == JoinType::Left {
         partition_mode = PartitionMode::Partitioned;
     }
 

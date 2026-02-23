@@ -27,10 +27,13 @@ impl BioSessionExt for SessionContext {
 
     fn with_config_rt_bio(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
         let mut rules = PhysicalOptimizer::new().rules;
-        // Insert IntervalJoinExec rule BEFORE join_selection so range joins
-        // are replaced first, then join_selection handles remaining joins
-        // (e.g., insertion fallback, colocated fallback) by resolving
-        // PartitionMode::Auto to a concrete mode.
+        // Insert IntervalJoinExec rule BEFORE join_selection. This prevents
+        // join_selection from swapping build/probe sides (LEFT→RIGHT),
+        // which would put the large cache on the build side.
+        //
+        // join_selection is kept so it can resolve PartitionMode::Auto on
+        // any remaining HashJoinExec/NestedLoopJoinExec nodes that our
+        // rule doesn't replace (non-range joins).
         let pos = rules
             .iter()
             .position(|r| r.name() == "join_selection")
