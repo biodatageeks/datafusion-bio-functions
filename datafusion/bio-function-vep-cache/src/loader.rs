@@ -4,11 +4,14 @@
 //! grouping variants into windows and parallelizing across DataFusion
 //! physical partitions.
 //!
-//! Two-phase approach:
+//! Three-phase approach:
 //! 1. **Read phase** (parallel): each partition reads its stream and groups
 //!    rows by (chrom, window_id) into a shared in-memory buffer.
-//! 2. **Write phase** (sequential): each window is flushed to fjall exactly
-//!    once — no read-modify-write overhead.
+//! 2. **Serialize phase** (parallel): each window's data is serialized to
+//!    Arrow IPC bytes (position index + per-column entries) on the blocking
+//!    thread pool.
+//! 3. **Write phase** (batched): pre-serialized entries are batch-inserted
+//!    into fjall using the `Batch` API to minimize L0 compaction pressure.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -25,8 +28,12 @@ use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use log::info;
 
-use crate::key_encoding::{DEFAULT_WINDOW_SIZE, window_id_for_position};
-use crate::kv_store::{FORMAT_V1, VepKvStore, to_v1_column_index, validate_v1_schema_width};
+use crate::key_encoding::{
+    DEFAULT_WINDOW_SIZE, EntryType, encode_entry_key, encode_window_key, window_id_for_position,
+};
+use crate::kv_store::{
+    FORMAT_V1, VepKvStore, serialize_ipc_pub, to_v1_column_index, validate_v1_schema_width,
+};
 use crate::position_index::PositionIndex;
 
 /// Statistics returned after loading.
@@ -176,26 +183,52 @@ impl CacheLoader {
                 .map_err(|e| DataFusionError::External(Box::new(e)))??;
         }
 
-        // Phase 2: Flush all accumulated windows to fjall (sequential).
-        // Each window is written exactly once — no read-modify-write.
+        // Phase 2+3: Serialize windows in parallel on blocking threads,
+        // then batch-insert into fjall.
         let all_windows = shared_buffers.drain();
-        let mut total_windows = 0u64;
-        let mut total_bytes = 0u64;
+        let num_windows = all_windows.len();
         let format_version = self.format_version;
 
-        info!("Flushing {} windows to fjall", all_windows.len());
+        info!("Serializing + writing {num_windows} windows (format v{format_version})");
 
-        for ((chrom, wid), batches) in &all_windows {
-            flush_to_store(
-                &store,
-                chrom,
-                *wid,
-                batches,
-                &mut total_windows,
-                &mut total_bytes,
-                format_version,
-            )?;
+        let serialize_start = Instant::now();
+
+        // Phase 2: Serialize each window in parallel on the blocking thread pool.
+        let mut join_set = tokio::task::JoinSet::new();
+        for ((chrom, wid), batches) in all_windows {
+            let schema = schema.clone();
+            join_set.spawn_blocking(move || {
+                prepare_window_entries(&schema, &chrom, wid, batches, format_version)
+            });
         }
+
+        // Phase 3: Collect serialized entries and batch-insert into fjall.
+        // Process in chunks to bound memory and reduce L0 pressure.
+        const WINDOWS_PER_BATCH: usize = 100;
+        let mut pending_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut total_windows = 0u64;
+        let mut total_bytes = 0u64;
+
+        while let Some(result) = join_set.join_next().await {
+            let prepared = result.map_err(|e| DataFusionError::External(Box::new(e)))??;
+            total_bytes += prepared.total_bytes;
+            total_windows += 1;
+            pending_entries.extend(prepared.entries);
+
+            if total_windows % WINDOWS_PER_BATCH as u64 == 0 {
+                store.batch_insert_raw(&pending_entries)?;
+                pending_entries.clear();
+            }
+        }
+        // Flush remaining entries.
+        if !pending_entries.is_empty() {
+            store.batch_insert_raw(&pending_entries)?;
+        }
+
+        let serialize_elapsed = serialize_start.elapsed().as_secs_f64();
+        info!(
+            "Serialize+write phase: {serialize_elapsed:.1}s for {total_windows} windows"
+        );
 
         store.persist()?;
 
@@ -315,115 +348,101 @@ fn string_value(col: &dyn Array, row: usize) -> &str {
     }
 }
 
-/// Merge batches for a window and write to the KV store.
-fn flush_to_store(
-    store: &VepKvStore,
+/// Pre-serialized window data ready for batch insertion into fjall.
+struct PreparedWindow {
+    /// (key, value) pairs to insert into the data partition.
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Approximate in-memory size of the source data.
+    total_bytes: u64,
+}
+
+/// Serialize a window's data into (key, value) pairs for batch insertion.
+///
+/// This is CPU-bound (Arrow IPC + LZ4 compression) and designed to run on
+/// `tokio::task::spawn_blocking`.
+fn prepare_window_entries(
+    schema: &SchemaRef,
     chrom: &str,
     window_id: u64,
-    batches: &[RecordBatch],
-    total_windows: &mut u64,
-    total_bytes: &mut u64,
+    batches: Vec<RecordBatch>,
     format_version: u8,
-) -> Result<()> {
+) -> Result<PreparedWindow> {
     if batches.is_empty() {
-        return Ok(());
+        return Ok(PreparedWindow {
+            entries: vec![],
+            total_bytes: 0,
+        });
     }
 
     let merged = if batches.len() == 1 {
-        batches[0].clone()
+        batches.into_iter().next().unwrap()
     } else {
-        let schema = batches[0].schema();
-        datafusion::arrow::compute::concat_batches(&schema, batches)
+        datafusion::arrow::compute::concat_batches(schema, &batches)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
     };
+
+    let total_bytes = merged.get_array_memory_size() as u64;
 
     if format_version >= FORMAT_V1 {
-        flush_to_store_v1(store, chrom, window_id, merged, total_windows, total_bytes)?;
+        prepare_v1_entries(chrom, window_id, &merged, total_bytes)
     } else {
-        flush_to_store_v0(store, chrom, window_id, merged, total_windows, total_bytes)?;
+        prepare_v0_entries(chrom, window_id, &merged, total_bytes)
     }
-
-    Ok(())
 }
 
-/// v0 (legacy monolithic): write all columns as a single Arrow IPC blob.
-fn flush_to_store_v0(
-    store: &VepKvStore,
+/// v0 (legacy monolithic): serialize all columns as a single Arrow IPC blob.
+fn prepare_v0_entries(
     chrom: &str,
     window_id: u64,
-    merged: RecordBatch,
-    total_windows: &mut u64,
-    total_bytes: &mut u64,
-) -> Result<()> {
-    let mem_size = merged.get_array_memory_size() as u64;
-
-    // Window should not already exist (all data accumulated before writing).
-    // Keep the merge path for safety in case of cross-window indel edge cases.
-    if let Some(existing) = store.get_window(chrom, window_id)? {
-        let schema = existing.schema();
-        let combined = datafusion::arrow::compute::concat_batches(&schema, &[existing, merged])
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        store.put_window(chrom, window_id, &combined)?;
-    } else {
-        store.put_window(chrom, window_id, &merged)?;
-        *total_windows += 1;
-    }
-
-    *total_bytes += mem_size;
-    Ok(())
+    merged: &RecordBatch,
+    total_bytes: u64,
+) -> Result<PreparedWindow> {
+    // v0 uses 10-byte encode_window_key (not 11-byte encode_entry_key).
+    let key = encode_window_key(chrom, window_id);
+    let value = serialize_ipc_pub(merged)?;
+    Ok(PreparedWindow {
+        entries: vec![(key, value)],
+        total_bytes,
+    })
 }
 
-/// v1 (columnar): write position index + per-column Arrow IPC entries.
-fn flush_to_store_v1(
-    store: &VepKvStore,
+/// v1 (columnar): serialize position index + per-column Arrow IPC entries.
+fn prepare_v1_entries(
     chrom: &str,
     window_id: u64,
-    merged: RecordBatch,
-    total_windows: &mut u64,
-    total_bytes: &mut u64,
-) -> Result<()> {
-    // Window should not already exist (all data accumulated before writing).
-    // Keep the merge path for safety in case of cross-window indel edge cases.
-    let merged = if let Some(existing_idx) = store.get_position_index(chrom, window_id)? {
-        let all_col_indices: Vec<u8> = (0..store.schema().fields().len())
-            .map(to_v1_column_index)
-            .collect::<Result<Vec<_>>>()?;
-        if let Some(existing_cols) = store.get_columns(chrom, window_id, &all_col_indices)? {
-            let existing_arrays: Vec<datafusion::arrow::array::ArrayRef> =
-                existing_cols.into_iter().map(|(a, _)| a).collect();
-            let existing_batch = RecordBatch::try_new(store.schema().clone(), existing_arrays)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            drop(existing_idx);
-            datafusion::arrow::compute::concat_batches(
-                &store.schema().clone(),
-                &[existing_batch, merged],
-            )
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
-        } else {
-            merged
-        }
-    } else {
-        *total_windows += 1;
-        merged
-    };
+    merged: &RecordBatch,
+    total_bytes: u64,
+) -> Result<PreparedWindow> {
+    let num_cols = merged.schema().fields().len();
+    let mut entries = Vec::with_capacity(num_cols + 1);
 
-    // Build and write position index.
-    let pos_index = PositionIndex::from_batch(&merged)?;
-    store.put_position_index(chrom, window_id, &pos_index)?;
+    // Position index entry.
+    let pos_index = PositionIndex::from_batch(merged)?;
+    let pos_key = encode_entry_key(chrom, window_id, EntryType::PositionIndex);
+    entries.push((pos_key, pos_index.to_bytes()));
 
-    // Write each column separately.
+    // Per-column entries.
     for (col_idx, field) in merged.schema().fields().iter().enumerate() {
-        store.put_column(
+        let col_key = encode_entry_key(
             chrom,
             window_id,
-            to_v1_column_index(col_idx)?,
-            merged.column(col_idx),
-            field,
-        )?;
+            EntryType::Column(to_v1_column_index(col_idx)?),
+        );
+        let col_batch = RecordBatch::try_new(
+            Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                field.as_ref().clone(),
+            ])),
+            vec![merged.column(col_idx).clone()],
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let col_value = serialize_ipc_pub(&col_batch)?;
+        entries.push((col_key, col_value));
     }
 
-    *total_bytes += merged.get_array_memory_size() as u64;
-    Ok(())
+    Ok(PreparedWindow {
+        entries,
+        total_bytes,
+    })
 }
 
 #[cfg(test)]

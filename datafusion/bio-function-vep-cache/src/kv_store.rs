@@ -41,6 +41,14 @@ fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
     DataFusionError::ArrowError(Box::new(e), None)
 }
 
+/// Serialize a RecordBatch to Arrow IPC stream format with LZ4 compression.
+///
+/// Exposed as `pub(crate)` so that the loader can pre-serialize entries before
+/// batch-inserting them into fjall.
+pub(crate) fn serialize_ipc_pub(batch: &RecordBatch) -> Result<Vec<u8>> {
+    serialize_ipc(batch)
+}
+
 pub(crate) fn max_v1_columns() -> usize {
     EntryType::MAX_COLUMN_INDEX as usize + 1
 }
@@ -308,6 +316,24 @@ impl VepKvStore {
     pub fn persist(&self) -> Result<()> {
         self.keyspace
             .persist(PersistMode::SyncAll)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
+    }
+
+    /// Atomically insert a batch of pre-serialized (key, value) pairs into the data partition.
+    ///
+    /// Uses fjall's `Batch` API to reduce WAL overhead and L0 segment pressure
+    /// compared to individual `insert()` calls.
+    pub(crate) fn batch_insert_raw(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut batch = fjall::Batch::with_capacity(self.keyspace.clone(), entries.len());
+        for (key, value) in entries {
+            batch.insert(&self.data, key, value);
+        }
+        batch
+            .commit()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(())
     }
