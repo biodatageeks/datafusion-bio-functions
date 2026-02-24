@@ -1,17 +1,16 @@
-//! Parquet -> fjall cache ingestion pipeline.
+//! Parquet -> fjall cache ingestion pipeline (streaming).
 //!
 //! Loads a VEP variation cache from Parquet into a fjall KV store,
 //! grouping variants into windows and parallelizing across DataFusion
 //! physical partitions.
 //!
-//! Three-phase approach:
-//! 1. **Read phase** (parallel): each partition reads its stream and groups
-//!    rows by (chrom, window_id) into a shared in-memory buffer.
-//! 2. **Serialize phase** (parallel): each window's data is serialized to
-//!    Arrow IPC bytes (position index + per-column entries) on the blocking
-//!    thread pool.
-//! 3. **Write phase** (batched): pre-serialized entries are batch-inserted
-//!    into fjall using the `Batch` API to minimize L0 compaction pressure.
+//! Streaming approach:
+//! - Each partition processes its stream batch-by-batch, splitting rows into
+//!   per-window buffers local to that partition.
+//! - Windows are flushed to fjall as soon as the stream advances past them
+//!   (position-order tracking), keeping memory bounded to a few active windows.
+//! - Cross-partition window overlap (rare — only at partition boundaries) is
+//!   handled via atomic read-modify-write under a shared lock.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -45,29 +44,20 @@ pub struct LoadStats {
     pub elapsed_secs: f64,
 }
 
-/// Thread-safe accumulator for window data from multiple partitions.
-struct SharedWindowBuffers {
-    buffers: std::sync::Mutex<HashMap<(String, u64), Vec<RecordBatch>>>,
+/// Per-partition stats accumulated during streaming.
+struct PartitionStats {
+    total_variants: u64,
+    total_windows: u64,
+    total_bytes: u64,
 }
 
-impl SharedWindowBuffers {
-    fn new() -> Self {
-        Self {
-            buffers: std::sync::Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Push a sub-batch for a given (chrom, window_id).
-    fn push(&self, chrom: String, wid: u64, batch: RecordBatch) {
-        let mut map = self.buffers.lock().unwrap();
-        map.entry((chrom, wid)).or_default().push(batch);
-    }
-
-    /// Drain all accumulated buffers.
-    fn drain(&self) -> HashMap<(String, u64), Vec<RecordBatch>> {
-        let mut map = self.buffers.lock().unwrap();
-        std::mem::take(&mut *map)
-    }
+/// Shared context passed to each partition's streaming task.
+struct StreamContext {
+    store: Arc<VepKvStore>,
+    schema: SchemaRef,
+    flush_lock: Arc<std::sync::Mutex<()>>,
+    window_size: u64,
+    format_version: u8,
 }
 
 /// Builder for loading a Parquet-based VEP cache into fjall.
@@ -115,13 +105,13 @@ impl CacheLoader {
 
     /// Load the cache from the registered source table into fjall.
     ///
-    /// Uses DataFusion's physical partitions for parallelism rather than
-    /// per-chromosome queries. The number of partitions is controlled by
-    /// the session's `target_partitions` config.
+    /// Spawns one streaming task per physical partition. Each task reads
+    /// batches, splits them into windows, and flushes completed windows
+    /// to fjall incrementally — memory stays bounded to a few active
+    /// windows per partition rather than the entire dataset.
     pub async fn load(&self, session: &SessionContext) -> Result<LoadStats> {
         let start_time = Instant::now();
 
-        // Get the source schema.
         let source_df = session.table(&self.source_table).await?;
         let schema: SchemaRef = Arc::new(source_df.schema().as_arrow().clone());
 
@@ -129,7 +119,6 @@ impl CacheLoader {
             validate_v1_schema_width(schema.fields().len())?;
         }
 
-        // Create the KV store with the chosen format version.
         let store = Arc::new(VepKvStore::create_with_version(
             Path::new(&self.target_path),
             schema.clone(),
@@ -137,7 +126,6 @@ impl CacheLoader {
             self.format_version,
         )?);
 
-        // Create physical plan — no WHERE, no ORDER BY.
         let plan = source_df.create_physical_plan().await?;
         let partition_count = plan.output_partitioning().partition_count();
         let task_ctx = session.task_ctx();
@@ -146,24 +134,34 @@ impl CacheLoader {
             "Loading into KV cache: {} partitions, window_size={}",
             partition_count, self.window_size
         );
-        debug!("Physical plan:\n{}", datafusion::physical_plan::displayable(plan.as_ref()).indent(true));
+        debug!(
+            "Physical plan:\n{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
 
-        // Phase 1: Read all partitions in parallel, accumulate in shared buffer.
-        let shared_buffers = Arc::new(SharedWindowBuffers::new());
+        // Shared lock for cross-partition read-modify-write safety.
+        let flush_lock = Arc::new(std::sync::Mutex::new(()));
         let semaphore = self
             .parallelism
             .map(|n| Arc::new(tokio::sync::Semaphore::new(n.min(partition_count))));
 
         let mut handles = Vec::with_capacity(partition_count);
         let window_size = self.window_size;
+        let format_version = self.format_version;
 
         for partition_id in 0..partition_count {
             let plan = Arc::clone(&plan);
             let task_ctx = Arc::clone(&task_ctx);
-            let buffers = Arc::clone(&shared_buffers);
             let sem = semaphore.clone();
+            let ctx = StreamContext {
+                store: Arc::clone(&store),
+                schema: schema.clone(),
+                flush_lock: Arc::clone(&flush_lock),
+                window_size,
+                format_version,
+            };
 
-            let handle = tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 if let Some(ref sem) = sem {
                     let _permit = sem
                         .acquire()
@@ -171,65 +169,23 @@ impl CacheLoader {
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 }
 
-                read_partition(plan, task_ctx, partition_id, window_size, buffers).await
-            });
-            handles.push(handle);
+                stream_partition(plan, task_ctx, partition_id, ctx).await
+            }));
         }
 
-        // Collect variant counts from all partitions.
+        // Collect stats from all partitions.
         let mut total_variants = 0u64;
-        for handle in handles {
-            total_variants += handle
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))??;
-        }
-
-        // Phase 2+3: Serialize windows in parallel on blocking threads,
-        // then batch-insert into fjall.
-        let all_windows = shared_buffers.drain();
-        let num_windows = all_windows.len();
-        let format_version = self.format_version;
-
-        info!("Serializing + writing {num_windows} windows (format v{format_version})");
-
-        let serialize_start = Instant::now();
-
-        // Phase 2: Serialize each window in parallel on the blocking thread pool.
-        let mut join_set = tokio::task::JoinSet::new();
-        for ((chrom, wid), batches) in all_windows {
-            let schema = schema.clone();
-            join_set.spawn_blocking(move || {
-                prepare_window_entries(&schema, &chrom, wid, batches, format_version)
-            });
-        }
-
-        // Phase 3: Collect serialized entries and batch-insert into fjall.
-        // Process in chunks to bound memory and reduce L0 pressure.
-        const WINDOWS_PER_BATCH: usize = 100;
-        let mut pending_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut total_windows = 0u64;
         let mut total_bytes = 0u64;
 
-        while let Some(result) = join_set.join_next().await {
-            let prepared = result.map_err(|e| DataFusionError::External(Box::new(e)))??;
-            total_bytes += prepared.total_bytes;
-            total_windows += 1;
-            pending_entries.extend(prepared.entries);
-
-            if total_windows % WINDOWS_PER_BATCH as u64 == 0 {
-                store.batch_insert_raw(&pending_entries)?;
-                pending_entries.clear();
-            }
+        for handle in handles {
+            let ps = handle
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))??;
+            total_variants += ps.total_variants;
+            total_windows += ps.total_windows;
+            total_bytes += ps.total_bytes;
         }
-        // Flush remaining entries.
-        if !pending_entries.is_empty() {
-            store.batch_insert_raw(&pending_entries)?;
-        }
-
-        let serialize_elapsed = serialize_start.elapsed().as_secs_f64();
-        info!(
-            "Serialize+write phase: {serialize_elapsed:.1}s for {total_windows} windows"
-        );
 
         store.persist()?;
 
@@ -247,18 +203,38 @@ impl CacheLoader {
     }
 }
 
-/// Read all data from a single physical partition and accumulate into shared buffers.
-async fn read_partition(
+/// Stream a single partition: read batches, split into windows, flush to fjall incrementally.
+///
+/// Uses position-order tracking to flush completed windows eagerly: once the
+/// stream advances past a window (sorted input), that window is sealed and
+/// written. At end-of-stream, all remaining windows are flushed.
+///
+/// Cross-partition overlap (rare — only at partition boundaries) is handled
+/// by read-modify-write under `flush_lock`.
+async fn stream_partition(
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<datafusion::execution::TaskContext>,
     partition_id: usize,
-    window_size: u64,
-    buffers: Arc<SharedWindowBuffers>,
-) -> Result<u64> {
+    ctx: StreamContext,
+) -> Result<PartitionStats> {
     let part_start = Instant::now();
     let mut stream = plan.execute(partition_id, task_ctx)?;
-    let mut total_variants = 0u64;
-    let mut batch_count = 0u64;
+
+    let chrom_col_idx = ctx.schema.index_of("chrom")?;
+    let start_col_idx = ctx.schema.index_of("start")?;
+
+    // Local per-window buffers (NOT shared across partitions).
+    let mut pending: HashMap<(String, u64), Vec<RecordBatch>> = HashMap::new();
+
+    // Track the maximum primary window ID seen per chromosome (frontier).
+    // Windows behind the frontier are sealed — no more data will arrive.
+    let mut frontier: HashMap<String, u64> = HashMap::new();
+
+    let mut stats = PartitionStats {
+        total_variants: 0,
+        total_windows: 0,
+        total_bytes: 0,
+    };
 
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
@@ -266,21 +242,140 @@ async fn read_partition(
             continue;
         }
 
-        total_variants += batch.num_rows() as u64;
-        batch_count += 1;
+        stats.total_variants += batch.num_rows() as u64;
 
-        let window_batches = split_batch_into_windows(&batch, window_size)?;
+        // Update frontier with max primary window per chrom in this batch.
+        let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
+        let chroms = batch.column(chrom_col_idx);
+        for row in 0..batch.num_rows() {
+            let chrom = string_value(chroms.as_ref(), row);
+            let wid = window_id_for_position(starts.value(row), ctx.window_size);
+            frontier
+                .entry(chrom.to_string())
+                .and_modify(|f| *f = (*f).max(wid))
+                .or_insert(wid);
+        }
+
+        // Split batch into per-window sub-batches and accumulate.
+        let window_batches = split_batch_into_windows(&batch, ctx.window_size)?;
         for ((chrom, wid), sub_batch) in window_batches {
-            buffers.push(chrom, wid, sub_batch);
+            pending.entry((chrom, wid)).or_default().push(sub_batch);
+        }
+
+        // Flush windows that are behind the frontier (sealed — no more data coming).
+        let flush_keys: Vec<_> = pending
+            .keys()
+            .filter(|(chrom, wid)| frontier.get(chrom).is_some_and(|f| *wid < *f))
+            .cloned()
+            .collect();
+
+        if !flush_keys.is_empty() {
+            flush_windows(
+                &ctx.store,
+                &ctx.schema,
+                &mut pending,
+                &flush_keys,
+                ctx.format_version,
+                &mut stats,
+                &ctx.flush_lock,
+            )?;
         }
     }
 
-    let elapsed = part_start.elapsed().as_secs_f64();
+    // Flush all remaining windows (the frontier windows themselves).
+    let remaining: Vec<_> = pending.keys().cloned().collect();
+    if !remaining.is_empty() {
+        flush_windows(
+            &ctx.store,
+            &ctx.schema,
+            &mut pending,
+            &remaining,
+            ctx.format_version,
+            &mut stats,
+            &ctx.flush_lock,
+        )?;
+    }
+
     info!(
-        "Partition {partition_id}: {total_variants} variants, {batch_count} batches in {elapsed:.1}s"
+        "Partition {partition_id}: {} variants, {} windows in {:.1}s",
+        stats.total_variants,
+        stats.total_windows,
+        part_start.elapsed().as_secs_f64()
     );
 
-    Ok(total_variants)
+    Ok(stats)
+}
+
+/// Read an existing window's full data from fjall, if present.
+///
+/// Used for read-modify-write when cross-partition overlap occurs.
+fn read_existing_window(
+    store: &VepKvStore,
+    schema: &SchemaRef,
+    chrom: &str,
+    window_id: u64,
+    format_version: u8,
+) -> Result<Option<RecordBatch>> {
+    if format_version >= FORMAT_V1 {
+        if store.get_position_index(chrom, window_id)?.is_none() {
+            return Ok(None);
+        }
+        let col_indices: Vec<u8> = (0..schema.fields().len()).map(|i| i as u8).collect();
+        match store.get_columns(chrom, window_id, &col_indices)? {
+            Some(col_data) => {
+                let arrays: Vec<_> = col_data.into_iter().map(|(arr, _)| arr).collect();
+                let batch = RecordBatch::try_new(schema.clone(), arrays)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                Ok(Some(batch))
+            }
+            None => Ok(None),
+        }
+    } else {
+        store.get_window(chrom, window_id)
+    }
+}
+
+/// Flush pending window data to fjall.
+///
+/// Acquires `flush_lock` to handle cross-partition overlap atomically via
+/// read-modify-write: if a window already exists in fjall (written by another
+/// partition), reads the existing data, concatenates with the new data, and
+/// writes the merged result.
+fn flush_windows(
+    store: &VepKvStore,
+    schema: &SchemaRef,
+    pending: &mut HashMap<(String, u64), Vec<RecordBatch>>,
+    keys: &[(String, u64)],
+    format_version: u8,
+    stats: &mut PartitionStats,
+    flush_lock: &std::sync::Mutex<()>,
+) -> Result<()> {
+    let _guard = flush_lock.lock().unwrap();
+    let mut all_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    for (chrom, wid) in keys {
+        if let Some(mut batches) = pending.remove(&(chrom.clone(), *wid)) {
+            // Read-modify-write: prepend existing data if another partition
+            // already wrote this window.
+            let existing = read_existing_window(store, schema, chrom, *wid, format_version)?;
+            let is_new = existing.is_none();
+            if let Some(existing_batch) = existing {
+                batches.insert(0, existing_batch);
+            }
+
+            let prepared = prepare_window_entries(schema, chrom, *wid, batches, format_version)?;
+            stats.total_bytes += prepared.total_bytes;
+            if is_new {
+                stats.total_windows += 1;
+            }
+            all_entries.extend(prepared.entries);
+        }
+    }
+
+    if !all_entries.is_empty() {
+        store.batch_insert_raw(&all_entries)?;
+    }
+    Ok(())
 }
 
 /// Split a RecordBatch into sub-batches keyed by (chrom, window_id).
