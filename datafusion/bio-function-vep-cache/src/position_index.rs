@@ -172,18 +172,48 @@ impl PositionIndex {
         vcf_alt: &str,
         matcher: AlleleMatcher,
     ) -> Vec<usize> {
-        let Some(row_indices) = self.position_map.get(&(start, end)) else {
-            return Vec::new();
-        };
+        let mut out = Vec::new();
+        self.append_matches(start, end, vcf_ref, vcf_alt, matcher, &mut out);
+        out
+    }
 
-        row_indices
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let allele = self.allele_string(i);
-                matcher(vcf_ref, vcf_alt, allele)
-            })
-            .collect()
+    /// Append matching row indices by position + allele to an existing buffer.
+    pub fn append_matches(
+        &self,
+        start: i64,
+        end: i64,
+        vcf_ref: &str,
+        vcf_alt: &str,
+        matcher: AlleleMatcher,
+        out: &mut Vec<usize>,
+    ) {
+        let Some(row_indices) = self.position_map.get(&(start, end)) else {
+            return;
+        };
+        for &i in row_indices {
+            let allele = self.allele_string(i);
+            if matcher(vcf_ref, vcf_alt, allele) {
+                out.push(i);
+            }
+        }
+    }
+
+    /// Return true if at least one row matches by position + allele.
+    pub fn has_match(
+        &self,
+        start: i64,
+        end: i64,
+        vcf_ref: &str,
+        vcf_alt: &str,
+        matcher: AlleleMatcher,
+    ) -> bool {
+        let Some(row_indices) = self.position_map.get(&(start, end)) else {
+            return false;
+        };
+        row_indices.iter().copied().any(|i| {
+            let allele = self.allele_string(i);
+            matcher(vcf_ref, vcf_alt, allele)
+        })
     }
 
     /// Find all co-located row indices (position match only, no allele check).

@@ -51,6 +51,33 @@ impl WindowAlleleIndex {
             .find_matches(start, end, vcf_ref, vcf_alt, matcher)
     }
 
+    /// Append matching row indices to `out` without allocating a new vector.
+    pub fn append_matches(
+        &self,
+        start: i64,
+        end: i64,
+        vcf_ref: &str,
+        vcf_alt: &str,
+        matcher: AlleleMatcher,
+        out: &mut Vec<usize>,
+    ) {
+        self.pos_index
+            .append_matches(start, end, vcf_ref, vcf_alt, matcher, out)
+    }
+
+    /// Return true if any row matches at the given position + allele.
+    pub fn has_match(
+        &self,
+        start: i64,
+        end: i64,
+        vcf_ref: &str,
+        vcf_alt: &str,
+        matcher: AlleleMatcher,
+    ) -> bool {
+        self.pos_index
+            .has_match(start, end, vcf_ref, vcf_alt, matcher)
+    }
+
     /// Find all co-located rows (position match only, no allele check).
     pub fn find_colocated(&self, start: i64, end: i64) -> Vec<usize> {
         self.pos_index.find_colocated(start, end)

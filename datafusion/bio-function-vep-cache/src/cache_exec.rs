@@ -7,15 +7,16 @@ use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::builder::{
-    BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
-    Int8Builder, StringBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
+    BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder,
+    Int64Builder, StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
 };
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    Int8Array, LargeStringArray, RecordBatch, StringArray, StringViewArray, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
@@ -225,6 +226,120 @@ struct KvLookupStream {
     output_col_indices: Vec<u8>,
     current_window: Option<(String, u64)>,
     current_index: Option<WindowAlleleIndex>,
+    profile_enabled: bool,
+    profile_emitted: bool,
+    profile: LookupProfile,
+}
+
+#[derive(Default)]
+struct LookupProfile {
+    batches: u64,
+    input_rows: u64,
+    output_rows: u64,
+    extract_cols: Duration,
+    match_loop: Duration,
+    fetch_columns: Duration,
+    vcf_take: Duration,
+    cache_build: Duration,
+    record_batch_build: Duration,
+    window_loads: u64,
+    window_load_time: Duration,
+}
+
+impl LookupProfile {
+    fn total_known(&self) -> Duration {
+        self.extract_cols
+            + self.match_loop
+            + self.fetch_columns
+            + self.vcf_take
+            + self.cache_build
+            + self.record_batch_build
+    }
+
+    fn pct(stage: Duration, total: Duration) -> f64 {
+        if total.is_zero() {
+            0.0
+        } else {
+            stage.as_secs_f64() * 100.0 / total.as_secs_f64()
+        }
+    }
+
+    fn emit(&self) {
+        let total = self.total_known();
+        let input_rate = if total.is_zero() {
+            0.0
+        } else {
+            self.input_rows as f64 / total.as_secs_f64()
+        };
+        let output_rate = if total.is_zero() {
+            0.0
+        } else {
+            self.output_rows as f64 / total.as_secs_f64()
+        };
+        eprintln!(
+            "[vep-kv-profile] batches={} input_rows={} output_rows={} total_s={:.3} input_rows_per_s={:.1} output_rows_per_s={:.1}",
+            self.batches,
+            self.input_rows,
+            self.output_rows,
+            total.as_secs_f64(),
+            input_rate,
+            output_rate
+        );
+        eprintln!(
+            "[vep-kv-profile] extract_cols={:.3}s ({:.1}%) match_loop={:.3}s ({:.1}%) fetch_columns={:.3}s ({:.1}%) vcf_take={:.3}s ({:.1}%) cache_build={:.3}s ({:.1}%) record_batch={:.3}s ({:.1}%)",
+            self.extract_cols.as_secs_f64(),
+            Self::pct(self.extract_cols, total),
+            self.match_loop.as_secs_f64(),
+            Self::pct(self.match_loop, total),
+            self.fetch_columns.as_secs_f64(),
+            Self::pct(self.fetch_columns, total),
+            self.vcf_take.as_secs_f64(),
+            Self::pct(self.vcf_take, total),
+            self.cache_build.as_secs_f64(),
+            Self::pct(self.cache_build, total),
+            self.record_batch_build.as_secs_f64(),
+            Self::pct(self.record_batch_build, total),
+        );
+        eprintln!(
+            "[vep-kv-profile] window_loads={} window_load_time_s={:.3}",
+            self.window_loads,
+            self.window_load_time.as_secs_f64()
+        );
+    }
+}
+
+enum StringColumnView<'a> {
+    Utf8(&'a StringArray),
+    Utf8View(&'a StringViewArray),
+    LargeUtf8(&'a LargeStringArray),
+}
+
+impl<'a> StringColumnView<'a> {
+    fn value_or_empty(&self, row: usize) -> &'a str {
+        match self {
+            Self::Utf8(arr) => {
+                if arr.is_null(row) {
+                    ""
+                } else {
+                    arr.value(row)
+                }
+            }
+            Self::Utf8View(arr) => {
+                if arr.is_null(row) {
+                    ""
+                } else {
+                    arr.value(row)
+                }
+            }
+            Self::LargeUtf8(arr) => {
+                if arr.is_null(row) {
+                    ""
+                } else {
+                    arr.value(row)
+                }
+            }
+        }
+    }
 }
 
 impl KvLookupStream {
@@ -258,6 +373,9 @@ impl KvLookupStream {
             output_col_indices,
             current_window: None,
             current_index: None,
+            profile_enabled: std::env::var_os("VEP_KV_PROFILE").is_some(),
+            profile_emitted: false,
+            profile: LookupProfile::default(),
         }
     }
 
@@ -270,7 +388,16 @@ impl KvLookupStream {
         };
 
         if need_load {
+            let started = if self.profile_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let pos_index = self.store.get_position_index(chrom, wid)?;
+            if let Some(t0) = started {
+                self.profile.window_loads += 1;
+                self.profile.window_load_time += t0.elapsed();
+            }
             self.current_window = Some((chrom.to_string(), wid));
             self.current_index = pos_index.map(WindowAlleleIndex::from_position_index);
         }
@@ -285,20 +412,38 @@ impl KvLookupStream {
         let ref_idx = vcf_schema.index_of("ref")?;
         let alt_idx = vcf_schema.index_of("alt")?;
 
-        let chroms = get_string_column(vcf_batch.column(chrom_idx), "chrom")?;
+        let extract_started = if self.profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let chroms = as_string_column(vcf_batch.column(chrom_idx), "chrom")?;
         let starts = get_i32_column(vcf_batch.column(start_idx), "start")?;
         let ends = get_i32_column(vcf_batch.column(end_idx), "end")?;
-        let refs = get_string_column(vcf_batch.column(ref_idx), "ref")?;
-        let alts = get_string_column(vcf_batch.column(alt_idx), "alt")?;
+        let refs = as_string_column(vcf_batch.column(ref_idx), "ref")?;
+        let alts = as_string_column(vcf_batch.column(alt_idx), "alt")?;
+        if let Some(t0) = extract_started {
+            self.profile.extract_cols += t0.elapsed();
+        }
 
         let num_vcf_cols = vcf_schema.fields().len();
         let num_rows = vcf_batch.num_rows();
+        if self.profile_enabled {
+            self.profile.batches += 1;
+            self.profile.input_rows += num_rows as u64;
+        }
 
         let mut matched_entries: Vec<MatchInfoStatic> = Vec::new();
+        let mut matched_cache_rows: Vec<usize> = Vec::new();
         let mut unmatched_vcf_rows: Vec<usize> = Vec::new();
 
+        let match_started = if self.profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         for row in 0..num_rows {
-            let raw_chrom = chroms[row].as_deref().unwrap_or("");
+            let raw_chrom = chroms.value_or_empty(row);
             let chrom = if self.vcf_has_chr {
                 raw_chrom.strip_prefix("chr").unwrap_or(raw_chrom)
             } else {
@@ -316,35 +461,52 @@ impl KvLookupStream {
             let norm_start_i64 = i64::from(norm_start);
             let norm_end_i64 = i64::from(norm_end);
 
-            let vcf_ref = refs[row].as_deref().unwrap_or("");
-            let vcf_alt = alts[row].as_deref().unwrap_or("");
+            let vcf_ref = refs.value_or_empty(row);
+            let vcf_alt = alts.value_or_empty(row);
 
             self.ensure_window(chrom, norm_start)?;
 
-            let matched = if let Some(index) = &self.current_index {
-                let mut matches = index.find_matches(
-                    norm_start_i64,
-                    norm_end_i64,
-                    vcf_ref,
-                    vcf_alt,
-                    self.exact_matcher,
-                );
-
-                // For insertions, also check cache coords where start=end+1.
-                if matches.is_empty() && norm_start == norm_end {
-                    matches = index.find_matches(
-                        i64::from(norm_start.saturating_add(1)),
-                        norm_start_i64,
-                        vcf_ref,
-                        vcf_alt,
-                        self.exact_matcher,
-                    );
-                }
-
-                if matches.is_empty() {
-                    match self.match_mode {
-                        KvMatchMode::Exact => {}
-                        KvMatchMode::ExactOrColocated => {
+            let row_start = matched_cache_rows.len();
+            if let Some(index) = &self.current_index {
+                match self.match_mode {
+                    KvMatchMode::Exact => {
+                        index.append_matches(
+                            norm_start_i64,
+                            norm_end_i64,
+                            vcf_ref,
+                            vcf_alt,
+                            self.exact_matcher,
+                            &mut matched_cache_rows,
+                        );
+                        if matched_cache_rows.len() == row_start && norm_start == norm_end {
+                            index.append_matches(
+                                i64::from(norm_start.saturating_add(1)),
+                                norm_start_i64,
+                                vcf_ref,
+                                vcf_alt,
+                                self.exact_matcher,
+                                &mut matched_cache_rows,
+                            );
+                        }
+                    }
+                    KvMatchMode::ExactOrColocated => {
+                        let mut matches = index.find_matches(
+                            norm_start_i64,
+                            norm_end_i64,
+                            vcf_ref,
+                            vcf_alt,
+                            self.exact_matcher,
+                        );
+                        if matches.is_empty() && norm_start == norm_end {
+                            matches = index.find_matches(
+                                i64::from(norm_start.saturating_add(1)),
+                                norm_start_i64,
+                                vcf_ref,
+                                vcf_alt,
+                                self.exact_matcher,
+                            );
+                        }
+                        if matches.is_empty() {
                             let mut coloc = index.find_colocated(norm_start_i64, norm_end_i64);
                             if coloc.is_empty() && norm_start == norm_end {
                                 coloc = index.find_colocated(
@@ -354,7 +516,26 @@ impl KvLookupStream {
                             }
                             matches = coloc;
                         }
-                        KvMatchMode::ExactOrRelaxed => {
+                        matched_cache_rows.extend(matches);
+                    }
+                    KvMatchMode::ExactOrRelaxed => {
+                        let mut matches = index.find_matches(
+                            norm_start_i64,
+                            norm_end_i64,
+                            vcf_ref,
+                            vcf_alt,
+                            self.exact_matcher,
+                        );
+                        if matches.is_empty() && norm_start == norm_end {
+                            matches = index.find_matches(
+                                i64::from(norm_start.saturating_add(1)),
+                                norm_start_i64,
+                                vcf_ref,
+                                vcf_alt,
+                                self.exact_matcher,
+                            );
+                        }
+                        if matches.is_empty() {
                             if let Some(relaxed) = self.relaxed_matcher {
                                 let mut rel = index.find_matches(
                                     norm_start_i64,
@@ -375,40 +556,38 @@ impl KvLookupStream {
                                 matches = rel;
                             }
                         }
+                        matched_cache_rows.extend(matches);
                     }
                 }
-
-                if matches.is_empty() {
-                    None
-                } else {
-                    Some(matches)
-                }
-            } else {
-                None
-            };
-
-            match matched {
-                Some(cache_rows) => {
-                    let (c, wid) = self.current_window.as_ref().unwrap();
-                    matched_entries.push(MatchInfoStatic {
-                        vcf_row: row,
-                        chrom: c.clone(),
-                        window_id: *wid,
-                        cache_rows,
-                    });
-                }
-                None => {
-                    unmatched_vcf_rows.push(row);
-                }
             }
+
+            let row_end = matched_cache_rows.len();
+            if row_end > row_start {
+                let (c, wid) = self.current_window.as_ref().unwrap();
+                matched_entries.push(MatchInfoStatic {
+                    vcf_row: row,
+                    chrom: c.clone(),
+                    window_id: *wid,
+                    cache_rows_start: row_start,
+                    cache_rows_end: row_end,
+                });
+            } else {
+                unmatched_vcf_rows.push(row);
+            }
+        }
+        if let Some(t0) = match_started {
+            self.profile.match_loop += t0.elapsed();
         }
 
         // Phase B: fetch needed columns for matched windows.
         let total_output_rows: usize = matched_entries
             .iter()
-            .map(|m| m.cache_rows.len())
+            .map(|m| m.cache_rows_end - m.cache_rows_start)
             .sum::<usize>()
             + unmatched_vcf_rows.len();
+        if self.profile_enabled {
+            self.profile.output_rows += total_output_rows as u64;
+        }
 
         // Build VCF output indices (expanded for matches).
         let mut vcf_output_indices: Vec<u32> = Vec::with_capacity(total_output_rows);
@@ -443,33 +622,36 @@ impl KvLookupStream {
         // Cache: (chrom, window_id) -> fetched column arrays
         let mut window_columns: HashMap<(String, u64), Vec<ArrayRef>> = HashMap::new();
 
+        let fetch_started = if self.profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         if !self.output_col_indices.is_empty() {
             // Collect unique windows that have matches.
-            let mut needed_windows: Vec<(String, u64)> = Vec::new();
+            let mut needed_windows: std::collections::HashSet<(String, u64)> =
+                std::collections::HashSet::new();
             for entry in &matched_entries {
-                let key = (entry.chrom.clone(), entry.window_id);
-                if !needed_windows.contains(&key) {
-                    needed_windows.push(key);
-                }
+                needed_windows.insert((entry.chrom.clone(), entry.window_id));
             }
-            for (chrom, wid) in &needed_windows {
+            for (chrom, wid) in needed_windows {
                 if let Some(cols) = self
                     .store
-                    .get_columns(chrom, *wid, &self.output_col_indices)?
+                    .get_columns(&chrom, wid, &self.output_col_indices)?
                 {
-                    window_columns.insert(
-                        (chrom.clone(), *wid),
-                        cols.into_iter().map(|(a, _)| a).collect(),
-                    );
+                    window_columns.insert((chrom, wid), cols.into_iter().map(|(a, _)| a).collect());
                 }
             }
+        }
+        if let Some(t0) = fetch_started {
+            self.profile.fetch_columns += t0.elapsed();
         }
 
         // Build expanded VCF indices.
         for entry in &combined {
             match entry {
                 OutputEntry::Matched(m) => {
-                    for _ in &m.cache_rows {
+                    for _ in m.cache_rows_start..m.cache_rows_end {
                         vcf_output_indices.push(m.vcf_row as u32);
                     }
                 }
@@ -483,19 +665,33 @@ impl KvLookupStream {
         let mut output_columns: Vec<ArrayRef> =
             Vec::with_capacity(num_vcf_cols + self.cache_columns.len());
         let take_indices = datafusion::arrow::array::UInt32Array::from(vcf_output_indices);
+        let take_started = if self.profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         for col_idx in 0..num_vcf_cols {
             let taken =
                 datafusion::arrow::compute::take(vcf_batch.column(col_idx), &take_indices, None)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             output_columns.push(taken);
         }
+        if let Some(t0) = take_started {
+            self.profile.vcf_take += t0.elapsed();
+        }
 
         // Build cache columns.
+        let cache_build_started = if self.profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         for (out_idx, cache_col_name) in self.cache_columns.iter().enumerate() {
             let output_schema_idx = num_vcf_cols + out_idx;
             let data_type = self.schema.field(output_schema_idx).data_type().clone();
             let output_col = build_cache_column_v1(
                 &combined,
+                &matched_cache_rows,
                 &window_columns,
                 out_idx,
                 &data_type,
@@ -504,9 +700,21 @@ impl KvLookupStream {
             )?;
             output_columns.push(output_col);
         }
+        if let Some(t0) = cache_build_started {
+            self.profile.cache_build += t0.elapsed();
+        }
 
-        RecordBatch::try_new(self.schema.clone(), output_columns)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        let batch_started = if self.profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let out = RecordBatch::try_new(self.schema.clone(), output_columns)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
+        if let Some(t0) = batch_started {
+            self.profile.record_batch_build += t0.elapsed();
+        }
+        out
     }
 }
 
@@ -519,12 +727,14 @@ struct MatchInfoStatic {
     vcf_row: usize,
     chrom: String,
     window_id: u64,
-    cache_rows: Vec<usize>,
+    cache_rows_start: usize,
+    cache_rows_end: usize,
 }
 
 /// Build a cache output column using v1 fetched column arrays.
 fn build_cache_column_v1(
     entries: &[OutputEntry<'_>],
+    matched_cache_rows: &[usize],
     window_columns: &HashMap<(String, u64), Vec<ArrayRef>>,
     out_col_idx: usize,
     data_type: &DataType,
@@ -534,194 +744,266 @@ fn build_cache_column_v1(
     match data_type {
         DataType::Utf8 => {
             let mut builder = StringBuilder::with_capacity(total_rows, total_rows * 16);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_string_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_string_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::Int64 => {
             let mut builder = Int64Builder::with_capacity(total_rows);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_int64_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_int64_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::Int32 => {
             let mut builder = Int32Builder::with_capacity(total_rows);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_int32_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_int32_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::Int16 => {
             let mut builder = Int16Builder::with_capacity(total_rows);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_int16_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_int16_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::Int8 => {
             let mut builder = Int8Builder::with_capacity(total_rows);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_int8_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_int8_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::UInt64 => {
             let mut builder = UInt64Builder::with_capacity(total_rows);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_u64_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_u64_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::UInt32 => {
             let mut builder = UInt32Builder::with_capacity(total_rows);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_u32_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_u32_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::UInt16 => {
             let mut builder = UInt16Builder::with_capacity(total_rows);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_u16_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_u16_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::UInt8 => {
             let mut builder = UInt8Builder::with_capacity(total_rows);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_u8_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_u8_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::Float64 => {
             let mut builder = Float64Builder::with_capacity(total_rows);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_f64_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_f64_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::Float32 => {
             let mut builder = Float32Builder::with_capacity(total_rows);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_f32_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_f32_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         DataType::Boolean => {
             let mut builder = BooleanBuilder::with_capacity(total_rows);
-            visit_output_rows(entries, window_columns, out_col_idx, |value| {
-                if let Some((col, i)) = value {
-                    if col.is_null(i) {
-                        builder.append_null();
+            visit_output_rows(
+                entries,
+                matched_cache_rows,
+                window_columns,
+                out_col_idx,
+                |value| {
+                    if let Some((col, i)) = value {
+                        if col.is_null(i) {
+                            builder.append_null();
+                        } else {
+                            builder.append_value(get_bool_value(col, i, cache_col_name)?);
+                        }
                     } else {
-                        builder.append_value(get_bool_value(col, i, cache_col_name)?);
+                        builder.append_null();
                     }
-                } else {
-                    builder.append_null();
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         _ => Err(DataFusionError::Execution(format!(
@@ -739,6 +1021,7 @@ fn normalize_cache_output_type(data_type: &DataType) -> DataType {
 
 fn visit_output_rows(
     entries: &[OutputEntry<'_>],
+    matched_cache_rows: &[usize],
     window_columns: &HashMap<(String, u64), Vec<ArrayRef>>,
     out_col_idx: usize,
     mut f: impl FnMut(Option<(&ArrayRef, usize)>) -> Result<()>,
@@ -750,7 +1033,8 @@ fn visit_output_rows(
                 let col = window_columns
                     .get(&key)
                     .and_then(|cols| cols.get(out_col_idx));
-                for &i in &m.cache_rows {
+                for pos in m.cache_rows_start..m.cache_rows_end {
+                    let i = matched_cache_rows[pos];
                     f(col.map(|c| (c, i)))?;
                 }
             }
@@ -871,12 +1155,15 @@ fn get_int16_value(col: &ArrayRef, i: usize, column_name: &str) -> Result<i16> {
 }
 
 fn get_int8_value(col: &ArrayRef, i: usize, column_name: &str) -> Result<i8> {
-    col.as_any().downcast_ref::<Int8Array>().map(|a| a.value(i)).ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "column '{column_name}' expected Int8 array, got {:?}",
-            col.data_type()
-        ))
-    })
+    col.as_any()
+        .downcast_ref::<Int8Array>()
+        .map(|a| a.value(i))
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "column '{column_name}' expected Int8 array, got {:?}",
+                col.data_type()
+            ))
+        })
 }
 
 fn get_u64_value(col: &ArrayRef, i: usize, column_name: &str) -> Result<u64> {
@@ -978,37 +1265,13 @@ fn get_string_value<'a>(col: &'a ArrayRef, i: usize, column_name: &str) -> Resul
     }
 }
 
-fn get_string_column(col: &ArrayRef, column_name: &str) -> Result<Vec<Option<String>>> {
+fn as_string_column<'a>(col: &'a ArrayRef, column_name: &str) -> Result<StringColumnView<'a>> {
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-        Ok((0..arr.len())
-            .map(|i| {
-                if arr.is_null(i) {
-                    None
-                } else {
-                    Some(arr.value(i).to_string())
-                }
-            })
-            .collect())
+        Ok(StringColumnView::Utf8(arr))
     } else if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
-        Ok((0..arr.len())
-            .map(|i| {
-                if arr.is_null(i) {
-                    None
-                } else {
-                    Some(arr.value(i).to_string())
-                }
-            })
-            .collect())
+        Ok(StringColumnView::Utf8View(arr))
     } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
-        Ok((0..arr.len())
-            .map(|i| {
-                if arr.is_null(i) {
-                    None
-                } else {
-                    Some(arr.value(i).to_string())
-                }
-            })
-            .collect())
+        Ok(StringColumnView::LargeUtf8(arr))
     } else {
         Err(DataFusionError::Execution(format!(
             "column '{column_name}' expected string array, got {:?}",
@@ -1052,7 +1315,13 @@ impl Stream for KvLookupStream {
                 Poll::Ready(Some(result))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(None) => {
+                if self.profile_enabled && !self.profile_emitted {
+                    self.profile.emit();
+                    self.profile_emitted = true;
+                }
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -1097,9 +1366,11 @@ mod tests {
             vcf_row: 0,
             chrom: "1".to_string(),
             window_id: 0,
-            cache_rows: vec![0],
+            cache_rows_start: 0,
+            cache_rows_end: 1,
         };
         let entries = vec![OutputEntry::Matched(&matched)];
+        let matched_cache_rows = vec![0usize];
         let mut window_columns: HashMap<(String, u64), Vec<ArrayRef>> = HashMap::new();
         window_columns.insert(
             ("1".to_string(), 0),
@@ -1108,6 +1379,7 @@ mod tests {
 
         let err = build_cache_column_v1(
             &entries,
+            &matched_cache_rows,
             &window_columns,
             0,
             &DataType::Int64,
