@@ -23,10 +23,11 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{Int64Type, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
-use log::info;
+use log::{debug, info};
 
 use crate::key_encoding::{
     DEFAULT_WINDOW_SIZE, EntryType, encode_entry_key, encode_window_key, window_id_for_position,
@@ -138,7 +139,19 @@ impl CacheLoader {
         )?);
 
         // Create physical plan — no WHERE, no ORDER BY.
-        let plan = source_df.create_physical_plan().await?;
+        // Wrap with RepartitionExec when target_partitions > 1 so that filtered
+        // data (e.g. single-chromosome loads from a sorted Parquet file) is
+        // evenly distributed across partitions.
+        let raw_plan = source_df.create_physical_plan().await?;
+        let target = session.state().config().target_partitions();
+        let plan: Arc<dyn ExecutionPlan> = if target > 1 {
+            Arc::new(RepartitionExec::try_new(
+                raw_plan,
+                Partitioning::RoundRobinBatch(target),
+            )?)
+        } else {
+            raw_plan
+        };
         let partition_count = plan.output_partitioning().partition_count();
         let task_ctx = session.task_ctx();
 
@@ -146,6 +159,7 @@ impl CacheLoader {
             "Loading into KV cache: {} partitions, window_size={}",
             partition_count, self.window_size
         );
+        debug!("Physical plan:\n{}", datafusion::physical_plan::displayable(plan.as_ref()).indent(true));
 
         // Phase 1: Read all partitions in parallel, accumulate in shared buffer.
         let shared_buffers = Arc::new(SharedWindowBuffers::new());
@@ -254,8 +268,10 @@ async fn read_partition(
     window_size: u64,
     buffers: Arc<SharedWindowBuffers>,
 ) -> Result<u64> {
+    let part_start = Instant::now();
     let mut stream = plan.execute(partition_id, task_ctx)?;
     let mut total_variants = 0u64;
+    let mut batch_count = 0u64;
 
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
@@ -264,12 +280,18 @@ async fn read_partition(
         }
 
         total_variants += batch.num_rows() as u64;
+        batch_count += 1;
 
         let window_batches = split_batch_into_windows(&batch, window_size)?;
         for ((chrom, wid), sub_batch) in window_batches {
             buffers.push(chrom, wid, sub_batch);
         }
     }
+
+    let elapsed = part_start.elapsed().as_secs_f64();
+    info!(
+        "Partition {partition_id}: {total_variants} variants, {batch_count} batches in {elapsed:.1}s"
+    );
 
     Ok(total_variants)
 }
