@@ -18,8 +18,8 @@ pub type AlleleMatcher = fn(&str, &str, &str) -> bool;
 /// position before applying allele matching.
 ///
 /// Supports two construction paths:
-/// - `from_position_index`: v1 format (fast, no Arrow IPC decode)
-/// - `from_batch`: v0 legacy format (builds PositionIndex from RecordBatch)
+/// - `from_position_index`: pre-built position index (fast, no Arrow IPC decode)
+/// - `from_batch`: utility path that builds a position index from a RecordBatch
 pub struct WindowAlleleIndex {
     pos_index: PositionIndex,
 }
@@ -30,7 +30,7 @@ impl WindowAlleleIndex {
         Self { pos_index: index }
     }
 
-    /// Build an index from a cache window batch (v0 legacy format).
+    /// Build an index from a cache window batch.
     ///
     /// The batch must have `start` (Int64), `end` (Int64), and `allele_string` (Utf8) columns.
     pub fn from_batch(batch: RecordBatch) -> Result<Self> {

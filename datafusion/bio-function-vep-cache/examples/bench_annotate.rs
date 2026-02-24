@@ -10,7 +10,7 @@ use futures::StreamExt;
 
 use datafusion_bio_function_vep_cache::allele_index::{AlleleMatcher, WindowAlleleIndex};
 use datafusion_bio_function_vep_cache::key_encoding::window_id_for_position;
-use datafusion_bio_function_vep_cache::kv_store::{FORMAT_V1, VepKvStore};
+use datafusion_bio_function_vep_cache::kv_store::VepKvStore;
 
 /// Simple exact matcher.
 fn allele_matches(_vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool {
@@ -63,7 +63,6 @@ fn get_u32_col(col: &dyn Array) -> Vec<u32> {
 struct AnnotationState {
     store: Arc<VepKvStore>,
     window_size: u64,
-    format_version: u8,
     matcher: AlleleMatcher,
     current_window: Option<(String, u64)>,
     current_index: Option<WindowAlleleIndex>,
@@ -73,11 +72,9 @@ struct AnnotationState {
 impl AnnotationState {
     fn new(store: Arc<VepKvStore>) -> Self {
         let window_size = store.window_size();
-        let format_version = store.format_version();
         Self {
             store,
             window_size,
-            format_version,
             matcher: allele_matches,
             current_window: None,
             current_index: None,
@@ -93,18 +90,9 @@ impl AnnotationState {
         };
 
         if need_load {
-            if self.format_version >= FORMAT_V1 {
-                let pos_index = self.store.get_position_index(chrom, wid)?;
-                self.current_window = Some((chrom.to_string(), wid));
-                self.current_index = pos_index.map(WindowAlleleIndex::from_position_index);
-            } else {
-                let batch = self.store.get_window(chrom, wid)?;
-                self.current_window = Some((chrom.to_string(), wid));
-                self.current_index = match batch {
-                    Some(b) => Some(WindowAlleleIndex::from_batch(b)?),
-                    None => None,
-                };
-            }
+            let pos_index = self.store.get_position_index(chrom, wid)?;
+            self.current_window = Some((chrom.to_string(), wid));
+            self.current_index = pos_index.map(WindowAlleleIndex::from_position_index);
             self.window_loads += 1;
         }
         Ok(())

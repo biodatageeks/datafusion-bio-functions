@@ -2,7 +2,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_bio_function_vep_cache::kv_store::{FORMAT_V0, FORMAT_V1};
 use datafusion_bio_function_vep_cache::{CacheLoader, VepKvStore};
 
 #[tokio::main]
@@ -12,11 +11,11 @@ async fn main() -> datafusion::common::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Usage: {} <parquet_path> <fjall_output_path> [chrom_filter] [window_size_kb] [format: v0|v1] [partitions]",
+            "Usage: {} <parquet_path> <fjall_output_path> [chrom_filter] [window_size_kb] [partitions]",
             args[0]
         );
         eprintln!(
-            "Example: {} /data/vep/115_GRCh38.parquet /tmp/vep_cache 22 1000 v1 8",
+            "Example: {} /data/vep/115_GRCh38.parquet /tmp/vep_cache 22 1000 8",
             args[0]
         );
         std::process::exit(1);
@@ -27,11 +26,7 @@ async fn main() -> datafusion::common::Result<()> {
     let chrom_filter = args.get(3).map(|s| s.as_str());
     let window_size_kb: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1000);
     let window_size = window_size_kb * 1000;
-    let format_version: u8 = match args.get(5).map(|s| s.as_str()) {
-        Some("v0") => FORMAT_V0,
-        _ => FORMAT_V1,
-    };
-    let target_partitions: Option<usize> = args.get(6).and_then(|s| s.parse().ok());
+    let target_partitions: Option<usize> = args.get(5).and_then(|s| s.parse().ok());
 
     let ctx = if let Some(partitions) = target_partitions {
         let config = SessionConfig::new().with_target_partitions(partitions);
@@ -74,9 +69,7 @@ async fn main() -> datafusion::common::Result<()> {
 
     // Load into fjall
     let load_start = Instant::now();
-    let loader = CacheLoader::new(source_table, output_path)
-        .with_window_size(window_size)
-        .with_format_version(format_version);
+    let loader = CacheLoader::new(source_table, output_path).with_window_size(window_size);
     let stats = loader.load(&ctx).await?;
     let load_elapsed = load_start.elapsed().as_secs_f64();
 
@@ -99,19 +92,10 @@ async fn main() -> datafusion::common::Result<()> {
     let mid_window = stats.total_windows / 2;
     let read_start = Instant::now();
     let mut read_iters = 0u32;
-    let fmt_ver = store.format_version();
     for wid in 0..stats.total_windows.min(20) {
-        if fmt_ver >= FORMAT_V1 {
-            if let Some(idx) = store.get_position_index(sample_chrom, wid)? {
-                let _index =
-                    datafusion_bio_function_vep_cache::allele_index::WindowAlleleIndex::from_position_index(idx);
-                read_iters += 1;
-            }
-        } else if let Some(batch) = store.get_window(sample_chrom, wid)? {
+        if let Some(idx) = store.get_position_index(sample_chrom, wid)? {
             let _index =
-                datafusion_bio_function_vep_cache::allele_index::WindowAlleleIndex::from_batch(
-                    batch,
-                )?;
+                datafusion_bio_function_vep_cache::allele_index::WindowAlleleIndex::from_position_index(idx);
             read_iters += 1;
         }
     }
@@ -123,23 +107,17 @@ async fn main() -> datafusion::common::Result<()> {
 
     // Also measure just a single window from the middle
     let single_start = Instant::now();
-    if fmt_ver >= FORMAT_V1 {
-        if let Some(idx) = store.get_position_index(sample_chrom, mid_window)? {
-            let _index =
-                datafusion_bio_function_vep_cache::allele_index::WindowAlleleIndex::from_position_index(idx);
-        }
-    } else if let Some(batch) = store.get_window(sample_chrom, mid_window)? {
+    if let Some(idx) = store.get_position_index(sample_chrom, mid_window)? {
         let _index =
-            datafusion_bio_function_vep_cache::allele_index::WindowAlleleIndex::from_batch(batch)?;
+            datafusion_bio_function_vep_cache::allele_index::WindowAlleleIndex::from_position_index(idx);
     }
     let single_read_ms = single_start.elapsed().as_secs_f64() * 1000.0;
 
     drop(store);
 
-    let fmt_label = if fmt_ver >= FORMAT_V1 { "v1" } else { "v0" };
     println!(
         "fmt={} | window={:>6}kb | variants={:>10} | windows={:>6} | avg/win={:>8.0} | load={:>5.1}s | disk={:>7.1}MB | avg_win_disk={:>6.0}KB | read+idx={:>6.1}ms avg | single={:>6.1}ms",
-        fmt_label,
+        "v1",
         window_size_kb,
         row_count,
         stats.total_windows,

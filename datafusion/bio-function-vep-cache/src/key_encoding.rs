@@ -49,8 +49,6 @@ pub enum EntryType {
     PositionIndex,
     /// Single column stored as Arrow IPC. The `u8` is the column index (0-based).
     Column(u8),
-    /// Legacy monolithic Arrow IPC batch (all columns). Used for v0 backward compat reads.
-    LegacyMonolithic,
 }
 
 impl EntryType {
@@ -58,25 +56,22 @@ impl EntryType {
     ///
     /// `entry_type` byte reserves:
     /// - `0x00` for `PositionIndex`
-    /// - `0xFF` for `LegacyMonolithic`
     ///
-    /// So column entries can use `0x01..=0xFE`, which maps to
-    /// column indices `0..=253` (254 total columns).
-    pub const MAX_COLUMN_INDEX: u8 = 0xFD;
+    /// So column entries can use `0x01..=0xFF`, which maps to
+    /// column indices `0..=254` (255 total columns).
+    pub const MAX_COLUMN_INDEX: u8 = 0xFE;
 
     fn to_byte(self) -> u8 {
         match self {
             Self::PositionIndex => 0x00,
-            Self::Column(idx) => idx + 1, // 0x01..=0xFE
-            Self::LegacyMonolithic => 0xFF,
+            Self::Column(idx) => idx + 1, // 0x01..=0xFF
         }
     }
 
     fn from_byte(b: u8) -> Self {
         match b {
             0x00 => Self::PositionIndex,
-            0xFF => Self::LegacyMonolithic,
-            col => Self::Column(col - 1), // 0x01..=0xFE → column 0..=253
+            col => Self::Column(col - 1), // 0x01..=0xFF → column 0..=254
         }
     }
 }
@@ -251,7 +246,6 @@ mod tests {
             EntryType::Column(0),
             EntryType::Column(42),
             EntryType::Column(EntryType::MAX_COLUMN_INDEX),
-            EntryType::LegacyMonolithic,
         ];
         for et in types {
             assert_eq!(EntryType::from_byte(et.to_byte()), et);
@@ -262,10 +256,10 @@ mod tests {
     fn test_max_column_index_maps_to_last_non_reserved_byte() {
         assert_eq!(
             EntryType::Column(EntryType::MAX_COLUMN_INDEX).to_byte(),
-            0xFE
+            0xFF
         );
         assert_eq!(
-            EntryType::from_byte(0xFE),
+            EntryType::from_byte(0xFF),
             EntryType::Column(EntryType::MAX_COLUMN_INDEX)
         );
     }
@@ -288,13 +282,11 @@ mod tests {
 
     #[test]
     fn test_entry_key_ordering() {
-        // Same chrom + window, different entry types: position index < column < legacy
+        // Same chrom + window, different entry types: position index < column
         let k_pos = encode_entry_key("1", 0, EntryType::PositionIndex);
         let k_col0 = encode_entry_key("1", 0, EntryType::Column(0));
         let k_col5 = encode_entry_key("1", 0, EntryType::Column(5));
-        let k_legacy = encode_entry_key("1", 0, EntryType::LegacyMonolithic);
         assert!(k_pos < k_col0);
         assert!(k_col0 < k_col5);
-        assert!(k_col5 < k_legacy);
     }
 }

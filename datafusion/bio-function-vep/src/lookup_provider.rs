@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, StringArray};
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
@@ -51,6 +51,13 @@ pub struct LookupProvider {
     schema: SchemaRef,
 }
 
+fn normalize_cache_output_type(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::Utf8View | DataType::LargeUtf8 => DataType::Utf8,
+        other => other.clone(),
+    }
+}
+
 impl LookupProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -76,7 +83,7 @@ impl LookupProvider {
             if let Ok(field) = cache_schema.field_with_name(col_name) {
                 fields.push(Arc::new(Field::new(
                     format!("cache_{}", field.name()),
-                    field.data_type().clone(),
+                    normalize_cache_output_type(field.data_type()),
                     true, // all cache columns are nullable in output (may not match)
                 )));
             }

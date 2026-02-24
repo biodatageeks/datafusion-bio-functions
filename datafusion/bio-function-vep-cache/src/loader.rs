@@ -30,10 +30,10 @@ use futures::StreamExt;
 use log::{debug, info};
 
 use crate::key_encoding::{
-    DEFAULT_WINDOW_SIZE, EntryType, encode_entry_key, encode_window_key, window_id_for_position,
+    DEFAULT_WINDOW_SIZE, EntryType, encode_entry_key, window_id_for_position,
 };
 use crate::kv_store::{
-    FORMAT_V1, VepKvStore, serialize_ipc_pub, to_v1_column_index, validate_v1_schema_width,
+    VepKvStore, serialize_ipc_pub, to_v1_column_index, validate_v1_schema_width,
 };
 use crate::position_index::PositionIndex;
 
@@ -91,7 +91,6 @@ struct StreamContext {
     schema: SchemaRef,
     flush_locks: Arc<FlushShards>,
     window_size: u64,
-    format_version: u8,
 }
 
 /// Builder for loading a Parquet-based VEP cache into fjall.
@@ -100,7 +99,6 @@ pub struct CacheLoader {
     target_path: String,
     window_size: u64,
     parallelism: Option<usize>,
-    format_version: u8,
 }
 
 impl CacheLoader {
@@ -114,7 +112,6 @@ impl CacheLoader {
             target_path: target_path.into(),
             window_size: DEFAULT_WINDOW_SIZE,
             parallelism: None,
-            format_version: FORMAT_V1,
         }
     }
 
@@ -131,12 +128,6 @@ impl CacheLoader {
         self
     }
 
-    /// Set the format version (default: FORMAT_V1 = columnar).
-    pub fn with_format_version(mut self, version: u8) -> Self {
-        self.format_version = version;
-        self
-    }
-
     /// Load the cache from the registered source table into fjall.
     ///
     /// Spawns one streaming task per physical partition. Each task reads
@@ -149,15 +140,12 @@ impl CacheLoader {
         let source_df = session.table(&self.source_table).await?;
         let schema: SchemaRef = Arc::new(source_df.schema().as_arrow().clone());
 
-        if self.format_version >= FORMAT_V1 {
-            validate_v1_schema_width(schema.fields().len())?;
-        }
+        validate_v1_schema_width(schema.fields().len())?;
 
-        let store = Arc::new(VepKvStore::create_with_version(
+        let store = Arc::new(VepKvStore::create(
             Path::new(&self.target_path),
             schema.clone(),
             self.window_size,
-            self.format_version,
         )?);
 
         let plan = source_df.create_physical_plan().await?;
@@ -181,7 +169,6 @@ impl CacheLoader {
 
         let mut handles = Vec::with_capacity(partition_count);
         let window_size = self.window_size;
-        let format_version = self.format_version;
 
         for partition_id in 0..partition_count {
             let plan = Arc::clone(&plan);
@@ -192,7 +179,6 @@ impl CacheLoader {
                 schema: schema.clone(),
                 flush_locks: Arc::clone(&flush_locks),
                 window_size,
-                format_version,
             };
 
             handles.push(tokio::spawn(async move {
@@ -336,24 +322,21 @@ fn read_existing_window(
     schema: &SchemaRef,
     chrom: &str,
     window_id: u64,
-    format_version: u8,
 ) -> Result<Option<RecordBatch>> {
-    if format_version >= FORMAT_V1 {
-        if store.get_position_index(chrom, window_id)?.is_none() {
-            return Ok(None);
+    if store.get_position_index(chrom, window_id)?.is_none() {
+        return Ok(None);
+    }
+    let col_indices: Vec<u8> = (0..schema.fields().len())
+        .map(to_v1_column_index)
+        .collect::<Result<Vec<_>>>()?;
+    match store.get_columns(chrom, window_id, &col_indices)? {
+        Some(col_data) => {
+            let arrays: Vec<_> = col_data.into_iter().map(|(arr, _)| arr).collect();
+            let batch = RecordBatch::try_new(schema.clone(), arrays)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            Ok(Some(batch))
         }
-        let col_indices: Vec<u8> = (0..schema.fields().len()).map(|i| i as u8).collect();
-        match store.get_columns(chrom, window_id, &col_indices)? {
-            Some(col_data) => {
-                let arrays: Vec<_> = col_data.into_iter().map(|(arr, _)| arr).collect();
-                let batch = RecordBatch::try_new(schema.clone(), arrays)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                Ok(Some(batch))
-            }
-            None => Ok(None),
-        }
-    } else {
-        store.get_window(chrom, window_id)
+        None => Ok(None),
     }
 }
 
@@ -385,10 +368,9 @@ async fn flush_windows(
     let store = Arc::clone(&ctx.store);
     let schema = ctx.schema.clone();
     let flush_locks = Arc::clone(&ctx.flush_locks);
-    let format_version = ctx.format_version;
 
     tokio::task::spawn_blocking(move || {
-        flush_windows_blocking(store, schema, windows, format_version, flush_locks)
+        flush_windows_blocking(store, schema, windows, flush_locks)
     })
     .await
     .map_err(|e| DataFusionError::External(Box::new(e)))?
@@ -402,7 +384,6 @@ fn flush_windows_blocking(
     store: Arc<VepKvStore>,
     schema: SchemaRef,
     windows: Vec<PendingWindow>,
-    format_version: u8,
     flush_locks: Arc<FlushShards>,
 ) -> Result<(u64, u64)> {
     let mut windows_by_shard: HashMap<usize, Vec<PendingWindow>> = HashMap::new();
@@ -426,7 +407,6 @@ fn flush_windows_blocking(
                 &schema,
                 &window.chrom,
                 window.window_id,
-                format_version,
             )?;
             let is_new = existing.is_none();
             if let Some(existing_batch) = existing {
@@ -438,7 +418,6 @@ fn flush_windows_blocking(
                 &window.chrom,
                 window.window_id,
                 window.batches,
-                format_version,
             )?;
             total_bytes += prepared.total_bytes;
             if is_new {
@@ -546,7 +525,6 @@ fn prepare_window_entries(
     chrom: &str,
     window_id: u64,
     batches: Vec<RecordBatch>,
-    format_version: u8,
 ) -> Result<PreparedWindow> {
     if batches.is_empty() {
         return Ok(PreparedWindow {
@@ -564,27 +542,7 @@ fn prepare_window_entries(
 
     let total_bytes = merged.get_array_memory_size() as u64;
 
-    if format_version >= FORMAT_V1 {
-        prepare_v1_entries(chrom, window_id, &merged, total_bytes)
-    } else {
-        prepare_v0_entries(chrom, window_id, &merged, total_bytes)
-    }
-}
-
-/// v0 (legacy monolithic): serialize all columns as a single Arrow IPC blob.
-fn prepare_v0_entries(
-    chrom: &str,
-    window_id: u64,
-    merged: &RecordBatch,
-    total_bytes: u64,
-) -> Result<PreparedWindow> {
-    // v0 uses 10-byte encode_window_key (not 11-byte encode_entry_key).
-    let key = encode_window_key(chrom, window_id);
-    let value = serialize_ipc_pub(merged)?;
-    Ok(PreparedWindow {
-        entries: vec![(key, value)],
-        total_bytes,
-    })
+    prepare_v1_entries(chrom, window_id, &merged, total_bytes)
 }
 
 /// v1 (columnar): serialize position index + per-column Arrow IPC entries.
@@ -630,7 +588,6 @@ fn prepare_v1_entries(
 mod tests {
     use super::*;
     use crate::key_encoding::EntryType;
-    use crate::kv_store::FORMAT_V0;
     use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
@@ -691,35 +648,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_loader_basic_v0() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = SessionContext::new();
-
-        let (schema, table) = make_test_table();
-        ctx.register_table("source", Arc::new(table)).unwrap();
-
-        let loader = CacheLoader::new("source", dir.path().to_str().unwrap())
-            .with_window_size(1_000_000)
-            .with_format_version(FORMAT_V0);
-        let stats = loader.load(&ctx).await.unwrap();
-
-        assert_eq!(stats.total_windows, 3);
-
-        let store = VepKvStore::open(dir.path()).unwrap();
-        assert_eq!(store.format_version(), FORMAT_V0);
-        assert_eq!(store.schema().as_ref(), schema.as_ref());
-
-        let batch = store.get_window("1", 0).unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 2);
-
-        let batch = store.get_window("1", 1).unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 1);
-
-        let batch = store.get_window("2", 0).unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn test_loader_basic_v1() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = SessionContext::new();
@@ -734,7 +662,6 @@ mod tests {
         assert_eq!(stats.total_windows, 3);
 
         let store = VepKvStore::open(dir.path()).unwrap();
-        assert_eq!(store.format_version(), FORMAT_V1);
         assert_eq!(store.schema().as_ref(), schema.as_ref());
 
         // v1: position index should be available

@@ -3,14 +3,13 @@ use std::time::Instant;
 
 use datafusion::arrow::array::Array;
 use datafusion::common::Result;
-use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::prelude::SessionContext;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use futures::StreamExt;
 
 use datafusion_bio_function_vep_cache::allele_index::WindowAlleleIndex;
 use datafusion_bio_function_vep_cache::key_encoding::window_id_for_position;
-use datafusion_bio_function_vep_cache::kv_store::{FORMAT_V1, VepKvStore};
+use datafusion_bio_function_vep_cache::kv_store::VepKvStore;
 
 fn allele_matches(_vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool {
     let mut parts = allele_string.split('/');
@@ -81,22 +80,11 @@ impl Stats {
             total_window_rows_allele_hit: 0,
         }
     }
-
-    fn merge(&mut self, other: &Stats) {
-        self.vcf_rows += other.vcf_rows;
-        self.matched_rows += other.matched_rows;
-        self.window_loads += other.window_loads;
-        self.total_window_rows_deserialized += other.total_window_rows_deserialized;
-        self.total_window_rows_probed += other.total_window_rows_probed;
-        self.total_window_rows_position_hit += other.total_window_rows_position_hit;
-        self.total_window_rows_allele_hit += other.total_window_rows_allele_hit;
-    }
 }
 
 struct AnnotationState {
     store: Arc<VepKvStore>,
     window_size: u64,
-    format_version: u8,
     current_window: Option<(String, u64)>,
     current_index: Option<WindowAlleleIndex>,
     stats: Stats,
@@ -105,11 +93,9 @@ struct AnnotationState {
 impl AnnotationState {
     fn new(store: Arc<VepKvStore>) -> Self {
         let window_size = store.window_size();
-        let format_version = store.format_version();
         Self {
             store,
             window_size,
-            format_version,
             current_window: None,
             current_index: None,
             stats: Stats::new(),
@@ -124,31 +110,16 @@ impl AnnotationState {
         };
 
         if need_load {
-            if self.format_version >= FORMAT_V1 {
-                let pos_index = self.store.get_position_index(chrom, wid)?;
-                self.current_window = Some((chrom.to_string(), wid));
-                self.stats.window_loads += 1;
-                match pos_index {
-                    Some(idx) => {
-                        self.stats.total_window_rows_deserialized += idx.num_rows() as u64;
-                        self.current_index = Some(WindowAlleleIndex::from_position_index(idx));
-                    }
-                    None => {
-                        self.current_index = None;
-                    }
+            let pos_index = self.store.get_position_index(chrom, wid)?;
+            self.current_window = Some((chrom.to_string(), wid));
+            self.stats.window_loads += 1;
+            match pos_index {
+                Some(idx) => {
+                    self.stats.total_window_rows_deserialized += idx.num_rows() as u64;
+                    self.current_index = Some(WindowAlleleIndex::from_position_index(idx));
                 }
-            } else {
-                let batch = self.store.get_window(chrom, wid)?;
-                self.current_window = Some((chrom.to_string(), wid));
-                self.stats.window_loads += 1;
-                match batch {
-                    Some(b) => {
-                        self.stats.total_window_rows_deserialized += b.num_rows() as u64;
-                        self.current_index = Some(WindowAlleleIndex::from_batch(b)?);
-                    }
-                    None => {
-                        self.current_index = None;
-                    }
+                None => {
+                    self.current_index = None;
                 }
             }
         }

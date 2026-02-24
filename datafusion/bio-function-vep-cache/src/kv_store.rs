@@ -9,7 +9,7 @@ use datafusion::arrow::datatypes::{Field, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 
-use crate::key_encoding::{EntryType, decode_window_key, encode_entry_key, encode_window_key};
+use crate::key_encoding::{EntryType, decode_entry_key, encode_entry_key};
 use crate::position_index::PositionIndex;
 
 const META_PARTITION: &str = "meta";
@@ -18,8 +18,6 @@ const SCHEMA_KEY: &[u8] = b"schema";
 const WINDOW_SIZE_KEY: &[u8] = b"window_size";
 const FORMAT_VERSION_KEY: &[u8] = b"format_version";
 
-/// Format version 0: legacy monolithic (all columns in one Arrow IPC blob per window).
-pub const FORMAT_V0: u8 = 0;
 /// Format version 1: columnar (position index + per-column Arrow IPC entries).
 pub const FORMAT_V1: u8 = 1;
 
@@ -118,25 +116,12 @@ impl VepKvStore {
         })
     }
 
-    /// Create a new KV store with the given schema, window size, and format version.
-    ///
-    /// Use `FORMAT_V1` for new caches (columnar), `FORMAT_V0` for legacy.
+    /// Create a new KV store with the given schema and window size.
     pub fn create(path: impl AsRef<Path>, schema: SchemaRef, window_size: u64) -> Result<Self> {
-        Self::create_with_version(path, schema, window_size, FORMAT_V1)
-    }
-
-    /// Create a new KV store with explicit format version.
-    pub fn create_with_version(
-        path: impl AsRef<Path>,
-        schema: SchemaRef,
-        window_size: u64,
-        format_version: u8,
-    ) -> Result<Self> {
         Self::create_with_options(
             path,
             schema,
             window_size,
-            format_version,
             256 * 1024 * 1024,
             PartitionCreateOptions::default(),
         )
@@ -147,13 +132,10 @@ impl VepKvStore {
         path: impl AsRef<Path>,
         schema: SchemaRef,
         window_size: u64,
-        format_version: u8,
         cache_size_bytes: u64,
         partition_opts: PartitionCreateOptions,
     ) -> Result<Self> {
-        if format_version >= FORMAT_V1 {
-            validate_v1_schema_width(schema.fields().len())?;
-        }
+        validate_v1_schema_width(schema.fields().len())?;
 
         let keyspace = Config::new(path)
             .cache_size(cache_size_bytes)
@@ -175,7 +157,7 @@ impl VepKvStore {
         meta.insert(WINDOW_SIZE_KEY, window_size.to_be_bytes())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        meta.insert(FORMAT_VERSION_KEY, [format_version])
+        meta.insert(FORMAT_VERSION_KEY, [FORMAT_V1])
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         keyspace
@@ -188,7 +170,7 @@ impl VepKvStore {
             meta,
             schema,
             window_size,
-            format_version,
+            format_version: FORMAT_V1,
         })
     }
 
@@ -287,31 +269,6 @@ impl VepKvStore {
         Ok(Some(results))
     }
 
-    // --- Legacy v0 API ---
-
-    /// Read a window's data as a RecordBatch (v0 legacy format).
-    pub fn get_window(&self, chrom: &str, window_id: u64) -> Result<Option<RecordBatch>> {
-        let key = encode_window_key(chrom, window_id);
-        match self.data.get(&key) {
-            Ok(Some(value)) => {
-                let batch = deserialize_ipc(&value)?;
-                Ok(Some(batch))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(DataFusionError::External(Box::new(e))),
-        }
-    }
-
-    /// Write a window's data as an Arrow IPC batch.
-    pub fn put_window(&self, chrom: &str, window_id: u64, batch: &RecordBatch) -> Result<()> {
-        let key = encode_window_key(chrom, window_id);
-        let value = serialize_ipc(batch)?;
-        self.data
-            .insert(&key, &value)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(())
-    }
-
     /// Persist all data to disk.
     pub fn persist(&self) -> Result<()> {
         self.keyspace
@@ -357,20 +314,33 @@ impl VepKvStore {
 
     /// Iterate all windows for a given chromosome (prefix scan).
     ///
-    /// For v0 format, returns full monolithic batches.
-    /// For v1 format, skips non-legacy entries (position index + columns are separate).
+    /// Returns full batches assembled from v1 per-column entries.
     pub fn windows_for_chrom(&self, chrom: &str) -> Result<Vec<(String, u64, RecordBatch)>> {
         let prefix = crate::key_encoding::chrom_prefix(chrom);
-        let mut results = Vec::new();
+        let mut windows = Vec::new();
         for item in self.data.prefix(&prefix) {
-            let (key, value) = item.map_err(|e| DataFusionError::External(Box::new(e)))?;
-            if key.len() == 10 {
-                // v0 legacy 10-byte key
-                let (c, wid) = decode_window_key(&key);
-                let batch = deserialize_ipc(&value)?;
+            let (key, _) = item.map_err(|e| DataFusionError::External(Box::new(e)))?;
+            if key.len() >= 11 {
+                let (c, wid, entry) = decode_entry_key(&key);
+                if entry == EntryType::PositionIndex {
+                    windows.push((c, wid));
+                }
+            }
+        }
+        windows.sort();
+        windows.dedup();
+
+        let all_cols: Vec<u8> = (0..self.schema.fields().len())
+            .map(to_v1_column_index)
+            .collect::<Result<Vec<_>>>()?;
+        let mut results = Vec::with_capacity(windows.len());
+        for (c, wid) in windows {
+            if let Some(cols) = self.get_columns(&c, wid, &all_cols)? {
+                let arrays: Vec<ArrayRef> = cols.into_iter().map(|(arr, _)| arr).collect();
+                let batch = RecordBatch::try_new(self.schema.clone(), arrays)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                 results.push((c, wid, batch));
             }
-            // v1 keys (11 bytes) are skipped — use get_position_index + get_columns instead
         }
         Ok(results)
     }
@@ -399,13 +369,24 @@ impl VepKvStore {
     }
 
     fn read_format_version(meta: &PartitionHandle) -> Result<u8> {
-        match meta
+        let version = match meta
             .get(FORMAT_VERSION_KEY)
             .map_err(|e| DataFusionError::External(Box::new(e)))?
         {
-            Some(v) => Ok(v[0]),
-            None => Ok(FORMAT_V0), // Legacy caches have no version key
+            Some(v) => v[0],
+            None => {
+                return Err(DataFusionError::Execution(
+                    "cache format metadata missing: legacy v0 caches are no longer supported; rebuild cache in v1 format"
+                        .to_string(),
+                ));
+            }
+        };
+        if version != FORMAT_V1 {
+            return Err(DataFusionError::Execution(format!(
+                "unsupported cache format version {version}: only v1 is supported"
+            )));
         }
+        Ok(version)
     }
 }
 
@@ -517,30 +498,20 @@ mod tests {
     }
 
     #[test]
-    fn test_kv_store_roundtrip_v0() {
+    fn test_open_rejects_unsupported_format() {
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
-        let batch = test_batch(&schema);
 
-        {
-            let store =
-                VepKvStore::create_with_version(dir.path(), schema.clone(), 1_000_000, FORMAT_V0)
-                    .unwrap();
-            store.put_window("1", 0, &batch).unwrap();
-            store.persist().unwrap();
-        }
+        let store = VepKvStore::create(dir.path(), schema, 1_000_000).unwrap();
+        store.put_metadata(FORMAT_VERSION_KEY, &[0]).unwrap();
+        store.persist().unwrap();
+        drop(store);
 
-        {
-            let store = VepKvStore::open(dir.path()).unwrap();
-            assert_eq!(store.format_version(), FORMAT_V0);
-            assert_eq!(store.schema().as_ref(), schema.as_ref());
-            assert_eq!(store.window_size(), 1_000_000);
-
-            let retrieved = store.get_window("1", 0).unwrap().unwrap();
-            assert_eq!(batch, retrieved);
-
-            assert!(store.get_window("1", 999).unwrap().is_none());
-        }
+        let err = match VepKvStore::open(dir.path()) {
+            Ok(_) => panic!("expected open to fail for unsupported format version"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("unsupported cache format version"));
     }
 
     #[test]
