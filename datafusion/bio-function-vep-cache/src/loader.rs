@@ -23,8 +23,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{Int64Type, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
-use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use log::{debug, info};
@@ -139,19 +138,7 @@ impl CacheLoader {
         )?);
 
         // Create physical plan — no WHERE, no ORDER BY.
-        // Wrap with RepartitionExec when target_partitions > 1 so that filtered
-        // data (e.g. single-chromosome loads from a sorted Parquet file) is
-        // evenly distributed across partitions.
-        let raw_plan = source_df.create_physical_plan().await?;
-        let target = session.state().config().target_partitions();
-        let plan: Arc<dyn ExecutionPlan> = if target > 1 {
-            Arc::new(RepartitionExec::try_new(
-                raw_plan,
-                Partitioning::RoundRobinBatch(target),
-            )?)
-        } else {
-            raw_plan
-        };
+        let plan = source_df.create_physical_plan().await?;
         let partition_count = plan.output_partitioning().partition_count();
         let task_ctx = session.task_ctx();
 
