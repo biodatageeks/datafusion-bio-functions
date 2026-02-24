@@ -10,9 +10,11 @@
 //! - Windows are flushed to fjall as soon as the stream advances past them
 //!   (position-order tracking), keeping memory bounded to a few active windows.
 //! - Cross-partition window overlap (rare — only at partition boundaries) is
-//!   handled via atomic read-modify-write under a shared lock.
+//!   handled via atomic read-modify-write under sharded window locks.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -51,11 +53,43 @@ struct PartitionStats {
     total_bytes: u64,
 }
 
+const FLUSH_LOCK_SHARDS: usize = 256;
+
+/// Striped lock set for window-level read-modify-write coordination.
+struct FlushShards {
+    locks: Vec<std::sync::Mutex<()>>,
+}
+
+impl FlushShards {
+    fn new(shards: usize) -> Self {
+        let shard_count = shards.max(1);
+        let mut locks = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            locks.push(std::sync::Mutex::new(()));
+        }
+        Self { locks }
+    }
+
+    fn shard_index(&self, chrom: &str, window_id: u64) -> usize {
+        let mut hasher = DefaultHasher::new();
+        chrom.hash(&mut hasher);
+        window_id.hash(&mut hasher);
+        (hasher.finish() as usize) % self.locks.len()
+    }
+}
+
+/// Per-window buffer drained from a partition's pending map and flushed.
+struct PendingWindow {
+    chrom: String,
+    window_id: u64,
+    batches: Vec<RecordBatch>,
+}
+
 /// Shared context passed to each partition's streaming task.
 struct StreamContext {
     store: Arc<VepKvStore>,
     schema: SchemaRef,
-    flush_lock: Arc<std::sync::Mutex<()>>,
+    flush_locks: Arc<FlushShards>,
     window_size: u64,
     format_version: u8,
 }
@@ -139,8 +173,8 @@ impl CacheLoader {
             datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
         );
 
-        // Shared lock for cross-partition read-modify-write safety.
-        let flush_lock = Arc::new(std::sync::Mutex::new(()));
+        // Sharded locks for cross-partition read-modify-write safety.
+        let flush_locks = Arc::new(FlushShards::new(FLUSH_LOCK_SHARDS));
         let semaphore = self
             .parallelism
             .map(|n| Arc::new(tokio::sync::Semaphore::new(n.min(partition_count))));
@@ -156,7 +190,7 @@ impl CacheLoader {
             let ctx = StreamContext {
                 store: Arc::clone(&store),
                 schema: schema.clone(),
-                flush_lock: Arc::clone(&flush_lock),
+                flush_locks: Arc::clone(&flush_locks),
                 window_size,
                 format_version,
             };
@@ -210,7 +244,7 @@ impl CacheLoader {
 /// written. At end-of-stream, all remaining windows are flushed.
 ///
 /// Cross-partition overlap (rare — only at partition boundaries) is handled
-/// by read-modify-write under `flush_lock`.
+/// by read-modify-write under sharded window locks.
 async fn stream_partition(
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<datafusion::execution::TaskContext>,
@@ -270,30 +304,18 @@ async fn stream_partition(
             .collect();
 
         if !flush_keys.is_empty() {
-            flush_windows(
-                &ctx.store,
-                &ctx.schema,
-                &mut pending,
-                &flush_keys,
-                ctx.format_version,
-                &mut stats,
-                &ctx.flush_lock,
-            )?;
+            let (new_windows, bytes) = flush_windows(&ctx, &mut pending, &flush_keys).await?;
+            stats.total_windows += new_windows;
+            stats.total_bytes += bytes;
         }
     }
 
     // Flush all remaining windows (the frontier windows themselves).
     let remaining: Vec<_> = pending.keys().cloned().collect();
     if !remaining.is_empty() {
-        flush_windows(
-            &ctx.store,
-            &ctx.schema,
-            &mut pending,
-            &remaining,
-            ctx.format_version,
-            &mut stats,
-            &ctx.flush_lock,
-        )?;
+        let (new_windows, bytes) = flush_windows(&ctx, &mut pending, &remaining).await?;
+        stats.total_windows += new_windows;
+        stats.total_bytes += bytes;
     }
 
     info!(
@@ -337,45 +359,100 @@ fn read_existing_window(
 
 /// Flush pending window data to fjall.
 ///
-/// Acquires `flush_lock` to handle cross-partition overlap atomically via
-/// read-modify-write: if a window already exists in fjall (written by another
-/// partition), reads the existing data, concatenates with the new data, and
-/// writes the merged result.
-fn flush_windows(
-    store: &VepKvStore,
-    schema: &SchemaRef,
+/// Drains the requested keys from `pending`, then offloads read/merge/serialize/write
+/// work to `spawn_blocking` so async stream tasks stay responsive.
+async fn flush_windows(
+    ctx: &StreamContext,
     pending: &mut HashMap<(String, u64), Vec<RecordBatch>>,
     keys: &[(String, u64)],
-    format_version: u8,
-    stats: &mut PartitionStats,
-    flush_lock: &std::sync::Mutex<()>,
-) -> Result<()> {
-    let _guard = flush_lock.lock().unwrap();
-    let mut all_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+) -> Result<(u64, u64)> {
+    let mut windows = Vec::with_capacity(keys.len());
 
     for (chrom, wid) in keys {
-        if let Some(mut batches) = pending.remove(&(chrom.clone(), *wid)) {
-            // Read-modify-write: prepend existing data if another partition
-            // already wrote this window.
-            let existing = read_existing_window(store, schema, chrom, *wid, format_version)?;
-            let is_new = existing.is_none();
-            if let Some(existing_batch) = existing {
-                batches.insert(0, existing_batch);
-            }
-
-            let prepared = prepare_window_entries(schema, chrom, *wid, batches, format_version)?;
-            stats.total_bytes += prepared.total_bytes;
-            if is_new {
-                stats.total_windows += 1;
-            }
-            all_entries.extend(prepared.entries);
+        if let Some(batches) = pending.remove(&(chrom.clone(), *wid)) {
+            windows.push(PendingWindow {
+                chrom: chrom.clone(),
+                window_id: *wid,
+                batches,
+            });
         }
     }
 
-    if !all_entries.is_empty() {
-        store.batch_insert_raw(&all_entries)?;
+    if windows.is_empty() {
+        return Ok((0, 0));
     }
-    Ok(())
+
+    let store = Arc::clone(&ctx.store);
+    let schema = ctx.schema.clone();
+    let flush_locks = Arc::clone(&ctx.flush_locks);
+    let format_version = ctx.format_version;
+
+    tokio::task::spawn_blocking(move || {
+        flush_windows_blocking(store, schema, windows, format_version, flush_locks)
+    })
+    .await
+    .map_err(|e| DataFusionError::External(Box::new(e)))?
+}
+
+/// Blocking read-modify-write flush path.
+///
+/// Windows are grouped by lock shard to avoid a single global serialization point
+/// while preserving atomicity for each window's merge+write sequence.
+fn flush_windows_blocking(
+    store: Arc<VepKvStore>,
+    schema: SchemaRef,
+    windows: Vec<PendingWindow>,
+    format_version: u8,
+    flush_locks: Arc<FlushShards>,
+) -> Result<(u64, u64)> {
+    let mut windows_by_shard: HashMap<usize, Vec<PendingWindow>> = HashMap::new();
+    for window in windows {
+        let shard_idx = flush_locks.shard_index(&window.chrom, window.window_id);
+        windows_by_shard.entry(shard_idx).or_default().push(window);
+    }
+
+    let mut total_windows = 0u64;
+    let mut total_bytes = 0u64;
+
+    for (shard_idx, shard_windows) in windows_by_shard {
+        let _guard = flush_locks.locks[shard_idx].lock().unwrap();
+        let mut all_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        for mut window in shard_windows {
+            // Read-modify-write: prepend existing data if another partition
+            // already wrote this window.
+            let existing = read_existing_window(
+                &store,
+                &schema,
+                &window.chrom,
+                window.window_id,
+                format_version,
+            )?;
+            let is_new = existing.is_none();
+            if let Some(existing_batch) = existing {
+                window.batches.insert(0, existing_batch);
+            }
+
+            let prepared = prepare_window_entries(
+                &schema,
+                &window.chrom,
+                window.window_id,
+                window.batches,
+                format_version,
+            )?;
+            total_bytes += prepared.total_bytes;
+            if is_new {
+                total_windows += 1;
+            }
+            all_entries.extend(prepared.entries);
+        }
+
+        if !all_entries.is_empty() {
+            store.batch_insert_raw(&all_entries)?;
+        }
+    }
+
+    Ok((total_windows, total_bytes))
 }
 
 /// Split a RecordBatch into sub-batches keyed by (chrom, window_id).
