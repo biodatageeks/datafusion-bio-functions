@@ -14,7 +14,10 @@ tokio.workspace = true
 futures.workspace = true
 log.workspace = true
 fjall = "2"
-arrow-ipc = { version = "56", features = ["lz4"] }
+arrow-ipc = { version = "56", features = ["lz4", "zstd"] }
+lz4_flex = "0.12.0"
+zstd = "0.13.3"
+ahash = "0.8.6"
 async-trait = "0.1.88"
 
 [dev-dependencies]
@@ -33,4 +36,8 @@ required-features = []
 
 [[example]]
 name = "bench_window_read"
+required-features = []
+
+[[example]]
+name = "bench_fjall_gets"
 required-features = []

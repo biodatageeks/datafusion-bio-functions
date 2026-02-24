@@ -26,10 +26,10 @@ async fn main() -> datafusion::common::Result<()> {
     // coordinate_system_zero_based=true => 0-based half-open output.
     let table = VcfTableProvider::new(
         vcf_path.clone(),
-        Some(vec![]),   // no INFO fields (faster)
-        Some(vec![]),   // no FORMAT fields (faster)
-        None,           // no object storage options
-        true,           // 0-based half-open coordinates
+        Some(vec![]), // no INFO fields (faster)
+        Some(vec![]), // no FORMAT fields (faster)
+        None,         // no object storage options
+        true,         // 0-based half-open coordinates
     )?;
 
     println!("Schema: {:?}", table.schema());
@@ -39,9 +39,7 @@ async fn main() -> datafusion::common::Result<()> {
     ctx.register_table("vcf", Arc::new(table))?;
 
     // Collect all batches via SQL to get start/end per batch.
-    let df = ctx
-        .sql("SELECT `chrom`, `start`, `end` FROM vcf")
-        .await?;
+    let df = ctx.sql("SELECT `chrom`, `start`, `end` FROM vcf").await?;
     let batches = df.collect().await?;
 
     let num_batches = batches.len();
@@ -57,12 +55,8 @@ async fn main() -> datafusion::common::Result<()> {
         let rows = batch.num_rows();
         total_rows += rows;
 
-        let start_col = batch
-            .column_by_name("start")
-            .expect("missing start column");
-        let end_col = batch
-            .column_by_name("end")
-            .expect("missing end column");
+        let start_col = batch.column_by_name("start").expect("missing start column");
+        let end_col = batch.column_by_name("end").expect("missing end column");
 
         // start and end are UInt32 in the VCF reader
         let starts = start_col
@@ -104,10 +98,7 @@ async fn main() -> datafusion::common::Result<()> {
     }
 
     println!("{}", "-".repeat(75));
-    println!(
-        "Total: {} batches, {} rows",
-        num_batches, total_rows
-    );
+    println!("Total: {} batches, {} rows", num_batches, total_rows);
 
     Ok(())
 }

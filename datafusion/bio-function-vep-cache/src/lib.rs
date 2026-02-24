@@ -10,6 +10,8 @@ pub mod cache_provider;
 pub mod key_encoding;
 pub mod kv_store;
 pub mod loader;
+pub mod mmap_block_store;
+pub mod position_entry;
 pub mod position_index;
 pub mod window;
 

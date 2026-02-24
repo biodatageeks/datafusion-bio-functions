@@ -30,11 +30,14 @@ use futures::StreamExt;
 use log::{debug, info};
 
 use crate::key_encoding::{
-    DEFAULT_WINDOW_SIZE, EntryType, encode_entry_key, window_id_for_position,
+    DEFAULT_WINDOW_SIZE, EntryType, encode_entry_key, encode_position_key, window_id_for_position,
 };
 use crate::kv_store::{
-    VepKvStore, serialize_ipc_pub, to_v1_column_index, validate_v1_schema_width,
+    FORMAT_V1, FORMAT_V2, FORMAT_V3, FORMAT_V4, FORMAT_V5, VepKvStore, serialize_ipc_pub,
+    to_v1_column_index, validate_v1_schema_width,
 };
+use crate::mmap_block_store::WindowBlockCodec;
+use crate::position_entry::serialize_position_entry;
 use crate::position_index::PositionIndex;
 
 /// Statistics returned after loading.
@@ -99,6 +102,8 @@ pub struct CacheLoader {
     target_path: String,
     window_size: u64,
     parallelism: Option<usize>,
+    format_version: u8,
+    v2_block_codec: WindowBlockCodec,
 }
 
 impl CacheLoader {
@@ -112,6 +117,8 @@ impl CacheLoader {
             target_path: target_path.into(),
             window_size: DEFAULT_WINDOW_SIZE,
             parallelism: None,
+            format_version: FORMAT_V1,
+            v2_block_codec: WindowBlockCodec::None,
         }
     }
 
@@ -128,6 +135,25 @@ impl CacheLoader {
         self
     }
 
+    /// Select cache format version.
+    ///
+    /// Supported:
+    /// - `FORMAT_V1`: position index + per-column Arrow IPC in Fjall
+    /// - `FORMAT_V2`: position index in Fjall + mmap per-column window payload blocks
+    /// - `FORMAT_V3`: position index in Fjall + mmap whole-batch Arrow IPC blocks (fastest)
+    pub fn with_format_version(mut self, format_version: u8) -> Self {
+        self.format_version = format_version;
+        self
+    }
+
+    /// Set v2 window payload IPC compression codec.
+    ///
+    /// Ignored when format_version is FORMAT_V1.
+    pub fn with_v2_block_codec(mut self, codec: WindowBlockCodec) -> Self {
+        self.v2_block_codec = codec;
+        self
+    }
+
     /// Load the cache from the registered source table into fjall.
     ///
     /// Spawns one streaming task per physical partition. Each task reads
@@ -140,21 +166,52 @@ impl CacheLoader {
         let source_df = session.table(&self.source_table).await?;
         let schema: SchemaRef = Arc::new(source_df.schema().as_arrow().clone());
 
-        validate_v1_schema_width(schema.fields().len())?;
+        if self.format_version == FORMAT_V1 {
+            validate_v1_schema_width(schema.fields().len())?;
+        }
 
-        let store = Arc::new(VepKvStore::create(
-            Path::new(&self.target_path),
-            schema.clone(),
-            self.window_size,
-        )?);
+        let store = Arc::new(match self.format_version {
+            FORMAT_V1 => VepKvStore::create(
+                Path::new(&self.target_path),
+                schema.clone(),
+                self.window_size,
+            )?,
+            FORMAT_V2 => VepKvStore::create_v2_with_codec(
+                Path::new(&self.target_path),
+                schema.clone(),
+                self.window_size,
+                self.v2_block_codec,
+            )?,
+            FORMAT_V3 => VepKvStore::create_v3_with_codec(
+                Path::new(&self.target_path),
+                schema.clone(),
+                self.window_size,
+                self.v2_block_codec,
+            )?,
+            FORMAT_V4 => VepKvStore::create_v4_with_codec(
+                Path::new(&self.target_path),
+                schema.clone(),
+                self.window_size,
+                self.v2_block_codec,
+            )?,
+            FORMAT_V5 => VepKvStore::create_v5(Path::new(&self.target_path), schema.clone())?,
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "unsupported cache format version in loader: {other} (supported: {FORMAT_V1}, {FORMAT_V2}, {FORMAT_V3}, {FORMAT_V4}, {FORMAT_V5})"
+                )));
+            }
+        });
 
         let plan = source_df.create_physical_plan().await?;
         let partition_count = plan.output_partitioning().partition_count();
         let task_ctx = session.task_ctx();
 
         info!(
-            "Loading into KV cache: {} partitions, window_size={}",
-            partition_count, self.window_size
+            "Loading into KV cache: {} partitions, window_size={}, format_version={}, v2_block_codec={}",
+            partition_count,
+            self.window_size,
+            self.format_version,
+            self.v2_block_codec.as_str()
         );
         debug!(
             "Physical plan:\n{}",
@@ -256,6 +313,14 @@ async fn stream_partition(
         total_bytes: 0,
     };
 
+    let is_v5 = ctx.store.format_version() == FORMAT_V5;
+
+    // V5 zstd dictionary compressor — built from first batch, reused for all subsequent.
+    // None until the first batch trains the dictionary. If training is skipped (too few
+    // samples), this stays None and all entries are stored uncompressed.
+    let mut v5_compressor: Option<zstd::bulk::Compressor<'static>> = None;
+    let mut v5_first_batch_done = false;
+
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
         if batch.num_rows() == 0 {
@@ -264,6 +329,53 @@ async fn stream_partition(
 
         stats.total_variants += batch.num_rows() as u64;
 
+        if is_v5 {
+            let store = Arc::clone(&ctx.store);
+            let schema = ctx.schema.clone();
+            let batch_clone = batch.clone();
+
+            if !v5_first_batch_done {
+                v5_first_batch_done = true;
+                // First batch: try to train dictionary, store it, build compressor.
+                // If training fails (too few samples), entries are inserted uncompressed.
+                let (compressor, positions, bytes) = tokio::task::spawn_blocking(move || {
+                    train_and_flush_first_v5_batch(&store, &schema, &batch_clone)
+                })
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))??;
+                v5_compressor = compressor;
+                stats.total_windows += positions;
+                stats.total_bytes += bytes;
+            } else if let Some(mut compressor) = v5_compressor.take() {
+                // Subsequent batches with dictionary: compress and insert.
+                let (comp_back, positions, bytes) = tokio::task::spawn_blocking(move || {
+                    let result = flush_positions_v5_compressed(
+                        &store,
+                        &schema,
+                        &batch_clone,
+                        &mut compressor,
+                    );
+                    result.map(|(p, b)| (compressor, p, b))
+                })
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))??;
+                v5_compressor = Some(comp_back);
+                stats.total_windows += positions;
+                stats.total_bytes += bytes;
+            } else {
+                // Subsequent batches without dictionary: insert uncompressed.
+                let (positions, bytes) = tokio::task::spawn_blocking(move || {
+                    flush_positions_v5_uncompressed(&store, &schema, &batch_clone)
+                })
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))??;
+                stats.total_windows += positions;
+                stats.total_bytes += bytes;
+            }
+            continue;
+        }
+
+        // V1-V4: window-based path.
         // Update frontier with max primary window per chrom in this batch.
         let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
         let chroms = batch.column(chrom_col_idx);
@@ -297,6 +409,7 @@ async fn stream_partition(
     }
 
     // Flush all remaining windows (the frontier windows themselves).
+    // V5 flushes inline, so pending is always empty.
     let remaining: Vec<_> = pending.keys().cloned().collect();
     if !remaining.is_empty() {
         let (new_windows, bytes) = flush_windows(&ctx, &mut pending, &remaining).await?;
@@ -323,21 +436,252 @@ fn read_existing_window(
     chrom: &str,
     window_id: u64,
 ) -> Result<Option<RecordBatch>> {
-    if store.get_position_index(chrom, window_id)?.is_none() {
-        return Ok(None);
-    }
-    let col_indices: Vec<u8> = (0..schema.fields().len())
-        .map(to_v1_column_index)
-        .collect::<Result<Vec<_>>>()?;
-    match store.get_columns(chrom, window_id, &col_indices)? {
-        Some(col_data) => {
-            let arrays: Vec<_> = col_data.into_iter().map(|(arr, _)| arr).collect();
-            let batch = RecordBatch::try_new(schema.clone(), arrays)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            Ok(Some(batch))
+    match store.format_version() {
+        FORMAT_V1 => {
+            if store.get_position_index(chrom, window_id)?.is_none() {
+                return Ok(None);
+            }
+            let col_indices: Vec<u8> = (0..schema.fields().len())
+                .map(to_v1_column_index)
+                .collect::<Result<Vec<_>>>()?;
+            match store.get_columns(chrom, window_id, &col_indices)? {
+                Some(col_data) => {
+                    let arrays: Vec<_> = col_data.into_iter().map(|(arr, _)| arr).collect();
+                    let batch = RecordBatch::try_new(schema.clone(), arrays)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                    Ok(Some(batch))
+                }
+                None => Ok(None),
+            }
         }
-        None => Ok(None),
+        FORMAT_V2 => store.get_window_block_v2(chrom, window_id),
+        FORMAT_V3 => store.get_window_batch_v3(chrom, window_id),
+        FORMAT_V4 => store.get_window_batch_v4(chrom, window_id),
+        other => Err(DataFusionError::Execution(format!(
+            "unsupported cache format version in read_existing_window: {other}"
+        ))),
     }
+}
+
+/// Train a zstd dictionary from the first V5 batch, store it, then compress + insert all entries.
+///
+/// Returns `(Option<Compressor>, num_positions, total_bytes)`. The compressor is `None` if
+/// there weren't enough samples to train a meaningful dictionary (entries stored uncompressed).
+fn train_and_flush_first_v5_batch(
+    store: &VepKvStore,
+    schema: &SchemaRef,
+    batch: &RecordBatch,
+) -> Result<(Option<zstd::bulk::Compressor<'static>>, u64, u64)> {
+    let chrom_col_idx = schema.index_of("chrom")?;
+    let start_col_idx = schema.index_of("start")?;
+    let end_col_idx = schema.index_of("end")?;
+    let allele_col_idx = schema.index_of("allele_string")?;
+
+    let chrom_col = batch.column(chrom_col_idx);
+    let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
+    let ends = batch.column(end_col_idx).as_primitive::<Int64Type>();
+
+    let col_indices: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+        .collect();
+
+    // Group row indices by (chrom, start, end).
+    let mut groups: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
+    for row in 0..batch.num_rows() {
+        let chrom = string_value(chrom_col.as_ref(), row);
+        let start = starts.value(row);
+        let end = ends.value(row);
+        groups
+            .entry((chrom.to_string(), start, end))
+            .or_default()
+            .push(row);
+    }
+
+    // Phase 1: serialize all entries (uncompressed) to collect training samples.
+    let mut serialized: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(groups.len());
+    for ((chrom, start, end), rows) in &groups {
+        let value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+        let key = encode_position_key(chrom, *start, *end);
+        serialized.push((key, value));
+    }
+
+    // Phase 2: train dictionary from samples (up to 10,000).
+    // Require a minimum of 100 samples for meaningful dictionary training.
+    let min_training_samples = 100;
+    let dict_bytes = if serialized.len() >= min_training_samples {
+        let max_samples = 10_000.min(serialized.len());
+        let samples: Vec<&[u8]> = serialized[..max_samples]
+            .iter()
+            .map(|(_, v)| v.as_slice())
+            .collect();
+        match train_v5_dict(&samples) {
+            Ok(dict) => {
+                info!(
+                    "V5 zstd dict trained: {} samples, dict {} bytes",
+                    max_samples,
+                    dict.len()
+                );
+                Some(dict)
+            }
+            Err(e) => {
+                info!("V5 zstd dict training failed (falling back to uncompressed): {e}");
+                None
+            }
+        }
+    } else {
+        info!(
+            "V5: only {} entries, skipping dictionary training (need >= {})",
+            serialized.len(),
+            min_training_samples
+        );
+        None
+    };
+
+    if let Some(ref dict) = dict_bytes {
+        // Store dictionary in meta and compress entries.
+        store.store_v5_dict(dict)?;
+
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(3, dict).map_err(|e| {
+            DataFusionError::Execution(format!("failed to create zstd compressor: {e}"))
+        })?;
+
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(serialized.len());
+        let mut total_bytes = 0u64;
+        for (key, raw_value) in serialized {
+            let compressed = compressor
+                .compress(&raw_value)
+                .map_err(|e| DataFusionError::Execution(format!("zstd compression failed: {e}")))?;
+            total_bytes += compressed.len() as u64;
+            entries.push((key, compressed));
+        }
+
+        let num_positions = entries.len() as u64;
+        store.batch_insert_position_entries(&entries)?;
+
+        Ok((Some(compressor), num_positions, total_bytes))
+    } else {
+        // Not enough samples — insert uncompressed, no compressor for subsequent batches.
+        let mut total_bytes = 0u64;
+        for (_, v) in &serialized {
+            total_bytes += v.len() as u64;
+        }
+        let num_positions = serialized.len() as u64;
+        store.batch_insert_position_entries(&serialized)?;
+
+        Ok((None, num_positions, total_bytes))
+    }
+}
+
+/// Flush V5 position entries without compression (fallback when dictionary training was skipped).
+fn flush_positions_v5_uncompressed(
+    store: &VepKvStore,
+    schema: &SchemaRef,
+    batch: &RecordBatch,
+) -> Result<(u64, u64)> {
+    let chrom_col_idx = schema.index_of("chrom")?;
+    let start_col_idx = schema.index_of("start")?;
+    let end_col_idx = schema.index_of("end")?;
+    let allele_col_idx = schema.index_of("allele_string")?;
+
+    let chrom_col = batch.column(chrom_col_idx);
+    let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
+    let ends = batch.column(end_col_idx).as_primitive::<Int64Type>();
+
+    let col_indices: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+        .collect();
+
+    let mut groups: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
+    for row in 0..batch.num_rows() {
+        let chrom = string_value(chrom_col.as_ref(), row);
+        let start = starts.value(row);
+        let end = ends.value(row);
+        groups
+            .entry((chrom.to_string(), start, end))
+            .or_default()
+            .push(row);
+    }
+
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(groups.len());
+    let mut total_bytes = 0u64;
+
+    for ((chrom, start, end), rows) in &groups {
+        let value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+        let key = encode_position_key(chrom, *start, *end);
+        total_bytes += value.len() as u64;
+        entries.push((key, value));
+    }
+
+    let num_positions = entries.len() as u64;
+    store.batch_insert_position_entries(&entries)?;
+
+    Ok((num_positions, total_bytes))
+}
+
+/// Compress and flush V5 position entries using a pre-trained zstd dictionary compressor.
+fn flush_positions_v5_compressed(
+    store: &VepKvStore,
+    schema: &SchemaRef,
+    batch: &RecordBatch,
+    compressor: &mut zstd::bulk::Compressor<'_>,
+) -> Result<(u64, u64)> {
+    let chrom_col_idx = schema.index_of("chrom")?;
+    let start_col_idx = schema.index_of("start")?;
+    let end_col_idx = schema.index_of("end")?;
+    let allele_col_idx = schema.index_of("allele_string")?;
+
+    let chrom_col = batch.column(chrom_col_idx);
+    let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
+    let ends = batch.column(end_col_idx).as_primitive::<Int64Type>();
+
+    let col_indices: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+        .collect();
+
+    let mut groups: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
+    for row in 0..batch.num_rows() {
+        let chrom = string_value(chrom_col.as_ref(), row);
+        let start = starts.value(row);
+        let end = ends.value(row);
+        groups
+            .entry((chrom.to_string(), start, end))
+            .or_default()
+            .push(row);
+    }
+
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(groups.len());
+    let mut total_bytes = 0u64;
+
+    for ((chrom, start, end), rows) in &groups {
+        let raw_value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+        let compressed = compressor
+            .compress(&raw_value)
+            .map_err(|e| DataFusionError::Execution(format!("zstd compression failed: {e}")))?;
+        let key = encode_position_key(chrom, *start, *end);
+        total_bytes += compressed.len() as u64;
+        entries.push((key, compressed));
+    }
+
+    let num_positions = entries.len() as u64;
+    store.batch_insert_position_entries(&entries)?;
+
+    Ok((num_positions, total_bytes))
+}
+
+/// Train a zstd dictionary from serialized position entry samples.
+fn train_v5_dict(samples: &[&[u8]]) -> Result<Vec<u8>> {
+    // Flatten samples into continuous buffer with sizes array for zstd training API.
+    let mut continuous = Vec::new();
+    let mut sizes = Vec::with_capacity(samples.len());
+    for sample in samples {
+        continuous.extend_from_slice(sample);
+        sizes.push(sample.len());
+    }
+
+    let dict_size = 112 * 1024; // 112KB — zstd default
+    let dict = zstd::dict::from_continuous(&continuous, &sizes, dict_size)
+        .map_err(|e| DataFusionError::Execution(format!("zstd dictionary training failed: {e}")))?;
+    Ok(dict)
 }
 
 /// Flush pending window data to fjall.
@@ -369,11 +713,9 @@ async fn flush_windows(
     let schema = ctx.schema.clone();
     let flush_locks = Arc::clone(&ctx.flush_locks);
 
-    tokio::task::spawn_blocking(move || {
-        flush_windows_blocking(store, schema, windows, flush_locks)
-    })
-    .await
-    .map_err(|e| DataFusionError::External(Box::new(e)))?
+    tokio::task::spawn_blocking(move || flush_windows_blocking(store, schema, windows, flush_locks))
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
 }
 
 /// Blocking read-modify-write flush path.
@@ -397,37 +739,107 @@ fn flush_windows_blocking(
 
     for (shard_idx, shard_windows) in windows_by_shard {
         let _guard = flush_locks.locks[shard_idx].lock().unwrap();
-        let mut all_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        match store.format_version() {
+            FORMAT_V1 => {
+                let mut all_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                for mut window in shard_windows {
+                    // Read-modify-write: prepend existing data if another partition
+                    // already wrote this window.
+                    let existing =
+                        read_existing_window(&store, &schema, &window.chrom, window.window_id)?;
+                    let is_new = existing.is_none();
+                    if let Some(existing_batch) = existing {
+                        window.batches.insert(0, existing_batch);
+                    }
 
-        for mut window in shard_windows {
-            // Read-modify-write: prepend existing data if another partition
-            // already wrote this window.
-            let existing = read_existing_window(
-                &store,
-                &schema,
-                &window.chrom,
-                window.window_id,
-            )?;
-            let is_new = existing.is_none();
-            if let Some(existing_batch) = existing {
-                window.batches.insert(0, existing_batch);
+                    let prepared = prepare_window_entries(
+                        &schema,
+                        &window.chrom,
+                        window.window_id,
+                        window.batches,
+                    )?;
+                    total_bytes += prepared.total_bytes;
+                    if is_new {
+                        total_windows += 1;
+                    }
+                    all_entries.extend(prepared.entries);
+                }
+
+                if !all_entries.is_empty() {
+                    store.batch_insert_raw(&all_entries)?;
+                }
             }
+            FORMAT_V2 => {
+                for mut window in shard_windows {
+                    let existing =
+                        read_existing_window(&store, &schema, &window.chrom, window.window_id)?;
+                    let is_new = existing.is_none();
+                    if let Some(existing_batch) = existing {
+                        window.batches.insert(0, existing_batch);
+                    }
 
-            let prepared = prepare_window_entries(
-                &schema,
-                &window.chrom,
-                window.window_id,
-                window.batches,
-            )?;
-            total_bytes += prepared.total_bytes;
-            if is_new {
-                total_windows += 1;
+                    let Some(merged) = merge_window_batches(&schema, window.batches)? else {
+                        continue;
+                    };
+                    total_bytes += merged.get_array_memory_size() as u64;
+                    if is_new {
+                        total_windows += 1;
+                    }
+
+                    let pos_index = PositionIndex::from_batch(&merged)?;
+                    store.put_position_index(&window.chrom, window.window_id, &pos_index)?;
+                    store.put_window_block_v2(&window.chrom, window.window_id, &merged)?;
+                }
             }
-            all_entries.extend(prepared.entries);
-        }
+            FORMAT_V3 => {
+                for mut window in shard_windows {
+                    let existing =
+                        read_existing_window(&store, &schema, &window.chrom, window.window_id)?;
+                    let is_new = existing.is_none();
+                    if let Some(existing_batch) = existing {
+                        window.batches.insert(0, existing_batch);
+                    }
 
-        if !all_entries.is_empty() {
-            store.batch_insert_raw(&all_entries)?;
+                    let Some(merged) = merge_window_batches(&schema, window.batches)? else {
+                        continue;
+                    };
+                    total_bytes += merged.get_array_memory_size() as u64;
+                    if is_new {
+                        total_windows += 1;
+                    }
+
+                    let pos_index = PositionIndex::from_batch(&merged)?;
+                    store.put_position_index(&window.chrom, window.window_id, &pos_index)?;
+                    store.put_window_block_v3(&window.chrom, window.window_id, &merged)?;
+                }
+            }
+            FORMAT_V4 => {
+                for mut window in shard_windows {
+                    let existing =
+                        read_existing_window(&store, &schema, &window.chrom, window.window_id)?;
+                    let is_new = existing.is_none();
+                    if let Some(existing_batch) = existing {
+                        window.batches.insert(0, existing_batch);
+                    }
+
+                    let Some(merged) = merge_window_batches(&schema, window.batches)? else {
+                        continue;
+                    };
+                    total_bytes += merged.get_array_memory_size() as u64;
+                    if is_new {
+                        total_windows += 1;
+                    }
+
+                    let pos_index = PositionIndex::from_batch(&merged)?;
+                    store.put_position_index(&window.chrom, window.window_id, &pos_index)?;
+                    store.put_window_block_v4(&window.chrom, window.window_id, &merged)?;
+                }
+            }
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "unsupported cache format version in flush_windows_blocking: {other}"
+                )));
+            }
         }
     }
 
@@ -526,11 +938,25 @@ fn prepare_window_entries(
     window_id: u64,
     batches: Vec<RecordBatch>,
 ) -> Result<PreparedWindow> {
-    if batches.is_empty() {
+    let Some(merged) = merge_window_batches(schema, batches)? else {
         return Ok(PreparedWindow {
             entries: vec![],
             total_bytes: 0,
         });
+    };
+
+    let total_bytes = merged.get_array_memory_size() as u64;
+
+    prepare_v1_entries(chrom, window_id, &merged, total_bytes)
+}
+
+/// Merge all sub-batches for a single `(chrom, window)` buffer.
+fn merge_window_batches(
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<Option<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(None);
     }
 
     let merged = if batches.len() == 1 {
@@ -539,10 +965,7 @@ fn prepare_window_entries(
         datafusion::arrow::compute::concat_batches(schema, &batches)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
     };
-
-    let total_bytes = merged.get_array_memory_size() as u64;
-
-    prepare_v1_entries(chrom, window_id, &merged, total_bytes)
+    Ok(Some(merged))
 }
 
 /// v1 (columnar): serialize position index + per-column Arrow IPC entries.
@@ -746,6 +1169,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_basic_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+
+        let (schema, table) = make_test_table();
+        ctx.register_table("source", Arc::new(table)).unwrap();
+
+        let loader = CacheLoader::new("source", dir.path().to_str().unwrap())
+            .with_window_size(1_000_000)
+            .with_format_version(FORMAT_V2);
+        let stats = loader.load(&ctx).await.unwrap();
+
+        assert_eq!(stats.total_windows, 3);
+
+        let store = VepKvStore::open(dir.path()).unwrap();
+        assert_eq!(store.format_version(), FORMAT_V2);
+        assert_eq!(store.schema().as_ref(), schema.as_ref());
+
+        let idx = store.get_position_index("1", 0).unwrap().unwrap();
+        assert_eq!(idx.num_rows(), 2);
+
+        let batch = store.get_window_block_v2("1", 0).unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), schema.fields().len());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_loader_cross_window_indel_concurrent() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = SessionContext::new();
@@ -842,5 +1292,184 @@ mod tests {
             CacheLoader::new("source", dir.path().to_str().unwrap()).with_window_size(1_000_000);
         let err = loader.load(&ctx).await.unwrap_err().to_string();
         assert!(err.contains("supports at most"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_basic_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+
+        let (schema, table) = make_test_table();
+        ctx.register_table("source", Arc::new(table)).unwrap();
+
+        let loader = CacheLoader::new("source", dir.path().to_str().unwrap())
+            .with_window_size(1_000_000)
+            .with_format_version(FORMAT_V3);
+        let stats = loader.load(&ctx).await.unwrap();
+
+        assert_eq!(stats.total_windows, 3);
+
+        let store = VepKvStore::open(dir.path()).unwrap();
+        assert_eq!(store.format_version(), FORMAT_V3);
+        assert_eq!(store.schema().as_ref(), schema.as_ref());
+
+        let idx = store.get_position_index("1", 0).unwrap().unwrap();
+        assert_eq!(idx.num_rows(), 2);
+
+        let batch = store.get_window_batch_v3("1", 0).unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), schema.fields().len());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_v3_with_lz4() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+
+        let (schema, table) = make_test_table();
+        ctx.register_table("source", Arc::new(table)).unwrap();
+
+        let loader = CacheLoader::new("source", dir.path().to_str().unwrap())
+            .with_window_size(1_000_000)
+            .with_format_version(FORMAT_V3)
+            .with_v2_block_codec(WindowBlockCodec::Lz4);
+        let stats = loader.load(&ctx).await.unwrap();
+
+        assert_eq!(stats.total_windows, 3);
+
+        let store = VepKvStore::open(dir.path()).unwrap();
+        assert_eq!(store.format_version(), FORMAT_V3);
+
+        let batch = store.get_window_batch_v3("1", 0).unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), schema.fields().len());
+
+        // Verify column projection works
+        let cols = store
+            .get_window_columns_v3("1", 0, &[0, 3])
+            .unwrap()
+            .unwrap();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_basic_v4() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+
+        let (schema, table) = make_test_table();
+        ctx.register_table("source", Arc::new(table)).unwrap();
+
+        let loader = CacheLoader::new("source", dir.path().to_str().unwrap())
+            .with_window_size(1_000_000)
+            .with_format_version(FORMAT_V4);
+        let stats = loader.load(&ctx).await.unwrap();
+
+        assert_eq!(stats.total_windows, 3);
+
+        let store = VepKvStore::open(dir.path()).unwrap();
+        assert_eq!(store.format_version(), FORMAT_V4);
+        assert_eq!(store.schema().as_ref(), schema.as_ref());
+
+        let idx = store.get_position_index("1", 0).unwrap().unwrap();
+        assert_eq!(idx.num_rows(), 2);
+
+        let batch = store.get_window_batch_v4("1", 0).unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), schema.fields().len());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_v4_with_lz4() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+
+        let (schema, table) = make_test_table();
+        ctx.register_table("source", Arc::new(table)).unwrap();
+
+        let loader = CacheLoader::new("source", dir.path().to_str().unwrap())
+            .with_window_size(1_000_000)
+            .with_format_version(FORMAT_V4)
+            .with_v2_block_codec(WindowBlockCodec::Lz4);
+        let stats = loader.load(&ctx).await.unwrap();
+
+        assert_eq!(stats.total_windows, 3);
+
+        let store = VepKvStore::open(dir.path()).unwrap();
+        assert_eq!(store.format_version(), FORMAT_V4);
+
+        let batch = store.get_window_batch_v4("1", 0).unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), schema.fields().len());
+
+        // Verify column projection works
+        let cols = store
+            .get_window_columns_v4("1", 0, &[0, 3])
+            .unwrap()
+            .unwrap();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_basic_v5() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+
+        let (schema, table) = make_test_table();
+        ctx.register_table("source", Arc::new(table)).unwrap();
+
+        let loader =
+            CacheLoader::new("source", dir.path().to_str().unwrap()).with_format_version(FORMAT_V5);
+        let stats = loader.load(&ctx).await.unwrap();
+
+        // 4 rows -> 3 unique positions: (1,100,100), (1,500000,500000), (1,1500000,1500000), (2,100,100)
+        assert_eq!(stats.total_variants, 4);
+        // "windows" for v5 = positions written
+        assert!(stats.total_windows > 0);
+
+        let store = VepKvStore::open(dir.path()).unwrap();
+        assert_eq!(store.format_version(), FORMAT_V5);
+        assert_eq!(store.schema().as_ref(), schema.as_ref());
+
+        // Verify position entries exist (using decompressed read since loader now compresses).
+        let chrom_code_1 = crate::key_encoding::chrom_to_code("1");
+        let chrom_code_2 = crate::key_encoding::chrom_to_code("2");
+
+        // Test data has too few entries for dictionary training; dict is absent.
+        // With real data (100+ positions), has_v5_dict() would be true.
+
+        let entry = store
+            .get_position_entry_decompressed(chrom_code_1, 100, 100)
+            .unwrap();
+        assert!(entry.is_some());
+
+        let entry = store
+            .get_position_entry_decompressed(chrom_code_1, 500_000, 500_000)
+            .unwrap();
+        assert!(entry.is_some());
+
+        let entry = store
+            .get_position_entry_decompressed(chrom_code_2, 100, 100)
+            .unwrap();
+        assert!(entry.is_some());
+
+        // Missing position.
+        let entry = store
+            .get_position_entry_decompressed(chrom_code_1, 999, 999)
+            .unwrap();
+        assert!(entry.is_none());
+
+        // Verify a position entry can be deserialized after decompression.
+        let raw = store
+            .get_position_entry_decompressed(chrom_code_1, 100, 100)
+            .unwrap()
+            .unwrap();
+        let reader = crate::position_entry::PositionEntryReader::new(&raw).unwrap();
+        // Position (1, 100, 100) has 2 rows in test data with same (start, end).
+        // Actually it has just 1 row at (1, 100, 100) in the test data.
+        assert!(reader.num_alleles() >= 1);
+        assert!(reader.num_cols() > 0);
     }
 }

@@ -291,7 +291,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
- "lz4_flex",
+ "lz4_flex 0.11.5",
  "zstd",
 ]
 
@@ -1165,6 +1165,7 @@ dependencies = [
 name = "datafusion-bio-function-vep-cache"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arrow-ipc",
  "async-trait",
  "datafusion",
@@ -1173,8 +1174,10 @@ dependencies = [
  "fjall",
  "futures",
  "log",
+ "lz4_flex 0.12.0",
  "tempfile",
  "tokio",
+ "zstd",
 ]
 
 [[package]]
@@ -2816,7 +2819,7 @@ dependencies = [
  "guardian",
  "interval-heap",
  "log",
- "lz4_flex",
+ "lz4_flex 0.11.5",
  "path-absolutize",
  "quick_cache",
  "rustc-hash",
@@ -2832,6 +2835,15 @@ name = "lz4_flex"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08ab2867e3eeeca90e844d1940eab391c9dc5228783db2ed999acbc0a9ed375a"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
+name = "lz4_flex"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab6473172471198271ff72e9379150e9dfd70d8e533e0752a27e515b48dd375e"
 dependencies = [
  "twox-hash",
 ]
@@ -3542,7 +3554,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.15.5",
- "lz4_flex",
+ "lz4_flex 0.11.5",
  "num",
  "num-bigint",
  "object_store",

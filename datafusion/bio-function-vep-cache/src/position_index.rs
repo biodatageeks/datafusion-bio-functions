@@ -12,7 +12,7 @@
 //! [allele_pool: remaining bytes, UTF-8]
 //! ```
 
-use std::collections::HashMap;
+use ahash::AHashMap;
 
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::common::{DataFusionError, Result};
@@ -37,7 +37,7 @@ struct PosEntry {
 pub struct PositionIndex {
     entries: Vec<PosEntry>,
     allele_pool: String,
-    position_map: HashMap<(i64, i64), Vec<usize>>,
+    position_map: AHashMap<(i64, i64), Vec<usize>>,
 }
 
 impl PositionIndex {
@@ -238,8 +238,8 @@ impl PositionIndex {
     }
 }
 
-fn build_position_map(entries: &[PosEntry]) -> HashMap<(i64, i64), Vec<usize>> {
-    let mut map: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+fn build_position_map(entries: &[PosEntry]) -> AHashMap<(i64, i64), Vec<usize>> {
+    let mut map: AHashMap<(i64, i64), Vec<usize>> = AHashMap::new();
     for (i, e) in entries.iter().enumerate() {
         map.entry((e.start, e.end)).or_default().push(i);
     }
