@@ -3,6 +3,12 @@
 //! Loads a VEP variation cache from Parquet into a fjall KV store,
 //! grouping variants into windows and parallelizing across DataFusion
 //! physical partitions.
+//!
+//! Two-phase approach:
+//! 1. **Read phase** (parallel): each partition reads its stream and groups
+//!    rows by (chrom, window_id) into a shared in-memory buffer.
+//! 2. **Write phase** (sequential): each window is flushed to fjall exactly
+//!    once — no read-modify-write overhead.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,27 +38,28 @@ pub struct LoadStats {
     pub elapsed_secs: f64,
 }
 
-/// Map from (chrom, window_id) to an async mutex guarding that window's writes.
-type WindowLockMap = HashMap<(String, u64), Arc<tokio::sync::Mutex<()>>>;
-
-/// Per-window mutex for safe concurrent flushes from multiple partitions.
-struct WindowLocks {
-    locks: std::sync::Mutex<WindowLockMap>,
+/// Thread-safe accumulator for window data from multiple partitions.
+struct SharedWindowBuffers {
+    buffers: std::sync::Mutex<HashMap<(String, u64), Vec<RecordBatch>>>,
 }
 
-impl WindowLocks {
+impl SharedWindowBuffers {
     fn new() -> Self {
         Self {
-            locks: std::sync::Mutex::new(HashMap::new()),
+            buffers: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Get (or create) an async lock for the given (chrom, window_id) pair.
-    fn get_lock(&self, chrom: &str, window_id: u64) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.locks.lock().unwrap();
-        map.entry((chrom.to_string(), window_id))
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    /// Push a sub-batch for a given (chrom, window_id).
+    fn push(&self, chrom: String, wid: u64, batch: RecordBatch) {
+        let mut map = self.buffers.lock().unwrap();
+        map.entry((chrom, wid)).or_default().push(batch);
+    }
+
+    /// Drain all accumulated buffers.
+    fn drain(&self) -> HashMap<(String, u64), Vec<RecordBatch>> {
+        let mut map = self.buffers.lock().unwrap();
+        std::mem::take(&mut *map)
     }
 }
 
@@ -133,21 +140,19 @@ impl CacheLoader {
             partition_count, self.window_size
         );
 
-        // Spawn one task per partition, optionally capped by parallelism.
-        let window_locks = Arc::new(WindowLocks::new());
+        // Phase 1: Read all partitions in parallel, accumulate in shared buffer.
+        let shared_buffers = Arc::new(SharedWindowBuffers::new());
         let semaphore = self
             .parallelism
             .map(|n| Arc::new(tokio::sync::Semaphore::new(n.min(partition_count))));
 
         let mut handles = Vec::with_capacity(partition_count);
         let window_size = self.window_size;
-        let format_version = self.format_version;
 
         for partition_id in 0..partition_count {
             let plan = Arc::clone(&plan);
             let task_ctx = Arc::clone(&task_ctx);
-            let store = Arc::clone(&store);
-            let window_locks = Arc::clone(&window_locks);
+            let buffers = Arc::clone(&shared_buffers);
             let sem = semaphore.clone();
 
             let handle = tokio::spawn(async move {
@@ -158,32 +163,38 @@ impl CacheLoader {
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 }
 
-                load_partition(
-                    plan,
-                    task_ctx,
-                    partition_id,
-                    store,
-                    window_size,
-                    format_version,
-                    window_locks,
-                )
-                .await
+                read_partition(plan, task_ctx, partition_id, window_size, buffers).await
             });
             handles.push(handle);
         }
 
-        // Collect results.
+        // Collect variant counts from all partitions.
         let mut total_variants = 0u64;
-        let mut total_windows = 0u64;
-        let mut total_bytes = 0u64;
-
         for handle in handles {
-            let (variants, windows, bytes) = handle
+            total_variants += handle
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))??;
-            total_variants += variants;
-            total_windows += windows;
-            total_bytes += bytes;
+        }
+
+        // Phase 2: Flush all accumulated windows to fjall (sequential).
+        // Each window is written exactly once — no read-modify-write.
+        let all_windows = shared_buffers.drain();
+        let mut total_windows = 0u64;
+        let mut total_bytes = 0u64;
+        let format_version = self.format_version;
+
+        info!("Flushing {} windows to fjall", all_windows.len());
+
+        for ((chrom, wid), batches) in &all_windows {
+            flush_to_store(
+                &store,
+                chrom,
+                *wid,
+                batches,
+                &mut total_windows,
+                &mut total_bytes,
+                format_version,
+            )?;
         }
 
         store.persist()?;
@@ -202,28 +213,16 @@ impl CacheLoader {
     }
 }
 
-/// Minimum rows buffered per window before flushing to the store.
-const FLUSH_THRESHOLD: usize = 8192;
-
-/// Load all variants from a single physical partition.
-async fn load_partition(
+/// Read all data from a single physical partition and accumulate into shared buffers.
+async fn read_partition(
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<datafusion::execution::TaskContext>,
     partition_id: usize,
-    store: Arc<VepKvStore>,
     window_size: u64,
-    format_version: u8,
-    window_locks: Arc<WindowLocks>,
-) -> Result<(u64, u64, u64)> {
+    buffers: Arc<SharedWindowBuffers>,
+) -> Result<u64> {
     let mut stream = plan.execute(partition_id, task_ctx)?;
-
     let mut total_variants = 0u64;
-    let mut total_windows = 0u64;
-    let mut total_bytes = 0u64;
-
-    // Local buffer: accumulate sub-batches per (chrom, window_id).
-    let mut buffers: HashMap<(String, u64), Vec<RecordBatch>> = HashMap::new();
-    let mut buffer_rows: HashMap<(String, u64), usize> = HashMap::new();
 
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
@@ -235,46 +234,11 @@ async fn load_partition(
 
         let window_batches = split_batch_into_windows(&batch, window_size)?;
         for ((chrom, wid), sub_batch) in window_batches {
-            let key = (chrom, wid);
-            let rows = sub_batch.num_rows();
-            buffers.entry(key.clone()).or_default().push(sub_batch);
-            let count = buffer_rows.entry(key.clone()).or_default();
-            *count += rows;
-
-            if *count >= FLUSH_THRESHOLD {
-                let batches = buffers.remove(&key).unwrap();
-                buffer_rows.remove(&key);
-                flush_with_lock(
-                    &store,
-                    &key.0,
-                    key.1,
-                    &batches,
-                    &mut total_windows,
-                    &mut total_bytes,
-                    format_version,
-                    &window_locks,
-                )
-                .await?;
-            }
+            buffers.push(chrom, wid, sub_batch);
         }
     }
 
-    // Flush all remaining buffers.
-    for ((chrom, wid), batches) in buffers {
-        flush_with_lock(
-            &store,
-            &chrom,
-            wid,
-            &batches,
-            &mut total_windows,
-            &mut total_bytes,
-            format_version,
-            &window_locks,
-        )
-        .await?;
-    }
-
-    Ok((total_variants, total_windows, total_bytes))
+    Ok(total_variants)
 }
 
 /// Split a RecordBatch into sub-batches keyed by (chrom, window_id).
@@ -351,31 +315,6 @@ fn string_value(col: &dyn Array, row: usize) -> &str {
     }
 }
 
-/// Flush buffered batches to the store under a per-window lock.
-#[allow(clippy::too_many_arguments)]
-async fn flush_with_lock(
-    store: &VepKvStore,
-    chrom: &str,
-    window_id: u64,
-    batches: &[RecordBatch],
-    total_windows: &mut u64,
-    total_bytes: &mut u64,
-    format_version: u8,
-    window_locks: &WindowLocks,
-) -> Result<()> {
-    let lock = window_locks.get_lock(chrom, window_id);
-    let _guard = lock.lock().await;
-    flush_to_store(
-        store,
-        chrom,
-        window_id,
-        batches,
-        total_windows,
-        total_bytes,
-        format_version,
-    )
-}
-
 /// Merge batches for a window and write to the KV store.
 fn flush_to_store(
     store: &VepKvStore,
@@ -418,7 +357,8 @@ fn flush_to_store_v0(
 ) -> Result<()> {
     let mem_size = merged.get_array_memory_size() as u64;
 
-    // If window already exists (from cross-window indel or another partition), merge with existing.
+    // Window should not already exist (all data accumulated before writing).
+    // Keep the merge path for safety in case of cross-window indel edge cases.
     if let Some(existing) = store.get_window(chrom, window_id)? {
         let schema = existing.schema();
         let combined = datafusion::arrow::compute::concat_batches(&schema, &[existing, merged])
@@ -442,9 +382,9 @@ fn flush_to_store_v1(
     total_windows: &mut u64,
     total_bytes: &mut u64,
 ) -> Result<()> {
-    // Check if window already exists (cross-window indel or another partition merge).
+    // Window should not already exist (all data accumulated before writing).
+    // Keep the merge path for safety in case of cross-window indel edge cases.
     let merged = if let Some(existing_idx) = store.get_position_index(chrom, window_id)? {
-        // Merge: read existing columns back, concat with new batch.
         let all_col_indices: Vec<u8> = (0..store.schema().fields().len())
             .map(to_v1_column_index)
             .collect::<Result<Vec<_>>>()?;
