@@ -23,6 +23,7 @@ const V2_BLOCK_CODEC_KEY: &[u8] = b"v2_block_codec";
 const V2_WINDOW_REF_PREFIX: &[u8] = b"v2_window_ref:";
 const V2_DEFAULT_BLOCK_DIR: &str = "blocks_v2";
 const V5_ZSTD_DICT_KEY: &[u8] = b"v5_zstd_dict";
+const V5_ZSTD_LEVEL_KEY: &[u8] = b"v5_zstd_level";
 
 /// Format version 1: columnar (position index + per-column Arrow IPC entries).
 pub const FORMAT_V1: u8 = 1;
@@ -880,6 +881,15 @@ impl VepKvStore {
         self.ensure_v5()?;
         self.meta
             .insert(V5_ZSTD_DICT_KEY, dict_bytes)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
+    }
+
+    /// Store the zstd compression level used when building this V5 cache (informational).
+    pub fn store_v5_zstd_level(&self, level: i32) -> Result<()> {
+        self.ensure_v5()?;
+        self.meta
+            .insert(V5_ZSTD_LEVEL_KEY, level.to_le_bytes())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(())
     }

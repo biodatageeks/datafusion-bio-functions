@@ -6,21 +6,30 @@
 //! - `vep_allele()` scalar UDF for VCF→VEP allele conversion
 
 pub mod allele;
+pub mod config;
 pub mod coordinate;
 pub mod lookup_provider;
 pub mod schema_contract;
 pub mod table_function;
 
+pub use config::AnnotationConfig;
 #[cfg(feature = "kv-cache")]
 pub use datafusion_bio_function_vep_cache as kv_cache;
 
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
-use datafusion_bio_function_ranges::create_bio_session;
 
 use crate::allele::{match_allele_relaxed_udf, match_allele_udf, vep_allele_udf};
 use crate::table_function::LookupFunction;
+
+/// Test-only convenience: create a session with ranges + VEP functions.
+#[cfg(test)]
+pub(crate) fn create_vep_session() -> SessionContext {
+    let ctx = datafusion_bio_function_ranges::create_bio_session();
+    register_vep_functions(&ctx);
+    ctx
+}
 
 /// Register all VEP functions on the given session context.
 ///
@@ -36,14 +45,4 @@ pub fn register_vep_functions(ctx: &SessionContext) {
 
     let session = Arc::new(ctx.clone());
     ctx.register_udtf("lookup_variants", Arc::new(LookupFunction::new(session)));
-}
-
-/// Create a session context with both ranges and VEP functions registered.
-///
-/// This builds on `create_bio_session()` from `bio-function-ranges` which sets up
-/// the `BioQueryPlanner` with `IntervalJoinExec` optimization.
-pub fn create_vep_session() -> SessionContext {
-    let ctx = create_bio_session();
-    register_vep_functions(&ctx);
-    ctx
 }

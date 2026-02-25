@@ -15,6 +15,8 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 |-------|-------------|--------|
 | **[datafusion-bio-function-pileup](datafusion/bio-function-pileup)** | Depth-of-coverage (pileup) computation from BAM alignments | ✅ |
 | **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, nearest-neighbor, overlap, merge, cluster, complement, and subtract operations | ✅ |
+| **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via `lookup_variants()` table function with KV cache backend | ✅ |
+| **[datafusion-bio-function-vep-cache](datafusion/bio-function-vep-cache)** | fjall KV store for VEP variation cache (V1–V5 formats, zstd dictionary compression) | ✅ |
 
 ## Features
 
@@ -41,6 +43,58 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **Subtract**: Basepair-level set difference via `SELECT * FROM subtract('left', 'right')` — fragments left intervals at right-interval overlap boundaries
 - **Multiple Algorithms**: Coitrees (default), IntervalTree, ArrayIntervalTree, Lapper, SuperIntervals — selectable via `SET bio.interval_join_algorithm`
 - **Transparent Optimization**: Hash/nested-loop joins with range conditions are automatically replaced with interval joins
+
+### VEP Annotation (variant lookup with KV cache)
+
+- **`lookup_variants()` Table Function**: SQL-based variant annotation against a pre-built VEP cache
+- **KV Cache Backend**: fjall LSM-tree store with V5 zstd dictionary compression for compact on-disk storage
+- **Match Modes**: `exact`, `exact_or_colocated_ids`, `exact_or_vep_existing` (indel-aware relaxed matching)
+- **Session Configuration**: Tunable parameters via SQL `SET` statements under the `bio.annotation` namespace
+
+#### Annotation Configuration
+
+Register `AnnotationConfig` on the session to enable SQL-level parameter overrides. If not registered, compiled defaults apply.
+
+```sql
+-- fjall block cache size in MB (default: 1024)
+-- Larger values reduce cold-start latency by caching more LSM block index
+-- pages and data blocks in memory.
+SET bio.annotation.cache_size_mb = 2048;
+
+-- Zstd compression level for V5 cache writes (default: 3)
+-- Higher levels produce smaller caches at the cost of slower writes.
+-- Decompression speed is constant regardless of level.
+-- Level 9 is a good balance for write-once caches.
+SET bio.annotation.v5_zstd_level = 9;
+
+-- Zstd dictionary size in KB for V5 cache writes (default: 112)
+-- Larger dictionaries can improve compression ratio.
+-- 256 KB is recommended with level 9.
+SET bio.annotation.v5_dict_size_kb = 256;
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `bio.annotation.cache_size_mb` | `1024` | fjall block cache size in MB for reads |
+| `bio.annotation.v5_zstd_level` | `3` | Zstd compression level for V5 writes (1–19) |
+| `bio.annotation.v5_dict_size_kb` | `112` | Zstd dictionary size in KB for V5 writes |
+
+**Registration from downstream (e.g., polars-bio):**
+
+```rust
+use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_bio_function_vep::{AnnotationConfig, register_vep_functions};
+use datafusion_bio_function_vep::config::resolve;
+
+// Register the config extension on the session
+let config = SessionConfig::new()
+    .with_option_extension(AnnotationConfig::default());
+let ctx = SessionContext::new_with_config(config);
+register_vep_functions(&ctx);
+
+// Read resolved values (SQL overrides or defaults)
+let ann = resolve(&ctx);
+```
 
 ## Installation
 

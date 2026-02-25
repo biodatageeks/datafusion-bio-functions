@@ -15,11 +15,11 @@ async fn main() -> datafusion::common::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Usage: {} <parquet_path> <fjall_output_path> [chrom_filter] [window_size_kb] [partitions] [format_version] [v2_codec]",
+            "Usage: {} <parquet_path> <fjall_output_path> [chrom_filter] [window_size_kb] [partitions] [format_version] [v2_codec | v5_zstd_level] [v5_dict_size_kb]",
             args[0]
         );
         eprintln!(
-            "Example: {} /data/vep/115_GRCh38.parquet /tmp/vep_cache 22 1000 8 2 lz4",
+            "Example: {} /data/vep/115_GRCh38.parquet /tmp/vep_cache 22 1000 8 5 9 112",
             args[0]
         );
         std::process::exit(1);
@@ -49,6 +49,16 @@ async fn main() -> datafusion::common::Result<()> {
         WindowBlockCodec::parse(args.get(7).map(|s| s.as_str()).unwrap_or("none"))?
     } else {
         WindowBlockCodec::None
+    };
+    let v5_zstd_level: i32 = if format_version == FORMAT_V5 {
+        args.get(7).and_then(|s| s.parse().ok()).unwrap_or(3)
+    } else {
+        3
+    };
+    let v5_dict_size_kb: u32 = if format_version == FORMAT_V5 {
+        args.get(8).and_then(|s| s.parse().ok()).unwrap_or(112)
+    } else {
+        112
     };
 
     let ctx = if let Some(partitions) = target_partitions {
@@ -95,7 +105,9 @@ async fn main() -> datafusion::common::Result<()> {
     let loader = CacheLoader::new(source_table, output_path)
         .with_window_size(window_size)
         .with_format_version(format_version)
-        .with_v2_block_codec(v2_codec);
+        .with_v2_block_codec(v2_codec)
+        .with_v5_zstd_level(v5_zstd_level)
+        .with_v5_dict_size_kb(v5_dict_size_kb);
     let stats = loader.load(&ctx).await?;
     let load_elapsed = load_start.elapsed().as_secs_f64();
 

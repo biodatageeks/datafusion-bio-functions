@@ -94,6 +94,8 @@ struct StreamContext {
     schema: SchemaRef,
     flush_locks: Arc<FlushShards>,
     window_size: u64,
+    v5_zstd_level: i32,
+    v5_dict_size_kb: u32,
 }
 
 /// Builder for loading a Parquet-based VEP cache into fjall.
@@ -104,6 +106,8 @@ pub struct CacheLoader {
     parallelism: Option<usize>,
     format_version: u8,
     v2_block_codec: WindowBlockCodec,
+    v5_zstd_level: i32,
+    v5_dict_size_kb: u32,
 }
 
 impl CacheLoader {
@@ -119,6 +123,8 @@ impl CacheLoader {
             parallelism: None,
             format_version: FORMAT_V1,
             v2_block_codec: WindowBlockCodec::None,
+            v5_zstd_level: 3,
+            v5_dict_size_kb: 112,
         }
     }
 
@@ -151,6 +157,21 @@ impl CacheLoader {
     /// Ignored when format_version is FORMAT_V1.
     pub fn with_v2_block_codec(mut self, codec: WindowBlockCodec) -> Self {
         self.v2_block_codec = codec;
+        self
+    }
+
+    /// Set the zstd compression level for V5 caches (default: 3).
+    ///
+    /// Higher levels produce smaller caches at the cost of slower writes.
+    /// Decompression speed is constant regardless of level.
+    pub fn with_v5_zstd_level(mut self, level: i32) -> Self {
+        self.v5_zstd_level = level;
+        self
+    }
+
+    /// Set the zstd dictionary size in KB for V5 caches (default: 112).
+    pub fn with_v5_dict_size_kb(mut self, size_kb: u32) -> Self {
+        self.v5_dict_size_kb = size_kb;
         self
     }
 
@@ -236,6 +257,8 @@ impl CacheLoader {
                 schema: schema.clone(),
                 flush_locks: Arc::clone(&flush_locks),
                 window_size,
+                v5_zstd_level: self.v5_zstd_level,
+                v5_dict_size_kb: self.v5_dict_size_kb,
             };
 
             handles.push(tokio::spawn(async move {
@@ -336,10 +359,18 @@ async fn stream_partition(
 
             if !v5_first_batch_done {
                 v5_first_batch_done = true;
+                let zstd_level = ctx.v5_zstd_level;
+                let dict_size_kb = ctx.v5_dict_size_kb;
                 // First batch: try to train dictionary, store it, build compressor.
                 // If training fails (too few samples), entries are inserted uncompressed.
                 let (compressor, positions, bytes) = tokio::task::spawn_blocking(move || {
-                    train_and_flush_first_v5_batch(&store, &schema, &batch_clone)
+                    train_and_flush_first_v5_batch(
+                        &store,
+                        &schema,
+                        &batch_clone,
+                        zstd_level,
+                        dict_size_kb,
+                    )
                 })
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))??;
@@ -471,6 +502,8 @@ fn train_and_flush_first_v5_batch(
     store: &VepKvStore,
     schema: &SchemaRef,
     batch: &RecordBatch,
+    zstd_level: i32,
+    dict_size_kb: u32,
 ) -> Result<(Option<zstd::bulk::Compressor<'static>>, u64, u64)> {
     let chrom_col_idx = schema.index_of("chrom")?;
     let start_col_idx = schema.index_of("start")?;
@@ -514,7 +547,7 @@ fn train_and_flush_first_v5_batch(
             .iter()
             .map(|(_, v)| v.as_slice())
             .collect();
-        match train_v5_dict(&samples) {
+        match train_v5_dict(&samples, dict_size_kb) {
             Ok(dict) => {
                 info!(
                     "V5 zstd dict trained: {} samples, dict {} bytes",
@@ -538,12 +571,14 @@ fn train_and_flush_first_v5_batch(
     };
 
     if let Some(ref dict) = dict_bytes {
-        // Store dictionary in meta and compress entries.
+        // Store dictionary and compression level in meta, then compress entries.
         store.store_v5_dict(dict)?;
+        store.store_v5_zstd_level(zstd_level)?;
 
-        let mut compressor = zstd::bulk::Compressor::with_dictionary(3, dict).map_err(|e| {
-            DataFusionError::Execution(format!("failed to create zstd compressor: {e}"))
-        })?;
+        let mut compressor =
+            zstd::bulk::Compressor::with_dictionary(zstd_level, dict).map_err(|e| {
+                DataFusionError::Execution(format!("failed to create zstd compressor: {e}"))
+            })?;
 
         let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(serialized.len());
         let mut total_bytes = 0u64;
@@ -669,7 +704,7 @@ fn flush_positions_v5_compressed(
 }
 
 /// Train a zstd dictionary from serialized position entry samples.
-fn train_v5_dict(samples: &[&[u8]]) -> Result<Vec<u8>> {
+fn train_v5_dict(samples: &[&[u8]], dict_size_kb: u32) -> Result<Vec<u8>> {
     // Flatten samples into continuous buffer with sizes array for zstd training API.
     let mut continuous = Vec::new();
     let mut sizes = Vec::with_capacity(samples.len());
@@ -678,7 +713,7 @@ fn train_v5_dict(samples: &[&[u8]]) -> Result<Vec<u8>> {
         sizes.push(sample.len());
     }
 
-    let dict_size = 112 * 1024; // 112KB — zstd default
+    let dict_size = dict_size_kb as usize * 1024;
     let dict = zstd::dict::from_continuous(&continuous, &sizes, dict_size)
         .map_err(|e| DataFusionError::Execution(format!("zstd dictionary training failed: {e}")))?;
     Ok(dict)
