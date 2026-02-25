@@ -16,7 +16,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 | **[datafusion-bio-function-pileup](datafusion/bio-function-pileup)** | Depth-of-coverage (pileup) computation from BAM alignments | ✅ |
 | **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, nearest-neighbor, overlap, merge, cluster, complement, and subtract operations | ✅ |
 | **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via `lookup_variants()` table function with KV cache backend | ✅ |
-| **[datafusion-bio-function-vep-cache](datafusion/bio-function-vep-cache)** | fjall KV store for VEP variation cache (V1–V5 formats, zstd dictionary compression) | ✅ |
+| **[datafusion-bio-function-vep-cache](datafusion/bio-function-vep-cache)** | fjall KV store for VEP variation cache (zstd dictionary compression) | ✅ |
 
 ## Features
 
@@ -47,7 +47,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 ### VEP Annotation (variant lookup with KV cache)
 
 - **`lookup_variants()` Table Function**: SQL-based variant annotation against a pre-built VEP cache
-- **KV Cache Backend**: fjall LSM-tree store with V5 zstd dictionary compression for compact on-disk storage
+- **KV Cache Backend**: fjall LSM-tree store with zstd dictionary compression for compact on-disk storage
 - **Match Modes**: `exact`, `exact_or_colocated_ids`, `exact_or_vep_existing` (indel-aware relaxed matching)
 - **Session Configuration**: Tunable parameters via SQL `SET` statements under the `bio.annotation` namespace
 
@@ -61,23 +61,28 @@ Register `AnnotationConfig` on the session to enable SQL-level parameter overrid
 -- pages and data blocks in memory.
 SET bio.annotation.cache_size_mb = 2048;
 
--- Zstd compression level for V5 cache writes (default: 3)
+-- Cache window size in base pairs (default: 1000000)
+-- Defines the genomic window size used when building or querying the KV cache.
+SET bio.annotation.window_size = 500000;
+
+-- Zstd compression level for cache writes (default: 3)
 -- Higher levels produce smaller caches at the cost of slower writes.
 -- Decompression speed is constant regardless of level.
 -- Level 9 is a good balance for write-once caches.
-SET bio.annotation.v5_zstd_level = 9;
+SET bio.annotation.zstd_level = 9;
 
--- Zstd dictionary size in KB for V5 cache writes (default: 112)
+-- Zstd dictionary size in KB for cache writes (default: 112)
 -- Larger dictionaries can improve compression ratio.
 -- 256 KB is recommended with level 9.
-SET bio.annotation.v5_dict_size_kb = 256;
+SET bio.annotation.dict_size_kb = 256;
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `bio.annotation.cache_size_mb` | `1024` | fjall block cache size in MB for reads |
-| `bio.annotation.v5_zstd_level` | `3` | Zstd compression level for V5 writes (1–19) |
-| `bio.annotation.v5_dict_size_kb` | `112` | Zstd dictionary size in KB for V5 writes |
+| `bio.annotation.window_size` | `1000000` | Cache window size in base pairs |
+| `bio.annotation.zstd_level` | `3` | Zstd compression level for cache writes (1–19) |
+| `bio.annotation.dict_size_kb` | `112` | Zstd dictionary size in KB for cache writes |
 
 **Registration from downstream (e.g., polars-bio):**
 

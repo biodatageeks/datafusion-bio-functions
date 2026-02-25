@@ -1,4 +1,4 @@
-//! Per-position entry serialization for V5 format.
+//! Per-position entry serialization.
 //!
 //! Each genomic position `(chrom, start, end)` stores one binary value in fjall
 //! containing an allele table and column-major data for all cache columns.
@@ -29,7 +29,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{DataFusionError, Result};
 
-// Reuse the same type codes as V4 (from mmap_block_store.rs).
+// Type codes for column data types.
 fn encode_data_type(dt: &DataType) -> Result<u8> {
     match dt {
         DataType::Int32 => Ok(0),
@@ -46,7 +46,7 @@ fn encode_data_type(dt: &DataType) -> Result<u8> {
         DataType::UInt8 => Ok(11),
         DataType::UInt16 => Ok(12),
         other => Err(DataFusionError::Execution(format!(
-            "V5 format does not support data type: {other}"
+            "unsupported data type for position entry: {other}"
         ))),
     }
 }
@@ -67,7 +67,7 @@ fn decode_data_type(code: u8) -> Result<DataType> {
         11 => Ok(DataType::UInt8),
         12 => Ok(DataType::UInt16),
         other => Err(DataFusionError::Execution(format!(
-            "V5 unknown data type code: {other}"
+            "unknown data type code: {other}"
         ))),
     }
 }
@@ -225,7 +225,7 @@ fn serialize_column_values(buf: &mut Vec<u8>, col: &dyn Array, rows: &[usize]) -
         }
         other => {
             return Err(DataFusionError::Execution(format!(
-                "V5 serialize: unsupported data type {other}"
+                "serialize: unsupported data type {other}"
             )));
         }
     }
@@ -278,7 +278,7 @@ impl<'a> PositionEntryReader<'a> {
     pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.len() < 4 {
             return Err(DataFusionError::Execution(
-                "V5 position entry too short for header".into(),
+                "position entry too short for header".into(),
             ));
         }
         let num_alleles = u16::from_le_bytes([data[0], data[1]]) as usize;
@@ -289,7 +289,7 @@ impl<'a> PositionEntryReader<'a> {
         for _ in 0..num_alleles {
             if offset + 2 > data.len() {
                 return Err(DataFusionError::Execution(
-                    "V5 position entry: truncated allele table".into(),
+                    "position entry: truncated allele table".into(),
                 ));
             }
             let len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
@@ -306,7 +306,7 @@ impl<'a> PositionEntryReader<'a> {
         for col in 0..num_cols {
             if col_off >= data.len() {
                 return Err(DataFusionError::Execution(format!(
-                    "V5 position entry: truncated column data at col {col}"
+                    "position entry: truncated column data at col {col}"
                 )));
             }
             let type_code = data[col_off];
@@ -352,7 +352,7 @@ impl<'a> PositionEntryReader<'a> {
     ) -> Result<()> {
         if col_idx >= self.col_offsets.len() {
             return Err(DataFusionError::Execution(format!(
-                "V5: column index {col_idx} out of range (have {})",
+                "column index {col_idx} out of range (have {})",
                 self.col_offsets.len()
             )));
         }
@@ -567,13 +567,12 @@ impl<'a> PositionEntryReader<'a> {
             }
             other => {
                 return Err(DataFusionError::Execution(format!(
-                    "V5 read: unsupported data type {other}"
+                    "read: unsupported data type {other}"
                 )));
             }
         }
         Ok(())
     }
-
 }
 
 /// Compute the packed size of a single column's data (after the type byte).
@@ -588,7 +587,7 @@ fn column_packed_size(dt: &DataType, n: usize, null_bytes: usize, data: &[u8]) -
             // null_bitmap + 4B total_string_bytes + N*4B offsets + string data
             if data.len() < null_bytes + 4 {
                 return Err(DataFusionError::Execution(
-                    "V5: truncated string column header".into(),
+                    "truncated string column header".into(),
                 ));
             }
             let total_str =
@@ -597,7 +596,7 @@ fn column_packed_size(dt: &DataType, n: usize, null_bytes: usize, data: &[u8]) -
         }
         other => {
             return Err(DataFusionError::Execution(format!(
-                "V5 column_packed_size: unsupported type {other}"
+                "column_packed_size: unsupported type {other}"
             )));
         }
     };
@@ -663,7 +662,7 @@ pub fn make_builder(dt: &DataType, capacity: usize) -> Result<Box<dyn ArrayBuild
             StringBuilder::with_capacity(capacity, capacity * 16),
         )),
         other => Err(DataFusionError::Execution(format!(
-            "V5 make_builder: unsupported type {other}"
+            "make_builder: unsupported type {other}"
         ))),
     }
 }

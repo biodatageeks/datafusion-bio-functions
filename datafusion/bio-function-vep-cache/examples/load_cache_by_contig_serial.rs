@@ -18,17 +18,12 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!(
-            "Usage: {} <parquet_path> <fjall_output_path> [window_size_kb]",
-            args[0]
-        );
+        eprintln!("Usage: {} <parquet_path> <fjall_output_path>", args[0]);
         std::process::exit(1);
     }
 
     let parquet_path = &args[1];
     let output_path = &args[2];
-    let window_size_kb: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1000);
-    let window_size = window_size_kb * 1000;
 
     let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
@@ -48,13 +43,12 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "contigs={} window_kb={} target_partitions=1 loader_parallelism=1",
+        "contigs={} target_partitions=1 loader_parallelism=1",
         contigs.len(),
-        window_size_kb
     );
     println!(
         "{:<8} {:>14} {:>10} {:>10} {:>9} {:>13} {:>13}",
-        "chrom", "variants", "windows", "bytes", "elapsed_s", "delta_gb", "total_gb"
+        "chrom", "variants", "positions", "bytes", "elapsed_s", "delta_gb", "total_gb"
     );
 
     let mut prev_total_bytes = 0u64;
@@ -68,7 +62,6 @@ async fn main() -> Result<()> {
 
         let start = Instant::now();
         let stats = CacheLoader::new("vep_contig", output_path)
-            .with_window_size(window_size)
             .with_parallelism(1)
             .load(&ctx)
             .await?;
@@ -82,7 +75,7 @@ async fn main() -> Result<()> {
             "{:<8} {:>14} {:>10} {:>10} {:>9.1} {:>13.3} {:>13.3}",
             plan.chrom,
             plan.variants,
-            stats.total_windows,
+            stats.total_positions,
             stats.total_bytes,
             elapsed,
             bytes_to_gb(delta_bytes),

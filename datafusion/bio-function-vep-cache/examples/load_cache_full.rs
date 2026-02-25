@@ -13,7 +13,7 @@ async fn main() -> datafusion::common::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!(
-            "Usage: {} <parquet_path> <fjall_output_path> <threads> [window_size_kb]",
+            "Usage: {} <parquet_path> <fjall_output_path> <threads>",
             args[0]
         );
         std::process::exit(1);
@@ -24,8 +24,6 @@ async fn main() -> datafusion::common::Result<()> {
     let threads: usize = args[3].parse().map_err(|e| {
         datafusion::common::DataFusionError::Execution(format!("invalid threads: {e}"))
     })?;
-    let window_size_kb: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1000);
-    let window_size = window_size_kb * 1000;
 
     let config = SessionConfig::new().with_target_partitions(threads);
     let ctx = SessionContext::new_with_config(config);
@@ -39,15 +37,13 @@ async fn main() -> datafusion::common::Result<()> {
     }
 
     let start = Instant::now();
-    let loader = CacheLoader::new("vep_source", output_path)
-        .with_window_size(window_size)
-        .with_parallelism(threads);
+    let loader = CacheLoader::new("vep_source", output_path).with_parallelism(threads);
     let stats = loader.load(&ctx).await?;
 
     println!(
         "Loaded: variants={} windows={} bytes={} elapsed={:.1}s threads={}",
         stats.total_variants,
-        stats.total_windows,
+        stats.total_positions,
         stats.total_bytes,
         start.elapsed().as_secs_f64(),
         threads

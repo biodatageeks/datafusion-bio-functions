@@ -35,9 +35,5 @@ name = "bench_annotate"
 required-features = []
 
 [[example]]
-name = "bench_window_read"
-required-features = []
-
-[[example]]
 name = "bench_fjall_gets"
 required-features = []

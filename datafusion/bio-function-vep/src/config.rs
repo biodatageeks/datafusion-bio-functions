@@ -5,8 +5,9 @@
 //!
 //! ```sql
 //! SET bio.annotation.cache_size_mb = 2048;
-//! SET bio.annotation.v5_zstd_level = 9;
-//! SET bio.annotation.v5_dict_size_kb = 256;
+//! SET bio.annotation.window_size = 1000000;
+//! SET bio.annotation.zstd_level = 9;
+//! SET bio.annotation.dict_size_kb = 256;
 //! ```
 //!
 //! Downstream (polars-bio) registers this extension on the session via
@@ -27,20 +28,27 @@ extensions_options! {
         /// index pages and data blocks in memory.
         pub cache_size_mb: u64, default = 1024
 
-        /// Zstd compression level for V5 cache writes (default: 3).
+        /// Cache window size for grouping variant positions (default: 1_000_000).
+        ///
+        /// Defines the genomic window size (in base pairs) used when building
+        /// or querying the KV cache. A larger window reduces key overhead but
+        /// increases the amount of data scanned per lookup.
+        pub window_size: u64, default = 1_000_000
+
+        /// Zstd compression level for cache writes (default: 3).
         ///
         /// Higher levels produce smaller caches at the cost of slower writes.
         /// Decompression speed is constant regardless of level (read throughput
         /// is unaffected). Recommended range: 1-19.
         /// Level 9 with dict_size_kb=256 is a good balance for write-once caches.
-        pub v5_zstd_level: u64, default = 3
+        pub zstd_level: u64, default = 3
 
-        /// Zstd dictionary size in KB for V5 cache writes (default: 112).
+        /// Zstd dictionary size in KB for cache writes (default: 112).
         ///
         /// The dictionary is trained from the first batch of position entries
         /// and reused for all subsequent entries. Larger dictionaries can improve
         /// compression ratio at the cost of slightly more memory during writes.
-        pub v5_dict_size_kb: u64, default = 112
+        pub dict_size_kb: u64, default = 112
     }
 }
 
