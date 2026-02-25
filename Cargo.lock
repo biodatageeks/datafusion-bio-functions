@@ -921,7 +921,7 @@ dependencies = [
 [[package]]
 name = "datafusion-bio-format-bam"
 version = "0.5.2"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=706e606d202da2e329b20a948b36344738990976#706e606d202da2e329b20a948b36344738990976"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=09baf51820f5eee80bc5b61bce415004e6a6abfe#09baf51820f5eee80bc5b61bce415004e6a6abfe"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -947,7 +947,7 @@ dependencies = [
 [[package]]
 name = "datafusion-bio-format-core"
 version = "0.5.2"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=706e606d202da2e329b20a948b36344738990976#706e606d202da2e329b20a948b36344738990976"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=09baf51820f5eee80bc5b61bce415004e6a6abfe#09baf51820f5eee80bc5b61bce415004e6a6abfe"
 dependencies = [
  "async-compression",
  "bytes",
@@ -2684,7 +2684,7 @@ dependencies = [
 [[package]]
 name = "noodles-bam"
 version = "0.82.0"
-source = "git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b#da905fff4909ada93e407c780456332fe113858b"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=e2b53501afd9d327735355db68dfb33d3e6ce9db#e2b53501afd9d327735355db68dfb33d3e6ce9db"
 dependencies = [
  "bstr",
  "futures",
@@ -2736,7 +2736,7 @@ dependencies = [
 [[package]]
 name = "noodles-bgzf"
 version = "0.42.0"
-source = "git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b#da905fff4909ada93e407c780456332fe113858b"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=e2b53501afd9d327735355db68dfb33d3e6ce9db#e2b53501afd9d327735355db68dfb33d3e6ce9db"
 dependencies = [
  "bytes",
  "crossbeam-channel",
@@ -2760,7 +2760,7 @@ dependencies = [
 [[package]]
 name = "noodles-core"
 version = "0.18.0"
-source = "git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b#da905fff4909ada93e407c780456332fe113858b"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=e2b53501afd9d327735355db68dfb33d3e6ce9db#e2b53501afd9d327735355db68dfb33d3e6ce9db"
 dependencies = [
  "bstr",
 ]
@@ -2807,7 +2807,7 @@ dependencies = [
 [[package]]
 name = "noodles-csi"
 version = "0.50.0"
-source = "git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b#da905fff4909ada93e407c780456332fe113858b"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=e2b53501afd9d327735355db68dfb33d3e6ce9db#e2b53501afd9d327735355db68dfb33d3e6ce9db"
 dependencies = [
  "bit-vec",
  "bstr",
@@ -2879,7 +2879,7 @@ dependencies = [
 [[package]]
 name = "noodles-sam"
 version = "0.78.0"
-source = "git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b#da905fff4909ada93e407c780456332fe113858b"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=e2b53501afd9d327735355db68dfb33d3e6ce9db#e2b53501afd9d327735355db68dfb33d3e6ce9db"
 dependencies = [
  "bitflags",
  "bstr",
