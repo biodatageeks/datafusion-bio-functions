@@ -5,10 +5,13 @@
 //! parallelizing across DataFusion physical partitions.
 //!
 //! Streaming approach:
-//! - Each partition processes its stream batch-by-batch.
-//! - The first batch trains a zstd dictionary from serialized position entries,
-//!   then all entries (first + subsequent) are compressed with that dictionary.
-//! - If training fails (too few samples), entries are stored uncompressed.
+//! 1. A sample of up to 10,000 rows is read from the source table to train
+//!    a single zstd dictionary. The dictionary is stored in KV meta and shared
+//!    across all partitions — this avoids the race condition where parallel
+//!    partitions would each train and overwrite different dictionaries.
+//! 2. Each partition processes its stream batch-by-batch, compressing entries
+//!    with the shared dictionary. Memory stays bounded to one batch per partition.
+//! 3. If training fails (too few samples), entries are stored uncompressed.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -47,8 +50,10 @@ struct PartitionStats {
 struct StreamContext {
     store: Arc<VepKvStore>,
     schema: SchemaRef,
+    /// Pre-trained dictionary bytes shared by all partitions. `None` if training
+    /// was skipped (too few samples) — partitions store entries uncompressed.
+    dict: Option<Arc<Vec<u8>>>,
     zstd_level: i32,
-    dict_size_kb: u32,
 }
 
 /// Builder for loading a Parquet-based VEP cache into fjall.
@@ -99,9 +104,10 @@ impl CacheLoader {
 
     /// Load the cache from the registered source table into fjall.
     ///
-    /// Spawns one streaming task per physical partition. Each task reads
-    /// batches and flushes position entries inline — memory stays bounded
-    /// to one batch at a time per partition.
+    /// First trains a zstd dictionary from a sample of the source data, then
+    /// spawns one streaming task per physical partition. Each task reads batches
+    /// and flushes position entries inline — memory stays bounded to one batch
+    /// at a time per partition.
     pub async fn load(&self, session: &SessionContext) -> Result<LoadStats> {
         let start_time = Instant::now();
 
@@ -113,13 +119,22 @@ impl CacheLoader {
             schema.clone(),
         )?);
 
+        // Phase 1: Train zstd dictionary from a sample of the source data.
+        // This happens once before any parallel work, ensuring all partitions
+        // share the same dictionary.
+        let dict = self.train_dictionary(session, &store, &schema).await?;
+
+        // Phase 2: Stream all partitions in parallel with the shared dictionary.
+        let source_df = session.table(&self.source_table).await?;
         let plan = source_df.create_physical_plan().await?;
         let partition_count = plan.output_partitioning().partition_count();
         let task_ctx = session.task_ctx();
 
         info!(
-            "Loading into KV cache: {} partitions, zstd_level={}, dict_size_kb={}",
-            partition_count, self.zstd_level, self.dict_size_kb,
+            "Loading into KV cache: {} partitions, zstd_level={}, dict={}",
+            partition_count,
+            self.zstd_level,
+            if dict.is_some() { "trained" } else { "none" },
         );
         debug!(
             "Physical plan:\n{}",
@@ -139,8 +154,8 @@ impl CacheLoader {
             let ctx = StreamContext {
                 store: Arc::clone(&store),
                 schema: schema.clone(),
+                dict: dict.clone(),
                 zstd_level: self.zstd_level,
-                dict_size_kb: self.dict_size_kb,
             };
 
             handles.push(tokio::spawn(async move {
@@ -183,6 +198,97 @@ impl CacheLoader {
             elapsed_secs: elapsed,
         })
     }
+
+    /// Train a zstd dictionary from a sample of the source table.
+    ///
+    /// Reads up to 10,000 rows via `LIMIT`, serializes them as position entries,
+    /// and trains a dictionary. Stores the dictionary and compression level in
+    /// the KV store meta partition. Returns `None` if too few samples.
+    async fn train_dictionary(
+        &self,
+        session: &SessionContext,
+        store: &VepKvStore,
+        schema: &SchemaRef,
+    ) -> Result<Option<Arc<Vec<u8>>>> {
+        let sample_df = session
+            .sql(&format!(
+                "SELECT * FROM `{}` LIMIT 10000",
+                self.source_table
+            ))
+            .await?;
+        let batches = sample_df.collect().await?;
+
+        let chrom_col_idx = schema.index_of("chrom")?;
+        let start_col_idx = schema.index_of("start")?;
+        let end_col_idx = schema.index_of("end")?;
+        let allele_col_idx = schema.index_of("allele_string")?;
+        let col_indices: Vec<usize> = (0..schema.fields().len())
+            .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+            .collect();
+
+        // Serialize position entries from sample batches.
+        let mut samples: Vec<Vec<u8>> = Vec::new();
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let chrom_col = batch.column(chrom_col_idx);
+            let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
+            let ends = batch.column(end_col_idx).as_primitive::<Int64Type>();
+
+            let mut groups: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
+            for row in 0..batch.num_rows() {
+                let chrom = string_value(chrom_col.as_ref(), row);
+                let start = starts.value(row);
+                let end = ends.value(row);
+                groups
+                    .entry((chrom.to_string(), start, end))
+                    .or_default()
+                    .push(row);
+            }
+
+            for rows in groups.values() {
+                let value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+                samples.push(value);
+            }
+        }
+
+        let min_training_samples = 100;
+        if samples.len() < min_training_samples {
+            info!(
+                "only {} sample entries, skipping dictionary training (need >= {})",
+                samples.len(),
+                min_training_samples
+            );
+            return Ok(None);
+        }
+
+        let max_samples = 10_000.min(samples.len());
+        let sample_refs: Vec<&[u8]> = samples[..max_samples]
+            .iter()
+            .map(|v| v.as_slice())
+            .collect();
+
+        let dict_size_kb = self.dict_size_kb;
+        let zstd_level = self.zstd_level;
+
+        match train_dict(&sample_refs, dict_size_kb) {
+            Ok(dict) => {
+                info!(
+                    "zstd dict trained: {} samples, dict {} bytes",
+                    max_samples,
+                    dict.len()
+                );
+                store.store_dict(&dict)?;
+                store.store_zstd_level(zstd_level)?;
+                Ok(Some(Arc::new(dict)))
+            }
+            Err(e) => {
+                info!("zstd dict training failed (falling back to uncompressed): {e}");
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Stream a single partition: read batches and flush position entries inline.
@@ -201,11 +307,17 @@ async fn stream_partition(
         total_bytes: 0,
     };
 
-    // Zstd dictionary compressor — built from first batch, reused for all subsequent.
-    // None until the first batch trains the dictionary. If training is skipped (too few
-    // samples), this stays None and all entries are stored uncompressed.
-    let mut compressor: Option<zstd::bulk::Compressor<'static>> = None;
-    let mut first_batch_done = false;
+    // Create compressor from shared dictionary (if available).
+    // Each partition gets its own compressor instance but all share the same dict.
+    let mut compressor = if let Some(ref dict) = ctx.dict {
+        Some(
+            zstd::bulk::Compressor::with_dictionary(ctx.zstd_level, dict).map_err(|e| {
+                DataFusionError::Execution(format!("failed to create zstd compressor: {e}"))
+            })?,
+        )
+    } else {
+        None
+    };
 
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
@@ -219,21 +331,7 @@ async fn stream_partition(
         let schema = ctx.schema.clone();
         let batch_clone = batch.clone();
 
-        if !first_batch_done {
-            first_batch_done = true;
-            let zstd_level = ctx.zstd_level;
-            let dict_size_kb = ctx.dict_size_kb;
-            // First batch: try to train dictionary, store it, build compressor.
-            let (comp, positions, bytes) = tokio::task::spawn_blocking(move || {
-                train_and_flush_first_batch(&store, &schema, &batch_clone, zstd_level, dict_size_kb)
-            })
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))??;
-            compressor = comp;
-            stats.total_positions += positions;
-            stats.total_bytes += bytes;
-        } else if let Some(mut comp) = compressor.take() {
-            // Subsequent batches with dictionary: compress and insert.
+        if let Some(mut comp) = compressor.take() {
             let (comp_back, positions, bytes) = tokio::task::spawn_blocking(move || {
                 let result = flush_positions_compressed(&store, &schema, &batch_clone, &mut comp);
                 result.map(|(p, b)| (comp, p, b))
@@ -244,7 +342,6 @@ async fn stream_partition(
             stats.total_positions += positions;
             stats.total_bytes += bytes;
         } else {
-            // Subsequent batches without dictionary: insert uncompressed.
             let (positions, bytes) = tokio::task::spawn_blocking(move || {
                 flush_positions_uncompressed(&store, &schema, &batch_clone)
             })
@@ -263,119 +360,6 @@ async fn stream_partition(
     );
 
     Ok(stats)
-}
-
-/// Train a zstd dictionary from the first batch, store it, then compress + insert all entries.
-///
-/// Returns `(Option<Compressor>, num_positions, total_bytes)`. The compressor is `None` if
-/// there weren't enough samples to train a meaningful dictionary (entries stored uncompressed).
-fn train_and_flush_first_batch(
-    store: &VepKvStore,
-    schema: &SchemaRef,
-    batch: &RecordBatch,
-    zstd_level: i32,
-    dict_size_kb: u32,
-) -> Result<(Option<zstd::bulk::Compressor<'static>>, u64, u64)> {
-    let chrom_col_idx = schema.index_of("chrom")?;
-    let start_col_idx = schema.index_of("start")?;
-    let end_col_idx = schema.index_of("end")?;
-    let allele_col_idx = schema.index_of("allele_string")?;
-
-    let chrom_col = batch.column(chrom_col_idx);
-    let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
-    let ends = batch.column(end_col_idx).as_primitive::<Int64Type>();
-
-    let col_indices: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
-        .collect();
-
-    // Group row indices by (chrom, start, end).
-    let mut groups: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
-    for row in 0..batch.num_rows() {
-        let chrom = string_value(chrom_col.as_ref(), row);
-        let start = starts.value(row);
-        let end = ends.value(row);
-        groups
-            .entry((chrom.to_string(), start, end))
-            .or_default()
-            .push(row);
-    }
-
-    // Phase 1: serialize all entries (uncompressed) to collect training samples.
-    let mut serialized: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(groups.len());
-    for ((chrom, start, end), rows) in &groups {
-        let value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
-        let key = encode_position_key(chrom, *start, *end);
-        serialized.push((key, value));
-    }
-
-    // Phase 2: train dictionary from samples (up to 10,000).
-    // Require a minimum of 100 samples for meaningful dictionary training.
-    let min_training_samples = 100;
-    let dict_bytes = if serialized.len() >= min_training_samples {
-        let max_samples = 10_000.min(serialized.len());
-        let samples: Vec<&[u8]> = serialized[..max_samples]
-            .iter()
-            .map(|(_, v)| v.as_slice())
-            .collect();
-        match train_dict(&samples, dict_size_kb) {
-            Ok(dict) => {
-                info!(
-                    "zstd dict trained: {} samples, dict {} bytes",
-                    max_samples,
-                    dict.len()
-                );
-                Some(dict)
-            }
-            Err(e) => {
-                info!("zstd dict training failed (falling back to uncompressed): {e}");
-                None
-            }
-        }
-    } else {
-        info!(
-            "only {} entries, skipping dictionary training (need >= {})",
-            serialized.len(),
-            min_training_samples
-        );
-        None
-    };
-
-    if let Some(ref dict) = dict_bytes {
-        // Store dictionary and compression level in meta, then compress entries.
-        store.store_dict(dict)?;
-        store.store_zstd_level(zstd_level)?;
-
-        let mut compressor =
-            zstd::bulk::Compressor::with_dictionary(zstd_level, dict).map_err(|e| {
-                DataFusionError::Execution(format!("failed to create zstd compressor: {e}"))
-            })?;
-
-        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(serialized.len());
-        let mut total_bytes = 0u64;
-        for (key, raw_value) in serialized {
-            let compressed = compressor
-                .compress(&raw_value)
-                .map_err(|e| DataFusionError::Execution(format!("zstd compression failed: {e}")))?;
-            total_bytes += compressed.len() as u64;
-            entries.push((key, compressed));
-        }
-
-        let num_positions = entries.len() as u64;
-        store.batch_insert_position_entries(&entries)?;
-
-        Ok((Some(compressor), num_positions, total_bytes))
-    } else {
-        // Not enough samples — insert uncompressed, no compressor for subsequent batches.
-        let mut total_bytes = 0u64;
-        for (_, v) in &serialized {
-            total_bytes += v.len() as u64;
-        }
-        let num_positions = serialized.len() as u64;
-        store.batch_insert_position_entries(&serialized)?;
-
-        Ok((None, num_positions, total_bytes))
-    }
 }
 
 /// Flush position entries without compression (fallback when dictionary training was skipped).

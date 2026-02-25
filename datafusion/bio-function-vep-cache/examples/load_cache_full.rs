@@ -41,7 +41,7 @@ async fn main() -> datafusion::common::Result<()> {
     let stats = loader.load(&ctx).await?;
 
     println!(
-        "Loaded: variants={} windows={} bytes={} elapsed={:.1}s threads={}",
+        "Loaded: variants={} positions={} bytes={} elapsed={:.1}s threads={}",
         stats.total_variants,
         stats.total_positions,
         stats.total_bytes,
