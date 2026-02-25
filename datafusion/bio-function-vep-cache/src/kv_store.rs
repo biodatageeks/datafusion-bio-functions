@@ -7,10 +7,10 @@ use std::sync::Arc;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
-use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
-const META_PARTITION: &str = "meta";
-const DATA_PARTITION: &str = "data";
+const META_KEYSPACE: &str = "meta";
+const DATA_KEYSPACE: &str = "data";
 const SCHEMA_KEY: &[u8] = b"schema";
 const FORMAT_VERSION_KEY: &[u8] = b"format_version";
 const ZSTD_DICT_KEY: &[u8] = b"zstd_dict";
@@ -22,16 +22,16 @@ const ZSTD_LEVEL_KEY: &[u8] = b"zstd_level";
 /// the allele table and column-major data. Only positions matching VCF queries are fetched.
 pub const FORMAT_V0: u8 = 0;
 
-/// Wrapper around fjall `Keyspace` for VEP cache storage.
+/// Wrapper around fjall `Database` for VEP cache storage.
 ///
 /// Layout:
-/// - `meta` partition: schema (Arrow IPC), format version, zstd dictionary
-/// - `data` partition: `(chrom, start, end)` -> compressed position entry
+/// - `meta` keyspace: schema (Arrow IPC), format version, zstd dictionary
+/// - `data` keyspace: `(chrom, start, end)` -> compressed position entry
 pub struct VepKvStore {
     root_path: PathBuf,
-    keyspace: Keyspace,
-    data: PartitionHandle,
-    meta: PartitionHandle,
+    db: Database,
+    data: Keyspace,
+    meta: Keyspace,
     schema: SchemaRef,
     format_version: u8,
     /// Raw zstd dictionary bytes for position entry decompression.
@@ -40,6 +40,10 @@ pub struct VepKvStore {
 
 fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
     DataFusionError::ArrowError(Box::new(e), None)
+}
+
+fn fjall_err(e: fjall::Error) -> DataFusionError {
+    DataFusionError::External(Box::new(e))
 }
 
 impl VepKvStore {
@@ -51,17 +55,17 @@ impl VepKvStore {
     /// Open an existing KV store with a custom fjall block cache size (bytes).
     pub fn open_with_cache_size(path: impl AsRef<Path>, cache_size_bytes: u64) -> Result<Self> {
         let root_path = path.as_ref().to_path_buf();
-        let keyspace = Config::new(&root_path)
+        let db = Database::builder(&root_path)
             .cache_size(cache_size_bytes)
             .open()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            .map_err(fjall_err)?;
 
-        let data = keyspace
-            .open_partition(DATA_PARTITION, PartitionCreateOptions::default())
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let meta = keyspace
-            .open_partition(META_PARTITION, PartitionCreateOptions::default())
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let data = db
+            .keyspace(DATA_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(fjall_err)?;
+        let meta = db
+            .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(fjall_err)?;
 
         let schema = Self::read_schema(&meta)?;
         let format_version = Self::read_format_version(&meta)?;
@@ -69,12 +73,12 @@ impl VepKvStore {
         // Load zstd dictionary if present.
         let zstd_dict = meta
             .get(ZSTD_DICT_KEY)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .map_err(fjall_err)?
             .map(|raw| Arc::new(raw.to_vec()));
 
         Ok(Self {
             root_path,
-            keyspace,
+            db,
             data,
             meta,
             schema,
@@ -84,34 +88,45 @@ impl VepKvStore {
     }
 
     /// Create a new KV store with the given schema.
+    ///
+    /// Uses write-optimized settings for bulk loading:
+    /// - `manual_journal_persist` — skip per-batch fsync (persist once at the end)
+    /// - L0 threshold raised to 16 — defer compaction during ingestion
+    /// - LZ4 disabled on data blocks — values are already zstd-compressed
     pub fn create(path: impl AsRef<Path>, schema: SchemaRef) -> Result<Self> {
         let root_path = path.as_ref().to_path_buf();
-        let keyspace = Config::new(&root_path)
+        let db = Database::builder(&root_path)
             .cache_size(256 * 1024 * 1024)
+            .manual_journal_persist(true)
             .open()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            .map_err(fjall_err)?;
 
-        let data = keyspace
-            .open_partition(DATA_PARTITION, PartitionCreateOptions::default())
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let meta = keyspace
-            .open_partition(META_PARTITION, PartitionCreateOptions::default())
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // Data keyspace: write-optimized for bulk loading.
+        let data_opts = || {
+            KeyspaceCreateOptions::default()
+                .manual_journal_persist(true)
+                .compaction_strategy(Arc::new(
+                    fjall::compaction::Leveled::default().with_l0_threshold(16),
+                ))
+                .data_block_compression_policy(fjall::config::CompressionPolicy::disabled())
+        };
+
+        let data = db.keyspace(DATA_KEYSPACE, data_opts).map_err(fjall_err)?;
+        let meta = db
+            .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(fjall_err)?;
 
         let schema_bytes = schema_to_ipc_bytes(&schema)?;
-        meta.insert(SCHEMA_KEY, &schema_bytes)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        meta.insert(SCHEMA_KEY, &schema_bytes).map_err(fjall_err)?;
 
         meta.insert(FORMAT_VERSION_KEY, [FORMAT_V0])
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            .map_err(fjall_err)?;
 
-        keyspace
-            .persist(PersistMode::SyncAll)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        db.persist(PersistMode::SyncAll).map_err(fjall_err)?;
 
         Ok(Self {
             root_path,
-            keyspace,
+            db,
             data,
             meta,
             schema,
@@ -133,8 +148,8 @@ impl VepKvStore {
         self.format_version
     }
 
-    /// Return a reference to the data partition handle (for diagnostics).
-    pub fn data_partition(&self) -> &PartitionHandle {
+    /// Return a reference to the data keyspace handle (for diagnostics).
+    pub fn data_partition(&self) -> &Keyspace {
         &self.data
     }
 
@@ -149,9 +164,7 @@ impl VepKvStore {
         value: &[u8],
     ) -> Result<()> {
         let key = crate::key_encoding::encode_position_key(chrom, start, end);
-        self.data
-            .insert(&key, value)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        self.data.insert(&key, value).map_err(fjall_err)?;
         Ok(())
     }
 
@@ -168,7 +181,7 @@ impl VepKvStore {
         crate::key_encoding::encode_position_key_buf(chrom_code, start, end, &mut key_buf);
         match self.data.get(&key_buf) {
             Ok(v) => Ok(v),
-            Err(e) => Err(DataFusionError::External(Box::new(e))),
+            Err(e) => Err(fjall_err(e)),
         }
     }
 
@@ -176,7 +189,7 @@ impl VepKvStore {
     pub fn store_dict(&self, dict_bytes: &[u8]) -> Result<()> {
         self.meta
             .insert(ZSTD_DICT_KEY, dict_bytes)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            .map_err(fjall_err)?;
         Ok(())
     }
 
@@ -184,7 +197,7 @@ impl VepKvStore {
     pub fn store_zstd_level(&self, level: i32) -> Result<()> {
         self.meta
             .insert(ZSTD_LEVEL_KEY, level.to_le_bytes())
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            .map_err(fjall_err)?;
         Ok(())
     }
 
@@ -292,7 +305,7 @@ impl VepKvStore {
         }
     }
 
-    /// Batch-insert pre-serialized position entries into the data partition.
+    /// Batch-insert pre-serialized position entries into the data keyspace.
     pub(crate) fn batch_insert_position_entries(
         &self,
         entries: &[(Vec<u8>, Vec<u8>)],
@@ -302,32 +315,26 @@ impl VepKvStore {
 
     /// Persist all data to disk.
     pub fn persist(&self) -> Result<()> {
-        self.keyspace
-            .persist(PersistMode::SyncAll)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        self.db.persist(PersistMode::SyncAll).map_err(fjall_err)?;
         Ok(())
     }
 
-    /// Atomically insert a batch of pre-serialized (key, value) pairs into the data partition.
+    /// Atomically insert a batch of pre-serialized (key, value) pairs into the data keyspace.
     pub(crate) fn batch_insert_raw(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut batch = fjall::Batch::with_capacity(self.keyspace.clone(), entries.len());
+        let mut batch = fjall::OwnedWriteBatch::with_capacity(self.db.clone(), entries.len());
         for (key, value) in entries {
             batch.insert(&self.data, key, value);
         }
-        batch
-            .commit()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        batch.commit().map_err(fjall_err)?;
         Ok(())
     }
 
     /// Store arbitrary metadata.
     pub fn put_metadata(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.meta
-            .insert(key, value)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        self.meta.insert(key, value).map_err(fjall_err)?;
         Ok(())
     }
 
@@ -336,25 +343,19 @@ impl VepKvStore {
         match self.meta.get(key) {
             Ok(Some(v)) => Ok(Some(v.to_vec())),
             Ok(None) => Ok(None),
-            Err(e) => Err(DataFusionError::External(Box::new(e))),
+            Err(e) => Err(fjall_err(e)),
         }
     }
 
-    fn read_schema(meta: &PartitionHandle) -> Result<SchemaRef> {
-        let value = meta
-            .get(SCHEMA_KEY)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
-            .ok_or_else(|| {
-                DataFusionError::Execution("KV store missing schema metadata".to_string())
-            })?;
+    fn read_schema(meta: &Keyspace) -> Result<SchemaRef> {
+        let value = meta.get(SCHEMA_KEY).map_err(fjall_err)?.ok_or_else(|| {
+            DataFusionError::Execution("KV store missing schema metadata".to_string())
+        })?;
         schema_from_ipc_bytes(&value)
     }
 
-    fn read_format_version(meta: &PartitionHandle) -> Result<u8> {
-        let version = match meta
-            .get(FORMAT_VERSION_KEY)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
-        {
+    fn read_format_version(meta: &Keyspace) -> Result<u8> {
+        let version = match meta.get(FORMAT_VERSION_KEY).map_err(fjall_err)? {
             Some(v) => v[0],
             None => {
                 return Err(DataFusionError::Execution(

@@ -573,6 +573,7 @@ impl<'a> PositionEntryReader<'a> {
         }
         Ok(())
     }
+
 }
 
 /// Compute the packed size of a single column's data (after the type byte).

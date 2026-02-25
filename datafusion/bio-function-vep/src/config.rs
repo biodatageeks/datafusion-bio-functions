@@ -5,7 +5,6 @@
 //!
 //! ```sql
 //! SET bio.annotation.cache_size_mb = 2048;
-//! SET bio.annotation.window_size = 1000000;
 //! SET bio.annotation.zstd_level = 9;
 //! SET bio.annotation.dict_size_kb = 256;
 //! ```
@@ -27,13 +26,6 @@ extensions_options! {
         /// Larger values reduce cold-start latency by caching more LSM block
         /// index pages and data blocks in memory.
         pub cache_size_mb: u64, default = 1024
-
-        /// Cache window size for grouping variant positions (default: 1_000_000).
-        ///
-        /// Defines the genomic window size (in base pairs) used when building
-        /// or querying the KV cache. A larger window reduces key overhead but
-        /// increases the amount of data scanned per lookup.
-        pub window_size: u64, default = 1_000_000
 
         /// Zstd compression level for cache writes (default: 3).
         ///

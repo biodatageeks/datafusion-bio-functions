@@ -61,10 +61,6 @@ Register `AnnotationConfig` on the session to enable SQL-level parameter overrid
 -- pages and data blocks in memory.
 SET bio.annotation.cache_size_mb = 2048;
 
--- Cache window size in base pairs (default: 1000000)
--- Defines the genomic window size used when building or querying the KV cache.
-SET bio.annotation.window_size = 500000;
-
 -- Zstd compression level for cache writes (default: 3)
 -- Higher levels produce smaller caches at the cost of slower writes.
 -- Decompression speed is constant regardless of level.
@@ -80,7 +76,6 @@ SET bio.annotation.dict_size_kb = 256;
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `bio.annotation.cache_size_mb` | `1024` | fjall block cache size in MB for reads |
-| `bio.annotation.window_size` | `1000000` | Cache window size in base pairs |
 | `bio.annotation.zstd_level` | `3` | Zstd compression level for cache writes (1–19) |
 | `bio.annotation.dict_size_kb` | `112` | Zstd dictionary size in KB for cache writes |
 

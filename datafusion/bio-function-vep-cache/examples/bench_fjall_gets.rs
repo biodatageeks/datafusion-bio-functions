@@ -34,13 +34,13 @@ fn main() {
     eprintln!("\n=== WRITE PHASE ===");
     let write_start = Instant::now();
     {
-        let keyspace = fjall::Config::new(&db_path)
+        let db = fjall::Database::builder(&db_path)
             .cache_size(cache_mb * 1024 * 1024)
             .open()
+            .expect("open database");
+        let keyspace = db
+            .keyspace("data", fjall::KeyspaceCreateOptions::default)
             .expect("open keyspace");
-        let partition = keyspace
-            .open_partition("data", fjall::PartitionCreateOptions::default())
-            .expect("open partition");
 
         // Generate a reproducible value payload
         let value_template: Vec<u8> = (0..value_size).map(|i| (i % 251) as u8).collect();
@@ -63,16 +63,14 @@ fn main() {
             // Embed position in first 8 bytes (like real data would have varying content)
             value[0..8].copy_from_slice(&pos.to_be_bytes());
 
-            partition.insert(&key, &value).expect("insert");
+            keyspace.insert(&key, &value).expect("insert");
 
             if (i + 1) % 500_000 == 0 {
                 eprintln!("  wrote {}/{num_entries}", i + 1);
             }
         }
 
-        keyspace
-            .persist(fjall::PersistMode::SyncAll)
-            .expect("persist");
+        db.persist(fjall::PersistMode::SyncAll).expect("persist");
     }
     let write_elapsed = write_start.elapsed();
     eprintln!(
@@ -93,17 +91,17 @@ fn main() {
     eprintln!("\n=== READ PHASE ===");
 
     // Re-open (simulates cold open, then cache warms up)
-    let keyspace = fjall::Config::new(&db_path)
+    let db = fjall::Database::builder(&db_path)
         .cache_size(cache_mb * 1024 * 1024)
         .open()
+        .expect("open database for read");
+    let keyspace = db
+        .keyspace("data", fjall::KeyspaceCreateOptions::default)
         .expect("open keyspace for read");
-    let partition = keyspace
-        .open_partition("data", fjall::PartitionCreateOptions::default())
-        .expect("open partition for read");
 
     let chrom_prefix: [u8; 2] = [0x00, 0x16];
     let position_step: u64 = 9;
-    let max_pos = (num_entries as u64) * position_step;
+    let _max_pos = (num_entries as u64) * position_step;
 
     // Generate lookup positions — sequential subset (like sorted VCF)
     // Pick `num_lookups` evenly spaced positions that exist in the DB
@@ -121,7 +119,7 @@ fn main() {
         let mut key = Vec::with_capacity(10);
         key.extend_from_slice(&chrom_prefix);
         key.extend_from_slice(&pos.to_be_bytes());
-        let _ = partition.get(&key).expect("warmup get");
+        let _ = keyspace.get(&key).expect("warmup get");
     }
 
     // --- Benchmark 1: Sequential gets (sorted VCF pattern) ---
@@ -137,7 +135,7 @@ fn main() {
             key.extend_from_slice(&chrom_prefix);
             key.extend_from_slice(&pos.to_be_bytes());
 
-            match partition.get(&key) {
+            match keyspace.get(&key) {
                 Ok(Some(val)) => {
                     total_bytes += val.len() as u64;
                     found += 1;
@@ -184,7 +182,7 @@ fn main() {
             key.extend_from_slice(&chrom_prefix);
             key.extend_from_slice(&pos.to_be_bytes());
 
-            if let Ok(Some(val)) = partition.get(&key) {
+            if let Ok(Some(val)) = keyspace.get(&key) {
                 total_bytes += val.len() as u64;
                 found += 1;
             }
@@ -220,7 +218,7 @@ fn main() {
         let mut found: u64 = 0;
 
         for key in &prebuilt_keys {
-            if let Ok(Some(val)) = partition.get(key) {
+            if let Ok(Some(val)) = keyspace.get(key) {
                 total_bytes += val.len() as u64;
                 found += 1;
             }
@@ -243,42 +241,43 @@ fn main() {
     eprintln!("\n--- small values (100B) for overhead measurement ---");
     let small_db_path = tmp.path().join("bench_fjall_small");
     {
-        let ks = fjall::Config::new(&small_db_path)
+        let db_small = fjall::Database::builder(&small_db_path)
             .cache_size(cache_mb * 1024 * 1024)
             .open()
             .expect("open small db");
-        let part = ks
-            .open_partition("data", fjall::PartitionCreateOptions::default())
-            .expect("open small partition");
+        let ks_small = db_small
+            .keyspace("data", fjall::KeyspaceCreateOptions::default)
+            .expect("open small keyspace");
         let small_val: Vec<u8> = vec![42u8; 100];
         for i in 0..num_lookups {
             let pos = (i as u64) * position_step;
             let mut key = Vec::with_capacity(10);
             key.extend_from_slice(&chrom_prefix);
             key.extend_from_slice(&pos.to_be_bytes());
-            part.insert(&key, &small_val).expect("insert small");
+            ks_small.insert(&key, &small_val).expect("insert small");
         }
-        ks.persist(fjall::PersistMode::SyncAll)
+        db_small
+            .persist(fjall::PersistMode::SyncAll)
             .expect("persist small");
     }
-    let ks_small = fjall::Config::new(&small_db_path)
+    let db_small = fjall::Database::builder(&small_db_path)
         .cache_size(cache_mb * 1024 * 1024)
         .open()
         .expect("reopen small db");
-    let part_small = ks_small
-        .open_partition("data", fjall::PartitionCreateOptions::default())
-        .expect("reopen small partition");
+    let ks_small = db_small
+        .keyspace("data", fjall::KeyspaceCreateOptions::default)
+        .expect("reopen small keyspace");
 
     // Warmup
     for key in prebuilt_keys.iter().take(1000) {
-        let _ = part_small.get(key);
+        let _ = ks_small.get(key);
     }
 
     for iter in 1..=3 {
         let start = Instant::now();
         let mut found: u64 = 0;
         for key in &prebuilt_keys {
-            if let Ok(Some(_val)) = part_small.get(key) {
+            if let Ok(Some(_val)) = ks_small.get(key) {
                 found += 1;
             }
         }

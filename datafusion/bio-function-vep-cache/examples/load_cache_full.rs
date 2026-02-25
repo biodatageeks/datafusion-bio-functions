@@ -1,8 +1,6 @@
 use std::path::Path;
 use std::time::Instant;
 
-use datafusion::arrow::datatypes::DataType;
-use datafusion::prelude::ParquetReadOptions;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_bio_function_vep_cache::CacheLoader;
 
@@ -27,9 +25,7 @@ async fn main() -> datafusion::common::Result<()> {
 
     let config = SessionConfig::new().with_target_partitions(threads);
     let ctx = SessionContext::new_with_config(config);
-    let parquet_opts = ParquetReadOptions::default()
-        .table_partition_cols(vec![("chrom".to_string(), DataType::Utf8)]);
-    ctx.register_parquet("vep_source", parquet_path, parquet_opts)
+    ctx.register_parquet("vep_source", parquet_path, Default::default())
         .await?;
 
     if Path::new(output_path).exists() {

@@ -13,7 +13,7 @@ datafusion.workspace = true
 tokio.workspace = true
 futures.workspace = true
 log.workspace = true
-fjall = "2"
+fjall = "3.0.2"
 arrow-ipc = { version = "56", features = ["lz4", "zstd"] }
 lz4_flex = "0.12.0"
 zstd = "0.13.3"
