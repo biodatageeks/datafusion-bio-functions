@@ -27,7 +27,7 @@ use futures::StreamExt;
 use log::{debug, info};
 
 use crate::key_encoding::{chrom_to_code, encode_position_key};
-use crate::kv_store::VepKvStore;
+use crate::kv_store::{VepKvStore, decompress_into_buffer_with_retry};
 use crate::position_entry::{PositionEntryReader, make_builder, serialize_position_entry};
 
 /// Statistics returned after loading.
@@ -470,11 +470,13 @@ fn flush_positions_compressed(
         let chrom_code = chrom_to_code(chrom);
         let mut raw_value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
         if let Some(existing_compressed) = store.get_position_entry(chrom_code, *start, *end)? {
-            let existing_raw = decompressor
-                .decompress(&existing_compressed, existing_compressed.len() * 20 + 4096)
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("zstd decompression failed: {e}"))
-                })?;
+            let mut existing_raw = Vec::new();
+            decompress_into_buffer_with_retry(
+                decompressor,
+                &existing_compressed,
+                &mut existing_raw,
+                "zstd decompression failed while merging existing position entry",
+            )?;
             raw_value = merge_position_entries(&existing_raw, &raw_value, schema)?;
         }
         let compressed = compressor

@@ -15,6 +15,8 @@ const SCHEMA_KEY: &[u8] = b"schema";
 const FORMAT_VERSION_KEY: &[u8] = b"format_version";
 const ZSTD_DICT_KEY: &[u8] = b"zstd_dict";
 const ZSTD_LEVEL_KEY: &[u8] = b"zstd_level";
+const MIN_DECOMPRESS_CAPACITY: usize = 4 * 1024;
+const MAX_DECOMPRESSED_ENTRY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Format version 0: position-keyed entries — one fjall entry per genomic position.
 ///
@@ -44,6 +46,62 @@ fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
 
 fn fjall_err(e: fjall::Error) -> DataFusionError {
     DataFusionError::External(Box::new(e))
+}
+
+fn is_destination_too_small_msg(msg: &str) -> bool {
+    msg.contains("Destination buffer is too small")
+}
+
+fn next_capacity(current: usize) -> Option<usize> {
+    if current >= MAX_DECOMPRESSED_ENTRY_BYTES {
+        None
+    } else {
+        current
+            .checked_mul(2)
+            .map(|v| v.min(MAX_DECOMPRESSED_ENTRY_BYTES))
+    }
+}
+
+/// Decompress a zstd payload into a reusable buffer, growing capacity as needed.
+pub(crate) fn decompress_into_buffer_with_retry(
+    decompressor: &mut zstd::bulk::Decompressor<'_>,
+    compressed: &[u8],
+    out: &mut Vec<u8>,
+    context: &str,
+) -> Result<()> {
+    let mut target_capacity = compressed
+        .len()
+        .saturating_mul(16)
+        .max(MIN_DECOMPRESS_CAPACITY)
+        .min(MAX_DECOMPRESSED_ENTRY_BYTES);
+
+    if out.capacity() < target_capacity {
+        out.reserve(target_capacity - out.capacity());
+    }
+
+    loop {
+        out.clear();
+        match decompressor.decompress_to_buffer(compressed, out) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let err_msg = e.to_string();
+                if !is_destination_too_small_msg(&err_msg) {
+                    return Err(DataFusionError::Execution(format!("{context}: {e}")));
+                }
+                let Some(next) = next_capacity(target_capacity) else {
+                    return Err(DataFusionError::Execution(format!(
+                        "{context}: destination buffer remains too small at {} bytes (compressed={} bytes)",
+                        target_capacity,
+                        compressed.len()
+                    )));
+                };
+                target_capacity = next;
+                if out.capacity() < target_capacity {
+                    out.reserve(target_capacity - out.capacity());
+                }
+            }
+        }
+    }
 }
 
 impl VepKvStore {
@@ -227,15 +285,18 @@ impl VepKvStore {
                                 "failed to create zstd decompressor: {e}"
                             ))
                         })?;
-                    let capacity = (compressed.len() * 16).max(4096);
-                    let decompressed =
-                        decompressor
-                            .decompress(&compressed, capacity)
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "zstd decompression failed (capacity={capacity}): {e}"
-                                ))
-                            })?;
+                    let mut decompressed = Vec::with_capacity(
+                        compressed
+                            .len()
+                            .saturating_mul(16)
+                            .max(MIN_DECOMPRESS_CAPACITY),
+                    );
+                    decompress_into_buffer_with_retry(
+                        &mut decompressor,
+                        &compressed,
+                        &mut decompressed,
+                        "zstd decompression failed",
+                    )?;
                     Ok(Some(decompressed))
                 } else {
                     Ok(Some(compressed.to_vec()))
@@ -282,18 +343,12 @@ impl VepKvStore {
             None => Ok(false),
             Some(compressed) => match decompressor {
                 Some(dec) => {
-                    buf.clear();
-                    if dec.decompress_to_buffer(&compressed, buf).is_err() {
-                        buf.clear();
-                        let fresh = dec
-                            .decompress(&compressed, compressed.len() * 20 + 4096)
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "zstd decompression failed: {e}"
-                                ))
-                            })?;
-                        *buf = fresh;
-                    }
+                    decompress_into_buffer_with_retry(
+                        dec,
+                        &compressed,
+                        buf,
+                        "zstd decompression failed",
+                    )?;
                     Ok(true)
                 }
                 None => {
@@ -537,5 +592,50 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_zstd_decompression_retries_when_destination_buffer_too_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+
+        let store = VepKvStore::create(dir.path(), schema).unwrap();
+
+        // Train a tiny dictionary to exercise dictionary-based decompression.
+        let mut samples: Vec<Vec<u8>> = Vec::new();
+        for i in 0..256u32 {
+            samples.push(format!("sample_{i}_allele_A/G").into_bytes());
+        }
+        let mut continuous = Vec::new();
+        let mut sizes = Vec::with_capacity(samples.len());
+        for s in &samples {
+            continuous.extend_from_slice(s);
+            sizes.push(s.len());
+        }
+        let dict = zstd::dict::from_continuous(&continuous, &sizes, 8 * 1024).unwrap();
+        store.store_dict(&dict).unwrap();
+
+        // Highly compressible payload: very large output relative to compressed bytes.
+        let huge = vec![b'X'; 512 * 1024];
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+        let compressed = compressor.compress(&huge).unwrap();
+
+        // Guard the regression condition: initial 16x guess is insufficient.
+        assert!(
+            huge.len() > compressed.len() * 16,
+            "test payload is not compressed enough to trigger resize retry"
+        );
+
+        store.put_position_entry("1", 42, 42, &compressed).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let reopened = VepKvStore::open(dir.path()).unwrap();
+        let chrom_code = crate::key_encoding::chrom_to_code("1");
+        let decompressed = reopened
+            .get_position_entry_decompressed(chrom_code, 42, 42)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decompressed, huge);
     }
 }
