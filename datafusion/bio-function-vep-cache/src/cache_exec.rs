@@ -449,33 +449,102 @@ impl KvLookupStream {
 
             let chrom_code = chrom_to_code(chrom);
 
-            // Try fetching the position entry (with zstd decompression if dict exists).
-            let mut found = self.store.get_position_entry_fast(
-                chrom_code,
-                norm_start_i64,
-                norm_end_i64,
-                decompressor.as_mut(),
-                &mut decompress_buf,
-            )?;
-
-            // SNP retry: if no match and start==end, try (start+1, start).
-            if !found && norm_start == norm_end {
+            // Probe a small set of coordinate encodings used by VEP-style caches:
+            // - exact normalized interval
+            // - indel point encodings at interval boundaries
+            // - insertion-style start>end form for point variants
+            let mut probe_keys: Vec<(i64, i64)> = Vec::with_capacity(4);
+            probe_keys.push((norm_start_i64, norm_end_i64));
+            if norm_start == norm_end {
                 let shifted = i64::from(norm_start.saturating_add(1));
-                found = self.store.get_position_entry_fast(
+                if !probe_keys.contains(&(shifted, norm_start_i64)) {
+                    probe_keys.push((shifted, norm_start_i64));
+                }
+            } else {
+                if !probe_keys.contains(&(norm_end_i64, norm_end_i64)) {
+                    probe_keys.push((norm_end_i64, norm_end_i64));
+                }
+                if !probe_keys.contains(&(norm_start_i64, norm_start_i64)) {
+                    probe_keys.push((norm_start_i64, norm_start_i64));
+                }
+                if !probe_keys.contains(&(norm_end_i64, norm_start_i64)) {
+                    probe_keys.push((norm_end_i64, norm_start_i64));
+                }
+            }
+            // Probe prefix-trimmed coordinates used by VEP allele normalization
+            // (e.g. REF=TTA ALT=T -> cache allele TA/- at shifted start).
+            for alt in vcf_alt.split(['|', ',']).filter(|a| !a.is_empty()) {
+                let shift_usize = common_prefix_len(vcf_ref, alt);
+                if shift_usize == 0 {
+                    continue;
+                }
+                // Apply shifted probes only to deletion-like events. For insertions,
+                // probing shifted point keys produces false positives.
+                let ref_remaining = vcf_ref.len().saturating_sub(shift_usize);
+                let alt_remaining = alt.len().saturating_sub(shift_usize);
+                if ref_remaining <= alt_remaining {
+                    continue;
+                }
+                let shift = shift_usize as i64;
+                if let Some(shifted_start) = norm_start_i64.checked_add(shift) {
+                    if !probe_keys.contains(&(shifted_start, norm_end_i64)) {
+                        probe_keys.push((shifted_start, norm_end_i64));
+                    }
+                    if !probe_keys.contains(&(shifted_start, shifted_start)) {
+                        probe_keys.push((shifted_start, shifted_start));
+                    }
+                    if !probe_keys.contains(&(norm_end_i64, shifted_start)) {
+                        probe_keys.push((norm_end_i64, shifted_start));
+                    }
+                }
+            }
+            // Deletions in tandem repeats may be right/left shifted in cache coordinates.
+            // Probe a bounded window of equivalent deletion intervals that still overlap
+            // the normalized VCF interval.
+            for alt in vcf_alt.split(['|', ',']).filter(|a| !a.is_empty()) {
+                let (ref_event_len, alt_event_len) = canonical_event_lengths(vcf_ref, alt);
+                if ref_event_len == 0 || alt_event_len != 0 {
+                    continue;
+                }
+                let del_len = ref_event_len as i64;
+                let max_shift = del_len.min(32);
+                for base_start in [norm_start_i64, norm_start_i64.saturating_sub(1)] {
+                    for shift in 0..=max_shift {
+                        let Some(candidate_start) = base_start.checked_add(shift) else {
+                            continue;
+                        };
+                        let Some(candidate_end) = candidate_start.checked_add(del_len - 1) else {
+                            continue;
+                        };
+                        // Mirror SQL interval semantics: only consider intervals overlapping
+                        // the normalized VCF interval.
+                        if candidate_start > norm_end_i64 || candidate_end < norm_start_i64 {
+                            continue;
+                        }
+                        if !probe_keys.contains(&(candidate_start, candidate_end)) {
+                            probe_keys.push((candidate_start, candidate_end));
+                        }
+                    }
+                }
+            }
+
+            let mut emitted_match = false;
+            for (probe_start, probe_end) in probe_keys {
+                let found = self.store.get_position_entry_fast(
                     chrom_code,
-                    shifted,
-                    norm_start_i64,
+                    probe_start,
+                    probe_end,
                     decompressor.as_mut(),
                     &mut decompress_buf,
                 )?;
-            }
+                if !found {
+                    continue;
+                }
 
-            if found {
                 let reader = PositionEntryReader::new(&decompress_buf)?;
 
                 // Match alleles within this position entry (reuse buffer).
                 matched_allele_rows.clear();
-
                 match self.match_mode {
                     KvMatchMode::Exact => {
                         for allele_idx in 0..reader.num_alleles() {
@@ -518,34 +587,32 @@ impl KvLookupStream {
                 }
 
                 if matched_allele_rows.is_empty() {
-                    // Position exists but no allele match -> null cache columns.
+                    continue;
+                }
+
+                emitted_match = true;
+                for _ in &matched_allele_rows {
                     vcf_indices.push(row as u32);
-                    for builder in &mut builders {
-                        append_null_to_builder(builder.as_mut())?;
-                    }
-                } else {
-                    // Append matched rows to builders.
-                    for _ in &matched_allele_rows {
-                        vcf_indices.push(row as u32);
-                    }
-                    for (col_out_idx, builder) in builders.iter_mut().enumerate() {
-                        let entry_idx = col_map[col_out_idx];
-                        if entry_idx == usize::MAX {
-                            // Column not found in entry -> nulls.
-                            for _ in &matched_allele_rows {
-                                append_null_to_builder(builder.as_mut())?;
-                            }
-                        } else {
-                            reader.append_column_values(
-                                entry_idx,
-                                &matched_allele_rows,
-                                builder.as_mut(),
-                            )?;
+                }
+                for (col_out_idx, builder) in builders.iter_mut().enumerate() {
+                    let entry_idx = col_map[col_out_idx];
+                    if entry_idx == usize::MAX {
+                        // Column not found in entry -> nulls.
+                        for _ in &matched_allele_rows {
+                            append_null_to_builder(builder.as_mut())?;
                         }
+                    } else {
+                        reader.append_column_values(
+                            entry_idx,
+                            &matched_allele_rows,
+                            builder.as_mut(),
+                        )?;
                     }
                 }
-            } else {
-                // Position not found -> null cache columns.
+            }
+
+            if !emitted_match {
+                // No coordinate probe matched any allele -> null cache columns.
                 vcf_indices.push(row as u32);
                 for builder in &mut builders {
                     append_null_to_builder(builder.as_mut())?;
@@ -752,6 +819,43 @@ fn normalize_vcf_coords(
         })?;
         Ok((shifted_start, end)) // 1-based closed -> 0-based half-open
     }
+}
+
+#[inline]
+fn common_prefix_len(left: &str, right: &str) -> usize {
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes().iter())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+#[inline]
+fn canonical_event_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
+    let ref_bytes = ref_allele.as_bytes();
+    let alt_bytes = alt_allele.as_bytes();
+
+    let mut ref_start = 0usize;
+    let mut alt_start = 0usize;
+    while ref_start < ref_bytes.len()
+        && alt_start < alt_bytes.len()
+        && ref_bytes[ref_start] == alt_bytes[alt_start]
+    {
+        ref_start += 1;
+        alt_start += 1;
+    }
+
+    let mut ref_end = ref_bytes.len();
+    let mut alt_end = alt_bytes.len();
+    while ref_end > ref_start
+        && alt_end > alt_start
+        && ref_bytes[ref_end - 1] == alt_bytes[alt_end - 1]
+    {
+        ref_end -= 1;
+        alt_end -= 1;
+    }
+
+    (ref_end - ref_start, alt_end - alt_start)
 }
 
 impl Stream for KvLookupStream {

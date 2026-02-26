@@ -19,16 +19,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray, StringViewArray};
-use datafusion::arrow::datatypes::{Int64Type, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Int64Type, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use log::{debug, info};
 
-use crate::key_encoding::encode_position_key;
+use crate::key_encoding::{chrom_to_code, encode_position_key};
 use crate::kv_store::VepKvStore;
-use crate::position_entry::serialize_position_entry;
+use crate::position_entry::{PositionEntryReader, make_builder, serialize_position_entry};
 
 /// Statistics returned after loading.
 #[derive(Debug, Clone)]
@@ -318,6 +318,13 @@ async fn stream_partition(
     } else {
         None
     };
+    let mut decompressor = if let Some(ref dict) = ctx.dict {
+        Some(zstd::bulk::Decompressor::with_dictionary(dict).map_err(|e| {
+            DataFusionError::Execution(format!("failed to create zstd decompressor: {e}"))
+        })?)
+    } else {
+        None
+    };
 
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
@@ -332,13 +339,22 @@ async fn stream_partition(
         let batch_clone = batch.clone();
 
         if let Some(mut comp) = compressor.take() {
-            let (comp_back, positions, bytes) = tokio::task::spawn_blocking(move || {
-                let result = flush_positions_compressed(&store, &schema, &batch_clone, &mut comp);
-                result.map(|(p, b)| (comp, p, b))
+            let mut dec = decompressor
+                .take()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "missing zstd decompressor while compression is enabled".to_string(),
+                    )
+                })?;
+            let (comp_back, dec_back, positions, bytes) = tokio::task::spawn_blocking(move || {
+                let result =
+                    flush_positions_compressed(&store, &schema, &batch_clone, &mut comp, &mut dec);
+                result.map(|(p, b)| (comp, dec, p, b))
             })
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))??;
             compressor = Some(comp_back);
+            decompressor = Some(dec_back);
             stats.total_positions += positions;
             stats.total_bytes += bytes;
         } else {
@@ -396,7 +412,14 @@ fn flush_positions_uncompressed(
     let mut total_bytes = 0u64;
 
     for ((chrom, start, end), rows) in &groups {
-        let value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+        let mut value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+        if let Some(existing) = store.get_position_entry_decompressed(
+            chrom_to_code(chrom),
+            *start,
+            *end,
+        )? {
+            value = merge_position_entries(&existing, &value, schema)?;
+        }
         let key = encode_position_key(chrom, *start, *end);
         total_bytes += value.len() as u64;
         entries.push((key, value));
@@ -414,6 +437,7 @@ fn flush_positions_compressed(
     schema: &SchemaRef,
     batch: &RecordBatch,
     compressor: &mut zstd::bulk::Compressor<'_>,
+    decompressor: &mut zstd::bulk::Decompressor<'_>,
 ) -> Result<(u64, u64)> {
     let chrom_col_idx = schema.index_of("chrom")?;
     let start_col_idx = schema.index_of("start")?;
@@ -443,7 +467,16 @@ fn flush_positions_compressed(
     let mut total_bytes = 0u64;
 
     for ((chrom, start, end), rows) in &groups {
-        let raw_value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+        let chrom_code = chrom_to_code(chrom);
+        let mut raw_value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+        if let Some(existing_compressed) = store.get_position_entry(chrom_code, *start, *end)? {
+            let existing_raw = decompressor
+                .decompress(&existing_compressed, existing_compressed.len() * 20 + 4096)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("zstd decompression failed: {e}"))
+                })?;
+            raw_value = merge_position_entries(&existing_raw, &raw_value, schema)?;
+        }
         let compressed = compressor
             .compress(&raw_value)
             .map_err(|e| DataFusionError::Execution(format!("zstd compression failed: {e}")))?;
@@ -456,6 +489,75 @@ fn flush_positions_compressed(
     store.batch_insert_position_entries(&entries)?;
 
     Ok((num_positions, total_bytes))
+}
+
+/// Merge two serialized entries for the same genomic position.
+///
+/// This preserves all allele rows when the same `(chrom,start,end)` appears in
+/// multiple input batches/partitions.
+fn merge_position_entries(existing: &[u8], incoming: &[u8], schema: &SchemaRef) -> Result<Vec<u8>> {
+    let existing_reader = PositionEntryReader::new(existing)?;
+    let incoming_reader = PositionEntryReader::new(incoming)?;
+
+    if existing_reader.num_cols() != incoming_reader.num_cols() {
+        return Err(DataFusionError::Execution(format!(
+            "cannot merge position entries with different column counts: existing={} incoming={}",
+            existing_reader.num_cols(),
+            incoming_reader.num_cols()
+        )));
+    }
+
+    let chrom_col_idx = schema.index_of("chrom")?;
+    let start_col_idx = schema.index_of("start")?;
+    let end_col_idx = schema.index_of("end")?;
+    let stored_col_indices: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+        .collect();
+
+    if stored_col_indices.len() != existing_reader.num_cols() {
+        return Err(DataFusionError::Execution(format!(
+            "schema/entry mismatch while merging position entries: schema stored cols={} entry cols={}",
+            stored_col_indices.len(),
+            existing_reader.num_cols()
+        )));
+    }
+
+    let total_rows = existing_reader.num_alleles() + incoming_reader.num_alleles();
+    let existing_rows: Vec<usize> = (0..existing_reader.num_alleles()).collect();
+    let incoming_rows: Vec<usize> = (0..incoming_reader.num_alleles()).collect();
+
+    let mut merged_columns = Vec::with_capacity(stored_col_indices.len());
+    let mut merged_fields = Vec::with_capacity(stored_col_indices.len());
+    for (entry_col_idx, &schema_col_idx) in stored_col_indices.iter().enumerate() {
+        let src_field = schema.field(schema_col_idx);
+        let normalized_dt = match src_field.data_type() {
+            DataType::Utf8View | DataType::LargeUtf8 => DataType::Utf8,
+            other => other.clone(),
+        };
+        let field = datafusion::arrow::datatypes::Field::new(
+            src_field.name(),
+            normalized_dt,
+            src_field.is_nullable(),
+        );
+        let mut builder = make_builder(field.data_type(), total_rows)?;
+        existing_reader.append_column_values(entry_col_idx, &existing_rows, builder.as_mut())?;
+        incoming_reader.append_column_values(entry_col_idx, &incoming_rows, builder.as_mut())?;
+        merged_columns.push(builder.finish());
+        merged_fields.push(field);
+    }
+
+    let merged_schema = Arc::new(Schema::new(merged_fields));
+    let merged_batch = RecordBatch::try_new(merged_schema.clone(), merged_columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    let allele_col_idx = merged_schema.index_of("allele_string").map_err(|_| {
+        DataFusionError::Execution(
+            "cannot merge position entries: allele_string column missing".to_string(),
+        )
+    })?;
+    let col_indices: Vec<usize> = (0..merged_schema.fields().len()).collect();
+    let rows: Vec<usize> = (0..total_rows).collect();
+    serialize_position_entry(&rows, &merged_batch, &col_indices, allele_col_idx)
 }
 
 /// Train a zstd dictionary from serialized position entry samples.

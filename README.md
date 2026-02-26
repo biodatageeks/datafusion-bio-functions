@@ -51,6 +51,106 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **Match Modes**: `exact`, `exact_or_colocated_ids`, `exact_or_vep_existing` (indel-aware relaxed matching)
 - **Session Configuration**: Tunable parameters via SQL `SET` statements under the `bio.annotation` namespace
 
+#### Cache Backend Selection (`lookup_variants`)
+
+`lookup_variants(vcf_table, cache_table, ...)` supports both backends through the same API:
+
+- **Parquet or other scan-capable table providers**: uses interval-join execution.
+- **Fjall `KvCacheTableProvider`**: dispatches to direct KV lookup execution.
+
+Both cache backends must expose the same required cache column names:
+`chrom`, `start`, `end`, `variation_name`, `allele_string`.
+
+#### `lookup_variants` API
+
+```sql
+lookup_variants(
+  vcf_table,
+  cache_table
+  [, columns]
+  [, prune_nulls]
+  [, match_mode]
+)
+```
+
+- `vcf_table`: registered VCF input table name.
+- `cache_table`: registered annotation cache table/provider name (Parquet or Fjall).
+- `columns` (optional): comma-separated cache columns to project. Default: all cache columns except `chrom,start,end` and `source_*`.
+- `prune_nulls` (optional, default `false`): remove cache-side rows where all selected annotation columns are null before join/lookup.
+- `match_mode` (optional, default `exact`):
+  - `exact`
+  - `exact_or_colocated_ids`
+  - `exact_or_vep_existing`
+
+Example:
+
+```sql
+SELECT *
+FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,clin_sig', false, 'exact');
+```
+
+**Parquet-backed cache table:**
+
+```rust
+use datafusion::prelude::SessionContext;
+use datafusion_bio_function_vep::register_vep_functions;
+
+let ctx = SessionContext::new();
+register_vep_functions(&ctx);
+
+ctx.register_parquet("var_cache", "/path/to/variation_cache.parquet", Default::default()).await?;
+let df = ctx
+    .sql("SELECT * FROM lookup_variants('vcf', 'var_cache', 'variation_name,clin_sig')")
+    .await?;
+```
+
+**Fjall-backed cache provider:**
+
+```rust
+use std::sync::Arc;
+use datafusion::prelude::SessionContext;
+use datafusion_bio_function_vep::register_vep_functions;
+use datafusion_bio_function_vep_cache::KvCacheTableProvider;
+
+let ctx = SessionContext::new();
+register_vep_functions(&ctx);
+
+let kv_cache = KvCacheTableProvider::open("/path/to/variation_fjall")?;
+ctx.register_table("var_cache", Arc::new(kv_cache))?;
+let df = ctx
+    .sql("SELECT * FROM lookup_variants('vcf', 'var_cache', 'variation_name,clin_sig')")
+    .await?;
+```
+
+#### Create Fjall Cache
+
+Create a full Fjall cache from a Parquet variation cache:
+
+```bash
+cargo run -p datafusion-bio-function-vep-cache --example load_cache_full --release -- \
+  /path/to/115_GRCh38_variants.parquet \
+  /path/to/variation_fjall \
+  8
+```
+
+- Third argument is thread count (`target_partitions` + loader parallelism).
+- Output path is recreated if it already exists.
+
+Create a filtered cache (single chromosome) and optionally tune compression:
+
+```bash
+cargo run -p datafusion-bio-function-vep-cache --example load_cache --release -- \
+  /path/to/115_GRCh38_variants.parquet \
+  /path/to/variation_fjall_chr22 \
+  22 \
+  8 \
+  9 \
+  256
+```
+
+- Args: `<parquet_path> <fjall_output_path> [chrom_filter] [partitions] [zstd_level] [dict_size_kb]`
+- Defaults for `load_cache`: `zstd_level=3`, `dict_size_kb=112`.
+
 #### Annotation Configuration
 
 Register `AnnotationConfig` on the session to enable SQL-level parameter overrides. If not registered, compiled defaults apply.

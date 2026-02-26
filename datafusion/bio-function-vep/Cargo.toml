@@ -26,4 +26,5 @@ name = "vcf_batch_stats"
 required-features = []
 
 [features]
+default = ["kv-cache"]
 kv-cache = ["dep:datafusion-bio-function-vep-cache"]
