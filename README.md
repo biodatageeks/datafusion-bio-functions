@@ -78,9 +78,9 @@ lookup_variants(
 - `columns` (optional): comma-separated cache columns to project. Default: all cache columns except `chrom,start,end` and `source_*`.
 - `prune_nulls` (optional, default `false`): remove cache-side rows where all selected annotation columns are null before join/lookup.
 - `match_mode` (optional, default `exact`):
-  - `exact`
-  - `exact_or_colocated_ids`
-  - `exact_or_vep_existing`
+  - `exact`: interval overlap + exact allele matching only.
+  - `exact_or_colocated_ids`: runs `exact`; for unmatched rows, fills fallback-capable columns (`variation_name`, `somatic`) from co-located overlap IDs.
+  - `exact_or_vep_existing`: runs `exact`; for unmatched rows, fills fallback-capable columns from indel-aware relaxed allele-compatible co-located rows (prefers `rs*` IDs for `variation_name`).
 
 Example:
 
