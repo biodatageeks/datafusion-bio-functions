@@ -12,8 +12,6 @@ edition.workspace = true
 datafusion.workspace = true
 datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
 datafusion-bio-function-vep-cache = { path = "../bio-function-vep-cache", optional = true }
-vortex-datafusion = { version = "0.56.0", optional = true }
-vortex = { version = "0.56.0", features = ["tokio"], optional = true }
 tokio.workspace = true
 futures.workspace = true
 log.workspace = true
@@ -30,4 +28,3 @@ required-features = []
 [features]
 default = ["kv-cache"]
 kv-cache = ["dep:datafusion-bio-function-vep-cache"]
-vortex-cache = ["dep:vortex-datafusion", "dep:vortex"]

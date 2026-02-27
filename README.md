@@ -15,7 +15,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 |-------|-------------|--------|
 | **[datafusion-bio-function-pileup](datafusion/bio-function-pileup)** | Depth-of-coverage (pileup) computation from BAM alignments | ✅ |
 | **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, nearest-neighbor, overlap, merge, cluster, complement, and subtract operations | ✅ |
-| **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via `lookup_variants()` with Parquet/Fjall/Vortex cache backends | ✅ |
+| **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via `lookup_variants()` table function with KV cache backend | ✅ |
 | **[datafusion-bio-function-vep-cache](datafusion/bio-function-vep-cache)** | fjall KV store for VEP variation cache (zstd dictionary compression) | ✅ |
 
 ## Features
@@ -44,21 +44,21 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **Multiple Algorithms**: Coitrees (default), IntervalTree, ArrayIntervalTree, Lapper, SuperIntervals — selectable via `SET bio.interval_join_algorithm`
 - **Transparent Optimization**: Hash/nested-loop joins with range conditions are automatically replaced with interval joins
 
-### VEP Annotation (variant lookup with pluggable cache backends)
+### VEP Annotation (variant lookup with KV cache)
 
 - **`lookup_variants()` Table Function**: SQL-based variant annotation against a pre-built VEP cache
-- **Cache Backends**: scan-capable tables (Parquet, Vortex) and a dedicated fjall KV backend
+- **KV Cache Backend**: fjall LSM-tree store with zstd dictionary compression for compact on-disk storage
 - **Match Modes**: `exact`, `exact_or_colocated_ids`, `exact_or_vep_existing` (indel-aware relaxed matching)
 - **Session Configuration**: Tunable parameters via SQL `SET` statements under the `bio.annotation` namespace
 
 #### Cache Backend Selection (`lookup_variants`)
 
-`lookup_variants(vcf_table, cache_table, ...)` supports multiple backends through the same API:
+`lookup_variants(vcf_table, cache_table, ...)` supports both backends through the same API:
 
-- **Parquet / Vortex / other scan-capable table providers**: uses interval-join execution.
+- **Parquet or other scan-capable table providers**: uses interval-join execution.
 - **Fjall `KvCacheTableProvider`**: dispatches to direct KV lookup execution.
 
-All cache backends must expose the same required cache column names:
+Both cache backends must expose the same required cache column names:
 `chrom`, `start`, `end`, `variation_name`, `allele_string`.
 
 #### `lookup_variants` API
@@ -74,7 +74,7 @@ lookup_variants(
 ```
 
 - `vcf_table`: registered VCF input table name.
-- `cache_table`: registered annotation cache table/provider name (Parquet, Vortex, Fjall, etc.).
+- `cache_table`: registered annotation cache table/provider name (Parquet or Fjall).
 - `columns` (optional): comma-separated cache columns to project. Default: all cache columns except `chrom,start,end` and `source_*`.
 - `prune_nulls` (optional, default `false`): remove cache-side rows where all selected annotation columns are null before join/lookup.
 - `match_mode` (optional, default `exact`):
@@ -104,21 +104,6 @@ let df = ctx
     .await?;
 ```
 
-**Vortex-backed cache table (`vortex-cache` feature):**
-
-```rust
-use datafusion::prelude::SessionContext;
-use datafusion_bio_function_vep::{register_vep_functions, register_vortex_cache};
-
-let ctx = SessionContext::new();
-register_vep_functions(&ctx);
-
-register_vortex_cache(&ctx, "var_cache", "/path/to/variation_cache_vortex").await?;
-let df = ctx
-    .sql("SELECT * FROM lookup_variants('vcf', 'var_cache', 'variation_name,clin_sig')")
-    .await?;
-```
-
 **Fjall-backed cache provider:**
 
 ```rust
@@ -137,37 +122,9 @@ let df = ctx
     .await?;
 ```
 
-#### Create Cache APIs
+#### Create Fjall Cache
 
-This workspace supports two cache-creation paths:
-- Fjall KV cache (`datafusion-bio-function-vep-cache`) via programmatic `CacheLoader`.
-- Vortex scan cache (`datafusion-bio-function-vep`, `vortex-cache` feature) via Parquet -> Vortex export.
-
-Use `CacheLoader` when you want to build a Fjall KV cache programmatically:
-
-```rust
-use datafusion::prelude::SessionContext;
-use datafusion_bio_function_vep_cache::CacheLoader;
-
-let ctx = SessionContext::new();
-ctx.register_parquet("vep_source", "/path/to/115_GRCh38_variants.parquet", Default::default()).await?;
-
-let stats = CacheLoader::new("vep_source", "/path/to/variation_fjall")
-    .with_parallelism(8)
-    .with_zstd_level(9)
-    .with_dict_size_kb(256)
-    .load(&ctx)
-    .await?;
-
-println!(
-    "loaded variants={} positions={} bytes={} elapsed={:.1}s",
-    stats.total_variants, stats.total_positions, stats.total_bytes, stats.elapsed_secs
-);
-```
-
-#### Create Fjall Cache (CLI)
-
-Create a full Fjall cache from a Parquet variation cache with the bundled CLI example:
+Create a full Fjall cache from a Parquet variation cache:
 
 ```bash
 cargo run -p datafusion-bio-function-vep-cache --example load_cache_full --release -- \
@@ -193,28 +150,6 @@ cargo run -p datafusion-bio-function-vep-cache --example load_cache --release --
 
 - Args: `<parquet_path> <fjall_output_path> [chrom_filter] [partitions] [zstd_level] [dict_size_kb]`
 - Defaults for `load_cache`: `zstd_level=3`, `dict_size_kb=112`.
-
-#### Create Vortex Cache (CLI)
-
-Create a Vortex cache directory from a Parquet variation cache:
-
-```bash
-cargo run -p datafusion-bio-function-vep --features vortex-cache --example tmp_export_parquet_to_vortex --release -- \
-  /path/to/115_GRCh38_variants.parquet \
-  /path/to/115_GRCh38_variants.vortex \
-  16 \
-  9 \
-  16384 \
-  16384 \
-  8
-```
-
-- Args: `<parquet_path> <vortex_output_dir> [target_partitions] [zstd_level] [values_per_page] [row_block_size] [max_parallel_writers] [limit_rows]`.
-- Defaults: `target_partitions=8`, `zstd_level=9`, `values_per_page=16384`, `row_block_size=16384`, `max_parallel_writers=target_partitions`.
-- For sparse, mostly-null annotation columns, start with higher compression pages:
-  `zstd_level=12 values_per_page=32768 row_block_size=32768`.
-- Output directory is recreated before writing.
-- If a run is interrupted (or disk fills), remove the partial output and rerun.
 
 #### Annotation Configuration
 

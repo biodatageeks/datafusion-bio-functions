@@ -168,8 +168,6 @@ impl TableProvider for LookupProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // KV cache dispatch: if the cache table is a KvCacheTableProvider,
         // use the window-based KvLookupExec instead of SQL/IntervalJoinExec.
-        // Otherwise use the generic interval-join path (Parquet, Vortex,
-        // or any other scan-capable table provider).
         #[cfg(feature = "kv-cache")]
         {
             use crate::allele::{allele_matches, allele_matches_relaxed};
@@ -255,7 +253,9 @@ impl TableProvider for LookupProvider {
                 let needs_utf8_cast = output_field.data_type() == &DataType::Utf8;
                 let project_cache_expr = |raw_expr: &str| -> String {
                     if needs_utf8_cast {
-                        format!("CAST(({raw_expr}) AS VARCHAR) AS `cache_{cache_col_name}`")
+                        format!(
+                            "CAST(({raw_expr}) AS VARCHAR) AS `cache_{cache_col_name}`"
+                        )
                     } else {
                         format!("{raw_expr} AS `cache_{cache_col_name}`")
                     }
@@ -279,8 +279,9 @@ impl TableProvider for LookupProvider {
                         projected_output_exprs.push(project_cache_expr("b.`somatic`"));
                     }
                 } else {
-                    projected_output_exprs
-                        .push(project_cache_expr(&format!("b.`{cache_col_name}`")));
+                    projected_output_exprs.push(project_cache_expr(&format!(
+                        "b.`{cache_col_name}`"
+                    )));
                 }
             }
         }
@@ -509,17 +510,11 @@ AND a.`alt` = f.`alt`";
 #[cfg(test)]
 mod tests {
     use crate::create_vep_session;
-    #[cfg(feature = "vortex-cache")]
-    use crate::register_vortex_cache;
     use datafusion::arrow::array::{
         Array, ArrayRef, Int8Array, Int64Array, RecordBatch, StringArray, StringViewArray,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
-    #[cfg(feature = "vortex-cache")]
-    use datafusion::datasource::file_format::format_as_file_type;
-    #[cfg(feature = "vortex-cache")]
-    use datafusion::logical_expr::LogicalPlanBuilder;
     use datafusion::physical_plan::displayable;
     #[cfg(feature = "kv-cache")]
     use datafusion_bio_function_vep_cache::{
@@ -527,10 +522,8 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::sync::Arc;
-    #[cfg(any(feature = "kv-cache", feature = "vortex-cache"))]
+    #[cfg(feature = "kv-cache")]
     use std::time::{SystemTime, UNIX_EPOCH};
-    #[cfg(feature = "vortex-cache")]
-    use vortex_datafusion::VortexFormatFactory;
 
     /// Extract string values from an array that may be Utf8, Utf8View, or LargeUtf8.
     fn string_values(col: &ArrayRef) -> Vec<Option<String>> {
@@ -645,7 +638,7 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).unwrap()
     }
 
-    #[cfg(any(feature = "kv-cache", feature = "vortex-cache"))]
+    #[cfg(feature = "kv-cache")]
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -683,80 +676,11 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "vortex-cache")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_lookup_uses_interval_join_for_vortex_cache_provider() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_data", Arc::new(vcf_table()))
-            .unwrap();
-        ctx.register_table("cache_source", Arc::new(cache_table()))
-            .unwrap();
-
-        let cache_dir = unique_temp_dir("vep-vortex-dispatch");
-        let cache_dir_str = cache_dir.to_string_lossy().into_owned();
-        let cache_df = ctx.table("cache_source").await.unwrap();
-        let copy_plan = LogicalPlanBuilder::copy_to(
-            cache_df.logical_plan().clone(),
-            cache_dir_str.clone(),
-            format_as_file_type(Arc::new(VortexFormatFactory::new())),
-            Default::default(),
-            vec![],
-        )
-        .unwrap()
-        .build()
-        .unwrap();
-        ctx.execute_logical_plan(copy_plan)
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-
-        register_vortex_cache(&ctx, "var_cache", &cache_dir_str)
-            .await
-            .unwrap();
-
-        let df = ctx
-            .sql(
-                "SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,clin_sig')",
-            )
-            .await
-            .unwrap();
-        let plan = df.clone().create_physical_plan().await.unwrap();
-        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-        assert!(
-            plan_str.contains("IntervalJoinExec"),
-            "Expected IntervalJoinExec for Vortex cache provider, got:\n{plan_str}"
-        );
-        assert!(
-            !plan_str.contains("KvLookupExec"),
-            "Did not expect KvLookupExec for Vortex cache provider, got:\n{plan_str}"
-        );
-
-        let batches = df.collect().await.unwrap();
-        let mut annotations = Vec::new();
-        for batch in &batches {
-            let col = batch.column_by_name("cache_variation_name").unwrap();
-            for value in string_values(col) {
-                if let Some(v) = value {
-                    annotations.push(v);
-                }
-            }
-        }
-        assert!(
-            annotations.contains(&"rs123".to_string()),
-            "Expected annotation from Vortex cache, got: {annotations:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&cache_dir);
-    }
-
     #[cfg(feature = "kv-cache")]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_lookup_dispatches_to_kv_exec_for_fjall_cache_provider() {
         let ctx = create_vep_session();
-        ctx.register_table("vcf_data", Arc::new(vcf_table()))
-            .unwrap();
+        ctx.register_table("vcf_data", Arc::new(vcf_table())).unwrap();
 
         let cache_schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -789,13 +713,10 @@ mod tests {
         drop(store);
 
         let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
-        ctx.register_table("var_cache", Arc::new(kv_provider))
-            .unwrap();
+        ctx.register_table("var_cache", Arc::new(kv_provider)).unwrap();
 
         let df = ctx
-            .sql(
-                "SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,clin_sig')",
-            )
+            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,clin_sig')")
             .await
             .unwrap();
 
@@ -883,8 +804,7 @@ mod tests {
         drop(store);
 
         let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
-        ctx.register_table("var_cache", Arc::new(kv_provider))
-            .unwrap();
+        ctx.register_table("var_cache", Arc::new(kv_provider)).unwrap();
 
         let batches = ctx
             .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string')")
@@ -972,8 +892,7 @@ mod tests {
         drop(store);
 
         let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
-        ctx.register_table("var_cache", Arc::new(kv_provider))
-            .unwrap();
+        ctx.register_table("var_cache", Arc::new(kv_provider)).unwrap();
 
         let batches = ctx
             .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string')")
@@ -995,9 +914,7 @@ mod tests {
         }
 
         assert!(
-            names
-                .iter()
-                .any(|v| v.as_deref() == Some("rs_repeat_shift")),
+            names.iter().any(|v| v.as_deref() == Some("rs_repeat_shift")),
             "Expected rs_repeat_shift from KV lookup, got: {names:?}"
         );
         assert!(
@@ -1053,11 +970,7 @@ mod tests {
             let clin_sig_vals = string_values(clin_sig_col);
             for i in 0..batch.num_rows() {
                 chroms.push(chrom_vals[i].clone().unwrap_or_else(|| "NULL".to_string()));
-                clin_sigs.push(
-                    clin_sig_vals[i]
-                        .clone()
-                        .unwrap_or_else(|| "NULL".to_string()),
-                );
+                clin_sigs.push(clin_sig_vals[i].clone().unwrap_or_else(|| "NULL".to_string()));
             }
         }
 
