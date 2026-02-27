@@ -4,6 +4,7 @@
 //! - `lookup_variants()` table function for known variant lookup via interval join
 //! - `match_allele()` scalar UDF for allele matching
 //! - `vep_allele()` scalar UDF for VCF→VEP allele conversion
+//! - `register_vortex_cache()` helper for Vortex-backed cache table registration
 
 pub mod allele;
 pub mod config;
@@ -11,10 +12,16 @@ pub mod coordinate;
 pub mod lookup_provider;
 pub mod schema_contract;
 pub mod table_function;
+#[cfg(feature = "vortex-cache")]
+pub mod vortex_cache;
 
 pub use config::AnnotationConfig;
 #[cfg(feature = "kv-cache")]
 pub use datafusion_bio_function_vep_cache as kv_cache;
+#[cfg(feature = "vortex-cache")]
+pub use vortex_cache::register_vortex_cache;
+#[cfg(feature = "vortex-cache")]
+pub use vortex_datafusion as vortex;
 
 use std::sync::Arc;
 

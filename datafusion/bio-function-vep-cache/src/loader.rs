@@ -57,6 +57,8 @@ struct StreamContext {
 }
 
 /// Builder for loading a Parquet-based VEP cache into fjall.
+///
+/// This is the primary programmatic API for creating a Fjall cache.
 pub struct CacheLoader {
     source_table: String,
     target_path: String,
