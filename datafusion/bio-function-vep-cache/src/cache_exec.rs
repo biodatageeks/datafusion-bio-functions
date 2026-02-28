@@ -53,6 +53,10 @@ pub struct KvLookupExec {
     vcf_has_chr: bool,
     vcf_zero_based: bool,
     cache_zero_based: bool,
+    /// When true, probe multiple coordinate encodings (insertion-style,
+    /// shifted deletions, tandem repeat window). When false, probe only
+    /// the exact normalized interval.
+    extended_probes: bool,
     properties: PlanProperties,
     /// Cache schema column positions for requested cache output columns.
     output_col_positions: Vec<usize>,
@@ -70,6 +74,7 @@ impl KvLookupExec {
         vcf_has_chr: bool,
         vcf_zero_based: bool,
         cache_zero_based: bool,
+        extended_probes: bool,
     ) -> Result<Self> {
         let input_schema = input.schema();
         let cache_schema = store.schema();
@@ -108,6 +113,7 @@ impl KvLookupExec {
             vcf_has_chr,
             vcf_zero_based,
             cache_zero_based,
+            extended_probes,
             properties,
             output_col_positions,
         })
@@ -170,6 +176,7 @@ impl ExecutionPlan for KvLookupExec {
             self.vcf_has_chr,
             self.vcf_zero_based,
             self.cache_zero_based,
+            self.extended_probes,
         )?))
     }
 
@@ -191,6 +198,7 @@ impl ExecutionPlan for KvLookupExec {
             self.vcf_has_chr,
             self.vcf_zero_based,
             self.cache_zero_based,
+            self.extended_probes,
             self.output_col_positions.clone(),
         )))
     }
@@ -208,6 +216,7 @@ struct KvLookupStream {
     vcf_has_chr: bool,
     vcf_zero_based: bool,
     cache_zero_based: bool,
+    extended_probes: bool,
     output_col_positions: Vec<usize>,
     profile_enabled: bool,
     profile_emitted: bool,
@@ -320,6 +329,7 @@ impl KvLookupStream {
         vcf_has_chr: bool,
         vcf_zero_based: bool,
         cache_zero_based: bool,
+        extended_probes: bool,
         output_col_positions: Vec<usize>,
     ) -> Self {
         Self {
@@ -333,6 +343,7 @@ impl KvLookupStream {
             vcf_has_chr,
             vcf_zero_based,
             cache_zero_based,
+            extended_probes,
             output_col_positions,
             profile_enabled: std::env::var_os("VEP_KV_PROFILE").is_some(),
             profile_emitted: false,
@@ -455,74 +466,78 @@ impl KvLookupStream {
             // - insertion-style start>end form for point variants
             let mut probe_keys: Vec<(i64, i64)> = Vec::with_capacity(4);
             probe_keys.push((norm_start_i64, norm_end_i64));
-            if norm_start == norm_end {
-                let shifted = i64::from(norm_start.saturating_add(1));
-                if !probe_keys.contains(&(shifted, norm_start_i64)) {
-                    probe_keys.push((shifted, norm_start_i64));
-                }
-            } else {
-                if !probe_keys.contains(&(norm_end_i64, norm_end_i64)) {
-                    probe_keys.push((norm_end_i64, norm_end_i64));
-                }
-                if !probe_keys.contains(&(norm_start_i64, norm_start_i64)) {
-                    probe_keys.push((norm_start_i64, norm_start_i64));
-                }
-                if !probe_keys.contains(&(norm_end_i64, norm_start_i64)) {
-                    probe_keys.push((norm_end_i64, norm_start_i64));
-                }
-            }
-            // Probe prefix-trimmed coordinates used by VEP allele normalization
-            // (e.g. REF=TTA ALT=T -> cache allele TA/- at shifted start).
-            for alt in vcf_alt.split(['|', ',']).filter(|a| !a.is_empty()) {
-                let shift_usize = common_prefix_len(vcf_ref, alt);
-                if shift_usize == 0 {
-                    continue;
-                }
-                // Apply shifted probes only to deletion-like events. For insertions,
-                // probing shifted point keys produces false positives.
-                let ref_remaining = vcf_ref.len().saturating_sub(shift_usize);
-                let alt_remaining = alt.len().saturating_sub(shift_usize);
-                if ref_remaining <= alt_remaining {
-                    continue;
-                }
-                let shift = shift_usize as i64;
-                if let Some(shifted_start) = norm_start_i64.checked_add(shift) {
-                    if !probe_keys.contains(&(shifted_start, norm_end_i64)) {
-                        probe_keys.push((shifted_start, norm_end_i64));
+            if self.extended_probes {
+                if norm_start == norm_end {
+                    let shifted = i64::from(norm_start.saturating_add(1));
+                    if !probe_keys.contains(&(shifted, norm_start_i64)) {
+                        probe_keys.push((shifted, norm_start_i64));
                     }
-                    if !probe_keys.contains(&(shifted_start, shifted_start)) {
-                        probe_keys.push((shifted_start, shifted_start));
+                } else {
+                    if !probe_keys.contains(&(norm_end_i64, norm_end_i64)) {
+                        probe_keys.push((norm_end_i64, norm_end_i64));
                     }
-                    if !probe_keys.contains(&(norm_end_i64, shifted_start)) {
-                        probe_keys.push((norm_end_i64, shifted_start));
+                    if !probe_keys.contains(&(norm_start_i64, norm_start_i64)) {
+                        probe_keys.push((norm_start_i64, norm_start_i64));
+                    }
+                    if !probe_keys.contains(&(norm_end_i64, norm_start_i64)) {
+                        probe_keys.push((norm_end_i64, norm_start_i64));
                     }
                 }
-            }
-            // Deletions in tandem repeats may be right/left shifted in cache coordinates.
-            // Probe a bounded window of equivalent deletion intervals that still overlap
-            // the normalized VCF interval.
-            for alt in vcf_alt.split(['|', ',']).filter(|a| !a.is_empty()) {
-                let (ref_event_len, alt_event_len) = canonical_event_lengths(vcf_ref, alt);
-                if ref_event_len == 0 || alt_event_len != 0 {
-                    continue;
-                }
-                let del_len = ref_event_len as i64;
-                let max_shift = del_len.min(32);
-                for base_start in [norm_start_i64, norm_start_i64.saturating_sub(1)] {
-                    for shift in 0..=max_shift {
-                        let Some(candidate_start) = base_start.checked_add(shift) else {
-                            continue;
-                        };
-                        let Some(candidate_end) = candidate_start.checked_add(del_len - 1) else {
-                            continue;
-                        };
-                        // Mirror SQL interval semantics: only consider intervals overlapping
-                        // the normalized VCF interval.
-                        if candidate_start > norm_end_i64 || candidate_end < norm_start_i64 {
-                            continue;
+                // Probe prefix-trimmed coordinates used by VEP allele normalization
+                // (e.g. REF=TTA ALT=T -> cache allele TA/- at shifted start).
+                for alt in vcf_alt.split(['|', ',']).filter(|a| !a.is_empty()) {
+                    let shift_usize = common_prefix_len(vcf_ref, alt);
+                    if shift_usize == 0 {
+                        continue;
+                    }
+                    // Apply shifted probes only to deletion-like events. For insertions,
+                    // probing shifted point keys produces false positives.
+                    let ref_remaining = vcf_ref.len().saturating_sub(shift_usize);
+                    let alt_remaining = alt.len().saturating_sub(shift_usize);
+                    if ref_remaining <= alt_remaining {
+                        continue;
+                    }
+                    let shift = shift_usize as i64;
+                    if let Some(shifted_start) = norm_start_i64.checked_add(shift) {
+                        if !probe_keys.contains(&(shifted_start, norm_end_i64)) {
+                            probe_keys.push((shifted_start, norm_end_i64));
                         }
-                        if !probe_keys.contains(&(candidate_start, candidate_end)) {
-                            probe_keys.push((candidate_start, candidate_end));
+                        if !probe_keys.contains(&(shifted_start, shifted_start)) {
+                            probe_keys.push((shifted_start, shifted_start));
+                        }
+                        if !probe_keys.contains(&(norm_end_i64, shifted_start)) {
+                            probe_keys.push((norm_end_i64, shifted_start));
+                        }
+                    }
+                }
+                // Deletions in tandem repeats may be right/left shifted in cache coordinates.
+                // Probe a bounded window of equivalent deletion intervals that still overlap
+                // the normalized VCF interval.
+                for alt in vcf_alt.split(['|', ',']).filter(|a| !a.is_empty()) {
+                    let (ref_event_len, alt_event_len) = canonical_event_lengths(vcf_ref, alt);
+                    if ref_event_len == 0 || alt_event_len != 0 {
+                        continue;
+                    }
+                    let del_len = ref_event_len as i64;
+                    let max_shift = del_len.min(32);
+                    for base_start in [norm_start_i64, norm_start_i64.saturating_sub(1)] {
+                        for shift in 0..=max_shift {
+                            let Some(candidate_start) = base_start.checked_add(shift) else {
+                                continue;
+                            };
+                            let Some(candidate_end) =
+                                candidate_start.checked_add(del_len - 1)
+                            else {
+                                continue;
+                            };
+                            // Mirror SQL interval semantics: only consider intervals overlapping
+                            // the normalized VCF interval.
+                            if candidate_start > norm_end_i64 || candidate_end < norm_start_i64 {
+                                continue;
+                            }
+                            if !probe_keys.contains(&(candidate_start, candidate_end)) {
+                                probe_keys.push((candidate_start, candidate_end));
+                            }
                         }
                     }
                 }

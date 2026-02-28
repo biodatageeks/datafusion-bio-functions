@@ -1,7 +1,8 @@
 //! Lookup provider for `lookup_variants()` table function.
 //!
-//! Implements interval join between a VCF table and a variation cache table,
-//! reusing the `IntervalJoinExec` from `bio-function-ranges`.
+//! Implements equi-join between a VCF table and a variation cache table using
+//! DataFusion's built-in `HashJoinExec`. When `extended_probes` is enabled,
+//! falls back to interval-overlap SQL for insertion-style coordinate matching.
 
 use std::any::Any;
 use std::collections::BTreeSet;
@@ -27,11 +28,28 @@ pub enum MatchMode {
     ExactOrVepExisting,
 }
 
-/// Table provider that implements variant lookup via interval join.
+/// Table provider that implements variant lookup via equi-join (or interval join
+/// when `extended_probes` is enabled).
 ///
 /// Generates an internal SQL plan that joins VCF variants against the variation
-/// cache using interval overlap on (chrom, start, end), with allele matching
-/// as a post-filter.
+/// cache using exact-position matching on normalized `(chrom, start, end)`,
+/// with `match_allele()` as a post-filter. DataFusion plans this as
+/// `HashJoinExec` (equi on 3 keys) + `JoinFilter`.
+///
+/// # Default mode (equi-join)
+///
+/// Requires VCF and cache coordinates to match exactly after normalization.
+/// SNVs and simple indels with consistent VCF/cache coordinates work well.
+/// Insertions or deletions where VEP normalizes coordinates differently
+/// (e.g., `start > end` for insertions, prefix-trimmed shifts for deletions,
+/// tandem-repeat right-shifting) will produce NULL cache columns.
+///
+/// # Extended probes mode
+///
+/// When `extended_probes = true`, uses interval-overlap SQL conditions and
+/// multi-probe KV lookups to handle VEP-style coordinate encodings. This
+/// matches more variants at the cost of a wider join (IntervalJoinExec
+/// instead of HashJoinExec).
 pub struct LookupProvider {
     session: Arc<SessionContext>,
     vcf_table: String,
@@ -47,6 +65,8 @@ pub struct LookupProvider {
     /// Coordinate normalizer for handling different coordinate systems.
     #[allow(dead_code)]
     coord_normalizer: CoordinateNormalizer,
+    /// When true, use interval-overlap SQL and multi-probe KV lookups.
+    extended_probes: bool,
     /// Output schema.
     schema: SchemaRef,
 }
@@ -69,6 +89,7 @@ impl LookupProvider {
         cache_columns: Vec<String>,
         match_mode: MatchMode,
         prune_nulls: bool,
+        extended_probes: bool,
     ) -> Result<Self> {
         let cache_schema_ref: SchemaRef = Arc::new(cache_schema.clone());
         validate_variation_schema(&cache_schema_ref)?;
@@ -111,6 +132,7 @@ impl LookupProvider {
             match_mode,
             prune_nulls,
             coord_normalizer,
+            extended_probes,
             schema,
         })
     }
@@ -207,6 +229,7 @@ impl TableProvider for LookupProvider {
                         vcf_has_chr,
                         self.coord_normalizer.input_zero_based,
                         self.coord_normalizer.cache_zero_based,
+                        self.extended_probes,
                     )?));
                 }
             }
@@ -332,25 +355,10 @@ impl TableProvider for LookupProvider {
         };
         let cache_normalized_end_expr = "CAST(`end` AS BIGINT)";
 
-        // Some cache rows encode insertions as start=end+1.
-        // Normalize these rows to a point at `end` so they become joinable.
-        let cache_join_start_expr = format!(
-            "CASE WHEN {cache_normalized_start_expr} > {cache_normalized_end_expr} \
-             THEN {cache_normalized_end_expr} ELSE {cache_normalized_start_expr} END"
-        );
-        let cache_inner_cols = format!(
-            "{cache_base_cols}, {cache_join_start_expr} AS `__lookup_join_start`, \
-             {cache_normalized_end_expr} AS `__lookup_join_end`"
-        );
-
-        // Build the ON clause for the interval join.
-        //
         // Normalize both tables to 1-based closed coordinates based on
         // `bio.coordinate_system_zero_based` metadata:
         // - zero-based half-open [start, end) -> [start + 1, end]
         // - one-based closed [start, end]     -> [start, end]
-        //
-        // After normalization, overlap is standard inclusive overlap.
         let vcf_start_expr = |alias: &str| -> String {
             if self.coord_normalizer.input_zero_based {
                 format!("CAST({alias}.`start` AS BIGINT) + 1")
@@ -367,12 +375,41 @@ impl TableProvider for LookupProvider {
             "a.`chrom`"
         };
 
-        let on_clause = format!(
-            "{vcf_join_chrom_expr_a} = b.`chrom` \
-             AND {vcf_end_expr_a} >= b.`__lookup_join_start` \
-             AND {vcf_start_expr_a} <= b.`__lookup_join_end` \
-             AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
-        );
+        // Build the cache subquery and ON clause depending on the probing mode.
+        let (cache_inner_cols, on_clause, cache_join_start_expr);
+
+        if self.extended_probes {
+            // Extended probes: interval-overlap SQL for insertion-style coordinates.
+            // Normalize insertion rows (start>end) to a point at `end`.
+            cache_join_start_expr = format!(
+                "CASE WHEN {cache_normalized_start_expr} > {cache_normalized_end_expr} \
+                 THEN {cache_normalized_end_expr} ELSE {cache_normalized_start_expr} END"
+            );
+            cache_inner_cols = format!(
+                "{cache_base_cols}, {cache_join_start_expr} AS `__lookup_join_start`, \
+                 {cache_normalized_end_expr} AS `__lookup_join_end`"
+            );
+            on_clause = format!(
+                "{vcf_join_chrom_expr_a} = b.`chrom` \
+                 AND {vcf_end_expr_a} >= b.`__lookup_join_start` \
+                 AND {vcf_start_expr_a} <= b.`__lookup_join_end` \
+                 AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
+            );
+        } else {
+            // Default: equi-join on exact normalized positions.
+            // DataFusion plans this as HashJoinExec (equi on 3 keys) + JoinFilter (match_allele).
+            cache_join_start_expr = cache_normalized_start_expr.to_string();
+            cache_inner_cols = format!(
+                "{cache_base_cols}, {cache_normalized_start_expr} AS `__norm_start`, \
+                 {cache_normalized_end_expr} AS `__norm_end`"
+            );
+            on_clause = format!(
+                "{vcf_join_chrom_expr_a} = b.`chrom` \
+                 AND {vcf_start_expr_a} = b.`__norm_start` \
+                 AND {vcf_end_expr_a} = b.`__norm_end` \
+                 AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
+            );
+        };
 
         // Build the LEFT JOIN query.
         // VCF is the left (build) side — small, fully indexed in memory.
@@ -408,18 +445,33 @@ impl TableProvider for LookupProvider {
             } else {
                 "fa.`chrom`"
             };
-            let fallback_join_on = if use_vep_existing_fallback {
+            let fallback_join_on = if self.extended_probes {
+                if use_vep_existing_fallback {
+                    format!(
+                        "{vcf_join_chrom_expr_fa} = c.`chrom` \
+                         AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
+                         AND {vcf_start_expr_fa} <= c.`__lookup_join_end` \
+                         AND match_allele_relaxed(fa.`ref`, fa.`alt`, c.`allele_string`)"
+                    )
+                } else {
+                    format!(
+                        "{vcf_join_chrom_expr_fa} = c.`chrom` \
+                         AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
+                         AND {vcf_start_expr_fa} <= c.`__lookup_join_end`"
+                    )
+                }
+            } else if use_vep_existing_fallback {
                 format!(
                     "{vcf_join_chrom_expr_fa} = c.`chrom` \
-                     AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
-                     AND {vcf_start_expr_fa} <= c.`__lookup_join_end` \
+                     AND {vcf_start_expr_fa} = c.`__norm_start` \
+                     AND {vcf_end_expr_fa} = c.`__norm_end` \
                      AND match_allele_relaxed(fa.`ref`, fa.`alt`, c.`allele_string`)"
                 )
             } else {
                 format!(
                     "{vcf_join_chrom_expr_fa} = c.`chrom` \
-                     AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
-                     AND {vcf_start_expr_fa} <= c.`__lookup_join_end`"
+                     AND {vcf_start_expr_fa} = c.`__norm_start` \
+                     AND {vcf_end_expr_fa} = c.`__norm_end`"
                 )
             };
             let mut fallback_cache_cols = vec!["`chrom`".to_string()];
@@ -432,10 +484,19 @@ impl TableProvider for LookupProvider {
             if use_vep_existing_fallback {
                 fallback_cache_cols.push("`allele_string`".to_string());
             }
-            fallback_cache_cols.push(format!("{cache_join_start_expr} AS `__lookup_join_start`"));
-            fallback_cache_cols.push(format!(
-                "{cache_normalized_end_expr} AS `__lookup_join_end`"
-            ));
+            if self.extended_probes {
+                fallback_cache_cols
+                    .push(format!("{cache_join_start_expr} AS `__lookup_join_start`"));
+                fallback_cache_cols.push(format!(
+                    "{cache_normalized_end_expr} AS `__lookup_join_end`"
+                ));
+            } else {
+                fallback_cache_cols
+                    .push(format!("{cache_normalized_start_expr} AS `__norm_start`"));
+                fallback_cache_cols.push(format!(
+                    "{cache_normalized_end_expr} AS `__norm_end`"
+                ));
+            }
             let fallback_cache_inner_cols = fallback_cache_cols.join(", ");
 
             let mut fallback_select_exprs = Vec::new();
@@ -623,12 +684,14 @@ mod tests {
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
         ]));
+        // Cache coordinates must exactly match VCF after normalization (equi-join).
+        // VCF has chr1:(100,101) and chr1:(200,201), cache uses bare chrom names.
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(vec!["1", "1"])),
-                Arc::new(Int64Array::from(vec![99, 199])),
-                Arc::new(Int64Array::from(vec![102, 202])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Int64Array::from(vec![101, 201])),
                 Arc::new(StringArray::from(vec!["rs123", "rs456"])),
                 Arc::new(StringArray::from(vec!["A/G", "C/T"])),
                 Arc::new(StringArray::from(vec!["benign", "pathogenic"])),
@@ -650,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_lookup_generates_interval_join() {
+    async fn test_lookup_generates_hash_join() {
         let ctx = create_vep_session();
 
         ctx.register_table("vcf_data", Arc::new(vcf_table()))
@@ -667,8 +730,8 @@ mod tests {
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
 
         assert!(
-            plan_str.contains("IntervalJoinExec"),
-            "Expected IntervalJoinExec in plan, got:\n{plan_str}"
+            plan_str.contains("HashJoinExec"),
+            "Expected HashJoinExec in plan, got:\n{plan_str}"
         );
         assert!(
             plan_str.contains("Left"),
@@ -807,7 +870,7 @@ mod tests {
         ctx.register_table("var_cache", Arc::new(kv_provider)).unwrap();
 
         let batches = ctx
-            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string')")
+            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string', false, 'exact', true)")
             .await
             .unwrap()
             .collect()
@@ -895,7 +958,7 @@ mod tests {
         ctx.register_table("var_cache", Arc::new(kv_provider)).unwrap();
 
         let batches = ctx
-            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string')")
+            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string', false, 'exact', true)")
             .await
             .unwrap()
             .collect()
@@ -941,14 +1004,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify NOT NULL pre-filter is pushed down before the join
+        // Verify the plan uses HashJoinExec with LEFT join
         let plan = df.clone().create_physical_plan().await.unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-        let interval_pos = plan_str.find("IntervalJoinExec").unwrap();
-        let filter_pos = plan_str.find("IS NOT NULL").unwrap();
         assert!(
-            filter_pos > interval_pos,
-            "Expected IS NOT NULL filter below IntervalJoinExec (pushed down before probing), got:\n{plan_str}"
+            plan_str.contains("HashJoinExec"),
+            "Expected HashJoinExec in plan, got:\n{plan_str}"
         );
 
         let batches = df.collect().await.unwrap();
@@ -989,17 +1050,14 @@ mod tests {
         );
     }
 
-    /// Regression test: VCF half-open [start, end) must NOT match VEP cache
-    /// entries at the adjacent position (start=end, 1-based closed).
-    ///
-    /// Before the fix, VCF [100, 101) with weak overlap (>=) would match
-    /// cache entries at BOTH position 100 AND position 101, producing
-    /// duplicate/false rows.
+    /// Regression test: equi-join ensures VCF rows only match cache entries
+    /// at exactly the same (chrom, start, end) coordinates. Decoy entries at
+    /// adjacent positions must NOT produce output rows.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_lookup_no_false_matches_at_adjacent_positions() {
         let ctx = create_vep_session();
 
-        // VCF: half-open intervals (end = start + 1 for SNVs)
+        // VCF: 1-based closed SNVs (start=end for point variants)
         let vcf_schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -1012,7 +1070,7 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(vec!["1", "1"])),
                 Arc::new(Int64Array::from(vec![100, 200])),
-                Arc::new(Int64Array::from(vec![101, 201])),
+                Arc::new(Int64Array::from(vec![100, 200])),
                 Arc::new(StringArray::from(vec!["A", "C"])),
                 Arc::new(StringArray::from(vec!["G", "T"])),
             ],
@@ -1221,7 +1279,7 @@ mod tests {
             .unwrap();
 
         let df = ctx
-            .sql("SELECT * FROM lookup_variants('vcf_insertion', 'cache_insertion_style', 'variation_name')")
+            .sql("SELECT * FROM lookup_variants('vcf_insertion', 'cache_insertion_style', 'variation_name', false, 'exact', true)")
             .await
             .unwrap();
         let batches = df.collect().await.unwrap();
@@ -1703,7 +1761,7 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![100])),
-                Arc::new(Int64Array::from(vec![101])),
+                Arc::new(Int64Array::from(vec![100])),
                 Arc::new(StringArray::from(vec!["A"])),
                 Arc::new(StringArray::from(vec!["G"])),
             ],

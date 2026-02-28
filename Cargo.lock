@@ -1162,6 +1162,7 @@ dependencies = [
  "datafusion-bio-format-vcf",
  "datafusion-bio-function-ranges",
  "datafusion-bio-function-vep-cache",
+ "env_logger",
  "futures",
  "log",
  "tokio",

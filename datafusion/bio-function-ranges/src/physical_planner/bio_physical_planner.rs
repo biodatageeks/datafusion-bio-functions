@@ -41,7 +41,6 @@ impl PhysicalOptimizerRule for IntervalJoinPhysicalOptimizationRule {
         let algorithm = bio_config.interval_join_algorithm;
 
         let low_memory = bio_config.interval_join_low_memory;
-        let partitioned_left_join = bio_config.interval_join_partitioned_left_join;
 
         plan.transform_up(|plan| {
             match plan.as_any().downcast_ref::<HashJoinExec>() {
@@ -54,7 +53,6 @@ impl PhysicalOptimizerRule for IntervalJoinPhysicalOptimizationRule {
                             intervals,
                             algorithm,
                             low_memory,
-                            partitioned_left_join,
                         )?;
                         Ok(Transformed::yes(new_plan))
                     } else {
@@ -107,19 +105,7 @@ fn from_hash_join(
     intervals: ColIntervals,
     algorithm: Algorithm,
     low_memory: bool,
-    partitioned_left_join: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    // IntervalJoinExec does not support PartitionMode::Auto at execution time.
-    // Keep existing behavior by defaulting Auto -> CollectLeft unless the
-    // caller explicitly requests partitioned LEFT joins.
-    let mut partition_mode = *join_exec.partition_mode();
-    if partition_mode == PartitionMode::Auto {
-        partition_mode = PartitionMode::CollectLeft;
-    }
-    if partitioned_left_join && join_exec.join_type == datafusion::common::JoinType::Left {
-        partition_mode = PartitionMode::Partitioned;
-    }
-
     let new_plan = IntervalJoinExec::try_new(
         join_exec.left().clone(),
         join_exec.right().clone(),
@@ -128,7 +114,7 @@ fn from_hash_join(
         intervals,
         &join_exec.join_type,
         join_exec.projection.clone(),
-        partition_mode,
+        *join_exec.partition_mode(),
         join_exec.null_equality() == NullEquality::NullEqualsNull,
         algorithm,
         low_memory,
@@ -149,7 +135,7 @@ fn from_nested_loop_join(
         join_exec.filter().cloned(),
         intervals,
         join_exec.join_type(),
-        join_exec.projection().cloned(),
+        None,
         PartitionMode::CollectLeft,
         true,
         algorithm,

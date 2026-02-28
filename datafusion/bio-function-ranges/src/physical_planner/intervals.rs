@@ -186,33 +186,32 @@ impl IntervalBuilder {
     }
 }
 
-/// Recursively flatten a tree of `AND` expressions into leaf predicates.
-fn flatten_and(expr: &Arc<dyn PhysicalExpr>, out: &mut Vec<Arc<dyn PhysicalExpr>>) {
-    if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
-        if matches!(binary.op(), Operator::And) {
-            flatten_and(&binary.left(), out);
-            flatten_and(&binary.right(), out);
-            return;
-        }
-    }
-    out.push(expr.clone());
-}
-
 fn try_parse(filter: &JoinFilter) -> Result<ColIntervals, String> {
     let mut inner = IntervalBuilder::empty();
     let indices = filter.column_indices();
 
-    // Collect all leaf predicates from the (possibly nested) AND tree.
-    let mut leaves = Vec::new();
-    flatten_and(filter.expression(), &mut leaves);
+    let expr = filter.expression();
+    let binary = expr
+        .as_any()
+        .downcast_ref::<BinaryExpr>()
+        .ok_or("filter expression is not a BinaryExpr")?;
 
-    // Try each leaf as a range condition; skip non-range predicates
-    // (e.g. UDF calls like match_allele).
-    for leaf in &leaves {
-        if let Some(binary) = leaf.as_any().downcast_ref::<BinaryExpr>() {
-            // Silently ignore predicates that are not range comparisons.
-            let _ = parse_condition(binary, indices, &mut inner);
-        }
+    if matches!(binary.op(), Operator::And) {
+        let left = binary
+            .left()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .ok_or("left side of AND is not a BinaryExpr")?;
+        let right = binary
+            .right()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .ok_or("right side of AND is not a BinaryExpr")?;
+
+        parse_condition(left, indices, &mut inner)?;
+        parse_condition(right, indices, &mut inner)?;
+    } else {
+        return Err("filter expression is not an AND".to_string());
     }
 
     inner.finish()
@@ -221,8 +220,9 @@ fn try_parse(filter: &JoinFilter) -> Result<ColIntervals, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::DataFusionError;
     use datafusion::common::tree_node::TreeNodeRecursion;
-    use datafusion::error::{DataFusionError, Result};
+    use datafusion::error::Result;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec};
     use datafusion::prelude::SessionContext;
@@ -514,73 +514,6 @@ mod tests {
             )
         })
         .map(|_| filter.expect("filter not found"))
-    }
-
-    #[tokio::test]
-    async fn test_range_conditions_with_extra_predicate() -> Result<()> {
-        // Use a fresh session with tables that include an extra column
-        // and a non-equality predicate that DataFusion keeps in the filter.
-        let ctx = SessionContext::new();
-        ctx.sql(
-            "CREATE TABLE t1 \
-             (contig TEXT, l_start INT, l_end INT, score INT) \
-             AS VALUES ('a', 1, 2, 10), ('b', 3, 4, 20)",
-        )
-        .await?;
-        ctx.sql(
-            "CREATE TABLE t2 \
-             (contig TEXT, name TEXT, r_end INT, r_start INT, min_score INT) \
-             AS VALUES ('a','x', 1, 2, 5), ('b','x', 3, 4, 15)",
-        )
-        .await?;
-
-        // Extra non-range predicate: t1.score > t2.min_score
-        let query = "SELECT * FROM t1 JOIN t2 \
-                     ON t1.contig = t2.contig \
-                     AND t2.r_end >= t1.l_start \
-                     AND t1.l_end >= t2.r_start \
-                     AND t1.score > t2.min_score";
-        let ds = ctx.sql(query).await?;
-        let plan = ds.create_physical_plan().await?;
-        let filter = find_join_filter(&plan)?;
-        let intervals = try_parse(filter).map_err(DataFusionError::Internal)?;
-
-        let l_start = Column::new("l_start", 1);
-        let l_end = Column::new("l_end", 2);
-
-        assert_eq!(to_column(intervals.left_interval.start), l_start);
-        assert_eq!(to_column(intervals.left_interval.end), l_end);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_only_non_range_predicates_returns_error() -> Result<()> {
-        // Use a non-equality predicate so DataFusion keeps it in the
-        // join filter rather than extracting it as an equi-condition.
-        let ctx = SessionContext::new();
-        ctx.sql(
-            "CREATE TABLE s1 (contig TEXT, val INT) \
-             AS VALUES ('a', 1)",
-        )
-        .await?;
-        ctx.sql(
-            "CREATE TABLE s2 (contig TEXT, val INT) \
-             AS VALUES ('a', 2)",
-        )
-        .await?;
-
-        let query = "SELECT * FROM s1 JOIN s2 \
-                     ON s1.contig = s2.contig \
-                     AND s1.val != s2.val";
-        let ds = ctx.sql(query).await?;
-        let plan = ds.create_physical_plan().await?;
-        let filter = find_join_filter(&plan)?;
-        let result = try_parse(filter);
-
-        assert!(result.is_err());
-
-        Ok(())
     }
 
     fn to_column(expr: Arc<dyn PhysicalExpr>) -> Column {

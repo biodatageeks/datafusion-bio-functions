@@ -1,7 +1,7 @@
 //! VEP (Variant Effect Predictor) annotation functions for Apache DataFusion.
 //!
 //! Provides:
-//! - `lookup_variants()` table function for known variant lookup via interval join
+//! - `lookup_variants()` table function for known variant lookup via equi-join
 //! - `match_allele()` scalar UDF for allele matching
 //! - `vep_allele()` scalar UDF for VCF→VEP allele conversion
 
@@ -37,7 +37,7 @@ pub(crate) fn create_vep_session() -> SessionContext {
 /// - `match_allele(ref, alt, allele_string)` — scalar UDF
 /// - `match_allele_relaxed(ref, alt, allele_string)` — scalar UDF
 /// - `vep_allele(ref, alt)` — scalar UDF
-/// - `lookup_variants(vcf_table, cache_table [, columns [, prune]])` — table function
+/// - `lookup_variants(vcf_table, cache_table [, columns [, prune [, match_mode [, extended_probes]]]])` — table function
 pub fn register_vep_functions(ctx: &SessionContext) {
     ctx.register_udf(match_allele_udf());
     ctx.register_udf(match_allele_relaxed_udf());

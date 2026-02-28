@@ -20,9 +20,14 @@ async-trait = "0.1.88"
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "45562f3beb230c23008b19bfe6c172bd1c5923fa" }
+env_logger = "0.11"
 
 [[example]]
 name = "vcf_batch_stats"
+required-features = []
+
+[[example]]
+name = "lookup_parquet_bench"
 required-features = []
 
 [features]
