@@ -32,7 +32,8 @@ use crate::kv_cache::KvCacheTableProvider;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     ExonFeature, MirnaFeature, MotifFeature, RegulatoryFeature, StructuralFeature, SvEventKind,
-    SvFeatureKind, TranscriptConsequenceEngine, TranscriptFeature, VariantInput,
+    SvFeatureKind, TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature,
+    VariantInput,
 };
 
 /// Table provider implementing `annotate_vep(...)`.
@@ -375,6 +376,61 @@ impl AnnotateProvider {
         Ok(out)
     }
 
+    async fn load_translations(&self, table: &str) -> Result<Vec<TranslationFeature>> {
+        let query = format!("SELECT * FROM `{table}`");
+        let batches = self.session.sql(&query).await?.collect().await?;
+        let mut out = Vec::new();
+
+        for batch in &batches {
+            let schema = batch.schema();
+            let tx_idx = schema
+                .index_of("transcript_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "annotate_vep(): translation table '{table}' is missing required column transcript_id (or stable_id)"
+                    ))
+                })?;
+            let cds_len_idx = schema
+                .index_of("cds_len")
+                .or_else(|_| schema.index_of("cds_length"))
+                .ok();
+            let protein_len_idx = schema.index_of("protein_len").ok();
+            let translation_seq_idx = schema.index_of("translation_seq").ok();
+            let cds_seq_idx = schema
+                .index_of("cds_sequence")
+                .or_else(|_| schema.index_of("cds_seq"))
+                .or_else(|_| schema.index_of("coding_sequence"))
+                .ok();
+
+            for row in 0..batch.num_rows() {
+                let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                    continue;
+                };
+                let cds_len = cds_len_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .and_then(|v| usize::try_from(v).ok());
+                let protein_len = protein_len_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .and_then(|v| usize::try_from(v).ok());
+                let translation_seq =
+                    translation_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let cds_sequence =
+                    cds_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+
+                out.push(TranslationFeature {
+                    transcript_id,
+                    cds_len,
+                    protein_len,
+                    translation_seq,
+                    cds_sequence,
+                });
+            }
+        }
+
+        Ok(out)
+    }
+
     async fn load_regulatory_features(&self, table: &str) -> Result<Vec<RegulatoryFeature>> {
         let query = format!("SELECT * FROM `{table}`");
         let batches = self.session.sql(&query).await?.collect().await?;
@@ -615,6 +671,7 @@ impl AnnotateProvider {
         requested_columns: &[&str],
         transcripts_table: Option<&str>,
         exons_table: Option<&str>,
+        translations_table: Option<&str>,
         regulatory_table: Option<&str>,
         motif_table: Option<&str>,
         mirna_table: Option<&str>,
@@ -642,6 +699,11 @@ impl AnnotateProvider {
         };
         let exons = if let Some(table) = exons_table {
             self.load_exons(table).await?
+        } else {
+            Vec::new()
+        };
+        let translations = if let Some(table) = translations_table {
+            self.load_translations(table).await?
         } else {
             Vec::new()
         };
@@ -674,6 +736,7 @@ impl AnnotateProvider {
                 &engine,
                 &transcripts,
                 &exons,
+                &translations,
                 &regulatory,
                 &motifs,
                 &mirnas,
@@ -706,6 +769,7 @@ impl AnnotateProvider {
         engine: &TranscriptConsequenceEngine,
         transcripts: &[TranscriptFeature],
         exons: &[ExonFeature],
+        translations: &[TranslationFeature],
         regulatory: &[RegulatoryFeature],
         motifs: &[MotifFeature],
         mirnas: &[MirnaFeature],
@@ -783,6 +847,7 @@ impl AnnotateProvider {
                 &variant,
                 transcripts,
                 exons,
+                translations,
                 regulatory,
                 motifs,
                 mirnas,
@@ -999,6 +1064,9 @@ impl TableProvider for AnnotateProvider {
         );
 
         let transcript_pair = self.resolve_transcript_context_tables(&cache_table).await?;
+        let translations_table = self
+            .resolve_optional_context_table("translations_table", &cache_table, "translations")
+            .await?;
         let regulatory_table = self
             .resolve_optional_context_table("regulatory_table", &cache_table, "regulatory_features")
             .await?;
@@ -1013,6 +1081,7 @@ impl TableProvider for AnnotateProvider {
             .await?;
 
         if transcript_pair.is_some()
+            || translations_table.is_some()
             || regulatory_table.is_some()
             || motif_table.is_some()
             || mirna_table.is_some()
@@ -1030,6 +1099,7 @@ impl TableProvider for AnnotateProvider {
                     &requested_columns,
                     tx_table,
                     ex_table,
+                    translations_table.as_deref(),
                     regulatory_table.as_deref(),
                     motif_table.as_deref(),
                     mirna_table.as_deref(),

@@ -34,6 +34,15 @@ pub struct ExonFeature {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationFeature {
+    pub transcript_id: String,
+    pub cds_len: Option<usize>,
+    pub protein_len: Option<usize>,
+    pub translation_seq: Option<String>,
+    pub cds_sequence: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegulatoryFeature {
     pub feature_id: String,
     pub chrom: String,
@@ -115,7 +124,7 @@ impl TranscriptConsequenceEngine {
         transcripts: &[TranscriptFeature],
         exons: &[ExonFeature],
     ) -> Vec<TranscriptConsequence> {
-        self.evaluate_variant_with_context(variant, transcripts, exons, &[], &[], &[], &[])
+        self.evaluate_variant_with_context(variant, transcripts, exons, &[], &[], &[], &[], &[])
     }
 
     pub fn evaluate_variant_with_context(
@@ -123,6 +132,7 @@ impl TranscriptConsequenceEngine {
         variant: &VariantInput,
         transcripts: &[TranscriptFeature],
         exons: &[ExonFeature],
+        translations: &[TranslationFeature],
         regulatory: &[RegulatoryFeature],
         motifs: &[MotifFeature],
         mirnas: &[MirnaFeature],
@@ -138,6 +148,10 @@ impl TranscriptConsequenceEngine {
         for tx_exons in exons_by_tx.values_mut() {
             tx_exons.sort_by_key(|e| e.exon_number);
         }
+        let translation_by_tx: HashMap<&str, &TranslationFeature> = translations
+            .iter()
+            .map(|t| (t.transcript_id.as_str(), t))
+            .collect();
 
         let mut out = Vec::new();
         let variant_chrom = normalize_chrom(&variant.chrom);
@@ -150,9 +164,11 @@ impl TranscriptConsequenceEngine {
                 .get(tx.transcript_id.as_str())
                 .cloned()
                 .unwrap_or_default();
+            let tx_translation = translation_by_tx.get(tx.transcript_id.as_str()).copied();
 
             if overlaps(variant.start, variant.end, tx.start, tx.end) {
-                let terms = self.evaluate_transcript_overlap(variant, tx, &tx_exons);
+                let terms =
+                    self.evaluate_transcript_overlap(variant, tx, &tx_exons, tx_translation);
                 if !terms.is_empty() {
                     out.push(TranscriptConsequence {
                         transcript_id: Some(tx.transcript_id.clone()),
@@ -194,6 +210,7 @@ impl TranscriptConsequenceEngine {
         variant: &VariantInput,
         tx: &TranscriptFeature,
         tx_exons: &[&ExonFeature],
+        tx_translation: Option<&TranslationFeature>,
     ) -> Vec<SoTerm> {
         let mut terms = BTreeSet::new();
 
@@ -215,7 +232,7 @@ impl TranscriptConsequenceEngine {
         } else if is_non_coding_biotype(&tx.biotype) {
             terms.insert(SoTerm::NonCodingTranscriptExonVariant);
         } else if self.overlaps_cds(variant, tx) {
-            self.add_coding_terms(&mut terms, variant, tx);
+            self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
         } else if let Some(utr_term) = self.utr_term(variant, tx) {
             terms.insert(utr_term);
         } else {
@@ -419,6 +436,8 @@ impl TranscriptConsequenceEngine {
         terms: &mut BTreeSet<SoTerm>,
         variant: &VariantInput,
         tx: &TranscriptFeature,
+        tx_exons: &[&ExonFeature],
+        tx_translation: Option<&TranslationFeature>,
     ) {
         let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
 
@@ -440,12 +459,21 @@ impl TranscriptConsequenceEngine {
 
         terms.insert(SoTerm::CodingSequenceVariant);
 
-        if cds_is_incomplete(tx) && self.overlaps_stop_codon(variant, tx) {
+        if cds_is_incomplete(tx, tx_translation) && self.overlaps_stop_codon(variant, tx) {
             terms.insert(SoTerm::IncompleteTerminalCodonVariant);
         }
 
         if ref_len == 0 {
             return;
+        }
+
+        if ref_len == alt_len {
+            if let Some(classification) =
+                classify_coding_substitution(tx, tx_exons, tx_translation, variant)
+            {
+                apply_codon_classification(terms, classification);
+                return;
+            }
         }
 
         if self.overlaps_start_codon(variant, tx) {
@@ -738,7 +766,12 @@ fn allele_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
     (ref_len, alt_len)
 }
 
-fn cds_is_incomplete(tx: &TranscriptFeature) -> bool {
+fn cds_is_incomplete(tx: &TranscriptFeature, tx_translation: Option<&TranslationFeature>) -> bool {
+    if let Some(translation) = tx_translation {
+        if let Some(cds_len) = translation.cds_len {
+            return cds_len % 3 != 0;
+        }
+    }
     let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
         return false;
     };
@@ -758,6 +791,255 @@ fn is_stop_codon(allele: &str) -> bool {
         allele.to_ascii_uppercase().as_str(),
         "TAA" | "TAG" | "TGA" | "*"
     )
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CodingClassification {
+    synonymous: bool,
+    missense: bool,
+    stop_gained: bool,
+    stop_lost: bool,
+    stop_retained: bool,
+    start_lost: bool,
+    start_retained: bool,
+}
+
+fn apply_codon_classification(terms: &mut BTreeSet<SoTerm>, c: CodingClassification) {
+    if c.start_lost {
+        terms.insert(SoTerm::StartLost);
+    }
+    if c.start_retained {
+        terms.insert(SoTerm::StartRetainedVariant);
+    }
+    if c.stop_gained {
+        terms.insert(SoTerm::StopGained);
+    }
+    if c.stop_lost {
+        terms.insert(SoTerm::StopLost);
+    }
+    if c.stop_retained {
+        terms.insert(SoTerm::StopRetainedVariant);
+    }
+    if c.synonymous {
+        terms.insert(SoTerm::SynonymousVariant);
+    }
+    if c.missense {
+        terms.insert(SoTerm::MissenseVariant);
+        terms.insert(SoTerm::ProteinAlteringVariant);
+    }
+}
+
+fn classify_coding_substitution(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+) -> Option<CodingClassification> {
+    let translation = tx_translation?;
+    let cds_seq = translation.cds_sequence.as_deref()?.to_ascii_uppercase();
+    let ref_len = variant.ref_allele.len();
+    let alt_len = variant.alt_allele.len();
+    if ref_len == 0 || ref_len != alt_len {
+        return None;
+    }
+
+    let genomic_positions = genomic_range(variant.start, variant.end)?;
+    if genomic_positions.len() != ref_len {
+        return None;
+    }
+
+    let mut cds_indices = Vec::with_capacity(genomic_positions.len());
+    for pos in &genomic_positions {
+        cds_indices.push(genomic_to_cds_index(tx, tx_exons, *pos)?);
+    }
+    cds_indices.sort_unstable();
+    if cds_indices
+        .windows(2)
+        .any(|w| w[1] != w[0].saturating_add(1))
+    {
+        return None;
+    }
+    let start_idx = *cds_indices.first()?;
+    let end_idx = *cds_indices.last()?;
+    if end_idx >= cds_seq.len() {
+        return None;
+    }
+
+    let ref_tx = if tx.strand >= 0 {
+        variant.ref_allele.to_ascii_uppercase()
+    } else {
+        reverse_complement(&variant.ref_allele)?.to_ascii_uppercase()
+    };
+    let alt_tx = if tx.strand >= 0 {
+        variant.alt_allele.to_ascii_uppercase()
+    } else {
+        reverse_complement(&variant.alt_allele)?.to_ascii_uppercase()
+    };
+
+    let ref_seq_slice = &cds_seq[start_idx..=end_idx];
+    if ref_seq_slice != ref_tx {
+        return None;
+    }
+
+    let mut mutated = cds_seq.as_bytes().to_vec();
+    let alt_bytes = alt_tx.as_bytes();
+    if alt_bytes.len() != ref_len {
+        return None;
+    }
+    for (i, b) in alt_bytes.iter().enumerate() {
+        mutated[start_idx + i] = *b;
+    }
+
+    let codon_start = start_idx / 3;
+    let codon_end = end_idx / 3;
+    let mut class = CodingClassification::default();
+    let mut aa_changed = false;
+    for codon_idx in codon_start..=codon_end {
+        let codon_base = codon_idx * 3;
+        if codon_base + 2 >= mutated.len() {
+            continue;
+        }
+        let old_codon = &cds_seq[codon_base..codon_base + 3];
+        let new_codon = std::str::from_utf8(&mutated[codon_base..codon_base + 3]).ok()?;
+        let old_aa = translate_codon(old_codon)?;
+        let new_aa = translate_codon(new_codon)?;
+
+        if codon_idx == 0 && old_aa == 'M' {
+            if new_aa == 'M' {
+                class.start_retained = true;
+            } else {
+                class.start_lost = true;
+            }
+        }
+        if old_aa == '*' && new_aa == '*' {
+            class.stop_retained = true;
+        } else if old_aa == '*' && new_aa != '*' {
+            class.stop_lost = true;
+        } else if old_aa != '*' && new_aa == '*' {
+            class.stop_gained = true;
+        }
+        if old_aa != new_aa {
+            aa_changed = true;
+        }
+    }
+
+    if aa_changed
+        && !class.stop_gained
+        && !class.stop_lost
+        && !class.start_lost
+        && !class.stop_retained
+    {
+        class.missense = true;
+    } else if !aa_changed && !class.stop_retained && !class.start_retained {
+        class.synonymous = true;
+    }
+
+    Some(class)
+}
+
+fn genomic_range(start: i64, end: i64) -> Option<Vec<i64>> {
+    let (s, e) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let len = e.saturating_sub(s).saturating_add(1);
+    let len_usize = usize::try_from(len).ok()?;
+    let mut out = Vec::with_capacity(len_usize);
+    for p in s..=e {
+        out.push(p);
+    }
+    Some(out)
+}
+
+fn genomic_to_cds_index(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    pos: i64,
+) -> Option<usize> {
+    let segments = coding_segments(tx, tx_exons)?;
+    let mut offset = 0usize;
+    for (seg_start, seg_end) in segments {
+        let seg_len = usize::try_from(seg_end.saturating_sub(seg_start).saturating_add(1)).ok()?;
+        if pos >= seg_start && pos <= seg_end {
+            let local = if tx.strand >= 0 {
+                usize::try_from(pos.saturating_sub(seg_start)).ok()?
+            } else {
+                usize::try_from(seg_end.saturating_sub(pos)).ok()?
+            };
+            return Some(offset + local);
+        }
+        offset = offset.saturating_add(seg_len);
+    }
+    None
+}
+
+fn coding_segments(tx: &TranscriptFeature, tx_exons: &[&ExonFeature]) -> Option<Vec<(i64, i64)>> {
+    let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
+        return None;
+    };
+    if cds_start <= 0 || cds_end <= 0 || cds_end < cds_start {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for exon in tx_exons {
+        let s = exon.start.max(cds_start);
+        let e = exon.end.min(cds_end);
+        if s <= e {
+            segments.push((s, e));
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    segments.sort_by_key(|(s, _)| *s);
+    if tx.strand < 0 {
+        segments.reverse();
+    }
+    Some(segments)
+}
+
+fn reverse_complement(seq: &str) -> Option<String> {
+    let mut out = String::with_capacity(seq.len());
+    for b in seq.as_bytes().iter().rev() {
+        let c = match b.to_ascii_uppercase() {
+            b'A' => 'T',
+            b'C' => 'G',
+            b'G' => 'C',
+            b'T' => 'A',
+            b'N' => 'N',
+            _ => return None,
+        };
+        out.push(c);
+    }
+    Some(out)
+}
+
+fn translate_codon(codon: &str) -> Option<char> {
+    match codon {
+        "TTT" | "TTC" => Some('F'),
+        "TTA" | "TTG" | "CTT" | "CTC" | "CTA" | "CTG" => Some('L'),
+        "ATT" | "ATC" | "ATA" => Some('I'),
+        "ATG" => Some('M'),
+        "GTT" | "GTC" | "GTA" | "GTG" => Some('V'),
+        "TCT" | "TCC" | "TCA" | "TCG" | "AGT" | "AGC" => Some('S'),
+        "CCT" | "CCC" | "CCA" | "CCG" => Some('P'),
+        "ACT" | "ACC" | "ACA" | "ACG" => Some('T'),
+        "GCT" | "GCC" | "GCA" | "GCG" => Some('A'),
+        "TAT" | "TAC" => Some('Y'),
+        "CAT" | "CAC" => Some('H'),
+        "CAA" | "CAG" => Some('Q'),
+        "AAT" | "AAC" => Some('N'),
+        "AAA" | "AAG" => Some('K'),
+        "GAT" | "GAC" => Some('D'),
+        "GAA" | "GAG" => Some('E'),
+        "TGT" | "TGC" => Some('C'),
+        "TGG" => Some('W'),
+        "CGT" | "CGC" | "CGA" | "CGG" | "AGA" | "AGG" => Some('R'),
+        "GGT" | "GGC" | "GGA" | "GGG" => Some('G'),
+        "TAA" | "TAG" | "TGA" => Some('*'),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1288,6 +1570,7 @@ mod tests {
             &var("22", 155, 155, "A", "G"),
             &[tx],
             &exons,
+            &[],
             &regulatory_features,
             &motifs,
             &mirnas,
