@@ -7,7 +7,7 @@ VEP-oriented DataFusion functions and benchmark tooling.
 | Area | Status | Notes |
 |---|---|---|
 | `lookup_variants(...)` table function | Implemented | Parquet + Fjall backends, match modes (`exact`, `exact_or_colocated_ids`, `exact_or_vep_existing`) |
-| `annotate_vep(...)` table function | Phase 1 scaffold | API and backend unification are implemented; `csq` and `most_severe_consequence` are currently placeholder `NULL` columns |
+| `annotate_vep(...)` table function | Phase 2 (transcript/exon baseline) | Uses `lookup_variants` metadata + transcript/exon context (when available) for ranked SO output; falls back to phase-1.5 placeholder CSQ when context tables are absent |
 | Ensembl VEP 115 golden benchmark pipeline | Implemented | Samples 1000 variants, runs VEP 115 in Docker, compares with `annotate_vep` output |
 | Full consequence engine parity (41 SO terms) | In progress | Design and cache contract documented in `PORTING_PLAN.md` |
 
@@ -53,9 +53,10 @@ cargo run -p datafusion-bio-function-vep --example annotate_vep_golden_bench --r
 Report file:
 - `/tmp/annotate_vep_golden_bench/HG002_chr22_1000_comparison_report.txt`
 
-Current expected behavior (phase 1):
+Current expected behavior:
 - key overlap should be high (variant identity matches),
-- `ours_with_csq=0` and `csq_exact_matches=0` because `annotate_vep` does not yet compute consequences.
+- `ours_with_csq` should be non-zero for cache-matched variants (and typically higher when transcript/exon context tables are provided),
+- `csq_exact_matches` should still be low because full transcript/regulatory consequence computation is not implemented yet.
 
 ## Other benchmark examples
 
@@ -69,4 +70,3 @@ Run with:
 ```bash
 cargo run -p datafusion-bio-function-vep --example <example_name> --release -- <args>
 ```
-

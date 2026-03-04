@@ -14,10 +14,11 @@ use std::path::Path;
 use datafusion::common::{DataFusionError, Result};
 use flate2::read::MultiGzDecoder;
 
+use crate::so_terms::SoTerm;
+
 pub const DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ: &str =
     "/Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/data/HG002_chr22.vcf.gz";
-pub const DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI: &str =
-    "/Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/data/HG002_chr22.vcf.gz.tbi";
+pub const DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI: &str = "/Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/data/HG002_chr22.vcf.gz.tbi";
 pub const DEFAULT_LOCAL_HG002_CHR22_VCF_GZ: &str = "vep-benchmark/data/HG002_chr22.vcf.gz";
 pub const DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI: &str = "vep-benchmark/data/HG002_chr22.vcf.gz.tbi";
 pub const DEFAULT_EXTERNAL_VEP_CACHE_DIR: &str =
@@ -107,7 +108,11 @@ pub fn ensure_local_copy(
 }
 
 /// Sample first `limit` variant records from a gzipped VCF, preserving headers.
-pub fn sample_gz_vcf_first_n(input_vcf_gz: &Path, output_vcf: &Path, limit: usize) -> Result<usize> {
+pub fn sample_gz_vcf_first_n(
+    input_vcf_gz: &Path,
+    output_vcf: &Path,
+    limit: usize,
+) -> Result<usize> {
     let file = File::open(input_vcf_gz).map_err(io_err)?;
     let decoder = MultiGzDecoder::new(file);
     let reader = BufReader::new(decoder);
@@ -118,7 +123,11 @@ pub fn sample_gz_vcf_first_n(input_vcf_gz: &Path, output_vcf: &Path, limit: usiz
     sample_vcf_lines(reader, &mut writer, limit)
 }
 
-fn sample_vcf_lines<R: BufRead, W: Write>(mut reader: R, writer: &mut W, limit: usize) -> Result<usize> {
+fn sample_vcf_lines<R: BufRead, W: Write>(
+    mut reader: R,
+    writer: &mut W,
+    limit: usize,
+) -> Result<usize> {
     let mut line = String::new();
     let mut count = 0usize;
 
@@ -163,10 +172,7 @@ pub fn parse_vep_vcf_annotations(vcf_path: &Path) -> Result<Vec<VariantAnnotatio
     Ok(out)
 }
 
-fn parse_vep_vcf_lines<R: BufRead>(
-    mut reader: R,
-    out: &mut Vec<VariantAnnotation>,
-) -> Result<()> {
+fn parse_vep_vcf_lines<R: BufRead>(mut reader: R, out: &mut Vec<VariantAnnotation>) -> Result<()> {
     let mut line = String::new();
     loop {
         line.clear();
@@ -216,20 +222,21 @@ pub fn normalize_chrom(chrom: &str) -> String {
 }
 
 pub fn most_severe_from_csq(csq: &str) -> Option<String> {
-    let mut best: Option<(u8, String)> = None;
+    let mut best: Option<(SoTerm, String)> = None;
 
     for ann in csq.split(',') {
         let mut parts = ann.split('|');
         let _allele = parts.next();
         let consequence_field = parts.next().unwrap_or("");
         for term in consequence_field.split('&') {
-            let rank = so_rank(term);
-            if rank == u8::MAX {
+            let Some(parsed) = SoTerm::from_str(term) else {
                 continue;
-            }
+            };
             match &best {
-                None => best = Some((rank, term.to_string())),
-                Some((best_rank, _)) if rank < *best_rank => best = Some((rank, term.to_string())),
+                None => best = Some((parsed, term.to_string())),
+                Some((best_term, _)) if parsed.rank() < best_term.rank() => {
+                    best = Some((parsed, term.to_string()))
+                }
                 _ => {}
             }
         }
@@ -238,9 +245,14 @@ pub fn most_severe_from_csq(csq: &str) -> Option<String> {
     best.map(|(_, term)| term)
 }
 
-pub fn compare_annotations(golden: &[VariantAnnotation], ours: &[VariantAnnotation]) -> ComparisonReport {
-    let golden_map: HashMap<VariantKey, &VariantAnnotation> = golden.iter().map(|r| (r.key.clone(), r)).collect();
-    let ours_map: HashMap<VariantKey, &VariantAnnotation> = ours.iter().map(|r| (r.key.clone(), r)).collect();
+pub fn compare_annotations(
+    golden: &[VariantAnnotation],
+    ours: &[VariantAnnotation],
+) -> ComparisonReport {
+    let golden_map: HashMap<VariantKey, &VariantAnnotation> =
+        golden.iter().map(|r| (r.key.clone(), r)).collect();
+    let ours_map: HashMap<VariantKey, &VariantAnnotation> =
+        ours.iter().map(|r| (r.key.clone(), r)).collect();
 
     let mut intersection_rows = 0usize;
     let mut missing_in_ours = 0usize;
@@ -273,7 +285,10 @@ pub fn compare_annotations(golden: &[VariantAnnotation], ours: &[VariantAnnotati
         }
     }
 
-    let extra_in_ours = ours_map.keys().filter(|k| !golden_map.contains_key(*k)).count();
+    let extra_in_ours = ours_map
+        .keys()
+        .filter(|k| !golden_map.contains_key(*k))
+        .count();
 
     ComparisonReport {
         golden_rows: golden_map.len(),
@@ -285,53 +300,6 @@ pub fn compare_annotations(golden: &[VariantAnnotation], ours: &[VariantAnnotati
         ours_with_csq,
         csq_exact_matches,
         most_severe_exact_matches,
-    }
-}
-
-fn so_rank(term: &str) -> u8 {
-    match term {
-        "transcript_ablation" => 1,
-        "splice_acceptor_variant" => 2,
-        "splice_donor_variant" => 3,
-        "stop_gained" => 4,
-        "frameshift_variant" => 5,
-        "stop_lost" => 6,
-        "start_lost" => 7,
-        "transcript_amplification" => 8,
-        "feature_elongation" => 9,
-        "feature_truncation" => 10,
-        "inframe_insertion" => 11,
-        "inframe_deletion" => 12,
-        "missense_variant" => 13,
-        "protein_altering_variant" => 14,
-        "splice_donor_5th_base_variant" => 15,
-        "splice_region_variant" => 16,
-        "splice_donor_region_variant" => 17,
-        "splice_polypyrimidine_tract_variant" => 18,
-        "incomplete_terminal_codon_variant" => 19,
-        "start_retained_variant" => 20,
-        "stop_retained_variant" => 21,
-        "synonymous_variant" => 22,
-        "coding_sequence_variant" => 23,
-        "mature_miRNA_variant" => 24,
-        "5_prime_UTR_variant" => 25,
-        "3_prime_UTR_variant" => 26,
-        "non_coding_transcript_exon_variant" => 27,
-        "intron_variant" => 28,
-        "NMD_transcript_variant" => 29,
-        "non_coding_transcript_variant" => 30,
-        "coding_transcript_variant" => 31,
-        "upstream_gene_variant" => 32,
-        "downstream_gene_variant" => 33,
-        "TFBS_ablation" => 34,
-        "TFBS_amplification" => 35,
-        "TF_binding_site_variant" => 36,
-        "regulatory_region_ablation" => 37,
-        "regulatory_region_amplification" => 38,
-        "regulatory_region_variant" => 39,
-        "intergenic_variant" => 40,
-        "sequence_variant" => 41,
-        _ => u8::MAX,
     }
 }
 

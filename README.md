@@ -48,7 +48,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **`lookup_variants()` Table Function**: SQL-based variant annotation against a pre-built VEP cache
 - **KV Cache Backend**: fjall LSM-tree store with zstd dictionary compression for compact on-disk storage
 - **Match Modes**: `exact`, `exact_or_colocated_ids`, `exact_or_vep_existing` (indel-aware relaxed matching)
-- **`annotate_vep()` Table Function**: backend-unified consequence annotation entrypoint (`parquet` or `fjall`) with stable output columns (`csq`, `most_severe_consequence`) for phased rollout
+- **`annotate_vep()` Table Function**: backend-unified consequence annotation entrypoint (`parquet` or `fjall`) with phased CSQ rollout
 - **Session Configuration**: Tunable parameters via SQL `SET` statements under the `bio.annotation` namespace
 
 #### `annotate_vep` API (Phase 1)
@@ -65,12 +65,15 @@ annotate_vep(
 - `vcf_table`: registered input VCF table.
 - `cache_source`: backend-specific source path/identifier.
 - `backend`: `parquet` or `fjall`.
-- `options_json` (optional): backend/runtime options for future phases.
+- `options_json` (optional): backend/runtime options. Current keys:
+  - `transcripts_table`: registered table name with transcript intervals/coding context.
+  - `exons_table`: registered table name with exon intervals/order.
 
-Phase 1 behavior is intentionally non-breaking:
+Current phase behavior:
 - pass-through VCF rows,
-- append `csq` and `most_severe_consequence` as nullable placeholders,
-- validate backend and unify backend selection under one API.
+- derive known-variant metadata via `lookup_variants`,
+- if transcript/exon context tables are available (auto-discovery or `options_json`), compute transcript-aware SO terms and ranked `most_severe_consequence`,
+- otherwise fall back to initial cache-hit CSQ placeholder (`sequence_variant`) for matched rows and keep unmatched rows as `NULL`.
 
 #### Ensembl-VEP Porting Plan
 
@@ -82,9 +85,9 @@ Feature comparison snapshot:
 | Capability | Ensembl-VEP (release 115) | bio-functions-vep (current) |
 |------------|----------------------------|-----------------------------|
 | Known-variant cache lookup | ✅ (`--check_existing`, colocated behavior) | ✅ (`lookup_variants` + match modes) |
-| Transcript consequence engine | ✅ (full SO consequence model) | 🚧 (`annotate_vep` scaffold, engine not merged yet) |
-| Supported consequence terms | 41/41 | lookup-only; no runtime consequence calculator yet |
-| Most severe consequence output | ✅ | 🚧 placeholder column in `annotate_vep` |
+| Transcript consequence engine | ✅ (full SO consequence model) | 🚧 transcript/exon phase-2 baseline merged (not full VEP parity) |
+| Supported consequence terms | 41/41 | 🚧 partial runtime coverage (transcript/exon-focused subset; regulatory/SV still missing) |
+| Most severe consequence output | ✅ | 🚧 ranked SO output when transcript/exon context is available; fallback placeholder otherwise |
 | Backend abstraction | Cache/files in VEP ecosystem | ✅ unified API for `parquet` + `fjall` entrypoint |
 | Native SQL execution in DataFusion | ❌ | ✅ |
 | Fjall KV backend | ❌ | ✅ |

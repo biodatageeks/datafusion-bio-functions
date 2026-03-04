@@ -13,9 +13,9 @@ Reference inputs used for parity planning:
 | Runtime model | Perl CLI pipeline | DataFusion SQL UDF/UDTF | DataFusion SQL-native annotation engine |
 | Known variant lookup | Yes (`--check_existing`, colocated matching) | Yes (`lookup_variants`) | Keep and integrate with consequence output |
 | Match behavior | VEP allele/coordinate normalization | `exact`, `exact_or_colocated_ids`, `exact_or_vep_existing`, optional `extended_probes` | Preserve existing modes, use as `Existing_variation` source |
-| Consequence engine | Full transcript/regulatory/motif consequence evaluation | Not yet (phase-1 scaffold) | Full SO term evaluation with rank + impact |
-| Consequence term coverage | 41/41 | 0/41 runtime consequence terms | 41/41 (or explicit unsupported list guarded by tests) |
-| `most_severe_consequence` | Yes | Placeholder column in `annotate_vep` | Fully computed rank-min consequence |
+| Consequence engine | Full transcript/regulatory/motif consequence evaluation | Partial transcript/exon phase-2 baseline + fallback path | Full SO term evaluation with rank + impact |
+| Consequence term coverage | 41/41 | Partial runtime subset (transcript/exon-focused; regulatory/SV missing) | 41/41 (or explicit unsupported list guarded by tests) |
+| `most_severe_consequence` | Yes | Ranked SO term when transcript/exon context is available; fallback placeholder (`sequence_variant`) for cache-hit-only mode | Fully computed rank-min consequence |
 | CSQ field generation | Full CSQ payload | Not yet | VEP-compatible CSQ fields (phased) |
 | Backends | VEP caches/filesystem model | Parquet + Fjall (lookup path) | Unified backend contract for all consequence artifacts |
 | SQL composability | No | Yes | Yes (primary interface) |
@@ -116,6 +116,24 @@ Legend:
 4. Regulatory + motif + miRNA consequences
 5. Structural-event consequences (`SV`-dependent terms)
 6. Performance tuning (projection pushdown, batching, fjall key-locality)
+
+## Progress Status (Updated March 4, 2026)
+
+| Step | Status | Notes |
+|---|---|---|
+| 1. `annotate_vep` API/backend abstraction | Complete | Unified `annotate_vep(vcf_table, cache_source, backend[, options_json])`; parquet/fjall cache source resolution implemented |
+| 2. Shared readers + transcript/exon baseline | In progress | `lookup_variants` integration complete; transcript/exon-driven consequence engine wired when context tables are provided (`<cache>_transcripts`, `<cache>_exons`, or `options_json` overrides) |
+| 3. Most-severe ranking + CSQ assembly + SQL tests | In progress | SO rank model (41 terms) implemented; `most_severe_consequence` computed from ranked terms in transcript/exon mode; fallback cache-hit CSQ remains for no-context mode |
+| 4. Regulatory/motif/miRNA consequences | Not started | Artifacts and matrix defined; runtime evaluation not yet merged |
+| 5. Structural-event consequences | Not started | `SV`-dependent terms (`ablation`, `amplification`, truncation/elongation) not yet merged |
+| 6. Performance tuning | Not started | Need profiling and optimizations after consequence coverage is broader |
+
+### Remaining Gaps (Next Priorities)
+
+1. Add translation/codon-level effects for `missense`, `synonymous`, `stop_gained`, `stop_retained`, `start_retained`, and incomplete terminal codon logic.
+2. Add regulatory/motif/miRNA table readers and consequence assignment path.
+3. Add structural-event interpretation using `sv_features`.
+4. Expand golden parity tests to include transcript/regulatory/SV representative cases and assert deterministic CSQ ordering.
 
 ## Acceptance Criteria
 

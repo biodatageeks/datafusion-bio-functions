@@ -16,7 +16,9 @@ pub mod golden_benchmark;
 pub mod kv_cache;
 pub mod lookup_provider;
 pub mod schema_contract;
+pub mod so_terms;
 pub mod table_function;
+pub mod transcript_consequence;
 
 pub use config::AnnotationConfig;
 
