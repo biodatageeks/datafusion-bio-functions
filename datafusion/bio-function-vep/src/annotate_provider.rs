@@ -31,7 +31,8 @@ use crate::annotation_store::{AnnotationBackend, build_store};
 use crate::kv_cache::KvCacheTableProvider;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
-    ExonFeature, TranscriptConsequenceEngine, TranscriptFeature, VariantInput,
+    ExonFeature, MirnaFeature, MotifFeature, RegulatoryFeature, StructuralFeature, SvEventKind,
+    SvFeatureKind, TranscriptConsequenceEngine, TranscriptFeature, VariantInput,
 };
 
 /// Table provider implementing `annotate_vep(...)`.
@@ -203,6 +204,33 @@ impl AnnotateProvider {
         Ok(None)
     }
 
+    async fn resolve_optional_context_table(
+        &self,
+        options_key: &str,
+        cache_table: &str,
+        suffix: &str,
+    ) -> Result<Option<String>> {
+        if let Some(options) = self.options_json.as_deref() {
+            if let Some(name) = Self::parse_json_string_option(options, options_key) {
+                if self.session.table(&name).await.is_ok() {
+                    return Ok(Some(name));
+                }
+            }
+        }
+
+        let primary = format!("{cache_table}_{suffix}");
+        if self.session.table(&primary).await.is_ok() {
+            return Ok(Some(primary));
+        }
+        if cache_table != self.cache_source {
+            let secondary = format!("{}_{}", self.cache_source, suffix);
+            if self.session.table(&secondary).await.is_ok() {
+                return Ok(Some(secondary));
+            }
+        }
+        Ok(None)
+    }
+
     async fn load_transcripts(&self, table: &str) -> Result<Vec<TranscriptFeature>> {
         let query = format!("SELECT * FROM `{table}`");
         let batches = self.session.sql(&query).await?.collect().await?;
@@ -347,14 +375,250 @@ impl AnnotateProvider {
         Ok(out)
     }
 
+    async fn load_regulatory_features(&self, table: &str) -> Result<Vec<RegulatoryFeature>> {
+        let query = format!("SELECT * FROM `{table}`");
+        let batches = self.session.sql(&query).await?.collect().await?;
+        let mut out = Vec::new();
+
+        for batch in &batches {
+            let schema = batch.schema();
+            let id_idx = schema
+                .index_of("stable_id")
+                .or_else(|_| schema.index_of("feature_id"))
+                .ok();
+            let chrom_idx = schema.index_of("chrom").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): regulatory table '{table}' is missing required column chrom"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): regulatory table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): regulatory table '{table}' is missing required column end"
+                ))
+            })?;
+
+            for row in 0..batch.num_rows() {
+                let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                let feature_id = id_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or_else(|| "reg".to_string());
+                out.push(RegulatoryFeature {
+                    feature_id,
+                    chrom,
+                    start,
+                    end,
+                });
+            }
+        }
+
+        Ok(out)
+    }
+
+    async fn load_motif_features(&self, table: &str) -> Result<Vec<MotifFeature>> {
+        let query = format!("SELECT * FROM `{table}`");
+        let batches = self.session.sql(&query).await?.collect().await?;
+        let mut out = Vec::new();
+
+        for batch in &batches {
+            let schema = batch.schema();
+            let id_idx = schema
+                .index_of("motif_id")
+                .or_else(|_| schema.index_of("feature_id"))
+                .ok();
+            let chrom_idx = schema.index_of("chrom").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): motif table '{table}' is missing required column chrom"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): motif table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): motif table '{table}' is missing required column end"
+                ))
+            })?;
+
+            for row in 0..batch.num_rows() {
+                let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                let motif_id = id_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or_else(|| "motif".to_string());
+                out.push(MotifFeature {
+                    motif_id,
+                    chrom,
+                    start,
+                    end,
+                });
+            }
+        }
+
+        Ok(out)
+    }
+
+    async fn load_mirna_features(&self, table: &str) -> Result<Vec<MirnaFeature>> {
+        let query = format!("SELECT * FROM `{table}`");
+        let batches = self.session.sql(&query).await?.collect().await?;
+        let mut out = Vec::new();
+
+        for batch in &batches {
+            let schema = batch.schema();
+            let id_idx = schema
+                .index_of("mirna_id")
+                .or_else(|_| schema.index_of("feature_id"))
+                .ok();
+            let chrom_idx = schema.index_of("chrom").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): miRNA table '{table}' is missing required column chrom"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): miRNA table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): miRNA table '{table}' is missing required column end"
+                ))
+            })?;
+
+            for row in 0..batch.num_rows() {
+                let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                let mirna_id = id_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or_else(|| "mirna".to_string());
+                out.push(MirnaFeature {
+                    mirna_id,
+                    chrom,
+                    start,
+                    end,
+                });
+            }
+        }
+
+        Ok(out)
+    }
+
+    async fn load_structural_features(&self, table: &str) -> Result<Vec<StructuralFeature>> {
+        let query = format!("SELECT * FROM `{table}`");
+        let batches = self.session.sql(&query).await?.collect().await?;
+        let mut out = Vec::new();
+
+        for batch in &batches {
+            let schema = batch.schema();
+            let id_idx = schema
+                .index_of("feature_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .ok();
+            let kind_idx = schema.index_of("feature_kind").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): structural table '{table}' is missing required column feature_kind"
+                ))
+            })?;
+            let event_idx = schema.index_of("event_type").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): structural table '{table}' is missing required column event_type"
+                ))
+            })?;
+            let chrom_idx = schema.index_of("chrom").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): structural table '{table}' is missing required column chrom"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): structural table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): structural table '{table}' is missing required column end"
+                ))
+            })?;
+
+            for row in 0..batch.num_rows() {
+                let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(kind_raw) = string_at(batch.column(kind_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(event_raw) = string_at(batch.column(event_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(feature_kind) = parse_sv_feature_kind(&kind_raw) else {
+                    continue;
+                };
+                let Some(event_kind) = parse_sv_event_kind(&event_raw) else {
+                    continue;
+                };
+                let feature_id = id_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or_else(|| "sv".to_string());
+                out.push(StructuralFeature {
+                    feature_id,
+                    chrom,
+                    start,
+                    end,
+                    feature_kind,
+                    event_kind,
+                });
+            }
+        }
+
+        Ok(out)
+    }
+
     async fn scan_with_transcript_engine(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         lookup_sql: &str,
         requested_columns: &[&str],
-        transcripts_table: &str,
-        exons_table: &str,
+        transcripts_table: Option<&str>,
+        exons_table: Option<&str>,
+        regulatory_table: Option<&str>,
+        motif_table: Option<&str>,
+        mirna_table: Option<&str>,
+        sv_table: Option<&str>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let vcf_names = self.vcf_field_names();
         let mut select_exprs = Vec::new();
@@ -371,8 +635,36 @@ impl AnnotateProvider {
         );
         let base_batches = self.session.sql(&base_query).await?.collect().await?;
 
-        let transcripts = self.load_transcripts(transcripts_table).await?;
-        let exons = self.load_exons(exons_table).await?;
+        let transcripts = if let Some(table) = transcripts_table {
+            self.load_transcripts(table).await?
+        } else {
+            Vec::new()
+        };
+        let exons = if let Some(table) = exons_table {
+            self.load_exons(table).await?
+        } else {
+            Vec::new()
+        };
+        let regulatory = if let Some(table) = regulatory_table {
+            self.load_regulatory_features(table).await?
+        } else {
+            Vec::new()
+        };
+        let motifs = if let Some(table) = motif_table {
+            self.load_motif_features(table).await?
+        } else {
+            Vec::new()
+        };
+        let mirnas = if let Some(table) = mirna_table {
+            self.load_mirna_features(table).await?
+        } else {
+            Vec::new()
+        };
+        let structural = if let Some(table) = sv_table {
+            self.load_structural_features(table).await?
+        } else {
+            Vec::new()
+        };
         let engine = TranscriptConsequenceEngine::default();
 
         let mut annotated_batches = Vec::with_capacity(base_batches.len());
@@ -382,6 +674,10 @@ impl AnnotateProvider {
                 &engine,
                 &transcripts,
                 &exons,
+                &regulatory,
+                &motifs,
+                &mirnas,
+                &structural,
             )?);
         }
 
@@ -410,6 +706,10 @@ impl AnnotateProvider {
         engine: &TranscriptConsequenceEngine,
         transcripts: &[TranscriptFeature],
         exons: &[ExonFeature],
+        regulatory: &[RegulatoryFeature],
+        motifs: &[MotifFeature],
+        mirnas: &[MirnaFeature],
+        structural: &[StructuralFeature],
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
@@ -479,7 +779,15 @@ impl AnnotateProvider {
                 ref_allele,
                 alt_allele: alt_allele.clone(),
             };
-            let assignments = engine.evaluate_variant(&variant, transcripts, exons);
+            let assignments = engine.evaluate_variant_with_context(
+                &variant,
+                transcripts,
+                exons,
+                regulatory,
+                motifs,
+                mirnas,
+                structural,
+            );
             let mut terms = TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
             if terms.is_empty() {
                 terms.push(SoTerm::SequenceVariant);
@@ -531,6 +839,26 @@ fn impact_label(impact: SoImpact) -> &'static str {
         SoImpact::Moderate => "MODERATE",
         SoImpact::Low => "LOW",
         SoImpact::Modifier => "MODIFIER",
+    }
+}
+
+fn parse_sv_feature_kind(value: &str) -> Option<SvFeatureKind> {
+    match value.to_ascii_lowercase().as_str() {
+        "transcript" | "tx" => Some(SvFeatureKind::Transcript),
+        "regulatory" | "reg" => Some(SvFeatureKind::Regulatory),
+        "tfbs" | "motif" => Some(SvFeatureKind::Tfbs),
+        "feature" | "generic" => Some(SvFeatureKind::Generic),
+        _ => None,
+    }
+}
+
+fn parse_sv_event_kind(value: &str) -> Option<SvEventKind> {
+    match value.to_ascii_lowercase().as_str() {
+        "ablation" | "deletion" | "del" => Some(SvEventKind::Ablation),
+        "amplification" | "duplication" | "dup" | "amp" => Some(SvEventKind::Amplification),
+        "elongation" | "elongate" => Some(SvEventKind::Elongation),
+        "truncation" | "truncate" => Some(SvEventKind::Truncation),
+        _ => None,
     }
 }
 
@@ -670,17 +998,42 @@ impl TableProvider for AnnotateProvider {
             "lookup_variants('{vcf_table_lit}', '{cache_table_lit}', '{columns_lit}', 'exact')"
         );
 
-        if let Some((transcripts_table, exons_table)) =
-            self.resolve_transcript_context_tables(&cache_table).await?
+        let transcript_pair = self.resolve_transcript_context_tables(&cache_table).await?;
+        let regulatory_table = self
+            .resolve_optional_context_table("regulatory_table", &cache_table, "regulatory_features")
+            .await?;
+        let motif_table = self
+            .resolve_optional_context_table("motif_table", &cache_table, "motif_features")
+            .await?;
+        let mirna_table = self
+            .resolve_optional_context_table("mirna_table", &cache_table, "mirna_features")
+            .await?;
+        let sv_table = self
+            .resolve_optional_context_table("sv_table", &cache_table, "sv_features")
+            .await?;
+
+        if transcript_pair.is_some()
+            || regulatory_table.is_some()
+            || motif_table.is_some()
+            || mirna_table.is_some()
+            || sv_table.is_some()
         {
+            let (tx_table, ex_table) = transcript_pair
+                .as_ref()
+                .map(|(tx, ex)| (Some(tx.as_str()), Some(ex.as_str())))
+                .unwrap_or((None, None));
             return self
                 .scan_with_transcript_engine(
                     state,
                     projection,
                     &lookup_sql,
                     &requested_columns,
-                    &transcripts_table,
-                    &exons_table,
+                    tx_table,
+                    ex_table,
+                    regulatory_table.as_deref(),
+                    motif_table.as_deref(),
+                    mirna_table.as_deref(),
+                    sv_table.as_deref(),
                 )
                 .await;
         }

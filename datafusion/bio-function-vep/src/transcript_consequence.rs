@@ -34,6 +34,56 @@ pub struct ExonFeature {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegulatoryFeature {
+    pub feature_id: String,
+    pub chrom: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MotifFeature {
+    pub motif_id: String,
+    pub chrom: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirnaFeature {
+    pub mirna_id: String,
+    pub chrom: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SvFeatureKind {
+    Transcript,
+    Regulatory,
+    Tfbs,
+    Generic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SvEventKind {
+    Ablation,
+    Amplification,
+    Elongation,
+    Truncation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralFeature {
+    pub feature_id: String,
+    pub chrom: String,
+    pub start: i64,
+    pub end: i64,
+    pub feature_kind: SvFeatureKind,
+    pub event_kind: SvEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptConsequence {
     pub transcript_id: Option<String>,
     pub terms: Vec<SoTerm>,
@@ -64,6 +114,19 @@ impl TranscriptConsequenceEngine {
         variant: &VariantInput,
         transcripts: &[TranscriptFeature],
         exons: &[ExonFeature],
+    ) -> Vec<TranscriptConsequence> {
+        self.evaluate_variant_with_context(variant, transcripts, exons, &[], &[], &[], &[])
+    }
+
+    pub fn evaluate_variant_with_context(
+        &self,
+        variant: &VariantInput,
+        transcripts: &[TranscriptFeature],
+        exons: &[ExonFeature],
+        regulatory: &[RegulatoryFeature],
+        motifs: &[MotifFeature],
+        mirnas: &[MirnaFeature],
+        structural: &[StructuralFeature],
     ) -> Vec<TranscriptConsequence> {
         let mut exons_by_tx: HashMap<&str, Vec<&ExonFeature>> = HashMap::new();
         for exon in exons {
@@ -103,6 +166,11 @@ impl TranscriptConsequenceEngine {
                 });
             }
         }
+
+        self.append_regulatory_terms(&mut out, variant, regulatory, structural);
+        self.append_tfbs_terms(&mut out, variant, motifs, structural);
+        self.append_mirna_terms(&mut out, variant, mirnas);
+        self.append_structural_transcript_terms(&mut out, variant, transcripts, structural);
 
         if out.is_empty() {
             out.push(TranscriptConsequence {
@@ -168,6 +236,171 @@ impl TranscriptConsequenceEngine {
         terms_vec
     }
 
+    fn append_regulatory_terms(
+        &self,
+        out: &mut Vec<TranscriptConsequence>,
+        variant: &VariantInput,
+        regulatory: &[RegulatoryFeature],
+        structural: &[StructuralFeature],
+    ) {
+        let mut terms = BTreeSet::new();
+        let chrom = normalize_chrom(&variant.chrom);
+        let overlaps_reg = regulatory.iter().any(|r| {
+            normalize_chrom(&r.chrom) == chrom
+                && overlaps(variant.start, variant.end, r.start, r.end)
+        });
+        if overlaps_reg {
+            terms.insert(SoTerm::RegulatoryRegionVariant);
+        }
+        for sv in structural {
+            if normalize_chrom(&sv.chrom) != chrom
+                || !overlaps(variant.start, variant.end, sv.start, sv.end)
+            {
+                continue;
+            }
+            if sv.feature_kind != SvFeatureKind::Regulatory {
+                continue;
+            }
+            match sv.event_kind {
+                SvEventKind::Ablation => {
+                    terms.insert(SoTerm::RegulatoryRegionAblation);
+                }
+                SvEventKind::Amplification => {
+                    terms.insert(SoTerm::RegulatoryRegionAmplification);
+                }
+                SvEventKind::Elongation | SvEventKind::Truncation => {}
+            }
+        }
+        if !terms.is_empty() {
+            let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
+            ordered.sort_by_key(|t| t.rank());
+            out.push(TranscriptConsequence {
+                transcript_id: None,
+                terms: ordered,
+            });
+        }
+    }
+
+    fn append_tfbs_terms(
+        &self,
+        out: &mut Vec<TranscriptConsequence>,
+        variant: &VariantInput,
+        motifs: &[MotifFeature],
+        structural: &[StructuralFeature],
+    ) {
+        let mut terms = BTreeSet::new();
+        let chrom = normalize_chrom(&variant.chrom);
+        let overlaps_tfbs = motifs.iter().any(|m| {
+            normalize_chrom(&m.chrom) == chrom
+                && overlaps(variant.start, variant.end, m.start, m.end)
+        });
+        if overlaps_tfbs {
+            terms.insert(SoTerm::TfBindingSiteVariant);
+        }
+        for sv in structural {
+            if normalize_chrom(&sv.chrom) != chrom
+                || !overlaps(variant.start, variant.end, sv.start, sv.end)
+            {
+                continue;
+            }
+            if sv.feature_kind != SvFeatureKind::Tfbs {
+                continue;
+            }
+            match sv.event_kind {
+                SvEventKind::Ablation => {
+                    terms.insert(SoTerm::TfbsAblation);
+                }
+                SvEventKind::Amplification => {
+                    terms.insert(SoTerm::TfbsAmplification);
+                }
+                SvEventKind::Elongation | SvEventKind::Truncation => {}
+            }
+        }
+        if !terms.is_empty() {
+            let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
+            ordered.sort_by_key(|t| t.rank());
+            out.push(TranscriptConsequence {
+                transcript_id: None,
+                terms: ordered,
+            });
+        }
+    }
+
+    fn append_mirna_terms(
+        &self,
+        out: &mut Vec<TranscriptConsequence>,
+        variant: &VariantInput,
+        mirnas: &[MirnaFeature],
+    ) {
+        let chrom = normalize_chrom(&variant.chrom);
+        let overlaps_mirna = mirnas.iter().any(|m| {
+            normalize_chrom(&m.chrom) == chrom
+                && overlaps(variant.start, variant.end, m.start, m.end)
+        });
+        if overlaps_mirna {
+            out.push(TranscriptConsequence {
+                transcript_id: None,
+                terms: vec![SoTerm::MatureMirnaVariant],
+            });
+        }
+    }
+
+    fn append_structural_transcript_terms(
+        &self,
+        out: &mut Vec<TranscriptConsequence>,
+        variant: &VariantInput,
+        transcripts: &[TranscriptFeature],
+        structural: &[StructuralFeature],
+    ) {
+        let chrom = normalize_chrom(&variant.chrom);
+        let mut terms = BTreeSet::new();
+        for sv in structural {
+            if normalize_chrom(&sv.chrom) != chrom
+                || !overlaps(variant.start, variant.end, sv.start, sv.end)
+            {
+                continue;
+            }
+            match sv.feature_kind {
+                SvFeatureKind::Transcript => match sv.event_kind {
+                    SvEventKind::Ablation => {
+                        terms.insert(SoTerm::TranscriptAblation);
+                    }
+                    SvEventKind::Amplification => {
+                        terms.insert(SoTerm::TranscriptAmplification);
+                    }
+                    SvEventKind::Elongation => {
+                        terms.insert(SoTerm::FeatureElongation);
+                    }
+                    SvEventKind::Truncation => {
+                        terms.insert(SoTerm::FeatureTruncation);
+                    }
+                },
+                SvFeatureKind::Generic => match sv.event_kind {
+                    SvEventKind::Elongation => {
+                        terms.insert(SoTerm::FeatureElongation);
+                    }
+                    SvEventKind::Truncation => {
+                        terms.insert(SoTerm::FeatureTruncation);
+                    }
+                    SvEventKind::Ablation | SvEventKind::Amplification => {}
+                },
+                SvFeatureKind::Regulatory | SvFeatureKind::Tfbs => {}
+            }
+        }
+        if !terms.is_empty()
+            && transcripts
+                .iter()
+                .any(|tx| normalize_chrom(&tx.chrom) == chrom)
+        {
+            let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
+            ordered.sort_by_key(|t| t.rank());
+            out.push(TranscriptConsequence {
+                transcript_id: None,
+                terms: ordered,
+            });
+        }
+    }
+
     fn overlaps_cds(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
         let Some(cds_start) = tx.cds_start else {
             return false;
@@ -207,11 +440,44 @@ impl TranscriptConsequenceEngine {
 
         terms.insert(SoTerm::CodingSequenceVariant);
 
+        if cds_is_incomplete(tx) && self.overlaps_stop_codon(variant, tx) {
+            terms.insert(SoTerm::IncompleteTerminalCodonVariant);
+        }
+
+        if ref_len == 0 {
+            return;
+        }
+
         if self.overlaps_start_codon(variant, tx) {
-            terms.insert(SoTerm::StartLost);
+            if is_start_codon(&variant.ref_allele) && is_start_codon(&variant.alt_allele) {
+                terms.insert(SoTerm::StartRetainedVariant);
+            } else {
+                terms.insert(SoTerm::StartLost);
+            }
         }
         if self.overlaps_stop_codon(variant, tx) {
-            terms.insert(SoTerm::StopLost);
+            if is_stop_codon(&variant.ref_allele) && is_stop_codon(&variant.alt_allele) {
+                terms.insert(SoTerm::StopRetainedVariant);
+            } else if !is_stop_codon(&variant.ref_allele) && is_stop_codon(&variant.alt_allele) {
+                terms.insert(SoTerm::StopGained);
+            } else {
+                terms.insert(SoTerm::StopLost);
+            }
+        }
+
+        if variant.ref_allele.eq_ignore_ascii_case(&variant.alt_allele) {
+            terms.insert(SoTerm::SynonymousVariant);
+        } else if ref_len == 1 && alt_len == 1 {
+            terms.insert(SoTerm::MissenseVariant);
+            terms.insert(SoTerm::ProteinAlteringVariant);
+        } else if ref_len % 3 == 0 && alt_len % 3 == 0 {
+            if !is_stop_codon(&variant.ref_allele) && is_stop_codon(&variant.alt_allele) {
+                terms.insert(SoTerm::StopGained);
+            } else {
+                terms.insert(SoTerm::ProteinAlteringVariant);
+            }
+        } else {
+            terms.insert(SoTerm::ProteinAlteringVariant);
         }
     }
 
@@ -412,32 +678,7 @@ impl TranscriptConsequenceEngine {
 }
 
 pub fn implemented_phase2_terms() -> Vec<SoTerm> {
-    vec![
-        SoTerm::IntergenicVariant,
-        SoTerm::UpstreamGeneVariant,
-        SoTerm::DownstreamGeneVariant,
-        SoTerm::IntronVariant,
-        SoTerm::SpliceAcceptorVariant,
-        SoTerm::SpliceDonorVariant,
-        SoTerm::SpliceDonor5thBaseVariant,
-        SoTerm::SpliceDonorRegionVariant,
-        SoTerm::SpliceRegionVariant,
-        SoTerm::SplicePolypyrimidineTractVariant,
-        SoTerm::FivePrimeUtrVariant,
-        SoTerm::ThreePrimeUtrVariant,
-        SoTerm::NonCodingTranscriptExonVariant,
-        SoTerm::NonCodingTranscriptVariant,
-        SoTerm::NmdTranscriptVariant,
-        SoTerm::CodingTranscriptVariant,
-        SoTerm::CodingSequenceVariant,
-        SoTerm::FrameshiftVariant,
-        SoTerm::InframeInsertion,
-        SoTerm::InframeDeletion,
-        SoTerm::ProteinAlteringVariant,
-        SoTerm::StartLost,
-        SoTerm::StopLost,
-        SoTerm::SequenceVariant,
-    ]
+    ALL_SO_TERMS.to_vec()
 }
 
 pub fn missing_phase2_terms() -> Vec<SoTerm> {
@@ -497,6 +738,28 @@ fn allele_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
     (ref_len, alt_len)
 }
 
+fn cds_is_incomplete(tx: &TranscriptFeature) -> bool {
+    let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
+        return false;
+    };
+    if cds_start <= 0 || cds_end <= 0 || cds_end < cds_start {
+        return false;
+    }
+    let cds_len = cds_end - cds_start + 1;
+    cds_len % 3 != 0
+}
+
+fn is_start_codon(allele: &str) -> bool {
+    allele.eq_ignore_ascii_case("ATG")
+}
+
+fn is_stop_codon(allele: &str) -> bool {
+    matches!(
+        allele.to_ascii_uppercase().as_str(),
+        "TAA" | "TAG" | "TGA" | "*"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +802,51 @@ mod tests {
             end,
             ref_allele: r.to_string(),
             alt_allele: a.to_string(),
+        }
+    }
+
+    fn regulatory(id: &str, chrom: &str, start: i64, end: i64) -> RegulatoryFeature {
+        RegulatoryFeature {
+            feature_id: id.to_string(),
+            chrom: chrom.to_string(),
+            start,
+            end,
+        }
+    }
+
+    fn motif(id: &str, chrom: &str, start: i64, end: i64) -> MotifFeature {
+        MotifFeature {
+            motif_id: id.to_string(),
+            chrom: chrom.to_string(),
+            start,
+            end,
+        }
+    }
+
+    fn mirna(id: &str, chrom: &str, start: i64, end: i64) -> MirnaFeature {
+        MirnaFeature {
+            mirna_id: id.to_string(),
+            chrom: chrom.to_string(),
+            start,
+            end,
+        }
+    }
+
+    fn sv(
+        id: &str,
+        chrom: &str,
+        start: i64,
+        end: i64,
+        feature_kind: SvFeatureKind,
+        event_kind: SvEventKind,
+    ) -> StructuralFeature {
+        StructuralFeature {
+            feature_id: id.to_string(),
+            chrom: chrom.to_string(),
+            start,
+            end,
+            feature_kind,
+            event_kind,
         }
     }
 
@@ -679,6 +987,28 @@ mod tests {
     }
 
     #[test]
+    fn coding_substitution_emits_missense_variant() {
+        let engine = TranscriptConsequenceEngine::default();
+        let tx = tx(
+            "pc",
+            "22",
+            100,
+            300,
+            1,
+            "protein_coding",
+            Some(120),
+            Some(280),
+        );
+        let exons = vec![exon("pc", 1, 100, 300)];
+        let assignments = engine.evaluate_variant(
+            &var("22", 150, 150, "A", "G"),
+            std::slice::from_ref(&tx),
+            &exons,
+        );
+        assert!(assignments[0].terms.contains(&SoTerm::MissenseVariant));
+    }
+
+    #[test]
     fn utr_terms_are_strand_aware() {
         let engine = TranscriptConsequenceEngine::default();
         let tx_pos = tx(
@@ -789,11 +1119,203 @@ mod tests {
     }
 
     #[test]
+    fn retained_and_gained_stop_terms_are_emitted() {
+        let engine = TranscriptConsequenceEngine::default();
+        let tx = tx(
+            "pc",
+            "22",
+            100,
+            400,
+            1,
+            "protein_coding",
+            Some(150),
+            Some(360),
+        );
+        let exons = vec![exon("pc", 1, 100, 400)];
+
+        let stop_retained = engine.evaluate_variant(
+            &var("22", 359, 361, "TAA", "TGA"),
+            std::slice::from_ref(&tx),
+            &exons,
+        );
+        assert!(
+            stop_retained[0]
+                .terms
+                .contains(&SoTerm::StopRetainedVariant)
+        );
+
+        let stop_gained = engine.evaluate_variant(
+            &var("22", 220, 222, "CAA", "TAA"),
+            std::slice::from_ref(&tx),
+            &exons,
+        );
+        assert!(stop_gained[0].terms.contains(&SoTerm::StopGained));
+    }
+
+    #[test]
+    fn start_retained_and_incomplete_terminal_codon_terms() {
+        let engine = TranscriptConsequenceEngine::default();
+        let tx_complete = tx(
+            "pc",
+            "22",
+            100,
+            350,
+            1,
+            "protein_coding",
+            Some(151),
+            Some(240), // 90bp (complete)
+        );
+        let tx_incomplete = tx(
+            "pc2",
+            "22",
+            100,
+            350,
+            1,
+            "protein_coding",
+            Some(151),
+            Some(241), // 91bp (incomplete terminal codon)
+        );
+        let exons = vec![exon("pc", 1, 100, 350), exon("pc2", 1, 100, 350)];
+
+        let start_retained = engine.evaluate_variant(
+            &var("22", 151, 153, "ATG", "ATG"),
+            std::slice::from_ref(&tx_complete),
+            &exons,
+        );
+        assert!(
+            start_retained[0]
+                .terms
+                .contains(&SoTerm::StartRetainedVariant)
+        );
+
+        let incomplete = engine.evaluate_variant(
+            &var("22", 239, 241, "TAA", "TAG"),
+            std::slice::from_ref(&tx_incomplete),
+            &exons,
+        );
+        assert!(
+            incomplete[0]
+                .terms
+                .contains(&SoTerm::IncompleteTerminalCodonVariant)
+        );
+    }
+
+    #[test]
+    fn context_features_emit_regulatory_tfbs_mirna_and_sv_terms() {
+        let engine = TranscriptConsequenceEngine::default();
+        let tx = tx(
+            "tx1",
+            "22",
+            100,
+            250,
+            1,
+            "protein_coding",
+            Some(120),
+            Some(240),
+        );
+        let exons = vec![exon("tx1", 1, 100, 250)];
+        let regulatory_features = vec![regulatory("reg1", "22", 140, 180)];
+        let motifs = vec![motif("motif1", "22", 150, 160)];
+        let mirnas = vec![mirna("mir1", "22", 155, 165)];
+        let structural = vec![
+            sv(
+                "sv_tx_del",
+                "22",
+                150,
+                160,
+                SvFeatureKind::Transcript,
+                SvEventKind::Ablation,
+            ),
+            sv(
+                "sv_tx_amp",
+                "22",
+                150,
+                160,
+                SvFeatureKind::Transcript,
+                SvEventKind::Amplification,
+            ),
+            sv(
+                "sv_tx_elong",
+                "22",
+                150,
+                160,
+                SvFeatureKind::Transcript,
+                SvEventKind::Elongation,
+            ),
+            sv(
+                "sv_tx_trunc",
+                "22",
+                150,
+                160,
+                SvFeatureKind::Transcript,
+                SvEventKind::Truncation,
+            ),
+            sv(
+                "sv_reg_del",
+                "22",
+                150,
+                160,
+                SvFeatureKind::Regulatory,
+                SvEventKind::Ablation,
+            ),
+            sv(
+                "sv_reg_amp",
+                "22",
+                150,
+                160,
+                SvFeatureKind::Regulatory,
+                SvEventKind::Amplification,
+            ),
+            sv(
+                "sv_tfbs_del",
+                "22",
+                150,
+                160,
+                SvFeatureKind::Tfbs,
+                SvEventKind::Ablation,
+            ),
+            sv(
+                "sv_tfbs_amp",
+                "22",
+                150,
+                160,
+                SvFeatureKind::Tfbs,
+                SvEventKind::Amplification,
+            ),
+        ];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 155, 155, "A", "G"),
+            &[tx],
+            &exons,
+            &regulatory_features,
+            &motifs,
+            &mirnas,
+            &structural,
+        );
+        let collapsed = TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
+
+        assert!(collapsed.contains(&SoTerm::RegulatoryRegionVariant));
+        assert!(collapsed.contains(&SoTerm::RegulatoryRegionAblation));
+        assert!(collapsed.contains(&SoTerm::RegulatoryRegionAmplification));
+        assert!(collapsed.contains(&SoTerm::TfBindingSiteVariant));
+        assert!(collapsed.contains(&SoTerm::TfbsAblation));
+        assert!(collapsed.contains(&SoTerm::TfbsAmplification));
+        assert!(collapsed.contains(&SoTerm::MatureMirnaVariant));
+        assert!(collapsed.contains(&SoTerm::TranscriptAblation));
+        assert!(collapsed.contains(&SoTerm::TranscriptAmplification));
+        assert!(collapsed.contains(&SoTerm::FeatureElongation));
+        assert!(collapsed.contains(&SoTerm::FeatureTruncation));
+    }
+
+    #[test]
     fn phase2_coverage_lists_sum_to_41() {
         let implemented = implemented_phase2_terms();
         let missing = missing_phase2_terms();
         assert_eq!(implemented.len() + missing.len(), 41);
         assert!(implemented.contains(&SoTerm::FrameshiftVariant));
-        assert!(missing.contains(&SoTerm::MissenseVariant));
+        assert!(implemented.contains(&SoTerm::MissenseVariant));
+        assert!(implemented.contains(&SoTerm::RegulatoryRegionVariant));
+        assert!(missing.is_empty());
     }
 }

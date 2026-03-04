@@ -7,9 +7,9 @@ VEP-oriented DataFusion functions and benchmark tooling.
 | Area | Status | Notes |
 |---|---|---|
 | `lookup_variants(...)` table function | Implemented | Parquet + Fjall backends, match modes (`exact`, `exact_or_colocated_ids`, `exact_or_vep_existing`) |
-| `annotate_vep(...)` table function | Phase 2 (transcript/exon baseline) | Uses `lookup_variants` metadata + transcript/exon context (when available) for ranked SO output; falls back to phase-1.5 placeholder CSQ when context tables are absent |
+| `annotate_vep(...)` table function | Phase 2 (context-aware baseline) | Uses `lookup_variants` metadata + transcript/exon context, and optionally regulatory/motif/miRNA/SV context tables for ranked SO output; falls back to phase-1.5 placeholder CSQ when context tables are absent |
 | Ensembl VEP 115 golden benchmark pipeline | Implemented | Samples 1000 variants, runs VEP 115 in Docker, compares with `annotate_vep` output |
-| Full consequence engine parity (41 SO terms) | In progress | Design and cache contract documented in `PORTING_PLAN.md` |
+| Full consequence engine parity (41 SO terms) | In progress | 41/41 term handlers are wired; codon-accurate parity and golden-match quality are still in progress (`PORTING_PLAN.md`) |
 
 ## Golden Benchmark: `annotate_vep` vs Ensembl VEP 115
 

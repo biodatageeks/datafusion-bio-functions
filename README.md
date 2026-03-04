@@ -68,6 +68,10 @@ annotate_vep(
 - `options_json` (optional): backend/runtime options. Current keys:
   - `transcripts_table`: registered table name with transcript intervals/coding context.
   - `exons_table`: registered table name with exon intervals/order.
+  - `regulatory_table`: registered table name with regulatory intervals.
+  - `motif_table`: registered table name with motif/TFBS intervals.
+  - `mirna_table`: registered table name with mature miRNA intervals.
+  - `sv_table`: registered table name with structural-event overlaps.
 
 Current phase behavior:
 - pass-through VCF rows,
@@ -86,7 +90,7 @@ Feature comparison snapshot:
 |------------|----------------------------|-----------------------------|
 | Known-variant cache lookup | ✅ (`--check_existing`, colocated behavior) | ✅ (`lookup_variants` + match modes) |
 | Transcript consequence engine | ✅ (full SO consequence model) | 🚧 transcript/exon phase-2 baseline merged (not full VEP parity) |
-| Supported consequence terms | 41/41 | 🚧 partial runtime coverage (transcript/exon-focused subset; regulatory/SV still missing) |
+| Supported consequence terms | 41/41 | 🚧 41/41 term handlers wired; codon-accurate parity still in progress |
 | Most severe consequence output | ✅ | 🚧 ranked SO output when transcript/exon context is available; fallback placeholder otherwise |
 | Backend abstraction | Cache/files in VEP ecosystem | ✅ unified API for `parquet` + `fjall` entrypoint |
 | Native SQL execution in DataFusion | ❌ | ✅ |

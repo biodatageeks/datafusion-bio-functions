@@ -361,7 +361,7 @@ mod tests {
         assert!(
             csq[0]
                 .as_ref()
-                .is_some_and(|s| s.contains("coding_sequence_variant"))
+                .is_some_and(|s| s.contains("missense_variant"))
         );
         assert!(csq[0].as_ref().is_some_and(|s| s.contains("rs100")));
         assert!(
@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(
             most,
             vec![
-                Some("coding_sequence_variant".to_string()),
+                Some("missense_variant".to_string()),
                 Some("non_coding_transcript_exon_variant".to_string())
             ]
         );
