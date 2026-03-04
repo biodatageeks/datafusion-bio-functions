@@ -221,7 +221,7 @@ impl VepKvStore {
         end: i64,
         value: &[u8],
     ) -> Result<()> {
-        let key = crate::key_encoding::encode_position_key(chrom, start, end);
+        let key = super::key_encoding::encode_position_key(chrom, start, end);
         self.data.insert(&key, value).map_err(fjall_err)?;
         Ok(())
     }
@@ -236,7 +236,7 @@ impl VepKvStore {
         end: i64,
     ) -> Result<Option<fjall::UserValue>> {
         let mut key_buf = Vec::with_capacity(18);
-        crate::key_encoding::encode_position_key_buf(chrom_code, start, end, &mut key_buf);
+        super::key_encoding::encode_position_key_buf(chrom_code, start, end, &mut key_buf);
         match self.data.get(&key_buf) {
             Ok(v) => Ok(v),
             Err(e) => Err(fjall_err(e)),
@@ -513,7 +513,7 @@ mod tests {
         store.put_position_entry("1", 100, 100, value).unwrap();
         store.persist().unwrap();
 
-        let chrom_code = crate::key_encoding::chrom_to_code("1");
+        let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
         let loaded = store
             .get_position_entry(chrom_code, 100, 100)
             .unwrap()
@@ -576,7 +576,7 @@ mod tests {
         assert!(reopened.has_dict());
 
         // Verify decompressed roundtrip for each entry.
-        let chrom_code = crate::key_encoding::chrom_to_code("1");
+        let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
         for (i, sample) in samples.iter().enumerate() {
             let decompressed = reopened
                 .get_position_entry_decompressed(chrom_code, i as i64, i as i64)
@@ -631,7 +631,7 @@ mod tests {
         drop(store);
 
         let reopened = VepKvStore::open(dir.path()).unwrap();
-        let chrom_code = crate::key_encoding::chrom_to_code("1");
+        let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
         let decompressed = reopened
             .get_position_entry_decompressed(chrom_code, 42, 42)
             .unwrap()

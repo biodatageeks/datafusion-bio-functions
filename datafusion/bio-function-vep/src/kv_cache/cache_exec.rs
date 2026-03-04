@@ -22,10 +22,10 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt};
 
-use crate::allele_index::AlleleMatcher;
-use crate::key_encoding::chrom_to_code;
-use crate::kv_store::VepKvStore;
-use crate::position_entry::{PositionEntryReader, make_builder};
+use super::allele_index::AlleleMatcher;
+use super::key_encoding::chrom_to_code;
+use super::kv_store::VepKvStore;
+use super::position_entry::{PositionEntryReader, make_builder};
 
 /// Lookup match mode (mirrors MatchMode from bio-function-vep).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

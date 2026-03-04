@@ -59,11 +59,7 @@ pub struct LookupProvider {
     cache_columns: Vec<String>,
     /// Lookup matching strategy.
     match_mode: MatchMode,
-    /// Whether to auto-prune all-null columns from output.
-    #[allow(dead_code)]
-    prune_nulls: bool,
     /// Coordinate normalizer for handling different coordinate systems.
-    #[allow(dead_code)]
     coord_normalizer: CoordinateNormalizer,
     /// When true, use interval-overlap SQL and multi-probe KV lookups.
     extended_probes: bool,
@@ -88,7 +84,6 @@ impl LookupProvider {
         cache_schema: Schema,
         cache_columns: Vec<String>,
         match_mode: MatchMode,
-        prune_nulls: bool,
         extended_probes: bool,
     ) -> Result<Self> {
         let cache_schema_ref: SchemaRef = Arc::new(cache_schema.clone());
@@ -130,7 +125,6 @@ impl LookupProvider {
             vcf_schema,
             cache_columns,
             match_mode,
-            prune_nulls,
             coord_normalizer,
             extended_probes,
             schema,
@@ -193,8 +187,8 @@ impl TableProvider for LookupProvider {
         #[cfg(feature = "kv-cache")]
         {
             use crate::allele::{allele_matches, allele_matches_relaxed};
-            use datafusion_bio_function_vep_cache::KvCacheTableProvider;
-            use datafusion_bio_function_vep_cache::cache_exec::{KvLookupExec, KvMatchMode};
+            use crate::kv_cache::cache_exec::{KvLookupExec, KvMatchMode};
+            use crate::kv_cache::KvCacheTableProvider;
 
             let table_ref = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -578,8 +572,8 @@ mod tests {
     use datafusion::datasource::MemTable;
     use datafusion::physical_plan::displayable;
     #[cfg(feature = "kv-cache")]
-    use datafusion_bio_function_vep_cache::{
-        KvCacheTableProvider, VepKvStore, position_entry::serialize_position_entry,
+    use crate::kv_cache::{
+        position_entry::serialize_position_entry, KvCacheTableProvider, VepKvStore,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -870,7 +864,7 @@ mod tests {
         ctx.register_table("var_cache", Arc::new(kv_provider)).unwrap();
 
         let batches = ctx
-            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string', false, 'exact', true)")
+            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string', 'exact', true)")
             .await
             .unwrap()
             .collect()
@@ -958,7 +952,7 @@ mod tests {
         ctx.register_table("var_cache", Arc::new(kv_provider)).unwrap();
 
         let batches = ctx
-            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string', false, 'exact', true)")
+            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string', 'exact', true)")
             .await
             .unwrap()
             .collect()
@@ -1279,7 +1273,7 @@ mod tests {
             .unwrap();
 
         let df = ctx
-            .sql("SELECT * FROM lookup_variants('vcf_insertion', 'cache_insertion_style', 'variation_name', false, 'exact', true)")
+            .sql("SELECT * FROM lookup_variants('vcf_insertion', 'cache_insertion_style', 'variation_name', 'exact', true)")
             .await
             .unwrap();
         let batches = df.collect().await.unwrap();
@@ -1358,7 +1352,7 @@ mod tests {
         // Exact mode: no allele match => NULL variation_name.
         let exact_df = ctx
             .sql(
-                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name,somatic', false, 'exact')",
+                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name,somatic', 'exact')",
             )
             .await
             .unwrap();
@@ -1377,7 +1371,7 @@ mod tests {
         // Fallback mode: fill variation_name and somatic from co-located rows.
         let coloc_df = ctx
             .sql(
-                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name,somatic', false, 'exact_or_colocated_ids')",
+                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name,somatic', 'exact_or_colocated_ids')",
             )
             .await
             .unwrap();
@@ -1453,7 +1447,7 @@ mod tests {
         // Exact mode must miss because both cache refs mismatch ("C/-", "T/-").
         let exact_df = ctx
             .sql(
-                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name,somatic', false, 'exact')",
+                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name,somatic', 'exact')",
             )
             .await
             .unwrap();
@@ -1473,7 +1467,7 @@ mod tests {
         // variation_name and somatic, preferring rs* IDs when available.
         let vep_existing_df = ctx
             .sql(
-                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name,somatic', false, 'exact_or_vep_existing')",
+                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name,somatic', 'exact_or_vep_existing')",
             )
             .await
             .unwrap();

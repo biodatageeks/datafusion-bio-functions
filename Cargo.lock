@@ -1157,26 +1157,12 @@ dependencies = [
 name = "datafusion-bio-function-vep"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "datafusion",
- "datafusion-bio-format-vcf",
- "datafusion-bio-function-ranges",
- "datafusion-bio-function-vep-cache",
- "env_logger",
- "futures",
- "log",
- "tokio",
-]
-
-[[package]]
-name = "datafusion-bio-function-vep-cache"
-version = "0.1.0"
-dependencies = [
  "ahash",
  "arrow-ipc",
  "async-trait",
  "datafusion",
  "datafusion-bio-format-vcf",
+ "datafusion-bio-function-ranges",
  "env_logger",
  "fjall",
  "futures",

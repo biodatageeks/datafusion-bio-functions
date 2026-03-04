@@ -30,7 +30,7 @@ use crate::lookup_provider::{LookupProvider, MatchMode};
 use crate::schema_contract::{COORDINATE_COLUMNS, parse_column_list, validate_requested_columns};
 
 /// Table function implementing
-/// `lookup_variants(vcf_table, cache_table [, columns [, prune [, match_mode [, extended_probes]]]])`.
+/// `lookup_variants(vcf_table, cache_table [, columns [, match_mode [, extended_probes]]])`.
 pub struct LookupFunction {
     session: Arc<SessionContext>,
 }
@@ -80,14 +80,7 @@ impl TableFunctionImpl for LookupFunction {
                 .collect()
         };
 
-        // Optional fourth argument: prune all-null columns (default: false)
-        let prune_nulls = if args.len() > 3 {
-            extract_bool_arg(&args[3], "prune_nulls", "lookup_variants")?
-        } else {
-            false
-        };
-
-        // Optional fifth argument: match mode (default: "exact")
+        // Optional fourth argument: match mode (default: "exact")
         // - exact: equi-join on (chrom, start, end) + exact allele matching.
         //   Only matches cache entries at the same normalized coordinates.
         //   Insertions/deletions with VEP-style shifted coordinates require
@@ -98,14 +91,14 @@ impl TableFunctionImpl for LookupFunction {
         // - exact_or_vep_existing: exact mode, but for unmatched rows fills
         //   fallback-capable columns using indel-aware relaxed allele-compatible
         //   co-located rows; for `variation_name` it prefers rs* identifiers.
-        let match_mode = if args.len() > 4 {
-            let mode = extract_string_arg(&args[4], "match_mode", "lookup_variants")?;
+        let match_mode = if args.len() > 3 {
+            let mode = extract_string_arg(&args[3], "match_mode", "lookup_variants")?;
             parse_match_mode(&mode)?
         } else {
             MatchMode::Exact
         };
 
-        // Optional sixth argument: extended_probes (default: false)
+        // Optional fifth argument: extended_probes (default: false)
         // When true, uses interval-overlap SQL (instead of equi-join) and
         // multi-probe KV lookups to match VEP-style coordinate encodings:
         //   - insertion-style (start > end)
@@ -113,8 +106,8 @@ impl TableFunctionImpl for LookupFunction {
         //   - tandem-repeat right/left shifted deletion windows
         // Set to true when the cache contains VEP-normalized indel coordinates
         // that differ from the VCF input coordinates.
-        let extended_probes = if args.len() > 5 {
-            extract_bool_arg(&args[5], "extended_probes", "lookup_variants")?
+        let extended_probes = if args.len() > 4 {
+            extract_bool_arg(&args[4], "extended_probes", "lookup_variants")?
         } else {
             false
         };
@@ -131,7 +124,6 @@ impl TableFunctionImpl for LookupFunction {
             cache_schema,
             columns,
             match_mode,
-            prune_nulls,
             extended_probes,
         )?))
     }

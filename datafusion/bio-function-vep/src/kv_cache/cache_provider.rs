@@ -13,7 +13,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 
-use crate::kv_store::VepKvStore;
+use super::kv_store::VepKvStore;
 
 /// TableProvider backed by a fjall KV store containing VEP cache data.
 ///

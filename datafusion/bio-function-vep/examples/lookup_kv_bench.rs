@@ -6,7 +6,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::register_vep_functions;
 #[cfg(feature = "kv-cache")]
-use datafusion_bio_function_vep_cache::KvCacheTableProvider;
+use datafusion_bio_function_vep::kv_cache::KvCacheTableProvider;
 
 #[derive(Clone, Debug)]
 struct Case {

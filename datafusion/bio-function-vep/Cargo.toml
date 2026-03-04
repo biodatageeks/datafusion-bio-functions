@@ -11,16 +11,21 @@ edition.workspace = true
 [dependencies]
 datafusion.workspace = true
 datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
-datafusion-bio-function-vep-cache = { path = "../bio-function-vep-cache", optional = true }
 tokio.workspace = true
 futures.workspace = true
 log.workspace = true
 async-trait = "0.1.88"
+fjall = { version = "3.0.2", optional = true }
+arrow-ipc = { version = "56", features = ["lz4", "zstd"], optional = true }
+lz4_flex = { version = "0.12.0", optional = true }
+zstd = { version = "0.13.3", optional = true }
+ahash = { version = "0.8.6", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "45562f3beb230c23008b19bfe6c172bd1c5923fa" }
 env_logger = "0.11"
+tempfile = "3"
 
 [[example]]
 name = "vcf_batch_stats"
@@ -30,6 +35,26 @@ required-features = []
 name = "lookup_parquet_bench"
 required-features = []
 
+[[example]]
+name = "lookup_kv_bench"
+required-features = ["kv-cache"]
+
+[[example]]
+name = "load_cache"
+required-features = ["kv-cache"]
+
+[[example]]
+name = "load_cache_full"
+required-features = ["kv-cache"]
+
+[[example]]
+name = "bench_annotate"
+required-features = ["kv-cache"]
+
+[[example]]
+name = "bench_fjall_gets"
+required-features = ["kv-cache"]
+
 [features]
 default = ["kv-cache"]
-kv-cache = ["dep:datafusion-bio-function-vep-cache"]
+kv-cache = ["dep:fjall", "dep:arrow-ipc", "dep:lz4_flex", "dep:zstd", "dep:ahash"]

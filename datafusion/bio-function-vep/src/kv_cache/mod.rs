@@ -1,4 +1,4 @@
-//! fjall KV cache backend for VEP variant lookup.
+//! Fjall KV cache backend for VEP variant lookup.
 //!
 //! Stores one zstd-compressed entry per genomic position in a fjall LSM-tree.
 //! Query variants are annotated by direct position key lookups.

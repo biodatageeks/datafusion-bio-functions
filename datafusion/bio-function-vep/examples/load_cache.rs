@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_bio_function_vep_cache::{CacheLoader, VepKvStore};
+use datafusion_bio_function_vep::kv_cache::{CacheLoader, VepKvStore};
 
 #[tokio::main]
 async fn main() -> datafusion::common::Result<()> {
@@ -91,7 +91,7 @@ async fn main() -> datafusion::common::Result<()> {
 
     // Measure a few position lookups
     let sample_chrom = chrom_filter.unwrap_or("22");
-    let chrom_code = datafusion_bio_function_vep_cache::key_encoding::chrom_to_code(sample_chrom);
+    let chrom_code = datafusion_bio_function_vep::kv_cache::key_encoding::chrom_to_code(sample_chrom);
     let read_start = Instant::now();
     let mut read_iters = 0u32;
     for pos in 0..20u64 {

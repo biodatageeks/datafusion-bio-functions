@@ -5,7 +5,7 @@
 //! (mimicking sorted VCF position lookups) and measures per-get latency.
 //!
 //! Usage:
-//!   cargo run --release -p datafusion-bio-function-vep-cache --example bench_fjall_gets \
+//!   cargo run --release -p datafusion-bio-function-vep --example bench_fjall_gets \
 //!     [num_entries] [value_size_bytes] [num_lookups] [cache_size_mb]
 //!
 //! Defaults: 4_000_000 entries, 4400 bytes/value, 50_000 lookups, 512 MB cache

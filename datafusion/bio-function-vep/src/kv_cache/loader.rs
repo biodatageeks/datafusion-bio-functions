@@ -26,9 +26,9 @@ use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use log::{debug, info};
 
-use crate::key_encoding::{chrom_to_code, encode_position_key};
-use crate::kv_store::{VepKvStore, decompress_into_buffer_with_retry};
-use crate::position_entry::{PositionEntryReader, make_builder, serialize_position_entry};
+use super::key_encoding::{chrom_to_code, encode_position_key};
+use super::kv_store::{VepKvStore, decompress_into_buffer_with_retry};
+use super::position_entry::{PositionEntryReader, make_builder, serialize_position_entry};
 
 /// Statistics returned after loading.
 #[derive(Debug, Clone)]
@@ -591,7 +591,7 @@ fn string_value(col: &dyn Array, row: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kv_store::FORMAT_V0;
+    use crate::kv_cache::kv_store::FORMAT_V0;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
@@ -640,8 +640,8 @@ mod tests {
         assert_eq!(store.schema().as_ref(), schema.as_ref());
 
         // Verify position entries exist.
-        let chrom_code_1 = crate::key_encoding::chrom_to_code("1");
-        let chrom_code_2 = crate::key_encoding::chrom_to_code("2");
+        let chrom_code_1 = crate::kv_cache::key_encoding::chrom_to_code("1");
+        let chrom_code_2 = crate::kv_cache::key_encoding::chrom_to_code("2");
 
         let entry = store
             .get_position_entry_decompressed(chrom_code_1, 100, 100)
@@ -669,7 +669,7 @@ mod tests {
             .get_position_entry_decompressed(chrom_code_1, 100, 100)
             .unwrap()
             .unwrap();
-        let reader = crate::position_entry::PositionEntryReader::new(&raw).unwrap();
+        let reader = crate::kv_cache::position_entry::PositionEntryReader::new(&raw).unwrap();
         assert!(reader.num_alleles() >= 1);
         assert!(reader.num_cols() > 0);
     }

@@ -15,8 +15,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 |-------|-------------|--------|
 | **[datafusion-bio-function-pileup](datafusion/bio-function-pileup)** | Depth-of-coverage (pileup) computation from BAM alignments | ✅ |
 | **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, nearest-neighbor, overlap, merge, cluster, complement, and subtract operations | ✅ |
-| **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via `lookup_variants()` table function with KV cache backend | ✅ |
-| **[datafusion-bio-function-vep-cache](datafusion/bio-function-vep-cache)** | fjall KV store for VEP variation cache (zstd dictionary compression) | ✅ |
+| **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via `lookup_variants()` table function with parquet + Fjall KV cache backends | ✅ |
 
 ## Features
 
@@ -68,25 +67,25 @@ lookup_variants(
   vcf_table,
   cache_table
   [, columns]
-  [, prune_nulls]
   [, match_mode]
+  [, extended_probes]
 )
 ```
 
 - `vcf_table`: registered VCF input table name.
 - `cache_table`: registered annotation cache table/provider name (Parquet or Fjall).
 - `columns` (optional): comma-separated cache columns to project. Default: all cache columns except `chrom,start,end` and `source_*`.
-- `prune_nulls` (optional, default `false`): remove cache-side rows where all selected annotation columns are null before join/lookup.
 - `match_mode` (optional, default `exact`):
   - `exact`: interval overlap + exact allele matching only.
   - `exact_or_colocated_ids`: runs `exact`; for unmatched rows, fills fallback-capable columns (`variation_name`, `somatic`) from co-located overlap IDs.
   - `exact_or_vep_existing`: runs `exact`; for unmatched rows, fills fallback-capable columns from indel-aware relaxed allele-compatible co-located rows (prefers `rs*` IDs for `variation_name`).
+- `extended_probes` (optional, default `false`): enables wider coordinate probing for VEP-style insertion/deletion coordinate encodings.
 
 Example:
 
 ```sql
 SELECT *
-FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,clin_sig', false, 'exact');
+FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,clin_sig', 'exact');
 ```
 
 **Parquet-backed cache table:**
@@ -110,7 +109,7 @@ let df = ctx
 use std::sync::Arc;
 use datafusion::prelude::SessionContext;
 use datafusion_bio_function_vep::register_vep_functions;
-use datafusion_bio_function_vep_cache::KvCacheTableProvider;
+use datafusion_bio_function_vep::kv_cache::KvCacheTableProvider;
 
 let ctx = SessionContext::new();
 register_vep_functions(&ctx);
@@ -127,7 +126,7 @@ let df = ctx
 Create a full Fjall cache from a Parquet variation cache:
 
 ```bash
-cargo run -p datafusion-bio-function-vep-cache --example load_cache_full --release -- \
+cargo run -p datafusion-bio-function-vep --example load_cache_full --features kv-cache --release -- \
   /path/to/115_GRCh38_variants.parquet \
   /path/to/variation_fjall \
   8
@@ -139,7 +138,7 @@ cargo run -p datafusion-bio-function-vep-cache --example load_cache_full --relea
 Create a filtered cache (single chromosome) and optionally tune compression:
 
 ```bash
-cargo run -p datafusion-bio-function-vep-cache --example load_cache --release -- \
+cargo run -p datafusion-bio-function-vep --example load_cache --features kv-cache --release -- \
   /path/to/115_GRCh38_variants.parquet \
   /path/to/variation_fjall_chr22 \
   22 \

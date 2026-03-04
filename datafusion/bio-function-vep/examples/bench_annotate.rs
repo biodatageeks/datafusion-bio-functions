@@ -7,8 +7,8 @@ use datafusion::prelude::SessionContext;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use futures::StreamExt;
 
-use datafusion_bio_function_vep_cache::cache_exec::{KvLookupExec, KvMatchMode};
-use datafusion_bio_function_vep_cache::kv_store::VepKvStore;
+use datafusion_bio_function_vep::kv_cache::cache_exec::{KvLookupExec, KvMatchMode};
+use datafusion_bio_function_vep::kv_cache::kv_store::VepKvStore;
 
 fn allele_matches(_vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool {
     let mut parts = allele_string.split('/');

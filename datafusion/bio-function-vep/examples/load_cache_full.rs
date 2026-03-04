@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_bio_function_vep_cache::CacheLoader;
+use datafusion_bio_function_vep::kv_cache::CacheLoader;
 
 #[tokio::main]
 async fn main() -> datafusion::common::Result<()> {
