@@ -1165,6 +1165,7 @@ dependencies = [
  "datafusion-bio-function-ranges",
  "env_logger",
  "fjall",
+ "flate2",
  "futures",
  "log",
  "lz4_flex 0.12.0",

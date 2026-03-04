@@ -43,12 +43,73 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 - **Multiple Algorithms**: Coitrees (default), IntervalTree, ArrayIntervalTree, Lapper, SuperIntervals — selectable via `SET bio.interval_join_algorithm`
 - **Transparent Optimization**: Hash/nested-loop joins with range conditions are automatically replaced with interval joins
 
-### VEP Annotation (variant lookup with KV cache)
+### VEP Annotation (lookup + consequence scaffolding)
 
 - **`lookup_variants()` Table Function**: SQL-based variant annotation against a pre-built VEP cache
 - **KV Cache Backend**: fjall LSM-tree store with zstd dictionary compression for compact on-disk storage
 - **Match Modes**: `exact`, `exact_or_colocated_ids`, `exact_or_vep_existing` (indel-aware relaxed matching)
+- **`annotate_vep()` Table Function**: backend-unified consequence annotation entrypoint (`parquet` or `fjall`) with stable output columns (`csq`, `most_severe_consequence`) for phased rollout
 - **Session Configuration**: Tunable parameters via SQL `SET` statements under the `bio.annotation` namespace
+
+#### `annotate_vep` API (Phase 1)
+
+```sql
+annotate_vep(
+  vcf_table,
+  cache_source,
+  backend
+  [, options_json]
+)
+```
+
+- `vcf_table`: registered input VCF table.
+- `cache_source`: backend-specific source path/identifier.
+- `backend`: `parquet` or `fjall`.
+- `options_json` (optional): backend/runtime options for future phases.
+
+Phase 1 behavior is intentionally non-breaking:
+- pass-through VCF rows,
+- append `csq` and `most_severe_consequence` as nullable placeholders,
+- validate backend and unify backend selection under one API.
+
+#### Ensembl-VEP Porting Plan
+
+Detailed analysis and implementation plan are in:
+- **[datafusion/bio-function-vep/PORTING_PLAN.md](datafusion/bio-function-vep/PORTING_PLAN.md)**
+
+Feature comparison snapshot:
+
+| Capability | Ensembl-VEP (release 115) | bio-functions-vep (current) |
+|------------|----------------------------|-----------------------------|
+| Known-variant cache lookup | ✅ (`--check_existing`, colocated behavior) | ✅ (`lookup_variants` + match modes) |
+| Transcript consequence engine | ✅ (full SO consequence model) | 🚧 (`annotate_vep` scaffold, engine not merged yet) |
+| Supported consequence terms | 41/41 | lookup-only; no runtime consequence calculator yet |
+| Most severe consequence output | ✅ | 🚧 placeholder column in `annotate_vep` |
+| Backend abstraction | Cache/files in VEP ecosystem | ✅ unified API for `parquet` + `fjall` entrypoint |
+| Native SQL execution in DataFusion | ❌ | ✅ |
+| Fjall KV backend | ❌ | ✅ |
+
+#### Golden Benchmark (`annotate_vep` vs Ensembl VEP 115)
+
+Benchmark input copied into this repo:
+- `vep-benchmark/data/HG002_chr22.vcf.gz`
+- `vep-benchmark/data/HG002_chr22.vcf.gz.tbi`
+
+Run the golden benchmark (samples first 1000 variants, runs Ensembl VEP 115 in Docker, runs `annotate_vep`, and writes a comparison report):
+
+```bash
+cargo run -p datafusion-bio-function-vep --example annotate_vep_golden_bench --release -- \
+  vep-benchmark/data/HG002_chr22.vcf.gz \
+  /Users/mwiewior/research/data/vep/115_GRCh38_variants.parquet \
+  parquet \
+  1000 \
+  /Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/cache \
+  vep-benchmark/data/HG002_chr22.vcf.gz \
+  /tmp/annotate_vep_golden_bench
+```
+
+Output report:
+- `/tmp/annotate_vep_golden_bench/HG002_chr22_1000_comparison_report.txt`
 
 #### Cache Backend Selection (`lookup_variants`)
 
