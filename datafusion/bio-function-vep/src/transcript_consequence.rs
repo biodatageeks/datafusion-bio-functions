@@ -440,6 +440,11 @@ impl TranscriptConsequenceEngine {
         tx_translation: Option<&TranslationFeature>,
     ) {
         let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
+        terms.insert(SoTerm::CodingSequenceVariant);
+
+        if cds_is_incomplete(tx, tx_translation) && self.overlaps_stop_codon(variant, tx) {
+            terms.insert(SoTerm::IncompleteTerminalCodonVariant);
+        }
 
         if ref_len != alt_len {
             let diff = ref_len.abs_diff(alt_len);
@@ -452,30 +457,55 @@ impl TranscriptConsequenceEngine {
             } else {
                 terms.insert(SoTerm::FrameshiftVariant);
             }
+
+            if let Some(classification) =
+                classify_coding_change(tx, tx_exons, tx_translation, variant)
+            {
+                apply_codon_classification(terms, classification);
+            } else {
+                self.add_start_stop_heuristic_terms(terms, variant, tx);
+            }
             terms.insert(SoTerm::ProteinAlteringVariant);
-            terms.insert(SoTerm::CodingSequenceVariant);
             return;
-        }
-
-        terms.insert(SoTerm::CodingSequenceVariant);
-
-        if cds_is_incomplete(tx, tx_translation) && self.overlaps_stop_codon(variant, tx) {
-            terms.insert(SoTerm::IncompleteTerminalCodonVariant);
         }
 
         if ref_len == 0 {
             return;
         }
 
-        if ref_len == alt_len {
-            if let Some(classification) =
-                classify_coding_substitution(tx, tx_exons, tx_translation, variant)
-            {
-                apply_codon_classification(terms, classification);
+        if let Some(classification) = classify_coding_change(tx, tx_exons, tx_translation, variant)
+        {
+            let has_any = classification.has_any();
+            apply_codon_classification(terms, classification);
+            if has_any {
                 return;
             }
         }
 
+        self.add_start_stop_heuristic_terms(terms, variant, tx);
+
+        if variant.ref_allele.eq_ignore_ascii_case(&variant.alt_allele) {
+            terms.insert(SoTerm::SynonymousVariant);
+        } else if ref_len == 1 && alt_len == 1 {
+            terms.insert(SoTerm::MissenseVariant);
+            terms.insert(SoTerm::ProteinAlteringVariant);
+        } else if ref_len % 3 == 0 && alt_len % 3 == 0 {
+            if !is_stop_codon(&variant.ref_allele) && is_stop_codon(&variant.alt_allele) {
+                terms.insert(SoTerm::StopGained);
+            } else {
+                terms.insert(SoTerm::ProteinAlteringVariant);
+            }
+        } else {
+            terms.insert(SoTerm::ProteinAlteringVariant);
+        }
+    }
+
+    fn add_start_stop_heuristic_terms(
+        &self,
+        terms: &mut BTreeSet<SoTerm>,
+        variant: &VariantInput,
+        tx: &TranscriptFeature,
+    ) {
         if self.overlaps_start_codon(variant, tx) {
             if is_start_codon(&variant.ref_allele) && is_start_codon(&variant.alt_allele) {
                 terms.insert(SoTerm::StartRetainedVariant);
@@ -491,21 +521,6 @@ impl TranscriptConsequenceEngine {
             } else {
                 terms.insert(SoTerm::StopLost);
             }
-        }
-
-        if variant.ref_allele.eq_ignore_ascii_case(&variant.alt_allele) {
-            terms.insert(SoTerm::SynonymousVariant);
-        } else if ref_len == 1 && alt_len == 1 {
-            terms.insert(SoTerm::MissenseVariant);
-            terms.insert(SoTerm::ProteinAlteringVariant);
-        } else if ref_len % 3 == 0 && alt_len % 3 == 0 {
-            if !is_stop_codon(&variant.ref_allele) && is_stop_codon(&variant.alt_allele) {
-                terms.insert(SoTerm::StopGained);
-            } else {
-                terms.insert(SoTerm::ProteinAlteringVariant);
-            }
-        } else {
-            terms.insert(SoTerm::ProteinAlteringVariant);
         }
     }
 
@@ -804,6 +819,18 @@ struct CodingClassification {
     start_retained: bool,
 }
 
+impl CodingClassification {
+    fn has_any(&self) -> bool {
+        self.synonymous
+            || self.missense
+            || self.stop_gained
+            || self.stop_lost
+            || self.stop_retained
+            || self.start_lost
+            || self.start_retained
+    }
+}
+
 fn apply_codon_classification(terms: &mut BTreeSet<SoTerm>, c: CodingClassification) {
     if c.start_lost {
         terms.insert(SoTerm::StartLost);
@@ -829,7 +856,7 @@ fn apply_codon_classification(terms: &mut BTreeSet<SoTerm>, c: CodingClassificat
     }
 }
 
-fn classify_coding_substitution(
+fn classify_coding_change(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
     tx_translation: Option<&TranslationFeature>,
@@ -837,11 +864,13 @@ fn classify_coding_substitution(
 ) -> Option<CodingClassification> {
     let translation = tx_translation?;
     let cds_seq = translation.cds_sequence.as_deref()?.to_ascii_uppercase();
-    let ref_len = variant.ref_allele.len();
-    let alt_len = variant.alt_allele.len();
-    if ref_len == 0 || ref_len != alt_len {
+    let ref_genomic = normalize_allele_seq(&variant.ref_allele);
+    let alt_genomic = normalize_allele_seq(&variant.alt_allele);
+    let ref_len = ref_genomic.len();
+    if ref_len == 0 {
         return None;
     }
+    let alt_len = alt_genomic.len();
 
     let genomic_positions = genomic_range(variant.start, variant.end)?;
     if genomic_positions.len() != ref_len {
@@ -866,14 +895,14 @@ fn classify_coding_substitution(
     }
 
     let ref_tx = if tx.strand >= 0 {
-        variant.ref_allele.to_ascii_uppercase()
+        ref_genomic
     } else {
-        reverse_complement(&variant.ref_allele)?.to_ascii_uppercase()
+        reverse_complement(&ref_genomic)?.to_ascii_uppercase()
     };
     let alt_tx = if tx.strand >= 0 {
-        variant.alt_allele.to_ascii_uppercase()
+        alt_genomic
     } else {
-        reverse_complement(&variant.alt_allele)?.to_ascii_uppercase()
+        reverse_complement(&alt_genomic)?.to_ascii_uppercase()
     };
 
     let ref_seq_slice = &cds_seq[start_idx..=end_idx];
@@ -881,57 +910,81 @@ fn classify_coding_substitution(
         return None;
     }
 
-    let mut mutated = cds_seq.as_bytes().to_vec();
+    let mut mutated = Vec::with_capacity(
+        cds_seq
+            .len()
+            .saturating_sub(ref_len)
+            .saturating_add(alt_len),
+    );
+    mutated.extend_from_slice(&cds_seq.as_bytes()[..start_idx]);
     let alt_bytes = alt_tx.as_bytes();
-    if alt_bytes.len() != ref_len {
-        return None;
-    }
-    for (i, b) in alt_bytes.iter().enumerate() {
-        mutated[start_idx + i] = *b;
-    }
+    mutated.extend_from_slice(alt_bytes);
+    mutated.extend_from_slice(&cds_seq.as_bytes()[end_idx + 1..]);
 
-    let codon_start = start_idx / 3;
-    let codon_end = end_idx / 3;
+    let old_aas = translate_protein_from_cds(cds_seq.as_bytes())?;
+    let new_aas = translate_protein_from_cds(&mutated)?;
     let mut class = CodingClassification::default();
-    let mut aa_changed = false;
-    for codon_idx in codon_start..=codon_end {
-        let codon_base = codon_idx * 3;
-        if codon_base + 2 >= mutated.len() {
-            continue;
-        }
-        let old_codon = &cds_seq[codon_base..codon_base + 3];
-        let new_codon = std::str::from_utf8(&mutated[codon_base..codon_base + 3]).ok()?;
-        let old_aa = translate_codon(old_codon)?;
-        let new_aa = translate_codon(new_codon)?;
 
-        if codon_idx == 0 && old_aa == 'M' {
-            if new_aa == 'M' {
-                class.start_retained = true;
-            } else {
-                class.start_lost = true;
+    if start_idx < 3 && old_aas.first() == Some(&'M') {
+        if new_aas.first() == Some(&'M') {
+            class.start_retained = true;
+        } else {
+            class.start_lost = true;
+        }
+    }
+
+    let old_stop = old_aas.iter().position(|aa| *aa == '*');
+    let new_stop = new_aas.iter().position(|aa| *aa == '*');
+    if let (Some(old_stop_idx), Some(new_stop_idx)) = (old_stop, new_stop) {
+        let stop_nt_start = old_stop_idx.saturating_mul(3);
+        let stop_nt_end = stop_nt_start.saturating_add(2);
+        if old_stop_idx == new_stop_idx
+            && ranges_overlap_usize(start_idx, end_idx, stop_nt_start, stop_nt_end)
+        {
+            class.stop_retained = true;
+        }
+    }
+
+    let frameshift = ref_len.abs_diff(alt_len) % 3 != 0;
+    let stop_might_be_disrupted = if let Some(old_stop_idx) = old_stop {
+        let stop_nt_start = old_stop_idx.saturating_mul(3);
+        let stop_nt_end = stop_nt_start.saturating_add(2);
+        ranges_overlap_usize(start_idx, end_idx, stop_nt_start, stop_nt_end)
+            || (frameshift && start_idx <= stop_nt_end)
+    } else {
+        false
+    };
+    match (old_stop, new_stop) {
+        (Some(old_idx), Some(new_idx)) => {
+            if new_idx < old_idx {
+                class.stop_gained = true;
+            } else if new_idx > old_idx && stop_might_be_disrupted {
+                class.stop_lost = true;
             }
         }
-        if old_aa == '*' && new_aa == '*' {
-            class.stop_retained = true;
-        } else if old_aa == '*' && new_aa != '*' {
-            class.stop_lost = true;
-        } else if old_aa != '*' && new_aa == '*' {
+        (Some(_), None) => {
+            if stop_might_be_disrupted {
+                class.stop_lost = true;
+            }
+        }
+        (None, Some(_)) => {
             class.stop_gained = true;
         }
-        if old_aa != new_aa {
-            aa_changed = true;
-        }
+        (None, None) => {}
     }
 
-    if aa_changed
-        && !class.stop_gained
-        && !class.stop_lost
-        && !class.start_lost
-        && !class.stop_retained
-    {
-        class.missense = true;
-    } else if !aa_changed && !class.stop_retained && !class.start_retained {
-        class.synonymous = true;
+    if ref_len == alt_len {
+        let aa_changed = old_aas != new_aas;
+        if aa_changed
+            && !class.stop_gained
+            && !class.stop_lost
+            && !class.start_lost
+            && !class.stop_retained
+        {
+            class.missense = true;
+        } else if !aa_changed && !class.stop_retained && !class.start_retained {
+            class.synonymous = true;
+        }
     }
 
     Some(class)
@@ -974,6 +1027,18 @@ fn genomic_to_cds_index(
     None
 }
 
+fn normalize_allele_seq(allele: &str) -> String {
+    if allele == "-" {
+        String::new()
+    } else {
+        allele.to_ascii_uppercase()
+    }
+}
+
+fn ranges_overlap_usize(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
+    a_start <= b_end && b_start <= a_end
+}
+
 fn coding_segments(tx: &TranscriptFeature, tx_exons: &[&ExonFeature]) -> Option<Vec<(i64, i64)>> {
     let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
         return None;
@@ -1011,6 +1076,17 @@ fn reverse_complement(seq: &str) -> Option<String> {
             _ => return None,
         };
         out.push(c);
+    }
+    Some(out)
+}
+
+fn translate_protein_from_cds(cds: &[u8]) -> Option<Vec<char>> {
+    let codon_count = cds.len() / 3;
+    let mut out = Vec::with_capacity(codon_count);
+    for codon_idx in 0..codon_count {
+        let base = codon_idx * 3;
+        let codon = std::str::from_utf8(&cds[base..base + 3]).ok()?;
+        out.push(translate_codon(codon)?);
     }
     Some(out)
 }
@@ -1129,6 +1205,22 @@ mod tests {
             end,
             feature_kind,
             event_kind,
+        }
+    }
+
+    fn translation(
+        tx_id: &str,
+        cds_len: Option<usize>,
+        protein_len: Option<usize>,
+        translation_seq: Option<&str>,
+        cds_sequence: Option<&str>,
+    ) -> TranslationFeature {
+        TranslationFeature {
+            transcript_id: tx_id.to_string(),
+            cds_len,
+            protein_len,
+            translation_seq: translation_seq.map(|v| v.to_string()),
+            cds_sequence: cds_sequence.map(|v| v.to_string()),
         }
     }
 
@@ -1266,6 +1358,44 @@ mod tests {
             &exons,
         );
         assert!(inframe_del[0].terms.contains(&SoTerm::InframeDeletion));
+    }
+
+    #[test]
+    fn coding_inframe_deletion_with_translation_can_emit_stop_lost() {
+        let engine = TranscriptConsequenceEngine::default();
+        let tx = tx(
+            "pc",
+            "22",
+            90,
+            140,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108),
+        );
+        let exons = vec![exon("pc", 1, 90, 140)];
+        let translations = vec![translation(
+            "pc",
+            Some(9),
+            Some(3),
+            Some("MA*"),
+            Some("ATGGCTTAA"),
+        )];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 106, 108, "TAA", "-"),
+            std::slice::from_ref(&tx),
+            &exons,
+            &translations,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let collapsed = TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
+        assert!(collapsed.contains(&SoTerm::InframeDeletion));
+        assert!(collapsed.contains(&SoTerm::StopLost));
+        assert!(collapsed.contains(&SoTerm::ProteinAlteringVariant));
     }
 
     #[test]
@@ -1480,6 +1610,36 @@ mod tests {
                 .terms
                 .contains(&SoTerm::IncompleteTerminalCodonVariant)
         );
+    }
+
+    #[test]
+    fn incomplete_terminal_uses_translation_cds_len_when_cds_sequence_missing() {
+        let engine = TranscriptConsequenceEngine::default();
+        let tx = tx(
+            "pc",
+            "22",
+            90,
+            140,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108), // complete by genomic span
+        );
+        let exons = vec![exon("pc", 1, 90, 140)];
+        let translations = vec![translation("pc", Some(10), Some(3), None, None)];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 106, 108, "TAA", "TAG"),
+            &[tx],
+            &exons,
+            &translations,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let collapsed = TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
+        assert!(collapsed.contains(&SoTerm::IncompleteTerminalCodonVariant));
     }
 
     #[test]
