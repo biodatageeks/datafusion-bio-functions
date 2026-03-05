@@ -117,23 +117,22 @@ Legend:
 5. Structural-event consequences (`SV`-dependent terms)
 6. Performance tuning (projection pushdown, batching, fjall key-locality)
 
-## Progress Status (Updated March 4, 2026)
+## Progress Status (Updated March 5, 2026)
 
 | Step | Status | Notes |
 |---|---|---|
 | 1. `annotate_vep` API/backend abstraction | Complete | Unified `annotate_vep(vcf_table, cache_source, backend[, options_json])`; parquet/fjall cache source resolution implemented |
-| 2. Shared readers + transcript/exon baseline | In progress | `lookup_variants` integration complete; transcript/exon-driven consequence engine wired from context tables (`<cache>_transcripts`, `<cache>_exons`) and optional `translations` (`<cache>_translations` or `options_json.translations_table`) for codon-aware substitution classification |
-| 3. Most-severe ranking + CSQ assembly + SQL tests | In progress | SO rank model (41 terms) implemented; deterministic CSQ ordering and backend-consistency tests added (parquet vs fjall) with transcript/regulatory/motif/miRNA/SV context fixtures |
-| 4. Regulatory/motif/miRNA consequences | In progress | Runtime overlap evaluation merged for `regulatory_region_variant`, `TF_binding_site_variant`, and `mature_miRNA_variant`; golden parity fixtures still needed |
-| 5. Structural-event consequences | In progress | Runtime SV term mapping merged for transcript/regulatory/TFBS feature kinds (ablation/amplification/truncation/elongation paths); golden parity fixtures still needed |
+| 2. Shared readers + transcript/exon baseline | In progress | `lookup_variants` integration complete; transcript/exon-driven consequence engine wired from context tables (`<cache>_transcripts`, `<cache>_exons`) and optional `translations` (`<cache>_translations` or `options_json.translations_table`) for codon-aware substitution/indel classification (including strand-aware cases) |
+| 3. Most-severe ranking + CSQ assembly + SQL tests | In progress | SO rank model (41 terms) implemented; deterministic CSQ ordering/backend-consistency tests plus term-set parity fixtures added (regulatory/motif/miRNA/SV, splice boundary, repeat-shifted deletion) |
+| 4. Regulatory/motif/miRNA consequences | In progress | Runtime overlap evaluation merged for `regulatory_region_variant`, `TF_binding_site_variant`, and `mature_miRNA_variant`; annotate-path term-level parity fixtures are now in place |
+| 5. Structural-event consequences | In progress | Runtime SV term mapping merged for transcript/regulatory/TFBS feature kinds (ablation/amplification/truncation/elongation paths); annotate-path term-level parity fixtures are now in place |
 | 6. Performance tuning | Not started | Need profiling and optimizations after consequence coverage is broader |
 
 ### Remaining Gaps (Next Priorities)
 
-1. Extend codon-aware classification beyond equal-length substitutions (indels/multi-codon edits) and tighten parity when translation/CDS context is missing or partial.
-2. Add annotate-path golden fixtures that assert term-level parity against Ensembl VEP for regulatory/motif/miRNA/SV contexts (not only deterministic ordering).
-3. Add per-term parity fixtures against Ensembl VEP for representative edge-cases (splice boundaries, repeat-shifted indels, structural overlaps).
-4. Performance-tune context-table loading/execution after parity fixtures are stable.
+1. Expand fixture corpus from synthetic parity cases to VEP-exported real-gene fixtures across multiple contigs/biotypes.
+2. Add remaining edge-case parity fixtures (multi-allelic CSQ payload shape and broader structural event combinations).
+3. Performance-tune context-table loading/execution after parity fixtures are stable.
 
 ## Acceptance Criteria
 

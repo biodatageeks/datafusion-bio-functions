@@ -5,7 +5,7 @@
 //! - runs Ensembl VEP in Docker as golden standard,
 //! - compares the golden output with `annotate_vep()` output.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -68,6 +68,15 @@ pub struct ComparisonReport {
     pub ours_with_csq: usize,
     pub csq_exact_matches: usize,
     pub most_severe_exact_matches: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermComparisonReport {
+    pub comparable_rows: usize,
+    pub golden_with_terms: usize,
+    pub ours_with_terms: usize,
+    pub term_set_exact_matches: usize,
+    pub golden_term_subset_matches: usize,
 }
 
 /// Ensure benchmark input is available in this repository.
@@ -303,6 +312,74 @@ pub fn compare_annotations(
     }
 }
 
+pub fn extract_csq_term_set(csq: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for ann in csq.split(',') {
+        let mut parts = ann.split('|');
+        let _allele = parts.next();
+        let term_field = parts.next().unwrap_or("");
+        for term in term_field.split('&').filter(|t| !t.is_empty()) {
+            out.insert(term.to_string());
+        }
+    }
+    out
+}
+
+pub fn compare_annotation_terms(
+    golden: &[VariantAnnotation],
+    ours: &[VariantAnnotation],
+) -> TermComparisonReport {
+    let golden_map: HashMap<VariantKey, &VariantAnnotation> =
+        golden.iter().map(|r| (r.key.clone(), r)).collect();
+    let ours_map: HashMap<VariantKey, &VariantAnnotation> =
+        ours.iter().map(|r| (r.key.clone(), r)).collect();
+
+    let mut comparable_rows = 0usize;
+    let mut golden_with_terms = 0usize;
+    let mut ours_with_terms = 0usize;
+    let mut term_set_exact_matches = 0usize;
+    let mut golden_term_subset_matches = 0usize;
+
+    for (key, golden_row) in &golden_map {
+        let Some(ours_row) = ours_map.get(key) else {
+            continue;
+        };
+        comparable_rows += 1;
+
+        let golden_terms = golden_row
+            .csq
+            .as_deref()
+            .map(extract_csq_term_set)
+            .unwrap_or_default();
+        let ours_terms = ours_row
+            .csq
+            .as_deref()
+            .map(extract_csq_term_set)
+            .unwrap_or_default();
+
+        if !golden_terms.is_empty() {
+            golden_with_terms += 1;
+        }
+        if !ours_terms.is_empty() {
+            ours_with_terms += 1;
+        }
+        if golden_terms == ours_terms {
+            term_set_exact_matches += 1;
+        }
+        if golden_terms.is_subset(&ours_terms) {
+            golden_term_subset_matches += 1;
+        }
+    }
+
+    TermComparisonReport {
+        comparable_rows,
+        golden_with_terms,
+        ours_with_terms,
+        term_set_exact_matches,
+        golden_term_subset_matches,
+    }
+}
+
 fn io_err<E: std::fmt::Display>(e: E) -> DataFusionError {
     DataFusionError::Execution(e.to_string())
 }
@@ -444,6 +521,59 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
                 ours_with_csq: 1,
                 csq_exact_matches: 1,
                 most_severe_exact_matches: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn extract_csq_term_set_collects_unique_terms() {
+        let csq =
+            "A|splice_region_variant&intron_variant|LOW,B|missense_variant&intron_variant|MODERATE";
+        let terms = extract_csq_term_set(csq);
+        assert_eq!(
+            terms,
+            BTreeSet::from([
+                "intron_variant".to_string(),
+                "missense_variant".to_string(),
+                "splice_region_variant".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn compare_annotation_terms_reports_exact_and_subset_matches() {
+        let golden = vec![VariantAnnotation {
+            key: VariantKey {
+                chrom: "1".to_string(),
+                pos: 100,
+                ref_allele: "A".to_string(),
+                alt_alleles: "G".to_string(),
+            },
+            csq: Some("G|splice_region_variant&intron_variant|LOW".to_string()),
+            most_severe_consequence: Some("splice_region_variant".to_string()),
+        }];
+        let ours = vec![VariantAnnotation {
+            key: VariantKey {
+                chrom: "1".to_string(),
+                pos: 100,
+                ref_allele: "A".to_string(),
+                alt_alleles: "G".to_string(),
+            },
+            csq: Some(
+                "G|splice_region_variant&intron_variant&coding_transcript_variant|LOW".to_string(),
+            ),
+            most_severe_consequence: Some("splice_region_variant".to_string()),
+        }];
+
+        let report = compare_annotation_terms(&golden, &ours);
+        assert_eq!(
+            report,
+            TermComparisonReport {
+                comparable_rows: 1,
+                golden_with_terms: 1,
+                ours_with_terms: 1,
+                term_set_exact_matches: 0,
+                golden_term_subset_matches: 1,
             }
         );
     }

@@ -13,11 +13,11 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::golden_benchmark::{
-    compare_annotations, ensure_local_copy, normalize_chrom, parse_vep_vcf_annotations,
-    sample_gz_vcf_first_n, ComparisonReport, VariantAnnotation, VariantKey,
-    DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI,
+    ComparisonReport, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI,
     DEFAULT_EXTERNAL_VEP_CACHE_DIR, DEFAULT_LOCAL_HG002_CHR22_VCF_GZ,
-    DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI,
+    DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI, TermComparisonReport, VariantAnnotation, VariantKey,
+    compare_annotation_terms, compare_annotations, ensure_local_copy, normalize_chrom,
+    parse_vep_vcf_annotations, sample_gz_vcf_first_n,
 };
 use datafusion_bio_function_vep::register_vep_functions;
 
@@ -105,16 +105,21 @@ async fn main() -> Result<()> {
         Some(&local_tbi),
     )?;
 
-    let sampled_vcf = args.work_dir.join(format!("HG002_chr22_{}.vcf", args.sample_limit));
-    let golden_vcf = args
+    let sampled_vcf = args
         .work_dir
-        .join(format!("HG002_chr22_{}_vep115_golden.vcf", args.sample_limit));
-    let report_path = args
-        .work_dir
-        .join(format!("HG002_chr22_{}_comparison_report.txt", args.sample_limit));
+        .join(format!("HG002_chr22_{}.vcf", args.sample_limit));
+    let golden_vcf = args.work_dir.join(format!(
+        "HG002_chr22_{}_vep115_golden.vcf",
+        args.sample_limit
+    ));
+    let report_path = args.work_dir.join(format!(
+        "HG002_chr22_{}_comparison_report.txt",
+        args.sample_limit
+    ));
 
     let sampling_start = Instant::now();
-    let sampled_rows = sample_gz_vcf_first_n(&args.local_copy_vcf_gz, &sampled_vcf, args.sample_limit)?;
+    let sampled_rows =
+        sample_gz_vcf_first_n(&args.local_copy_vcf_gz, &sampled_vcf, args.sample_limit)?;
     let sampling_elapsed = sampling_start.elapsed().as_secs_f64();
     println!(
         "sampled rows: {} (elapsed {:.3}s) -> {}",
@@ -124,7 +129,12 @@ async fn main() -> Result<()> {
     );
 
     let docker_start = Instant::now();
-    run_vep_docker(&sampled_vcf, &golden_vcf, &args.work_dir, &args.vep_cache_dir)?;
+    run_vep_docker(
+        &sampled_vcf,
+        &golden_vcf,
+        &args.work_dir,
+        &args.vep_cache_dir,
+    )?;
     let docker_elapsed = docker_start.elapsed().as_secs_f64();
     println!(
         "golden VEP output generated (elapsed {:.3}s) -> {}",
@@ -142,7 +152,8 @@ async fn main() -> Result<()> {
     );
 
     let ours_start = Instant::now();
-    let ours_annotations = run_annotate_vep(&sampled_vcf, &args.cache_source, &args.backend).await?;
+    let ours_annotations =
+        run_annotate_vep(&sampled_vcf, &args.cache_source, &args.backend).await?;
     let ours_elapsed = ours_start.elapsed().as_secs_f64();
     println!(
         "annotate_vep rows: {} (elapsed {:.3}s)",
@@ -151,10 +162,12 @@ async fn main() -> Result<()> {
     );
 
     let report = compare_annotations(&golden_annotations, &ours_annotations);
-    print_report(&report);
+    let term_report = compare_annotation_terms(&golden_annotations, &ours_annotations);
+    print_report(&report, &term_report);
     write_report(
         &report_path,
         &report,
+        &term_report,
         sampled_rows,
         sampling_elapsed,
         docker_elapsed,
@@ -230,7 +243,11 @@ fn run_vep_docker(
     Ok(())
 }
 
-async fn run_annotate_vep(sampled_vcf: &Path, cache_source: &str, backend: &str) -> Result<Vec<VariantAnnotation>> {
+async fn run_annotate_vep(
+    sampled_vcf: &Path,
+    cache_source: &str,
+    backend: &str,
+) -> Result<Vec<VariantAnnotation>> {
     let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
     register_vep_functions(&ctx);
@@ -339,7 +356,7 @@ fn int64_at(col: &ArrayRef, row: usize) -> Result<Option<i64>> {
     )))
 }
 
-fn print_report(report: &ComparisonReport) {
+fn print_report(report: &ComparisonReport, term_report: &TermComparisonReport) {
     println!("\ncomparison report");
     println!("  golden_rows: {}", report.golden_rows);
     println!("  ours_rows: {}", report.ours_rows);
@@ -353,11 +370,26 @@ fn print_report(report: &ComparisonReport) {
         "  most_severe_exact_matches: {}",
         report.most_severe_exact_matches
     );
+    println!("  term_comparable_rows: {}", term_report.comparable_rows);
+    println!(
+        "  term_golden_with_terms: {}",
+        term_report.golden_with_terms
+    );
+    println!("  term_ours_with_terms: {}", term_report.ours_with_terms);
+    println!(
+        "  term_set_exact_matches: {}",
+        term_report.term_set_exact_matches
+    );
+    println!(
+        "  golden_term_subset_matches: {}",
+        term_report.golden_term_subset_matches
+    );
 }
 
 fn write_report(
     report_path: &Path,
     report: &ComparisonReport,
+    term_report: &TermComparisonReport,
     sampled_rows: usize,
     sampling_elapsed_s: f64,
     docker_elapsed_s: f64,
@@ -383,6 +415,26 @@ fn write_report(
         f,
         "most_severe_exact_matches={}",
         report.most_severe_exact_matches
+    )
+    .map_err(io_err)?;
+    writeln!(f, "term_comparable_rows={}", term_report.comparable_rows).map_err(io_err)?;
+    writeln!(
+        f,
+        "term_golden_with_terms={}",
+        term_report.golden_with_terms
+    )
+    .map_err(io_err)?;
+    writeln!(f, "term_ours_with_terms={}", term_report.ours_with_terms).map_err(io_err)?;
+    writeln!(
+        f,
+        "term_set_exact_matches={}",
+        term_report.term_set_exact_matches
+    )
+    .map_err(io_err)?;
+    writeln!(
+        f,
+        "golden_term_subset_matches={}",
+        term_report.golden_term_subset_matches
     )
     .map_err(io_err)?;
     Ok(())

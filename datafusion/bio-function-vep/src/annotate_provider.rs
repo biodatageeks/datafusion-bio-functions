@@ -169,6 +169,21 @@ impl AnnotateProvider {
         Some(value.to_string())
     }
 
+    fn parse_json_bool_option(json: &str, key: &str) -> Option<bool> {
+        let needle = format!("\"{key}\"");
+        let start = json.find(&needle)?;
+        let rest = &json[start + needle.len()..];
+        let colon = rest.find(':')?;
+        let after_colon = rest[colon + 1..].trim_start();
+        if after_colon.starts_with("true") {
+            return Some(true);
+        }
+        if after_colon.starts_with("false") {
+            return Some(false);
+        }
+        None
+    }
+
     async fn resolve_transcript_context_tables(
         &self,
         cache_table: &str,
@@ -1059,8 +1074,15 @@ impl TableProvider for AnnotateProvider {
         let vcf_table_lit = Self::escaped_sql_literal(&self.vcf_table);
         let cache_table_lit = Self::escaped_sql_literal(&cache_table);
         let columns_lit = Self::escaped_sql_literal(&requested_columns_sql);
+        // For annotate_vep parity we default to extended probes so indel-shifted
+        // cache coordinates (VEP-style) still resolve to known variants.
+        let extended_probes = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_bool_option(opts, "extended_probes"))
+            .unwrap_or(true);
         let lookup_sql = format!(
-            "lookup_variants('{vcf_table_lit}', '{cache_table_lit}', '{columns_lit}', 'exact')"
+            "lookup_variants('{vcf_table_lit}', '{cache_table_lit}', '{columns_lit}', 'exact', {extended_probes})"
         );
 
         let transcript_pair = self.resolve_transcript_context_tables(&cache_table).await?;
