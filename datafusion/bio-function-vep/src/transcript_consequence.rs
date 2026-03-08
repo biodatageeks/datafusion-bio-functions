@@ -598,9 +598,16 @@ impl TranscriptConsequenceEngine {
                 terms.insert(SoTerm::FrameshiftVariant);
             }
 
-            if let Some(classification) =
+            if let Some(mut classification) =
                 classify_coding_change(tx, tx_exons, tx_translation, variant)
             {
+                // VEP does not emit stop_gained/stop_lost alongside
+                // frameshift_variant — the frameshift already implies
+                // all downstream protein changes.
+                if terms.contains(&SoTerm::FrameshiftVariant) {
+                    classification.stop_gained = false;
+                    classification.stop_lost = false;
+                }
                 apply_codon_classification(terms, classification);
             } else {
                 self.add_start_stop_heuristic_terms(terms, variant, tx);
@@ -756,33 +763,45 @@ impl TranscriptConsequenceEngine {
         tx: &TranscriptFeature,
         tx_exons: &[&ExonFeature],
     ) {
+        // For indels, VEP uses the affected-base range (excluding the VCF
+        // anchor base) when checking splice site distances. Build a
+        // trimmed variant that strips any common prefix.
+        let trimmed = VariantInput::from_vcf(
+            variant.chrom.clone(),
+            variant.start,
+            variant.end,
+            variant.ref_allele.clone(),
+            variant.alt_allele.clone(),
+        );
+        let splice_variant = &trimmed;
+
         for exon in tx_exons {
             if tx.strand >= 0 {
                 // Donor (intron after exon end): +1/+2, +5, +3..+6, +7/+8
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.end + 1,
                     exon.end + 2,
                     SoTerm::SpliceDonorVariant,
                 );
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.end + 5,
                     exon.end + 5,
                     SoTerm::SpliceDonor5thBaseVariant,
                 );
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.end + 3,
                     exon.end + 6,
                     SoTerm::SpliceDonorRegionVariant,
                 );
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.end + 7,
                     exon.end + 8,
                     SoTerm::SpliceRegionVariant,
@@ -791,21 +810,21 @@ impl TranscriptConsequenceEngine {
                 // Acceptor (before exon start): -1/-2, -3..-8, -3..-17
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.start - 2,
                     exon.start - 1,
                     SoTerm::SpliceAcceptorVariant,
                 );
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.start - 8,
                     exon.start - 3,
                     SoTerm::SpliceRegionVariant,
                 );
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.start - 17,
                     exon.start - 3,
                     SoTerm::SplicePolypyrimidineTractVariant,
@@ -814,28 +833,28 @@ impl TranscriptConsequenceEngine {
                 // Donor for negative strand lives before exon start.
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.start - 2,
                     exon.start - 1,
                     SoTerm::SpliceDonorVariant,
                 );
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.start - 5,
                     exon.start - 5,
                     SoTerm::SpliceDonor5thBaseVariant,
                 );
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.start - 6,
                     exon.start - 3,
                     SoTerm::SpliceDonorRegionVariant,
                 );
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.start - 8,
                     exon.start - 7,
                     SoTerm::SpliceRegionVariant,
@@ -844,21 +863,21 @@ impl TranscriptConsequenceEngine {
                 // Acceptor for negative strand lives after exon end.
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.end + 1,
                     exon.end + 2,
                     SoTerm::SpliceAcceptorVariant,
                 );
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.end + 3,
                     exon.end + 8,
                     SoTerm::SpliceRegionVariant,
                 );
                 add_if_overlaps(
                     terms,
-                    variant,
+                    splice_variant,
                     exon.end + 3,
                     exon.end + 17,
                     SoTerm::SplicePolypyrimidineTractVariant,
