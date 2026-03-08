@@ -1853,14 +1853,14 @@ mod tests {
         );
         let csq0 = csq[0].as_ref().expect("csq should be present");
         assert_terms_sorted_by_rank(csq0);
+        // VEP suppresses stop_lost alongside inframe indels.
         assert_term_set_exact(
             csq0,
             &[
-                "stop_lost",
                 "inframe_deletion",
             ],
         );
-        assert_eq!(most[0], Some("stop_lost".to_string()));
+        assert_eq!(most[0], Some("inframe_deletion".to_string()));
     }
 
     #[tokio::test(flavor = "multi_thread")]

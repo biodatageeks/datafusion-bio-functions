@@ -632,9 +632,12 @@ impl TranscriptConsequenceEngine {
                 classify_coding_change(tx, tx_exons, tx_translation, variant)
             {
                 // VEP does not emit stop_gained/stop_lost alongside
-                // frameshift_variant — the frameshift already implies
-                // all downstream protein changes.
-                if terms.contains(&SoTerm::FrameshiftVariant) {
+                // frameshift_variant or inframe indels — the primary
+                // indel consequence already describes the event.
+                if terms.contains(&SoTerm::FrameshiftVariant)
+                    || terms.contains(&SoTerm::InframeDeletion)
+                    || terms.contains(&SoTerm::InframeInsertion)
+                {
                     classification.stop_gained = false;
                     classification.stop_lost = false;
                 }
@@ -1040,6 +1043,14 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         || terms.contains(&SoTerm::SpliceAcceptorVariant)
     {
         terms.remove(&SoTerm::IntronVariant);
+    }
+
+    // VEP omits splice_donor_region_variant when the more specific
+    // splice_donor_5th_base_variant is present — the 5th base position
+    // is within the donor region (positions 3–6), so the specific term
+    // subsumes the general one.
+    if terms.contains(&SoTerm::SpliceDonor5thBaseVariant) {
+        terms.remove(&SoTerm::SpliceDonorRegionVariant);
     }
 }
 
@@ -1684,7 +1695,8 @@ mod tests {
         );
         let collapsed = TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
         assert!(collapsed.contains(&SoTerm::InframeDeletion));
-        assert!(collapsed.contains(&SoTerm::StopLost));
+        // VEP suppresses stop_lost alongside inframe indels.
+        assert!(!collapsed.contains(&SoTerm::StopLost));
         // Parent terms are stripped when specific children are present.
         assert!(!collapsed.contains(&SoTerm::ProteinAlteringVariant));
         assert!(!collapsed.contains(&SoTerm::CodingSequenceVariant));

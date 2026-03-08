@@ -168,20 +168,29 @@ async fn main() -> Result<()> {
         normalized_vcf.display()
     );
 
-    let docker_start = Instant::now();
-    run_vep_docker(
-        &normalized_vcf,
-        &golden_vcf,
-        &args.work_dir,
-        &args.vep_cache_dir,
-        args.merged,
-    )?;
-    let docker_elapsed = docker_start.elapsed().as_secs_f64();
-    println!(
-        "golden VEP output generated (elapsed {:.3}s) -> {}",
-        docker_elapsed,
-        golden_vcf.display()
-    );
+    let docker_elapsed = if golden_vcf.exists() {
+        println!(
+            "reusing existing golden VEP output -> {}",
+            golden_vcf.display()
+        );
+        0.0
+    } else {
+        let docker_start = Instant::now();
+        run_vep_docker(
+            &normalized_vcf,
+            &golden_vcf,
+            &args.work_dir,
+            &args.vep_cache_dir,
+            args.merged,
+        )?;
+        let elapsed = docker_start.elapsed().as_secs_f64();
+        println!(
+            "golden VEP output generated (elapsed {:.3}s) -> {}",
+            elapsed,
+            golden_vcf.display()
+        );
+        elapsed
+    };
 
     let parse_start = Instant::now();
     let golden_annotations = parse_vep_vcf_annotations(&golden_vcf)?;
