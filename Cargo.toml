@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["datafusion/bio-function-pileup", "datafusion/bio-function-ranges", "datafusion/bio-function-vep"]
+members = ["datafusion/bio-function-pileup", "datafusion/bio-function-ranges", "datafusion/bio-function-vep", "datafusion/bio-function-vcftools"]
 exclude = ["datafusion/bio-function-ranges/superintervals"]
 
 [workspace.package]
