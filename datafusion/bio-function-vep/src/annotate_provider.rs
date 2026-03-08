@@ -247,8 +247,24 @@ impl AnnotateProvider {
         Ok(None)
     }
 
-    async fn load_transcripts(&self, table: &str) -> Result<Vec<TranscriptFeature>> {
-        let query = format!("SELECT * FROM `{table}`");
+    fn chrom_filter_clause(chroms: &HashSet<String>) -> String {
+        if chroms.is_empty() {
+            return String::new();
+        }
+        let literals: Vec<String> = chroms
+            .iter()
+            .map(|c| format!("'{}'", c.replace('\'', "''")))
+            .collect();
+        format!(" WHERE chrom IN ({})", literals.join(", "))
+    }
+
+    async fn load_transcripts(
+        &self,
+        table: &str,
+        chroms: &HashSet<String>,
+    ) -> Result<Vec<TranscriptFeature>> {
+        let filter = Self::chrom_filter_clause(chroms);
+        let query = format!("SELECT * FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -334,8 +350,30 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    async fn load_exons(&self, table: &str) -> Result<Vec<ExonFeature>> {
-        let query = format!("SELECT * FROM `{table}`");
+    async fn load_exons(
+        &self,
+        table: &str,
+        chroms: &HashSet<String>,
+    ) -> Result<Vec<ExonFeature>> {
+        let has_chrom = self
+            .session
+            .table(table)
+            .await
+            .ok()
+            .map(|t| {
+                t.schema()
+                    .as_arrow()
+                    .fields()
+                    .iter()
+                    .any(|f| f.name() == "chrom")
+            })
+            .unwrap_or(false);
+        let filter = if has_chrom {
+            Self::chrom_filter_clause(chroms)
+        } else {
+            String::new()
+        };
+        let query = format!("SELECT * FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -391,8 +429,30 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    async fn load_translations(&self, table: &str) -> Result<Vec<TranslationFeature>> {
-        let query = format!("SELECT * FROM `{table}`");
+    async fn load_translations(
+        &self,
+        table: &str,
+        chroms: &HashSet<String>,
+    ) -> Result<Vec<TranslationFeature>> {
+        let has_chrom = self
+            .session
+            .table(table)
+            .await
+            .ok()
+            .map(|t| {
+                t.schema()
+                    .as_arrow()
+                    .fields()
+                    .iter()
+                    .any(|f| f.name() == "chrom")
+            })
+            .unwrap_or(false);
+        let filter = if has_chrom {
+            Self::chrom_filter_clause(chroms)
+        } else {
+            String::new()
+        };
+        let query = format!("SELECT * FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -446,8 +506,13 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    async fn load_regulatory_features(&self, table: &str) -> Result<Vec<RegulatoryFeature>> {
-        let query = format!("SELECT * FROM `{table}`");
+    async fn load_regulatory_features(
+        &self,
+        table: &str,
+        chroms: &HashSet<String>,
+    ) -> Result<Vec<RegulatoryFeature>> {
+        let filter = Self::chrom_filter_clause(chroms);
+        let query = format!("SELECT * FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -498,8 +563,13 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    async fn load_motif_features(&self, table: &str) -> Result<Vec<MotifFeature>> {
-        let query = format!("SELECT * FROM `{table}`");
+    async fn load_motif_features(
+        &self,
+        table: &str,
+        chroms: &HashSet<String>,
+    ) -> Result<Vec<MotifFeature>> {
+        let filter = Self::chrom_filter_clause(chroms);
+        let query = format!("SELECT * FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -550,8 +620,13 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    async fn load_mirna_features(&self, table: &str) -> Result<Vec<MirnaFeature>> {
-        let query = format!("SELECT * FROM `{table}`");
+    async fn load_mirna_features(
+        &self,
+        table: &str,
+        chroms: &HashSet<String>,
+    ) -> Result<Vec<MirnaFeature>> {
+        let filter = Self::chrom_filter_clause(chroms);
+        let query = format!("SELECT * FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -602,8 +677,13 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    async fn load_structural_features(&self, table: &str) -> Result<Vec<StructuralFeature>> {
-        let query = format!("SELECT * FROM `{table}`");
+    async fn load_structural_features(
+        &self,
+        table: &str,
+        chroms: &HashSet<String>,
+    ) -> Result<Vec<StructuralFeature>> {
+        let filter = Self::chrom_filter_clause(chroms);
+        let query = format!("SELECT * FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -707,38 +787,54 @@ impl AnnotateProvider {
         );
         let base_batches = self.session.sql(&base_query).await?.collect().await?;
 
+        // Extract distinct chrom values from VCF batches for predicate pushdown
+        let vcf_chroms: HashSet<String> = {
+            let mut set = HashSet::new();
+            for batch in &base_batches {
+                if let Ok(idx) = batch.schema().index_of("chrom") {
+                    let col = batch.column(idx);
+                    for row in 0..batch.num_rows() {
+                        if let Some(v) = string_at(col.as_ref(), row) {
+                            set.insert(v);
+                        }
+                    }
+                }
+            }
+            set
+        };
+
         let transcripts = if let Some(table) = transcripts_table {
-            self.load_transcripts(table).await?
+            self.load_transcripts(table, &vcf_chroms).await?
         } else {
             Vec::new()
         };
         let exons = if let Some(table) = exons_table {
-            self.load_exons(table).await?
+            self.load_exons(table, &vcf_chroms).await?
         } else {
             Vec::new()
         };
         let translations = if let Some(table) = translations_table {
-            self.load_translations(table).await?
+            self.load_translations(table, &vcf_chroms).await?
         } else {
             Vec::new()
         };
         let regulatory = if let Some(table) = regulatory_table {
-            self.load_regulatory_features(table).await?
+            self.load_regulatory_features(table, &vcf_chroms).await?
         } else {
             Vec::new()
         };
         let motifs = if let Some(table) = motif_table {
-            self.load_motif_features(table).await?
+            self.load_motif_features(table, &vcf_chroms).await?
         } else {
             Vec::new()
         };
         let mirnas = if let Some(table) = mirna_table {
-            self.load_mirna_features(table).await?
+            self.load_mirna_features(table, &vcf_chroms).await?
         } else {
             Vec::new()
         };
         let structural = if let Some(table) = sv_table {
-            self.load_structural_features(table).await?
+            self.load_structural_features(table, &vcf_chroms).await?
         } else {
             Vec::new()
         };
