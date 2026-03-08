@@ -13,6 +13,55 @@ pub struct VariantInput {
     pub alt_allele: String,
 }
 
+impl VariantInput {
+    /// Create a VariantInput from VCF-style coordinates, trimming the common
+    /// prefix/suffix anchor bases that VCF uses for indels.  VEP internally
+    /// performs this normalization so that only the truly changed bases are
+    /// used for splice-site and other positional checks.
+    pub fn from_vcf(chrom: String, pos: i64, end: i64, ref_allele: String, alt_allele: String) -> Self {
+        let ref_bytes = ref_allele.as_bytes();
+        let alt_bytes = alt_allele.as_bytes();
+
+        // Trim common prefix
+        let prefix_len = ref_bytes
+            .iter()
+            .zip(alt_bytes.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        if prefix_len == 0 || (prefix_len == ref_bytes.len() && prefix_len == alt_bytes.len()) {
+            // No trimming needed (SNV or identical alleles)
+            return Self { chrom, start: pos, end, ref_allele, alt_allele };
+        }
+
+        let trimmed_ref = &ref_bytes[prefix_len..];
+        let trimmed_alt = &alt_bytes[prefix_len..];
+        let new_start = pos + prefix_len as i64;
+        let new_end = if trimmed_ref.is_empty() {
+            // Pure insertion: VEP uses the position before/after the insertion
+            new_start + 1
+        } else {
+            pos + ref_bytes.len() as i64 - 1
+        };
+
+        Self {
+            chrom,
+            start: new_start,
+            end: new_end,
+            ref_allele: if trimmed_ref.is_empty() {
+                "-".to_string()
+            } else {
+                String::from_utf8_lossy(trimmed_ref).to_string()
+            },
+            alt_allele: if trimmed_alt.is_empty() {
+                "-".to_string()
+            } else {
+                String::from_utf8_lossy(trimmed_alt).to_string()
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptFeature {
     pub transcript_id: String,
@@ -98,6 +147,57 @@ pub struct TranscriptConsequence {
     pub terms: Vec<SoTerm>,
 }
 
+/// Pre-built indexes over context features, constructed once and reused
+/// across all variants in a batch.
+pub struct PreparedContext<'a> {
+    pub exons_by_tx: HashMap<&'a str, Vec<&'a ExonFeature>>,
+    pub translation_by_tx: HashMap<&'a str, &'a TranslationFeature>,
+    /// Transcripts sorted by start position for binary-search overlap queries.
+    pub transcripts_sorted: Vec<&'a TranscriptFeature>,
+    pub regulatory: &'a [RegulatoryFeature],
+    pub motifs: &'a [MotifFeature],
+    pub mirnas: &'a [MirnaFeature],
+    pub structural: &'a [StructuralFeature],
+}
+
+impl<'a> PreparedContext<'a> {
+    pub fn new(
+        transcripts: &'a [TranscriptFeature],
+        exons: &'a [ExonFeature],
+        translations: &'a [TranslationFeature],
+        regulatory: &'a [RegulatoryFeature],
+        motifs: &'a [MotifFeature],
+        mirnas: &'a [MirnaFeature],
+        structural: &'a [StructuralFeature],
+    ) -> Self {
+        let mut exons_by_tx: HashMap<&str, Vec<&ExonFeature>> = HashMap::new();
+        for exon in exons {
+            exons_by_tx
+                .entry(exon.transcript_id.as_str())
+                .or_default()
+                .push(exon);
+        }
+        for tx_exons in exons_by_tx.values_mut() {
+            tx_exons.sort_by_key(|e| e.exon_number);
+        }
+        let translation_by_tx: HashMap<&str, &TranslationFeature> = translations
+            .iter()
+            .map(|t| (t.transcript_id.as_str(), t))
+            .collect();
+        let mut transcripts_sorted: Vec<&TranscriptFeature> = transcripts.iter().collect();
+        transcripts_sorted.sort_by_key(|tx| tx.start);
+        Self {
+            exons_by_tx,
+            translation_by_tx,
+            transcripts_sorted,
+            regulatory,
+            motifs,
+            mirnas,
+            structural,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscriptConsequenceEngine {
     upstream_distance: i64,
@@ -138,33 +238,42 @@ impl TranscriptConsequenceEngine {
         mirnas: &[MirnaFeature],
         structural: &[StructuralFeature],
     ) -> Vec<TranscriptConsequence> {
-        let mut exons_by_tx: HashMap<&str, Vec<&ExonFeature>> = HashMap::new();
-        for exon in exons {
-            exons_by_tx
-                .entry(exon.transcript_id.as_str())
-                .or_default()
-                .push(exon);
-        }
-        for tx_exons in exons_by_tx.values_mut() {
-            tx_exons.sort_by_key(|e| e.exon_number);
-        }
-        let translation_by_tx: HashMap<&str, &TranslationFeature> = translations
-            .iter()
-            .map(|t| (t.transcript_id.as_str(), t))
-            .collect();
+        let ctx = PreparedContext::new(
+            transcripts, exons, translations, regulatory, motifs, mirnas, structural,
+        );
+        self.evaluate_variant_prepared(variant, &ctx)
+    }
 
+    /// Evaluate a variant against pre-built context indexes.
+    /// Use this when annotating many variants against the same context —
+    /// build `PreparedContext` once and call this per variant.
+    pub fn evaluate_variant_prepared(
+        &self,
+        variant: &VariantInput,
+        ctx: &PreparedContext<'_>,
+    ) -> Vec<TranscriptConsequence> {
         let mut out = Vec::new();
         let variant_chrom = normalize_chrom(&variant.chrom);
-        for tx in transcripts {
+
+        let window_end = variant.end + self.upstream_distance.max(self.downstream_distance);
+
+        for &tx in &ctx.transcripts_sorted {
+            if tx.start > window_end {
+                break; // All remaining transcripts are beyond the window.
+            }
             if normalize_chrom(&tx.chrom) != variant_chrom {
                 continue;
             }
 
-            let tx_exons = exons_by_tx
+            let tx_exons = ctx
+                .exons_by_tx
                 .get(tx.transcript_id.as_str())
                 .cloned()
                 .unwrap_or_default();
-            let tx_translation = translation_by_tx.get(tx.transcript_id.as_str()).copied();
+            let tx_translation = ctx
+                .translation_by_tx
+                .get(tx.transcript_id.as_str())
+                .copied();
 
             if overlaps(variant.start, variant.end, tx.start, tx.end) {
                 let terms =
@@ -183,12 +292,17 @@ impl TranscriptConsequenceEngine {
             }
         }
 
-        self.append_regulatory_terms(&mut out, variant, regulatory, structural);
-        self.append_tfbs_terms(&mut out, variant, motifs, structural);
-        self.append_mirna_terms(&mut out, variant, mirnas);
-        self.append_structural_transcript_terms(&mut out, variant, transcripts, structural);
+        // Track whether any transcript was matched (overlap or upstream/downstream).
+        let has_transcript_hit = !out.is_empty();
 
-        if out.is_empty() {
+        self.append_regulatory_terms(&mut out, variant, ctx.regulatory, ctx.structural);
+        self.append_tfbs_terms(&mut out, variant, ctx.motifs, ctx.structural);
+        self.append_mirna_terms(&mut out, variant, ctx.mirnas);
+        self.append_structural_transcript_terms_prepared(&mut out, variant, ctx);
+
+        // VEP emits intergenic_variant when no transcript was hit, even if
+        // regulatory/motif features overlap (those are orthogonal to transcripts).
+        if !has_transcript_hit {
             out.push(TranscriptConsequence {
                 transcript_id: None,
                 terms: vec![SoTerm::IntergenicVariant],
@@ -218,12 +332,26 @@ impl TranscriptConsequenceEngine {
             .iter()
             .any(|e| overlaps(variant.start, variant.end, e.start, e.end));
 
-        // Exonic boundary +/- 3bp contributes splice_region.
-        if tx_exons.iter().any(|e| {
-            overlaps(variant.start, variant.end, e.start, e.start + 2)
-                || overlaps(variant.start, variant.end, e.end - 2, e.end)
-        }) {
-            terms.insert(SoTerm::SpliceRegionVariant);
+        // Exonic boundary +/- 3bp contributes splice_region, but only
+        // at internal splice junctions — not at terminal transcript
+        // boundaries (first/last exon outer edges).
+        {
+            let tx_start = tx.start;
+            let tx_end = tx.end;
+            if tx_exons.iter().any(|e| {
+                // Exon start boundary is a splice junction unless it equals
+                // the transcript start (terminal).
+                let start_is_junction = e.start != tx_start;
+                // Exon end boundary is a splice junction unless it equals
+                // the transcript end (terminal).
+                let end_is_junction = e.end != tx_end;
+                (start_is_junction
+                    && overlaps(variant.start, variant.end, e.start, e.start + 2))
+                    || (end_is_junction
+                        && overlaps(variant.start, variant.end, e.end - 2, e.end))
+            }) {
+                terms.insert(SoTerm::SpliceRegionVariant);
+            }
         }
 
         if !overlaps_exon {
@@ -235,18 +363,21 @@ impl TranscriptConsequenceEngine {
             self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
         } else if let Some(utr_term) = self.utr_term(variant, tx) {
             terms.insert(utr_term);
-        } else {
-            terms.insert(SoTerm::CodingTranscriptVariant);
         }
 
         if tx.biotype == "nonsense_mediated_decay" {
             terms.insert(SoTerm::NmdTranscriptVariant);
         }
         if is_non_coding_biotype(&tx.biotype) {
-            terms.insert(SoTerm::NonCodingTranscriptVariant);
-        } else {
-            terms.insert(SoTerm::CodingTranscriptVariant);
+            // VEP omits the parent non_coding_transcript_variant when the more
+            // specific non_coding_transcript_exon_variant is already present.
+            if !terms.contains(&SoTerm::NonCodingTranscriptExonVariant) {
+                terms.insert(SoTerm::NonCodingTranscriptVariant);
+            }
         }
+
+        // VEP omits parent SO terms when more specific children are present.
+        strip_parent_terms(&mut terms);
 
         let mut terms_vec: Vec<SoTerm> = terms.into_iter().collect();
         terms_vec.sort_by_key(|t| t.rank());
@@ -362,14 +493,27 @@ impl TranscriptConsequenceEngine {
         }
     }
 
-    fn append_structural_transcript_terms(
+    fn append_structural_transcript_terms_prepared(
         &self,
         out: &mut Vec<TranscriptConsequence>,
         variant: &VariantInput,
-        transcripts: &[TranscriptFeature],
-        structural: &[StructuralFeature],
+        ctx: &PreparedContext<'_>,
     ) {
         let chrom = normalize_chrom(&variant.chrom);
+        let has_tx = ctx
+            .transcripts_sorted
+            .iter()
+            .any(|tx| normalize_chrom(&tx.chrom) == chrom);
+        Self::append_structural_terms_inner(out, variant, ctx.structural, &chrom, has_tx);
+    }
+
+    fn append_structural_terms_inner(
+        out: &mut Vec<TranscriptConsequence>,
+        variant: &VariantInput,
+        structural: &[StructuralFeature],
+        chrom: &str,
+        has_transcripts_on_chrom: bool,
+    ) {
         let mut terms = BTreeSet::new();
         for sv in structural {
             if normalize_chrom(&sv.chrom) != chrom
@@ -404,11 +548,7 @@ impl TranscriptConsequenceEngine {
                 SvFeatureKind::Regulatory | SvFeatureKind::Tfbs => {}
             }
         }
-        if !terms.is_empty()
-            && transcripts
-                .iter()
-                .any(|tx| normalize_chrom(&tx.chrom) == chrom)
-        {
+        if !terms.is_empty() && has_transcripts_on_chrom {
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
             out.push(TranscriptConsequence {
@@ -480,6 +620,14 @@ impl TranscriptConsequenceEngine {
             if has_any {
                 return;
             }
+        } else if tx_translation
+            .and_then(|t| t.cds_sequence.as_deref())
+            .is_some()
+        {
+            // Translation data exists but classify_coding_change failed
+            // (CDS sequence mismatch). Don't fall through to the
+            // heuristic — CodingSequenceVariant is already inserted.
+            return;
         }
 
         self.add_start_stop_heuristic_terms(terms, variant, tx);
@@ -764,7 +912,55 @@ fn add_if_overlaps(
 }
 
 fn is_non_coding_biotype(biotype: &str) -> bool {
-    biotype != "protein_coding"
+    !matches!(
+        biotype,
+        "protein_coding"
+            | "nonsense_mediated_decay"
+            | "non_stop_decay"
+            | "protein_coding_LoF"
+            | "IG_C_gene"
+            | "IG_D_gene"
+            | "IG_J_gene"
+            | "IG_V_gene"
+            | "TR_C_gene"
+            | "TR_D_gene"
+            | "TR_J_gene"
+            | "TR_V_gene"
+            | "polymorphic_pseudogene"
+    )
+}
+
+/// Returns true for transcript IDs that VEP annotates against.
+/// VEP only reports ENST, NM_, NR_, XM_, XR_ transcripts.
+pub fn is_vep_transcript(id: &str) -> bool {
+    id.starts_with("ENST")
+        || id.starts_with("NM_")
+        || id.starts_with("NR_")
+        || id.starts_with("XM_")
+        || id.starts_with("XR_")
+}
+
+/// Remove parent SO terms when more specific children are present.
+/// VEP never emits `coding_sequence_variant` alongside a specific
+/// coding consequence (missense, synonymous, etc.), and never emits
+/// `protein_altering_variant` alongside `missense_variant`.
+fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
+    let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
+        || terms.contains(&SoTerm::SynonymousVariant)
+        || terms.contains(&SoTerm::StopGained)
+        || terms.contains(&SoTerm::StopLost)
+        || terms.contains(&SoTerm::StartLost)
+        || terms.contains(&SoTerm::FrameshiftVariant)
+        || terms.contains(&SoTerm::InframeInsertion)
+        || terms.contains(&SoTerm::InframeDeletion)
+        || terms.contains(&SoTerm::StopRetainedVariant)
+        || terms.contains(&SoTerm::StartRetainedVariant)
+        || terms.contains(&SoTerm::IncompleteTerminalCodonVariant);
+
+    if has_specific_coding {
+        terms.remove(&SoTerm::CodingSequenceVariant);
+        terms.remove(&SoTerm::ProteinAlteringVariant);
+    }
 }
 
 fn allele_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
@@ -1311,7 +1507,9 @@ mod tests {
         );
         let terms = &exonic[0].terms;
         assert!(terms.contains(&SoTerm::NonCodingTranscriptExonVariant));
-        assert!(terms.contains(&SoTerm::NonCodingTranscriptVariant));
+        // VEP omits the parent non_coding_transcript_variant when the more
+        // specific non_coding_transcript_exon_variant is present.
+        assert!(!terms.contains(&SoTerm::NonCodingTranscriptVariant));
 
         let intronic = engine.evaluate_variant(
             &var("22", 200, 200, "A", "G"),
@@ -1395,7 +1593,9 @@ mod tests {
         let collapsed = TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
         assert!(collapsed.contains(&SoTerm::InframeDeletion));
         assert!(collapsed.contains(&SoTerm::StopLost));
-        assert!(collapsed.contains(&SoTerm::ProteinAlteringVariant));
+        // Parent terms are stripped when specific children are present.
+        assert!(!collapsed.contains(&SoTerm::ProteinAlteringVariant));
+        assert!(!collapsed.contains(&SoTerm::CodingSequenceVariant));
     }
 
     #[test]

@@ -173,7 +173,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx1", "tx2"])),
+                Arc::new(StringArray::from(vec!["ENST00000000010", "ENST00000000011"])),
                 Arc::new(StringArray::from(vec!["1", "2"])),
                 Arc::new(Int64Array::from(vec![50, 150])),
                 Arc::new(Int64Array::from(vec![200, 250])),
@@ -197,7 +197,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx1", "tx2"])),
+                Arc::new(StringArray::from(vec!["ENST00000000010", "ENST00000000011"])),
                 Arc::new(Int64Array::from(vec![1, 1])),
                 Arc::new(Int64Array::from(vec![50, 150])),
                 Arc::new(Int64Array::from(vec![200, 250])),
@@ -269,7 +269,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_syn"])),
+                Arc::new(StringArray::from(vec!["ENST00000000001"])),
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![90])),
                 Arc::new(Int64Array::from(vec![140])),
@@ -293,7 +293,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_syn"])),
+                Arc::new(StringArray::from(vec!["ENST00000000001"])),
                 Arc::new(Int64Array::from(vec![1])),
                 Arc::new(Int64Array::from(vec![90])),
                 Arc::new(Int64Array::from(vec![140])),
@@ -315,7 +315,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_syn"])),
+                Arc::new(StringArray::from(vec!["ENST00000000001"])),
                 Arc::new(Int64Array::from(vec![9])),
                 Arc::new(Int64Array::from(vec![3])),
                 Arc::new(StringArray::from(vec!["MA*"])),
@@ -389,7 +389,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_ctx"])),
+                Arc::new(StringArray::from(vec!["ENST00000000002"])),
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![100])),
                 Arc::new(Int64Array::from(vec![250])),
@@ -413,7 +413,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_ctx"])),
+                Arc::new(StringArray::from(vec!["ENST00000000002"])),
                 Arc::new(Int64Array::from(vec![1])),
                 Arc::new(Int64Array::from(vec![100])),
                 Arc::new(Int64Array::from(vec![250])),
@@ -577,7 +577,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_far"])),
+                Arc::new(StringArray::from(vec!["ENST00000000003"])),
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![20_000])),
                 Arc::new(Int64Array::from(vec![20_100])),
@@ -602,7 +602,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_far"])),
+                Arc::new(StringArray::from(vec!["ENST00000000003"])),
                 Arc::new(Int64Array::from(vec![1])),
                 Arc::new(Int64Array::from(vec![20_000])),
                 Arc::new(Int64Array::from(vec![20_100])),
@@ -792,7 +792,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_splice"])),
+                Arc::new(StringArray::from(vec!["ENST00000000004"])),
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![100])),
                 Arc::new(Int64Array::from(vec![300])),
@@ -816,7 +816,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_splice", "tx_splice"])),
+                Arc::new(StringArray::from(vec!["ENST00000000004", "ENST00000000004"])),
                 Arc::new(Int64Array::from(vec![1, 2])),
                 Arc::new(Int64Array::from(vec![100, 250])),
                 Arc::new(Int64Array::from(vec![150, 300])),
@@ -888,7 +888,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_repeat"])),
+                Arc::new(StringArray::from(vec!["ENST00000000005"])),
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![40])),
                 Arc::new(Int64Array::from(vec![120])),
@@ -913,7 +913,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_repeat"])),
+                Arc::new(StringArray::from(vec!["ENST00000000005"])),
                 Arc::new(Int64Array::from(vec![1])),
                 Arc::new(Int64Array::from(vec![40])),
                 Arc::new(Int64Array::from(vec![120])),
@@ -985,7 +985,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_neg"])),
+                Arc::new(StringArray::from(vec!["ENST00000000006"])),
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![90])),
                 Arc::new(Int64Array::from(vec![140])),
@@ -1010,7 +1010,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_neg"])),
+                Arc::new(StringArray::from(vec!["ENST00000000006"])),
                 Arc::new(Int64Array::from(vec![1])),
                 Arc::new(Int64Array::from(vec![90])),
                 Arc::new(Int64Array::from(vec![140])),
@@ -1031,7 +1031,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_neg"])),
+                Arc::new(StringArray::from(vec!["ENST00000000006"])),
                 Arc::new(Int64Array::from(vec![9])),
                 Arc::new(Int64Array::from(vec![3])),
                 Arc::new(StringArray::from(vec!["MA*"])),
@@ -1105,7 +1105,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_stop"])),
+                Arc::new(StringArray::from(vec!["ENST00000000007"])),
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![90])),
                 Arc::new(Int64Array::from(vec![140])),
@@ -1129,7 +1129,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_stop"])),
+                Arc::new(StringArray::from(vec!["ENST00000000007"])),
                 Arc::new(Int64Array::from(vec![1])),
                 Arc::new(Int64Array::from(vec![90])),
                 Arc::new(Int64Array::from(vec![140])),
@@ -1150,7 +1150,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["tx_stop"])),
+                Arc::new(StringArray::from(vec!["ENST00000000007"])),
                 Arc::new(Int64Array::from(vec![9])),
                 Arc::new(Int64Array::from(vec![3])),
                 Arc::new(StringArray::from(vec!["MA*"])),
@@ -1633,6 +1633,7 @@ mod tests {
             "mature_miRNA_variant",
             "TF_binding_site_variant",
             "regulatory_region_variant",
+            "intergenic_variant",
         ];
 
         let mut observed = Vec::new();
@@ -1689,7 +1690,6 @@ mod tests {
         let expected_terms = [
             "splice_donor_variant",
             "intron_variant",
-            "coding_transcript_variant",
         ];
 
         for backend in ["parquet", "fjall"] {
@@ -1737,9 +1737,6 @@ mod tests {
 
         let expected_terms = [
             "frameshift_variant",
-            "protein_altering_variant",
-            "coding_transcript_variant",
-            "coding_sequence_variant",
         ];
 
         for backend in ["parquet", "fjall"] {
@@ -1811,8 +1808,6 @@ mod tests {
             csq0,
             &[
                 "synonymous_variant",
-                "coding_transcript_variant",
-                "coding_sequence_variant",
             ],
         );
         assert_eq!(most[0], Some("synonymous_variant".to_string()));
@@ -1862,9 +1857,6 @@ mod tests {
             &[
                 "stop_lost",
                 "inframe_deletion",
-                "protein_altering_variant",
-                "coding_transcript_variant",
-                "coding_sequence_variant",
             ],
         );
         assert_eq!(most[0], Some("stop_lost".to_string()));

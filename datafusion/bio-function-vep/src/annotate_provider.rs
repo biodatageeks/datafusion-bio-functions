@@ -32,8 +32,9 @@ use crate::kv_cache::KvCacheTableProvider;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     ExonFeature, MirnaFeature, MotifFeature, RegulatoryFeature, StructuralFeature, SvEventKind,
-    SvFeatureKind, TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature,
-    VariantInput,
+    PreparedContext, SvFeatureKind, TranscriptConsequenceEngine, TranscriptFeature,
+    TranslationFeature,
+    VariantInput, is_vep_transcript,
 };
 
 /// Table provider implementing `annotate_vep(...)`.
@@ -251,10 +252,19 @@ impl AnnotateProvider {
         if chroms.is_empty() {
             return String::new();
         }
-        let literals: Vec<String> = chroms
-            .iter()
-            .map(|c| format!("'{}'", c.replace('\'', "''")))
-            .collect();
+        // Include both "chr"-prefixed and bare variants so mismatched naming
+        // between VCF (chr22) and context tables (22) still matches.
+        let mut expanded: HashSet<String> = HashSet::new();
+        for c in chroms {
+            let escaped = c.replace('\'', "''");
+            expanded.insert(escaped.clone());
+            if let Some(bare) = escaped.strip_prefix("chr") {
+                expanded.insert(bare.to_string());
+            } else {
+                expanded.insert(format!("chr{escaped}"));
+            }
+        }
+        let literals: Vec<String> = expanded.iter().map(|c| format!("'{c}'")).collect();
         format!(" WHERE chrom IN ({})", literals.join(", "))
     }
 
@@ -787,71 +797,100 @@ impl AnnotateProvider {
         );
         let base_batches = self.session.sql(&base_query).await?.collect().await?;
 
-        // Extract distinct chrom values from VCF batches for predicate pushdown
-        let vcf_chroms: HashSet<String> = {
-            let mut set = HashSet::new();
-            for batch in &base_batches {
-                if let Ok(idx) = batch.schema().index_of("chrom") {
-                    let col = batch.column(idx);
-                    for row in 0..batch.num_rows() {
-                        if let Some(v) = string_at(col.as_ref(), row) {
-                            set.insert(v);
+        // Check if there are any cache misses (rows without cached most_severe).
+        // Only load context tables if we actually need the transcript engine.
+        let has_cache_misses = base_batches.iter().any(|batch| {
+            let Ok(idx) = batch.schema().index_of("cache_most_severe_consequence") else {
+                return true; // Column missing — all rows are misses.
+            };
+            let col = batch.column(idx);
+            (0..batch.num_rows()).any(|row| string_at(col.as_ref(), row).is_none())
+        });
+
+        let (transcripts, exons, translations, regulatory, motifs, mirnas, structural) =
+            if has_cache_misses {
+                // Extract distinct chrom values from VCF batches for predicate pushdown
+                let vcf_chroms: HashSet<String> = {
+                    let mut set = HashSet::new();
+                    for batch in &base_batches {
+                        if let Ok(idx) = batch.schema().index_of("chrom") {
+                            let col = batch.column(idx);
+                            for row in 0..batch.num_rows() {
+                                if let Some(v) = string_at(col.as_ref(), row) {
+                                    set.insert(v);
+                                }
+                            }
                         }
                     }
-                }
-            }
-            set
-        };
+                    set
+                };
 
-        let transcripts = if let Some(table) = transcripts_table {
-            self.load_transcripts(table, &vcf_chroms).await?
-        } else {
-            Vec::new()
-        };
-        let exons = if let Some(table) = exons_table {
-            self.load_exons(table, &vcf_chroms).await?
-        } else {
-            Vec::new()
-        };
-        let translations = if let Some(table) = translations_table {
-            self.load_translations(table, &vcf_chroms).await?
-        } else {
-            Vec::new()
-        };
-        let regulatory = if let Some(table) = regulatory_table {
-            self.load_regulatory_features(table, &vcf_chroms).await?
-        } else {
-            Vec::new()
-        };
-        let motifs = if let Some(table) = motif_table {
-            self.load_motif_features(table, &vcf_chroms).await?
-        } else {
-            Vec::new()
-        };
-        let mirnas = if let Some(table) = mirna_table {
-            self.load_mirna_features(table, &vcf_chroms).await?
-        } else {
-            Vec::new()
-        };
-        let structural = if let Some(table) = sv_table {
-            self.load_structural_features(table, &vcf_chroms).await?
-        } else {
-            Vec::new()
-        };
+                let tx = if let Some(table) = transcripts_table {
+                    self.load_transcripts(table, &vcf_chroms)
+                        .await?
+                        .into_iter()
+                        .filter(|t| is_vep_transcript(&t.transcript_id))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let ex = if let Some(table) = exons_table {
+                    self.load_exons(table, &vcf_chroms).await?
+                } else {
+                    Vec::new()
+                };
+                let tl = if let Some(table) = translations_table {
+                    self.load_translations(table, &vcf_chroms).await?
+                } else {
+                    Vec::new()
+                };
+                let rg = if let Some(table) = regulatory_table {
+                    self.load_regulatory_features(table, &vcf_chroms).await?
+                } else {
+                    Vec::new()
+                };
+                let mt = if let Some(table) = motif_table {
+                    self.load_motif_features(table, &vcf_chroms).await?
+                } else {
+                    Vec::new()
+                };
+                let mi = if let Some(table) = mirna_table {
+                    self.load_mirna_features(table, &vcf_chroms).await?
+                } else {
+                    Vec::new()
+                };
+                let st = if let Some(table) = sv_table {
+                    self.load_structural_features(table, &vcf_chroms).await?
+                } else {
+                    Vec::new()
+                };
+                (tx, ex, tl, rg, mt, mi, st)
+            } else {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
         let engine = TranscriptConsequenceEngine::default();
+        let ctx = PreparedContext::new(
+            &transcripts,
+            &exons,
+            &translations,
+            &regulatory,
+            &motifs,
+            &mirnas,
+            &structural,
+        );
 
         let mut annotated_batches = Vec::with_capacity(base_batches.len());
         for batch in &base_batches {
             annotated_batches.push(self.annotate_batch_with_transcript_engine(
-                batch,
-                &engine,
-                &transcripts,
-                &exons,
-                &translations,
-                &regulatory,
-                &motifs,
-                &mirnas,
-                &structural,
+                batch, &engine, &ctx,
             )?);
         }
 
@@ -878,13 +917,7 @@ impl AnnotateProvider {
         &self,
         batch: &RecordBatch,
         engine: &TranscriptConsequenceEngine,
-        transcripts: &[TranscriptFeature],
-        exons: &[ExonFeature],
-        translations: &[TranslationFeature],
-        regulatory: &[RegulatoryFeature],
-        motifs: &[MotifFeature],
-        mirnas: &[MirnaFeature],
-        structural: &[StructuralFeature],
+        ctx: &PreparedContext<'_>,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
@@ -915,6 +948,8 @@ impl AnnotateProvider {
         let variation_name_idx = schema.index_of("cache_variation_name").ok();
         let clin_sig_idx = schema.index_of("cache_clin_sig").ok();
         let af_idx = schema.index_of("cache_AF").ok();
+        let cached_csq_idx = schema.index_of("cache_consequence_types").ok();
+        let cached_most_idx = schema.index_of("cache_most_severe_consequence").ok();
 
         let mut csq_builder = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 40);
         let mut most_builder =
@@ -926,55 +961,64 @@ impl AnnotateProvider {
                 most_builder.append_null();
                 continue;
             };
-            let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
-                csq_builder.append_null();
-                most_builder.append_null();
-                continue;
-            };
-            let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
-                csq_builder.append_null();
-                most_builder.append_null();
-                continue;
-            };
-            let Some(ref_allele) = string_at(batch.column(ref_idx).as_ref(), row) else {
-                csq_builder.append_null();
-                most_builder.append_null();
-                continue;
-            };
             let Some(alt_allele) = string_at(batch.column(alt_idx).as_ref(), row) else {
                 csq_builder.append_null();
                 most_builder.append_null();
                 continue;
             };
 
-            let variant = VariantInput {
-                chrom,
-                start,
-                end,
-                ref_allele,
-                alt_allele: alt_allele.clone(),
+            // Cache-hit fast path: use pre-computed consequence from variation cache.
+            let cached_most = cached_most_idx
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+            let cached_csq = cached_csq_idx
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+
+            let (term_field, most_str) = if let Some(most_val) = &cached_most {
+                // Cache hit — use cached consequence_types and most_severe.
+                let csq_val = cached_csq.unwrap_or_default();
+                (csq_val, most_val.clone())
+            } else {
+                // Cache miss — compute via transcript engine.
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    csq_builder.append_null();
+                    most_builder.append_null();
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    csq_builder.append_null();
+                    most_builder.append_null();
+                    continue;
+                };
+                let Some(ref_allele) = string_at(batch.column(ref_idx).as_ref(), row) else {
+                    csq_builder.append_null();
+                    most_builder.append_null();
+                    continue;
+                };
+
+                let variant = VariantInput {
+                    chrom: chrom.clone(),
+                    start,
+                    end,
+                    ref_allele,
+                    alt_allele: alt_allele.clone(),
+                };
+                let assignments = engine.evaluate_variant_prepared(&variant, ctx);
+                let mut terms = TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
+                if terms.is_empty() {
+                    terms.push(SoTerm::SequenceVariant);
+                }
+                let most = most_severe_term(terms.iter()).unwrap_or(SoTerm::SequenceVariant);
+                let tf = terms
+                    .iter()
+                    .map(|t| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join("&");
+                (tf, most.as_str().to_string())
             };
-            let assignments = engine.evaluate_variant_with_context(
-                &variant,
-                transcripts,
-                exons,
-                translations,
-                regulatory,
-                motifs,
-                mirnas,
-                structural,
-            );
-            let mut terms = TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
-            if terms.is_empty() {
-                terms.push(SoTerm::SequenceVariant);
-            }
-            let most = most_severe_term(terms.iter()).unwrap_or(SoTerm::SequenceVariant);
-            let term_field = terms
-                .iter()
-                .map(|t| t.as_str())
-                .collect::<Vec<_>>()
-                .join("&");
-            let impact = impact_label(most.impact());
+
+            let impact = SoTerm::from_str(&most_str)
+                .map(|t| impact_label(t.impact()))
+                .unwrap_or_else(|| impact_label(SoImpact::Modifier));
 
             let variation_name = variation_name_idx
                 .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
@@ -986,11 +1030,15 @@ impl AnnotateProvider {
                 .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 .unwrap_or_default();
 
+            // Replace commas in sub-fields to avoid breaking the CSQ
+            // comma-delimited annotation separator (VEP uses '&').
+            let clin_sig_safe = clin_sig.replace(',', "&");
+            let af_safe = af.replace(',', "&");
             csq_builder.append_value(format!(
                 "{}|{}|{}|{}|{}|{}",
-                alt_allele, term_field, impact, variation_name, clin_sig, af
+                alt_allele, term_field, impact, variation_name, clin_sig_safe, af_safe
             ));
-            most_builder.append_value(most.as_str());
+            most_builder.append_value(&most_str);
         }
 
         let mut out_cols = Vec::with_capacity(self.vcf_field_count() + 2);
@@ -1159,6 +1207,8 @@ impl TableProvider for AnnotateProvider {
             "somatic",
             "phenotype_or_disease",
             "pubmed",
+            "consequence_types",
+            "most_severe_consequence",
         ];
         let requested_columns: Vec<&str> = preferred_columns
             .iter()
@@ -1170,8 +1220,10 @@ impl TableProvider for AnnotateProvider {
         let vcf_table_lit = Self::escaped_sql_literal(&self.vcf_table);
         let cache_table_lit = Self::escaped_sql_literal(&cache_table);
         let columns_lit = Self::escaped_sql_literal(&requested_columns_sql);
-        // For annotate_vep parity we default to extended probes so indel-shifted
-        // cache coordinates (VEP-style) still resolve to known variants.
+        // Extended probes use interval-overlap join to handle VEP-style
+        // indel coordinate encodings. Enabled by default for backward
+        // compatibility. When input is pre-normalized (e.g. bcftools norm),
+        // set "extended_probes":false in options_json for faster equi-join.
         let extended_probes = self
             .options_json
             .as_deref()

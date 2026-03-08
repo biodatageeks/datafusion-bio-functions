@@ -10,14 +10,15 @@ use datafusion::arrow::array::{
     UInt32Array, UInt64Array,
 };
 use datafusion::common::{DataFusionError, Result};
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::golden_benchmark::{
     ComparisonReport, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI,
     DEFAULT_EXTERNAL_VEP_CACHE_DIR, DEFAULT_LOCAL_HG002_CHR22_VCF_GZ,
-    DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI, TermComparisonReport, VariantAnnotation, VariantKey,
-    compare_annotation_terms, compare_annotations, ensure_local_copy, normalize_chrom,
-    parse_vep_vcf_annotations, sample_gz_vcf_first_n,
+    DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI, TermComparisonReport, VariantAnnotation,
+    VariantDiscrepancy, VariantKey, collect_discrepancies, compare_annotation_terms,
+    compare_annotations, ensure_local_copy, normalize_chrom, parse_vep_vcf_annotations,
+    sample_gz_vcf_first_n,
 };
 use datafusion_bio_function_vep::register_vep_functions;
 
@@ -25,7 +26,6 @@ const DEFAULT_CACHE_SOURCE: &str = "/Users/mwiewior/research/data/vep/115_GRCh38
 const DEFAULT_BACKEND: &str = "parquet";
 const DEFAULT_SAMPLE_LIMIT: usize = 1000;
 const DEFAULT_WORK_DIR: &str = "/tmp/annotate_vep_golden_bench";
-
 #[derive(Debug, Clone)]
 struct Args {
     source_vcf_gz: PathBuf,
@@ -35,44 +35,60 @@ struct Args {
     vep_cache_dir: PathBuf,
     local_copy_vcf_gz: PathBuf,
     work_dir: PathBuf,
+    /// Directory containing context parquet files (transcripts, exons, etc.).
+    context_dir: Option<PathBuf>,
+    /// Whether to use VEP --merged flag (for merged Ensembl+RefSeq cache).
+    merged: bool,
 }
 
 impl Args {
     fn parse() -> Self {
         let args: Vec<String> = std::env::args().collect();
+
+        // Check for --merged flag anywhere in args.
+        let merged = args.iter().any(|a| a == "--merged");
+        // Filter out flags for positional parsing.
+        let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+
         Self {
             source_vcf_gz: PathBuf::from(
-                args.get(1)
-                    .cloned()
-                    .unwrap_or_else(|| DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ.to_string()),
+                positional
+                    .get(1)
+                    .map(|s| s.as_str())
+                    .unwrap_or(DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ),
             ),
-            cache_source: args
+            cache_source: positional
                 .get(2)
-                .cloned()
+                .map(|s| s.to_string())
                 .unwrap_or_else(|| DEFAULT_CACHE_SOURCE.to_string()),
-            backend: args
+            backend: positional
                 .get(3)
-                .cloned()
+                .map(|s| s.to_string())
                 .unwrap_or_else(|| DEFAULT_BACKEND.to_string()),
-            sample_limit: args
+            sample_limit: positional
                 .get(4)
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_SAMPLE_LIMIT),
             vep_cache_dir: PathBuf::from(
-                args.get(5)
-                    .cloned()
-                    .unwrap_or_else(|| DEFAULT_EXTERNAL_VEP_CACHE_DIR.to_string()),
+                positional
+                    .get(5)
+                    .map(|s| s.as_str())
+                    .unwrap_or(DEFAULT_EXTERNAL_VEP_CACHE_DIR),
             ),
             local_copy_vcf_gz: PathBuf::from(
-                args.get(6)
-                    .cloned()
-                    .unwrap_or_else(|| DEFAULT_LOCAL_HG002_CHR22_VCF_GZ.to_string()),
+                positional
+                    .get(6)
+                    .map(|s| s.as_str())
+                    .unwrap_or(DEFAULT_LOCAL_HG002_CHR22_VCF_GZ),
             ),
             work_dir: PathBuf::from(
-                args.get(7)
-                    .cloned()
-                    .unwrap_or_else(|| DEFAULT_WORK_DIR.to_string()),
+                positional
+                    .get(7)
+                    .map(|s| s.as_str())
+                    .unwrap_or(DEFAULT_WORK_DIR),
             ),
+            context_dir: positional.get(8).map(|s| PathBuf::from(s.as_str())),
+            merged,
         }
     }
 }
@@ -93,6 +109,14 @@ async fn main() -> Result<()> {
     println!("  backend: {}", args.backend);
     println!("  vep_cache_dir: {}", args.vep_cache_dir.display());
     println!("  work_dir: {}", args.work_dir.display());
+    println!(
+        "  context_dir: {}",
+        args.context_dir
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(auto-discover)".to_string())
+    );
+    println!("  merged: {}", args.merged);
 
     fs::create_dir_all(&args.work_dir).map_err(io_err)?;
 
@@ -116,6 +140,10 @@ async fn main() -> Result<()> {
         "HG002_chr22_{}_comparison_report.txt",
         args.sample_limit
     ));
+    let diff_path = args.work_dir.join(format!(
+        "HG002_chr22_{}_discrepancies.txt",
+        args.sample_limit
+    ));
 
     let sampling_start = Instant::now();
     let sampled_rows =
@@ -128,12 +156,25 @@ async fn main() -> Result<()> {
         sampled_vcf.display()
     );
 
+    // Decompose multi-allelic sites so both VEP and our engine see single-alt records.
+    let normalized_vcf = args
+        .work_dir
+        .join(format!("HG002_chr22_{}_norm.vcf", args.sample_limit));
+    let norm_rows = normalize_vcf(&sampled_vcf, &normalized_vcf)?;
+    println!(
+        "normalized: {} -> {} rows (multi-allelic decomposed) -> {}",
+        sampled_rows,
+        norm_rows,
+        normalized_vcf.display()
+    );
+
     let docker_start = Instant::now();
     run_vep_docker(
-        &sampled_vcf,
+        &normalized_vcf,
         &golden_vcf,
         &args.work_dir,
         &args.vep_cache_dir,
+        args.merged,
     )?;
     let docker_elapsed = docker_start.elapsed().as_secs_f64();
     println!(
@@ -151,9 +192,22 @@ async fn main() -> Result<()> {
         parse_elapsed
     );
 
+    // Build options_json if context_dir is provided.
+    let options_json = build_options_json(&args);
+
+    let effective_context_dir = args
+        .context_dir
+        .as_deref()
+        .or_else(|| Path::new(&args.cache_source).parent());
     let ours_start = Instant::now();
-    let ours_annotations =
-        run_annotate_vep(&sampled_vcf, &args.cache_source, &args.backend).await?;
+    let ours_annotations = run_annotate_vep(
+        &normalized_vcf,
+        &args.cache_source,
+        &args.backend,
+        options_json.as_deref(),
+        effective_context_dir,
+    )
+    .await?;
     let ours_elapsed = ours_start.elapsed().as_secs_f64();
     println!(
         "annotate_vep rows: {} (elapsed {:.3}s)",
@@ -163,7 +217,11 @@ async fn main() -> Result<()> {
 
     let report = compare_annotations(&golden_annotations, &ours_annotations);
     let term_report = compare_annotation_terms(&golden_annotations, &ours_annotations);
+    let discrepancies = collect_discrepancies(&golden_annotations, &ours_annotations);
+
     print_report(&report, &term_report);
+    print_discrepancy_summary(&discrepancies, &report);
+
     write_report(
         &report_path,
         &report,
@@ -174,9 +232,155 @@ async fn main() -> Result<()> {
         parse_elapsed,
         ours_elapsed,
     )?;
+    write_discrepancies(&diff_path, &discrepancies)?;
     println!("report written to {}", report_path.display());
+    println!(
+        "discrepancies written to {} ({} variants)",
+        diff_path.display(),
+        discrepancies.len()
+    );
 
     Ok(())
+}
+
+/// Build options_json from context_dir by discovering parquet files.
+///
+/// Scans context_dir for files matching known patterns and builds the
+/// JSON string to pass as the 4th argument to `annotate_vep()`.
+fn build_options_json(args: &Args) -> Option<String> {
+    // Use explicit context_dir, or derive from cache_source parent directory.
+    let context_dir = args
+        .context_dir
+        .as_deref()
+        .or_else(|| Path::new(&args.cache_source).parent())
+        .filter(|p| p.is_dir())?;
+
+    // Derive base name from cache_source (e.g. "115_GRCh38_variation_22" -> "115_GRCh38")
+    // by stripping "_variation*" or "_variants*" suffix.
+    let cache_stem = Path::new(&args.cache_source)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    let base = if let Some(idx) = cache_stem.find("_variation") {
+        &cache_stem[..idx]
+    } else if let Some(idx) = cache_stem.find("_variants") {
+        &cache_stem[..idx]
+    } else {
+        cache_stem
+    };
+
+    // Derive suffix (e.g. "_22" from "115_GRCh38_variation_22").
+    let suffix = cache_stem
+        .strip_prefix(base)
+        .and_then(|rest| rest.strip_prefix("_variation"))
+        .or_else(|| {
+            cache_stem
+                .strip_prefix(base)
+                .and_then(|rest| rest.strip_prefix("_variants"))
+        })
+        .unwrap_or("");
+
+    // Build table name -> parquet path mapping for known context tables.
+    let table_specs: Vec<(&str, &str)> = vec![
+        ("transcripts_table", "transcript"),
+        ("exons_table", "exon"),
+        ("translations_table", "translation"),
+        ("regulatory_table", "regulatory"),
+        ("motif_table", "motif"),
+    ];
+
+    let mut entries = Vec::new();
+    for (json_key, file_stem) in &table_specs {
+        let parquet_name = format!("{base}_{file_stem}{suffix}.parquet");
+        let parquet_path = context_dir.join(&parquet_name);
+        if parquet_path.exists() {
+            // Table name used for DataFusion registration (no .parquet extension).
+            let table_name = format!("{base}_{file_stem}{suffix}");
+            entries.push(format!("\"{json_key}\":\"{table_name}\""));
+        }
+    }
+
+    // Disable extended probes for faster equi-join.
+    entries.push("\"extended_probes\":false".to_string());
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    Some(format!("{{{}}}", entries.join(",")))
+}
+
+/// Register context parquet files from context_dir in the DataFusion session.
+async fn register_context_tables(
+    ctx: &SessionContext,
+    context_dir: &Path,
+    options_json: &str,
+) -> Result<()> {
+    // Parse table names from options_json and register corresponding parquet files.
+    let keys = [
+        "transcripts_table",
+        "exons_table",
+        "translations_table",
+        "regulatory_table",
+        "motif_table",
+    ];
+    for key in &keys {
+        if let Some(table_name) = parse_json_string_value(options_json, key) {
+            let parquet_path = context_dir.join(format!("{table_name}.parquet"));
+            if parquet_path.exists() {
+                ctx.register_parquet(
+                    &table_name,
+                    parquet_path.display().to_string().as_str(),
+                    ParquetReadOptions::default(),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decompose multi-allelic sites using `bcftools norm -m -both`.
+/// Returns the number of data rows in the normalized VCF.
+fn normalize_vcf(input: &Path, output: &Path) -> Result<usize> {
+    let result = Command::new("bcftools")
+        .arg("norm")
+        .arg("-m")
+        .arg("-both")
+        .arg("-o")
+        .arg(output.as_os_str())
+        .arg(input.as_os_str())
+        .output()
+        .map_err(io_err)?;
+
+    if !result.status.success() {
+        return Err(DataFusionError::Execution(format!(
+            "bcftools norm failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        )));
+    }
+
+    // Count data lines in the output VCF.
+    let contents = fs::read_to_string(output).map_err(io_err)?;
+    let count = contents.lines().filter(|l| !l.starts_with('#')).count();
+    Ok(count)
+}
+
+/// Minimal JSON string value parser (matches the one in AnnotateProvider).
+fn parse_json_string_value(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let start = json.find(&needle)?;
+    let rest = &json[start + needle.len()..];
+    let colon = rest.find(':')?;
+    let after_colon = rest[colon + 1..].trim_start();
+    let after_quote = after_colon.strip_prefix('"')?;
+    let end_quote = after_quote.find('"')?;
+    let value = &after_quote[..end_quote];
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 fn run_vep_docker(
@@ -184,6 +388,7 @@ fn run_vep_docker(
     golden_vcf: &Path,
     work_dir: &Path,
     vep_cache_dir: &Path,
+    merged: bool,
 ) -> Result<()> {
     let sampled_name = sampled_vcf
         .file_name()
@@ -197,8 +402,8 @@ fn run_vep_docker(
     let volume_cache = format!("{}:/opt/vep/.vep", vep_cache_dir.display());
     let volume_work = format!("{}:/work", work_dir.display());
 
-    let output = Command::new("docker")
-        .arg("run")
+    let mut cmd = Command::new("docker");
+    cmd.arg("run")
         .arg("--rm")
         .arg("-v")
         .arg(volume_cache)
@@ -220,9 +425,19 @@ fn run_vep_docker(
         .arg("--fork")
         .arg("4")
         .arg("--force_overwrite")
-        .arg("--no_stats")
-        .output()
-        .map_err(io_err)?;
+        .arg("--no_stats");
+
+    // Enable regulatory feature annotations (VEP skips them by default).
+    cmd.arg("--regulatory");
+
+    if merged {
+        cmd.arg("--merged");
+        // Merged caches auto-enable --use_transcript_ref which requires FASTA.
+        // Use --use_given_ref to skip the FASTA requirement.
+        cmd.arg("--use_given_ref");
+    }
+
+    let output = cmd.output().map_err(io_err)?;
 
     if !output.status.success() {
         return Err(DataFusionError::Execution(format!(
@@ -247,6 +462,8 @@ async fn run_annotate_vep(
     sampled_vcf: &Path,
     cache_source: &str,
     backend: &str,
+    options_json: Option<&str>,
+    context_dir: Option<&Path>,
 ) -> Result<Vec<VariantAnnotation>> {
     let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
@@ -261,11 +478,25 @@ async fn run_annotate_vep(
     )?;
     ctx.register_table("sampled_vcf", Arc::new(vcf))?;
 
-    let sql = format!(
-        "SELECT chrom, start, ref, alt, csq, most_severe_consequence FROM annotate_vep('sampled_vcf', '{}', '{}')",
-        sql_literal(cache_source),
-        sql_literal(backend)
-    );
+    // Register context parquet tables if options_json and context_dir are provided.
+    if let (Some(opts), Some(dir)) = (options_json, context_dir) {
+        register_context_tables(&ctx, dir, opts).await?;
+    }
+
+    let sql = if let Some(opts) = options_json {
+        format!(
+            "SELECT chrom, start, ref, alt, csq, most_severe_consequence FROM annotate_vep('sampled_vcf', '{}', '{}', '{}')",
+            sql_literal(cache_source),
+            sql_literal(backend),
+            sql_literal(opts)
+        )
+    } else {
+        format!(
+            "SELECT chrom, start, ref, alt, csq, most_severe_consequence FROM annotate_vep('sampled_vcf', '{}', '{}')",
+            sql_literal(cache_source),
+            sql_literal(backend)
+        )
+    };
     let batches = ctx.sql(&sql).await?.collect().await?;
 
     let mut out = Vec::new();
@@ -370,6 +601,12 @@ fn print_report(report: &ComparisonReport, term_report: &TermComparisonReport) {
         "  most_severe_exact_matches: {}",
         report.most_severe_exact_matches
     );
+    if report.intersection_rows > 0 {
+        println!(
+            "  most_severe_accuracy: {:.1}%",
+            report.most_severe_exact_matches as f64 / report.intersection_rows as f64 * 100.0
+        );
+    }
     println!("  term_comparable_rows: {}", term_report.comparable_rows);
     println!(
         "  term_golden_with_terms: {}",
@@ -380,10 +617,73 @@ fn print_report(report: &ComparisonReport, term_report: &TermComparisonReport) {
         "  term_set_exact_matches: {}",
         term_report.term_set_exact_matches
     );
+    if term_report.comparable_rows > 0 {
+        println!(
+            "  term_set_accuracy: {:.1}%",
+            term_report.term_set_exact_matches as f64 / term_report.comparable_rows as f64 * 100.0
+        );
+    }
     println!(
         "  golden_term_subset_matches: {}",
         term_report.golden_term_subset_matches
     );
+}
+
+fn print_discrepancy_summary(discrepancies: &[VariantDiscrepancy], report: &ComparisonReport) {
+    let total = discrepancies.len();
+    let most_severe_mismatches = discrepancies.iter().filter(|d| !d.most_severe_match).count();
+    let term_mismatches = discrepancies.iter().filter(|d| !d.term_set_match).count();
+    let missing = discrepancies.iter().filter(|d| d.ours_most_severe.is_none()).count();
+
+    println!("\ndiscrepancy summary");
+    println!("  total_discrepancies: {total}");
+    println!("  most_severe_mismatches: {most_severe_mismatches}");
+    println!("  term_set_mismatches: {term_mismatches}");
+    println!("  missing_in_ours: {missing}");
+
+    // Print first 20 discrepancies as preview.
+    let preview_limit = 20;
+    let shown = discrepancies.len().min(preview_limit);
+    if shown > 0 {
+        println!("\nfirst {shown} discrepancies:");
+        for d in discrepancies.iter().take(preview_limit) {
+            let golden_ms = d
+                .golden_most_severe
+                .as_deref()
+                .unwrap_or("(none)");
+            let ours_ms = d.ours_most_severe.as_deref().unwrap_or("(none)");
+            let ms_marker = if d.most_severe_match { "=" } else { "!" };
+            let ts_marker = if d.term_set_match { "=" } else { "!" };
+
+            println!(
+                "  {}:{} {}/{} most_severe[{ms_marker}]: {} vs {} terms[{ts_marker}]: {:?} vs {:?}",
+                d.key.chrom,
+                d.key.pos,
+                d.key.ref_allele,
+                d.key.alt_alleles,
+                golden_ms,
+                ours_ms,
+                d.golden_terms,
+                d.ours_terms,
+            );
+        }
+        if total > preview_limit {
+            println!("  ... and {} more (see discrepancies file)", total - preview_limit);
+        }
+    }
+
+    // Print accuracy rates.
+    if report.intersection_rows > 0 {
+        println!(
+            "\naccuracy: most_severe={:.1}% term_set={:.1}%",
+            (report.intersection_rows - most_severe_mismatches) as f64
+                / report.intersection_rows as f64
+                * 100.0,
+            (report.intersection_rows - term_mismatches) as f64
+                / report.intersection_rows as f64
+                * 100.0,
+        );
+    }
 }
 
 fn write_report(
@@ -417,6 +717,14 @@ fn write_report(
         report.most_severe_exact_matches
     )
     .map_err(io_err)?;
+    if report.intersection_rows > 0 {
+        writeln!(
+            f,
+            "most_severe_accuracy={:.3}",
+            report.most_severe_exact_matches as f64 / report.intersection_rows as f64
+        )
+        .map_err(io_err)?;
+    }
     writeln!(f, "term_comparable_rows={}", term_report.comparable_rows).map_err(io_err)?;
     writeln!(
         f,
@@ -431,12 +739,60 @@ fn write_report(
         term_report.term_set_exact_matches
     )
     .map_err(io_err)?;
+    if term_report.comparable_rows > 0 {
+        writeln!(
+            f,
+            "term_set_accuracy={:.3}",
+            term_report.term_set_exact_matches as f64 / term_report.comparable_rows as f64
+        )
+        .map_err(io_err)?;
+    }
     writeln!(
         f,
         "golden_term_subset_matches={}",
         term_report.golden_term_subset_matches
     )
     .map_err(io_err)?;
+    Ok(())
+}
+
+fn write_discrepancies(path: &Path, discrepancies: &[VariantDiscrepancy]) -> Result<()> {
+    let mut f = File::create(path).map_err(io_err)?;
+    writeln!(
+        f,
+        "# Per-variant discrepancies (golden vs ours)"
+    )
+    .map_err(io_err)?;
+    writeln!(
+        f,
+        "# chrom:pos ref/alt | most_severe_match | golden_most_severe | ours_most_severe | term_set_match | golden_terms | ours_terms"
+    )
+    .map_err(io_err)?;
+    writeln!(f, "# total: {}", discrepancies.len()).map_err(io_err)?;
+    writeln!(f).map_err(io_err)?;
+
+    for d in discrepancies {
+        let golden_ms = d.golden_most_severe.as_deref().unwrap_or("(none)");
+        let ours_ms = d.ours_most_severe.as_deref().unwrap_or("(none)");
+        let golden_terms: Vec<&str> = d.golden_terms.iter().map(|s| s.as_str()).collect();
+        let ours_terms: Vec<&str> = d.ours_terms.iter().map(|s| s.as_str()).collect();
+
+        writeln!(
+            f,
+            "{}:{} {}/{} | ms={} | golden={} | ours={} | ts={} | golden_terms=[{}] | ours_terms=[{}]",
+            d.key.chrom,
+            d.key.pos,
+            d.key.ref_allele,
+            d.key.alt_alleles,
+            d.most_severe_match,
+            golden_ms,
+            ours_ms,
+            d.term_set_match,
+            golden_terms.join(","),
+            ours_terms.join(","),
+        )
+        .map_err(io_err)?;
+    }
     Ok(())
 }
 

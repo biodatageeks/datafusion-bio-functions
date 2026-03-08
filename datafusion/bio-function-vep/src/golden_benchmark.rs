@@ -79,6 +79,18 @@ pub struct TermComparisonReport {
     pub golden_term_subset_matches: usize,
 }
 
+/// Per-variant discrepancy between golden and our annotation.
+#[derive(Debug, Clone)]
+pub struct VariantDiscrepancy {
+    pub key: VariantKey,
+    pub golden_most_severe: Option<String>,
+    pub ours_most_severe: Option<String>,
+    pub golden_terms: BTreeSet<String>,
+    pub ours_terms: BTreeSet<String>,
+    pub most_severe_match: bool,
+    pub term_set_match: bool,
+}
+
 /// Ensure benchmark input is available in this repository.
 ///
 /// Copies source file and optional tabix index when destination is missing.
@@ -378,6 +390,78 @@ pub fn compare_annotation_terms(
         term_set_exact_matches,
         golden_term_subset_matches,
     }
+}
+
+/// Collect per-variant discrepancies between golden and our annotations.
+///
+/// Only returns entries where most_severe or term set differ.
+pub fn collect_discrepancies(
+    golden: &[VariantAnnotation],
+    ours: &[VariantAnnotation],
+) -> Vec<VariantDiscrepancy> {
+    let golden_map: HashMap<VariantKey, &VariantAnnotation> =
+        golden.iter().map(|r| (r.key.clone(), r)).collect();
+    let ours_map: HashMap<VariantKey, &VariantAnnotation> =
+        ours.iter().map(|r| (r.key.clone(), r)).collect();
+
+    let mut out = Vec::new();
+
+    for (key, golden_row) in &golden_map {
+        let Some(ours_row) = ours_map.get(key) else {
+            // Missing in ours — always a discrepancy.
+            let golden_terms = golden_row
+                .csq
+                .as_deref()
+                .map(extract_csq_term_set)
+                .unwrap_or_default();
+            out.push(VariantDiscrepancy {
+                key: key.clone(),
+                golden_most_severe: golden_row.most_severe_consequence.clone(),
+                ours_most_severe: None,
+                golden_terms,
+                ours_terms: BTreeSet::new(),
+                most_severe_match: false,
+                term_set_match: false,
+            });
+            continue;
+        };
+
+        let golden_terms = golden_row
+            .csq
+            .as_deref()
+            .map(extract_csq_term_set)
+            .unwrap_or_default();
+        let ours_terms = ours_row
+            .csq
+            .as_deref()
+            .map(extract_csq_term_set)
+            .unwrap_or_default();
+
+        let most_severe_match =
+            golden_row.most_severe_consequence == ours_row.most_severe_consequence;
+        let term_set_match = golden_terms == ours_terms;
+
+        if !most_severe_match || !term_set_match {
+            out.push(VariantDiscrepancy {
+                key: key.clone(),
+                golden_most_severe: golden_row.most_severe_consequence.clone(),
+                ours_most_severe: ours_row.most_severe_consequence.clone(),
+                golden_terms,
+                ours_terms,
+                most_severe_match,
+                term_set_match,
+            });
+        }
+    }
+
+    // Sort by position for deterministic output.
+    out.sort_by(|a, b| {
+        a.key
+            .chrom
+            .cmp(&b.key.chrom)
+            .then(a.key.pos.cmp(&b.key.pos))
+    });
+    out
 }
 
 fn io_err<E: std::fmt::Display>(e: E) -> DataFusionError {
