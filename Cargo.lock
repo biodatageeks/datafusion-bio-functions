@@ -83,6 +83,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "anstream"
+version = "0.6.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43d5b281e737544384e969a5ccad3f1cdd24b48086a0fc1b2a5262a26b8f4f4a"
+dependencies = [
+ "anstyle",
+ "anstyle-parse",
+ "anstyle-query",
+ "anstyle-wincon",
+ "colorchoice",
+ "is_terminal_polyfill",
+ "utf8parse",
+]
+
+[[package]]
+name = "anstyle"
+version = "1.0.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5192cca8006f1fd4f7237516f40fa183bb07f8fbdfedaa0036de5ea9b0b45e78"
+
+[[package]]
+name = "anstyle-parse"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7644824f0aa2c7b9384579234ef10eb7efb6a0deb83f9630a49594dd9c15c2"
+dependencies = [
+ "utf8parse",
+]
+
+[[package]]
+name = "anstyle-query"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "anstyle-wincon"
+version = "3.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
+dependencies = [
+ "anstyle",
+ "once_cell_polyfill",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -241,7 +291,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
- "lz4_flex",
+ "lz4_flex 0.11.5",
  "zstd",
 ]
 
@@ -621,10 +671,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
+name = "byteorder-lite"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
+
+[[package]]
 name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+
+[[package]]
+name = "byteview"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c53ba0f290bfc610084c05582d9c5d421662128fc69f4bf236707af6fd321b9"
 
 [[package]]
 name = "bzip2"
@@ -727,6 +789,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "240f9610db0e586042f50260506972820ef10d5eb9a0e867a00f8cfe0a238be3"
 
 [[package]]
+name = "colorchoice"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
+
+[[package]]
 name = "comfy-table"
 version = "7.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -736,6 +804,12 @@ dependencies = [
  "strum_macros",
  "unicode-width",
 ]
+
+[[package]]
+name = "compare"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea0095f6103c2a8b44acd6fd15960c801dafebf02e21940360833e0673f48ba7"
 
 [[package]]
 name = "const-oid"
@@ -808,6 +882,25 @@ version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
 dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-skiplist"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df29de440c58ca2cc6e587ec3d22347551a32435fbde9d2bff64e78a9ffa151b"
+dependencies = [
+ "crossbeam-epoch",
  "crossbeam-utils",
 ]
 
@@ -938,15 +1031,15 @@ dependencies = [
  "async-trait",
  "bytes",
  "datafusion",
- "datafusion-bio-format-core",
+ "datafusion-bio-format-core 0.5.0",
  "futures",
  "futures-util",
  "hex",
  "log",
  "noodles-bam 0.82.0",
- "noodles-bgzf 0.42.0",
- "noodles-core 0.18.0",
- "noodles-csi 0.50.0",
+ "noodles-bgzf 0.42.0 (git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b)",
+ "noodles-core 0.18.0 (git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b)",
+ "noodles-csi 0.50.0 (git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b)",
  "noodles-sam 0.78.0",
  "opendal",
  "serde",
@@ -966,7 +1059,7 @@ dependencies = [
  "datafusion-execution",
  "futures",
  "log",
- "noodles",
+ "noodles 0.93.0",
  "noodles-bgzf 0.36.0",
  "noodles-sam 0.78.0",
  "opendal",
@@ -975,6 +1068,57 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
+]
+
+[[package]]
+name = "datafusion-bio-format-core"
+version = "0.5.2"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=45562f3beb230c23008b19bfe6c172bd1c5923fa#45562f3beb230c23008b19bfe6c172bd1c5923fa"
+dependencies = [
+ "async-compression",
+ "bytes",
+ "datafusion",
+ "datafusion-execution",
+ "futures",
+ "log",
+ "noodles 0.93.0",
+ "noodles-bgzf 0.36.0",
+ "noodles-sam 0.78.0",
+ "opendal",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
+name = "datafusion-bio-format-vcf"
+version = "0.5.2"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=45562f3beb230c23008b19bfe6c172bd1c5923fa#45562f3beb230c23008b19bfe6c172bd1c5923fa"
+dependencies = [
+ "async-compression",
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "datafusion",
+ "datafusion-bio-format-core 0.5.2",
+ "datafusion-execution",
+ "env_logger",
+ "flate2",
+ "futures",
+ "log",
+ "noodles 0.100.0",
+ "noodles-bgzf 0.36.0",
+ "noodles-bgzf 0.42.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+ "noodles-core 0.18.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+ "noodles-csi 0.50.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+ "noodles-tabix 0.56.0",
+ "noodles-vcf 0.80.0",
+ "opendal",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1007,6 +1151,27 @@ dependencies = [
  "rust-lapper",
  "superintervals",
  "tokio",
+]
+
+[[package]]
+name = "datafusion-bio-function-vep"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "arrow-ipc",
+ "async-trait",
+ "datafusion",
+ "datafusion-bio-format-vcf",
+ "datafusion-bio-function-ranges",
+ "env_logger",
+ "fjall",
+ "flate2",
+ "futures",
+ "log",
+ "lz4_flex 0.12.0",
+ "tempfile",
+ "tokio",
+ "zstd",
 ]
 
 [[package]]
@@ -1704,6 +1869,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "enum_dispatch"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
+dependencies = [
+ "once_cell",
+ "proc-macro2 1.0.106",
+ "quote 1.0.44",
+ "syn 2.0.115",
+]
+
+[[package]]
+name = "env_filter"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a1c3cc8e57274ec99de65301228b537f1e4eedc1b8e0f9411c6caac8ae7308f"
+dependencies = [
+ "log",
+ "regex",
+]
+
+[[package]]
+name = "env_logger"
+version = "0.11.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2daee4ea451f429a58296525ddf28b45a3b64f1acf6587e2067437bb11e218d"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "env_filter",
+ "jiff",
+ "log",
+]
+
+[[package]]
 name = "equator"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1764,6 +1964,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
+name = "fjall"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a2799b4198427a08c774838e44d0b77f677208f19a1927671cd2cd36bb30d69"
+dependencies = [
+ "byteorder-lite",
+ "byteview",
+ "dashmap",
+ "flume",
+ "log",
+ "lsm-tree",
+ "lz4_flex 0.11.5",
+ "tempfile",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "flatbuffers"
 version = "25.12.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1782,6 +1999,15 @@ dependencies = [
  "crc32fast",
  "miniz_oxide",
  "zlib-rs",
+]
+
+[[package]]
+name = "flume"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
+dependencies = [
+ "spin",
 ]
 
 [[package]]
@@ -2317,6 +2543,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 
 [[package]]
+name = "interval-heap"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11274e5e8e89b8607cfedc2910b6626e998779b48a019151c7604d0adcb86ac6"
+dependencies = [
+ "compare",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2331,6 +2566,12 @@ dependencies = [
  "memchr",
  "serde",
 ]
+
+[[package]]
+name = "is_terminal_polyfill"
+version = "1.70.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "itertools"
@@ -2355,6 +2596,30 @@ name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
+
+[[package]]
+name = "jiff"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3e3d65f018c6ae946ab16e80944b97096ed73c35b221d1c478a6c81d8f57940"
+dependencies = [
+ "jiff-static",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a17c2b211d863c7fde02cbea8a3c1a439b98e109286554f2860bdded7ff83818"
+dependencies = [
+ "proc-macro2 1.0.106",
+ "quote 1.0.44",
+ "syn 2.0.115",
+]
 
 [[package]]
 name = "jobserver"
@@ -2533,10 +2798,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "lsm-tree"
+version = "3.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86e8d0b8e0cf2531a437788ce94d95570dbaabfe9888db20022c2d5ccec9b221"
+dependencies = [
+ "byteorder-lite",
+ "byteview",
+ "crossbeam-skiplist",
+ "enum_dispatch",
+ "interval-heap",
+ "log",
+ "lz4_flex 0.11.5",
+ "quick_cache",
+ "rustc-hash",
+ "self_cell",
+ "sfa",
+ "tempfile",
+ "varint-rs",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "lz4_flex"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08ab2867e3eeeca90e844d1940eab391c9dc5228783db2ed999acbc0a9ed375a"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
+name = "lz4_flex"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab6473172471198271ff72e9379150e9dfd70d8e533e0752a27e515b48dd375e"
 dependencies = [
  "twox-hash",
 ]
@@ -2664,8 +2960,17 @@ dependencies = [
  "noodles-fastq",
  "noodles-gff",
  "noodles-sam 0.72.0",
- "noodles-tabix",
- "noodles-vcf",
+ "noodles-tabix 0.50.0",
+ "noodles-vcf 0.74.0",
+]
+
+[[package]]
+name = "noodles"
+version = "0.100.0"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c#9b7b2c5b6531373918302d4c07410e583f1b5b5c"
+dependencies = [
+ "noodles-bgzf 0.42.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+ "noodles-vcf 0.80.0",
 ]
 
 [[package]]
@@ -2696,9 +3001,9 @@ dependencies = [
  "futures",
  "indexmap",
  "memchr",
- "noodles-bgzf 0.42.0",
- "noodles-core 0.18.0",
- "noodles-csi 0.50.0",
+ "noodles-bgzf 0.42.0 (git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b)",
+ "noodles-core 0.18.0 (git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b)",
+ "noodles-csi 0.50.0 (git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b)",
  "noodles-sam 0.78.0",
  "pin-project-lite",
  "tokio",
@@ -2717,7 +3022,7 @@ dependencies = [
  "noodles-bgzf 0.36.0",
  "noodles-core 0.16.0",
  "noodles-csi 0.44.0",
- "noodles-vcf",
+ "noodles-vcf 0.74.0",
  "pin-project-lite",
  "tokio",
 ]
@@ -2729,6 +3034,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c10c4cb29950028823653395ebedfcaf5b652e504aacf816b510fb0268daa2eb"
 dependencies = [
  "byteorder",
+ "bytes",
+ "crossbeam-channel",
+ "flate2",
+ "futures",
+ "libdeflater",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "noodles-bgzf"
+version = "0.42.0"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c#9b7b2c5b6531373918302d4c07410e583f1b5b5c"
+dependencies = [
  "bytes",
  "crossbeam-channel",
  "flate2",
@@ -2759,6 +3079,14 @@ name = "noodles-core"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "962b13b79312f773a12ffcb0cdaccab6327f8343b6f440a888eff10c749d52b0"
+dependencies = [
+ "bstr",
+]
+
+[[package]]
+name = "noodles-core"
+version = "0.18.0"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c#9b7b2c5b6531373918302d4c07410e583f1b5b5c"
 dependencies = [
  "bstr",
 ]
@@ -2813,13 +3141,25 @@ dependencies = [
 [[package]]
 name = "noodles-csi"
 version = "0.50.0"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c#9b7b2c5b6531373918302d4c07410e583f1b5b5c"
+dependencies = [
+ "bit-vec",
+ "bstr",
+ "indexmap",
+ "noodles-bgzf 0.42.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+ "noodles-core 0.18.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+]
+
+[[package]]
+name = "noodles-csi"
+version = "0.50.0"
 source = "git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b#da905fff4909ada93e407c780456332fe113858b"
 dependencies = [
  "bit-vec",
  "bstr",
  "indexmap",
- "noodles-bgzf 0.42.0",
- "noodles-core 0.18.0",
+ "noodles-bgzf 0.42.0 (git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b)",
+ "noodles-core 0.18.0 (git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b)",
 ]
 
 [[package]]
@@ -2892,9 +3232,9 @@ dependencies = [
  "indexmap",
  "lexical-core",
  "memchr",
- "noodles-bgzf 0.42.0",
- "noodles-core 0.18.0",
- "noodles-csi 0.50.0",
+ "noodles-bgzf 0.42.0 (git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b)",
+ "noodles-core 0.18.0 (git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b)",
+ "noodles-csi 0.50.0 (git+https://github.com/biodatageeks/noodles.git?rev=da905fff4909ada93e407c780456332fe113858b)",
 ]
 
 [[package]]
@@ -2912,6 +3252,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "noodles-tabix"
+version = "0.56.0"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c#9b7b2c5b6531373918302d4c07410e583f1b5b5c"
+dependencies = [
+ "bstr",
+ "indexmap",
+ "noodles-bgzf 0.42.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+ "noodles-core 0.18.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+ "noodles-csi 0.50.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+ "tokio",
+]
+
+[[package]]
 name = "noodles-vcf"
 version = "0.74.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2923,7 +3276,24 @@ dependencies = [
  "noodles-bgzf 0.36.0",
  "noodles-core 0.16.0",
  "noodles-csi 0.44.0",
- "noodles-tabix",
+ "noodles-tabix 0.50.0",
+ "percent-encoding",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "noodles-vcf"
+version = "0.80.0"
+source = "git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c#9b7b2c5b6531373918302d4c07410e583f1b5b5c"
+dependencies = [
+ "futures",
+ "indexmap",
+ "memchr",
+ "noodles-bgzf 0.42.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+ "noodles-core 0.18.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+ "noodles-csi 0.50.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
+ "noodles-tabix 0.56.0",
  "percent-encoding",
  "pin-project-lite",
  "tokio",
@@ -3065,6 +3435,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
+name = "once_cell_polyfill"
+version = "1.70.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
 name = "opendal"
 version = "0.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3167,7 +3543,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.15.5",
- "lz4_flex",
+ "lz4_flex 0.11.5",
  "num",
  "num-bigint",
  "object_store",
@@ -3425,6 +3801,16 @@ checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
 dependencies = [
  "memchr",
  "serde",
+]
+
+[[package]]
+name = "quick_cache"
+version = "0.6.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ada44a88ef953a3294f6eb55d2007ba44646015e18613d2f213016379203ef3"
+dependencies = [
+ "equivalent",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -3929,6 +4315,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "self_cell"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b12e76d157a900eb52e81bc6e9f3069344290341720e9178cde2407113ac8d89"
+
+[[package]]
 name = "semver"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3999,6 +4391,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sfa"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1296838937cab56cd6c4eeeb8718ec777383700c33f060e2869867bd01d1175"
+dependencies = [
+ "byteorder-lite",
+ "log",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -4115,6 +4518,9 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+dependencies = [
+ "lock_api",
+]
 
 [[package]]
 name = "spki"
@@ -4618,6 +5024,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
+name = "utf8parse"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
 name = "uuid"
 version = "1.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4628,6 +5040,12 @@ dependencies = [
  "serde_core",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "varint-rs"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f54a172d0620933a27a4360d3db3e2ae0dd6cceae9730751a036bbf182c4b23"
 
 [[package]]
 name = "vec_map"
@@ -5167,6 +5585,12 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "xz2"

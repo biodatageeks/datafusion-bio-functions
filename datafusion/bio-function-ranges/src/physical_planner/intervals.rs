@@ -83,7 +83,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (le, JoinSide::Left) => {
                     let le = if is_lt { minus_one(le) } else { le };
-                    inner.with_rs(rs).with_le(le);
+                    inner.with_rs(rs)?.with_le(le)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as rs </<= le".to_string()),
@@ -93,7 +93,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (re, JoinSide::Right) => {
                     let re = if is_lt { minus_one(re) } else { re };
-                    inner.with_re(re).with_ls(ls);
+                    inner.with_re(re)?.with_ls(ls)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as ls </<= re".to_string()),
@@ -103,7 +103,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (ls, JoinSide::Left) => {
                     let re = if is_gt { minus_one(re) } else { re };
-                    inner.with_re(re).with_ls(ls);
+                    inner.with_re(re)?.with_ls(ls)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as re >/>= ls".to_string()),
@@ -113,7 +113,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (rs, JoinSide::Right) => {
                     let le = if is_gt { minus_one(le) } else { le };
-                    inner.with_rs(rs).with_le(le);
+                    inner.with_rs(rs)?.with_le(le)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as le >/>= rs".to_string()),
@@ -140,88 +140,89 @@ impl IntervalBuilder {
         }
     }
 
-    fn with_ls(&mut self, ls: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_ls(&mut self, ls: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.ls.is_some() {
-            panic!("ls must not be called twice")
+            return Err("ls already set".to_string());
         }
         self.ls = Some(ls);
-        self
+        Ok(self)
     }
-    fn with_le(&mut self, le: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_le(&mut self, le: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.le.is_some() {
-            panic!("le must not be called twice")
+            return Err("le already set".to_string());
         }
         self.le = Some(le);
-        self
+        Ok(self)
     }
-    fn with_rs(&mut self, rs: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_rs(&mut self, rs: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.rs.is_some() {
-            panic!("rs must not be called twice")
+            return Err("rs already set".to_string());
         }
         self.rs = Some(rs);
-        self
+        Ok(self)
     }
-    fn with_re(&mut self, re: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_re(&mut self, re: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.re.is_some() {
-            panic!("re must not be called twice")
+            return Err("re already set".to_string());
         }
         self.re = Some(re);
-        self
+        Ok(self)
     }
 
-    fn finish(self) -> ColIntervals {
+    fn finish(self) -> Result<ColIntervals, String> {
         let l_interval = ColInterval {
-            start: self.ls.expect("ls must be set"),
-            end: self.le.expect("le must be set"),
+            start: self.ls.ok_or("left start bound not found")?,
+            end: self.le.ok_or("left end bound not found")?,
         };
         let r_interval = ColInterval {
-            start: self.rs.expect("rs must be set"),
-            end: self.re.expect("re must be set"),
+            start: self.rs.ok_or("right start bound not found")?,
+            end: self.re.ok_or("right end bound not found")?,
         };
 
-        ColIntervals {
+        Ok(ColIntervals {
             left_interval: l_interval,
             right_interval: r_interval,
-        }
+        })
     }
 }
 
 fn try_parse(filter: &JoinFilter) -> Result<ColIntervals, String> {
     let mut inner = IntervalBuilder::empty();
-
-    let expr = filter
-        .expression()
-        .as_any()
-        .downcast_ref::<BinaryExpr>()
-        .ok_or("couldn't cast filter to BinaryExpr")?;
-
-    if !matches!(expr.op(), Operator::And) {
-        return Err("expr.op() is not AND".to_string());
-    }
-
-    let left = expr
-        .left()
-        .as_any()
-        .downcast_ref::<BinaryExpr>()
-        .ok_or("couldn't cast left side to BinaryExpr")?;
-    let right = expr
-        .right()
-        .as_any()
-        .downcast_ref::<BinaryExpr>()
-        .ok_or("couldn't cast right side to BinaryExpr")?;
     let indices = filter.column_indices();
 
-    parse_condition(left, indices, &mut inner)?;
-    parse_condition(right, indices, &mut inner)?;
+    let expr = filter.expression();
+    let binary = expr
+        .as_any()
+        .downcast_ref::<BinaryExpr>()
+        .ok_or("filter expression is not a BinaryExpr")?;
 
-    Ok(inner.finish())
+    if matches!(binary.op(), Operator::And) {
+        let left = binary
+            .left()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .ok_or("left side of AND is not a BinaryExpr")?;
+        let right = binary
+            .right()
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .ok_or("right side of AND is not a BinaryExpr")?;
+
+        parse_condition(left, indices, &mut inner)?;
+        parse_condition(right, indices, &mut inner)?;
+    } else {
+        return Err("filter expression is not an AND".to_string());
+    }
+
+    inner.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::DataFusionError;
     use datafusion::common::tree_node::TreeNodeRecursion;
-    use datafusion::error::{DataFusionError, Result};
+    use datafusion::error::Result;
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec};
     use datafusion::prelude::SessionContext;
