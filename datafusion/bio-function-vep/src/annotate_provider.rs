@@ -487,7 +487,6 @@ impl AnnotateProvider {
                 .or_else(|_| schema.index_of("cds_seq"))
                 .or_else(|_| schema.index_of("coding_sequence"))
                 .ok();
-
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
                     continue;

@@ -1160,6 +1160,7 @@ dependencies = [
  "ahash",
  "arrow-ipc",
  "async-trait",
+ "coitrees",
  "datafusion",
  "datafusion-bio-format-vcf",
  "datafusion-bio-function-ranges",

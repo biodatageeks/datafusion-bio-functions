@@ -1691,7 +1691,6 @@ mod tests {
 
         let expected_terms = [
             "splice_donor_variant",
-            "intron_variant",
         ];
 
         for backend in ["parquet", "fjall"] {

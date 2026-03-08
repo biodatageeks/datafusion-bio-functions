@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::so_terms::{ALL_SO_TERMS, SoTerm, unique_sorted_terms};
+use coitrees::{COITree, Interval, IntervalTree};
+
+use crate::so_terms::{ALL_SO_TERMS, SoTerm};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VariantInput {
@@ -38,8 +40,9 @@ impl VariantInput {
         let trimmed_alt = &alt_bytes[prefix_len..];
         let new_start = pos + prefix_len as i64;
         let new_end = if trimmed_ref.is_empty() {
-            // Pure insertion: VEP uses the position before/after the insertion
-            new_start + 1
+            // Pure insertion: the affected position is the insertion point
+            // itself, not a 2-base span.
+            new_start
         } else {
             pos + ref_bytes.len() as i64 - 1
         };
@@ -152,8 +155,11 @@ pub struct TranscriptConsequence {
 pub struct PreparedContext<'a> {
     pub exons_by_tx: HashMap<&'a str, Vec<&'a ExonFeature>>,
     pub translation_by_tx: HashMap<&'a str, &'a TranslationFeature>,
-    /// Transcripts sorted by start position for binary-search overlap queries.
-    pub transcripts_sorted: Vec<&'a TranscriptFeature>,
+    /// All transcripts stored by index; the COITree metadata is the index
+    /// into this vec.
+    pub transcripts: Vec<&'a TranscriptFeature>,
+    /// Per-chromosome interval tree mapping genomic range → transcript index.
+    pub tx_trees: HashMap<String, COITree<usize, u32>>,
     pub regulatory: &'a [RegulatoryFeature],
     pub motifs: &'a [MotifFeature],
     pub mirnas: &'a [MirnaFeature],
@@ -184,12 +190,30 @@ impl<'a> PreparedContext<'a> {
             .iter()
             .map(|t| (t.transcript_id.as_str(), t))
             .collect();
-        let mut transcripts_sorted: Vec<&TranscriptFeature> = transcripts.iter().collect();
-        transcripts_sorted.sort_by_key(|tx| tx.start);
+        let tx_refs: Vec<&TranscriptFeature> = transcripts.iter().collect();
+
+        // Build per-chromosome COITree for fast interval overlap queries.
+        let mut chrom_intervals: HashMap<String, Vec<Interval<usize>>> = HashMap::new();
+        for (idx, tx) in tx_refs.iter().enumerate() {
+            let chrom = normalize_chrom(&tx.chrom).to_string();
+            chrom_intervals
+                .entry(chrom)
+                .or_default()
+                .push(Interval::new(tx.start as i32, tx.end as i32, idx));
+        }
+        let tx_trees: HashMap<String, COITree<usize, u32>> = chrom_intervals
+            .into_iter()
+            .map(|(chrom, intervals)| {
+                let tree = COITree::new(&intervals);
+                (chrom, tree)
+            })
+            .collect();
+
         Self {
             exons_by_tx,
             translation_by_tx,
-            transcripts_sorted,
+            transcripts: tx_refs,
+            tx_trees,
             regulatory,
             motifs,
             mirnas,
@@ -254,42 +278,41 @@ impl TranscriptConsequenceEngine {
     ) -> Vec<TranscriptConsequence> {
         let mut out = Vec::new();
         let variant_chrom = normalize_chrom(&variant.chrom);
+        let max_dist = self.upstream_distance.max(self.downstream_distance);
 
-        let window_end = variant.end + self.upstream_distance.max(self.downstream_distance);
+        // Query the per-chromosome COITree with the variant range expanded
+        // by upstream/downstream distance to catch nearby transcripts.
+        if let Some(tree) = ctx.tx_trees.get(variant_chrom) {
+            let query_first = (variant.start - max_dist) as i32;
+            let query_last = (variant.end + max_dist) as i32;
+            tree.query(query_first, query_last, |node| {
+                let tx = ctx.transcripts[*node.metadata];
+                let tx_exons = ctx
+                    .exons_by_tx
+                    .get(tx.transcript_id.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                let tx_translation = ctx
+                    .translation_by_tx
+                    .get(tx.transcript_id.as_str())
+                    .copied();
 
-        for &tx in &ctx.transcripts_sorted {
-            if tx.start > window_end {
-                break; // All remaining transcripts are beyond the window.
-            }
-            if normalize_chrom(&tx.chrom) != variant_chrom {
-                continue;
-            }
-
-            let tx_exons = ctx
-                .exons_by_tx
-                .get(tx.transcript_id.as_str())
-                .cloned()
-                .unwrap_or_default();
-            let tx_translation = ctx
-                .translation_by_tx
-                .get(tx.transcript_id.as_str())
-                .copied();
-
-            if overlaps(variant.start, variant.end, tx.start, tx.end) {
-                let terms =
-                    self.evaluate_transcript_overlap(variant, tx, &tx_exons, tx_translation);
-                if !terms.is_empty() {
+                if overlaps(variant.start, variant.end, tx.start, tx.end) {
+                    let terms =
+                        self.evaluate_transcript_overlap(variant, tx, &tx_exons, tx_translation);
+                    if !terms.is_empty() {
+                        out.push(TranscriptConsequence {
+                            transcript_id: Some(tx.transcript_id.clone()),
+                            terms,
+                        });
+                    }
+                } else if let Some(term) = self.upstream_downstream_term(variant, tx) {
                     out.push(TranscriptConsequence {
                         transcript_id: Some(tx.transcript_id.clone()),
-                        terms,
+                        terms: vec![term],
                     });
                 }
-            } else if let Some(term) = self.upstream_downstream_term(variant, tx) {
-                out.push(TranscriptConsequence {
-                    transcript_id: Some(tx.transcript_id.clone()),
-                    terms: vec![term],
-                });
-            }
+            });
         }
 
         // Track whether any transcript was matched (overlap or upstream/downstream).
@@ -312,11 +335,21 @@ impl TranscriptConsequenceEngine {
     }
 
     pub fn collapse_variant_terms(assignments: &[TranscriptConsequence]) -> Vec<SoTerm> {
-        let mut terms = Vec::new();
+        let mut set = BTreeSet::new();
         for a in assignments {
-            terms.extend_from_slice(&a.terms);
+            set.extend(a.terms.iter().copied());
         }
-        unique_sorted_terms(terms)
+        // Apply coding parent-term stripping on the merged set so that a
+        // `coding_sequence_variant` from a null-CDS transcript is removed
+        // when another transcript contributes a specific child (missense,
+        // synonymous, etc.).
+        // NOTE: only strip coding parents here, NOT intron_variant —
+        // intron_variant stripping is per-transcript only (a different
+        // transcript may legitimately contribute intron_variant).
+        strip_coding_parent_terms(&mut set);
+        let mut v: Vec<SoTerm> = set.into_iter().collect();
+        v.sort_by_key(|t| t.rank());
+        v
     }
 
     fn evaluate_transcript_overlap(
@@ -500,10 +533,7 @@ impl TranscriptConsequenceEngine {
         ctx: &PreparedContext<'_>,
     ) {
         let chrom = normalize_chrom(&variant.chrom);
-        let has_tx = ctx
-            .transcripts_sorted
-            .iter()
-            .any(|tx| normalize_chrom(&tx.chrom) == chrom);
+        let has_tx = ctx.tx_trees.contains_key(chrom);
         Self::append_structural_terms_inner(out, variant, ctx.structural, &chrom, has_tx);
     }
 
@@ -957,10 +987,34 @@ pub fn is_vep_transcript(id: &str) -> bool {
         || id.starts_with("XR_")
 }
 
+/// Strip only coding parent terms (`coding_sequence_variant`,
+/// `protein_altering_variant`) when specific children are present.
+/// Used at the cross-transcript collapse level.
+fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
+    let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
+        || terms.contains(&SoTerm::SynonymousVariant)
+        || terms.contains(&SoTerm::StopGained)
+        || terms.contains(&SoTerm::StopLost)
+        || terms.contains(&SoTerm::StartLost)
+        || terms.contains(&SoTerm::FrameshiftVariant)
+        || terms.contains(&SoTerm::InframeInsertion)
+        || terms.contains(&SoTerm::InframeDeletion)
+        || terms.contains(&SoTerm::StopRetainedVariant)
+        || terms.contains(&SoTerm::StartRetainedVariant)
+        || terms.contains(&SoTerm::IncompleteTerminalCodonVariant);
+
+    if has_specific_coding {
+        terms.remove(&SoTerm::CodingSequenceVariant);
+        terms.remove(&SoTerm::ProteinAlteringVariant);
+    }
+}
+
 /// Remove parent SO terms when more specific children are present.
 /// VEP never emits `coding_sequence_variant` alongside a specific
 /// coding consequence (missense, synonymous, etc.), and never emits
 /// `protein_altering_variant` alongside `missense_variant`.
+/// Also strips `intron_variant` alongside splice_donor/acceptor
+/// (per-transcript level only).
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
@@ -977,6 +1031,15 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     if has_specific_coding {
         terms.remove(&SoTerm::CodingSequenceVariant);
         terms.remove(&SoTerm::ProteinAlteringVariant);
+    }
+
+    // VEP omits intron_variant when splice_donor_variant or
+    // splice_acceptor_variant is present on the same transcript —
+    // the splice site terms already imply an intronic location.
+    if terms.contains(&SoTerm::SpliceDonorVariant)
+        || terms.contains(&SoTerm::SpliceAcceptorVariant)
+    {
+        terms.remove(&SoTerm::IntronVariant);
     }
 }
 
@@ -1090,9 +1153,20 @@ fn classify_coding_change(
         return None;
     }
 
+    // VEP prepends N characters to the CDS sequence when the first coding
+    // exon starts mid-codon (non-zero phase).  These Ns align the reading
+    // frame to codon boundaries but are not part of the genomic sequence.
+    // We must offset CDS indices by the number of leading Ns so that the
+    // genomic-to-CDS mapping lines up with the padded string.
+    let leading_n_offset = cds_seq
+        .bytes()
+        .take_while(|&b| b == b'N')
+        .count();
+
     let mut cds_indices = Vec::with_capacity(genomic_positions.len());
     for pos in &genomic_positions {
-        cds_indices.push(genomic_to_cds_index(tx, tx_exons, *pos)?);
+        let idx = genomic_to_cds_index(tx, tx_exons, *pos)?;
+        cds_indices.push(idx + leading_n_offset);
     }
     cds_indices.sort_unstable();
     if cds_indices
@@ -1327,6 +1401,7 @@ fn translate_codon(codon: &str) -> Option<char> {
         "CGT" | "CGC" | "CGA" | "CGG" | "AGA" | "AGG" => Some('R'),
         "GGT" | "GGC" | "GGA" | "GGG" => Some('G'),
         "TAA" | "TAG" | "TGA" => Some('*'),
+        _ if codon.contains('N') => Some('X'),
         _ => None,
     }
 }
