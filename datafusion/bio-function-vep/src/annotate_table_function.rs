@@ -1354,10 +1354,12 @@ mod tests {
         assert_eq!(chrom, vec![Some("1".to_string()), Some("2".to_string())]);
         assert!(csq.iter().all(|v| v.is_some()));
         assert!(most.iter().all(|v| v.is_some()));
+        // Without translation tables, SNV in CDS produces
+        // coding_sequence_variant (no codon evidence for missense).
         assert!(
             csq[0]
                 .as_ref()
-                .is_some_and(|s| s.contains("missense_variant"))
+                .is_some_and(|s| s.contains("coding_sequence_variant"))
         );
         assert!(csq[0].as_ref().is_some_and(|s| s.contains("rs100")));
         assert!(
@@ -1368,7 +1370,7 @@ mod tests {
         assert_eq!(
             most,
             vec![
-                Some("missense_variant".to_string()),
+                Some("coding_sequence_variant".to_string()),
                 Some("non_coding_transcript_exon_variant".to_string())
             ]
         );

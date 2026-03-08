@@ -637,21 +637,19 @@ impl TranscriptConsequenceEngine {
             return;
         }
 
+        // No translation data available. Apply start/stop heuristics
+        // (position + allele pattern based) but do NOT guess
+        // missense/synonymous without codon evidence.
         self.add_start_stop_heuristic_terms(terms, variant, tx);
 
-        if variant.ref_allele.eq_ignore_ascii_case(&variant.alt_allele) {
-            terms.insert(SoTerm::SynonymousVariant);
-        } else if ref_len == 1 && alt_len == 1 {
-            terms.insert(SoTerm::MissenseVariant);
-            terms.insert(SoTerm::ProteinAlteringVariant);
-        } else if ref_len % 3 == 0 && alt_len % 3 == 0 {
-            if !is_stop_codon(&variant.ref_allele) && is_stop_codon(&variant.alt_allele) {
-                terms.insert(SoTerm::StopGained);
-            } else {
-                terms.insert(SoTerm::ProteinAlteringVariant);
-            }
-        } else {
-            terms.insert(SoTerm::ProteinAlteringVariant);
+        // Detect premature stop gain from allele pattern (in-frame
+        // substitution where alt is a stop codon but ref is not).
+        if ref_len == alt_len
+            && ref_len % 3 == 0
+            && !is_stop_codon(&variant.ref_allele)
+            && is_stop_codon(&variant.alt_allele)
+        {
+            terms.insert(SoTerm::StopGained);
         }
     }
 
@@ -1636,7 +1634,10 @@ mod tests {
             std::slice::from_ref(&tx),
             &exons,
         );
-        assert!(assignments[0].terms.contains(&SoTerm::MissenseVariant));
+        // Without translation data, the engine cannot determine
+        // missense vs synonymous — only CodingSequenceVariant.
+        assert!(assignments[0].terms.contains(&SoTerm::CodingSequenceVariant));
+        assert!(!assignments[0].terms.contains(&SoTerm::MissenseVariant));
     }
 
     #[test]
