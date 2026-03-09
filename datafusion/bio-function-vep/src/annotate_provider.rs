@@ -38,7 +38,7 @@ use crate::transcript_consequence::{
 
 /// Known variation cache annotation columns exposed as top-level output fields.
 /// All are nullable Utf8. Columns not present in the actual cache emit NULLs.
-const CACHE_OUTPUT_COLUMNS: &[&str] = &[
+pub const CACHE_OUTPUT_COLUMNS: &[&str] = &[
     // Variant identity
     "variation_name",
     // Clinical
@@ -1061,6 +1061,31 @@ impl AnnotateProvider {
                 continue;
             };
 
+            // VEP-style allele minimization: strip shared prefix between REF and ALT.
+            // e.g., REF=T ALT=TCAC → "CAC", REF=TCAC ALT=T → "-", REF=C ALT=G → "G"
+            let vep_allele = {
+                let ref_al = string_at(batch.column(ref_idx).as_ref(), row)
+                    .unwrap_or_default();
+                let prefix_len = ref_al
+                    .as_bytes()
+                    .iter()
+                    .zip(alt_allele.as_bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                if prefix_len == 0
+                    || (prefix_len == ref_al.len() && prefix_len == alt_allele.len())
+                {
+                    alt_allele.clone()
+                } else {
+                    let trimmed = &alt_allele[prefix_len..];
+                    if trimmed.is_empty() {
+                        "-".to_string()
+                    } else {
+                        trimmed.to_string()
+                    }
+                }
+            };
+
             // Cache-hit fast path: use pre-computed consequence from variation cache.
             let cached_most =
                 cached_most_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
@@ -1082,7 +1107,7 @@ impl AnnotateProvider {
                 // Existing_variation|DISTANCE|STRAND|FLAGS|SYMBOL_SOURCE|HGNC_ID|
                 // MOTIF_NAME|MOTIF_POS|HIGH_INF_POS|MOTIF_SCORE_CHANGE|TRANSCRIPTION_FACTORS|SOURCE
                 let csq_entry = format!(
-                    "{alt_allele}|{csq_val}|{impact}|||||||||||||||||||||||||||"
+                    "{vep_allele}|{csq_val}|{impact}|||||||||||||||||||||||||||"
                 );
                 (csq_entry, most_val.clone())
             } else {
@@ -1136,7 +1161,7 @@ impl AnnotateProvider {
                     let feature_type = tc.feature_type.as_str();
                     let feature = tc.transcript_id.as_deref().unwrap_or("");
                     // Look up transcript metadata via index (zero-copy).
-                    let (symbol, gene, biotype, strand_str, symbol_source, hgnc_id, source) =
+                    let (symbol, gene, biotype, strand_str, symbol_source, hgnc_id) =
                         if let Some(idx) = tc.transcript_idx {
                             let tx = ctx.transcripts[idx];
                             (
@@ -1146,10 +1171,9 @@ impl AnnotateProvider {
                                 if tx.strand >= 0 { "1" } else { "-1" },
                                 tx.gene_symbol_source.as_deref().unwrap_or(""),
                                 tx.gene_hgnc_id.as_deref().unwrap_or(""),
-                                tx.source.as_deref().unwrap_or(""),
                             )
                         } else {
-                            ("", "", "", "", "", "", "")
+                            ("", "", "", "", "", "")
                         };
                     let exon = tc.exon_str.as_deref().unwrap_or("");
                     let intron = tc.intron_str.as_deref().unwrap_or("");
@@ -1161,17 +1185,17 @@ impl AnnotateProvider {
                     let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
                     let flags = tc.flags.as_deref().unwrap_or("");
                     csq_entries.push(format!(
-                        "{alt_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                        "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                          {exon}|{intron}|||\
                          {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                          |{distance}|{strand_str}|{flags}|{symbol_source}|{hgnc_id}|\
-                         |||||{source}"
+                         |||||"
                     ));
                 }
                 if csq_entries.is_empty() {
                     let impact = impact_label(SoImpact::Modifier);
                     csq_entries.push(format!(
-                        "{alt_allele}|sequence_variant|{impact}|||||||||||||||||||||||||||"
+                        "{vep_allele}|sequence_variant|{impact}|||||||||||||||||||||||||||"
                     ));
                 }
                 (csq_entries.join(","), most_str)

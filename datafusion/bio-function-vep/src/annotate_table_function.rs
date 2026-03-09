@@ -134,28 +134,34 @@ mod tests {
     }
 
     fn cache_table() -> MemTable {
-        let schema = Arc::new(Schema::new(vec![
+        use crate::annotate_provider::CACHE_OUTPUT_COLUMNS;
+
+        // Core columns required for the join.
+        let mut fields = vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
-            Field::new("variation_name", DataType::Utf8, true),
             Field::new("allele_string", DataType::Utf8, false),
-            Field::new("clin_sig", DataType::Utf8, true),
-            Field::new("AF", DataType::Float64, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["1"])),
-                Arc::new(Int64Array::from(vec![100])),
-                Arc::new(Int64Array::from(vec![101])),
-                Arc::new(StringArray::from(vec!["rs100"])),
-                Arc::new(StringArray::from(vec!["A/G"])),
-                Arc::new(StringArray::from(vec!["benign"])),
-                Arc::new(Float64Array::from(vec![0.12_f64])),
-            ],
-        )
-        .expect("valid cache batch");
+        ];
+        let mut columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = vec![
+            Arc::new(StringArray::from(vec!["1"])),
+            Arc::new(Int64Array::from(vec![100])),
+            Arc::new(Int64Array::from(vec![101])),
+            Arc::new(StringArray::from(vec!["A/G"])),
+        ];
+        // Add all CACHE_OUTPUT_COLUMNS as nullable Utf8.
+        for &col in CACHE_OUTPUT_COLUMNS {
+            fields.push(Field::new(col, DataType::Utf8, true));
+            let val: Option<&str> = match col {
+                "variation_name" => Some("rs100"),
+                "clin_sig" => Some("benign"),
+                _ => None,
+            };
+            columns.push(Arc::new(StringArray::from(vec![val])));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch =
+            RecordBatch::try_new(schema.clone(), columns).expect("valid cache batch");
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid cache memtable")
     }
 
@@ -1370,7 +1376,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|s| s.contains("coding_sequence_variant"))
         );
-        assert!(csq[0].as_ref().is_some_and(|s| s.contains("rs100")));
+        // variation_name is not emitted in CSQ (VEP Existing_variation is empty for non-merged caches).
         assert!(
             csq[1]
                 .as_ref()
@@ -1764,10 +1770,9 @@ mod tests {
                     .expect("most_severe_consequence column exists"),
             );
             let csq0 = csq[0].as_ref().expect("csq should be present");
-            assert!(
-                csq0.contains("|rs_repeat_shift|"),
-                "repeat-shifted allele should resolve to cache variation_name via extended probes, got: {csq0}"
-            );
+            // variation_name is no longer emitted in CSQ (VEP Existing_variation is
+            // empty for non-merged caches). The cache lookup still works; we just
+            // don't put variation_name in the Allele|...|SOURCE format string.
             assert_terms_sorted_by_rank(csq0);
             assert_term_set_exact(csq0, &expected_terms);
             assert_eq!(most[0], Some("frameshift_variant".to_string()));

@@ -505,6 +505,131 @@ pub struct CsqFieldReport {
     pub total_entries_compared: usize,
 }
 
+/// Diagnostic report for unmatched CSQ entries between golden and ours.
+#[derive(Debug, Clone)]
+pub struct CsqUnmatchedReport {
+    /// Golden entries not found in ours, grouped by Feature_type.
+    pub golden_only_by_ft: HashMap<String, usize>,
+    /// Our entries not found in golden, grouped by Feature_type.
+    pub ours_only_by_ft: HashMap<String, usize>,
+    /// Total golden CSQ entries.
+    pub golden_total: usize,
+    /// Total ours CSQ entries.
+    pub ours_total: usize,
+    /// Matched by (Allele, Feature) key.
+    pub matched: usize,
+    /// Sample of unmatched golden Feature IDs (first 30).
+    pub golden_only_sample: Vec<(String, String, String)>,
+    /// Sample of unmatched ours Feature IDs (first 30).
+    pub ours_only_sample: Vec<(String, String, String)>,
+}
+
+/// Diagnose why CSQ entries are unmatched between golden and ours.
+pub fn diagnose_unmatched_csq(
+    golden: &[VariantAnnotation],
+    ours: &[VariantAnnotation],
+) -> CsqUnmatchedReport {
+    let golden_map: HashMap<VariantKey, &VariantAnnotation> =
+        golden.iter().map(|r| (r.key.clone(), r)).collect();
+    let ours_map: HashMap<VariantKey, &VariantAnnotation> =
+        ours.iter().map(|r| (r.key.clone(), r)).collect();
+
+    let mut golden_only_by_ft: HashMap<String, usize> = HashMap::new();
+    let mut ours_only_by_ft: HashMap<String, usize> = HashMap::new();
+    let mut golden_total = 0usize;
+    let mut ours_total = 0usize;
+    let mut matched = 0usize;
+    let mut golden_only_sample: Vec<(String, String, String)> = Vec::new();
+    let mut ours_only_sample: Vec<(String, String, String)> = Vec::new();
+
+    for (key, golden_row) in &golden_map {
+        let golden_csq = match golden_row.csq.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        let golden_entries = parse_csq_entries(golden_csq);
+        golden_total += golden_entries.len();
+
+        let ours_csq = ours_map
+            .get(key)
+            .and_then(|r| r.csq.as_deref())
+            .unwrap_or("");
+        let ours_entries = parse_csq_entries(ours_csq);
+
+        let mut ours_keys: HashMap<(String, String), &CsqEntry> = HashMap::new();
+        for e in &ours_entries {
+            ours_keys
+                .entry((e.allele().to_string(), e.feature().to_string()))
+                .or_insert(e);
+        }
+
+        for ge in &golden_entries {
+            let k = (ge.allele().to_string(), ge.feature().to_string());
+            if ours_keys.contains_key(&k) {
+                matched += 1;
+            } else {
+                let ft = ge.fields.get(5).cloned().unwrap_or_default();
+                *golden_only_by_ft.entry(ft.clone()).or_default() += 1;
+                if golden_only_sample.len() < 30 {
+                    golden_only_sample.push((
+                        ge.allele().to_string(),
+                        ge.feature().to_string(),
+                        ft,
+                    ));
+                }
+            }
+        }
+    }
+
+    // Count ours-only entries
+    for (key, ours_row) in &ours_map {
+        let ours_csq = match ours_row.csq.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        let ours_entries = parse_csq_entries(ours_csq);
+        ours_total += ours_entries.len();
+
+        let golden_csq = golden_map
+            .get(key)
+            .and_then(|r| r.csq.as_deref())
+            .unwrap_or("");
+        let golden_entries = parse_csq_entries(golden_csq);
+
+        let mut golden_keys: HashMap<(String, String), &CsqEntry> = HashMap::new();
+        for e in &golden_entries {
+            golden_keys
+                .entry((e.allele().to_string(), e.feature().to_string()))
+                .or_insert(e);
+        }
+
+        for oe in &ours_entries {
+            let k = (oe.allele().to_string(), oe.feature().to_string());
+            if !golden_keys.contains_key(&k) {
+                let ft = oe.fields.get(5).cloned().unwrap_or_default();
+                *ours_only_by_ft.entry(ft.clone()).or_default() += 1;
+                if ours_only_sample.len() < 30 {
+                    ours_only_sample.push((
+                        oe.allele().to_string(),
+                        oe.feature().to_string(),
+                        ft,
+                    ));
+                }
+            }
+        }
+    }
+
+    CsqUnmatchedReport {
+        golden_only_by_ft,
+        ours_only_by_ft,
+        golden_total,
+        ours_total,
+        matched,
+        golden_only_sample,
+        ours_only_sample,
+    }
+}
+
 /// Parsed CSQ entry (one pipe-delimited annotation from one transcript).
 #[derive(Debug, Clone)]
 struct CsqEntry {

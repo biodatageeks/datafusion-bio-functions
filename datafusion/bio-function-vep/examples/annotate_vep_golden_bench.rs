@@ -13,12 +13,12 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::golden_benchmark::{
-    ComparisonReport, CsqFieldReport, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ,
+    ComparisonReport, CsqFieldReport, CsqUnmatchedReport, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ,
     DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI, DEFAULT_EXTERNAL_VEP_CACHE_DIR,
     DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI, TermComparisonReport,
     VariantAnnotation, VariantDiscrepancy, VariantKey, collect_discrepancies,
-    compare_annotation_terms, compare_annotations, compare_csq_fields, ensure_local_copy,
-    normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
+    compare_annotation_terms, compare_annotations, compare_csq_fields, diagnose_unmatched_csq,
+    ensure_local_copy, normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
 };
 use datafusion_bio_function_vep::register_vep_functions;
 
@@ -228,9 +228,11 @@ async fn main() -> Result<()> {
     let term_report = compare_annotation_terms(&golden_annotations, &ours_annotations);
     let csq_field_report = compare_csq_fields(&golden_annotations, &ours_annotations);
     let discrepancies = collect_discrepancies(&golden_annotations, &ours_annotations);
+    let unmatched_report = diagnose_unmatched_csq(&golden_annotations, &ours_annotations);
 
     print_report(&report, &term_report);
     print_csq_field_report(&csq_field_report);
+    print_unmatched_report(&unmatched_report);
     print_discrepancy_summary(&discrepancies, &report);
 
     write_report(
@@ -663,6 +665,53 @@ fn print_csq_field_report(report: &CsqFieldReport) {
             "  {:<20} {}/{} ({:.1}%)",
             name, matches, report.total_entries_compared, pct
         );
+    }
+}
+
+fn print_unmatched_report(report: &CsqUnmatchedReport) {
+    println!("\ncsq entry matching diagnostic:");
+    println!("  golden_total_entries: {}", report.golden_total);
+    println!("  ours_total_entries: {}", report.ours_total);
+    println!("  matched_by_allele_feature: {}", report.matched);
+    println!(
+        "  golden_only (unmatched): {}",
+        report.golden_total.saturating_sub(report.matched)
+    );
+    println!(
+        "  ours_only (extra): {}",
+        report.ours_total.saturating_sub(report.matched)
+    );
+
+    if !report.golden_only_by_ft.is_empty() {
+        println!("  golden_only by Feature_type:");
+        let mut sorted: Vec<_> = report.golden_only_by_ft.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        for (ft, count) in &sorted {
+            let label = if ft.is_empty() { "(empty)" } else { ft.as_str() };
+            println!("    {:<25} {}", label, count);
+        }
+    }
+    if !report.ours_only_by_ft.is_empty() {
+        println!("  ours_only by Feature_type:");
+        let mut sorted: Vec<_> = report.ours_only_by_ft.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        for (ft, count) in &sorted {
+            let label = if ft.is_empty() { "(empty)" } else { ft.as_str() };
+            println!("    {:<25} {}", label, count);
+        }
+    }
+
+    if !report.golden_only_sample.is_empty() {
+        println!("  golden_only samples (allele|feature|feature_type):");
+        for (a, f, ft) in &report.golden_only_sample {
+            println!("    {}|{}|{}", a, f, ft);
+        }
+    }
+    if !report.ours_only_sample.is_empty() {
+        println!("  ours_only samples (allele|feature|feature_type):");
+        for (a, f, ft) in &report.ours_only_sample {
+            println!("    {}|{}|{}", a, f, ft);
+        }
     }
 }
 

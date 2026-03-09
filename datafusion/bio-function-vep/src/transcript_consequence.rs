@@ -577,15 +577,10 @@ impl TranscriptConsequenceEngine {
         regulatory: &[RegulatoryFeature],
         structural: &[StructuralFeature],
     ) {
-        let mut terms = BTreeSet::new();
         let chrom = normalize_chrom(&variant.chrom);
-        let overlaps_reg = regulatory.iter().any(|r| {
-            normalize_chrom(&r.chrom) == chrom
-                && overlaps(variant.start, variant.end, r.start, r.end)
-        });
-        if overlaps_reg {
-            terms.insert(SoTerm::RegulatoryRegionVariant);
-        }
+
+        // Collect SV-derived terms (ablation/amplification) that apply across all regulatory features.
+        let mut sv_terms = BTreeSet::new();
         for sv in structural {
             if normalize_chrom(&sv.chrom) != chrom
                 || !overlaps(variant.start, variant.end, sv.start, sv.end)
@@ -597,16 +592,42 @@ impl TranscriptConsequenceEngine {
             }
             match sv.event_kind {
                 SvEventKind::Ablation => {
-                    terms.insert(SoTerm::RegulatoryRegionAblation);
+                    sv_terms.insert(SoTerm::RegulatoryRegionAblation);
                 }
                 SvEventKind::Amplification => {
-                    terms.insert(SoTerm::RegulatoryRegionAmplification);
+                    sv_terms.insert(SoTerm::RegulatoryRegionAmplification);
                 }
                 SvEventKind::Elongation | SvEventKind::Truncation => {}
             }
         }
-        if !terms.is_empty() {
+
+        // Emit one CSQ entry per overlapping regulatory feature (matching VEP behavior).
+        for r in regulatory {
+            if normalize_chrom(&r.chrom) != chrom
+                || !overlaps(variant.start, variant.end, r.start, r.end)
+            {
+                continue;
+            }
+            let mut terms: BTreeSet<SoTerm> = sv_terms.clone();
+            terms.insert(SoTerm::RegulatoryRegionVariant);
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
+            ordered.sort_by_key(|t| t.rank());
+            out.push(TranscriptConsequence {
+                transcript_id: Some(r.feature_id.clone()),
+                feature_type: FeatureType::RegulatoryFeature,
+                terms: ordered,
+                ..Default::default()
+            });
+        }
+
+        // If no regulatory features overlap but SV terms exist, emit a single entry.
+        if !sv_terms.is_empty()
+            && !regulatory.iter().any(|r| {
+                normalize_chrom(&r.chrom) == chrom
+                    && overlaps(variant.start, variant.end, r.start, r.end)
+            })
+        {
+            let mut ordered: Vec<SoTerm> = sv_terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
             out.push(TranscriptConsequence {
                 feature_type: FeatureType::RegulatoryFeature,
