@@ -22,6 +22,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use futures::{Stream, StreamExt, ready};
+use log::warn;
 
 /// Physical execution plan for fused array transformation.
 ///
@@ -74,43 +75,61 @@ impl FusedArrayTransformExec {
             fields.push(field);
         }
 
-        // Get the element type from the first array column as a fallback
-        let fallback_element_type = if let Some(first_array_col) = array_columns.first() {
-            let idx = input_schema.index_of(first_array_col)?;
+        // Build element-level schema for type inference
+        let element_schema = build_element_schema(&input_schema, &array_columns)?;
+
+        // Helper to get element type from array column
+        let get_array_element_type = |array_col: &str| -> Result<DataType> {
+            let idx = input_schema.index_of(array_col)?;
             let input_field = input_schema.field(idx);
             match input_field.data_type() {
-                DataType::List(inner) | DataType::LargeList(inner) => inner.data_type().clone(),
-                DataType::FixedSizeList(inner, _) => inner.data_type().clone(),
-                other => {
-                    return Err(DataFusionError::Plan(format!(
-                        "Column '{first_array_col}' has type {other}, expected List type"
-                    )));
-                }
+                DataType::List(inner) | DataType::LargeList(inner) => Ok(inner.data_type().clone()),
+                DataType::FixedSizeList(inner, _) => Ok(inner.data_type().clone()),
+                other => Err(DataFusionError::Plan(format!(
+                    "Column '{array_col}' has type {other}, expected List type"
+                ))),
             }
-        } else {
-            DataType::Float64 // Default fallback
         };
 
-        // Add output array columns for ALL outputs (may have more outputs than input arrays)
+        // Add output array columns - infer type from corresponding transform expression
         for (i, output_col) in output_columns.iter().enumerate() {
-            let element_type = if i < array_columns.len() {
-                let array_col = &array_columns[i];
-                let idx = input_schema.index_of(array_col)?;
-                let input_field = input_schema.field(idx);
-
-                // Determine element type from input List type
-                match input_field.data_type() {
-                    DataType::List(inner) | DataType::LargeList(inner) => inner.data_type().clone(),
-                    DataType::FixedSizeList(inner, _) => inner.data_type().clone(),
-                    other => {
-                        return Err(DataFusionError::Plan(format!(
-                            "Column '{array_col}' has type {other}, expected List type"
-                        )));
+            // Infer element type from the transform expression
+            // If type inference fails (e.g., column not in element schema), fall back to array column's type
+            let element_type = if i < transform_exprs.len() {
+                let inferred = transform_exprs[i].data_type(&element_schema);
+                match inferred {
+                    Ok(dt) => dt,
+                    Err(e) => {
+                        // Try falling back to array column's element type
+                        if let Some(array_col) = array_columns.get(i) {
+                            if let Ok(dt) = get_array_element_type(array_col) {
+                                warn!(
+                                    "Type inference failed for output '{output_col}': {e}. Falling back to array column type: {dt:?}"
+                                );
+                                dt
+                            } else {
+                                warn!(
+                                    "Type inference failed for output '{output_col}': {e}. Using Float64 fallback."
+                                );
+                                DataType::Float64
+                            }
+                        } else {
+                            warn!(
+                                "Type inference failed for output '{output_col}': {e}. Using Float64 fallback."
+                            );
+                            DataType::Float64
+                        }
                     }
                 }
+            } else if i < array_columns.len() {
+                // No transform expression, use array column's element type
+                get_array_element_type(&array_columns[i])?
             } else {
-                // For derived outputs, use fallback type
-                fallback_element_type.clone()
+                // Default fallback for extra outputs without corresponding array columns
+                warn!(
+                    "No type information for output '{output_col}' at index {i}. Using Float64 fallback."
+                );
+                DataType::Float64
             };
 
             fields.push(Field::new(
@@ -466,6 +485,35 @@ impl RecordBatchStream for FusedArrayTransformStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
+}
+
+/// Build a schema representing the element types of array columns.
+///
+/// For each array column, we extract the element type and create a
+/// column with the same name but the scalar (element) type. This schema
+/// is used for inferring the output type of transform expressions.
+fn build_element_schema(input_schema: &SchemaRef, array_columns: &[String]) -> Result<Schema> {
+    let mut fields: Vec<Field> = Vec::with_capacity(array_columns.len());
+
+    for col_name in array_columns {
+        let idx = input_schema.index_of(col_name)?;
+        let input_field = input_schema.field(idx);
+
+        // Extract element type from List/LargeList/FixedSizeList
+        let element_type = match input_field.data_type() {
+            DataType::List(inner) | DataType::LargeList(inner) => inner.data_type().clone(),
+            DataType::FixedSizeList(inner, _) => inner.data_type().clone(),
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "Column '{col_name}' has type {other}, expected List type"
+                )));
+            }
+        };
+
+        fields.push(Field::new(col_name, element_type, true));
+    }
+
+    Ok(Schema::new(fields))
 }
 
 #[cfg(test)]
