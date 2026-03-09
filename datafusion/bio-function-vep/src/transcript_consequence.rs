@@ -863,6 +863,12 @@ impl TranscriptConsequenceEngine {
                 continue; // Degenerate / overlapping exons.
             }
 
+            // VEP skips splice checks for "frameshift introns" — very short
+            // introns (≤13bp) where abs(intron_end - intron_start) <= 12.
+            if (intron_end - intron_start).abs() <= 12 {
+                continue;
+            }
+
             // Quick check: does variant overlap the intron or its extended
             // boundary margins?  VEP uses two separate trees — one for the
             // full intron span (polypyrimidine at -16..-2, splice_region at
@@ -900,42 +906,61 @@ impl TranscriptConsequenceEngine {
         intron_end: i64,
     ) {
         if is_ins {
-            // Donor: insertion exactly at intron_start or intron_start+1
-            if variant.start == intron_start || variant.start == intron_start + 1 {
+            // VEP insertion coordinate model: overlap(P, P-1, X, Y) where P
+            // is the insertion point.  This effectively checks P in [X+1, Y],
+            // which is narrower than a simple point-in-range check.
+            // Single-position checks overlap(P, P-1, X, X) are impossible.
+            let p = variant.start;
+
+            // Donor: overlap(P, P-1, intron_start, intron_start+1)
+            //   → P in [intron_start+1, intron_start+1] = P == intron_start+1
+            if p == intron_start + 1 {
                 terms.insert(SoTerm::SpliceDonorVariant);
             }
-            if variant.start == intron_start + 4 {
-                terms.insert(SoTerm::SpliceDonor5thBaseVariant);
-            }
-            if (intron_start + 2..=intron_start + 5).contains(&variant.start) {
+            // 5th base: overlap(P, P-1, X, X) is impossible for insertions.
+            // (single-position range never matches inverted coords)
+
+            // Donor region: overlap(P, P-1, intron_start+2, intron_start+5)
+            //   → P in [intron_start+3, intron_start+5]
+            if (intron_start + 3..=intron_start + 5).contains(&p) {
                 terms.insert(SoTerm::SpliceDonorRegionVariant);
             }
-            // splice_region at +6/+7
-            if variant.start == intron_start + 6 || variant.start == intron_start + 7 {
-                terms.insert(SoTerm::SpliceRegionVariant);
-            }
 
-            // Acceptor: insertion exactly at intron_end or intron_end-1
-            if variant.start == intron_end || variant.start == intron_end - 1 {
+            // Acceptor: overlap(P, P-1, intron_end-1, intron_end)
+            //   → P in [intron_end, intron_end] = P == intron_end
+            if p == intron_end {
                 terms.insert(SoTerm::SpliceAcceptorVariant);
             }
-            // splice_region at intron_end-7..intron_end-2
-            if (intron_end - 7..=intron_end - 2).contains(&variant.start) {
-                terms.insert(SoTerm::SpliceRegionVariant);
-            }
-            // polypyrimidine at intron_end-16..intron_end-2
-            if (intron_end - 16..=intron_end - 2).contains(&variant.start) {
+
+            // Polypyrimidine: overlap(P, P-1, intron_end-16, intron_end-2)
+            //   → P in [intron_end-15, intron_end-2]
+            if (intron_end - 15..=intron_end - 2).contains(&p) {
                 terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
             }
 
-            // VEP _intron_overlap exonic splice_region for insertions:
-            // vf_start == intron_start or vf_end == intron_end
-            // plus exonic positions intron_start-3..intron_start-1, intron_end+1..intron_end+3
-            if variant.start == intron_start || variant.start == intron_end {
-                terms.insert(SoTerm::SpliceRegionVariant);
-            }
-            if (intron_start - 3..=intron_start - 1).contains(&variant.start)
-                || (intron_end + 1..=intron_end + 3).contains(&variant.start)
+            // VEP _intron_overlap splice_region for insertions uses explicit
+            // checks on vf_start/vf_end plus overlap on boundary ranges.
+            // vf_start = P, vf_end = P-1.
+            //
+            // Intronic splice_region overlap ranges:
+            //   overlap(P, P-1, intron_start+2, intron_start+7) → P in [intron_start+3, intron_start+7]
+            //   overlap(P, P-1, intron_end-7, intron_end-2)     → P in [intron_end-6, intron_end-2]
+            // Exonic splice_region overlap ranges:
+            //   overlap(P, P-1, intron_start-3, intron_start-1) → P in [intron_start-2, intron_start-1]
+            //   overlap(P, P-1, intron_end+1, intron_end+3)     → P in [intron_end+2, intron_end+3]
+            // Explicit insertion checks from _intron_overlap:
+            //   vf_start == intron_start     → P == intron_start
+            //   vf_end   == intron_end       → P-1 == intron_end → P == intron_end+1
+            //   vf_start == intron_start+2   → P == intron_start+2
+            //   vf_end   == intron_end-2     → P-1 == intron_end-2 → P == intron_end-1
+            if (intron_start + 3..=intron_start + 7).contains(&p)
+                || (intron_end - 6..=intron_end - 2).contains(&p)
+                || (intron_start - 2..=intron_start - 1).contains(&p)
+                || (intron_end + 2..=intron_end + 3).contains(&p)
+                || p == intron_start
+                || p == intron_end + 1
+                || p == intron_start + 2
+                || p == intron_end - 1
             {
                 terms.insert(SoTerm::SpliceRegionVariant);
             }
@@ -1027,37 +1052,45 @@ impl TranscriptConsequenceEngine {
         intron_end: i64,
     ) {
         if is_ins {
-            // Donor (intron end on negative strand): intron_end, intron_end-1
-            if variant.start == intron_end || variant.start == intron_end - 1 {
+            // VEP insertion coordinate model: overlap(P, P-1, X, Y) → P in [X+1, Y].
+            // Single-position overlap(P, P-1, X, X) is impossible for insertions.
+            let p = variant.start;
+
+            // Donor (negative strand = intron end):
+            //   overlap(P, P-1, intron_end-1, intron_end) → P == intron_end
+            if p == intron_end {
                 terms.insert(SoTerm::SpliceDonorVariant);
             }
-            if variant.start == intron_end - 4 {
-                terms.insert(SoTerm::SpliceDonor5thBaseVariant);
-            }
-            if (intron_end - 5..=intron_end - 2).contains(&variant.start) {
+            // 5th base reverse: single-position → impossible for insertions
+
+            // Donor region reverse: overlap(P, P-1, intron_end-5, intron_end-2)
+            //   → P in [intron_end-4, intron_end-2]
+            if (intron_end - 4..=intron_end - 2).contains(&p) {
                 terms.insert(SoTerm::SpliceDonorRegionVariant);
             }
-            if variant.start == intron_end - 6 || variant.start == intron_end - 7 {
-                terms.insert(SoTerm::SpliceRegionVariant);
-            }
 
-            // Acceptor (intron start on negative strand): intron_start, intron_start+1
-            if variant.start == intron_start || variant.start == intron_start + 1 {
+            // Acceptor (negative strand = intron start):
+            //   overlap(P, P-1, intron_start, intron_start+1) → P == intron_start+1
+            if p == intron_start + 1 {
                 terms.insert(SoTerm::SpliceAcceptorVariant);
             }
-            if (intron_start + 2..=intron_start + 7).contains(&variant.start) {
-                terms.insert(SoTerm::SpliceRegionVariant);
-            }
-            if (intron_start + 2..=intron_start + 16).contains(&variant.start) {
+
+            // Polypyrimidine reverse: overlap(P, P-1, intron_start+2, intron_start+16)
+            //   → P in [intron_start+3, intron_start+16]
+            if (intron_start + 3..=intron_start + 16).contains(&p) {
                 terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
             }
 
-            // Exonic splice_region for insertions
-            if variant.start == intron_start || variant.start == intron_end {
-                terms.insert(SoTerm::SpliceRegionVariant);
-            }
-            if (intron_start - 3..=intron_start - 1).contains(&variant.start)
-                || (intron_end + 1..=intron_end + 3).contains(&variant.start)
+            // splice_region: same _intron_overlap logic as positive strand
+            // (strand-independent in VEP)
+            if (intron_start + 3..=intron_start + 7).contains(&p)
+                || (intron_end - 6..=intron_end - 2).contains(&p)
+                || (intron_start - 2..=intron_start - 1).contains(&p)
+                || (intron_end + 2..=intron_end + 3).contains(&p)
+                || p == intron_start
+                || p == intron_end + 1
+                || p == intron_start + 2
+                || p == intron_end - 1
             {
                 terms.insert(SoTerm::SpliceRegionVariant);
             }
@@ -1205,9 +1238,15 @@ pub fn is_vep_transcript(id: &str) -> bool {
         || id.starts_with("XR_")
 }
 
-/// Strip only coding parent terms (`coding_sequence_variant`,
-/// `protein_altering_variant`) when specific children are present.
+/// Strip only `protein_altering_variant` when specific children are present.
 /// Used at the cross-transcript collapse level.
+///
+/// NOTE: `coding_sequence_variant` is NOT stripped here because it may
+/// legitimately come from a different transcript than the specific coding
+/// term (e.g., transcript A gives frameshift, transcript B gives
+/// coding_sequence_variant because the codon change can't be computed).
+/// Per-transcript stripping in `strip_parent_terms` handles the case
+/// where both appear on the SAME transcript.
 fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
@@ -1222,7 +1261,6 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         || terms.contains(&SoTerm::IncompleteTerminalCodonVariant);
 
     if has_specific_coding {
-        terms.remove(&SoTerm::CodingSequenceVariant);
         terms.remove(&SoTerm::ProteinAlteringVariant);
     }
 }
@@ -2509,7 +2547,11 @@ mod tests {
         );
         let exons = vec![exon("T1", 1, 1000, 1200), exon("T1", 2, 1400, 2000)];
 
-        // Insertion at +5 (1205): should get splice_donor_5th_base
+        // Insertion at +5 (1205): VEP's overlap(P, P-1, X, X) is impossible
+        // for insertions — single-position checks never fire. So 5th_base
+        // should NOT be emitted for insertions. Instead, donor_region fires
+        // because overlap(P, P-1, intron_start+2, intron_start+5) →
+        // P in [intron_start+3, intron_start+5] and 1205 = 1201+4 = intron_start+4.
         let assignments = engine.evaluate_variant_with_context(
             &var("22", 1205, 1205, "-", "ACGC"),
             &[t.clone()],
@@ -2522,8 +2564,13 @@ mod tests {
         );
         let terms = &assignments[0].terms;
         assert!(
-            terms.contains(&SoTerm::SpliceDonor5thBaseVariant),
-            "Insertion at +5 should get splice_donor_5th_base: {:?}",
+            !terms.contains(&SoTerm::SpliceDonor5thBaseVariant),
+            "Insertion at +5 should NOT get splice_donor_5th_base (VEP single-pos impossible): {:?}",
+            terms
+        );
+        assert!(
+            terms.contains(&SoTerm::SpliceDonorRegionVariant),
+            "Insertion at +5 should get splice_donor_region: {:?}",
             terms
         );
 
@@ -2625,11 +2672,10 @@ mod tests {
     }
 
     #[test]
-    fn deletion_near_tiny_intron_gets_splice_region() {
+    fn deletion_near_tiny_intron_skips_splice_frameshift_intron() {
         // Exon 1: 1000..1200, Exon 2: 1210..2000 (tiny 9bp intron: 1201..1209)
-        // Deletion 1199..1201 spans exon 1 end into intron
-        // Splice region for donor: +7/+8 = 1207/1208
-        // But also splice_donor at +1/+2 = 1201/1202
+        // VEP skips splice checks for "frameshift introns" (≤13bp).
+        // The 9bp intron should be skipped — no splice terms emitted.
         let engine = TranscriptConsequenceEngine::default();
         let t = tx(
             "T1",
@@ -2645,7 +2691,7 @@ mod tests {
         let cds = &"ATG".repeat(67);
         let translations = vec![translation("T1", Some(201), Some(66), None, Some(cds))];
 
-        // Deletion from 1199..1203 spans into intron, hits +1..+3 of donor
+        // Deletion from 1199..1203 spans into the tiny intron
         let assignments = engine.evaluate_variant_with_context(
             &var("22", 1199, 1203, "NNNNN", "-"),
             &[t],
@@ -2658,9 +2704,13 @@ mod tests {
         );
         let terms = &assignments[0].terms;
         assert!(
-            terms.contains(&SoTerm::SpliceRegionVariant)
-                || terms.contains(&SoTerm::SpliceDonorVariant),
-            "Deletion near tiny intron should get splice_region or splice_donor: {:?}",
+            !terms.contains(&SoTerm::SpliceDonorVariant),
+            "Frameshift intron (≤13bp) should NOT get splice_donor: {:?}",
+            terms
+        );
+        assert!(
+            terms.contains(&SoTerm::FrameshiftVariant),
+            "Should still get frameshift from CDS overlap: {:?}",
             terms
         );
     }
