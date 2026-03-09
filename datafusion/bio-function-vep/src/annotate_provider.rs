@@ -994,13 +994,13 @@ impl AnnotateProvider {
                     continue;
                 };
 
-                let variant = VariantInput {
-                    chrom: chrom.clone(),
+                let variant = VariantInput::from_vcf(
+                    chrom.clone(),
                     start,
                     end,
                     ref_allele,
-                    alt_allele: alt_allele.clone(),
-                };
+                    alt_allele.clone(),
+                );
                 let assignments = engine.evaluate_variant_prepared(&variant, ctx);
                 let mut terms = TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
                 if terms.is_empty() {

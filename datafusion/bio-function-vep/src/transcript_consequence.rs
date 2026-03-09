@@ -360,10 +360,20 @@ impl TranscriptConsequenceEngine {
         tx_translation: Option<&TranslationFeature>,
     ) -> Vec<SoTerm> {
         let mut terms = BTreeSet::new();
+        let is_ins = variant.ref_allele == "-";
 
-        let overlaps_exon = tx_exons
-            .iter()
-            .any(|e| overlaps(variant.start, variant.end, e.start, e.end));
+        // For pure insertions, VEP requires both flanking positions
+        // (start-1 and start) to be within the exon.  An insertion at
+        // the first base of an exon (start == exon.start) is between the
+        // last intron base and the first exon base — VEP considers that
+        // intronic.
+        let overlaps_exon = tx_exons.iter().any(|e| {
+            if is_ins {
+                variant.start > e.start && variant.start <= e.end
+            } else {
+                overlaps(variant.start, variant.end, e.start, e.end)
+            }
+        });
 
         // Exonic boundary +/- 3bp contributes splice_region, but only
         // at internal splice junctions — not at terminal transcript
