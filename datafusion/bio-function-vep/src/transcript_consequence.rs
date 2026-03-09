@@ -932,9 +932,11 @@ impl TranscriptConsequenceEngine {
                 terms.insert(SoTerm::SpliceAcceptorVariant);
             }
 
-            // Polypyrimidine: overlap(P, P-1, intron_end-16, intron_end-2)
-            //   → P in [intron_end-15, intron_end-2]
-            if (intron_end - 15..=intron_end - 2).contains(&p) {
+            // Polypyrimidine: VEP checks in two loops with different coord models.
+            //   _overlapped_introns (normalized P-1,P): P in [intron_end-16, intron_end-1]
+            //   _overlapped_introns_boundary (raw P,P-1): P in [intron_end-15, intron_end-2]
+            //   Union: P in [intron_end-16, intron_end-1]
+            if (intron_end - 16..=intron_end - 1).contains(&p) {
                 terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
             }
 
@@ -1075,9 +1077,11 @@ impl TranscriptConsequenceEngine {
                 terms.insert(SoTerm::SpliceAcceptorVariant);
             }
 
-            // Polypyrimidine reverse: overlap(P, P-1, intron_start+2, intron_start+16)
-            //   → P in [intron_start+3, intron_start+16]
-            if (intron_start + 3..=intron_start + 16).contains(&p) {
+            // Polypyrimidine reverse: VEP checks in two loops.
+            //   _overlapped_introns (normalized): P in [intron_start+2, intron_start+17]
+            //   _overlapped_introns_boundary (raw): P in [intron_start+3, intron_start+16]
+            //   Union: P in [intron_start+2, intron_start+17]
+            if (intron_start + 2..=intron_start + 17).contains(&p) {
                 terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
             }
 
