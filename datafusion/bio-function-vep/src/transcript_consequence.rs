@@ -2960,6 +2960,64 @@ mod tests {
     }
 
     #[test]
+    fn regulatory_emits_per_feature_entries_with_stable_ids() {
+        let engine = TranscriptConsequenceEngine::default();
+        let reg1 = regulatory("ENSR22_A", "22", 100, 200);
+        let reg2 = regulatory("ENSR22_B", "22", 150, 250);
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 160, 160, "A", "G"),
+            &[],
+            &[],
+            &[],
+            &[reg1, reg2],
+            &[],
+            &[],
+            &[],
+        );
+        // Should produce one entry per overlapping regulatory feature.
+        let reg_entries: Vec<_> = assignments
+            .iter()
+            .filter(|tc| tc.feature_type == FeatureType::RegulatoryFeature)
+            .collect();
+        assert_eq!(reg_entries.len(), 2);
+        let ids: Vec<_> = reg_entries
+            .iter()
+            .map(|tc| tc.transcript_id.as_deref().unwrap_or(""))
+            .collect();
+        assert!(ids.contains(&"ENSR22_A"));
+        assert!(ids.contains(&"ENSR22_B"));
+        for tc in &reg_entries {
+            assert!(tc.terms.contains(&SoTerm::RegulatoryRegionVariant));
+        }
+    }
+
+    #[test]
+    fn regulatory_non_overlapping_feature_excluded() {
+        let engine = TranscriptConsequenceEngine::default();
+        let reg_overlap = regulatory("ENSR22_A", "22", 100, 200);
+        let reg_no_overlap = regulatory("ENSR22_B", "22", 300, 400);
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 150, 150, "A", "G"),
+            &[],
+            &[],
+            &[],
+            &[reg_overlap, reg_no_overlap],
+            &[],
+            &[],
+            &[],
+        );
+        let reg_entries: Vec<_> = assignments
+            .iter()
+            .filter(|tc| tc.feature_type == FeatureType::RegulatoryFeature)
+            .collect();
+        assert_eq!(reg_entries.len(), 1);
+        assert_eq!(
+            reg_entries[0].transcript_id.as_deref(),
+            Some("ENSR22_A")
+        );
+    }
+
+    #[test]
     fn phase2_coverage_lists_sum_to_41() {
         let implemented = implemented_phase2_terms();
         let missing = missing_phase2_terms();
@@ -3513,6 +3571,158 @@ mod tests {
             terms.contains(&SoTerm::IntronVariant),
             "Large exon-spanning deletion should get intron_variant: {:?}",
             terms
+        );
+    }
+
+    // ---- Tests for CSQ field helper functions ----
+
+    #[test]
+    fn format_codon_display_snv() {
+        // Codon GCT, changed base at position 1 → gCt (ref) / gGt (alt)
+        assert_eq!(format_codon_display(b"GCT", 1, 1, 0), "gCt");
+        assert_eq!(format_codon_display(b"GGT", 1, 1, 0), "gGt");
+        // First base changed
+        assert_eq!(format_codon_display(b"ACG", 0, 0, 0), "Acg");
+        // Last base changed
+        assert_eq!(format_codon_display(b"ACT", 2, 2, 0), "acT");
+    }
+
+    #[test]
+    fn format_codon_display_with_offset() {
+        // Codon at nt_offset=3, changed_start=4 (second base of codon)
+        assert_eq!(format_codon_display(b"GCT", 4, 4, 3), "gCt");
+    }
+
+    #[test]
+    fn which_exon_str_single_exon() {
+        let exons = vec![exon("tx1", 1, 100, 200)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 150, 150, "A", "G");
+        assert_eq!(which_exon_str(&v, &refs), Some("1/1".to_string()));
+    }
+
+    #[test]
+    fn which_exon_str_multi_exon() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 350, 350, "A", "G");
+        assert_eq!(which_exon_str(&v, &refs), Some("2/3".to_string()));
+    }
+
+    #[test]
+    fn which_exon_str_no_overlap() {
+        let exons = vec![exon("tx1", 1, 100, 200)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 250, 250, "A", "G");
+        assert_eq!(which_exon_str(&v, &refs), None);
+    }
+
+    #[test]
+    fn which_intron_str_between_exons_plus_strand() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 250, 250, "A", "G");
+        assert_eq!(which_intron_str(&v, &refs, 1), Some("1/2".to_string()));
+    }
+
+    #[test]
+    fn which_intron_str_second_intron() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 450, 450, "A", "G");
+        assert_eq!(which_intron_str(&v, &refs, 1), Some("2/2".to_string()));
+    }
+
+    #[test]
+    fn which_intron_str_minus_strand_reverses_numbering() {
+        let exons = vec![
+            exon("tx1", 1, 100, 200),
+            exon("tx1", 2, 300, 400),
+            exon("tx1", 3, 500, 600),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Variant in genomic intron between exon1 and exon2 (pos 250).
+        // On minus strand, this is intron 2/2 (reversed).
+        let v = var("22", 250, 250, "A", "G");
+        assert_eq!(which_intron_str(&v, &refs, -1), Some("2/2".to_string()));
+    }
+
+    #[test]
+    fn genomic_to_cdna_index_single_exon() {
+        let exons = vec![exon("tx1", 1, 100, 200)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Position 100 → cDNA index 1 (1-based)
+        assert_eq!(genomic_to_cdna_index(&refs, 1, 100), Some(1));
+        // Position 150 → cDNA index 51
+        assert_eq!(genomic_to_cdna_index(&refs, 1, 150), Some(51));
+    }
+
+    #[test]
+    fn genomic_to_cdna_index_multi_exon() {
+        let exons = vec![
+            exon("tx1", 1, 100, 110), // 11 bases
+            exon("tx1", 2, 200, 210), // 11 bases
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // First exon: pos 100 → 1, pos 110 → 11
+        assert_eq!(genomic_to_cdna_index(&refs, 1, 100), Some(1));
+        assert_eq!(genomic_to_cdna_index(&refs, 1, 110), Some(11));
+        // Second exon: pos 200 → 12 (11 + 1)
+        assert_eq!(genomic_to_cdna_index(&refs, 1, 200), Some(12));
+    }
+
+    #[test]
+    fn genomic_to_cdna_index_intronic_returns_none() {
+        let exons = vec![
+            exon("tx1", 1, 100, 110),
+            exon("tx1", 2, 200, 210),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Position 150 is intronic
+        assert_eq!(genomic_to_cdna_index(&refs, 1, 150), None);
+    }
+
+    #[test]
+    fn compute_cdna_position_snv() {
+        let exons = vec![exon("tx1", 1, 100, 200)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 150, 150, "A", "G");
+        assert_eq!(compute_cdna_position(&v, &refs, 1), Some("51".to_string()));
+    }
+
+    #[test]
+    fn compute_flags_none_when_both_false() {
+        let t = tx("t1", "22", 100, 200, 1, "protein_coding", Some(110), Some(190));
+        assert_eq!(compute_flags(&t), None);
+    }
+
+    #[test]
+    fn compute_flags_cds_start_nf() {
+        let mut t = tx("t1", "22", 100, 200, 1, "protein_coding", Some(110), Some(190));
+        t.cds_start_nf = true;
+        assert_eq!(compute_flags(&t), Some("cds_start_NF".to_string()));
+    }
+
+    #[test]
+    fn compute_flags_both() {
+        let mut t = tx("t1", "22", 100, 200, 1, "protein_coding", Some(110), Some(190));
+        t.cds_start_nf = true;
+        t.cds_end_nf = true;
+        assert_eq!(
+            compute_flags(&t),
+            Some("cds_start_NF&cds_end_NF".to_string())
         );
     }
 }

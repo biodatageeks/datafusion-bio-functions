@@ -1070,4 +1070,64 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
             assert_eq!(c, 2);
         }
     }
+
+    #[test]
+    fn diagnose_unmatched_reports_golden_only_and_ours_only() {
+        let key = VariantKey {
+            chrom: "22".into(),
+            pos: 100,
+            ref_allele: "A".into(),
+            alt_alleles: "G".into(),
+        };
+        // Golden has TX1 and TX2; ours has TX1 and TX3.
+        let golden = vec![VariantAnnotation {
+            key: key.clone(),
+            csq: Some(
+                "G|miss|MOD|S|G1|Transcript|TX1|pc||||||||||||||||||||||||,\
+                 G|intr|MOD|S|G1|Transcript|TX2|pc||||||||||||||||||||||||"
+                    .into(),
+            ),
+            most_severe_consequence: Some("missense_variant".into()),
+        }];
+        let ours = vec![VariantAnnotation {
+            key,
+            csq: Some(
+                "G|miss|MOD|S|G1|Transcript|TX1|pc||||||||||||||||||||||||,\
+                 G|intr|MOD|S|G1|Transcript|TX3|pc||||||||||||||||||||||||"
+                    .into(),
+            ),
+            most_severe_consequence: Some("missense_variant".into()),
+        }];
+        let report = diagnose_unmatched_csq(&golden, &ours);
+        assert_eq!(report.golden_total, 2);
+        assert_eq!(report.ours_total, 2);
+        assert_eq!(report.matched, 1); // TX1 matched
+        // TX2 is golden-only, TX3 is ours-only
+        assert_eq!(report.golden_only_by_ft.get("Transcript"), Some(&1));
+        assert_eq!(report.ours_only_by_ft.get("Transcript"), Some(&1));
+        assert_eq!(report.golden_only_sample.len(), 1);
+        assert_eq!(report.golden_only_sample[0].1, "TX2");
+        assert_eq!(report.ours_only_sample.len(), 1);
+        assert_eq!(report.ours_only_sample[0].1, "TX3");
+    }
+
+    #[test]
+    fn diagnose_unmatched_all_matched() {
+        let key = VariantKey {
+            chrom: "22".into(),
+            pos: 100,
+            ref_allele: "A".into(),
+            alt_alleles: "G".into(),
+        };
+        let csq = "G|miss|MOD|S|G1|Transcript|TX1|pc||||||||||||||||||||||||";
+        let ann = vec![VariantAnnotation {
+            key,
+            csq: Some(csq.into()),
+            most_severe_consequence: Some("missense_variant".into()),
+        }];
+        let report = diagnose_unmatched_csq(&ann, &ann);
+        assert_eq!(report.matched, 1);
+        assert!(report.golden_only_by_ft.is_empty());
+        assert!(report.ours_only_by_ft.is_empty());
+    }
 }
