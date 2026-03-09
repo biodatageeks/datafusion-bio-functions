@@ -89,6 +89,12 @@ pub struct TranscriptFeature {
     pub cds_end: Option<i64>,
     /// Mature miRNA genomic regions (mapped from cDNA attributes in raw_object_json).
     pub mature_mirna_regions: Vec<(i64, i64)>,
+    // Gene metadata for per-transcript CSQ serialization.
+    pub gene_stable_id: Option<String>,
+    pub gene_symbol: Option<String>,
+    pub gene_symbol_source: Option<String>,
+    pub gene_hgnc_id: Option<String>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +168,31 @@ pub struct StructuralFeature {
 pub struct TranscriptConsequence {
     pub transcript_id: Option<String>,
     pub terms: Vec<SoTerm>,
+    /// Index into `PreparedContext.transcripts` for efficient metadata lookup
+    /// without cloning. `None` for non-transcript features (regulatory, motif,
+    /// intergenic, etc.).
+    pub transcript_idx: Option<usize>,
+    /// Feature type label for CSQ serialization.
+    pub feature_type: FeatureType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureType {
+    Transcript,
+    RegulatoryFeature,
+    MotifFeature,
+    None,
+}
+
+impl FeatureType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FeatureType::Transcript => "Transcript",
+            FeatureType::RegulatoryFeature => "RegulatoryFeature",
+            FeatureType::MotifFeature => "MotifFeature",
+            FeatureType::None => "",
+        }
+    }
 }
 
 /// Pre-built indexes over context features, constructed once and reused
@@ -307,7 +338,8 @@ impl TranscriptConsequenceEngine {
             let query_first = (variant.start - max_dist) as i32;
             let query_last = (variant.end + max_dist) as i32;
             tree.query(query_first, query_last, |node| {
-                let tx = ctx.transcripts[*node.metadata];
+                let tx_idx = *node.metadata;
+                let tx = ctx.transcripts[tx_idx];
                 let tx_exons = ctx
                     .exons_by_tx
                     .get(tx.transcript_id.as_str())
@@ -331,12 +363,16 @@ impl TranscriptConsequenceEngine {
                     if !terms.is_empty() {
                         out.push(TranscriptConsequence {
                             transcript_id: Some(tx.transcript_id.clone()),
+                            transcript_idx: Some(tx_idx),
+                            feature_type: FeatureType::Transcript,
                             terms,
                         });
                     }
                 } else if let Some(term) = self.upstream_downstream_term(variant, tx) {
                     out.push(TranscriptConsequence {
                         transcript_id: Some(tx.transcript_id.clone()),
+                        transcript_idx: Some(tx_idx),
+                        feature_type: FeatureType::Transcript,
                         terms: vec![term],
                     });
                 }
@@ -356,6 +392,8 @@ impl TranscriptConsequenceEngine {
         if !has_transcript_hit {
             out.push(TranscriptConsequence {
                 transcript_id: None,
+                transcript_idx: None,
+                feature_type: FeatureType::None,
                 terms: vec![SoTerm::IntergenicVariant],
             });
         }
@@ -508,6 +546,8 @@ impl TranscriptConsequenceEngine {
             ordered.sort_by_key(|t| t.rank());
             out.push(TranscriptConsequence {
                 transcript_id: None,
+                transcript_idx: None,
+                feature_type: FeatureType::RegulatoryFeature,
                 terms: ordered,
             });
         }
@@ -553,6 +593,8 @@ impl TranscriptConsequenceEngine {
             ordered.sort_by_key(|t| t.rank());
             out.push(TranscriptConsequence {
                 transcript_id: None,
+                transcript_idx: None,
+                feature_type: FeatureType::MotifFeature,
                 terms: ordered,
             });
         }
@@ -572,6 +614,8 @@ impl TranscriptConsequenceEngine {
         if overlaps_mirna {
             out.push(TranscriptConsequence {
                 transcript_id: None,
+                transcript_idx: None,
+                feature_type: FeatureType::None,
                 terms: vec![SoTerm::MatureMirnaVariant],
             });
         }
@@ -634,6 +678,8 @@ impl TranscriptConsequenceEngine {
             ordered.sort_by_key(|t| t.rank());
             out.push(TranscriptConsequence {
                 transcript_id: None,
+                transcript_idx: None,
+                feature_type: FeatureType::None,
                 terms: ordered,
             });
         }
@@ -1468,13 +1514,18 @@ fn is_non_coding_biotype(biotype: &str) -> bool {
 }
 
 /// Returns true for transcript IDs that VEP annotates against.
-/// VEP only reports ENST, NM_, NR_, XM_, XR_ transcripts.
-pub fn is_vep_transcript(id: &str) -> bool {
-    id.starts_with("ENST")
-        || id.starts_with("NM_")
-        || id.starts_with("NR_")
-        || id.starts_with("XM_")
-        || id.starts_with("XR_")
+/// When `merged` is true (VEP `--merged` mode), both Ensembl and RefSeq
+/// transcripts are accepted.  Default (non-merged) accepts only ENST.
+pub fn is_vep_transcript(id: &str, merged: bool) -> bool {
+    if merged {
+        id.starts_with("ENST")
+            || id.starts_with("NM_")
+            || id.starts_with("NR_")
+            || id.starts_with("XM_")
+            || id.starts_with("XR_")
+    } else {
+        id.starts_with("ENST")
+    }
 }
 
 /// Strip only `protein_altering_variant` when specific children are present.
@@ -1959,6 +2010,11 @@ mod tests {
             cds_start,
             cds_end,
             mature_mirna_regions: Vec::new(),
+            gene_stable_id: None,
+            gene_symbol: None,
+            gene_symbol_source: None,
+            gene_hgnc_id: None,
+            source: None,
         }
     }
 

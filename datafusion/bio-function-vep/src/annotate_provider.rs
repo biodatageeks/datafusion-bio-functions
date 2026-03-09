@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{
     Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
     LargeStringArray, RecordBatch, StringArray, StringBuilder, StringViewArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
@@ -35,6 +35,57 @@ use crate::transcript_consequence::{
     SvEventKind, SvFeatureKind, TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature,
     VariantInput, is_vep_transcript,
 };
+
+/// Known variation cache annotation columns exposed as top-level output fields.
+/// All are nullable Utf8. Columns not present in the actual cache emit NULLs.
+const CACHE_OUTPUT_COLUMNS: &[&str] = &[
+    // Variant identity
+    "variation_name",
+    // Clinical
+    "clin_sig",
+    "clin_sig_allele",
+    "clinical_impact",
+    "phenotype_or_disease",
+    "pubmed",
+    // Flags
+    "somatic",
+    "minor_allele",
+    "minor_allele_freq",
+    // 1000 Genomes
+    "AF",
+    "AFR",
+    "AMR",
+    "EAS",
+    "EUR",
+    "SAS",
+    // gnomAD exome
+    "gnomADe",
+    "gnomADe_AFR",
+    "gnomADe_AMR",
+    "gnomADe_ASJ",
+    "gnomADe_EAS",
+    "gnomADe_FIN",
+    "gnomADe_NFE",
+    "gnomADe_SAS",
+    "gnomADe_MID",
+    "gnomADe_REMAINING",
+    // gnomAD genome
+    "gnomADg",
+    "gnomADg_AFR",
+    "gnomADg_AMI",
+    "gnomADg_AMR",
+    "gnomADg_ASJ",
+    "gnomADg_EAS",
+    "gnomADg_FIN",
+    "gnomADg_MID",
+    "gnomADg_NFE",
+    "gnomADg_SAS",
+    "gnomADg_REMAINING",
+    // Cross-reference IDs
+    "clinvar_ids",
+    "cosmic_ids",
+    "dbsnp_ids",
+];
 
 /// Table provider implementing `annotate_vep(...)`.
 pub struct AnnotateProvider {
@@ -74,6 +125,9 @@ impl AnnotateProvider {
             DataType::Utf8,
             true,
         )));
+        for &col_name in CACHE_OUTPUT_COLUMNS {
+            fields.push(Arc::new(Field::new(col_name, DataType::Utf8, true)));
+        }
 
         Self {
             session,
@@ -145,7 +199,10 @@ impl AnnotateProvider {
     }
 
     fn vcf_field_count(&self) -> usize {
-        self.schema.fields().len().saturating_sub(2)
+        self.schema
+            .fields()
+            .len()
+            .saturating_sub(2 + CACHE_OUTPUT_COLUMNS.len())
     }
 
     fn vcf_field_names(&self) -> Vec<String> {
@@ -315,6 +372,11 @@ impl AnnotateProvider {
             let cds_start_idx = schema.index_of("cds_start").ok();
             let cds_end_idx = schema.index_of("cds_end").ok();
             let raw_json_idx = schema.index_of("raw_object_json").ok();
+            let gene_stable_id_idx = schema.index_of("gene_stable_id").ok();
+            let gene_symbol_idx = schema.index_of("gene_symbol").ok();
+            let gene_symbol_source_idx = schema.index_of("gene_symbol_source").ok();
+            let gene_hgnc_id_idx = schema.index_of("gene_hgnc_id").ok();
+            let source_idx = schema.index_of("source").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -354,6 +416,16 @@ impl AnnotateProvider {
                     Vec::new()
                 };
 
+                let gene_stable_id =
+                    gene_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let gene_symbol =
+                    gene_symbol_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let gene_symbol_source = gene_symbol_source_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let gene_hgnc_id =
+                    gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let source = source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+
                 out.push(TranscriptFeature {
                     transcript_id,
                     chrom,
@@ -364,6 +436,11 @@ impl AnnotateProvider {
                     cds_start,
                     cds_end,
                     mature_mirna_regions,
+                    gene_stable_id,
+                    gene_symbol,
+                    gene_symbol_source,
+                    gene_hgnc_id,
+                    source,
                 });
             }
         }
@@ -831,11 +908,17 @@ impl AnnotateProvider {
                     set
                 };
 
+                let merged = self
+                    .options_json
+                    .as_deref()
+                    .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
+                    .unwrap_or(false);
+
                 let tx = if let Some(table) = transcripts_table {
                     self.load_transcripts(table, &vcf_chroms)
                         .await?
                         .into_iter()
-                        .filter(|t| is_vep_transcript(&t.transcript_id))
+                        .filter(|t| is_vep_transcript(&t.transcript_id, merged))
                         .collect::<Vec<_>>()
                 } else {
                     Vec::new()
@@ -951,8 +1034,6 @@ impl AnnotateProvider {
             )
         })?;
         let variation_name_idx = schema.index_of("cache_variation_name").ok();
-        let clin_sig_idx = schema.index_of("cache_clin_sig").ok();
-        let af_idx = schema.index_of("cache_AF").ok();
         let cached_csq_idx = schema.index_of("cache_consequence_types").ok();
         let cached_most_idx = schema.index_of("cache_most_severe_consequence").ok();
 
@@ -978,12 +1059,22 @@ impl AnnotateProvider {
             let cached_csq =
                 cached_csq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
 
-            let (term_field, most_str) = if let Some(most_val) = &cached_most {
-                // Cache hit — use cached consequence_types and most_severe.
+            let variation_name = variation_name_idx
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                .unwrap_or_default();
+
+            let (csq_string, most_str) = if let Some(most_val) = &cached_most {
+                // Cache hit — produce single CSQ entry with empty transcript fields.
                 let csq_val = cached_csq.unwrap_or_default();
-                (csq_val, most_val.clone())
+                let impact = SoTerm::from_str(most_val)
+                    .map(|t| impact_label(t.impact()))
+                    .unwrap_or_else(|| impact_label(SoImpact::Modifier));
+                let csq_entry = format!(
+                    "{alt_allele}|{csq_val}|{impact}|||||{variation_name}|{variation_name}||||"
+                );
+                (csq_entry, most_val.clone())
             } else {
-                // Cache miss — compute via transcript engine.
+                // Cache miss — compute via transcript engine and produce per-transcript CSQ.
                 let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
                     csq_builder.append_null();
                     most_builder.append_null();
@@ -1008,45 +1099,65 @@ impl AnnotateProvider {
                     alt_allele.clone(),
                 );
                 let assignments = engine.evaluate_variant_prepared(&variant, ctx);
-                let mut terms = TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
-                if terms.is_empty() {
-                    terms.push(SoTerm::SequenceVariant);
+
+                // Derive most_severe from all assignments.
+                let mut all_terms =
+                    TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
+                if all_terms.is_empty() {
+                    all_terms.push(SoTerm::SequenceVariant);
                 }
-                let most = most_severe_term(terms.iter()).unwrap_or(SoTerm::SequenceVariant);
-                let tf = terms
-                    .iter()
-                    .map(|t| t.as_str())
-                    .collect::<Vec<_>>()
-                    .join("&");
-                (tf, most.as_str().to_string())
+                let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
+                let most_str = most.as_str().to_string();
+
+                // Build per-transcript CSQ entries, comma-separated.
+                let mut csq_entries: Vec<String> = Vec::with_capacity(assignments.len());
+                for tc in &assignments {
+                    let terms_str = tc
+                        .terms
+                        .iter()
+                        .map(|t| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    let tc_impact = most_severe_term(tc.terms.iter())
+                        .map(|t| impact_label(t.impact()))
+                        .unwrap_or_else(|| impact_label(SoImpact::Modifier));
+                    let feature_type = tc.feature_type.as_str();
+                    let feature = tc.transcript_id.as_deref().unwrap_or("");
+                    // Look up transcript metadata via index (zero-copy).
+                    let (symbol, gene, biotype, strand_str, symbol_source, hgnc_id, source) =
+                        if let Some(idx) = tc.transcript_idx {
+                            let tx = ctx.transcripts[idx];
+                            (
+                                tx.gene_symbol.as_deref().unwrap_or(""),
+                                tx.gene_stable_id.as_deref().unwrap_or(""),
+                                tx.biotype.as_str(),
+                                if tx.strand >= 0 { "1" } else { "-1" },
+                                tx.gene_symbol_source.as_deref().unwrap_or(""),
+                                tx.gene_hgnc_id.as_deref().unwrap_or(""),
+                                tx.source.as_deref().unwrap_or(""),
+                            )
+                        } else {
+                            ("", "", "", "", "", "", "")
+                        };
+                    csq_entries.push(format!(
+                        "{alt_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|{variation_name}|{strand_str}|{symbol_source}|{hgnc_id}|{source}"
+                    ));
+                }
+                if csq_entries.is_empty() {
+                    let impact = impact_label(SoImpact::Modifier);
+                    csq_entries.push(format!(
+                        "{alt_allele}|sequence_variant|{impact}|||||{variation_name}|||||"
+                    ));
+                }
+                (csq_entries.join(","), most_str)
             };
 
-            let impact = SoTerm::from_str(&most_str)
-                .map(|t| impact_label(t.impact()))
-                .unwrap_or_else(|| impact_label(SoImpact::Modifier));
-
-            let variation_name = variation_name_idx
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                .unwrap_or_default();
-            let clin_sig = clin_sig_idx
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                .unwrap_or_default();
-            let af = af_idx
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                .unwrap_or_default();
-
-            // Replace commas in sub-fields to avoid breaking the CSQ
-            // comma-delimited annotation separator (VEP uses '&').
-            let clin_sig_safe = clin_sig.replace(',', "&");
-            let af_safe = af.replace(',', "&");
-            csq_builder.append_value(format!(
-                "{}|{}|{}|{}|{}|{}",
-                alt_allele, term_field, impact, variation_name, clin_sig_safe, af_safe
-            ));
+            csq_builder.append_value(&csq_string);
             most_builder.append_value(&most_str);
         }
 
-        let mut out_cols = Vec::with_capacity(self.vcf_field_count() + 2);
+        let mut out_cols =
+            Vec::with_capacity(self.vcf_field_count() + 2 + CACHE_OUTPUT_COLUMNS.len());
         for name in self.vcf_field_names() {
             let idx = schema.index_of(&name).map_err(|_| {
                 DataFusionError::Execution(format!(
@@ -1057,6 +1168,25 @@ impl AnnotateProvider {
         }
         out_cols.push(Arc::new(csq_builder.finish()));
         out_cols.push(Arc::new(most_builder.finish()));
+
+        // Pass through extra cache annotation columns.
+        for &col_name in CACHE_OUTPUT_COLUMNS {
+            let col_name_in_batch = format!("cache_{col_name}");
+            if let Ok(idx) = schema.index_of(&col_name_in_batch) {
+                let col = batch.column(idx);
+                let mut builder =
+                    StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+                for row in 0..batch.num_rows() {
+                    match string_at(col.as_ref(), row) {
+                        Some(v) => builder.append_value(&v),
+                        None => builder.append_null(),
+                    }
+                }
+                out_cols.push(Arc::new(builder.finish()));
+            } else {
+                out_cols.push(new_null_array(&DataType::Utf8, batch.num_rows()));
+            }
+        }
 
         Ok(RecordBatch::try_new(self.schema.clone(), out_cols)?)
     }
@@ -1272,16 +1402,15 @@ impl TableProvider for AnnotateProvider {
             .map(|f| f.name().clone())
             .collect();
 
-        let preferred_columns = [
-            "variation_name",
-            "clin_sig",
-            "AF",
-            "somatic",
-            "phenotype_or_disease",
-            "pubmed",
+        let mut preferred_columns = vec![
             "consequence_types",
             "most_severe_consequence",
         ];
+        for &col in CACHE_OUTPUT_COLUMNS {
+            if !preferred_columns.contains(&col) {
+                preferred_columns.push(col);
+            }
+        }
         let requested_columns: Vec<&str> = preferred_columns
             .iter()
             .copied()
@@ -1401,7 +1530,10 @@ impl TableProvider for AnnotateProvider {
         );
 
         let total_fields = self.schema.fields().len();
-        let vcf_fields = total_fields.saturating_sub(2);
+        let vcf_fields = self.vcf_field_count();
+        let csq_idx = vcf_fields;
+        let most_severe_idx = vcf_fields + 1;
+        let cache_col_start = vcf_fields + 2;
         let projected_indices: Vec<usize> = projection
             .cloned()
             .unwrap_or_else(|| (0..total_fields).collect());
@@ -1418,10 +1550,15 @@ impl TableProvider for AnnotateProvider {
             if idx < vcf_fields {
                 let name = self.schema.field(idx).name().clone();
                 projected_exprs.push(format!("l.`{name}` AS `{name}`"));
-            } else if idx == vcf_fields {
+            } else if idx == csq_idx {
                 projected_exprs.push(format!("{csq_expr} AS `csq`"));
-            } else {
+            } else if idx == most_severe_idx {
                 projected_exprs.push(format!("{most_severe_expr} AS `most_severe_consequence`"));
+            } else if idx >= cache_col_start {
+                let col_name = CACHE_OUTPUT_COLUMNS[idx - cache_col_start];
+                projected_exprs.push(format!(
+                    "CAST(l.`cache_{col_name}` AS VARCHAR) AS `{col_name}`"
+                ));
             }
         }
 

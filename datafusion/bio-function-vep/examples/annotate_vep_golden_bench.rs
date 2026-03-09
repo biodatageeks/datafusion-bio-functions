@@ -13,12 +13,12 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::golden_benchmark::{
-    ComparisonReport, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI,
-    DEFAULT_EXTERNAL_VEP_CACHE_DIR, DEFAULT_LOCAL_HG002_CHR22_VCF_GZ,
-    DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI, TermComparisonReport, VariantAnnotation,
-    VariantDiscrepancy, VariantKey, collect_discrepancies, compare_annotation_terms,
-    compare_annotations, ensure_local_copy, normalize_chrom, parse_vep_vcf_annotations,
-    sample_gz_vcf_first_n,
+    ComparisonReport, CsqFieldReport, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ,
+    DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI, DEFAULT_EXTERNAL_VEP_CACHE_DIR,
+    DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI, TermComparisonReport,
+    VariantAnnotation, VariantDiscrepancy, VariantKey, collect_discrepancies,
+    compare_annotation_terms, compare_annotations, compare_csq_fields, ensure_local_copy,
+    normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
 };
 use datafusion_bio_function_vep::register_vep_functions;
 
@@ -226,15 +226,18 @@ async fn main() -> Result<()> {
 
     let report = compare_annotations(&golden_annotations, &ours_annotations);
     let term_report = compare_annotation_terms(&golden_annotations, &ours_annotations);
+    let csq_field_report = compare_csq_fields(&golden_annotations, &ours_annotations);
     let discrepancies = collect_discrepancies(&golden_annotations, &ours_annotations);
 
     print_report(&report, &term_report);
+    print_csq_field_report(&csq_field_report);
     print_discrepancy_summary(&discrepancies, &report);
 
     write_report(
         &report_path,
         &report,
         &term_report,
+        &csq_field_report,
         sampled_rows,
         sampling_elapsed,
         docker_elapsed,
@@ -312,6 +315,10 @@ fn build_options_json(args: &Args) -> Option<String> {
 
     // Disable extended probes for faster equi-join.
     entries.push("\"extended_probes\":false".to_string());
+
+    if args.merged {
+        entries.push("\"merged\":true".to_string());
+    }
 
     if entries.is_empty() {
         return None;
@@ -431,13 +438,15 @@ fn run_vep_docker(
         .arg("--output_file")
         .arg(format!("/work/{golden_name}"))
         .arg("--vcf")
-        .arg("--fork")
-        .arg("4")
         .arg("--force_overwrite")
         .arg("--no_stats");
 
     // Enable regulatory feature annotations (VEP skips them by default).
     cmd.arg("--regulatory");
+
+    // Restrict CSQ fields to match our per-transcript CSQ format.
+    cmd.arg("--fields")
+        .arg("Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,Existing_variation,STRAND,SYMBOL_SOURCE,HGNC_ID,SOURCE");
 
     if merged {
         cmd.arg("--merged");
@@ -638,6 +647,25 @@ fn print_report(report: &ComparisonReport, term_report: &TermComparisonReport) {
     );
 }
 
+fn print_csq_field_report(report: &CsqFieldReport) {
+    if report.total_entries_compared == 0 {
+        println!("\ncsq field report: no entries to compare");
+        return;
+    }
+    println!(
+        "\ncsq per-field accuracy ({} entries compared):",
+        report.total_entries_compared
+    );
+    for (i, name) in report.field_names.iter().enumerate() {
+        let matches = report.field_match_counts[i];
+        let pct = matches as f64 / report.total_entries_compared as f64 * 100.0;
+        println!(
+            "  {:<20} {}/{} ({:.1}%)",
+            name, matches, report.total_entries_compared, pct
+        );
+    }
+}
+
 fn print_discrepancy_summary(discrepancies: &[VariantDiscrepancy], report: &ComparisonReport) {
     let total = discrepancies.len();
     let most_severe_mismatches = discrepancies
@@ -704,6 +732,7 @@ fn write_report(
     report_path: &Path,
     report: &ComparisonReport,
     term_report: &TermComparisonReport,
+    csq_field_report: &CsqFieldReport,
     sampled_rows: usize,
     sampling_elapsed_s: f64,
     docker_elapsed_s: f64,
@@ -767,6 +796,28 @@ fn write_report(
         term_report.golden_term_subset_matches
     )
     .map_err(io_err)?;
+    // CSQ per-field accuracy report.
+    writeln!(f, "\n# CSQ per-field accuracy").map_err(io_err)?;
+    writeln!(
+        f,
+        "csq_entries_compared={}",
+        csq_field_report.total_entries_compared
+    )
+    .map_err(io_err)?;
+    for (i, name) in csq_field_report.field_names.iter().enumerate() {
+        let matches = csq_field_report.field_match_counts[i];
+        let pct = if csq_field_report.total_entries_compared > 0 {
+            matches as f64 / csq_field_report.total_entries_compared as f64
+        } else {
+            0.0
+        };
+        writeln!(
+            f,
+            "csq_field_{name}={matches}/{} ({pct:.3})",
+            csq_field_report.total_entries_compared
+        )
+        .map_err(io_err)?;
+    }
     Ok(())
 }
 
