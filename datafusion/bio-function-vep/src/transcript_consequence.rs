@@ -20,7 +20,13 @@ impl VariantInput {
     /// prefix/suffix anchor bases that VCF uses for indels.  VEP internally
     /// performs this normalization so that only the truly changed bases are
     /// used for splice-site and other positional checks.
-    pub fn from_vcf(chrom: String, pos: i64, end: i64, ref_allele: String, alt_allele: String) -> Self {
+    pub fn from_vcf(
+        chrom: String,
+        pos: i64,
+        end: i64,
+        ref_allele: String,
+        alt_allele: String,
+    ) -> Self {
         let ref_bytes = ref_allele.as_bytes();
         let alt_bytes = alt_allele.as_bytes();
 
@@ -33,7 +39,13 @@ impl VariantInput {
 
         if prefix_len == 0 || (prefix_len == ref_bytes.len() && prefix_len == alt_bytes.len()) {
             // No trimming needed (SNV or identical alleles)
-            return Self { chrom, start: pos, end, ref_allele, alt_allele };
+            return Self {
+                chrom,
+                start: pos,
+                end,
+                ref_allele,
+                alt_allele,
+            };
         }
 
         let trimmed_ref = &ref_bytes[prefix_len..];
@@ -263,7 +275,13 @@ impl TranscriptConsequenceEngine {
         structural: &[StructuralFeature],
     ) -> Vec<TranscriptConsequence> {
         let ctx = PreparedContext::new(
-            transcripts, exons, translations, regulatory, motifs, mirnas, structural,
+            transcripts,
+            exons,
+            translations,
+            regulatory,
+            motifs,
+            mirnas,
+            structural,
         );
         self.evaluate_variant_prepared(variant, &ctx)
     }
@@ -383,38 +401,24 @@ impl TranscriptConsequenceEngine {
             }
         });
 
-        // Exonic boundary +/- 3bp contributes splice_region, but only
-        // at internal splice junctions — not at terminal transcript
-        // boundaries (first/last exon outer edges).
-        {
-            let tx_start = tx.start;
-            let tx_end = tx.end;
-            if tx_exons.iter().any(|e| {
-                // Exon start boundary is a splice junction unless it equals
-                // the transcript start (terminal).
-                let start_is_junction = e.start != tx_start;
-                // Exon end boundary is a splice junction unless it equals
-                // the transcript end (terminal).
-                let end_is_junction = e.end != tx_end;
-                (start_is_junction
-                    && overlaps(variant.start, variant.end, e.start, e.start + 2))
-                    || (end_is_junction
-                        && overlaps(variant.start, variant.end, e.end - 2, e.end))
-            }) {
-                terms.insert(SoTerm::SpliceRegionVariant);
+        if !overlaps_exon {
+            terms.insert(SoTerm::IntronVariant);
+        }
+        if is_non_coding_biotype(&tx.biotype) && overlaps_exon {
+            terms.insert(SoTerm::NonCodingTranscriptExonVariant);
+        } else if overlaps_exon && self.overlaps_cds(variant, tx) {
+            self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
+        } else if overlaps_exon {
+            if let Some(utr_term) = self.utr_term(variant, tx) {
+                terms.insert(utr_term);
             }
         }
 
-        if !overlaps_exon {
-            terms.insert(SoTerm::IntronVariant);
-            self.add_intronic_splice_terms(&mut terms, variant, tx, tx_exons);
-        } else if is_non_coding_biotype(&tx.biotype) {
-            terms.insert(SoTerm::NonCodingTranscriptExonVariant);
-        } else if self.overlaps_cds(variant, tx) {
-            self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
-        } else if let Some(utr_term) = self.utr_term(variant, tx) {
-            terms.insert(utr_term);
-        }
+        // VEP checks splice sites using intron boundary regions that extend
+        // into exons (intron_start-4..intron_start+7 and intron_end-8..intron_end+3).
+        // This naturally handles both fully-intronic variants AND exon-spanning
+        // deletions that reach into splice sites.
+        self.add_intron_splice_terms(&mut terms, variant, tx, tx_exons);
 
         if tx.biotype == "nonsense_mediated_decay" {
             terms.insert(SoTerm::NmdTranscriptVariant);
@@ -815,16 +819,24 @@ impl TranscriptConsequenceEngine {
         None
     }
 
-    fn add_intronic_splice_terms(
+    /// Check splice site terms using intron-based iteration, matching VEP's
+    /// algorithm.  VEP builds an intron boundary interval tree with extended
+    /// regions (intron_start-4..intron_start+7 and intron_end-8..intron_end+3)
+    /// that reach into exons.  This naturally handles both fully-intronic
+    /// variants AND exon-spanning deletions.
+    fn add_intron_splice_terms(
         &self,
         terms: &mut BTreeSet<SoTerm>,
         variant: &VariantInput,
         tx: &TranscriptFeature,
         tx_exons: &[&ExonFeature],
     ) {
+        if tx_exons.len() < 2 {
+            return; // Single-exon transcript has no introns.
+        }
+
         // For indels, VEP uses the affected-base range (excluding the VCF
-        // anchor base) when checking splice site distances. Build a
-        // trimmed variant that strips any common prefix.
+        // anchor base) when checking splice site distances.
         let trimmed = VariantInput::from_vcf(
             variant.chrom.clone(),
             variant.start,
@@ -832,116 +844,291 @@ impl TranscriptConsequenceEngine {
             variant.ref_allele.clone(),
             variant.alt_allele.clone(),
         );
-        let splice_variant = &trimmed;
+        let sv = &trimmed;
+        let is_ins = sv.ref_allele == "-";
+        let (sv_min, sv_max) = if sv.start <= sv.end {
+            (sv.start, sv.end)
+        } else {
+            (sv.end, sv.start)
+        };
 
-        for exon in tx_exons {
-            if tx.strand >= 0 {
-                // Donor (intron after exon end): +1/+2, +5, +3..+6, +7..+8
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.end + 1,
-                    exon.end + 2,
-                    SoTerm::SpliceDonorVariant,
-                );
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.end + 5,
-                    exon.end + 5,
-                    SoTerm::SpliceDonor5thBaseVariant,
-                );
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.end + 3,
-                    exon.end + 6,
-                    SoTerm::SpliceDonorRegionVariant,
-                );
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.end + 7,
-                    exon.end + 8,
-                    SoTerm::SpliceRegionVariant,
-                );
+        // Derive introns from sorted exon pairs.
+        let mut sorted_exons: Vec<&ExonFeature> = tx_exons.to_vec();
+        sorted_exons.sort_by_key(|e| e.start);
 
-                // Acceptor (before exon start): -1/-2, -3..-8, -3..-17
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.start - 2,
-                    exon.start - 1,
-                    SoTerm::SpliceAcceptorVariant,
-                );
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.start - 8,
-                    exon.start - 3,
-                    SoTerm::SpliceRegionVariant,
-                );
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.start - 17,
-                    exon.start - 3,
-                    SoTerm::SplicePolypyrimidineTractVariant,
-                );
-            } else {
-                // Donor for negative strand lives before exon start.
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.start - 2,
-                    exon.start - 1,
-                    SoTerm::SpliceDonorVariant,
-                );
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.start - 5,
-                    exon.start - 5,
-                    SoTerm::SpliceDonor5thBaseVariant,
-                );
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.start - 6,
-                    exon.start - 3,
-                    SoTerm::SpliceDonorRegionVariant,
-                );
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.start - 8,
-                    exon.start - 7,
-                    SoTerm::SpliceRegionVariant,
-                );
-
-                // Acceptor for negative strand lives after exon end.
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.end + 1,
-                    exon.end + 2,
-                    SoTerm::SpliceAcceptorVariant,
-                );
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.end + 3,
-                    exon.end + 8,
-                    SoTerm::SpliceRegionVariant,
-                );
-                add_if_overlaps(
-                    terms,
-                    splice_variant,
-                    exon.end + 3,
-                    exon.end + 17,
-                    SoTerm::SplicePolypyrimidineTractVariant,
-                );
+        for pair in sorted_exons.windows(2) {
+            let intron_start = pair[0].end + 1;
+            let intron_end = pair[1].start - 1;
+            if intron_start > intron_end {
+                continue; // Degenerate / overlapping exons.
             }
+
+            // Quick check: does variant overlap the intron or its extended
+            // boundary margins?  VEP uses two separate trees — one for the
+            // full intron span (polypyrimidine at -16..-2, splice_region at
+            // +2..+7 / -7..-2) and one for boundary regions that reach into
+            // exons.  We combine both into a single check covering the full
+            // range: (intron_start - 4) .. (intron_end + 3).
+            if !overlaps(sv_min, sv_max, intron_start - 4, intron_end + 3) {
+                continue;
+            }
+
+            // Now check specific splice positions within this intron.
+            // VEP uses intron-relative offsets (0-based from intron_start/end).
+            if tx.strand >= 0 {
+                self.add_splice_for_intron_positive(terms, sv, is_ins, intron_start, intron_end);
+            } else {
+                self.add_splice_for_intron_negative(terms, sv, is_ins, intron_start, intron_end);
+            }
+        }
+    }
+
+    /// Splice checks for a single intron on the positive strand.
+    /// Intron coordinates are 1-based inclusive [intron_start, intron_end].
+    ///
+    /// VEP Perl offsets (from `_intron_effects`):
+    ///   donor (start):  +0/+1 = splice_donor, +4 = 5th_base, +2..+5 = donor_region
+    ///   acceptor (end): -0/-1 = splice_acceptor
+    ///   splice_region:  _intron_overlap checks +2..+7, -7..-2, start-3..start-1, end+1..end+3
+    ///   polypyrimidine: -16..-2 (from intron_end)
+    fn add_splice_for_intron_positive(
+        &self,
+        terms: &mut BTreeSet<SoTerm>,
+        variant: &VariantInput,
+        is_ins: bool,
+        intron_start: i64,
+        intron_end: i64,
+    ) {
+        if is_ins {
+            // Donor: insertion exactly at intron_start or intron_start+1
+            if variant.start == intron_start || variant.start == intron_start + 1 {
+                terms.insert(SoTerm::SpliceDonorVariant);
+            }
+            if variant.start == intron_start + 4 {
+                terms.insert(SoTerm::SpliceDonor5thBaseVariant);
+            }
+            if (intron_start + 2..=intron_start + 5).contains(&variant.start) {
+                terms.insert(SoTerm::SpliceDonorRegionVariant);
+            }
+            // splice_region at +6/+7
+            if variant.start == intron_start + 6 || variant.start == intron_start + 7 {
+                terms.insert(SoTerm::SpliceRegionVariant);
+            }
+
+            // Acceptor: insertion exactly at intron_end or intron_end-1
+            if variant.start == intron_end || variant.start == intron_end - 1 {
+                terms.insert(SoTerm::SpliceAcceptorVariant);
+            }
+            // splice_region at intron_end-7..intron_end-2
+            if (intron_end - 7..=intron_end - 2).contains(&variant.start) {
+                terms.insert(SoTerm::SpliceRegionVariant);
+            }
+            // polypyrimidine at intron_end-16..intron_end-2
+            if (intron_end - 16..=intron_end - 2).contains(&variant.start) {
+                terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
+            }
+
+            // VEP _intron_overlap exonic splice_region for insertions:
+            // vf_start == intron_start or vf_end == intron_end
+            // plus exonic positions intron_start-3..intron_start-1, intron_end+1..intron_end+3
+            if variant.start == intron_start || variant.start == intron_end {
+                terms.insert(SoTerm::SpliceRegionVariant);
+            }
+            if (intron_start - 3..=intron_start - 1).contains(&variant.start)
+                || (intron_end + 1..=intron_end + 3).contains(&variant.start)
+            {
+                terms.insert(SoTerm::SpliceRegionVariant);
+            }
+        } else {
+            // Deletions/SNVs: range overlap
+            // Donor: intron_start..intron_start+1
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_start,
+                intron_start + 1,
+                SoTerm::SpliceDonorVariant,
+            );
+            // 5th base: intron_start+4
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_start + 4,
+                intron_start + 4,
+                SoTerm::SpliceDonor5thBaseVariant,
+            );
+            // Donor region: intron_start+2..intron_start+5
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_start + 2,
+                intron_start + 5,
+                SoTerm::SpliceDonorRegionVariant,
+            );
+            // splice_region (intronic): intron_start+2..intron_start+7, intron_end-7..intron_end-2
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_start + 2,
+                intron_start + 7,
+                SoTerm::SpliceRegionVariant,
+            );
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_end - 7,
+                intron_end - 2,
+                SoTerm::SpliceRegionVariant,
+            );
+            // splice_region (exonic): intron_start-3..intron_start-1, intron_end+1..intron_end+3
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_start - 3,
+                intron_start - 1,
+                SoTerm::SpliceRegionVariant,
+            );
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_end + 1,
+                intron_end + 3,
+                SoTerm::SpliceRegionVariant,
+            );
+
+            // Acceptor: intron_end-1..intron_end
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_end - 1,
+                intron_end,
+                SoTerm::SpliceAcceptorVariant,
+            );
+            // Polypyrimidine: intron_end-16..intron_end-2
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_end - 16,
+                intron_end - 2,
+                SoTerm::SplicePolypyrimidineTractVariant,
+            );
+        }
+    }
+
+    /// Splice checks for a single intron on the negative strand.
+    /// On negative strand, the donor is at the intron END and acceptor at
+    /// the intron START (genomic coordinates).
+    fn add_splice_for_intron_negative(
+        &self,
+        terms: &mut BTreeSet<SoTerm>,
+        variant: &VariantInput,
+        is_ins: bool,
+        intron_start: i64,
+        intron_end: i64,
+    ) {
+        if is_ins {
+            // Donor (intron end on negative strand): intron_end, intron_end-1
+            if variant.start == intron_end || variant.start == intron_end - 1 {
+                terms.insert(SoTerm::SpliceDonorVariant);
+            }
+            if variant.start == intron_end - 4 {
+                terms.insert(SoTerm::SpliceDonor5thBaseVariant);
+            }
+            if (intron_end - 5..=intron_end - 2).contains(&variant.start) {
+                terms.insert(SoTerm::SpliceDonorRegionVariant);
+            }
+            if variant.start == intron_end - 6 || variant.start == intron_end - 7 {
+                terms.insert(SoTerm::SpliceRegionVariant);
+            }
+
+            // Acceptor (intron start on negative strand): intron_start, intron_start+1
+            if variant.start == intron_start || variant.start == intron_start + 1 {
+                terms.insert(SoTerm::SpliceAcceptorVariant);
+            }
+            if (intron_start + 2..=intron_start + 7).contains(&variant.start) {
+                terms.insert(SoTerm::SpliceRegionVariant);
+            }
+            if (intron_start + 2..=intron_start + 16).contains(&variant.start) {
+                terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
+            }
+
+            // Exonic splice_region for insertions
+            if variant.start == intron_start || variant.start == intron_end {
+                terms.insert(SoTerm::SpliceRegionVariant);
+            }
+            if (intron_start - 3..=intron_start - 1).contains(&variant.start)
+                || (intron_end + 1..=intron_end + 3).contains(&variant.start)
+            {
+                terms.insert(SoTerm::SpliceRegionVariant);
+            }
+        } else {
+            // Donor (intron end, negative strand): intron_end-1..intron_end
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_end - 1,
+                intron_end,
+                SoTerm::SpliceDonorVariant,
+            );
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_end - 4,
+                intron_end - 4,
+                SoTerm::SpliceDonor5thBaseVariant,
+            );
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_end - 5,
+                intron_end - 2,
+                SoTerm::SpliceDonorRegionVariant,
+            );
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_end - 7,
+                intron_end - 2,
+                SoTerm::SpliceRegionVariant,
+            );
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_end + 1,
+                intron_end + 3,
+                SoTerm::SpliceRegionVariant,
+            );
+
+            // Acceptor (intron start, negative strand): intron_start..intron_start+1
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_start,
+                intron_start + 1,
+                SoTerm::SpliceAcceptorVariant,
+            );
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_start + 2,
+                intron_start + 7,
+                SoTerm::SpliceRegionVariant,
+            );
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_start - 3,
+                intron_start - 1,
+                SoTerm::SpliceRegionVariant,
+            );
+            // Polypyrimidine (negative strand): intron_start+2..intron_start+16
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_start + 2,
+                intron_start + 16,
+                SoTerm::SplicePolypyrimidineTractVariant,
+            );
         }
     }
 }
@@ -1067,8 +1254,7 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     // VEP omits intron_variant when splice_donor_variant or
     // splice_acceptor_variant is present on the same transcript —
     // the splice site terms already imply an intronic location.
-    if terms.contains(&SoTerm::SpliceDonorVariant)
-        || terms.contains(&SoTerm::SpliceAcceptorVariant)
+    if terms.contains(&SoTerm::SpliceDonorVariant) || terms.contains(&SoTerm::SpliceAcceptorVariant)
     {
         terms.remove(&SoTerm::IntronVariant);
     }
@@ -1079,6 +1265,16 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     // subsumes the general one.
     if terms.contains(&SoTerm::SpliceDonor5thBaseVariant) {
         terms.remove(&SoTerm::SpliceDonorRegionVariant);
+    }
+
+    // VEP's splice_region function suppresses splice_region_variant when
+    // any of the more specific splice site terms are present.
+    if terms.contains(&SoTerm::SpliceDonorVariant)
+        || terms.contains(&SoTerm::SpliceAcceptorVariant)
+        || terms.contains(&SoTerm::SpliceDonorRegionVariant)
+        || terms.contains(&SoTerm::SpliceDonor5thBaseVariant)
+    {
+        terms.remove(&SoTerm::SpliceRegionVariant);
     }
 }
 
@@ -1197,10 +1393,7 @@ fn classify_coding_change(
     // frame to codon boundaries but are not part of the genomic sequence.
     // We must offset CDS indices by the number of leading Ns so that the
     // genomic-to-CDS mapping lines up with the padded string.
-    let leading_n_offset = cds_seq
-        .bytes()
-        .take_while(|&b| b == b'N')
-        .count();
+    let leading_n_offset = cds_seq.bytes().take_while(|&b| b == b'N').count();
 
     let mut cds_indices = Vec::with_capacity(genomic_positions.len());
     for pos in &genomic_positions {
@@ -1772,7 +1965,11 @@ mod tests {
         );
         // Without translation data, the engine cannot determine
         // missense vs synonymous — only CodingSequenceVariant.
-        assert!(assignments[0].terms.contains(&SoTerm::CodingSequenceVariant));
+        assert!(
+            assignments[0]
+                .terms
+                .contains(&SoTerm::CodingSequenceVariant)
+        );
         assert!(!assignments[0].terms.contains(&SoTerm::MissenseVariant));
     }
 
@@ -2136,7 +2333,16 @@ mod tests {
         // CDS: ATG CGA TGA CGA AAA CGA AAA AAA AAA AAA TAA = 33 nt
         let cds = "ATGCGATGACGAAAACGAAAAAAAAAAAATAA";
         // transcript 100..131 (1-based inclusive), CDS 100..130
-        let tx = tx("pc", "22", 100, 131, 1, "protein_coding", Some(100), Some(130));
+        let tx = tx(
+            "pc",
+            "22",
+            100,
+            131,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(130),
+        );
         let exons = vec![exon("pc", 1, 100, 131)];
         // CGA at CDS positions 16-18 (0-based 15-17). Genomic pos = 100+15 = 115.
         // Mutate C->T at pos 115 to turn CGA->TGA.
@@ -2160,6 +2366,301 @@ mod tests {
         assert!(
             !terms.contains(&SoTerm::MissenseVariant),
             "Should not emit missense when stop_gained applies: {:?}",
+            terms
+        );
+    }
+
+    // ── Approach A tests: insertion exact-matching for splice sites ──
+
+    #[test]
+    fn insertion_at_splice_acceptor_exact_match() {
+        // Transcript: 1000..2000, two exons with intron between them.
+        // Exon 1: 1000..1200, Exon 2: 1400..2000
+        // Intron: 1201..1399
+        // Acceptor site for exon 2: positions 1398 (-2) and 1399 (-1)
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        let exons = vec![exon("T1", 1, 1000, 1200), exon("T1", 2, 1400, 2000)];
+
+        // Insertion exactly at intron position 1399 (exon2.start - 1) → splice_acceptor
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 1399, 1399, "-", "AAAA"),
+            &[t.clone()],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::SpliceAcceptorVariant),
+            "Insertion at intron pos -1 should get splice_acceptor: {:?}",
+            terms
+        );
+
+        // Insertion at intron position 1397 (exon2.start - 3) → NOT splice_acceptor
+        let assignments2 = engine.evaluate_variant_with_context(
+            &var("22", 1397, 1397, "-", "AAAA"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms2 = &assignments2[0].terms;
+        assert!(
+            !terms2.contains(&SoTerm::SpliceAcceptorVariant),
+            "Insertion at intron pos -3 should NOT get splice_acceptor: {:?}",
+            terms2
+        );
+    }
+
+    #[test]
+    fn insertion_splice_donor_region_uses_exact_position() {
+        // Exon 1: 1000..1200, Exon 2: 1400..2000
+        // Donor region for exon 1 (positive strand): +3..+6 = 1203..1206
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        let exons = vec![exon("T1", 1, 1000, 1200), exon("T1", 2, 1400, 2000)];
+
+        // Insertion at position 1204 (+4): should get splice_region (from exonic
+        // boundary check) but NOT splice_donor_region for insertions
+        // Actually +4 is in range +3..+6 so with exact matching it DOES match.
+        // The key insight: insertion at +4 should get splice_donor_region only
+        // if it's an exact match to the donor region positions.
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 1204, 1204, "-", "ACGCACCGCGCACCG"),
+            &[t.clone()],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        // Position 1204 = exon.end + 4 = in donor region range → should match
+        assert!(
+            terms.contains(&SoTerm::SpliceDonorRegionVariant),
+            "Insertion exactly at +4 should get splice_donor_region: {:?}",
+            terms
+        );
+
+        // Insertion at +7 should get splice_region but NOT donor_region
+        let assignments2 = engine.evaluate_variant_with_context(
+            &var("22", 1207, 1207, "-", "ACGC"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms2 = &assignments2[0].terms;
+        assert!(
+            terms2.contains(&SoTerm::SpliceRegionVariant),
+            "Insertion at +7 should get splice_region: {:?}",
+            terms2
+        );
+        assert!(
+            !terms2.contains(&SoTerm::SpliceDonorRegionVariant),
+            "Insertion at +7 should NOT get splice_donor_region: {:?}",
+            terms2
+        );
+    }
+
+    #[test]
+    fn insertion_splice_donor_5th_base_exact_match() {
+        // Exon 1: 1000..1200, intron starts at 1201
+        // +5 position = 1205
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        let exons = vec![exon("T1", 1, 1000, 1200), exon("T1", 2, 1400, 2000)];
+
+        // Insertion at +5 (1205): should get splice_donor_5th_base
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 1205, 1205, "-", "ACGC"),
+            &[t.clone()],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::SpliceDonor5thBaseVariant),
+            "Insertion at +5 should get splice_donor_5th_base: {:?}",
+            terms
+        );
+
+        // Insertion at +6 (1206): should NOT get splice_donor_5th_base
+        let assignments2 = engine.evaluate_variant_with_context(
+            &var("22", 1206, 1206, "-", "ACGC"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms2 = &assignments2[0].terms;
+        assert!(
+            !terms2.contains(&SoTerm::SpliceDonor5thBaseVariant),
+            "Insertion at +6 should NOT get splice_donor_5th_base: {:?}",
+            terms2
+        );
+    }
+
+    // ── Approach B tests: exon-spanning indel splice detection ──
+
+    #[test]
+    fn deletion_spanning_exon_intron_boundary_gets_splice_donor() {
+        // Exon 1: 1000..1200, Exon 2: 1400..2000
+        // Deletion from 1198..1202 spans exon 1 end into intron
+        // Donor site: +1/+2 = 1201/1202
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        let exons = vec![exon("T1", 1, 1000, 1200), exon("T1", 2, 1400, 2000)];
+        let cds = &"ATG".repeat(67); // enough CDS
+        let translations = vec![translation("T1", Some(201), Some(66), None, Some(cds))];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 1198, 1202, "NNNNN", "-"),
+            &[t],
+            &exons,
+            &translations,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::SpliceDonorVariant),
+            "Deletion spanning exon→intron should get splice_donor: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn large_deletion_spanning_into_intron_gets_splice_acceptor() {
+        // Exon 1: 1000..1200, Exon 2: 1400..2000
+        // Deletion from 1380..1420 spans into intron before exon 2
+        // Acceptor site for exon 2: -1/-2 = 1399/1398
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        let exons = vec![exon("T1", 1, 1000, 1200), exon("T1", 2, 1400, 2000)];
+        let cds = &"ATG".repeat(267); // enough CDS
+        let translations = vec![translation("T1", Some(801), Some(266), None, Some(cds))];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 1380, 1420, &"N".repeat(41), "-"),
+            &[t],
+            &exons,
+            &translations,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::SpliceAcceptorVariant),
+            "Large deletion spanning into intron should get splice_acceptor: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn deletion_near_tiny_intron_gets_splice_region() {
+        // Exon 1: 1000..1200, Exon 2: 1210..2000 (tiny 9bp intron: 1201..1209)
+        // Deletion 1199..1201 spans exon 1 end into intron
+        // Splice region for donor: +7/+8 = 1207/1208
+        // But also splice_donor at +1/+2 = 1201/1202
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        let exons = vec![exon("T1", 1, 1000, 1200), exon("T1", 2, 1210, 2000)];
+        let cds = &"ATG".repeat(67);
+        let translations = vec![translation("T1", Some(201), Some(66), None, Some(cds))];
+
+        // Deletion from 1199..1203 spans into intron, hits +1..+3 of donor
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 1199, 1203, "NNNNN", "-"),
+            &[t],
+            &exons,
+            &translations,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::SpliceRegionVariant)
+                || terms.contains(&SoTerm::SpliceDonorVariant),
+            "Deletion near tiny intron should get splice_region or splice_donor: {:?}",
             terms
         );
     }
