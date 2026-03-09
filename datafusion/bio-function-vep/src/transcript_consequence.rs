@@ -278,6 +278,7 @@ impl TranscriptConsequenceEngine {
     ) -> Vec<TranscriptConsequence> {
         let mut out = Vec::new();
         let variant_chrom = normalize_chrom(&variant.chrom);
+        let is_ins = variant.ref_allele == "-";
         let max_dist = self.upstream_distance.max(self.downstream_distance);
 
         // Query the per-chromosome COITree with the variant range expanded
@@ -297,7 +298,14 @@ impl TranscriptConsequenceEngine {
                     .get(tx.transcript_id.as_str())
                     .copied();
 
-                if overlaps(variant.start, variant.end, tx.start, tx.end) {
+                let variant_overlaps_tx = if is_ins {
+                    // For insertions, require both flanking positions
+                    // to be within the transcript (same logic as exon check).
+                    variant.start > tx.start && variant.start <= tx.end
+                } else {
+                    overlaps(variant.start, variant.end, tx.start, tx.end)
+                };
+                if variant_overlaps_tx {
                     let terms =
                         self.evaluate_transcript_overlap(variant, tx, &tx_exons, tx_translation);
                     if !terms.is_empty() {
@@ -771,26 +779,36 @@ impl TranscriptConsequenceEngine {
         variant: &VariantInput,
         tx: &TranscriptFeature,
     ) -> Option<SoTerm> {
+        // For insertions, use the left flanking position (start - 1) so
+        // that an insertion at the transcript boundary is detected as
+        // upstream/downstream.  The insertion is between start-1 and start;
+        // if start-1 is in the upstream window, the insertion is upstream.
+        let check_start = if variant.ref_allele == "-" {
+            variant.start.saturating_sub(1)
+        } else {
+            variant.start
+        };
+        let check_end = variant.end;
         if tx.strand >= 0 {
             let up_start = tx.start.saturating_sub(self.upstream_distance);
             let up_end = tx.start.saturating_sub(1);
-            if overlaps(variant.start, variant.end, up_start, up_end) {
+            if overlaps(check_start, check_end, up_start, up_end) {
                 return Some(SoTerm::UpstreamGeneVariant);
             }
             let down_start = tx.end.saturating_add(1);
             let down_end = tx.end.saturating_add(self.downstream_distance);
-            if overlaps(variant.start, variant.end, down_start, down_end) {
+            if overlaps(check_start, check_end, down_start, down_end) {
                 return Some(SoTerm::DownstreamGeneVariant);
             }
         } else {
             let up_start = tx.end.saturating_add(1);
             let up_end = tx.end.saturating_add(self.upstream_distance);
-            if overlaps(variant.start, variant.end, up_start, up_end) {
+            if overlaps(check_start, check_end, up_start, up_end) {
                 return Some(SoTerm::UpstreamGeneVariant);
             }
             let down_start = tx.start.saturating_sub(self.downstream_distance);
             let down_end = tx.start.saturating_sub(1);
-            if overlaps(variant.start, variant.end, down_start, down_end) {
+            if overlaps(check_start, check_end, down_start, down_end) {
                 return Some(SoTerm::DownstreamGeneVariant);
             }
         }
