@@ -91,7 +91,8 @@ async fn main() -> datafusion::common::Result<()> {
 
     // Measure a few position lookups
     let sample_chrom = chrom_filter.unwrap_or("22");
-    let chrom_code = datafusion_bio_function_vep::kv_cache::key_encoding::chrom_to_code(sample_chrom);
+    let chrom_code =
+        datafusion_bio_function_vep::kv_cache::key_encoding::chrom_to_code(sample_chrom);
     let read_start = Instant::now();
     let mut read_iters = 0u32;
     for pos in 0..20u64 {

@@ -173,7 +173,10 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["ENST00000000010", "ENST00000000011"])),
+                Arc::new(StringArray::from(vec![
+                    "ENST00000000010",
+                    "ENST00000000011",
+                ])),
                 Arc::new(StringArray::from(vec!["1", "2"])),
                 Arc::new(Int64Array::from(vec![50, 150])),
                 Arc::new(Int64Array::from(vec![200, 250])),
@@ -197,7 +200,10 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["ENST00000000010", "ENST00000000011"])),
+                Arc::new(StringArray::from(vec![
+                    "ENST00000000010",
+                    "ENST00000000011",
+                ])),
                 Arc::new(Int64Array::from(vec![1, 1])),
                 Arc::new(Int64Array::from(vec![50, 150])),
                 Arc::new(Int64Array::from(vec![200, 250])),
@@ -816,7 +822,10 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["ENST00000000004", "ENST00000000004"])),
+                Arc::new(StringArray::from(vec![
+                    "ENST00000000004",
+                    "ENST00000000004",
+                ])),
                 Arc::new(Int64Array::from(vec![1, 2])),
                 Arc::new(Int64Array::from(vec![100, 250])),
                 Arc::new(Int64Array::from(vec![150, 300])),
@@ -1689,9 +1698,7 @@ mod tests {
         ctx.register_table("var_splice_cache_exons", Arc::new(splice_exons_table()))
             .expect("register splice exons");
 
-        let expected_terms = [
-            "splice_donor_variant",
-        ];
+        let expected_terms = ["splice_donor_variant"];
 
         for backend in ["parquet", "fjall"] {
             let sql = format!(
@@ -1736,9 +1743,7 @@ mod tests {
         )
         .expect("register repeat exons");
 
-        let expected_terms = [
-            "frameshift_variant",
-        ];
+        let expected_terms = ["frameshift_variant"];
 
         for backend in ["parquet", "fjall"] {
             let sql = format!(
@@ -1805,12 +1810,7 @@ mod tests {
         );
         let csq0 = csq[0].as_ref().expect("csq should be present");
         assert_terms_sorted_by_rank(csq0);
-        assert_term_set_exact(
-            csq0,
-            &[
-                "synonymous_variant",
-            ],
-        );
+        assert_term_set_exact(csq0, &["synonymous_variant"]);
         assert_eq!(most[0], Some("synonymous_variant".to_string()));
     }
 
@@ -1854,12 +1854,7 @@ mod tests {
         let csq0 = csq[0].as_ref().expect("csq should be present");
         assert_terms_sorted_by_rank(csq0);
         // VEP suppresses stop_lost alongside inframe indels.
-        assert_term_set_exact(
-            csq0,
-            &[
-                "inframe_deletion",
-            ],
-        );
+        assert_term_set_exact(csq0, &["inframe_deletion"]);
         assert_eq!(most[0], Some("inframe_deletion".to_string()));
     }
 

@@ -31,9 +31,8 @@ use crate::annotation_store::{AnnotationBackend, build_store};
 use crate::kv_cache::KvCacheTableProvider;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
-    ExonFeature, MirnaFeature, MotifFeature, RegulatoryFeature, StructuralFeature, SvEventKind,
-    PreparedContext, SvFeatureKind, TranscriptConsequenceEngine, TranscriptFeature,
-    TranslationFeature,
+    ExonFeature, MirnaFeature, MotifFeature, PreparedContext, RegulatoryFeature, StructuralFeature,
+    SvEventKind, SvFeatureKind, TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature,
     VariantInput, is_vep_transcript,
 };
 
@@ -360,11 +359,7 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    async fn load_exons(
-        &self,
-        table: &str,
-        chroms: &HashSet<String>,
-    ) -> Result<Vec<ExonFeature>> {
+    async fn load_exons(&self, table: &str, chroms: &HashSet<String>) -> Result<Vec<ExonFeature>> {
         let has_chrom = self
             .session
             .table(table)
@@ -888,9 +883,8 @@ impl AnnotateProvider {
 
         let mut annotated_batches = Vec::with_capacity(base_batches.len());
         for batch in &base_batches {
-            annotated_batches.push(self.annotate_batch_with_transcript_engine(
-                batch, &engine, &ctx,
-            )?);
+            annotated_batches
+                .push(self.annotate_batch_with_transcript_engine(batch, &engine, &ctx)?);
         }
 
         let projected_batches = if let Some(indices) = projection {
@@ -967,10 +961,10 @@ impl AnnotateProvider {
             };
 
             // Cache-hit fast path: use pre-computed consequence from variation cache.
-            let cached_most = cached_most_idx
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-            let cached_csq = cached_csq_idx
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+            let cached_most =
+                cached_most_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+            let cached_csq =
+                cached_csq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
 
             let (term_field, most_str) = if let Some(most_val) = &cached_most {
                 // Cache hit — use cached consequence_types and most_severe.

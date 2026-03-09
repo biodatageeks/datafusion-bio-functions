@@ -319,9 +319,11 @@ async fn stream_partition(
         None
     };
     let mut decompressor = if let Some(ref dict) = ctx.dict {
-        Some(zstd::bulk::Decompressor::with_dictionary(dict).map_err(|e| {
-            DataFusionError::Execution(format!("failed to create zstd decompressor: {e}"))
-        })?)
+        Some(
+            zstd::bulk::Decompressor::with_dictionary(dict).map_err(|e| {
+                DataFusionError::Execution(format!("failed to create zstd decompressor: {e}"))
+            })?,
+        )
     } else {
         None
     };
@@ -339,13 +341,11 @@ async fn stream_partition(
         let batch_clone = batch.clone();
 
         if let Some(mut comp) = compressor.take() {
-            let mut dec = decompressor
-                .take()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "missing zstd decompressor while compression is enabled".to_string(),
-                    )
-                })?;
+            let mut dec = decompressor.take().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "missing zstd decompressor while compression is enabled".to_string(),
+                )
+            })?;
             let (comp_back, dec_back, positions, bytes) = tokio::task::spawn_blocking(move || {
                 let result =
                     flush_positions_compressed(&store, &schema, &batch_clone, &mut comp, &mut dec);
@@ -413,11 +413,9 @@ fn flush_positions_uncompressed(
 
     for ((chrom, start, end), rows) in &groups {
         let mut value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
-        if let Some(existing) = store.get_position_entry_decompressed(
-            chrom_to_code(chrom),
-            *start,
-            *end,
-        )? {
+        if let Some(existing) =
+            store.get_position_entry_decompressed(chrom_to_code(chrom), *start, *end)?
+        {
             value = merge_position_entries(&existing, &value, schema)?;
         }
         let key = encode_position_key(chrom, *start, *end);

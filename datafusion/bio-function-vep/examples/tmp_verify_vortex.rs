@@ -15,8 +15,16 @@ async fn main() -> Result<()> {
     let ctx = SessionContext::new();
     ctx.register_parquet("vx", path, Default::default()).await?;
     if do_count {
-        let batches = ctx.sql("SELECT COUNT(*) AS cnt FROM vx").await?.collect().await?;
-        println!("ok: count query succeeded path={} batches={}", path, batches.len());
+        let batches = ctx
+            .sql("SELECT COUNT(*) AS cnt FROM vx")
+            .await?
+            .collect()
+            .await?;
+        println!(
+            "ok: count query succeeded path={} batches={}",
+            path,
+            batches.len()
+        );
     } else {
         let batches = ctx.sql("SELECT * FROM vx LIMIT 1").await?.collect().await?;
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();

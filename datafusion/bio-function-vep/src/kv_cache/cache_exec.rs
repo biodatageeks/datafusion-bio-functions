@@ -525,8 +525,7 @@ impl KvLookupStream {
                             let Some(candidate_start) = base_start.checked_add(shift) else {
                                 continue;
                             };
-                            let Some(candidate_end) =
-                                candidate_start.checked_add(del_len - 1)
+                            let Some(candidate_end) = candidate_start.checked_add(del_len - 1)
                             else {
                                 continue;
                             };

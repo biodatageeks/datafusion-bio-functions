@@ -640,9 +640,15 @@ fn print_report(report: &ComparisonReport, term_report: &TermComparisonReport) {
 
 fn print_discrepancy_summary(discrepancies: &[VariantDiscrepancy], report: &ComparisonReport) {
     let total = discrepancies.len();
-    let most_severe_mismatches = discrepancies.iter().filter(|d| !d.most_severe_match).count();
+    let most_severe_mismatches = discrepancies
+        .iter()
+        .filter(|d| !d.most_severe_match)
+        .count();
     let term_mismatches = discrepancies.iter().filter(|d| !d.term_set_match).count();
-    let missing = discrepancies.iter().filter(|d| d.ours_most_severe.is_none()).count();
+    let missing = discrepancies
+        .iter()
+        .filter(|d| d.ours_most_severe.is_none())
+        .count();
 
     println!("\ndiscrepancy summary");
     println!("  total_discrepancies: {total}");
@@ -656,10 +662,7 @@ fn print_discrepancy_summary(discrepancies: &[VariantDiscrepancy], report: &Comp
     if shown > 0 {
         println!("\nfirst {shown} discrepancies:");
         for d in discrepancies.iter().take(preview_limit) {
-            let golden_ms = d
-                .golden_most_severe
-                .as_deref()
-                .unwrap_or("(none)");
+            let golden_ms = d.golden_most_severe.as_deref().unwrap_or("(none)");
             let ours_ms = d.ours_most_severe.as_deref().unwrap_or("(none)");
             let ms_marker = if d.most_severe_match { "=" } else { "!" };
             let ts_marker = if d.term_set_match { "=" } else { "!" };
@@ -677,7 +680,10 @@ fn print_discrepancy_summary(discrepancies: &[VariantDiscrepancy], report: &Comp
             );
         }
         if total > preview_limit {
-            println!("  ... and {} more (see discrepancies file)", total - preview_limit);
+            println!(
+                "  ... and {} more (see discrepancies file)",
+                total - preview_limit
+            );
         }
     }
 
@@ -688,8 +694,7 @@ fn print_discrepancy_summary(discrepancies: &[VariantDiscrepancy], report: &Comp
             (report.intersection_rows - most_severe_mismatches) as f64
                 / report.intersection_rows as f64
                 * 100.0,
-            (report.intersection_rows - term_mismatches) as f64
-                / report.intersection_rows as f64
+            (report.intersection_rows - term_mismatches) as f64 / report.intersection_rows as f64
                 * 100.0,
         );
     }
@@ -767,11 +772,7 @@ fn write_report(
 
 fn write_discrepancies(path: &Path, discrepancies: &[VariantDiscrepancy]) -> Result<()> {
     let mut f = File::create(path).map_err(io_err)?;
-    writeln!(
-        f,
-        "# Per-variant discrepancies (golden vs ours)"
-    )
-    .map_err(io_err)?;
+    writeln!(f, "# Per-variant discrepancies (golden vs ours)").map_err(io_err)?;
     writeln!(
         f,
         "# chrom:pos ref/alt | most_severe_match | golden_most_severe | ours_most_severe | term_set_match | golden_terms | ours_terms"

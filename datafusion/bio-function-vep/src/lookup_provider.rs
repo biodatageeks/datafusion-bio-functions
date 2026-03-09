@@ -187,8 +187,8 @@ impl TableProvider for LookupProvider {
         #[cfg(feature = "kv-cache")]
         {
             use crate::allele::{allele_matches, allele_matches_relaxed};
-            use crate::kv_cache::cache_exec::{KvLookupExec, KvMatchMode};
             use crate::kv_cache::KvCacheTableProvider;
+            use crate::kv_cache::cache_exec::{KvLookupExec, KvMatchMode};
 
             let table_ref = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -270,9 +270,7 @@ impl TableProvider for LookupProvider {
                 let needs_utf8_cast = output_field.data_type() == &DataType::Utf8;
                 let project_cache_expr = |raw_expr: &str| -> String {
                     if needs_utf8_cast {
-                        format!(
-                            "CAST(({raw_expr}) AS VARCHAR) AS `cache_{cache_col_name}`"
-                        )
+                        format!("CAST(({raw_expr}) AS VARCHAR) AS `cache_{cache_col_name}`")
                     } else {
                         format!("{raw_expr} AS `cache_{cache_col_name}`")
                     }
@@ -296,9 +294,8 @@ impl TableProvider for LookupProvider {
                         projected_output_exprs.push(project_cache_expr("b.`somatic`"));
                     }
                 } else {
-                    projected_output_exprs.push(project_cache_expr(&format!(
-                        "b.`{cache_col_name}`"
-                    )));
+                    projected_output_exprs
+                        .push(project_cache_expr(&format!("b.`{cache_col_name}`")));
                 }
             }
         }
@@ -487,9 +484,7 @@ impl TableProvider for LookupProvider {
             } else {
                 fallback_cache_cols
                     .push(format!("{cache_normalized_start_expr} AS `__norm_start`"));
-                fallback_cache_cols.push(format!(
-                    "{cache_normalized_end_expr} AS `__norm_end`"
-                ));
+                fallback_cache_cols.push(format!("{cache_normalized_end_expr} AS `__norm_end`"));
             }
             let fallback_cache_inner_cols = fallback_cache_cols.join(", ");
 
@@ -565,16 +560,16 @@ AND a.`alt` = f.`alt`";
 #[cfg(test)]
 mod tests {
     use crate::create_vep_session;
+    #[cfg(feature = "kv-cache")]
+    use crate::kv_cache::{
+        KvCacheTableProvider, VepKvStore, position_entry::serialize_position_entry,
+    };
     use datafusion::arrow::array::{
         Array, ArrayRef, Int8Array, Int64Array, RecordBatch, StringArray, StringViewArray,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
     use datafusion::physical_plan::displayable;
-    #[cfg(feature = "kv-cache")]
-    use crate::kv_cache::{
-        position_entry::serialize_position_entry, KvCacheTableProvider, VepKvStore,
-    };
     use std::collections::HashMap;
     use std::sync::Arc;
     #[cfg(feature = "kv-cache")]
@@ -737,7 +732,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_lookup_dispatches_to_kv_exec_for_fjall_cache_provider() {
         let ctx = create_vep_session();
-        ctx.register_table("vcf_data", Arc::new(vcf_table())).unwrap();
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .unwrap();
 
         let cache_schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -770,10 +766,13 @@ mod tests {
         drop(store);
 
         let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
-        ctx.register_table("var_cache", Arc::new(kv_provider)).unwrap();
+        ctx.register_table("var_cache", Arc::new(kv_provider))
+            .unwrap();
 
         let df = ctx
-            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,clin_sig')")
+            .sql(
+                "SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,clin_sig')",
+            )
             .await
             .unwrap();
 
@@ -861,7 +860,8 @@ mod tests {
         drop(store);
 
         let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
-        ctx.register_table("var_cache", Arc::new(kv_provider)).unwrap();
+        ctx.register_table("var_cache", Arc::new(kv_provider))
+            .unwrap();
 
         let batches = ctx
             .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string', 'exact', true)")
@@ -949,7 +949,8 @@ mod tests {
         drop(store);
 
         let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
-        ctx.register_table("var_cache", Arc::new(kv_provider)).unwrap();
+        ctx.register_table("var_cache", Arc::new(kv_provider))
+            .unwrap();
 
         let batches = ctx
             .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,allele_string', 'exact', true)")
@@ -971,7 +972,9 @@ mod tests {
         }
 
         assert!(
-            names.iter().any(|v| v.as_deref() == Some("rs_repeat_shift")),
+            names
+                .iter()
+                .any(|v| v.as_deref() == Some("rs_repeat_shift")),
             "Expected rs_repeat_shift from KV lookup, got: {names:?}"
         );
         assert!(
@@ -1025,7 +1028,11 @@ mod tests {
             let clin_sig_vals = string_values(clin_sig_col);
             for i in 0..batch.num_rows() {
                 chroms.push(chrom_vals[i].clone().unwrap_or_else(|| "NULL".to_string()));
-                clin_sigs.push(clin_sig_vals[i].clone().unwrap_or_else(|| "NULL".to_string()));
+                clin_sigs.push(
+                    clin_sig_vals[i]
+                        .clone()
+                        .unwrap_or_else(|| "NULL".to_string()),
+                );
             }
         }
 
