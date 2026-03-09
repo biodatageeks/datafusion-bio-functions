@@ -1859,6 +1859,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_csq_has_29_pipe_delimited_fields_per_transcript() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .expect("register vcf table");
+        ctx.register_table("var_cache", Arc::new(cache_table()))
+            .expect("register cache table");
+        ctx.register_table("var_cache_transcripts", Arc::new(transcripts_table()))
+            .expect("register transcripts table");
+        ctx.register_table("var_cache_exons", Arc::new(exons_table()))
+            .expect("register exons table");
+
+        let df = ctx
+            .sql(
+                "SELECT csq FROM annotate_vep('vcf_data', 'var_cache', 'parquet') \
+                 ORDER BY chrom",
+            )
+            .await
+            .expect("query should parse");
+        let batches = df.collect().await.expect("collect annotate_vep");
+        let csq_values = string_values(batches[0].column_by_name("csq").expect("csq column"));
+
+        for csq_opt in &csq_values {
+            let Some(csq) = csq_opt else { continue };
+            // Each CSQ entry (comma-separated) should have exactly 29 pipe-delimited fields.
+            for entry in csq.split(',') {
+                let fields: Vec<&str> = entry.split('|').collect();
+                assert_eq!(
+                    fields.len(),
+                    29,
+                    "CSQ entry should have 29 pipe-delimited fields, got {}: {:?}",
+                    fields.len(),
+                    entry
+                );
+                // Allele (field 0) should be non-empty.
+                assert!(!fields[0].is_empty(), "Allele field should not be empty");
+                // Consequence (field 1) should be non-empty.
+                assert!(
+                    !fields[1].is_empty(),
+                    "Consequence field should not be empty"
+                );
+                // IMPACT (field 2) should be one of the standard values.
+                assert!(
+                    ["HIGH", "MODERATE", "LOW", "MODIFIER"].contains(&fields[2]),
+                    "IMPACT field should be a standard value, got: {}",
+                    fields[2]
+                );
+                // Feature_type (field 5) should be set for transcript hits.
+                // Feature (field 6) should match transcript_id when Feature_type is "Transcript".
+                if fields[5] == "Transcript" {
+                    assert!(
+                        !fields[6].is_empty(),
+                        "Feature should have transcript_id when Feature_type is Transcript"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_rejects_unknown_backend() {
         let ctx = create_vep_session();
         ctx.register_table("vcf_data", Arc::new(vcf_table()))

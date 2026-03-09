@@ -464,6 +464,140 @@ pub fn collect_discrepancies(
     out
 }
 
+/// CSQ field names matching VEP default `--fields` output order (29 fields).
+pub const CSQ_FIELD_NAMES: &[&str] = &[
+    "Allele",
+    "Consequence",
+    "IMPACT",
+    "SYMBOL",
+    "Gene",
+    "Feature_type",
+    "Feature",
+    "BIOTYPE",
+    "EXON",
+    "INTRON",
+    "HGVSc",
+    "HGVSp",
+    "cDNA_position",
+    "CDS_position",
+    "Protein_position",
+    "Amino_acids",
+    "Codons",
+    "Existing_variation",
+    "DISTANCE",
+    "STRAND",
+    "FLAGS",
+    "SYMBOL_SOURCE",
+    "HGNC_ID",
+    "MOTIF_NAME",
+    "MOTIF_POS",
+    "HIGH_INF_POS",
+    "MOTIF_SCORE_CHANGE",
+    "TRANSCRIPTION_FACTORS",
+    "SOURCE",
+];
+
+/// Per-field match report for CSQ comparison.
+#[derive(Debug, Clone)]
+pub struct CsqFieldReport {
+    pub field_names: Vec<String>,
+    pub field_match_counts: Vec<usize>,
+    pub total_entries_compared: usize,
+}
+
+/// Parsed CSQ entry (one pipe-delimited annotation from one transcript).
+#[derive(Debug, Clone)]
+struct CsqEntry {
+    fields: Vec<String>,
+}
+
+impl CsqEntry {
+    fn allele(&self) -> &str {
+        self.fields.first().map(|s| s.as_str()).unwrap_or("")
+    }
+    fn feature(&self) -> &str {
+        self.fields.get(6).map(|s| s.as_str()).unwrap_or("")
+    }
+}
+
+fn parse_csq_entries(csq: &str) -> Vec<CsqEntry> {
+    csq.split(',')
+        .map(|ann| CsqEntry {
+            fields: ann.split('|').map(|s| s.to_string()).collect(),
+        })
+        .collect()
+}
+
+/// Compare per-field CSQ accuracy between golden VEP output and ours.
+///
+/// Matches entries by (Allele, Feature) key within each variant, then
+/// compares each of the 13 CSQ fields.
+pub fn compare_csq_fields(
+    golden: &[VariantAnnotation],
+    ours: &[VariantAnnotation],
+) -> CsqFieldReport {
+    let field_count = CSQ_FIELD_NAMES.len();
+    let mut field_match_counts = vec![0usize; field_count];
+    let mut total_entries = 0usize;
+
+    let golden_map: HashMap<VariantKey, &VariantAnnotation> =
+        golden.iter().map(|r| (r.key.clone(), r)).collect();
+    let ours_map: HashMap<VariantKey, &VariantAnnotation> =
+        ours.iter().map(|r| (r.key.clone(), r)).collect();
+
+    for (key, golden_row) in &golden_map {
+        let Some(ours_row) = ours_map.get(key) else {
+            continue;
+        };
+
+        let golden_csq = match golden_row.csq.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        let ours_csq = match ours_row.csq.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+
+        let golden_entries = parse_csq_entries(golden_csq);
+        let ours_entries = parse_csq_entries(ours_csq);
+
+        // Index ours entries by (allele, feature) for lookup.
+        let mut ours_by_key: HashMap<(String, String), &CsqEntry> = HashMap::new();
+        for entry in &ours_entries {
+            let k = (entry.allele().to_string(), entry.feature().to_string());
+            ours_by_key.entry(k).or_insert(entry);
+        }
+
+        for golden_entry in &golden_entries {
+            let k = (
+                golden_entry.allele().to_string(),
+                golden_entry.feature().to_string(),
+            );
+            let Some(ours_entry) = ours_by_key.get(&k) else {
+                // No matching entry in ours — count as mismatch for all fields.
+                total_entries += 1;
+                continue;
+            };
+
+            total_entries += 1;
+            for i in 0..field_count {
+                let golden_val = golden_entry.fields.get(i).map(|s| s.as_str()).unwrap_or("");
+                let ours_val = ours_entry.fields.get(i).map(|s| s.as_str()).unwrap_or("");
+                if golden_val == ours_val {
+                    field_match_counts[i] += 1;
+                }
+            }
+        }
+    }
+
+    CsqFieldReport {
+        field_names: CSQ_FIELD_NAMES.iter().map(|s| s.to_string()).collect(),
+        field_match_counts,
+        total_entries_compared: total_entries,
+    }
+}
+
 fn io_err<E: std::fmt::Display>(e: E) -> DataFusionError {
     DataFusionError::Execution(e.to_string())
 }
@@ -660,5 +794,155 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
                 golden_term_subset_matches: 1,
             }
         );
+    }
+
+    #[test]
+    fn csq_field_names_has_29_entries() {
+        assert_eq!(CSQ_FIELD_NAMES.len(), 29);
+        assert_eq!(CSQ_FIELD_NAMES[0], "Allele");
+        assert_eq!(CSQ_FIELD_NAMES[1], "Consequence");
+        assert_eq!(CSQ_FIELD_NAMES[6], "Feature");
+        assert_eq!(CSQ_FIELD_NAMES[17], "Existing_variation");
+        assert_eq!(CSQ_FIELD_NAMES[19], "STRAND");
+        assert_eq!(CSQ_FIELD_NAMES[28], "SOURCE");
+    }
+
+    #[test]
+    fn parse_csq_entries_splits_correctly() {
+        let csq = "G|missense_variant|MODERATE|TP53|ENSG00000141510|Transcript|ENST00000269305|protein_coding|rs123|1|HGNC|11998|Ensembl";
+        let entries = parse_csq_entries(csq);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].allele(), "G");
+        assert_eq!(entries[0].feature(), "ENST00000269305");
+        assert_eq!(entries[0].fields.len(), 13);
+    }
+
+    #[test]
+    fn parse_csq_entries_handles_multi_transcript() {
+        let csq = "G|missense_variant|MODERATE|SYM|GENE1|Transcript|TX1|pc|rs1|1|HGNC|100|Ensembl,G|intron_variant|MODIFIER|SYM|GENE1|Transcript|TX2|pc|rs1|-1|HGNC|100|Ensembl";
+        let entries = parse_csq_entries(csq);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].feature(), "TX1");
+        assert_eq!(entries[1].feature(), "TX2");
+    }
+
+    #[test]
+    fn compare_csq_fields_all_match() {
+        let csq = "G|missense_variant|MODERATE|TP53|ENSG1|Transcript|ENST1|protein_coding|rs1|1|HGNC|11998|Ensembl";
+        let golden = vec![VariantAnnotation {
+            key: VariantKey {
+                chrom: "22".into(),
+                pos: 100,
+                ref_allele: "A".into(),
+                alt_alleles: "G".into(),
+            },
+            csq: Some(csq.to_string()),
+            most_severe_consequence: Some("missense_variant".into()),
+        }];
+        let ours = golden.clone();
+        let report = compare_csq_fields(&golden, &ours);
+        assert_eq!(report.total_entries_compared, 1);
+        assert_eq!(report.field_match_counts.len(), 29);
+        for &c in &report.field_match_counts {
+            assert_eq!(c, 1, "all fields should match");
+        }
+    }
+
+    #[test]
+    fn compare_csq_fields_partial_mismatch() {
+        let golden_csq = "G|missense_variant|MODERATE|TP53|ENSG1|Transcript|ENST1|protein_coding|rs1|1|HGNC|11998|Ensembl";
+        let ours_csq = "G|missense_variant|MODERATE|BRCA1|ENSG2|Transcript|ENST1|protein_coding|rs1|-1|HGNC|11998|RefSeq";
+        let key = VariantKey {
+            chrom: "22".into(),
+            pos: 100,
+            ref_allele: "A".into(),
+            alt_alleles: "G".into(),
+        };
+        let golden = vec![VariantAnnotation {
+            key: key.clone(),
+            csq: Some(golden_csq.into()),
+            most_severe_consequence: Some("missense_variant".into()),
+        }];
+        let ours = vec![VariantAnnotation {
+            key,
+            csq: Some(ours_csq.into()),
+            most_severe_consequence: Some("missense_variant".into()),
+        }];
+        let report = compare_csq_fields(&golden, &ours);
+        assert_eq!(report.total_entries_compared, 1);
+        // Allele(0)=match, Consequence(1)=match, IMPACT(2)=match
+        // SYMBOL(3)=mismatch, Gene(4)=mismatch
+        // Feature_type(5)=match, Feature(6)=match, BIOTYPE(7)=match
+        // Existing_variation(8)=match, STRAND(9)=mismatch
+        // SYMBOL_SOURCE(10)=match, HGNC_ID(11)=match, SOURCE(12)=mismatch
+        assert_eq!(report.field_match_counts[0], 1); // Allele
+        assert_eq!(report.field_match_counts[1], 1); // Consequence
+        assert_eq!(report.field_match_counts[2], 1); // IMPACT
+        assert_eq!(report.field_match_counts[3], 0); // SYMBOL
+        assert_eq!(report.field_match_counts[4], 0); // Gene
+        assert_eq!(report.field_match_counts[5], 1); // Feature_type
+        assert_eq!(report.field_match_counts[6], 1); // Feature
+        assert_eq!(report.field_match_counts[7], 1); // BIOTYPE
+        assert_eq!(report.field_match_counts[8], 1); // Existing_variation
+        assert_eq!(report.field_match_counts[9], 0); // STRAND
+        assert_eq!(report.field_match_counts[10], 1); // SYMBOL_SOURCE
+        assert_eq!(report.field_match_counts[11], 1); // HGNC_ID
+        assert_eq!(report.field_match_counts[12], 0); // SOURCE
+    }
+
+    #[test]
+    fn compare_csq_fields_no_matching_variant_skipped() {
+        let key_a = VariantKey {
+            chrom: "1".into(),
+            pos: 100,
+            ref_allele: "A".into(),
+            alt_alleles: "G".into(),
+        };
+        let key_b = VariantKey {
+            chrom: "1".into(),
+            pos: 200,
+            ref_allele: "C".into(),
+            alt_alleles: "T".into(),
+        };
+        let golden = vec![VariantAnnotation {
+            key: key_a,
+            csq: Some("G|missense_variant|MODERATE|S|G|Transcript|TX|pc|rs1|1|H|1|E".into()),
+            most_severe_consequence: Some("missense_variant".into()),
+        }];
+        let ours = vec![VariantAnnotation {
+            key: key_b,
+            csq: Some("T|intron_variant|MODIFIER|S|G|Transcript|TX|pc|rs2|-1|H|1|E".into()),
+            most_severe_consequence: Some("intron_variant".into()),
+        }];
+        let report = compare_csq_fields(&golden, &ours);
+        assert_eq!(report.total_entries_compared, 0);
+    }
+
+    #[test]
+    fn compare_csq_fields_multi_transcript_matching() {
+        let csq_golden = "G|missense_variant|MODERATE|S|G1|Transcript|TX1|pc|rs1|1|H|1|E,G|intron_variant|MODIFIER|S|G1|Transcript|TX2|nc|rs1|-1|H|1|E";
+        let csq_ours = "G|intron_variant|MODIFIER|S|G1|Transcript|TX2|nc|rs1|-1|H|1|E,G|missense_variant|MODERATE|S|G1|Transcript|TX1|pc|rs1|1|H|1|E";
+        let key = VariantKey {
+            chrom: "1".into(),
+            pos: 100,
+            ref_allele: "A".into(),
+            alt_alleles: "G".into(),
+        };
+        let golden = vec![VariantAnnotation {
+            key: key.clone(),
+            csq: Some(csq_golden.into()),
+            most_severe_consequence: Some("missense_variant".into()),
+        }];
+        let ours = vec![VariantAnnotation {
+            key,
+            csq: Some(csq_ours.into()),
+            most_severe_consequence: Some("missense_variant".into()),
+        }];
+        let report = compare_csq_fields(&golden, &ours);
+        // 2 golden entries matched by (Allele, Feature) key, all fields match
+        assert_eq!(report.total_entries_compared, 2);
+        for &c in &report.field_match_counts {
+            assert_eq!(c, 2);
+        }
     }
 }

@@ -406,15 +406,21 @@ impl AnnotateProvider {
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .filter(|v| *v > 0);
 
+                // Extract raw_object_json once — used for miRNA regions and FLAGS.
+                let raw_json =
+                    raw_json_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+
                 // For miRNA transcripts, extract mature miRNA regions from
                 // raw_object_json attributes (cDNA coords mapped to genomic).
                 let mature_mirna_regions = if biotype == "miRNA" {
-                    let raw_json =
-                        raw_json_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                     parse_mirna_regions_from_json(raw_json.as_deref(), start, end, strand)
                 } else {
                     Vec::new()
                 };
+
+                // Parse CDS incompleteness flags from raw_object_json attributes.
+                let (cds_start_nf, cds_end_nf) =
+                    parse_transcript_flags(raw_json.as_deref());
 
                 let gene_stable_id =
                     gene_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
@@ -441,6 +447,8 @@ impl AnnotateProvider {
                     gene_symbol_source,
                     gene_hgnc_id,
                     source,
+                    cds_start_nf,
+                    cds_end_nf,
                 });
             }
         }
@@ -1059,7 +1067,7 @@ impl AnnotateProvider {
             let cached_csq =
                 cached_csq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
 
-            let variation_name = variation_name_idx
+            let _variation_name = variation_name_idx
                 .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 .unwrap_or_default();
 
@@ -1069,8 +1077,12 @@ impl AnnotateProvider {
                 let impact = SoTerm::from_str(most_val)
                     .map(|t| impact_label(t.impact()))
                     .unwrap_or_else(|| impact_label(SoImpact::Modifier));
+                // 29-field CSQ: Allele|Consequence|IMPACT|SYMBOL|Gene|Feature_type|Feature|BIOTYPE|
+                // EXON|INTRON|HGVSc|HGVSp|cDNA_pos|CDS_pos|Protein_pos|AA|Codons|
+                // Existing_variation|DISTANCE|STRAND|FLAGS|SYMBOL_SOURCE|HGNC_ID|
+                // MOTIF_NAME|MOTIF_POS|HIGH_INF_POS|MOTIF_SCORE_CHANGE|TRANSCRIPTION_FACTORS|SOURCE
                 let csq_entry = format!(
-                    "{alt_allele}|{csq_val}|{impact}|||||{variation_name}|{variation_name}||||"
+                    "{alt_allele}|{csq_val}|{impact}|||||||||||||||||||||||||||"
                 );
                 (csq_entry, most_val.clone())
             } else {
@@ -1139,14 +1151,27 @@ impl AnnotateProvider {
                         } else {
                             ("", "", "", "", "", "", "")
                         };
+                    let exon = tc.exon_str.as_deref().unwrap_or("");
+                    let intron = tc.intron_str.as_deref().unwrap_or("");
+                    let cdna_pos = tc.cdna_position.as_deref().unwrap_or("");
+                    let cds_pos = tc.cds_position.as_deref().unwrap_or("");
+                    let protein_pos = tc.protein_position.as_deref().unwrap_or("");
+                    let amino_acids = tc.amino_acids.as_deref().unwrap_or("");
+                    let codons_str = tc.codons.as_deref().unwrap_or("");
+                    let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
+                    let flags = tc.flags.as_deref().unwrap_or("");
                     csq_entries.push(format!(
-                        "{alt_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|{variation_name}|{strand_str}|{symbol_source}|{hgnc_id}|{source}"
+                        "{alt_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                         {exon}|{intron}|||\
+                         {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                         |{distance}|{strand_str}|{flags}|{symbol_source}|{hgnc_id}|\
+                         |||||{source}"
                     ));
                 }
                 if csq_entries.is_empty() {
                     let impact = impact_label(SoImpact::Modifier);
                     csq_entries.push(format!(
-                        "{alt_allele}|sequence_variant|{impact}|||||{variation_name}|||||"
+                        "{alt_allele}|sequence_variant|{impact}|||||||||||||||||||||||||||"
                     ));
                 }
                 (csq_entries.join(","), most_str)
@@ -1276,6 +1301,17 @@ fn parse_mirna_regions_from_json(
         }
     }
     regions
+}
+
+/// Parse `cds_start_NF` and `cds_end_NF` flags from `raw_object_json` attributes.
+/// These indicate incomplete CDS (5' or 3' truncation).
+fn parse_transcript_flags(raw_json: Option<&str>) -> (bool, bool) {
+    let Some(json_str) = raw_json else {
+        return (false, false);
+    };
+    let cds_start_nf = json_str.contains("\"cds_start_NF\"");
+    let cds_end_nf = json_str.contains("\"cds_end_NF\"");
+    (cds_start_nf, cds_end_nf)
 }
 
 fn parse_cdna_range(s: &str) -> Option<(i64, i64)> {

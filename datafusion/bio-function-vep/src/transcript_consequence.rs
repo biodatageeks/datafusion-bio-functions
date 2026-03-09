@@ -95,6 +95,10 @@ pub struct TranscriptFeature {
     pub gene_symbol_source: Option<String>,
     pub gene_hgnc_id: Option<String>,
     pub source: Option<String>,
+    /// CDS start not found (incomplete 5' end).
+    pub cds_start_nf: bool,
+    /// CDS end not found (incomplete 3' end).
+    pub cds_end_nf: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,7 +168,7 @@ pub struct StructuralFeature {
     pub event_kind: SvEventKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TranscriptConsequence {
     pub transcript_id: Option<String>,
     pub terms: Vec<SoTerm>,
@@ -174,13 +178,32 @@ pub struct TranscriptConsequence {
     pub transcript_idx: Option<usize>,
     /// Feature type label for CSQ serialization.
     pub feature_type: FeatureType,
+    /// EXON field: "N/total" when variant overlaps an exon.
+    pub exon_str: Option<String>,
+    /// INTRON field: "N/total" when variant overlaps an intron.
+    pub intron_str: Option<String>,
+    /// cDNA_position: 1-based position within the cDNA.
+    pub cdna_position: Option<String>,
+    /// CDS_position: 1-based position within the CDS.
+    pub cds_position: Option<String>,
+    /// Protein_position: 1-based amino acid position.
+    pub protein_position: Option<String>,
+    /// Amino_acids: e.g. "V/I" for missense.
+    pub amino_acids: Option<String>,
+    /// Codons: e.g. "gTt/gAt" with VEP case convention.
+    pub codons: Option<String>,
+    /// Distance to transcript for upstream/downstream variants.
+    pub distance: Option<i64>,
+    /// FLAGS: e.g. "cds_start_NF", "cds_end_NF".
+    pub flags: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FeatureType {
     Transcript,
     RegulatoryFeature,
     MotifFeature,
+    #[default]
     None,
 }
 
@@ -358,22 +381,54 @@ impl TranscriptConsequenceEngine {
                     overlaps(variant.start, variant.end, tx.start, tx.end)
                 };
                 if variant_overlaps_tx {
-                    let terms =
+                    let (terms, coding_class) =
                         self.evaluate_transcript_overlap(variant, tx, &tx_exons, tx_translation);
                     if !terms.is_empty() {
+                        let exon_str = which_exon_str(variant, &tx_exons);
+                        let intron_str = which_intron_str(variant, &tx_exons, tx.strand);
+                        let cdna_position = compute_cdna_position(variant, &tx_exons, tx.strand);
+                        let (cds_position, protein_position, amino_acids, codons) =
+                            if let Some(ref cc) = coding_class {
+                                let cds_pos = match (cc.cds_position_start, cc.cds_position_end) {
+                                    (Some(s), Some(e)) if s == e => Some(s.to_string()),
+                                    (Some(s), Some(e)) => Some(format!("{s}-{e}")),
+                                    _ => None,
+                                };
+                                let prot_pos = match (cc.protein_position_start, cc.protein_position_end) {
+                                    (Some(s), Some(e)) if s == e => Some(s.to_string()),
+                                    (Some(s), Some(e)) => Some(format!("{s}-{e}")),
+                                    _ => None,
+                                };
+                                (cds_pos, prot_pos, cc.amino_acids.clone(), cc.codons.clone())
+                            } else {
+                                (None, None, None, None)
+                            };
+                        let flags = compute_flags(tx);
                         out.push(TranscriptConsequence {
                             transcript_id: Some(tx.transcript_id.clone()),
                             transcript_idx: Some(tx_idx),
                             feature_type: FeatureType::Transcript,
                             terms,
+                            exon_str,
+                            intron_str,
+                            cdna_position,
+                            cds_position,
+                            protein_position,
+                            amino_acids,
+                            codons,
+                            distance: None,
+                            flags,
                         });
                     }
-                } else if let Some(term) = self.upstream_downstream_term(variant, tx) {
+                } else if let Some((term, dist)) = self.upstream_downstream_term(variant, tx) {
                     out.push(TranscriptConsequence {
                         transcript_id: Some(tx.transcript_id.clone()),
                         transcript_idx: Some(tx_idx),
                         feature_type: FeatureType::Transcript,
                         terms: vec![term],
+                        distance: Some(dist),
+                        flags: compute_flags(tx),
+                        ..Default::default()
                     });
                 }
             });
@@ -391,10 +446,8 @@ impl TranscriptConsequenceEngine {
         // regulatory/motif features overlap (those are orthogonal to transcripts).
         if !has_transcript_hit {
             out.push(TranscriptConsequence {
-                transcript_id: None,
-                transcript_idx: None,
-                feature_type: FeatureType::None,
                 terms: vec![SoTerm::IntergenicVariant],
+                ..Default::default()
             });
         }
         out
@@ -424,9 +477,10 @@ impl TranscriptConsequenceEngine {
         tx: &TranscriptFeature,
         tx_exons: &[&ExonFeature],
         tx_translation: Option<&TranslationFeature>,
-    ) -> Vec<SoTerm> {
+    ) -> (Vec<SoTerm>, Option<CodingClassification>) {
         let mut terms = BTreeSet::new();
         let is_ins = variant.ref_allele == "-";
+        let mut coding_class = None;
 
         // For pure insertions, VEP requires both flanking positions
         // (start-1 and start) to be within the exon.  An insertion at
@@ -480,7 +534,7 @@ impl TranscriptConsequenceEngine {
             // specific child (frameshift/inframe) — so it survives stripping.
             terms.insert(SoTerm::CodingSequenceVariant);
         } else if overlaps_exon && self.overlaps_cds(variant, tx) {
-            self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
+            coding_class = self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
         } else if overlaps_exon {
             if let Some(utr_term) = self.utr_term(variant, tx) {
                 terms.insert(utr_term);
@@ -513,7 +567,7 @@ impl TranscriptConsequenceEngine {
 
         let mut terms_vec: Vec<SoTerm> = terms.into_iter().collect();
         terms_vec.sort_by_key(|t| t.rank());
-        terms_vec
+        (terms_vec, coding_class)
     }
 
     fn append_regulatory_terms(
@@ -555,10 +609,9 @@ impl TranscriptConsequenceEngine {
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
             out.push(TranscriptConsequence {
-                transcript_id: None,
-                transcript_idx: None,
                 feature_type: FeatureType::RegulatoryFeature,
                 terms: ordered,
+                ..Default::default()
             });
         }
     }
@@ -602,10 +655,9 @@ impl TranscriptConsequenceEngine {
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
             out.push(TranscriptConsequence {
-                transcript_id: None,
-                transcript_idx: None,
                 feature_type: FeatureType::MotifFeature,
                 terms: ordered,
+                ..Default::default()
             });
         }
     }
@@ -623,10 +675,8 @@ impl TranscriptConsequenceEngine {
         });
         if overlaps_mirna {
             out.push(TranscriptConsequence {
-                transcript_id: None,
-                transcript_idx: None,
-                feature_type: FeatureType::None,
                 terms: vec![SoTerm::MatureMirnaVariant],
+                ..Default::default()
             });
         }
     }
@@ -687,10 +737,8 @@ impl TranscriptConsequenceEngine {
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
             out.push(TranscriptConsequence {
-                transcript_id: None,
-                transcript_idx: None,
-                feature_type: FeatureType::None,
                 terms: ordered,
+                ..Default::default()
             });
         }
     }
@@ -772,14 +820,14 @@ impl TranscriptConsequenceEngine {
         tx: &TranscriptFeature,
         tx_exons: &[&ExonFeature],
         tx_translation: Option<&TranslationFeature>,
-    ) {
+    ) -> Option<CodingClassification> {
         let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
         terms.insert(SoTerm::CodingSequenceVariant);
 
         // VEP: complex indel — deletion spans exon→intron boundary.
         // VEP can't compute protein change; only coding_sequence_variant.
         if self.is_complex_indel(variant, tx_exons) {
-            return;
+            return None;
         }
 
         if cds_is_incomplete(tx, tx_translation) && self.overlaps_stop_codon(variant, tx) {
@@ -811,25 +859,28 @@ impl TranscriptConsequenceEngine {
                     classification.stop_gained = false;
                     classification.stop_lost = false;
                 }
-                apply_codon_classification(terms, classification);
+                apply_codon_classification(terms, &classification);
+                terms.insert(SoTerm::ProteinAlteringVariant);
+                return Some(classification);
             } else {
                 self.add_start_stop_heuristic_terms(terms, variant, tx);
             }
             terms.insert(SoTerm::ProteinAlteringVariant);
-            return;
+            return None;
         }
 
         if ref_len == 0 {
-            return;
+            return None;
         }
 
         if let Some(classification) = classify_coding_change(tx, tx_exons, tx_translation, variant)
         {
             let has_any = classification.has_any();
-            apply_codon_classification(terms, classification);
+            apply_codon_classification(terms, &classification);
             if has_any {
-                return;
+                return Some(classification);
             }
+            return Some(classification);
         } else if tx_translation
             .and_then(|t| t.cds_sequence.as_deref())
             .is_some()
@@ -837,7 +888,7 @@ impl TranscriptConsequenceEngine {
             // Translation data exists but classify_coding_change failed
             // (CDS sequence mismatch). Don't fall through to the
             // heuristic — CodingSequenceVariant is already inserted.
-            return;
+            return None;
         }
 
         // No translation data available. Apply start/stop heuristics
@@ -854,6 +905,7 @@ impl TranscriptConsequenceEngine {
         {
             terms.insert(SoTerm::StopGained);
         }
+        None
     }
 
     fn add_start_stop_heuristic_terms(
@@ -930,7 +982,7 @@ impl TranscriptConsequenceEngine {
         &self,
         variant: &VariantInput,
         tx: &TranscriptFeature,
-    ) -> Option<SoTerm> {
+    ) -> Option<(SoTerm, i64)> {
         // For insertions, use the left flanking position (start - 1) so
         // that an insertion at the transcript boundary is detected as
         // upstream/downstream.  The insertion is between start-1 and start;
@@ -945,23 +997,27 @@ impl TranscriptConsequenceEngine {
             let up_start = tx.start.saturating_sub(self.upstream_distance);
             let up_end = tx.start.saturating_sub(1);
             if overlaps(check_start, check_end, up_start, up_end) {
-                return Some(SoTerm::UpstreamGeneVariant);
+                let dist = tx.start.saturating_sub(check_end).max(0);
+                return Some((SoTerm::UpstreamGeneVariant, dist));
             }
             let down_start = tx.end.saturating_add(1);
             let down_end = tx.end.saturating_add(self.downstream_distance);
             if overlaps(check_start, check_end, down_start, down_end) {
-                return Some(SoTerm::DownstreamGeneVariant);
+                let dist = check_start.saturating_sub(tx.end).max(0);
+                return Some((SoTerm::DownstreamGeneVariant, dist));
             }
         } else {
             let up_start = tx.end.saturating_add(1);
             let up_end = tx.end.saturating_add(self.upstream_distance);
             if overlaps(check_start, check_end, up_start, up_end) {
-                return Some(SoTerm::UpstreamGeneVariant);
+                let dist = check_start.saturating_sub(tx.end).max(0);
+                return Some((SoTerm::UpstreamGeneVariant, dist));
             }
             let down_start = tx.start.saturating_sub(self.downstream_distance);
             let down_end = tx.start.saturating_sub(1);
             if overlaps(check_start, check_end, down_start, down_end) {
-                return Some(SoTerm::DownstreamGeneVariant);
+                let dist = tx.start.saturating_sub(check_end).max(0);
+                return Some((SoTerm::DownstreamGeneVariant, dist));
             }
         }
         None
@@ -1656,7 +1712,7 @@ fn is_stop_codon(allele: &str) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct CodingClassification {
     synonymous: bool,
     missense: bool,
@@ -1665,6 +1721,18 @@ struct CodingClassification {
     stop_retained: bool,
     start_lost: bool,
     start_retained: bool,
+    /// Amino acids: "REF/ALT" (e.g. "V/I").
+    amino_acids: Option<String>,
+    /// Codons with VEP case convention (e.g. "gTt/gAt").
+    codons: Option<String>,
+    /// 1-based CDS start position.
+    cds_position_start: Option<usize>,
+    /// 1-based CDS end position.
+    cds_position_end: Option<usize>,
+    /// 1-based protein start position.
+    protein_position_start: Option<usize>,
+    /// 1-based protein end position.
+    protein_position_end: Option<usize>,
 }
 
 impl CodingClassification {
@@ -1679,7 +1747,7 @@ impl CodingClassification {
     }
 }
 
-fn apply_codon_classification(terms: &mut BTreeSet<SoTerm>, c: CodingClassification) {
+fn apply_codon_classification(terms: &mut BTreeSet<SoTerm>, c: &CodingClassification) {
     if c.start_lost {
         terms.insert(SoTerm::StartLost);
     }
@@ -1864,7 +1932,228 @@ fn classify_coding_change(
         }
     }
 
+    // Populate CSQ metadata fields from the computed data.
+    let first_codon = start_idx / 3;
+    let last_codon = end_idx / 3;
+
+    // CDS position (1-based)
+    class.cds_position_start = Some(start_idx + 1);
+    class.cds_position_end = Some(end_idx + 1);
+
+    // Protein position (1-based)
+    class.protein_position_start = Some(first_codon + 1);
+    class.protein_position_end = Some(last_codon + 1);
+
+    // Amino acids
+    if first_codon < old_aas.len() {
+        let ref_end = (last_codon + 1).min(old_aas.len());
+        let ref_aa: String = old_aas[first_codon..ref_end].iter().collect();
+        if ref_len == alt_len {
+            let alt_end = (last_codon + 1).min(new_aas.len());
+            if first_codon < new_aas.len() {
+                let alt_aa: String = new_aas[first_codon..alt_end].iter().collect();
+                if ref_aa == alt_aa {
+                    class.amino_acids = Some(ref_aa);
+                } else {
+                    class.amino_acids = Some(format!("{ref_aa}/{alt_aa}"));
+                }
+            }
+        } else {
+            // Indels: show affected ref AAs and alt AAs
+            let alt_first_codon = first_codon;
+            let alt_last_codon = if mutated.len() >= 3 {
+                (start_idx + alt_len).saturating_sub(1) / 3
+            } else {
+                0
+            };
+            let alt_end = (alt_last_codon + 1).min(new_aas.len());
+            if alt_first_codon < new_aas.len() {
+                let alt_aa: String = new_aas[alt_first_codon..alt_end].iter().collect();
+                if alt_aa.is_empty() {
+                    class.amino_acids = Some(format!("{ref_aa}/-"));
+                } else {
+                    class.amino_acids = Some(format!("{ref_aa}/{alt_aa}"));
+                }
+            } else {
+                class.amino_acids = Some(format!("{ref_aa}/-"));
+            }
+        }
+    }
+
+    // Codons with VEP case convention (changed bases uppercase, context lowercase)
+    if ref_len == alt_len {
+        let codon_nt_start = first_codon * 3;
+        let codon_nt_end = ((last_codon + 1) * 3).min(cds_seq.len());
+        let codon_nt_end_alt = ((last_codon + 1) * 3).min(mutated.len());
+        if codon_nt_end <= cds_seq.len() && codon_nt_end_alt <= mutated.len() {
+            let ref_codon = format_codon_display(
+                &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
+                start_idx,
+                end_idx,
+                codon_nt_start,
+            );
+            let alt_codon = format_codon_display(
+                &mutated[codon_nt_start..codon_nt_end_alt],
+                start_idx,
+                end_idx,
+                codon_nt_start,
+            );
+            class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+        }
+    }
+
     Some(class)
+}
+
+/// Format codon bases with VEP case convention: changed positions uppercase,
+/// unchanged positions lowercase.
+fn format_codon_display(bases: &[u8], changed_start: usize, changed_end: usize, codon_nt_offset: usize) -> String {
+    bases.iter().enumerate().map(|(i, &b)| {
+        let abs_pos = codon_nt_offset + i;
+        if abs_pos >= changed_start && abs_pos <= changed_end {
+            (b as char).to_ascii_uppercase()
+        } else {
+            (b as char).to_ascii_lowercase()
+        }
+    }).collect()
+}
+
+/// Determine which exon (if any) the variant overlaps.
+/// Returns "N/total" string for the EXON CSQ field.
+fn which_exon_str(variant: &VariantInput, tx_exons: &[&ExonFeature]) -> Option<String> {
+    if tx_exons.is_empty() {
+        return None;
+    }
+    let is_ins = variant.ref_allele == "-";
+    let total = tx_exons.len();
+    for exon in tx_exons {
+        let hit = if is_ins {
+            variant.start > exon.start && variant.start <= exon.end
+        } else {
+            overlaps(variant.start, variant.end, exon.start, exon.end)
+        };
+        if hit {
+            return Some(format!("{}/{}", exon.exon_number, total));
+        }
+    }
+    None
+}
+
+/// Determine which intron (if any) the variant overlaps.
+/// Returns "N/total" string for the INTRON CSQ field.
+fn which_intron_str(variant: &VariantInput, tx_exons: &[&ExonFeature], strand: i8) -> Option<String> {
+    if tx_exons.len() < 2 {
+        return None;
+    }
+    let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
+    sorted.sort_by_key(|e| e.start);
+    let total_introns = sorted.len() - 1;
+
+    for (i, pair) in sorted.windows(2).enumerate() {
+        let intron_start = pair[0].end + 1;
+        let intron_end = pair[1].start - 1;
+        if intron_start > intron_end {
+            continue;
+        }
+        let hit = if variant.ref_allele == "-" {
+            variant.start >= intron_start && variant.start <= intron_end
+        } else {
+            overlaps(variant.start, variant.end, intron_start, intron_end)
+        };
+        if hit {
+            let intron_num = if strand >= 0 {
+                i + 1
+            } else {
+                total_introns - i
+            };
+            return Some(format!("{intron_num}/{total_introns}"));
+        }
+    }
+    None
+}
+
+/// Build ordered exon segments for cDNA coordinate mapping.
+/// Returns (start, end) pairs ordered by transcript direction.
+fn exon_segments(tx_exons: &[&ExonFeature], strand: i8) -> Option<Vec<(i64, i64)>> {
+    if tx_exons.is_empty() {
+        return None;
+    }
+    let mut segments: Vec<(i64, i64)> = tx_exons.iter().map(|e| (e.start, e.end)).collect();
+    segments.sort_by_key(|(s, _)| *s);
+    if strand < 0 {
+        segments.reverse();
+    }
+    Some(segments)
+}
+
+/// Map a genomic position to 1-based cDNA index (counting all exonic bases).
+fn genomic_to_cdna_index(tx_exons: &[&ExonFeature], strand: i8, pos: i64) -> Option<usize> {
+    let segments = exon_segments(tx_exons, strand)?;
+    let mut offset = 0usize;
+    for (seg_start, seg_end) in segments {
+        let seg_len = usize::try_from(seg_end.saturating_sub(seg_start).saturating_add(1)).ok()?;
+        if pos >= seg_start && pos <= seg_end {
+            let local = if strand >= 0 {
+                usize::try_from(pos.saturating_sub(seg_start)).ok()?
+            } else {
+                usize::try_from(seg_end.saturating_sub(pos)).ok()?
+            };
+            return Some(offset + local + 1); // 1-based
+        }
+        offset = offset.saturating_add(seg_len);
+    }
+    None
+}
+
+/// Compute the cDNA_position string for a variant overlapping an exon.
+fn compute_cdna_position(variant: &VariantInput, tx_exons: &[&ExonFeature], strand: i8) -> Option<String> {
+    if tx_exons.is_empty() {
+        return None;
+    }
+    let is_ins = variant.ref_allele == "-";
+    // Check if variant overlaps any exon
+    let in_exon = tx_exons.iter().any(|e| {
+        if is_ins {
+            variant.start > e.start && variant.start <= e.end
+        } else {
+            overlaps(variant.start, variant.end, e.start, e.end)
+        }
+    });
+    if !in_exon {
+        return None;
+    }
+    if is_ins {
+        let a = genomic_to_cdna_index(tx_exons, strand, variant.start.saturating_sub(1));
+        let b = genomic_to_cdna_index(tx_exons, strand, variant.start);
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                let lo = a.min(b);
+                let hi = a.max(b);
+                Some(format!("{lo}-{hi}"))
+            }
+            _ => None,
+        }
+    } else {
+        let start_cdna = genomic_to_cdna_index(tx_exons, strand, variant.start)?;
+        let end_cdna = genomic_to_cdna_index(tx_exons, strand, variant.end)?;
+        if start_cdna == end_cdna {
+            Some(start_cdna.to_string())
+        } else {
+            let lo = start_cdna.min(end_cdna);
+            let hi = start_cdna.max(end_cdna);
+            Some(format!("{lo}-{hi}"))
+        }
+    }
+}
+
+/// Compute FLAGS field from transcript attributes.
+fn compute_flags(tx: &TranscriptFeature) -> Option<String> {
+    match (tx.cds_start_nf, tx.cds_end_nf) {
+        (true, true) => Some("cds_start_NF&cds_end_NF".to_string()),
+        (true, false) => Some("cds_start_NF".to_string()),
+        (false, true) => Some("cds_end_NF".to_string()),
+        (false, false) => None,
+    }
 }
 
 fn genomic_range(start: i64, end: i64) -> Option<Vec<i64>> {
@@ -2025,6 +2314,8 @@ mod tests {
             gene_symbol_source: None,
             gene_hgnc_id: None,
             source: None,
+            cds_start_nf: false,
+            cds_end_nf: false,
         }
     }
 

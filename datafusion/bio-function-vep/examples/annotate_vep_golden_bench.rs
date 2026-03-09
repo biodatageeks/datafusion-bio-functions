@@ -444,9 +444,9 @@ fn run_vep_docker(
     // Enable regulatory feature annotations (VEP skips them by default).
     cmd.arg("--regulatory");
 
-    // Restrict CSQ fields to match our per-transcript CSQ format.
+    // Use all default VEP CSQ fields for full per-field comparison.
     cmd.arg("--fields")
-        .arg("Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,Existing_variation,STRAND,SYMBOL_SOURCE,HGNC_ID,SOURCE");
+        .arg("Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,EXON,INTRON,HGVSc,HGVSp,cDNA_position,CDS_position,Protein_position,Amino_acids,Codons,Existing_variation,DISTANCE,STRAND,FLAGS,SYMBOL_SOURCE,HGNC_ID,MOTIF_NAME,MOTIF_POS,HIGH_INF_POS,MOTIF_SCORE_CHANGE,TRANSCRIPTION_FACTORS,SOURCE");
 
     if merged {
         cmd.arg("--merged");
