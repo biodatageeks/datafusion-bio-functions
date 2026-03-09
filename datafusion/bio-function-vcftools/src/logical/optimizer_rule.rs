@@ -177,13 +177,13 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Option<TraversalResult<'_>> {
             let input_schema = unnest.input.schema();
             for (qualifier, field) in input_schema.iter() {
                 let name = field.name().to_string();
-                if !column_definitions.contains_key(&name) {
+                column_definitions.entry(name.clone()).or_insert_with(|| {
                     let qualified_col = datafusion::common::Column::new(
                         qualifier.cloned(),
-                        name.clone(),
+                        name,
                     );
-                    column_definitions.insert(name, Expr::Column(qualified_col));
-                }
+                    Expr::Column(qualified_col)
+                });
             }
             
             Some(TraversalResult {

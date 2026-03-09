@@ -1017,7 +1017,9 @@ dependencies = [
  "datafusion",
  "futures",
  "log",
+ "parquet",
  "serial_test",
+ "tempfile",
  "tokio",
 ]
 
