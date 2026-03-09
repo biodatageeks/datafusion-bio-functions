@@ -401,11 +401,26 @@ impl TranscriptConsequenceEngine {
             }
         });
 
-        if !overlaps_exon {
+        // VEP adds intron_variant when the variant overlaps any intron body,
+        // even if the variant also overlaps an exon (exon-spanning deletions).
+        let overlaps_intron = self.variant_overlaps_intron(variant, tx_exons);
+        if !overlaps_exon || overlaps_intron {
             terms.insert(SoTerm::IntronVariant);
         }
+
+        // VEP treats variants falling in frameshift introns (≤13bp) as part
+        // of the surrounding coding context.  If the variant is within CDS
+        // bounds and sits in a frameshift intron, emit coding_sequence_variant.
+        let in_frameshift_intron = !overlaps_exon && self.in_frameshift_intron(variant, tx_exons);
+
         if is_non_coding_biotype(&tx.biotype) && overlaps_exon {
             terms.insert(SoTerm::NonCodingTranscriptExonVariant);
+        } else if in_frameshift_intron && self.overlaps_cds(variant, tx) {
+            // VEP treats frameshift intron variants as coding but cannot
+            // determine the precise codon change (the CDS includes the
+            // intron bases).  Emit only coding_sequence_variant — no
+            // specific child (frameshift/inframe) — so it survives stripping.
+            terms.insert(SoTerm::CodingSequenceVariant);
         } else if overlaps_exon && self.overlaps_cds(variant, tx) {
             self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
         } else if overlaps_exon {
@@ -824,6 +839,50 @@ impl TranscriptConsequenceEngine {
     /// regions (intron_start-4..intron_start+7 and intron_end-8..intron_end+3)
     /// that reach into exons.  This naturally handles both fully-intronic
     /// variants AND exon-spanning deletions.
+    /// Returns true if the variant overlaps any intron body (gap between
+    /// adjacent exons), regardless of whether it also overlaps an exon.
+    fn variant_overlaps_intron(&self, variant: &VariantInput, tx_exons: &[&ExonFeature]) -> bool {
+        if tx_exons.len() < 2 {
+            return false;
+        }
+        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
+        sorted.sort_by_key(|e| e.start);
+        for pair in sorted.windows(2) {
+            let intron_start = pair[0].end + 1;
+            let intron_end = pair[1].start - 1;
+            if intron_start > intron_end {
+                continue;
+            }
+            if overlaps(variant.start, variant.end, intron_start, intron_end) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns true if the variant falls within a frameshift intron (≤13bp).
+    /// VEP treats such variants as part of the surrounding coding context.
+    fn in_frameshift_intron(&self, variant: &VariantInput, tx_exons: &[&ExonFeature]) -> bool {
+        if tx_exons.len() < 2 {
+            return false;
+        }
+        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
+        sorted.sort_by_key(|e| e.start);
+        for pair in sorted.windows(2) {
+            let intron_start = pair[0].end + 1;
+            let intron_end = pair[1].start - 1;
+            if intron_start > intron_end {
+                continue;
+            }
+            if (intron_end - intron_start).abs() <= 12
+                && overlaps(variant.start, variant.end, intron_start, intron_end)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn add_intron_splice_terms(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -864,24 +923,37 @@ impl TranscriptConsequenceEngine {
             }
 
             // VEP skips splice checks for "frameshift introns" — very short
-            // introns (≤13bp) where abs(intron_end - intron_start) <= 12.
-            if (intron_end - intron_start).abs() <= 12 {
+            // introns (≤13bp) where abs(intron_end - intron_start) <= 12 —
+            // but only when the variant actually overlaps the intron body.
+            // A variant in the exonic boundary region of a frameshift intron
+            // can still receive splice_region_variant.
+            let is_frameshift_intron = (intron_end - intron_start).abs() <= 12;
+            if is_frameshift_intron && overlaps(sv_min, sv_max, intron_start, intron_end) {
                 continue;
             }
 
             // Quick check: does variant overlap the intron or its extended
-            // boundary margins?  VEP uses two separate trees — one for the
-            // full intron span (polypyrimidine at -16..-2, splice_region at
-            // +2..+7 / -7..-2) and one for boundary regions that reach into
-            // exons.  We combine both into a single check covering the full
-            // range: (intron_start - 4) .. (intron_end + 3).
-            if !overlaps(sv_min, sv_max, intron_start - 4, intron_end + 3) {
+            // boundary margins?  VEP uses two separate interval trees:
+            //   tree 1: [intron_start-4, intron_end+3]  (full span)
+            //   tree 2: [intron_start-4, intron_start+7] (5' boundary)
+            //           [intron_end-8,   intron_end+3]   (3' boundary)
+            // For small introns, the 3' boundary can extend past intron_start-4
+            // and the 5' boundary can extend past intron_end+3.
+            let boundary_min = (intron_start - 4).min(intron_end - 8);
+            let boundary_max = (intron_end + 3).max(intron_start + 7);
+            if !overlaps(sv_min, sv_max, boundary_min, boundary_max) {
                 continue;
             }
 
-            // Now check specific splice positions within this intron.
-            // VEP uses intron-relative offsets (0-based from intron_start/end).
-            if tx.strand >= 0 {
+            // For frameshift introns where the variant is in the exonic
+            // boundary region (not overlapping the intron body), VEP only
+            // checks splice_region via _intron_overlap — the first loop
+            // (which checks donor/acceptor/PPT/etc.) requires overlap with
+            // the full intron span tree, which small introns don't trigger.
+            if is_frameshift_intron {
+                // Only splice_region checks (exonic boundary of intron)
+                self.add_splice_region_only(terms, sv, is_ins, intron_start, intron_end);
+            } else if tx.strand >= 0 {
                 self.add_splice_for_intron_positive(terms, sv, is_ins, intron_start, intron_end);
             } else {
                 self.add_splice_for_intron_negative(terms, sv, is_ins, intron_start, intron_end);
@@ -897,6 +969,66 @@ impl TranscriptConsequenceEngine {
     ///   acceptor (end): -0/-1 = splice_acceptor
     ///   splice_region:  _intron_overlap checks +2..+7, -7..-2, start-3..start-1, end+1..end+3
     ///   polypyrimidine: -16..-2 (from intron_end)
+    /// For frameshift introns where the variant is in the exonic boundary
+    /// region, VEP only checks splice_region (via `_intron_overlap` in the
+    /// boundary loop).  Strand is irrelevant for _intron_overlap — it checks
+    /// the same genomic coordinate ranges on both strands.
+    fn add_splice_region_only(
+        &self,
+        terms: &mut BTreeSet<SoTerm>,
+        variant: &VariantInput,
+        is_ins: bool,
+        intron_start: i64,
+        intron_end: i64,
+    ) {
+        if is_ins {
+            let p = variant.start;
+            // _intron_overlap insertion checks for splice_region
+            if (intron_start + 3..=intron_start + 7).contains(&p)
+                || (intron_end - 6..=intron_end - 2).contains(&p)
+                || (intron_start - 2..=intron_start - 1).contains(&p)
+                || (intron_end + 2..=intron_end + 3).contains(&p)
+                || p == intron_start
+                || p == intron_end + 1
+                || p == intron_start + 2
+                || p == intron_end - 1
+            {
+                terms.insert(SoTerm::SpliceRegionVariant);
+            }
+        } else {
+            // splice_region (intronic): intron_start+2..intron_start+7, intron_end-7..intron_end-2
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_start + 2,
+                intron_start + 7,
+                SoTerm::SpliceRegionVariant,
+            );
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_end - 7,
+                intron_end - 2,
+                SoTerm::SpliceRegionVariant,
+            );
+            // splice_region (exonic): intron_start-3..intron_start-1, intron_end+1..intron_end+3
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_start - 3,
+                intron_start - 1,
+                SoTerm::SpliceRegionVariant,
+            );
+            add_if_overlaps(
+                terms,
+                variant,
+                intron_end + 1,
+                intron_end + 3,
+                SoTerm::SpliceRegionVariant,
+            );
+        }
+    }
+
     fn add_splice_for_intron_positive(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -1293,9 +1425,8 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         terms.remove(&SoTerm::ProteinAlteringVariant);
     }
 
-    // VEP omits intron_variant when splice_donor_variant or
-    // splice_acceptor_variant is present on the same transcript —
-    // the splice site terms already imply an intronic location.
+    // VEP suppresses intron_variant in the collapsed output when
+    // splice_donor_variant or splice_acceptor_variant is present.
     if terms.contains(&SoTerm::SpliceDonorVariant) || terms.contains(&SoTerm::SpliceAcceptorVariant)
     {
         terms.remove(&SoTerm::IntronVariant);
@@ -1317,6 +1448,13 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         || terms.contains(&SoTerm::SpliceDonor5thBaseVariant)
     {
         terms.remove(&SoTerm::SpliceRegionVariant);
+    }
+
+    // VEP's splice_polypyrimidine_tract_variant predicate returns 0 when
+    // splice_donor or splice_acceptor is present for the same transcript.
+    if terms.contains(&SoTerm::SpliceDonorVariant) || terms.contains(&SoTerm::SpliceAcceptorVariant)
+    {
+        terms.remove(&SoTerm::SplicePolypyrimidineTractVariant);
     }
 }
 
