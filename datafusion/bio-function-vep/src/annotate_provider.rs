@@ -26,6 +26,7 @@ use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext};
 
+use crate::allele::vcf_to_vep_allele;
 use crate::annotation_store::{AnnotationBackend, build_store};
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
@@ -623,6 +624,7 @@ impl AnnotateProvider {
                 .index_of("stable_id")
                 .or_else(|_| schema.index_of("feature_id"))
                 .ok();
+            let ft_idx = schema.index_of("feature_type").ok();
             let chrom_idx = schema.index_of("chrom").map_err(|_| {
                 DataFusionError::Execution(format!(
                     "annotate_vep(): regulatory table '{table}' is missing required column chrom"
@@ -652,11 +654,14 @@ impl AnnotateProvider {
                 let feature_id = id_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                     .unwrap_or_else(|| "reg".to_string());
+                let feature_type =
+                    ft_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 out.push(RegulatoryFeature {
                     feature_id,
                     chrom,
                     start,
                     end,
+                    feature_type,
                 });
             }
         }
@@ -1061,29 +1066,12 @@ impl AnnotateProvider {
                 continue;
             };
 
-            // VEP-style allele minimization: strip shared prefix between REF and ALT.
-            // e.g., REF=T ALT=TCAC → "CAC", REF=TCAC ALT=T → "-", REF=C ALT=G → "G"
+            // VEP-style allele minimization: strip shared prefix and suffix between REF and ALT.
             let vep_allele = {
                 let ref_al = string_at(batch.column(ref_idx).as_ref(), row)
                     .unwrap_or_default();
-                let prefix_len = ref_al
-                    .as_bytes()
-                    .iter()
-                    .zip(alt_allele.as_bytes())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                if prefix_len == 0
-                    || (prefix_len == ref_al.len() && prefix_len == alt_allele.len())
-                {
-                    alt_allele.clone()
-                } else {
-                    let trimmed = &alt_allele[prefix_len..];
-                    if trimmed.is_empty() {
-                        "-".to_string()
-                    } else {
-                        trimmed.to_string()
-                    }
-                }
+                let (_vep_ref, vep_alt) = vcf_to_vep_allele(&ref_al, &alt_allele);
+                vep_alt
             };
 
             // Cache-hit fast path: use pre-computed consequence from variation cache.
@@ -1161,7 +1149,7 @@ impl AnnotateProvider {
                     let feature_type = tc.feature_type.as_str();
                     let feature = tc.transcript_id.as_deref().unwrap_or("");
                     // Look up transcript metadata via index (zero-copy).
-                    let (symbol, gene, biotype, strand_str, symbol_source, hgnc_id) =
+                    let (symbol, gene, biotype_tx, strand_str, symbol_source, hgnc_id) =
                         if let Some(idx) = tc.transcript_idx {
                             let tx = ctx.transcripts[idx];
                             (
@@ -1175,6 +1163,10 @@ impl AnnotateProvider {
                         } else {
                             ("", "", "", "", "", "")
                         };
+                    let biotype = tc
+                        .biotype_override
+                        .as_deref()
+                        .unwrap_or(biotype_tx);
                     let exon = tc.exon_str.as_deref().unwrap_or("");
                     let intron = tc.intron_str.as_deref().unwrap_or("");
                     let cdna_pos = tc.cdna_position.as_deref().unwrap_or("");
@@ -1329,13 +1321,33 @@ fn parse_mirna_regions_from_json(
 
 /// Parse `cds_start_NF` and `cds_end_NF` flags from `raw_object_json` attributes.
 /// These indicate incomplete CDS (5' or 3' truncation).
+/// Only returns true when the attribute has `"value":"1"` (not just presence of the key).
 fn parse_transcript_flags(raw_json: Option<&str>) -> (bool, bool) {
     let Some(json_str) = raw_json else {
         return (false, false);
     };
-    let cds_start_nf = json_str.contains("\"cds_start_NF\"");
-    let cds_end_nf = json_str.contains("\"cds_end_NF\"");
-    (cds_start_nf, cds_end_nf)
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return (false, false);
+    };
+    let attrs = val
+        .pointer("/__value/attributes")
+        .and_then(|a| a.as_array());
+    let Some(attrs) = attrs else {
+        return (false, false);
+    };
+    let mut start_nf = false;
+    let mut end_nf = false;
+    for attr in attrs {
+        let code = attr.get("code").and_then(|c| c.as_str()).unwrap_or("");
+        let value = attr.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        if code == "cds_start_NF" && value == "1" {
+            start_nf = true;
+        }
+        if code == "cds_end_NF" && value == "1" {
+            end_nf = true;
+        }
+    }
+    (start_nf, end_nf)
 }
 
 fn parse_cdna_range(s: &str) -> Option<(i64, i64)> {
@@ -1632,5 +1644,40 @@ impl TableProvider for AnnotateProvider {
 
         let df = self.session.sql(&query).await?;
         df.create_physical_plan().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_flags_cds_start_nf_value_1() {
+        let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"1"}]}}"#;
+        assert_eq!(parse_transcript_flags(Some(json)), (true, false));
+    }
+
+    #[test]
+    fn test_parse_flags_cds_start_nf_value_0() {
+        // This was the bug — key present but value is "0", should NOT set the flag.
+        let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"0"}]}}"#;
+        assert_eq!(parse_transcript_flags(Some(json)), (false, false));
+    }
+
+    #[test]
+    fn test_parse_flags_both_nf() {
+        let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"1"},{"code":"cds_end_NF","value":"1"}]}}"#;
+        assert_eq!(parse_transcript_flags(Some(json)), (true, true));
+    }
+
+    #[test]
+    fn test_parse_flags_no_attributes() {
+        let json = r#"{"__value":{}}"#;
+        assert_eq!(parse_transcript_flags(Some(json)), (false, false));
+    }
+
+    #[test]
+    fn test_parse_flags_none_input() {
+        assert_eq!(parse_transcript_flags(None), (false, false));
     }
 }

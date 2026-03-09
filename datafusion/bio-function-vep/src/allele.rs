@@ -9,25 +9,44 @@ use std::sync::Arc;
 
 /// Convert VCF REF/ALT pair to VEP allele format.
 ///
-/// VCF: REF="ACGT", ALT="A"   → VEP: "CGT/-"   (deletion)
-/// VCF: REF="A", ALT="ACGT"   → VEP: "-/CGT"   (insertion)
-/// VCF: REF="A", ALT="G"      → VEP: "A/G"     (SNV)
-/// VCF: REF="AC", ALT="GT"    → VEP: "AC/GT"   (MNV)
+/// Strips shared prefix and suffix between REF and ALT to produce minimal
+/// VEP-style allele representations.
+///
+/// VCF: REF="ACGT", ALT="A"    → VEP: "CGT/-"   (deletion)
+/// VCF: REF="A", ALT="ACGT"    → VEP: "-/CGT"   (insertion)
+/// VCF: REF="A", ALT="G"       → VEP: "A/G"     (SNV)
+/// VCF: REF="AC", ALT="GT"     → VEP: "AC/GT"   (MNV)
+/// VCF: REF="TCAC", ALT="T"    → VEP: "CAC/-"   (deletion, prefix+suffix)
+/// VCF: REF="ATCG", ALT="AGCG" → VEP: "T/G"     (shared prefix "A", shared suffix "CG")
 pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String) {
     if ref_allele.len() == 1 && alt_allele.len() == 1 {
         // SNV
         return (ref_allele.to_string(), alt_allele.to_string());
     }
 
+    let ref_bytes = ref_allele.as_bytes();
+    let alt_bytes = alt_allele.as_bytes();
+
     // Find common prefix
-    let prefix_len = ref_allele
-        .bytes()
-        .zip(alt_allele.bytes())
+    let prefix_len = ref_bytes
+        .iter()
+        .zip(alt_bytes.iter())
         .take_while(|(a, b)| a == b)
         .count();
 
-    let ref_trimmed = &ref_allele[prefix_len..];
-    let alt_trimmed = &alt_allele[prefix_len..];
+    // Find common suffix (not overlapping with prefix)
+    let mut suffix_len = 0;
+    let ref_remaining = ref_bytes.len() - prefix_len;
+    let alt_remaining = alt_bytes.len() - prefix_len;
+    while suffix_len < ref_remaining
+        && suffix_len < alt_remaining
+        && ref_bytes[ref_bytes.len() - 1 - suffix_len] == alt_bytes[alt_bytes.len() - 1 - suffix_len]
+    {
+        suffix_len += 1;
+    }
+
+    let ref_trimmed = &ref_allele[prefix_len..ref_allele.len() - suffix_len];
+    let alt_trimmed = &alt_allele[prefix_len..alt_allele.len() - suffix_len];
 
     let vep_ref = if ref_trimmed.is_empty() {
         "-".to_string()
@@ -407,5 +426,48 @@ mod tests {
     #[test]
     fn test_relaxed_does_not_relax_snv() {
         assert!(!allele_matches_relaxed("A", "G", "C/T"));
+    }
+
+    #[test]
+    fn test_vcf_to_vep_allele_suffix_trim_deletion() {
+        // REF=TCAC ALT=T → after prefix "T" trimmed: ref="CAC" alt=""
+        // No shared suffix needed — pure prefix trim yields "-"
+        let (r, a) = vcf_to_vep_allele("TCAC", "T");
+        assert_eq!(r, "CAC");
+        assert_eq!(a, "-");
+    }
+
+    #[test]
+    fn test_vcf_to_vep_allele_suffix_trim_complex() {
+        // REF=ATCG ALT=AGCG → shared prefix "A", shared suffix "CG"
+        // Net: ref="T" alt="G"
+        let (r, a) = vcf_to_vep_allele("ATCG", "AGCG");
+        assert_eq!(r, "T");
+        assert_eq!(a, "G");
+    }
+
+    #[test]
+    fn test_vcf_to_vep_allele_no_suffix_needed() {
+        // SNV: no trimming needed
+        let (r, a) = vcf_to_vep_allele("A", "T");
+        assert_eq!(r, "A");
+        assert_eq!(a, "T");
+    }
+
+    #[test]
+    fn test_vcf_to_vep_allele_prefix_and_suffix_insertion() {
+        // REF=AG ALT=ATCG → shared prefix "A", shared suffix "G"
+        // Net: ref="-" alt="TC"
+        let (r, a) = vcf_to_vep_allele("AG", "ATCG");
+        assert_eq!(r, "-");
+        assert_eq!(a, "TC");
+    }
+
+    #[test]
+    fn test_vcf_to_vep_allele_identity() {
+        // REF=A ALT=A → SNV path, no trimming
+        let (r, a) = vcf_to_vep_allele("A", "A");
+        assert_eq!(r, "A");
+        assert_eq!(a, "A");
     }
 }

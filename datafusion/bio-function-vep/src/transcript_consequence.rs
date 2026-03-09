@@ -124,6 +124,8 @@ pub struct RegulatoryFeature {
     pub chrom: String,
     pub start: i64,
     pub end: i64,
+    /// Regulatory feature type used as BIOTYPE in CSQ (e.g. "promoter", "enhancer").
+    pub feature_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +198,8 @@ pub struct TranscriptConsequence {
     pub distance: Option<i64>,
     /// FLAGS: e.g. "cds_start_NF", "cds_end_NF".
     pub flags: Option<String>,
+    /// Override biotype for non-transcript features (e.g. regulatory feature_type).
+    pub biotype_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -418,6 +422,7 @@ impl TranscriptConsequenceEngine {
                             codons,
                             distance: None,
                             flags,
+                            ..Default::default()
                         });
                     }
                 } else if let Some((term, dist)) = self.upstream_downstream_term(variant, tx) {
@@ -616,6 +621,7 @@ impl TranscriptConsequenceEngine {
                 transcript_id: Some(r.feature_id.clone()),
                 feature_type: FeatureType::RegulatoryFeature,
                 terms: ordered,
+                biotype_override: r.feature_type.clone(),
                 ..Default::default()
             });
         }
@@ -2003,6 +2009,7 @@ fn classify_coding_change(
 
     // Codons with VEP case convention (changed bases uppercase, context lowercase)
     if ref_len == alt_len {
+        // SNV / MNV: same-length substitution
         let codon_nt_start = first_codon * 3;
         let codon_nt_end = ((last_codon + 1) * 3).min(cds_seq.len());
         let codon_nt_end_alt = ((last_codon + 1) * 3).min(mutated.len());
@@ -2020,6 +2027,36 @@ fn classify_coding_change(
                 codon_nt_start,
             );
             class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+        }
+    } else {
+        // In-frame indels: show affected codons with changed bases uppercase
+        let codon_nt_start = first_codon * 3;
+        let codon_nt_end = ((last_codon + 1) * 3).min(cds_seq.len());
+        if codon_nt_end <= cds_seq.len() {
+            let ref_codon = format_codon_display(
+                &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
+                start_idx,
+                end_idx,
+                codon_nt_start,
+            );
+            // For the alt codon, compute the corresponding region in the mutated CDS.
+            // The alt spans from the same codon start to the end of the affected region.
+            let alt_end_idx = start_idx + alt_len;
+            let alt_last_codon = if alt_end_idx > 0 {
+                (alt_end_idx - 1) / 3
+            } else {
+                first_codon
+            };
+            let alt_codon_nt_end = ((alt_last_codon + 1) * 3).min(mutated.len());
+            if alt_codon_nt_end <= mutated.len() {
+                let alt_codon = format_codon_display(
+                    &mutated[codon_nt_start..alt_codon_nt_end],
+                    start_idx,
+                    start_idx + alt_len.max(1) - 1,
+                    codon_nt_start,
+                );
+                class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+            }
         }
     }
 
@@ -2365,6 +2402,23 @@ mod tests {
             chrom: chrom.to_string(),
             start,
             end,
+            feature_type: None,
+        }
+    }
+
+    fn regulatory_with_type(
+        id: &str,
+        chrom: &str,
+        start: i64,
+        end: i64,
+        ft: &str,
+    ) -> RegulatoryFeature {
+        RegulatoryFeature {
+            feature_id: id.to_string(),
+            chrom: chrom.to_string(),
+            start,
+            end,
+            feature_type: Some(ft.to_string()),
         }
     }
 
@@ -3724,5 +3778,40 @@ mod tests {
             compute_flags(&t),
             Some("cds_start_NF&cds_end_NF".to_string())
         );
+    }
+
+    // --- Phase 1: Regulatory feature biotype tests ---
+
+    #[test]
+    fn test_regulatory_feature_biotype_promoter() {
+        let r = regulatory_with_type("ENSR001", "22", 100, 200, "promoter");
+        let engine = TranscriptConsequenceEngine::default();
+        let variant = var("22", 150, 150, "A", "G");
+        let mut out = Vec::new();
+        engine.append_regulatory_terms(&mut out, &variant, &[r], &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].biotype_override, Some("promoter".to_string()));
+    }
+
+    #[test]
+    fn test_regulatory_feature_biotype_enhancer() {
+        let r = regulatory_with_type("ENSR002", "22", 100, 200, "enhancer");
+        let engine = TranscriptConsequenceEngine::default();
+        let variant = var("22", 150, 150, "A", "G");
+        let mut out = Vec::new();
+        engine.append_regulatory_terms(&mut out, &variant, &[r], &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].biotype_override, Some("enhancer".to_string()));
+    }
+
+    #[test]
+    fn test_regulatory_feature_biotype_none() {
+        let r = regulatory("ENSR003", "22", 100, 200);
+        let engine = TranscriptConsequenceEngine::default();
+        let variant = var("22", 150, 150, "A", "G");
+        let mut out = Vec::new();
+        engine.append_regulatory_terms(&mut out, &variant, &[r], &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].biotype_override, None);
     }
 }
