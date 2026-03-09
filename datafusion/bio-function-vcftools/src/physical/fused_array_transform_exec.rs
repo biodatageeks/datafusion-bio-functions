@@ -9,9 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use datafusion::arrow::array::{
-    Array, ArrayRef, ListArray, RecordBatch,
-};
+use datafusion::arrow::array::{Array, ArrayRef, ListArray, RecordBatch};
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
@@ -167,7 +165,9 @@ impl FusedArrayTransformExec {
 impl DisplayAs for FusedArrayTransformExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(
                     f,
                     "FusedArrayTransformExec: arrays=[{}], passthrough=[{}], outputs=[{}]",
@@ -304,7 +304,7 @@ impl FusedArrayTransformStream {
     /// Apply transform expressions element-wise to array columns.
     fn apply_transforms(&self, batch: &RecordBatch, num_rows: usize) -> Result<Vec<ArrayRef>> {
         let input_schema = batch.schema();
-        
+
         // Extract all array columns as ListArrays
         let list_arrays: Vec<(&String, &ListArray)> = self
             .array_columns
@@ -332,7 +332,7 @@ impl FusedArrayTransformStream {
             for row_idx in 0..num_rows {
                 // Check if any input is null -> produce null output
                 let any_null = list_arrays.iter().any(|(_, arr)| arr.is_null(row_idx));
-                
+
                 if any_null {
                     null_bitmap.push(false);
                     offsets.push(current_offset);
@@ -341,7 +341,7 @@ impl FusedArrayTransformStream {
 
                 // Build a mini-batch for this row's array elements
                 let mini_batch = self.build_element_batch(&list_arrays, row_idx)?;
-                
+
                 if mini_batch.num_rows() == 0 {
                     null_bitmap.push(true);
                     offsets.push(current_offset);
@@ -351,7 +351,7 @@ impl FusedArrayTransformStream {
                 // Evaluate the expression on the mini-batch
                 let result = expr.evaluate(&mini_batch)?;
                 let result_array = result.into_array(mini_batch.num_rows())?;
-                
+
                 current_offset += result_array.len() as i32;
                 all_values.push(result_array);
                 null_bitmap.push(true);
@@ -379,16 +379,12 @@ impl FusedArrayTransformStream {
             // Build the ListArray
             let offset_buffer = OffsetBuffer::new(offsets.into());
             let list_field = Arc::new(Field::new("item", values_array.data_type().clone(), true));
-            
+
             // Build null buffer
             let null_buffer = datafusion::arrow::buffer::NullBuffer::from(null_bitmap);
-            
-            let list_array = ListArray::try_new(
-                list_field,
-                offset_buffer,
-                values_array,
-                Some(null_buffer),
-            )?;
+
+            let list_array =
+                ListArray::try_new(list_field, offset_buffer, values_array, Some(null_buffer))?;
 
             output_arrays.push(Arc::new(list_array));
         }
@@ -397,7 +393,7 @@ impl FusedArrayTransformStream {
     }
 
     /// Build a mini-batch from array elements at a specific row index.
-    /// 
+    ///
     /// For arrays at row_idx, we create a batch where each column has the
     /// elements of that array. The column names match the array column names
     /// (these are the "unnested" element columns that expressions reference).
@@ -418,7 +414,7 @@ impl FusedArrayTransformStream {
 
         for (col_name, list_arr) in list_arrays {
             let values = list_arr.value(row_idx);
-            
+
             // Get the element type from the list's value type
             let element_type = match list_arr.data_type() {
                 DataType::List(inner) => inner.data_type().clone(),
@@ -450,11 +446,7 @@ impl FusedArrayTransformStream {
     }
 
     /// Apply identity transformation (pass through arrays unchanged).
-    fn apply_identity_transform(
-        &self,
-        list_arr: &ListArray,
-        _num_rows: usize,
-    ) -> Result<ArrayRef> {
+    fn apply_identity_transform(&self, list_arr: &ListArray, _num_rows: usize) -> Result<ArrayRef> {
         // For identity transform, just clone the array
         Ok(Arc::new(list_arr.clone()))
     }
@@ -578,8 +570,7 @@ mod tests {
         let batch = create_test_batch();
         let schema = batch.schema();
 
-        let mem_exec =
-            TestMemoryExec::try_new(&[vec![batch.clone()]], schema, None).unwrap();
+        let mem_exec = TestMemoryExec::try_new(&[vec![batch.clone()]], schema, None).unwrap();
 
         let fused = FusedArrayTransformExec::try_new(
             Arc::new(mem_exec),
@@ -599,8 +590,7 @@ mod tests {
         let batch = create_test_batch();
         let schema = batch.schema();
 
-        let mem_exec =
-            TestMemoryExec::try_new(&[vec![batch.clone()]], schema, None).unwrap();
+        let mem_exec = TestMemoryExec::try_new(&[vec![batch.clone()]], schema, None).unwrap();
 
         let fused = FusedArrayTransformExec::try_new(
             Arc::new(mem_exec),

@@ -256,11 +256,7 @@ impl UserDefinedLogicalNodeCore for FusedArrayTransform {
         )
     }
 
-    fn with_exprs_and_inputs(
-        &self,
-        exprs: Vec<Expr>,
-        inputs: Vec<LogicalPlan>,
-    ) -> Result<Self> {
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
         if inputs.len() != 1 {
             return Err(datafusion::common::DataFusionError::Plan(
                 "FusedArrayTransform requires exactly one input".to_string(),

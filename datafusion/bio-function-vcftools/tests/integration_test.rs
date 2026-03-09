@@ -15,9 +15,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
 use datafusion::datasource::MemTable;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::*;
-use datafusion_bio_function_vcftools::{
-    FusedArrayTransformOptimizerRule, VcfQueryPlanner,
-};
+use datafusion_bio_function_vcftools::{FusedArrayTransformOptimizerRule, VcfQueryPlanner};
 use serial_test::serial;
 
 /// Create test data with array columns.
@@ -503,9 +501,14 @@ async fn test_struct_field_access_optimized() {
         let inner = arr.value(row);
         if let Some(i32_arr) = inner.as_any().downcast_ref::<Int32Array>() {
             (0..i32_arr.len()).map(|i| i32_arr.value(i)).collect()
-        } else if let Some(i64_arr) = inner.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>() {
+        } else if let Some(i64_arr) = inner
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        {
             // DataFusion may cast to Int64
-            (0..i64_arr.len()).map(|i| i64_arr.value(i) as i32).collect()
+            (0..i64_arr.len())
+                .map(|i| i64_arr.value(i) as i32)
+                .collect()
         } else {
             panic!("Unexpected array type for struct field elements");
         }
@@ -717,7 +720,10 @@ async fn test_null_arrays() {
 
     // Only rows with non-NULL arrays should appear (2 rows: meta1 and meta3)
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 2, "Expected 2 rows (NULL array row filtered out)");
+    assert_eq!(
+        total_rows, 2,
+        "Expected 2 rows (NULL array row filtered out)"
+    );
 }
 
 #[tokio::test]
@@ -760,7 +766,10 @@ async fn test_empty_arrays() {
 
     // Only rows with non-empty arrays should appear (2 rows: meta1 and meta3)
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 2, "Expected 2 rows (empty array row filtered out)");
+    assert_eq!(
+        total_rows, 2,
+        "Expected 2 rows (empty array row filtered out)"
+    );
 }
 
 #[tokio::test]
@@ -809,22 +818,47 @@ async fn test_mismatched_array_lengths() {
     // Should produce 2 rows (one per original row)
     // The exact element count depends on DataFusion's unnest semantics (cross-product vs zip)
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 2, "Expected 2 rows in result (one per original row)");
+    assert_eq!(
+        total_rows, 2,
+        "Expected 2 rows in result (one per original row)"
+    );
 
     // Verify columns exist and have list structure
     let batch = &results[0];
     let values_a_col = batch.column_by_name("values_a_out").unwrap();
     let values_b_col = batch.column_by_name("values_b_out").unwrap();
-    
-    let list_a = values_a_col.as_any().downcast_ref::<ListArray>().expect("values_a_out should be ListArray");
-    let list_b = values_b_col.as_any().downcast_ref::<ListArray>().expect("values_b_out should be ListArray");
+
+    let list_a = values_a_col
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("values_a_out should be ListArray");
+    let list_b = values_b_col
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("values_b_out should be ListArray");
 
     // Just verify both arrays have elements (exact count depends on unnest semantics)
     for i in 0..2 {
-        assert!(!list_a.is_null(i), "Row {} values_a_out should not be null", i);
-        assert!(!list_b.is_null(i), "Row {} values_b_out should not be null", i);
-        assert!(list_a.value(i).len() > 0, "Row {} values_a_out should have elements", i);
-        assert!(list_b.value(i).len() > 0, "Row {} values_b_out should have elements", i);
+        assert!(
+            !list_a.is_null(i),
+            "Row {} values_a_out should not be null",
+            i
+        );
+        assert!(
+            !list_b.is_null(i),
+            "Row {} values_b_out should not be null",
+            i
+        );
+        assert!(
+            list_a.value(i).len() > 0,
+            "Row {} values_a_out should have elements",
+            i
+        );
+        assert!(
+            list_b.value(i).len() > 0,
+            "Row {} values_b_out should have elements",
+            i
+        );
     }
 
     println!("Mismatched lengths test passed - verified structure");
@@ -888,8 +922,14 @@ async fn test_null_elements_in_arrays() {
     assert!(!row0_floats.is_null(0), "Row 0[0] should be valid");
     assert!(row0_floats.is_null(1), "Row 0[1] should be null");
     assert!(!row0_floats.is_null(2), "Row 0[2] should be valid");
-    assert!((row0_floats.value(0) - 1.0).abs() < 0.001, "Row 0[0] should be 1.0");
-    assert!((row0_floats.value(2) - 3.0).abs() < 0.001, "Row 0[2] should be 3.0");
+    assert!(
+        (row0_floats.value(0) - 1.0).abs() < 0.001,
+        "Row 0[0] should be 1.0"
+    );
+    assert!(
+        (row0_floats.value(2) - 3.0).abs() < 0.001,
+        "Row 0[2] should be 3.0"
+    );
 
     // Row 1: [NULL, 5.0]
     let row1_inner = list_array.value(1);
@@ -898,7 +938,10 @@ async fn test_null_elements_in_arrays() {
     assert_eq!(row1_floats.null_count(), 1, "Row 1 should have 1 null");
     assert!(row1_floats.is_null(0), "Row 1[0] should be null");
     assert!(!row1_floats.is_null(1), "Row 1[1] should be valid");
-    assert!((row1_floats.value(1) - 5.0).abs() < 0.001, "Row 1[1] should be 5.0");
+    assert!(
+        (row1_floats.value(1) - 5.0).abs() < 0.001,
+        "Row 1[1] should be 5.0"
+    );
 
     println!("Null elements test passed - verified NULL positions are preserved");
 }
@@ -910,7 +953,7 @@ async fn test_null_elements_in_arrays() {
 #[tokio::test]
 #[serial]
 async fn test_arithmetic_transform() {
-    // NOTE: This test currently FAILS because the FusedArrayTransform optimization 
+    // NOTE: This test currently FAILS because the FusedArrayTransform optimization
     //       does NOT support transformations in a separate CTE yet.
     //
     // Current limitation: The optimizer rule only detects the simple pattern:
@@ -927,7 +970,7 @@ async fn test_arithmetic_transform() {
     // CTE support is implemented.
     use datafusion::physical_plan::displayable;
 
-    let ctx = create_optimized_context().await;  // Use optimized context
+    let ctx = create_optimized_context().await; // Use optimized context
     let batch = create_test_data();
     let schema = batch.schema();
 
@@ -1000,10 +1043,26 @@ async fn test_arithmetic_transform() {
 
     // Verify the arithmetic is correct
     for batch in &results {
-        let values_a_col = batch.column(2).as_any().downcast_ref::<ListArray>().unwrap();
-        let values_b_col = batch.column(3).as_any().downcast_ref::<ListArray>().unwrap();
-        let values_sum_col = batch.column(4).as_any().downcast_ref::<ListArray>().unwrap();
-        let values_product_col = batch.column(5).as_any().downcast_ref::<ListArray>().unwrap();
+        let values_a_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let values_b_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let values_sum_col = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let values_product_col = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
 
         for i in 0..batch.num_rows() {
             let arr_a = values_a_col.value(i);
@@ -1062,7 +1121,7 @@ async fn test_conditional_transform() {
     // This test uses create_optimized_context() so it will PASS once support is added.
     use datafusion::physical_plan::displayable;
 
-    let ctx = create_optimized_context().await;  // Use optimized context
+    let ctx = create_optimized_context().await; // Use optimized context
     let batch = create_test_data();
     let schema = batch.schema();
 
@@ -1152,7 +1211,9 @@ async fn test_conditional_transform() {
         if let Some(f64_arr) = inner.as_any().downcast_ref::<Float64Array>() {
             (0..f64_arr.len()).map(|i| f64_arr.value(i)).collect()
         } else if let Some(f32_arr) = inner.as_any().downcast_ref::<Float32Array>() {
-            (0..f32_arr.len()).map(|i| f32_arr.value(i) as f64).collect()
+            (0..f32_arr.len())
+                .map(|i| f32_arr.value(i) as f64)
+                .collect()
         } else {
             panic!("Unexpected array type for values_conditional elements");
         }
@@ -1163,16 +1224,40 @@ async fn test_conditional_transform() {
     let row2 = get_f64_list(values_cond_col, 2);
 
     assert_eq!(row0.len(), 3, "Row 0 should have 3 elements");
-    assert!((row0[0] - 11.0).abs() < 0.001, "Row 0[0] should be 11.0, got {}", row0[0]);
-    assert!((row0[1] - 22.0).abs() < 0.001, "Row 0[1] should be 22.0, got {}", row0[1]);
-    assert!((row0[2] - 33.0).abs() < 0.001, "Row 0[2] should be 33.0, got {}", row0[2]);
+    assert!(
+        (row0[0] - 11.0).abs() < 0.001,
+        "Row 0[0] should be 11.0, got {}",
+        row0[0]
+    );
+    assert!(
+        (row0[1] - 22.0).abs() < 0.001,
+        "Row 0[1] should be 22.0, got {}",
+        row0[1]
+    );
+    assert!(
+        (row0[2] - 33.0).abs() < 0.001,
+        "Row 0[2] should be 33.0, got {}",
+        row0[2]
+    );
 
     assert_eq!(row1.len(), 2, "Row 1 should have 2 elements");
-    assert!((row1[0] - 160.0).abs() < 0.001, "Row 1[0] should be 160.0, got {}", row1[0]);
-    assert!((row1[1] - 250.0).abs() < 0.001, "Row 1[1] should be 250.0, got {}", row1[1]);
+    assert!(
+        (row1[0] - 160.0).abs() < 0.001,
+        "Row 1[0] should be 160.0, got {}",
+        row1[0]
+    );
+    assert!(
+        (row1[1] - 250.0).abs() < 0.001,
+        "Row 1[1] should be 250.0, got {}",
+        row1[1]
+    );
 
     assert_eq!(row2.len(), 1, "Row 2 should have 1 element");
-    assert!((row2[0] - 360.0).abs() < 0.001, "Row 2[0] should be 360.0, got {}", row2[0]);
+    assert!(
+        (row2[0] - 360.0).abs() < 0.001,
+        "Row 2[0] should be 360.0, got {}",
+        row2[0]
+    );
 
     println!("Conditional transform test passed - verified CASE expression values");
 
@@ -1477,10 +1562,10 @@ fn create_parquet_test_data() -> RecordBatch {
 #[tokio::test]
 #[serial]
 async fn test_parquet_round_trip_with_transform() {
-    use datafusion::physical_plan::displayable;
     use datafusion::dataframe::DataFrameWriteOptions;
     use datafusion::parquet::basic::Compression;
     use datafusion::parquet::file::properties::WriterProperties;
+    use datafusion::physical_plan::displayable;
 
     // Create temp directory for parquet files
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1594,7 +1679,15 @@ async fn test_parquet_round_trip_with_transform() {
     assert_eq!(results.len(), 1, "Expected 1 batch");
     let batch = &results[0];
     println!("Result schema: {:?}", batch.schema());
-    println!("Result columns: {:?}", batch.schema().fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+    println!(
+        "Result columns: {:?}",
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(batch.num_rows(), 3, "Expected 3 rows");
 
     // Verify values_d schema type - must be floating-point (result of val_a * val_b or val_a + val_b)
@@ -1610,18 +1703,25 @@ async fn test_parquet_round_trip_with_transform() {
             inner_type
         );
     } else {
-        panic!("values_d should be a List type, got {:?}", values_d_field.data_type());
+        panic!(
+            "values_d should be a List type, got {:?}",
+            values_d_field.data_type()
+        );
     }
 
     // Verify metadata column (can be Utf8 or Utf8View)
     let metadata_col = batch.column_by_name("metadata").unwrap();
-    let metadata_values: Vec<String> = if let Some(arr) = metadata_col.as_any().downcast_ref::<StringArray>() {
-        (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
-    } else if let Some(arr) = metadata_col.as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>() {
-        (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
-    } else {
-        panic!("Unexpected array type for metadata column");
-    };
+    let metadata_values: Vec<String> =
+        if let Some(arr) = metadata_col.as_any().downcast_ref::<StringArray>() {
+            (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
+        } else if let Some(arr) = metadata_col
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringViewArray>()
+        {
+            (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
+        } else {
+            panic!("Unexpected array type for metadata column");
+        };
     assert_eq!(metadata_values[0], "meta1");
     assert_eq!(metadata_values[1], "meta2");
     assert_eq!(metadata_values[2], "meta3");
@@ -1643,9 +1743,14 @@ async fn test_parquet_round_trip_with_transform() {
         if let Some(f64_arr) = inner.as_any().downcast_ref::<Float64Array>() {
             (0..f64_arr.len()).map(|i| f64_arr.value(i)).collect()
         } else if let Some(f32_arr) = inner.as_any().downcast_ref::<Float32Array>() {
-            (0..f32_arr.len()).map(|i| f32_arr.value(i) as f64).collect()
+            (0..f32_arr.len())
+                .map(|i| f32_arr.value(i) as f64)
+                .collect()
         } else {
-            panic!("Unexpected array type for values_d elements: {:?}", inner.data_type());
+            panic!(
+                "Unexpected array type for values_d elements: {:?}",
+                inner.data_type()
+            );
         }
     }
 
@@ -1655,16 +1760,40 @@ async fn test_parquet_round_trip_with_transform() {
 
     // Expected: row0=[11.0, 40.0, 33.0], row1=[160.0, 55.0], row2=[360.0]
     assert_eq!(row0_d.len(), 3, "Row 0 values_d should have 3 elements");
-    assert!((row0_d[0] - 11.0).abs() < 0.001, "Row 0 val_d[0] should be 11.0, got {}", row0_d[0]);
-    assert!((row0_d[1] - 40.0).abs() < 0.001, "Row 0 val_d[1] should be 40.0, got {}", row0_d[1]);
-    assert!((row0_d[2] - 33.0).abs() < 0.001, "Row 0 val_d[2] should be 33.0, got {}", row0_d[2]);
+    assert!(
+        (row0_d[0] - 11.0).abs() < 0.001,
+        "Row 0 val_d[0] should be 11.0, got {}",
+        row0_d[0]
+    );
+    assert!(
+        (row0_d[1] - 40.0).abs() < 0.001,
+        "Row 0 val_d[1] should be 40.0, got {}",
+        row0_d[1]
+    );
+    assert!(
+        (row0_d[2] - 33.0).abs() < 0.001,
+        "Row 0 val_d[2] should be 33.0, got {}",
+        row0_d[2]
+    );
 
     assert_eq!(row1_d.len(), 2, "Row 1 values_d should have 2 elements");
-    assert!((row1_d[0] - 160.0).abs() < 0.001, "Row 1 val_d[0] should be 160.0, got {}", row1_d[0]);
-    assert!((row1_d[1] - 55.0).abs() < 0.001, "Row 1 val_d[1] should be 55.0, got {}", row1_d[1]);
+    assert!(
+        (row1_d[0] - 160.0).abs() < 0.001,
+        "Row 1 val_d[0] should be 160.0, got {}",
+        row1_d[0]
+    );
+    assert!(
+        (row1_d[1] - 55.0).abs() < 0.001,
+        "Row 1 val_d[1] should be 55.0, got {}",
+        row1_d[1]
+    );
 
     assert_eq!(row2_d.len(), 1, "Row 2 values_d should have 1 element");
-    assert!((row2_d[0] - 360.0).abs() < 0.001, "Row 2 val_d[0] should be 360.0, got {}", row2_d[0]);
+    assert!(
+        (row2_d[0] - 360.0).abs() < 0.001,
+        "Row 2 val_d[0] should be 360.0, got {}",
+        row2_d[0]
+    );
 
     // Verify values_a is preserved correctly
     let values_a_col = batch
@@ -1677,10 +1806,15 @@ async fn test_parquet_round_trip_with_transform() {
     fn get_i64_list(arr: &ListArray, row: usize) -> Vec<i64> {
         let inner = arr.value(row);
         // DataFusion may cast Int32 to Int64 during aggregation
-        if let Some(i64_arr) = inner.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>() {
+        if let Some(i64_arr) = inner
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        {
             (0..i64_arr.len()).map(|i| i64_arr.value(i)).collect()
         } else if let Some(i32_arr) = inner.as_any().downcast_ref::<Int32Array>() {
-            (0..i32_arr.len()).map(|i| i32_arr.value(i) as i64).collect()
+            (0..i32_arr.len())
+                .map(|i| i32_arr.value(i) as i64)
+                .collect()
         } else {
             panic!("Unexpected array type for values_a");
         }
@@ -1707,9 +1841,18 @@ async fn test_parquet_round_trip_with_transform() {
     let row2_b = get_f64_list(values_b_col, 2);
 
     assert_eq!(row0_b.len(), 3, "Row 0 values_b should have 3 elements");
-    assert!((row0_b[0] - 10.0).abs() < 0.001, "Row 0 val_b[0] should be 10.0");
-    assert!((row0_b[1] - 20.0).abs() < 0.001, "Row 0 val_b[1] should be 20.0");
-    assert!((row0_b[2] - 30.0).abs() < 0.001, "Row 0 val_b[2] should be 30.0");
+    assert!(
+        (row0_b[0] - 10.0).abs() < 0.001,
+        "Row 0 val_b[0] should be 10.0"
+    );
+    assert!(
+        (row0_b[1] - 20.0).abs() < 0.001,
+        "Row 0 val_b[1] should be 20.0"
+    );
+    assert!(
+        (row0_b[2] - 30.0).abs() < 0.001,
+        "Row 0 val_b[2] should be 30.0"
+    );
     assert_eq!(row1_b.len(), 2, "Row 1 values_b should have 2 elements");
     assert_eq!(row2_b.len(), 1, "Row 2 values_b should have 1 element");
 
