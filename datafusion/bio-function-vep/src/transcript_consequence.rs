@@ -456,16 +456,22 @@ impl TranscriptConsequenceEngine {
         let in_frameshift_intron = !overlaps_exon && self.in_frameshift_intron(variant, tx_exons);
 
         if is_non_coding_biotype(&tx.biotype) && overlaps_exon {
-            terms.insert(SoTerm::NonCodingTranscriptExonVariant);
             // VEP: mature_miRNA_variant for miRNA transcripts where variant
             // overlaps a mature miRNA region (cDNA-mapped from attributes).
+            // When within a mature miRNA region, VEP suppresses
+            // non_coding_transcript_exon_variant (predicate returns 0).
+            let mut in_mature_mirna = false;
             if tx.biotype == "miRNA" {
                 for &(mstart, mend) in &tx.mature_mirna_regions {
                     if overlaps(variant.start, variant.end, mstart, mend) {
                         terms.insert(SoTerm::MatureMirnaVariant);
+                        in_mature_mirna = true;
                         break;
                     }
                 }
+            }
+            if !in_mature_mirna {
+                terms.insert(SoTerm::NonCodingTranscriptExonVariant);
             }
         } else if in_frameshift_intron && self.overlaps_cds(variant, tx) {
             // VEP treats frameshift intron variants as coding but cannot
@@ -491,9 +497,13 @@ impl TranscriptConsequenceEngine {
             terms.insert(SoTerm::NmdTranscriptVariant);
         }
         if is_non_coding_biotype(&tx.biotype) {
-            // VEP omits the parent non_coding_transcript_variant when the more
-            // specific non_coding_transcript_exon_variant is already present.
-            if !terms.contains(&SoTerm::NonCodingTranscriptExonVariant) {
+            // VEP omits the parent non_coding_transcript_variant when either:
+            // - the more specific non_coding_transcript_exon_variant is present, or
+            // - the variant falls within a mature miRNA region (VEP's
+            //   within_non_coding_gene predicate checks within_mature_miRNA).
+            if !terms.contains(&SoTerm::NonCodingTranscriptExonVariant)
+                && !terms.contains(&SoTerm::MatureMirnaVariant)
+            {
                 terms.insert(SoTerm::NonCodingTranscriptVariant);
             }
         }
@@ -3039,8 +3049,8 @@ mod tests {
             terms
         );
         assert!(
-            terms.contains(&SoTerm::NonCodingTranscriptExonVariant),
-            "miRNA variant should also get non_coding_transcript_exon_variant: {:?}",
+            !terms.contains(&SoTerm::NonCodingTranscriptExonVariant),
+            "VEP suppresses non_coding_transcript_exon_variant inside mature miRNA region: {:?}",
             terms
         );
 
