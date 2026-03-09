@@ -818,7 +818,7 @@ impl TranscriptConsequenceEngine {
 
         for exon in tx_exons {
             if tx.strand >= 0 {
-                // Donor (intron after exon end): +1/+2, +5, +3..+6, +7/+8
+                // Donor (intron after exon end): +1/+2, +5, +3..+6, +7..+8
                 add_if_overlaps(
                     terms,
                     splice_variant,
@@ -1279,6 +1279,27 @@ fn classify_coding_change(
             class.stop_gained = true;
         }
         (None, None) => {}
+    }
+
+    // Per-codon stop analysis: when the CDS already contains internal stop
+    // codons (e.g. pseudogenes / LoF transcripts), the global first-stop
+    // comparison above may miss a new stop introduced *after* an existing
+    // one.  VEP classifies stop_gained/stop_lost based on the specific
+    // codon(s) affected by the variant, so we do the same here.
+    if ref_len == alt_len && !class.stop_gained && !class.stop_lost {
+        let first_codon = start_idx / 3;
+        let last_codon = end_idx / 3;
+        for ci in first_codon..=last_codon {
+            if ci < old_aas.len() && ci < new_aas.len() {
+                let old_aa = old_aas[ci];
+                let new_aa = new_aas[ci];
+                if old_aa != '*' && new_aa == '*' {
+                    class.stop_gained = true;
+                } else if old_aa == '*' && new_aa != '*' {
+                    class.stop_lost = true;
+                }
+            }
+        }
     }
 
     if ref_len == alt_len {
@@ -2077,5 +2098,51 @@ mod tests {
         assert!(implemented.contains(&SoTerm::MissenseVariant));
         assert!(implemented.contains(&SoTerm::RegulatoryRegionVariant));
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn stop_gained_detected_when_cds_has_internal_stops() {
+        // Regression test for CYP2D7-like pseudogene transcripts where the
+        // CDS already contains premature stop codons.  A G->A SNV on the
+        // negative strand (C->T on coding strand) converts CGA (Arg) to
+        // TGA (Stop).  Previously missed because the global first-stop
+        // comparison was unchanged.
+        //
+        // CDS layout (positive strand, 1-based coords 100-130):
+        //   ATG CGA TGA CGA AAA CGA AAA AAA AAA AAA TAA
+        //   M   R   *   R   K   R   K   K   K   K   *
+        // Codon 2 (pos 7-9, 1-based 106-108) is already TGA (internal stop).
+        // We mutate codon 5 (pos 16-18, 1-based 115-117): CGA -> TGA.
+        // On positive strand the ref is C at pos 115 and alt is T.
+        let engine = TranscriptConsequenceEngine::default();
+        // CDS: ATG CGA TGA CGA AAA CGA AAA AAA AAA AAA TAA = 33 nt
+        let cds = "ATGCGATGACGAAAACGAAAAAAAAAAAATAA";
+        // transcript 100..131 (1-based inclusive), CDS 100..130
+        let tx = tx("pc", "22", 100, 131, 1, "protein_coding", Some(100), Some(130));
+        let exons = vec![exon("pc", 1, 100, 131)];
+        // CGA at CDS positions 16-18 (0-based 15-17). Genomic pos = 100+15 = 115.
+        // Mutate C->T at pos 115 to turn CGA->TGA.
+        let translations = vec![translation("pc", Some(31), Some(10), None, Some(cds))];
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 115, 115, "C", "T"),
+            &[tx],
+            &exons,
+            &translations,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::StopGained),
+            "Expected stop_gained but got: {:?}",
+            terms
+        );
+        assert!(
+            !terms.contains(&SoTerm::MissenseVariant),
+            "Should not emit missense when stop_gained applies: {:?}",
+            terms
+        );
     }
 }
