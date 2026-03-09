@@ -87,6 +87,8 @@ pub struct TranscriptFeature {
     pub biotype: String,
     pub cds_start: Option<i64>,
     pub cds_end: Option<i64>,
+    /// Mature miRNA genomic regions (mapped from cDNA attributes in raw_object_json).
+    pub mature_mirna_regions: Vec<(i64, i64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,10 +403,12 @@ impl TranscriptConsequenceEngine {
             }
         });
 
-        // VEP adds intron_variant when the variant overlaps any intron body,
-        // even if the variant also overlaps an exon (exon-spanning deletions).
+        // VEP adds intron_variant when the variant overlaps the intron body
+        // (excluding splice site positions at the first/last 2bp).  The
+        // narrower range in variant_overlaps_intron handles this correctly
+        // for both purely-intronic variants and exon-spanning deletions.
         let overlaps_intron = self.variant_overlaps_intron(variant, tx_exons);
-        if !overlaps_exon || overlaps_intron {
+        if overlaps_intron {
             terms.insert(SoTerm::IntronVariant);
         }
 
@@ -415,6 +419,16 @@ impl TranscriptConsequenceEngine {
 
         if is_non_coding_biotype(&tx.biotype) && overlaps_exon {
             terms.insert(SoTerm::NonCodingTranscriptExonVariant);
+            // VEP: mature_miRNA_variant for miRNA transcripts where variant
+            // overlaps a mature miRNA region (cDNA-mapped from attributes).
+            if tx.biotype == "miRNA" {
+                for &(mstart, mend) in &tx.mature_mirna_regions {
+                    if overlaps(variant.start, variant.end, mstart, mend) {
+                        terms.insert(SoTerm::MatureMirnaVariant);
+                        break;
+                    }
+                }
+            }
         } else if in_frameshift_intron && self.overlaps_cds(variant, tx) {
             // VEP treats frameshift intron variants as coding but cannot
             // determine the precise codon change (the CDS includes the
@@ -638,6 +652,63 @@ impl TranscriptConsequenceEngine {
         overlaps(variant.start, variant.end, cds_start, cds_end)
     }
 
+    /// Returns true when a deletion extends beyond the exons it overlaps
+    /// into a non-frameshift intron.  VEP treats these as "complex indels"
+    /// where CDS consequences can't be determined — only
+    /// `coding_sequence_variant`.  Frameshift introns (≤12bp) are treated
+    /// as part of the coding context, so they don't trigger complex indel.
+    fn is_complex_indel(&self, variant: &VariantInput, tx_exons: &[&ExonFeature]) -> bool {
+        // Insertions aren't complex
+        if variant.ref_allele == "-" {
+            return false;
+        }
+        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
+        sorted.sort_by_key(|e| e.start);
+        for e in &sorted {
+            if !overlaps(variant.start, variant.end, e.start, e.end) {
+                continue;
+            }
+            // Variant overlaps this exon — does it extend beyond?
+            if variant.start < e.start || variant.end > e.end {
+                // Check if the intron it extends into is a frameshift intron
+                if self.extends_into_frameshift_intron_only(variant, &sorted, e) {
+                    continue;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns true if the variant extends only into frameshift introns
+    /// (≤12bp) from the given exon.
+    fn extends_into_frameshift_intron_only(
+        &self,
+        variant: &VariantInput,
+        sorted_exons: &[&ExonFeature],
+        exon: &ExonFeature,
+    ) -> bool {
+        for pair in sorted_exons.windows(2) {
+            let intron_start = pair[0].end + 1;
+            let intron_end = pair[1].start - 1;
+            if intron_start > intron_end {
+                continue;
+            }
+            // Check if variant extends into this intron from the given exon
+            let adjacent = (pair[0].start == exon.start && pair[0].end == exon.end)
+                || (pair[1].start == exon.start && pair[1].end == exon.end);
+            if !adjacent {
+                continue;
+            }
+            if overlaps(variant.start, variant.end, intron_start, intron_end) {
+                if (intron_end - intron_start).abs() > 12 {
+                    return false; // Non-frameshift intron
+                }
+            }
+        }
+        true
+    }
+
     fn add_coding_terms(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -648,6 +719,12 @@ impl TranscriptConsequenceEngine {
     ) {
         let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
         terms.insert(SoTerm::CodingSequenceVariant);
+
+        // VEP: complex indel — deletion spans exon→intron boundary.
+        // VEP can't compute protein change; only coding_sequence_variant.
+        if self.is_complex_indel(variant, tx_exons) {
+            return;
+        }
 
         if cds_is_incomplete(tx, tx_translation) && self.overlaps_stop_codon(variant, tx) {
             terms.insert(SoTerm::IncompleteTerminalCodonVariant);
@@ -840,11 +917,17 @@ impl TranscriptConsequenceEngine {
     /// that reach into exons.  This naturally handles both fully-intronic
     /// variants AND exon-spanning deletions.
     /// Returns true if the variant overlaps any intron body (gap between
-    /// adjacent exons), regardless of whether it also overlaps an exon.
+    /// adjacent exons).  VEP's `intronic` flag effectively excludes splice
+    /// site positions (the first and last 2 bases of each intron), so we
+    /// use `intron_start + 2 .. intron_end - 2`.  This prevents false
+    /// `intron_variant` at splice donor/acceptor sites without needing
+    /// post-hoc stripping.  Frameshift introns (≤12bp span) are also
+    /// skipped, matching VEP behaviour.
     fn variant_overlaps_intron(&self, variant: &VariantInput, tx_exons: &[&ExonFeature]) -> bool {
         if tx_exons.len() < 2 {
             return false;
         }
+        let is_ins = variant.ref_allele == "-";
         let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
         sorted.sort_by_key(|e| e.start);
         for pair in sorted.windows(2) {
@@ -853,7 +936,27 @@ impl TranscriptConsequenceEngine {
             if intron_start > intron_end {
                 continue;
             }
-            if overlaps(variant.start, variant.end, intron_start, intron_end) {
+            // Skip frameshift introns (≤12bp)
+            if (intron_end - intron_start).abs() <= 12 {
+                continue;
+            }
+            // Narrower range excluding splice site positions
+            let inner_start = intron_start + 2;
+            let inner_end = intron_end - 2;
+            if inner_start > inner_end {
+                continue;
+            }
+            let hit = if is_ins {
+                // For insertions, VEP requires both flanking positions
+                // (start-1 and start) within the intron body — but using
+                // the full intron range, not the narrower splice-excluded
+                // range.  This means an insertion at intron_start (first
+                // intron base) is NOT intronic (left flank is the exon).
+                variant.start > intron_start && variant.start <= intron_end
+            } else {
+                overlaps(variant.start, variant.end, inner_start, inner_end)
+            };
+            if hit {
                 return true;
             }
         }
@@ -1425,13 +1528,6 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         terms.remove(&SoTerm::ProteinAlteringVariant);
     }
 
-    // VEP suppresses intron_variant in the collapsed output when
-    // splice_donor_variant or splice_acceptor_variant is present.
-    if terms.contains(&SoTerm::SpliceDonorVariant) || terms.contains(&SoTerm::SpliceAcceptorVariant)
-    {
-        terms.remove(&SoTerm::IntronVariant);
-    }
-
     // VEP omits splice_donor_region_variant when the more specific
     // splice_donor_5th_base_variant is present — the 5th base position
     // is within the donor region (positions 3–6), so the specific term
@@ -1862,6 +1958,7 @@ mod tests {
             biotype: biotype.to_string(),
             cds_start,
             cds_end,
+            mature_mirna_regions: Vec::new(),
         }
     }
 
@@ -2853,6 +2950,190 @@ mod tests {
         assert!(
             terms.contains(&SoTerm::FrameshiftVariant),
             "Should still get frameshift from CDS overlap: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn variant_in_mirna_transcript_gets_mature_mirna_variant() {
+        // miRNA transcript on minus strand, single exon 100..200.
+        // Mature miRNA region mapped from cDNA "42-59" on minus strand:
+        //   genomic_start = 200 - 59 + 1 = 142
+        //   genomic_end   = 200 - 42 + 1 = 159
+        let engine = TranscriptConsequenceEngine::default();
+        let mut t = tx("ENST_MIRNA", "22", 100, 200, -1, "miRNA", None, None);
+        t.mature_mirna_regions = vec![(142, 159)];
+        let exons = vec![exon("ENST_MIRNA", 1, 100, 200)];
+
+        // SNV at 150 — within the mature miRNA region
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 150, 150, "A", "G"),
+            &[t.clone()],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::MatureMirnaVariant),
+            "SNV in mature miRNA region should get mature_miRNA_variant: {:?}",
+            terms
+        );
+        assert!(
+            terms.contains(&SoTerm::NonCodingTranscriptExonVariant),
+            "miRNA variant should also get non_coding_transcript_exon_variant: {:?}",
+            terms
+        );
+
+        // SNV at 120 — within transcript exon but outside mature miRNA region
+        let assignments2 = engine.evaluate_variant_with_context(
+            &var("22", 120, 120, "A", "G"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms2 = &assignments2[0].terms;
+        assert!(
+            !terms2.contains(&SoTerm::MatureMirnaVariant),
+            "SNV outside mature miRNA region should NOT get mature_miRNA_variant: {:?}",
+            terms2
+        );
+        assert!(
+            terms2.contains(&SoTerm::NonCodingTranscriptExonVariant),
+            "miRNA variant outside mature region should still get non_coding_transcript_exon_variant: {:?}",
+            terms2
+        );
+    }
+
+    #[test]
+    fn complex_indel_spanning_exon_intron_gets_coding_sequence_variant_only() {
+        // Exon 1: 1000..1050, Exon 2: 1200..1400
+        // Deletion from 1045..1060 spans exon 1 into intron (non-frameshift)
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            1400,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1400),
+        );
+        let exons = vec![exon("T1", 1, 1000, 1050), exon("T1", 2, 1200, 1400)];
+        let cds = &"ATG".repeat(84);
+        let translations = vec![translation("T1", Some(252), Some(83), None, Some(cds))];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 1045, 1060, &"N".repeat(16), "-"),
+            &[t],
+            &exons,
+            &translations,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::CodingSequenceVariant),
+            "Complex indel should get coding_sequence_variant: {:?}",
+            terms
+        );
+        assert!(
+            !terms.contains(&SoTerm::InframeDeletion),
+            "Complex indel should NOT get inframe_deletion: {:?}",
+            terms
+        );
+        assert!(
+            !terms.contains(&SoTerm::FrameshiftVariant),
+            "Complex indel should NOT get frameshift_variant: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn intron_variant_not_emitted_at_splice_donor_position() {
+        // Variant at intron_start (splice donor +1 position) should NOT get
+        // intron_variant — only splice_donor_variant.
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        let exons = vec![exon("T1", 1, 1000, 1200), exon("T1", 2, 1400, 2000)];
+
+        // SNV at intron_start (1201) — splice donor +1
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 1201, 1201, "A", "G"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::SpliceDonorVariant),
+            "Should get splice_donor_variant: {:?}",
+            terms
+        );
+        assert!(
+            !terms.contains(&SoTerm::IntronVariant),
+            "Splice donor position should NOT get intron_variant: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn large_deletion_spanning_exon_intron_gets_intron_variant() {
+        // A large deletion that starts in an exon and extends well into
+        // an intron should get intron_variant (overlaps narrower range).
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        let exons = vec![exon("T1", 1, 1000, 1200), exon("T1", 2, 1400, 2000)];
+        let cds = &"ATG".repeat(267);
+        let translations = vec![translation("T1", Some(801), Some(266), None, Some(cds))];
+
+        // Deletion from 1195..1250: overlaps exon 1, extends deep into intron
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 1195, 1250, &"N".repeat(56), "-"),
+            &[t],
+            &exons,
+            &translations,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::IntronVariant),
+            "Large exon-spanning deletion should get intron_variant: {:?}",
             terms
         );
     }

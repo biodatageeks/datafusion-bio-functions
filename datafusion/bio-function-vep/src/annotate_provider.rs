@@ -314,6 +314,7 @@ impl AnnotateProvider {
             })?;
             let cds_start_idx = schema.index_of("cds_start").ok();
             let cds_end_idx = schema.index_of("cds_end").ok();
+            let raw_json_idx = schema.index_of("raw_object_json").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -343,6 +344,16 @@ impl AnnotateProvider {
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .filter(|v| *v > 0);
 
+                // For miRNA transcripts, extract mature miRNA regions from
+                // raw_object_json attributes (cDNA coords mapped to genomic).
+                let mature_mirna_regions = if biotype == "miRNA" {
+                    let raw_json =
+                        raw_json_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                    parse_mirna_regions_from_json(raw_json.as_deref(), start, end, strand)
+                } else {
+                    Vec::new()
+                };
+
                 out.push(TranscriptFeature {
                     transcript_id,
                     chrom,
@@ -352,6 +363,7 @@ impl AnnotateProvider {
                     biotype,
                     cds_start,
                     cds_end,
+                    mature_mirna_regions,
                 });
             }
         }
@@ -1077,6 +1089,73 @@ fn parse_sv_event_kind(value: &str) -> Option<SvEventKind> {
         "truncation" | "truncate" => Some(SvEventKind::Truncation),
         _ => None,
     }
+}
+
+/// Parse mature miRNA genomic regions from the `raw_object_json` transcript
+/// attribute.  VEP stores miRNA cDNA coordinates in the transcript's attribute
+/// array as `{code: "miRNA", value: "42-59"}`.  We map those cDNA coords to
+/// genomic coordinates using the strand and transcript boundaries.
+///
+/// miRNA transcripts are almost always single-exon, so the mapping is trivial:
+/// - Plus strand:  `genomic = tx.start + cdna - 1`
+/// - Minus strand: `genomic_start = tx.end - cdna_end + 1`, `genomic_end = tx.end - cdna_start + 1`
+fn parse_mirna_regions_from_json(
+    raw_json: Option<&str>,
+    tx_start: i64,
+    tx_end: i64,
+    strand: i8,
+) -> Vec<(i64, i64)> {
+    let Some(json_str) = raw_json else {
+        return Vec::new();
+    };
+
+    // Look for patterns like {"code":"miRNA","value":"42-59"} in the JSON.
+    // We do a lightweight parse to avoid pulling in a full JSON library just
+    // for this single use case.
+    let mut regions = Vec::new();
+    // Find all occurrences of "miRNA" code entries and extract their values.
+    let needle = "\"miRNA\"";
+    let mut search_from = 0;
+    while let Some(pos) = json_str[search_from..].find(needle) {
+        let abs_pos = search_from + pos + needle.len();
+        search_from = abs_pos;
+
+        // Look for the "value" key nearby (within the same JSON object).
+        let window_end = (abs_pos + 200).min(json_str.len());
+        let window = &json_str[abs_pos..window_end];
+
+        // Find "value" key
+        if let Some(val_pos) = window.find("\"value\"") {
+            let after_key = &window[val_pos + 7..]; // skip "value"
+            // Find the value string: skip colon and whitespace, then quoted string
+            if let Some(quote_start) = after_key.find('"') {
+                let val_start = quote_start + 1;
+                if let Some(quote_end) = after_key[val_start..].find('"') {
+                    let val_str = &after_key[val_start..val_start + quote_end];
+                    // Parse "N-M" pattern
+                    if let Some((cdna_start, cdna_end)) = parse_cdna_range(val_str) {
+                        let (gstart, gend) = if strand >= 0 {
+                            (tx_start + cdna_start - 1, tx_start + cdna_end - 1)
+                        } else {
+                            (tx_end - cdna_end + 1, tx_end - cdna_start + 1)
+                        };
+                        regions.push((gstart, gend));
+                    }
+                }
+            }
+        }
+    }
+    regions
+}
+
+fn parse_cdna_range(s: &str) -> Option<(i64, i64)> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let start: i64 = parts[0].trim().parse().ok()?;
+    let end: i64 = parts[1].trim().parse().ok()?;
+    Some((start, end))
 }
 
 fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
