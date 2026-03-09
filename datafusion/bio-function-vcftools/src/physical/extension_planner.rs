@@ -56,10 +56,7 @@ impl ExtensionPlanner for FusedArrayTransformPlanner {
 
         // Build the "element-level" schema for expression conversion
         // This schema represents the columns as if they were unnested (scalar element types)
-        let element_schema = build_element_schema(
-            &input_schema,
-            fused_transform.array_columns(),
-        )?;
+        let element_schema = build_element_schema(&input_schema, fused_transform.array_columns())?;
         let element_df_schema = DFSchema::try_from(element_schema)?;
 
         // Convert logical expressions to physical expressions using the element schema
@@ -88,10 +85,7 @@ impl ExtensionPlanner for FusedArrayTransformPlanner {
 /// column with the same name but the scalar (element) type. This schema
 /// is used for converting transform expressions that reference the
 /// "unnested" element columns.
-fn build_element_schema(
-    input_schema: &Arc<Schema>,
-    array_columns: &[String],
-) -> Result<Schema> {
+fn build_element_schema(input_schema: &Arc<Schema>, array_columns: &[String]) -> Result<Schema> {
     let mut fields: Vec<Field> = Vec::with_capacity(array_columns.len());
 
     for col_name in array_columns {

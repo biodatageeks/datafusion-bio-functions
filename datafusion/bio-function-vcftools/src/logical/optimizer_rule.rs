@@ -18,8 +18,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, SubqueryAlias};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
@@ -92,7 +92,7 @@ impl OptimizerRule for FusedArrayTransformOptimizerRule {
         if !self.is_enabled() {
             return Ok(Transformed::no(plan));
         }
-        
+
         debug!("FusedArrayTransformOptimizerRule: rewrite() called");
 
         plan.transform_up(|node| match try_optimize(&node) {
@@ -136,14 +136,14 @@ struct TraversalResult<'a> {
 fn traverse_to_unnest(plan: &LogicalPlan) -> Option<TraversalResult<'_>> {
     // Skip SubqueryAlias wrappers
     let plan = skip_wrappers(plan);
-    
+
     match plan {
         LogicalPlan::Unnest(unnest) => {
             // Base case: we found Unnest
             // Map OUTPUT column names (with depth) to INPUT column names (without depth)
             // because FusedArrayTransform operates on unnest's input, not output
             let mut column_definitions = HashMap::new();
-            
+
             // Build mapping from exec_columns (input placeholder names) to output names
             // exec_columns contains: __unnest_placeholder(indexed.values_a)
             // output schema contains: __unnest_placeholder(indexed.values_a,depth=1)
@@ -152,11 +152,11 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Option<TraversalResult<'_>> {
                 // The output column name typically has ",depth=1)" appended before the closing paren
                 // We'll map any column that starts with the input name (without closing paren)
                 let input_prefix = input_name.trim_end_matches(')');
-                
+
                 // Find the corresponding output column
                 let unnest_plan = LogicalPlan::Unnest(unnest.clone());
                 let output_schema = unnest_plan.schema();
-                
+
                 for (_qualifier, field) in output_schema.iter() {
                     let output_name = field.name();
                     // Check if this output column corresponds to this input column
@@ -168,24 +168,21 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Option<TraversalResult<'_>> {
                         );
                     }
                 }
-                
+
                 // Also add the input column directly
                 column_definitions.insert(input_name.clone(), Expr::Column(input_name.into()));
             }
-            
+
             // Also include passthrough columns from the input schema
             let input_schema = unnest.input.schema();
             for (qualifier, field) in input_schema.iter() {
                 let name = field.name().to_string();
                 column_definitions.entry(name.clone()).or_insert_with(|| {
-                    let qualified_col = datafusion::common::Column::new(
-                        qualifier.cloned(),
-                        name,
-                    );
+                    let qualified_col = datafusion::common::Column::new(qualifier.cloned(), name);
                     Expr::Column(qualified_col)
                 });
             }
-            
+
             Some(TraversalResult {
                 unnest,
                 column_definitions,
@@ -194,30 +191,35 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Option<TraversalResult<'_>> {
         LogicalPlan::Projection(projection) => {
             // Recurse into child
             let child_result = traverse_to_unnest(projection.input.as_ref())?;
-            
+
             // Build new column definitions by resolving projection expressions
             let mut new_definitions = HashMap::new();
-            
+
             for expr in &projection.expr {
                 let (alias, inner_expr) = match expr {
-                    Expr::Alias(alias_expr) => (alias_expr.name.clone(), alias_expr.expr.as_ref().clone()),
+                    Expr::Alias(alias_expr) => {
+                        (alias_expr.name.clone(), alias_expr.expr.as_ref().clone())
+                    }
                     // For column references, use just the name (not qualified)
                     Expr::Column(col) => (col.name().to_string(), expr.clone()),
                     other => (expr.schema_name().to_string(), other.clone()),
                 };
-                
+
                 // Resolve the expression against child definitions
                 let resolved = resolve_expr(&inner_expr, &child_result.column_definitions);
                 new_definitions.insert(alias, resolved);
             }
-            
+
             Some(TraversalResult {
                 unnest: child_result.unnest,
                 column_definitions: new_definitions,
             })
         }
         _ => {
-            trace!("traverse_to_unnest: expected Projection or Unnest, got {}", plan_type_name(plan));
+            trace!(
+                "traverse_to_unnest: expected Projection or Unnest, got {}",
+                plan_type_name(plan)
+            );
             None
         }
     }
@@ -250,7 +252,7 @@ fn try_optimize(plan: &LogicalPlan) -> Option<Result<LogicalPlan>> {
     let LogicalPlan::Aggregate(aggregate) = plan else {
         return None;
     };
-    
+
     trace!("Found Aggregate node, checking for optimization pattern");
 
     // Check if all aggregate expressions are array_agg
@@ -258,7 +260,7 @@ fn try_optimize(plan: &LogicalPlan) -> Option<Result<LogicalPlan>> {
         trace!("Not all aggregates are array_agg");
         return None;
     }
-    
+
     trace!("All aggregates are array_agg, traversing to find Unnest");
 
     // Get the SubqueryAlias name if the immediate child is a SubqueryAlias
@@ -276,8 +278,11 @@ fn try_optimize(plan: &LogicalPlan) -> Option<Result<LogicalPlan>> {
     };
     let unnest_plan = traversal.unnest;
     let column_definitions = traversal.column_definitions;
-    
-    trace!("Found Unnest, column_definitions: {:?}", column_definitions.keys().collect::<Vec<_>>());
+
+    trace!(
+        "Found Unnest, column_definitions: {:?}",
+        column_definitions.keys().collect::<Vec<_>>()
+    );
 
     // Get the input to unnest (this is what we'll use as our input)
     let unnest_input = unnest_plan.input.clone();
@@ -313,11 +318,11 @@ fn try_optimize(plan: &LogicalPlan) -> Option<Result<LogicalPlan>> {
     // For each array_agg(col), we resolve 'col' to get the actual transformation
     let mut output_columns = Vec::new();
     let mut transform_exprs = Vec::new();
-    
+
     for expr in &aggregate.aggr_expr {
         // Get output column name
         output_columns.push(expr.schema_name().to_string());
-        
+
         // Extract the argument to array_agg and resolve it
         if let Expr::AggregateFunction(AggregateFunction { params, .. }) = expr {
             if let Some(arg) = params.args.first() {
@@ -334,7 +339,10 @@ fn try_optimize(plan: &LogicalPlan) -> Option<Result<LogicalPlan>> {
 
     debug!(
         "Pattern matched: arrays={array_columns:?}, passthrough={passthrough_columns:?}, outputs={output_columns:?}, transforms={:?}",
-        transform_exprs.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        transform_exprs
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 
     // Create the FusedArrayTransform node
@@ -389,7 +397,7 @@ mod tests {
         // Clear the env var if set
         // SAFETY: Test runs single-threaded, env var modification is safe
         unsafe { std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM") };
-        
+
         let rule = FusedArrayTransformOptimizerRule::new();
         assert!(!rule.is_enabled());
     }
@@ -398,10 +406,10 @@ mod tests {
     fn test_rule_enabled_via_env() {
         // SAFETY: Test runs single-threaded, env var modification is safe
         unsafe { std::env::set_var("BIO_FUSED_ARRAY_TRANSFORM", "1") };
-        
+
         let rule = FusedArrayTransformOptimizerRule::new();
         assert!(rule.is_enabled());
-        
+
         // Clean up
         // SAFETY: Test runs single-threaded, env var modification is safe
         unsafe { std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM") };
