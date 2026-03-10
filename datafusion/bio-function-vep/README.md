@@ -40,7 +40,7 @@ The `annotate_vep_golden_bench` example:
 ```bash
 cargo run -p datafusion-bio-function-vep --example annotate_vep_golden_bench --release -- \
   vep-benchmark/data/HG002_chr22.vcf.gz \
-  /Users/mwiewior/research/data/vep/115_GRCh38_variants.parquet \
+  /Users/mwiewior/research/data/vep/115_GRCh38_variation_22.parquet \
   parquet \
   1000 \
   /Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/cache \

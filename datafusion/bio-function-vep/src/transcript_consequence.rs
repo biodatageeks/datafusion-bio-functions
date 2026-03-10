@@ -111,6 +111,8 @@ pub struct TranscriptFeature {
     pub gene_symbol_source: Option<String>,
     pub gene_hgnc_id: Option<String>,
     pub source: Option<String>,
+    /// Transcript version number (e.g. 6 for ENST00000379410.6).
+    pub version: Option<i32>,
     /// CDS start not found (incomplete 5' end).
     pub cds_start_nf: bool,
     /// CDS end not found (incomplete 3' end).
@@ -134,6 +136,10 @@ pub struct TranslationFeature {
     pub protein_len: Option<usize>,
     pub translation_seq: Option<String>,
     pub cds_sequence: Option<String>,
+    /// Translation stable ID (ENSP…) for HGVSp notation.
+    pub stable_id: Option<String>,
+    /// Translation version number.
+    pub version: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +224,10 @@ pub struct TranscriptConsequence {
     pub flags: Option<String>,
     /// Override biotype for non-transcript features (e.g. regulatory feature_type).
     pub biotype_override: Option<String>,
+    /// HGVSc notation (e.g. "ENST00000379410.6:c.1043G>A").
+    pub hgvsc: Option<String>,
+    /// HGVSp notation (e.g. "ENSP00000368698.2:p.Arg348His").
+    pub hgvsp: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -427,6 +437,25 @@ impl TranscriptConsequenceEngine {
                                 (None, None, None, None)
                             };
                         let flags = compute_flags(tx);
+                        // Compute HGVSc notation.
+                        let hgvsc = crate::hgvs::format_hgvsc(
+                            tx,
+                            &tx_exons,
+                            cdna_position.as_deref(),
+                            &variant.ref_allele,
+                            &variant.alt_allele,
+                            variant.start,
+                            variant.end,
+                        );
+                        // Compute HGVSp notation.
+                        let hgvsp = tx_translation.and_then(|tl| {
+                            crate::hgvs::format_hgvsp(
+                                tl,
+                                protein_position.as_deref(),
+                                amino_acids.as_deref(),
+                                &terms,
+                            )
+                        });
                         out.push(TranscriptConsequence {
                             transcript_id: Some(tx.transcript_id.clone()),
                             transcript_idx: Some(tx_idx),
@@ -441,6 +470,8 @@ impl TranscriptConsequenceEngine {
                             codons,
                             distance: None,
                             flags,
+                            hgvsc,
+                            hgvsp,
                             ..Default::default()
                         });
                     }
@@ -2713,6 +2744,7 @@ mod tests {
             gene_symbol_source: None,
             gene_hgnc_id: None,
             source: None,
+            version: None,
             cds_start_nf: false,
             cds_end_nf: false,
             flags_str: None,
@@ -2813,6 +2845,8 @@ mod tests {
             protein_len,
             translation_seq: translation_seq.map(|v| v.to_string()),
             cds_sequence: cds_sequence.map(|v| v.to_string()),
+            stable_id: None,
+            version: None,
         }
     }
 

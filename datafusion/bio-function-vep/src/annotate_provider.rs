@@ -378,6 +378,7 @@ impl AnnotateProvider {
             let gene_symbol_source_idx = schema.index_of("gene_symbol_source").ok();
             let gene_hgnc_id_idx = schema.index_of("gene_hgnc_id").ok();
             let source_idx = schema.index_of("source").ok();
+            let version_idx = schema.index_of("version").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -432,6 +433,9 @@ impl AnnotateProvider {
                 let gene_hgnc_id =
                     gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let source = source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let version = version_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .and_then(|v| i32::try_from(v).ok());
 
                 out.push(TranscriptFeature {
                     transcript_id,
@@ -448,6 +452,7 @@ impl AnnotateProvider {
                     gene_symbol_source,
                     gene_hgnc_id,
                     source,
+                    version,
                     cds_start_nf,
                     cds_end_nf,
                     flags_str,
@@ -581,6 +586,8 @@ impl AnnotateProvider {
                 .or_else(|_| schema.index_of("cds_seq"))
                 .or_else(|_| schema.index_of("coding_sequence"))
                 .ok();
+            let tl_stable_id_idx = schema.index_of("stable_id").ok();
+            let tl_version_idx = schema.index_of("version").ok();
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
                     continue;
@@ -595,6 +602,11 @@ impl AnnotateProvider {
                     translation_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let cds_sequence =
                     cds_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let tl_stable_id =
+                    tl_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let tl_version = tl_version_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .and_then(|v| i32::try_from(v).ok());
 
                 out.push(TranslationFeature {
                     transcript_id,
@@ -602,6 +614,8 @@ impl AnnotateProvider {
                     protein_len,
                     translation_seq,
                     cds_sequence,
+                    stable_id: tl_stable_id,
+                    version: tl_version,
                 });
             }
         }
@@ -1050,6 +1064,11 @@ impl AnnotateProvider {
         let variation_name_idx = schema.index_of("cache_variation_name").ok();
         let cached_csq_idx = schema.index_of("cache_consequence_types").ok();
         let cached_most_idx = schema.index_of("cache_most_severe_consequence").ok();
+        let merged = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
+            .unwrap_or(false);
 
         let mut csq_builder = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 40);
         let mut most_builder =
@@ -1080,7 +1099,7 @@ impl AnnotateProvider {
             let cached_csq =
                 cached_csq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
 
-            let _variation_name = variation_name_idx
+            let variation_name = variation_name_idx
                 .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 .unwrap_or_default();
 
@@ -1095,7 +1114,7 @@ impl AnnotateProvider {
                 // Existing_variation|DISTANCE|STRAND|FLAGS|SYMBOL_SOURCE|HGNC_ID|
                 // MOTIF_NAME|MOTIF_POS|HIGH_INF_POS|MOTIF_SCORE_CHANGE|TRANSCRIPTION_FACTORS|SOURCE
                 let csq_entry =
-                    format!("{vep_allele}|{csq_val}|{impact}|||||||||||||||||||||||||||");
+                    format!("{vep_allele}|{csq_val}|{impact}|||||||||||||||||{variation_name}||||||||||");
                 (csq_entry, most_val.clone())
             } else {
                 // Cache miss — compute via transcript engine and produce per-transcript CSQ.
@@ -1148,7 +1167,7 @@ impl AnnotateProvider {
                     let feature_type = tc.feature_type.as_str();
                     let feature = tc.transcript_id.as_deref().unwrap_or("");
                     // Look up transcript metadata via index (zero-copy).
-                    let (symbol, gene, biotype_tx, strand_str, symbol_source, hgnc_id) =
+                    let (symbol, gene, biotype_tx, strand_str, symbol_source, hgnc_id, source) =
                         if let Some(idx) = tc.transcript_idx {
                             let tx = ctx.transcripts[idx];
                             (
@@ -1158,9 +1177,10 @@ impl AnnotateProvider {
                                 if tx.strand >= 0 { "1" } else { "-1" },
                                 tx.gene_symbol_source.as_deref().unwrap_or(""),
                                 tx.gene_hgnc_id.as_deref().unwrap_or(""),
+                                tx.source.as_deref().unwrap_or(""),
                             )
                         } else {
-                            ("", "", "", "", "", "")
+                            ("", "", "", "", "", "", "")
                         };
                     let biotype = tc.biotype_override.as_deref().unwrap_or(biotype_tx);
                     let exon = tc.exon_str.as_deref().unwrap_or("");
@@ -1172,12 +1192,18 @@ impl AnnotateProvider {
                     let codons_str = tc.codons.as_deref().unwrap_or("");
                     let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
                     let flags = tc.flags.as_deref().unwrap_or("");
+                    // HGVSc/HGVSp require VEP's --hgvs flag + FASTA; leave
+                    // empty by default to preserve schema compatibility.
+                    let hgvsc = "";
+                    let hgvsp = "";
+                    // VEP only emits SOURCE when using --merged cache.
+                    let source_val = if merged { source } else { "" };
                     csq_entries.push(format!(
                         "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
-                         {exon}|{intron}|||\
+                         {exon}|{intron}|{hgvsc}|{hgvsp}|\
                          {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                          |{distance}|{strand_str}|{flags}|{symbol_source}|{hgnc_id}|\
-                         |||||"
+                         |||||{source_val}"
                     ));
                 }
                 if csq_entries.is_empty() {

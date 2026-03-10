@@ -12,6 +12,7 @@ pub mod annotation_store;
 pub mod config;
 pub mod coordinate;
 pub mod golden_benchmark;
+pub mod hgvs;
 #[cfg(feature = "kv-cache")]
 pub mod kv_cache;
 pub mod lookup_provider;
