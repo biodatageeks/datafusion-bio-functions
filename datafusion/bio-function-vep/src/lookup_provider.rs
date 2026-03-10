@@ -436,33 +436,22 @@ impl TableProvider for LookupProvider {
             } else {
                 "fa.`chrom`"
             };
+            // Always use allele-aware matching in the fallback join.
+            // Without it, position-only matching can pick the wrong co-located
+            // variant when multiple variants exist at the same locus.
             let fallback_join_on = if self.extended_probes {
-                if use_vep_existing_fallback {
-                    format!(
-                        "{vcf_join_chrom_expr_fa} = c.`chrom` \
-                         AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
-                         AND {vcf_start_expr_fa} <= c.`__lookup_join_end` \
-                         AND match_allele_relaxed(fa.`ref`, fa.`alt`, c.`allele_string`)"
-                    )
-                } else {
-                    format!(
-                        "{vcf_join_chrom_expr_fa} = c.`chrom` \
-                         AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
-                         AND {vcf_start_expr_fa} <= c.`__lookup_join_end`"
-                    )
-                }
-            } else if use_vep_existing_fallback {
                 format!(
                     "{vcf_join_chrom_expr_fa} = c.`chrom` \
-                     AND {vcf_start_expr_fa} = c.`__norm_start` \
-                     AND {vcf_end_expr_fa} = c.`__norm_end` \
+                     AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
+                     AND {vcf_start_expr_fa} <= c.`__lookup_join_end` \
                      AND match_allele_relaxed(fa.`ref`, fa.`alt`, c.`allele_string`)"
                 )
             } else {
                 format!(
                     "{vcf_join_chrom_expr_fa} = c.`chrom` \
                      AND {vcf_start_expr_fa} = c.`__norm_start` \
-                     AND {vcf_end_expr_fa} = c.`__norm_end`"
+                     AND {vcf_end_expr_fa} = c.`__norm_end` \
+                     AND match_allele_relaxed(fa.`ref`, fa.`alt`, c.`allele_string`)"
                 )
             };
             let mut fallback_cache_cols = vec!["`chrom`".to_string()];
@@ -472,9 +461,8 @@ impl TableProvider for LookupProvider {
             if projects_cache_somatic {
                 fallback_cache_cols.push("`somatic`".to_string());
             }
-            if use_vep_existing_fallback {
-                fallback_cache_cols.push("`allele_string`".to_string());
-            }
+            // Always include allele_string for allele-aware matching in fallback.
+            fallback_cache_cols.push("`allele_string`".to_string());
             if self.extended_probes {
                 fallback_cache_cols
                     .push(format!("{cache_join_start_expr} AS `__lookup_join_start`"));
@@ -490,15 +478,12 @@ impl TableProvider for LookupProvider {
 
             let mut fallback_select_exprs = Vec::new();
             if projects_cache_variation_name {
-                let fallback_variation_name_expr = if use_vep_existing_fallback {
+                // Prefer rsID variants, fall back to any other ID.
+                let fallback_variation_name_expr =
                     "COALESCE(\
                      MIN(CASE WHEN c.`variation_name` LIKE 'rs%' THEN c.`variation_name` END), \
                      MIN(c.`variation_name`)) AS `__lookup_fallback_variation_name`"
-                        .to_string()
-                } else {
-                    "STRING_AGG(DISTINCT c.`variation_name`, '&') AS `__lookup_fallback_variation_name`"
-                        .to_string()
-                };
+                        .to_string();
                 fallback_select_exprs.push(fallback_variation_name_expr);
             }
             if projects_cache_somatic {
@@ -1307,6 +1292,7 @@ mod tests {
     async fn test_lookup_exact_or_colocated_ids_fills_variation_name_on_exact_miss() {
         let ctx = create_vep_session();
 
+        // VCF: deletion AC→A at pos 100 (VEP-trimmed: ref=C, alt=-).
         let vcf_schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -1320,14 +1306,16 @@ mod tests {
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![100])),
                 Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["AC"])),
                 Arc::new(StringArray::from(vec!["A"])),
-                Arc::new(StringArray::from(vec!["G"])),
             ],
         )
         .unwrap();
         let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
 
-        // Co-located cache row with allele mismatch: exact mode should miss.
+        // Cache: deletion at same position but with different representation
+        // (TG/T vs C/-). Strict match_allele fails because ref "TG" != "C"/"AC",
+        // but match_allele_relaxed succeeds because both are 1-base deletions.
         let cache_schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -1344,7 +1332,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![100])),
                 Arc::new(Int64Array::from(vec![100])),
                 Arc::new(StringArray::from(vec!["rs_coloc_only"])),
-                Arc::new(StringArray::from(vec!["C/T"])),
+                Arc::new(StringArray::from(vec!["TG/T"])),
                 Arc::new(Int8Array::from(vec![Some(1)])),
                 Arc::new(StringArray::from(vec!["benign"])),
             ],
