@@ -4177,4 +4177,545 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].biotype_override, None);
     }
+
+    // ---- VariantInput::from_vcf suffix/prefix trimming ----
+
+    #[test]
+    fn from_vcf_snv_no_trimming() {
+        let v = VariantInput::from_vcf("22".into(), 100, 100, "A".into(), "G".into());
+        assert_eq!(v.start, 100);
+        assert_eq!(v.end, 100);
+        assert_eq!(v.ref_allele, "A");
+        assert_eq!(v.alt_allele, "G");
+    }
+
+    #[test]
+    fn from_vcf_simple_deletion() {
+        // VCF: pos=100 REF=ACGT ALT=A → deletion of CGT at 101-103
+        let v = VariantInput::from_vcf("22".into(), 100, 103, "ACGT".into(), "A".into());
+        assert_eq!(v.start, 101);
+        assert_eq!(v.end, 103);
+        assert_eq!(v.ref_allele, "CGT");
+        assert_eq!(v.alt_allele, "-");
+    }
+
+    #[test]
+    fn from_vcf_simple_insertion() {
+        // VCF: pos=100 REF=A ALT=ACGT → insertion of CGT after pos 100
+        let v = VariantInput::from_vcf("22".into(), 100, 100, "A".into(), "ACGT".into());
+        assert_eq!(v.start, 101);
+        assert_eq!(v.end, 101);
+        assert_eq!(v.ref_allele, "-");
+        assert_eq!(v.alt_allele, "CGT");
+    }
+
+    #[test]
+    fn from_vcf_mnv_prefix_only_no_suffix_trim() {
+        // MNV: REF=ATCG ALT=AGCG → same length, only prefix "A" trimmed
+        // VEP does NOT suffix-trim same-length substitutions
+        let v = VariantInput::from_vcf("22".into(), 100, 103, "ATCG".into(), "AGCG".into());
+        assert_eq!(v.start, 101);
+        assert_eq!(v.end, 103);
+        assert_eq!(v.ref_allele, "TCG");
+        assert_eq!(v.alt_allele, "GCG");
+    }
+
+    #[test]
+    fn from_vcf_indel_with_suffix_trim() {
+        // Indel: REF=AG ALT=ATCG → prefix "A", suffix "G" → ref="-" alt="TC"
+        let v = VariantInput::from_vcf("22".into(), 100, 101, "AG".into(), "ATCG".into());
+        assert_eq!(v.ref_allele, "-");
+        assert_eq!(v.alt_allele, "TC");
+    }
+
+    #[test]
+    fn from_vcf_deletion_with_suffix_trim() {
+        // REF=AGCGT ALT=AT → prefix "A", then ref="GCGT" alt="T"
+        // suffix "T" shared → ref="GCG" alt="-"
+        let v = VariantInput::from_vcf("22".into(), 100, 104, "AGCGT".into(), "AT".into());
+        assert_eq!(v.ref_allele, "GCG");
+        assert_eq!(v.alt_allele, "-");
+    }
+
+    // ---- classify_coding_change: SNV codons and amino acids ----
+
+    /// Helper: build a minimal protein-coding transcript + exon + translation
+    /// for a single-exon gene, and classify a variant against it.
+    fn classify_snv(
+        cds_seq: &str,
+        variant_pos: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+    ) -> Option<CodingClassification> {
+        // Single exon from 1000..(1000+cds_len-1), positive strand
+        let cds_len = cds_seq.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx("T1", "22", 1000, tx_end, 1, "protein_coding", Some(1000), Some(tx_end));
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
+        let v = var("22", variant_pos, variant_pos, ref_allele, alt_allele);
+        classify_coding_change(&t, &exons_ref, Some(&tr), &v)
+    }
+
+    #[test]
+    fn classify_snv_synonymous_codon_case() {
+        // CDS: ATG GCT ... → change C→T at pos 1004 (index 4, codon 1 pos 1)
+        // GCT → GTT: Ala→Val = missense
+        let cds = "ATGGCTTAA";
+        let c = classify_snv(cds, 1004, "C", "T").unwrap();
+        assert!(c.missense);
+        assert_eq!(c.codons, Some("gCt/gTt".to_string()));
+        assert_eq!(c.amino_acids, Some("A/V".to_string()));
+        assert_eq!(c.protein_position_start, Some(2));
+        assert_eq!(c.protein_position_end, Some(2));
+        assert_eq!(c.cds_position_start, Some(5));
+        assert_eq!(c.cds_position_end, Some(5));
+    }
+
+    #[test]
+    fn classify_snv_synonymous() {
+        // GCT → GCC: both Ala = synonymous
+        // Change T→C at index 5 (pos 1005)
+        let cds = "ATGGCTTAA";
+        let c = classify_snv(cds, 1005, "T", "C").unwrap();
+        assert!(c.synonymous);
+        assert_eq!(c.codons, Some("gcT/gcC".to_string()));
+        assert_eq!(c.amino_acids, Some("A".to_string()));
+    }
+
+    // ---- classify_coding_change: deletion codons/amino acids ----
+
+    /// Helper for deletion classification in a single-exon transcript.
+    fn classify_deletion(
+        cds_seq: &str,
+        del_start: i64,
+        del_end: i64,
+        ref_allele: &str,
+    ) -> Option<CodingClassification> {
+        let cds_len = cds_seq.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx("T1", "22", 1000, tx_end, 1, "protein_coding", Some(1000), Some(tx_end));
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
+        let v = var("22", del_start, del_end, ref_allele, "-");
+        classify_coding_change(&t, &exons_ref, Some(&tr), &v)
+    }
+
+    #[test]
+    fn classify_frameshift_deletion_codons_and_amino_acids() {
+        // CDS: ATG GCT GAA TGA (12 bases, 3 codons + stop)
+        // Delete 1 base at index 3 (pos 1003, "G" of GCT) → frameshift
+        let cds = "ATGGCTGAATGA";
+        let c = classify_deletion(cds, 1003, 1003, "G").unwrap();
+        // Frameshift deletion: ref codon has deleted base uppercase, alt all lowercase
+        assert!(c.codons.is_some());
+        let codons = c.codons.unwrap();
+        let parts: Vec<&str> = codons.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        // Ref codon should have uppercase at the changed position
+        assert!(parts[0].chars().any(|c| c.is_uppercase()));
+        // Alt codon should be all lowercase (frameshift deletion)
+        assert!(parts[1].chars().all(|c| c.is_lowercase()));
+        // Amino acids: frameshift uses X
+        assert!(c.amino_acids.as_ref().unwrap().contains('X'));
+    }
+
+    #[test]
+    fn classify_inframe_deletion_codons() {
+        // CDS: ATG GCT GAA AAA TGA (15 bases)
+        // Delete 3 bases at index 3-5 (pos 1003-1005, "GCT") → inframe deletion
+        let cds = "ATGGCTGAAAAATGA";
+        let c = classify_deletion(cds, 1003, 1005, "GCT").unwrap();
+        assert!(c.codons.is_some());
+        let codons = c.codons.unwrap();
+        let parts: Vec<&str> = codons.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        // Ref codon: deleted bases uppercase
+        assert_eq!(parts[0], "GCT");
+        // Alt codon: remaining bases lowercase or "-"
+        assert!(parts[1] == "-" || parts[1].chars().all(|c| c.is_lowercase()));
+    }
+
+    #[test]
+    fn classify_inframe_deletion_amino_acids_no_x() {
+        // Inframe deletion should NOT use X — shows actual ref/alt AAs
+        let cds = "ATGGCTGAAAAATGA";
+        let c = classify_deletion(cds, 1003, 1005, "GCT").unwrap();
+        assert!(c.amino_acids.is_some());
+        let aa = c.amino_acids.unwrap();
+        assert!(!aa.contains('X'), "Inframe deletion should not use X: {aa}");
+        assert!(aa.contains('/'), "Amino acids should be ref/alt format: {aa}");
+    }
+
+    #[test]
+    fn classify_frameshift_deletion_amino_acids_uses_x() {
+        // Delete 1 base → frameshift → amino acids should use X
+        let cds = "ATGGCTGAATGA";
+        let c = classify_deletion(cds, 1003, 1003, "G").unwrap();
+        assert!(c.amino_acids.is_some());
+        let aa = c.amino_acids.unwrap();
+        assert!(aa.contains('X'), "Frameshift deletion should use X: {aa}");
+        // Should be "REF_AA/X" format (no preserved AA for deletions)
+        let parts: Vec<&str> = aa.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1], "X", "Deletion frameshift alt should be just X: {aa}");
+    }
+
+    #[test]
+    fn classify_inframe_deletion_positions() {
+        // Delete codon at index 3-5 → CDS pos 4-6, protein pos 2
+        let cds = "ATGGCTGAAAAATGA";
+        let c = classify_deletion(cds, 1003, 1005, "GCT").unwrap();
+        assert_eq!(c.cds_position_start, Some(4));
+        assert_eq!(c.cds_position_end, Some(6));
+        assert_eq!(c.protein_position_start, Some(2));
+        assert_eq!(c.protein_position_end, Some(2));
+    }
+
+    // ---- classify_insertion: codons, amino acids, positions ----
+
+    /// Helper for insertion classification in a single-exon transcript.
+    fn classify_ins(
+        cds_seq: &str,
+        ins_pos: i64,
+        alt_allele: &str,
+    ) -> Option<CodingClassification> {
+        let cds_len = cds_seq.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx("T1", "22", 1000, tx_end, 1, "protein_coding", Some(1000), Some(tx_end));
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
+        // Insertions: ref="-", alt=inserted bases, start=insertion point
+        let v = var("22", ins_pos, ins_pos, "-", alt_allele);
+        classify_coding_change(&t, &exons_ref, Some(&tr), &v)
+    }
+
+    #[test]
+    fn classify_frameshift_insertion_codons() {
+        // CDS: ATG GCT GAA TGA (12 bases)
+        // Insert "TT" after pos 1003 (CDS index 3, within codon 1) → frameshift
+        let cds = "ATGGCTGAATGA";
+        let c = classify_ins(cds, 1004, "TT").unwrap();
+        assert!(c.codons.is_some());
+        let codons = c.codons.unwrap();
+        let parts: Vec<&str> = codons.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        // Ref codon should be all lowercase for insertion frameshift
+        assert!(
+            parts[0].chars().all(|c| c.is_lowercase()),
+            "Insertion frameshift ref codon should be all lowercase: {}",
+            parts[0]
+        );
+        // Alt codon should have inserted bases uppercase
+        assert!(
+            parts[1].chars().any(|c| c.is_uppercase()),
+            "Insertion frameshift alt codon should have uppercase inserted bases: {}",
+            parts[1]
+        );
+    }
+
+    #[test]
+    fn classify_frameshift_insertion_amino_acids_preserved() {
+        // CDS: ATG CAT GAA TGA → M H E *
+        // Insert "TT" after pos 1006 (within codon 2: CAT, CDS idx 6)
+        // This should be a frameshift. If the first affected codon's AA is
+        // preserved after mutation, format is "H/HX"; otherwise "H/X".
+        let cds = "ATGCATGAATGA";
+        let c = classify_ins(cds, 1007, "TT").unwrap();
+        assert!(c.amino_acids.is_some());
+        let aa = c.amino_acids.unwrap();
+        assert!(
+            aa.contains('X'),
+            "Frameshift insertion should use X: {aa}"
+        );
+        // Should be either "H/HX" (preserved) or "H/X" (not preserved)
+        let parts: Vec<&str> = aa.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(
+            parts[1] == "X" || parts[1].ends_with('X'),
+            "Alt should end with X: {aa}"
+        );
+    }
+
+    #[test]
+    fn classify_inframe_insertion_at_codon_boundary() {
+        // CDS: ATG GCT GAA AAA TGA (15 bases)
+        // Insert "AAA" (3 bases) at codon boundary (after pos 1005, between codon 1 and 2)
+        // ins_point in CDS = index 6 which is a codon boundary
+        let cds = "ATGGCTGAAAAATGA";
+        let c = classify_ins(cds, 1006, "AAA").unwrap();
+        assert!(c.codons.is_some());
+        let codons = c.codons.unwrap();
+        // At codon boundary: ref="-", alt=UPPERCASE inserted bases
+        let parts: Vec<&str> = codons.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "-");
+        assert!(
+            parts[1].chars().all(|c| c.is_uppercase()),
+            "Inframe insertion at boundary alt should be uppercase: {}",
+            parts[1]
+        );
+    }
+
+    #[test]
+    fn classify_inframe_insertion_within_codon() {
+        // CDS: ATG GCT GAA AAA TGA (15 bases)
+        // Insert "AAA" (3 bases) within codon 1 (after pos 1004, CDS idx 4)
+        let cds = "ATGGCTGAAAAATGA";
+        let c = classify_ins(cds, 1005, "AAA").unwrap();
+        assert!(c.codons.is_some());
+        let codons = c.codons.unwrap();
+        let parts: Vec<&str> = codons.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        // Ref codon should be all lowercase
+        assert!(
+            parts[0].chars().all(|c| c.is_lowercase()),
+            "Inframe insertion within codon ref should be lowercase: {}",
+            parts[0]
+        );
+        // Alt codon should have inserted bases uppercase, context lowercase
+        assert!(
+            parts[1].chars().any(|c| c.is_uppercase()),
+            "Inframe insertion alt should have uppercase inserted bases: {}",
+            parts[1]
+        );
+        assert!(
+            parts[1].chars().any(|c| c.is_lowercase()),
+            "Inframe insertion alt should have lowercase context: {}",
+            parts[1]
+        );
+    }
+
+    #[test]
+    fn classify_inframe_insertion_amino_acids_no_x() {
+        // Inframe insertions should NOT use X
+        let cds = "ATGGCTGAAAAATGA";
+        let c = classify_ins(cds, 1006, "AAA").unwrap();
+        assert!(c.amino_acids.is_some());
+        let aa = c.amino_acids.unwrap();
+        assert!(!aa.contains('X'), "Inframe insertion should not use X: {aa}");
+    }
+
+    #[test]
+    fn classify_insertion_cds_positions() {
+        // Insertion between CDS index 3 and 4 → CDS pos 4-5 (1-based)
+        let cds = "ATGGCTGAATGA";
+        let c = classify_ins(cds, 1004, "TT").unwrap();
+        assert_eq!(c.cds_position_start, Some(4));
+        assert_eq!(c.cds_position_end, Some(5));
+    }
+
+    #[test]
+    fn classify_insertion_protein_position_frameshift() {
+        // Frameshift insertion: protein position is just the affected codon
+        let cds = "ATGGCTGAATGA";
+        let c = classify_ins(cds, 1004, "TT").unwrap();
+        assert_eq!(
+            c.protein_position_start,
+            c.protein_position_end,
+            "Frameshift insertion protein position should be a single codon"
+        );
+    }
+
+    #[test]
+    fn classify_insertion_protein_position_inframe_boundary() {
+        // Inframe insertion at codon boundary: protein position spans flanking codons
+        let cds = "ATGGCTGAAAAATGA";
+        let c = classify_ins(cds, 1006, "AAA").unwrap();
+        assert_eq!(c.protein_position_start, Some(2));
+        assert_eq!(c.protein_position_end, Some(3));
+    }
+
+    // ---- compute_cdna_position: insertion at exon boundary ----
+
+    #[test]
+    fn compute_cdna_position_insertion_within_exon() {
+        // Insertion within a single exon → range "a-b"
+        let exons = vec![exon("tx1", 1, 100, 200)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 150, 150, "-", "ACG");
+        let pos = compute_cdna_position(&v, &refs, 1);
+        assert!(pos.is_some());
+        let s = pos.unwrap();
+        assert!(s.contains('-'), "Insertion cDNA should be a range: {s}");
+    }
+
+    #[test]
+    fn compute_cdna_position_insertion_at_exon_left_boundary() {
+        // Insertion at start of exon: left flanking position is intronic
+        // Exon: 200..300. Insertion at pos 200: left=199 (intronic), right=200 (exonic)
+        let exons = vec![exon("tx1", 1, 200, 300)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 200, 200, "-", "ACG");
+        let pos = compute_cdna_position(&v, &refs, 1);
+        assert!(
+            pos.is_some(),
+            "Insertion at exon left boundary should produce cDNA position"
+        );
+        let s = pos.unwrap();
+        assert!(s.contains('-'), "Should be a range: {s}");
+        // Should contain "1" since pos 200 is cDNA index 1
+        assert!(s.contains('1'), "Should reference cDNA position 1: {s}");
+    }
+
+    #[test]
+    fn compute_cdna_position_insertion_at_exon_right_boundary() {
+        // Insertion at end of exon: right flanking position is intronic
+        // Exon: 100..200. Insertion at pos 201: left=200 (exonic), right=201 (intronic)
+        let exons = vec![exon("tx1", 1, 100, 200)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 201, 201, "-", "ACG");
+        let pos = compute_cdna_position(&v, &refs, 1);
+        assert!(
+            pos.is_some(),
+            "Insertion at exon right boundary should produce cDNA position"
+        );
+        let s = pos.unwrap();
+        // pos 200 = cDNA index 101, inferred adjacent = 102
+        assert!(s.contains("101"), "Should reference last exonic cDNA position: {s}");
+    }
+
+    #[test]
+    fn compute_cdna_position_insertion_at_exon_boundary_minus_strand() {
+        // Minus strand: insertion at exon boundary with intronic flanking
+        let exons = vec![exon("tx1", 1, 200, 300)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Insertion at pos 200: left=199 (intronic), right=200 (exonic)
+        let v = var("22", 200, 200, "-", "ACG");
+        let pos = compute_cdna_position(&v, &refs, -1);
+        assert!(
+            pos.is_some(),
+            "Insertion at exon boundary on minus strand should produce cDNA position"
+        );
+    }
+
+    #[test]
+    fn compute_cdna_position_deletion_spanning_boundary() {
+        // Deletion that starts before exon, ends within exon → "?-N"
+        let exons = vec![exon("tx1", 1, 100, 200)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Deletion from 90 to 110: start is outside exon, end is inside
+        let v = var("22", 90, 110, &"N".repeat(21), "-");
+        let pos = compute_cdna_position(&v, &refs, 1);
+        assert!(pos.is_some());
+        let s = pos.unwrap();
+        assert!(
+            s.contains('?'),
+            "Boundary-spanning deletion should have '?' for unknown end: {s}"
+        );
+    }
+
+    #[test]
+    fn compute_cdna_position_deletion_spanning_boundary_minus_strand() {
+        // On minus strand: deletion extending past exon end
+        let exons = vec![exon("tx1", 1, 100, 200)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Deletion from 190 to 210: start inside, end outside
+        let v = var("22", 190, 210, &"N".repeat(21), "-");
+        let pos = compute_cdna_position(&v, &refs, -1);
+        assert!(pos.is_some());
+        let s = pos.unwrap();
+        assert!(
+            s.contains('?'),
+            "Boundary-spanning deletion on minus strand should have '?': {s}"
+        );
+    }
+
+    #[test]
+    fn compute_cdna_position_deletion_range() {
+        // Multi-base deletion fully within exon → "start-end"
+        let exons = vec![exon("tx1", 1, 100, 200)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 110, 115, "NNNNNN", "-");
+        let pos = compute_cdna_position(&v, &refs, 1);
+        assert_eq!(pos, Some("11-16".to_string()));
+    }
+
+    // ---- FLAGS field from transcript attributes ----
+
+    #[test]
+    fn compute_flags_cds_end_nf_only() {
+        let mut t = tx("t1", "22", 100, 200, 1, "protein_coding", Some(110), Some(190));
+        t.cds_end_nf = true;
+        assert_eq!(compute_flags(&t), Some("cds_end_NF".to_string()));
+    }
+
+    #[test]
+    fn compute_flags_uses_flags_str_when_present() {
+        // When flags_str is set (from VEP cache parsing), it should be used
+        // to preserve encounter order.
+        let mut t = tx("t1", "22", 100, 200, 1, "protein_coding", Some(110), Some(190));
+        t.cds_start_nf = true;
+        t.cds_end_nf = true;
+        t.flags_str = Some("cds_end_NF&cds_start_NF".to_string());
+        let flags = compute_flags(&t);
+        assert_eq!(
+            flags,
+            Some("cds_end_NF&cds_start_NF".to_string()),
+            "Should use flags_str to preserve encounter order"
+        );
+    }
+
+    // ---- Multiple regulatory features at same position ----
+
+    #[test]
+    fn test_multiple_regulatory_features_each_gets_biotype() {
+        let r1 = regulatory_with_type("ENSR001", "22", 100, 200, "promoter");
+        let r2 = regulatory_with_type("ENSR002", "22", 100, 200, "enhancer");
+        let engine = TranscriptConsequenceEngine::default();
+        let variant = var("22", 150, 150, "A", "G");
+        let mut out = Vec::new();
+        engine.append_regulatory_terms(&mut out, &variant, &[r1, r2], &[]);
+        assert_eq!(out.len(), 2, "Each regulatory feature should get its own entry");
+        assert_eq!(out[0].biotype_override, Some("promoter".to_string()));
+        assert_eq!(out[1].biotype_override, Some("enhancer".to_string()));
+    }
+
+    #[test]
+    fn test_regulatory_feature_biotype_tf_binding_site() {
+        let r = regulatory_with_type("ENSR004", "22", 100, 200, "TF_binding_site");
+        let engine = TranscriptConsequenceEngine::default();
+        let variant = var("22", 150, 150, "A", "G");
+        let mut out = Vec::new();
+        engine.append_regulatory_terms(&mut out, &variant, &[r], &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].biotype_override, Some("TF_binding_site".to_string()));
+    }
+
+    #[test]
+    fn test_regulatory_feature_biotype_open_chromatin() {
+        let r = regulatory_with_type("ENSR005", "22", 100, 200, "open_chromatin_region");
+        let engine = TranscriptConsequenceEngine::default();
+        let variant = var("22", 150, 150, "A", "G");
+        let mut out = Vec::new();
+        engine.append_regulatory_terms(&mut out, &variant, &[r], &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].biotype_override,
+            Some("open_chromatin_region".to_string())
+        );
+    }
+
+    // ---- format_codon_display: additional edge cases ----
+
+    #[test]
+    fn format_codon_display_all_changed() {
+        // All 3 bases changed (e.g., 3-base MNV within one codon)
+        assert_eq!(format_codon_display(b"ACG", 0, 2, 0), "ACG");
+    }
+
+    #[test]
+    fn format_codon_display_none_changed() {
+        // Changed range outside codon → all lowercase
+        assert_eq!(format_codon_display(b"ACG", 5, 5, 0), "acg");
+    }
+
+    #[test]
+    fn format_codon_display_multi_base_range() {
+        // Two of three bases changed: positions 0 and 1
+        assert_eq!(format_codon_display(b"ACG", 0, 1, 0), "ACg");
+    }
 }

@@ -1718,4 +1718,45 @@ mod tests {
             (false, true, Some("cds_end_NF".to_string()))
         );
     }
+
+    #[test]
+    fn test_parse_flags_mixed_wrapped_unwrapped() {
+        // Mix of wrapped (__class/__value) and unwrapped attributes
+        let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"1"},{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"cds_end_NF","value":"1"}}]}}"#;
+        assert_eq!(
+            parse_transcript_flags(Some(json)),
+            (true, true, Some("cds_start_NF&cds_end_NF".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_non_1_value_rejected() {
+        // value="true" should NOT be accepted — only "1" counts
+        let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"true"}]}}"#;
+        assert_eq!(parse_transcript_flags(Some(json)), (false, false, None));
+    }
+
+    #[test]
+    fn test_parse_flags_ignores_non_cds_attributes() {
+        // Non-cds_start_NF/cds_end_NF attributes should be ignored
+        let json = r#"{"__value":{"attributes":[{"code":"some_other","value":"1"},{"code":"cds_start_NF","value":"1"}]}}"#;
+        assert_eq!(
+            parse_transcript_flags(Some(json)),
+            (true, false, Some("cds_start_NF".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_empty_attributes_array() {
+        let json = r#"{"__value":{"attributes":[]}}"#;
+        assert_eq!(parse_transcript_flags(Some(json)), (false, false, None));
+    }
+
+    #[test]
+    fn test_parse_flags_malformed_json() {
+        assert_eq!(
+            parse_transcript_flags(Some("not valid json")),
+            (false, false, None)
+        );
+    }
 }
