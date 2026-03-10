@@ -508,6 +508,40 @@ pub const CSQ_FIELD_NAMES: &[&str] = &[
     "TREMBL",
     "UNIPARC",
     "UNIPROT_ISOFORM",
+    // Batch 3 fields.
+    "AF",
+    "AFR_AF",
+    "AMR_AF",
+    "EAS_AF",
+    "EUR_AF",
+    "SAS_AF",
+    "gnomADe_AF",
+    "gnomADe_AFR",
+    "gnomADe_AMR",
+    "gnomADe_ASJ",
+    "gnomADe_EAS",
+    "gnomADe_FIN",
+    "gnomADe_MID",
+    "gnomADe_NFE",
+    "gnomADe_REMAINING",
+    "gnomADe_SAS",
+    "gnomADg_AF",
+    "gnomADg_AFR",
+    "gnomADg_AMI",
+    "gnomADg_AMR",
+    "gnomADg_ASJ",
+    "gnomADg_EAS",
+    "gnomADg_FIN",
+    "gnomADg_MID",
+    "gnomADg_NFE",
+    "gnomADg_REMAINING",
+    "gnomADg_SAS",
+    "MAX_AF",
+    "MAX_AF_POPS",
+    "CLIN_SIG",
+    "SOMATIC",
+    "PHENO",
+    "PUBMED",
 ];
 
 /// Sample of a field-level mismatch for debugging.
@@ -956,8 +990,8 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
     }
 
     #[test]
-    fn csq_field_names_has_41_entries() {
-        assert_eq!(CSQ_FIELD_NAMES.len(), 41);
+    fn csq_field_names_has_74_entries() {
+        assert_eq!(CSQ_FIELD_NAMES.len(), 74);
         assert_eq!(CSQ_FIELD_NAMES[0], "Allele");
         assert_eq!(CSQ_FIELD_NAMES[1], "Consequence");
         assert_eq!(CSQ_FIELD_NAMES[6], "Feature");
@@ -966,6 +1000,11 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         assert_eq!(CSQ_FIELD_NAMES[28], "SOURCE");
         assert_eq!(CSQ_FIELD_NAMES[29], "VARIANT_CLASS");
         assert_eq!(CSQ_FIELD_NAMES[40], "UNIPROT_ISOFORM");
+        assert_eq!(CSQ_FIELD_NAMES[41], "AF");
+        assert_eq!(CSQ_FIELD_NAMES[47], "gnomADe_AF");
+        assert_eq!(CSQ_FIELD_NAMES[57], "gnomADg_AF");
+        assert_eq!(CSQ_FIELD_NAMES[68], "MAX_AF");
+        assert_eq!(CSQ_FIELD_NAMES[73], "PUBMED");
     }
 
     #[test]
@@ -1003,7 +1042,7 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         let ours = golden.clone();
         let report = compare_csq_fields(&golden, &ours);
         assert_eq!(report.total_entries_compared, 1);
-        assert_eq!(report.field_match_counts.len(), 41);
+        assert_eq!(report.field_match_counts.len(), 74);
         for &c in &report.field_match_counts {
             assert_eq!(c, 1, "all fields should match");
         }

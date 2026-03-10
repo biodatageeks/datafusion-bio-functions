@@ -88,6 +88,164 @@ pub const CACHE_OUTPUT_COLUMNS: &[&str] = &[
     "dbsnp_ids",
 ];
 
+/// AF column definition: how to read, emit, and name each frequency population.
+struct AfColumn {
+    /// Column name in the variation cache parquet (e.g. `"gnomADg_FIN"`).
+    cache_col: &'static str,
+    /// Flag group: 0 = `--af`, 1 = `--af_1kg`, 2 = `--af_gnomade`, 3 = `--af_gnomadg`.
+    flag_group: u8,
+    /// Whether VEP emits this field's frequency in the individual CSQ slot.
+    /// VEP's offline cache mode only emits global AF + 1000G sub-pops + gnomAD global;
+    /// gnomAD sub-population frequencies are NOT emitted in individual CSQ fields.
+    emit_in_csq: bool,
+    /// Population name for MAX_AF_POPS (VEP-internal naming convention).
+    /// `None` means this entry is excluded from MAX_AF computation (globals).
+    max_af_pop: Option<&'static str>,
+}
+
+const AF_COLUMNS: &[AfColumn] = &[
+    // --af (global 1000 Genomes) — emitted in CSQ, excluded from MAX_AF_POPS
+    AfColumn { cache_col: "AF", flag_group: 0, emit_in_csq: true, max_af_pop: None },
+    // --af_1kg (continental) — emitted, MAX_AF uses short names (AFR not AFR_AF)
+    AfColumn { cache_col: "AFR", flag_group: 1, emit_in_csq: true, max_af_pop: Some("AFR") },
+    AfColumn { cache_col: "AMR", flag_group: 1, emit_in_csq: true, max_af_pop: Some("AMR") },
+    AfColumn { cache_col: "EAS", flag_group: 1, emit_in_csq: true, max_af_pop: Some("EAS") },
+    AfColumn { cache_col: "EUR", flag_group: 1, emit_in_csq: true, max_af_pop: Some("EUR") },
+    AfColumn { cache_col: "SAS", flag_group: 1, emit_in_csq: true, max_af_pop: Some("SAS") },
+    // --af_gnomade — only global emitted in CSQ; sub-pops used for MAX_AF only
+    AfColumn { cache_col: "gnomADe", flag_group: 2, emit_in_csq: true, max_af_pop: None },
+    AfColumn { cache_col: "gnomADe_AFR", flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_AFR") },
+    AfColumn { cache_col: "gnomADe_AMR", flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_AMR") },
+    AfColumn { cache_col: "gnomADe_ASJ", flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_ASJ") },
+    AfColumn { cache_col: "gnomADe_EAS", flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_EAS") },
+    AfColumn { cache_col: "gnomADe_FIN", flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_FIN") },
+    AfColumn { cache_col: "gnomADe_MID", flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_MID") },
+    AfColumn { cache_col: "gnomADe_NFE", flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_NFE") },
+    AfColumn { cache_col: "gnomADe_REMAINING", flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_REMAINING") },
+    AfColumn { cache_col: "gnomADe_SAS", flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_SAS") },
+    // --af_gnomadg — only global emitted in CSQ; sub-pops used for MAX_AF only
+    AfColumn { cache_col: "gnomADg", flag_group: 3, emit_in_csq: true, max_af_pop: None },
+    AfColumn { cache_col: "gnomADg_AFR", flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_AFR") },
+    AfColumn { cache_col: "gnomADg_AMI", flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_AMI") },
+    AfColumn { cache_col: "gnomADg_AMR", flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_AMR") },
+    AfColumn { cache_col: "gnomADg_ASJ", flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_ASJ") },
+    AfColumn { cache_col: "gnomADg_EAS", flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_EAS") },
+    AfColumn { cache_col: "gnomADg_FIN", flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_FIN") },
+    AfColumn { cache_col: "gnomADg_MID", flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_MID") },
+    AfColumn { cache_col: "gnomADg_NFE", flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_NFE") },
+    AfColumn { cache_col: "gnomADg_REMAINING", flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_REMAINING") },
+    AfColumn { cache_col: "gnomADg_SAS", flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_SAS") },
+];
+
+/// Parsed VEP option flags controlling which Batch 3 CSQ fields are emitted.
+/// Flag names match Ensembl VEP CLI: `--check_existing`, `--af`, `--af_1kg`,
+/// `--af_gnomade`, `--af_gnomadg`, `--max_af`, `--pubmed`.
+#[derive(Debug, Clone)]
+struct VepFlags {
+    check_existing: bool,
+    af: bool,
+    af_1kg: bool,
+    af_gnomade: bool,
+    af_gnomadg: bool,
+    max_af: bool,
+    pubmed: bool,
+}
+
+impl VepFlags {
+    fn from_options_json(options_json: Option<&str>) -> Self {
+        let parse = |key| {
+            options_json
+                .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
+                .unwrap_or(false)
+        };
+        let af = parse("af");
+        let af_1kg = parse("af_1kg");
+        let af_gnomade = parse("af_gnomade");
+        let af_gnomadg = parse("af_gnomadg");
+        let max_af = parse("max_af");
+        let pubmed = parse("pubmed");
+        // VEP behavior: AF flags imply --check_existing.
+        let check_existing =
+            parse("check_existing") || af || af_1kg || af_gnomade || af_gnomadg || max_af || pubmed;
+        Self {
+            check_existing,
+            af,
+            af_1kg,
+            af_gnomade,
+            af_gnomadg,
+            max_af,
+            pubmed,
+        }
+    }
+
+    /// Whether this AF column's flag group is enabled.
+    fn af_group_enabled(&self, group: u8) -> bool {
+        match group {
+            0 => self.af,
+            1 => self.af_1kg,
+            2 => self.af_gnomade,
+            3 => self.af_gnomadg,
+            _ => false,
+        }
+    }
+}
+
+/// Parse a VEP cache `"allele:freq"` string and extract the frequency for the
+/// specified VEP-minimized allele.
+///
+/// Cache format examples:
+///   `"T:0.9301"`           — single allele
+///   `"A:0.006,G:0.994"`    — multi-allele (comma-separated)
+///   `"-:0.001"`            — deletion allele
+fn extract_af_for_allele<'a>(cache_af_str: &'a str, vep_allele: &str) -> &'a str {
+    if cache_af_str.is_empty() {
+        return "";
+    }
+    for entry in cache_af_str.split(',') {
+        if let Some((allele, freq)) = entry.split_once(':') {
+            if allele == vep_allele {
+                return freq;
+            }
+        }
+    }
+    ""
+}
+
+/// Compute MAX_AF and MAX_AF_POPS from collected (population_name, frequency_str) pairs.
+///
+/// Returns `(max_af_str, max_af_pops_str)` where `max_af_pops_str` uses `&` as
+/// separator when multiple populations tie for the maximum (matching VEP format).
+fn compute_max_af(af_entries: &[(&str, &str)]) -> (String, String) {
+    let mut max_val: f64 = f64::NEG_INFINITY;
+    let mut max_pops: Vec<&str> = Vec::new();
+    let mut found_any = false;
+
+    for &(pop_name, freq_str) in af_entries {
+        if freq_str.is_empty() {
+            continue;
+        }
+        let Ok(freq) = freq_str.parse::<f64>() else {
+            continue;
+        };
+        found_any = true;
+        if freq > max_val {
+            max_val = freq;
+            max_pops.clear();
+            max_pops.push(pop_name);
+        } else if (freq - max_val).abs() < f64::EPSILON {
+            max_pops.push(pop_name);
+        }
+    }
+
+    if !found_any {
+        return (String::new(), String::new());
+    }
+    // Format MAX_AF the same way VEP does: fixed decimal, no trailing zeros.
+    let max_af_str = format!("{max_val}");
+    let max_af_pops_str = max_pops.join("&");
+    (max_af_str, max_af_pops_str)
+}
+
 /// Table provider implementing `annotate_vep(...)`.
 pub struct AnnotateProvider {
     session: Arc<SessionContext>,
@@ -1125,6 +1283,18 @@ impl AnnotateProvider {
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
             .unwrap_or(false);
+        let flags = VepFlags::from_options_json(self.options_json.as_deref());
+
+        // Resolve cache column indices for Batch 3 AF columns.
+        let af_col_indices: Vec<Option<usize>> = AF_COLUMNS
+            .iter()
+            .map(|col| schema.index_of(&format!("cache_{}", col.cache_col)).ok())
+            .collect();
+        // Clinical/frequency metadata indices.
+        let clin_sig_idx = schema.index_of("cache_clin_sig").ok();
+        let somatic_idx = schema.index_of("cache_somatic").ok();
+        let pheno_idx = schema.index_of("cache_phenotype_or_disease").ok();
+        let pubmed_idx = schema.index_of("cache_pubmed").ok();
 
         let mut csq_builder = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 40);
         let mut most_builder =
@@ -1157,16 +1327,99 @@ impl AnnotateProvider {
                 .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 .unwrap_or_default();
 
+            // --- Batch 3: per-variant fields (same for every transcript entry) ---
+            let existing_var = if flags.check_existing {
+                &variation_name
+            } else {
+                ""
+            };
+
+            // Extract allele frequencies from cache columns.
+            let af_raw: Vec<String> = af_col_indices
+                .iter()
+                .map(|opt_idx| {
+                    opt_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or_default()
+                })
+                .collect();
+            // Parse allele:freq for each AF column. Build two vectors:
+            // 1. af_csq_values: what goes into CSQ fields (empty for gnomAD sub-pops)
+            // 2. max_af_entries: sub-population (name, freq) pairs for MAX_AF computation
+            let mut af_csq_values: Vec<String> = Vec::with_capacity(AF_COLUMNS.len());
+            let mut max_af_entries: Vec<(&str, &str)> = Vec::new();
+            for (i, col) in AF_COLUMNS.iter().enumerate() {
+                let freq = if flags.af_group_enabled(col.flag_group) {
+                    extract_af_for_allele(&af_raw[i], &vep_allele)
+                } else {
+                    ""
+                };
+                // CSQ output: only emit for columns VEP emits in offline/cache mode.
+                let csq_val = if col.emit_in_csq { freq } else { "" };
+                af_csq_values.push(csq_val.to_string());
+                // MAX_AF: only include sub-populations (not globals).
+                if let Some(pop_name) = col.max_af_pop {
+                    if !freq.is_empty() {
+                        max_af_entries.push((pop_name, freq));
+                    }
+                }
+            }
+            let (max_af, max_af_pops) = if flags.max_af {
+                compute_max_af(&max_af_entries)
+            } else {
+                (String::new(), String::new())
+            };
+
+            // Clinical / phenotype fields.
+            let clin_sig = if flags.check_existing {
+                clin_sig_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let somatic_val = if flags.check_existing {
+                somatic_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .map(|v| if v != 0 { "1" } else { "" })
+                    .unwrap_or("")
+            } else {
+                ""
+            };
+            let pheno_val = if flags.check_existing {
+                pheno_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .map(|v| if v != 0 { "1" } else { "" })
+                    .unwrap_or("")
+            } else {
+                ""
+            };
+            let pubmed_val = if flags.pubmed {
+                pubmed_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            // Build the 33-field Batch 3 suffix (positions 41-73) shared across all transcripts.
+            let batch3_suffix = format!(
+                "{}|{}|{}|{clin_sig}|{somatic_val}|{pheno_val}|{pubmed_val}",
+                af_csq_values.join("|"),
+                max_af,
+                max_af_pops,
+            );
+
             let (csq_string, most_str) = if let Some(most_val) = &cached_most {
                 // Cache hit — produce single CSQ entry with empty transcript fields.
                 let csq_val = cached_csq.unwrap_or_default();
                 let impact = SoTerm::from_str(most_val)
                     .map(|t| impact_label(t.impact()))
                     .unwrap_or_else(|| impact_label(SoImpact::Modifier));
-                // 41-field CSQ: 29 base fields + 12 Batch 1 fields.
+                // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
                 let csq_entry = format!(
-                    "{vep_allele}|{csq_val}|{impact}|||||||||||||||||{variation_name}||||||||||\
-                     {variant_class}||||||||||||"
+                    "{vep_allele}|{csq_val}|{impact}|||||||||||||||||{existing_var}||||||||||\
+                     {variant_class}||||||||||||{batch3_suffix}"
                 );
                 (csq_entry, most_val.clone())
             } else {
@@ -1244,7 +1497,7 @@ impl AnnotateProvider {
                     let amino_acids = tc.amino_acids.as_deref().unwrap_or("");
                     let codons_str = tc.codons.as_deref().unwrap_or("");
                     let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
-                    let flags = tc.flags.as_deref().unwrap_or("");
+                    let tc_flags = tc.flags.as_deref().unwrap_or("");
                     let hgvsc = "";
                     let hgvsp = "";
                     let source_val = if merged { source } else { "" };
@@ -1285,21 +1538,23 @@ impl AnnotateProvider {
                         .and_then(|tx| tx.uniprot_isoform.as_deref())
                         .unwrap_or("");
 
+                    // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
                     csq_entries.push(format!(
                         "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                          {exon}|{intron}|{hgvsc}|{hgvsp}|\
                          {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                         |{distance}|{strand_str}|{flags}|{symbol_source}|{hgnc_id}|\
+                         {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
                          |||||{source_val}|\
                          {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
-                         {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}"
+                         {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
+                         {batch3_suffix}"
                     ));
                 }
                 if csq_entries.is_empty() {
                     let impact = impact_label(SoImpact::Modifier);
                     csq_entries.push(format!(
-                        "{vep_allele}|sequence_variant|{impact}|||||||||||||||||||||||||||\
-                         {variant_class}||||||||||||"
+                        "{vep_allele}|sequence_variant|{impact}|||||||||||||||||{existing_var}||||||||||\
+                         {variant_class}||||||||||||{batch3_suffix}"
                     ));
                 }
                 (csq_entries.join(","), most_str)
@@ -1760,5 +2015,123 @@ mod tests {
     #[test]
     fn test_flags_str_neither() {
         assert_eq!(flags_str_from_bools(false, false), None);
+    }
+
+    // --- extract_af_for_allele tests ---
+
+    #[test]
+    fn test_extract_af_single_allele() {
+        assert_eq!(extract_af_for_allele("T:0.9301", "T"), "0.9301");
+    }
+
+    #[test]
+    fn test_extract_af_multi_allele() {
+        assert_eq!(extract_af_for_allele("A:0.006,G:0.994", "G"), "0.994");
+        assert_eq!(extract_af_for_allele("A:0.006,G:0.994", "A"), "0.006");
+    }
+
+    #[test]
+    fn test_extract_af_deletion_allele() {
+        assert_eq!(extract_af_for_allele("-:0.001,T:0.999", "-"), "0.001");
+    }
+
+    #[test]
+    fn test_extract_af_no_match() {
+        assert_eq!(extract_af_for_allele("A:0.5", "G"), "");
+    }
+
+    #[test]
+    fn test_extract_af_empty_input() {
+        assert_eq!(extract_af_for_allele("", "T"), "");
+    }
+
+    #[test]
+    fn test_extract_af_zero_freq() {
+        assert_eq!(extract_af_for_allele("T:0", "T"), "0");
+    }
+
+    // --- compute_max_af tests ---
+
+    #[test]
+    fn test_compute_max_af_single_pop() {
+        let entries = vec![("gnomADg_NFE", "0.05")];
+        let (max_af, max_pops) = compute_max_af(&entries);
+        assert_eq!(max_af, "0.05");
+        assert_eq!(max_pops, "gnomADg_NFE");
+    }
+
+    #[test]
+    fn test_compute_max_af_multiple_pops() {
+        let entries = vec![
+            ("AFR_AF", "0.01"),
+            ("EUR_AF", "0.05"),
+            ("gnomADg_NFE", "0.03"),
+        ];
+        let (max_af, max_pops) = compute_max_af(&entries);
+        assert_eq!(max_af, "0.05");
+        assert_eq!(max_pops, "EUR_AF");
+    }
+
+    #[test]
+    fn test_compute_max_af_tie() {
+        let entries = vec![("AFR_AF", "0.05"), ("EUR_AF", "0.05")];
+        let (max_af, max_pops) = compute_max_af(&entries);
+        assert_eq!(max_af, "0.05");
+        assert_eq!(max_pops, "AFR_AF&EUR_AF");
+    }
+
+    #[test]
+    fn test_compute_max_af_empty() {
+        let entries: Vec<(&str, &str)> = vec![];
+        let (max_af, max_pops) = compute_max_af(&entries);
+        assert_eq!(max_af, "");
+        assert_eq!(max_pops, "");
+    }
+
+    #[test]
+    fn test_compute_max_af_skips_empty_freq() {
+        let entries = vec![("AF", ""), ("gnomADg_NFE", "0.02")];
+        let (max_af, max_pops) = compute_max_af(&entries);
+        assert_eq!(max_af, "0.02");
+        assert_eq!(max_pops, "gnomADg_NFE");
+    }
+
+    // --- VepFlags tests ---
+
+    #[test]
+    fn test_vep_flags_none() {
+        let flags = VepFlags::from_options_json(None);
+        assert!(!flags.check_existing);
+        assert!(!flags.af);
+    }
+
+    #[test]
+    fn test_vep_flags_af_implies_check_existing() {
+        let flags = VepFlags::from_options_json(Some(r#"{"af":true}"#));
+        assert!(flags.af);
+        assert!(flags.check_existing);
+    }
+
+    #[test]
+    fn test_vep_flags_pubmed_implies_check_existing() {
+        let flags = VepFlags::from_options_json(Some(r#"{"pubmed":true}"#));
+        assert!(flags.pubmed);
+        assert!(flags.check_existing);
+    }
+
+    #[test]
+    fn test_vep_flags_check_existing_standalone() {
+        let flags = VepFlags::from_options_json(Some(r#"{"check_existing":true}"#));
+        assert!(flags.check_existing);
+        assert!(!flags.af);
+        assert!(!flags.pubmed);
+    }
+
+    #[test]
+    fn test_vep_flags_af_group_enabled() {
+        let flags = VepFlags::from_options_json(Some(r#"{"af_gnomadg":true}"#));
+        assert!(flags.af_group_enabled(3)); // gnomADg
+        assert!(!flags.af_group_enabled(0)); // global AF
+        assert!(!flags.af_group_enabled(2)); // gnomADe
     }
 }

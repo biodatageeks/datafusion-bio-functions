@@ -318,6 +318,15 @@ fn build_options_json(args: &Args) -> Option<String> {
     // Disable extended probes for faster equi-join.
     entries.push("\"extended_probes\":false".to_string());
 
+    // Batch 3 flags — enable frequency and clinical CSQ fields.
+    entries.push("\"check_existing\":true".to_string());
+    entries.push("\"af\":true".to_string());
+    entries.push("\"af_1kg\":true".to_string());
+    entries.push("\"af_gnomade\":true".to_string());
+    entries.push("\"af_gnomadg\":true".to_string());
+    entries.push("\"max_af\":true".to_string());
+    entries.push("\"pubmed\":true".to_string());
+
     if args.merged {
         entries.push("\"merged\":true".to_string());
     }
@@ -456,9 +465,29 @@ fn run_vep_docker(
     cmd.arg("--ccds");
     cmd.arg("--uniprot");
 
-    // Explicit field order matching CSQ_FIELD_NAMES (41 fields).
+    // Batch 3 VEP flags — enable frequency and clinical CSQ fields.
+    cmd.arg("--check_existing");
+    cmd.arg("--af");
+    cmd.arg("--af_1kg");
+    cmd.arg("--af_gnomade");
+    cmd.arg("--af_gnomadg");
+    cmd.arg("--max_af");
+    cmd.arg("--pubmed");
+
+    // Explicit field order matching CSQ_FIELD_NAMES (74 fields).
     cmd.arg("--fields")
-        .arg("Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,EXON,INTRON,HGVSc,HGVSp,cDNA_position,CDS_position,Protein_position,Amino_acids,Codons,Existing_variation,DISTANCE,STRAND,FLAGS,SYMBOL_SOURCE,HGNC_ID,MOTIF_NAME,MOTIF_POS,HIGH_INF_POS,MOTIF_SCORE_CHANGE,TRANSCRIPTION_FACTORS,SOURCE,VARIANT_CLASS,CANONICAL,TSL,MANE_SELECT,MANE_PLUS_CLINICAL,ENSP,GENE_PHENO,CCDS,SWISSPROT,TREMBL,UNIPARC,UNIPROT_ISOFORM");
+        .arg("Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,EXON,INTRON,\
+              HGVSc,HGVSp,cDNA_position,CDS_position,Protein_position,Amino_acids,Codons,\
+              Existing_variation,DISTANCE,STRAND,FLAGS,SYMBOL_SOURCE,HGNC_ID,\
+              MOTIF_NAME,MOTIF_POS,HIGH_INF_POS,MOTIF_SCORE_CHANGE,TRANSCRIPTION_FACTORS,SOURCE,\
+              VARIANT_CLASS,CANONICAL,TSL,MANE_SELECT,MANE_PLUS_CLINICAL,ENSP,GENE_PHENO,CCDS,\
+              SWISSPROT,TREMBL,UNIPARC,UNIPROT_ISOFORM,\
+              AF,AFR_AF,AMR_AF,EAS_AF,EUR_AF,SAS_AF,\
+              gnomADe_AF,gnomADe_AFR,gnomADe_AMR,gnomADe_ASJ,gnomADe_EAS,gnomADe_FIN,\
+              gnomADe_MID,gnomADe_NFE,gnomADe_REMAINING,gnomADe_SAS,\
+              gnomADg_AF,gnomADg_AFR,gnomADg_AMI,gnomADg_AMR,gnomADg_ASJ,gnomADg_EAS,\
+              gnomADg_FIN,gnomADg_MID,gnomADg_NFE,gnomADg_REMAINING,gnomADg_SAS,\
+              MAX_AF,MAX_AF_POPS,CLIN_SIG,SOMATIC,PHENO,PUBMED");
 
     if merged {
         cmd.arg("--merged");
