@@ -2009,9 +2009,13 @@ fn classify_coding_change(
             }
         } else if frameshift {
             // Frameshifts: VEP uses X for the altered downstream sequence.
-            // If the first affected codon's amino acid is preserved, show it
-            // before X (e.g., "H/HX"); otherwise just "L/X".
-            if first_codon < new_aas.len() && new_aas[first_codon] == old_aas[first_codon] {
+            // For insertion frameshifts only: if the first affected codon's
+            // amino acid is preserved, show it before X (e.g., "H/HX").
+            // Deletion frameshifts always use "{ref}/X".
+            if alt_len > ref_len
+                && first_codon < new_aas.len()
+                && new_aas[first_codon] == old_aas[first_codon]
+            {
                 let preserved: String = std::iter::once(new_aas[first_codon]).collect();
                 class.amino_acids = Some(format!("{ref_aa}/{preserved}X"));
             } else {
@@ -2240,8 +2244,15 @@ fn classify_insertion(
     if first_codon < old_aas.len() {
         let ref_aa = old_aas[first_codon];
         if frameshift {
-            // VEP always uses X for frameshift insertions.
-            class.amino_acids = Some(format!("{ref_aa}/X"));
+            // Frameshifts: VEP uses X for the altered downstream sequence.
+            // If the first affected codon's amino acid is preserved, show it
+            // before X (e.g., "H/HX"); otherwise just "L/X".
+            if first_codon < new_aas.len() && new_aas[first_codon] == old_aas[first_codon] {
+                let preserved: String = std::iter::once(new_aas[first_codon]).collect();
+                class.amino_acids = Some(format!("{ref_aa}/{preserved}X"));
+            } else {
+                class.amino_acids = Some(format!("{ref_aa}/X"));
+            }
         } else {
             // Inframe insertion
             // For insertions, the alt spans from the insertion point through
@@ -2452,10 +2463,14 @@ fn compute_cdna_position(
         return None;
     }
     let is_ins = variant.ref_allele == "-";
-    // Check if variant overlaps any exon
+    // Check if variant overlaps any exon.
+    // For insertions, either flanking position (start-1 or start) in an exon
+    // suffices — this handles insertions right at exon boundaries.
     let in_exon = tx_exons.iter().any(|e| {
         if is_ins {
-            variant.start > e.start && variant.start <= e.end
+            let left = variant.start - 1;
+            let right = variant.start;
+            (left >= e.start && left <= e.end) || (right >= e.start && right <= e.end)
         } else {
             overlaps(variant.start, variant.end, e.start, e.end)
         }
@@ -2472,7 +2487,26 @@ fn compute_cdna_position(
                 let hi = a.max(b);
                 Some(format!("{lo}-{hi}"))
             }
-            _ => None,
+            // Insertion at exon boundary: one flanking position is intronic.
+            // The two cDNA positions are always adjacent, so infer the missing
+            // one from the known one, accounting for strand direction.
+            (None, Some(b)) => {
+                let other = if strand >= 0 {
+                    b.saturating_sub(1)
+                } else {
+                    b + 1
+                };
+                let lo = b.min(other);
+                let hi = b.max(other);
+                Some(format!("{lo}-{hi}"))
+            }
+            (Some(a), None) => {
+                let other = if strand >= 0 { a + 1 } else { a.saturating_sub(1) };
+                let lo = a.min(other);
+                let hi = a.max(other);
+                Some(format!("{lo}-{hi}"))
+            }
+            (None, None) => None,
         }
     } else {
         let start_cdna = genomic_to_cdna_index(tx_exons, strand, variant.start);
