@@ -7,6 +7,7 @@
 //! - otherwise falls back to phase-1.5 known-variant CSQ placeholders.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Debug, Formatter};
@@ -190,6 +191,113 @@ impl VepFlags {
             _ => false,
         }
     }
+}
+
+/// Aggregated data from ALL co-located variants at the same position.
+///
+/// VEP collects every variant at the same chromosomal position (regardless of
+/// allele matching) and aggregates their metadata into `&`-separated strings.
+/// This struct holds the pre-aggregated values for a given (chrom, start, end).
+#[derive(Debug, Default, Clone)]
+struct ColocatedData {
+    /// All variation names joined with `&`, ordered non-somatic first.
+    existing_variation: String,
+    /// Somatic flags ("0"/"1") for each co-located variant, joined with `&`.
+    /// Empty string when there is exactly one non-somatic variant.
+    somatic_flags: String,
+    /// Phenotype flags ("0"/"1") for each co-located variant, joined with `&`.
+    /// Empty string when there is exactly one non-phenotype variant.
+    pheno_flags: String,
+}
+
+/// Build co-located variant aggregation from cache entries.
+///
+/// Groups cache rows by (chrom, start, end) and produces one `ColocatedData`
+/// per position. Variants are ordered: non-somatic first, then somatic, with
+/// alphabetical tie-breaking on variation_name within each group.
+fn build_colocated_map(
+    coloc_batches: &[RecordBatch],
+) -> HashMap<(String, i64, i64), ColocatedData> {
+    // Collect raw entries keyed by position.
+    let mut raw: HashMap<(String, i64, i64), Vec<(String, i64, i64)>> = HashMap::new();
+
+    for batch in coloc_batches {
+        let schema = batch.schema();
+        let chrom_idx = schema.index_of("coloc_chrom").unwrap_or(0);
+        let start_idx = schema.index_of("coloc_start").unwrap_or(1);
+        let end_idx = schema.index_of("coloc_end").unwrap_or(2);
+        let var_name_idx = schema.index_of("coloc_variation_name").unwrap_or(3);
+        let somatic_idx = schema.index_of("coloc_somatic").unwrap_or(4);
+        let pheno_idx = schema.index_of("coloc_pheno").unwrap_or(5);
+
+        for row in 0..batch.num_rows() {
+            let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                continue;
+            };
+            let end = int64_at(batch.column(end_idx).as_ref(), row).unwrap_or(start);
+            let var_name = string_at(batch.column(var_name_idx).as_ref(), row)
+                .unwrap_or_default();
+            let somatic = int64_at(batch.column(somatic_idx).as_ref(), row).unwrap_or(0);
+            let pheno = int64_at(batch.column(pheno_idx).as_ref(), row).unwrap_or(0);
+
+            if var_name.is_empty() {
+                continue;
+            }
+            raw.entry((chrom, start, end))
+                .or_default()
+                .push((var_name, somatic, pheno));
+        }
+    }
+
+    // Aggregate into ColocatedData.
+    let mut map = HashMap::with_capacity(raw.len());
+    for (key, mut entries) in raw {
+        // Sort to match VEP's co-located variant ordering:
+        // rs* IDs (dbSNP) first, then others (HGMD, COSMIC), alphabetical within.
+        entries.sort_by(|a, b| {
+            let a_rs = a.0.starts_with("rs");
+            let b_rs = b.0.starts_with("rs");
+            b_rs.cmp(&a_rs).then_with(|| a.0.cmp(&b.0))
+        });
+
+        let names: Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
+        let existing_variation = names.join("&");
+
+        let somatic_strs: Vec<&str> = entries
+            .iter()
+            .map(|(_, s, _)| if *s != 0 { "1" } else { "0" })
+            .collect();
+        let pheno_strs: Vec<&str> = entries
+            .iter()
+            .map(|(_, _, p)| if *p != 0 { "1" } else { "0" })
+            .collect();
+
+        // VEP behavior: when all co-located variants are non-somatic (0),
+        // output empty string. Only output "0&1" style when at least one is somatic.
+        let somatic_flags = if somatic_strs.iter().all(|s| *s == "0") {
+            String::new()
+        } else {
+            somatic_strs.join("&")
+        };
+        let pheno_flags = if pheno_strs.iter().all(|s| *s == "0") {
+            String::new()
+        } else {
+            pheno_strs.join("&")
+        };
+
+        map.insert(
+            key,
+            ColocatedData {
+                existing_variation,
+                somatic_flags,
+                pheno_flags,
+            },
+        );
+    }
+    map
 }
 
 /// Replace commas with `&` in a CSQ field value.
@@ -1122,12 +1230,91 @@ impl AnnotateProvider {
         Ok(out)
     }
 
+    /// Query the variation cache for ALL variants at positions found in base_batches.
+    ///
+    /// Aggregates co-located variant data (Existing_variation, SOMATIC, PHENO)
+    /// by (chrom, start, end), including non-allele-matching entries like COSMIC.
+    async fn build_colocated_variant_map(
+        &self,
+        base_batches: &[RecordBatch],
+        cache_table: &str,
+    ) -> Result<HashMap<(String, i64, i64), ColocatedData>> {
+        // Extract distinct (chrom, start, end) from base_batches.
+        let mut positions: HashSet<(String, i64, i64)> = HashSet::new();
+        for batch in base_batches {
+            let chrom_idx = batch.schema().index_of("chrom").ok();
+            let start_idx = batch.schema().index_of("start").ok();
+            let end_idx = batch.schema().index_of("end").ok();
+            let (Some(ci), Some(si), Some(ei)) = (chrom_idx, start_idx, end_idx) else {
+                continue;
+            };
+            for row in 0..batch.num_rows() {
+                if let (Some(chrom), Some(start)) = (
+                    string_at(batch.column(ci).as_ref(), row),
+                    int64_at(batch.column(si).as_ref(), row),
+                ) {
+                    let end = int64_at(batch.column(ei).as_ref(), row).unwrap_or(start);
+                    let chrom_norm = chrom
+                        .strip_prefix("chr")
+                        .unwrap_or(&chrom)
+                        .to_string();
+                    positions.insert((chrom_norm, start, end));
+                }
+            }
+        }
+        if positions.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Register a temporary table of positions for an efficient semi-join.
+        let chroms: Vec<&str> = positions.iter().map(|(c, _, _)| c.as_str()).collect();
+        let starts: Vec<i64> = positions.iter().map(|(_, s, _)| *s).collect();
+        let ends: Vec<i64> = positions.iter().map(|(_, _, e)| *e).collect();
+        let pos_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("p_chrom", DataType::Utf8, false),
+                Field::new("p_start", DataType::Int64, false),
+                Field::new("p_end", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(chroms)),
+                Arc::new(Int64Array::from(starts)),
+                Arc::new(Int64Array::from(ends)),
+            ],
+        )?;
+        let pos_table = MemTable::try_new(pos_batch.schema(), vec![vec![pos_batch]])?;
+        self.session
+            .register_table("__vep_coloc_positions", Arc::new(pos_table))?;
+
+        let coloc_sql = format!(
+            "SELECT c.`chrom` AS coloc_chrom, \
+                    CAST(c.`start` AS BIGINT) AS coloc_start, \
+                    CAST(c.`end` AS BIGINT) AS coloc_end, \
+                    c.`variation_name` AS coloc_variation_name, \
+                    CAST(COALESCE(c.`somatic`, 0) AS BIGINT) AS coloc_somatic, \
+                    CAST(COALESCE(c.`phenotype_or_disease`, 0) AS BIGINT) AS coloc_pheno \
+             FROM `{cache_table}` AS c \
+             INNER JOIN __vep_coloc_positions AS p \
+             ON c.`chrom` = p.`p_chrom` \
+             AND CAST(c.`start` AS BIGINT) = p.`p_start` \
+             AND CAST(c.`end` AS BIGINT) = p.`p_end` \
+             WHERE c.`variation_name` IS NOT NULL"
+        );
+        let coloc_batches = self.session.sql(&coloc_sql).await?.collect().await?;
+
+        // Clean up temp table (best-effort).
+        let _ = self.session.deregister_table("__vep_coloc_positions");
+
+        Ok(build_colocated_map(&coloc_batches))
+    }
+
     async fn scan_with_transcript_engine(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         lookup_sql: &str,
         requested_columns: &[&str],
+        cache_table: &str,
         transcripts_table: Option<&str>,
         exons_table: Option<&str>,
         translations_table: Option<&str>,
@@ -1150,6 +1337,18 @@ impl AnnotateProvider {
             lookup_sql
         );
         let base_batches = self.session.sql(&base_query).await?.collect().await?;
+
+        // Build co-located variant aggregation.
+        // VEP includes ALL variants at the same position (regardless of allele)
+        // for Existing_variation, SOMATIC, and PHENO fields.
+        let flags = VepFlags::from_options_json(self.options_json.as_deref());
+        let colocated_map = if flags.check_existing {
+            self.build_colocated_variant_map(&base_batches, cache_table)
+                .await
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
 
         // Check if there are any cache misses (rows without cached most_severe).
         // Only load context tables if we actually need the transcript engine.
@@ -1249,8 +1448,12 @@ impl AnnotateProvider {
 
         let mut annotated_batches = Vec::with_capacity(base_batches.len());
         for batch in &base_batches {
-            annotated_batches
-                .push(self.annotate_batch_with_transcript_engine(batch, &engine, &ctx)?);
+            annotated_batches.push(self.annotate_batch_with_transcript_engine(
+                batch,
+                &engine,
+                &ctx,
+                &colocated_map,
+            )?);
         }
 
         let projected_batches = if let Some(indices) = projection {
@@ -1277,6 +1480,7 @@ impl AnnotateProvider {
         batch: &RecordBatch,
         engine: &TranscriptConsequenceEngine,
         ctx: &PreparedContext<'_>,
+        colocated_map: &HashMap<(String, i64, i64), ColocatedData>,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
@@ -1357,8 +1561,15 @@ impl AnnotateProvider {
                 .unwrap_or_default();
 
             // --- Batch 3: per-variant fields (same for every transcript entry) ---
+            // Look up co-located variant aggregation (all variants at same position).
+            let start_val = int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0);
+            let end_val = int64_at(batch.column(end_idx).as_ref(), row).unwrap_or(start_val);
+            let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
+            let coloc = colocated_map.get(&(chrom_norm.to_string(), start_val, end_val));
+
+            let coloc_existing = coloc.map(|c| c.existing_variation.as_str());
             let existing_var = if flags.check_existing {
-                &variation_name
+                coloc_existing.unwrap_or(&variation_name)
             } else {
                 ""
             };
@@ -1419,19 +1630,27 @@ impl AnnotateProvider {
             } else {
                 String::new()
             };
-            let somatic_val = if flags.check_existing {
-                somatic_idx
-                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
-                    .map(|v| if v != 0 { "1" } else { "" })
-                    .unwrap_or("")
+            let somatic_val: &str = if flags.check_existing {
+                if let Some(c) = coloc {
+                    &c.somatic_flags
+                } else {
+                    somatic_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .map(|v| if v != 0 { "1" } else { "" })
+                        .unwrap_or("")
+                }
             } else {
                 ""
             };
-            let pheno_val = if flags.check_existing {
-                pheno_idx
-                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
-                    .map(|v| if v != 0 { "1" } else { "" })
-                    .unwrap_or("")
+            let pheno_val: &str = if flags.check_existing {
+                if let Some(c) = coloc {
+                    &c.pheno_flags
+                } else {
+                    pheno_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .map(|v| if v != 0 { "1" } else { "" })
+                        .unwrap_or("")
+                }
             } else {
                 ""
             };
@@ -1920,6 +2139,7 @@ impl TableProvider for AnnotateProvider {
                     projection,
                     &lookup_sql,
                     &requested_columns,
+                    &cache_table,
                     tx_table,
                     ex_table,
                     translations_table.as_deref(),
