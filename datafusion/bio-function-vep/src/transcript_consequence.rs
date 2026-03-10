@@ -119,6 +119,18 @@ pub struct TranscriptFeature {
     pub cds_end_nf: bool,
     /// Pre-formatted FLAGS string preserving VEP's attribute encounter order.
     pub flags_str: Option<String>,
+    // --- Batch 1 fields (top-level cache columns) ---
+    pub is_canonical: bool,
+    pub tsl: Option<i32>,
+    pub mane_select: Option<String>,
+    pub mane_plus_clinical: Option<String>,
+    pub translation_stable_id: Option<String>,
+    pub gene_phenotype: bool,
+    pub ccds: Option<String>,
+    pub swissprot: Option<String>,
+    pub trembl: Option<String>,
+    pub uniparc: Option<String>,
+    pub uniprot_isoform: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2748,6 +2760,17 @@ mod tests {
             cds_start_nf: false,
             cds_end_nf: false,
             flags_str: None,
+            is_canonical: false,
+            tsl: None,
+            mane_select: None,
+            mane_plus_clinical: None,
+            translation_stable_id: None,
+            gene_phenotype: false,
+            ccds: None,
+            swissprot: None,
+            trembl: None,
+            uniparc: None,
+            uniprot_isoform: None,
         }
     }
 

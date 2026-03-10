@@ -378,9 +378,22 @@ impl AnnotateProvider {
             let gene_hgnc_id_idx = schema.index_of("gene_hgnc_id").ok();
             let source_idx = schema.index_of("source").ok();
             let version_idx = schema.index_of("version").ok();
+            let raw_json_idx = schema.index_of("raw_object_json").ok();
             let cds_start_nf_idx = schema.index_of("cds_start_nf").ok();
             let cds_end_nf_idx = schema.index_of("cds_end_nf").ok();
             let mirna_regions_idx = schema.index_of("mature_mirna_regions").ok();
+            // Batch 1 columns.
+            let is_canonical_idx = schema.index_of("is_canonical").ok();
+            let tsl_idx = schema.index_of("tsl").ok();
+            let mane_select_idx = schema.index_of("mane_select").ok();
+            let mane_plus_clinical_idx = schema.index_of("mane_plus_clinical").ok();
+            let translation_stable_id_idx = schema.index_of("translation_stable_id").ok();
+            let gene_phenotype_idx = schema.index_of("gene_phenotype").ok();
+            let ccds_idx = schema.index_of("ccds").ok();
+            let swissprot_idx = schema.index_of("swissprot").ok();
+            let trembl_idx = schema.index_of("trembl").ok();
+            let uniparc_idx = schema.index_of("uniparc").ok();
+            let uniprot_isoform_idx = schema.index_of("uniprot_isoform").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -442,6 +455,33 @@ impl AnnotateProvider {
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .and_then(|v| i32::try_from(v).ok());
 
+                // Batch 1 fields.
+                let is_canonical = is_canonical_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
+                let tsl = tsl_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .and_then(|v| i32::try_from(v).ok());
+                let mane_select = mane_select_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let mane_plus_clinical = mane_plus_clinical_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let translation_stable_id = translation_stable_id_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let gene_phenotype = gene_phenotype_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
+                let ccds =
+                    ccds_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let swissprot =
+                    swissprot_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let trembl =
+                    trembl_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let uniparc =
+                    uniparc_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let uniprot_isoform = uniprot_isoform_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+
                 out.push(TranscriptFeature {
                     transcript_id,
                     chrom,
@@ -461,6 +501,17 @@ impl AnnotateProvider {
                     cds_start_nf,
                     cds_end_nf,
                     flags_str,
+                    is_canonical,
+                    tsl,
+                    mane_select,
+                    mane_plus_clinical,
+                    translation_stable_id,
+                    gene_phenotype,
+                    ccds,
+                    swissprot,
+                    trembl,
+                    uniparc,
+                    uniprot_isoform,
                 });
             }
         }
@@ -1092,11 +1143,9 @@ impl AnnotateProvider {
             };
 
             // VEP-style allele minimization: strip shared prefix and suffix between REF and ALT.
-            let vep_allele = {
-                let ref_al = string_at(batch.column(ref_idx).as_ref(), row).unwrap_or_default();
-                let (_vep_ref, vep_alt) = vcf_to_vep_allele(&ref_al, &alt_allele);
-                vep_alt
-            };
+            let ref_al = string_at(batch.column(ref_idx).as_ref(), row).unwrap_or_default();
+            let (vep_ref, vep_allele) = vcf_to_vep_allele(&ref_al, &alt_allele);
+            let variant_class = classify_variant(&vep_ref, &vep_allele);
 
             // Cache-hit fast path: use pre-computed consequence from variation cache.
             let cached_most =
@@ -1114,12 +1163,11 @@ impl AnnotateProvider {
                 let impact = SoTerm::from_str(most_val)
                     .map(|t| impact_label(t.impact()))
                     .unwrap_or_else(|| impact_label(SoImpact::Modifier));
-                // 29-field CSQ: Allele|Consequence|IMPACT|SYMBOL|Gene|Feature_type|Feature|BIOTYPE|
-                // EXON|INTRON|HGVSc|HGVSp|cDNA_pos|CDS_pos|Protein_pos|AA|Codons|
-                // Existing_variation|DISTANCE|STRAND|FLAGS|SYMBOL_SOURCE|HGNC_ID|
-                // MOTIF_NAME|MOTIF_POS|HIGH_INF_POS|MOTIF_SCORE_CHANGE|TRANSCRIPTION_FACTORS|SOURCE
-                let csq_entry =
-                    format!("{vep_allele}|{csq_val}|{impact}|||||||||||||||||{variation_name}||||||||||");
+                // 41-field CSQ: 29 base fields + 12 Batch 1 fields.
+                let csq_entry = format!(
+                    "{vep_allele}|{csq_val}|{impact}|||||||||||||||||{variation_name}||||||||||\
+                     {variant_class}||||||||||||"
+                );
                 (csq_entry, most_val.clone())
             } else {
                 // Cache miss — compute via transcript engine and produce per-transcript CSQ.
@@ -1172,9 +1220,9 @@ impl AnnotateProvider {
                     let feature_type = tc.feature_type.as_str();
                     let feature = tc.transcript_id.as_deref().unwrap_or("");
                     // Look up transcript metadata via index (zero-copy).
+                    let tx_opt = tc.transcript_idx.map(|idx| &ctx.transcripts[idx]);
                     let (symbol, gene, biotype_tx, strand_str, symbol_source, hgnc_id, source) =
-                        if let Some(idx) = tc.transcript_idx {
-                            let tx = ctx.transcripts[idx];
+                        if let Some(tx) = tx_opt {
                             (
                                 tx.gene_symbol.as_deref().unwrap_or(""),
                                 tx.gene_stable_id.as_deref().unwrap_or(""),
@@ -1197,24 +1245,61 @@ impl AnnotateProvider {
                     let codons_str = tc.codons.as_deref().unwrap_or("");
                     let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
                     let flags = tc.flags.as_deref().unwrap_or("");
-                    // HGVSc/HGVSp require VEP's --hgvs flag + FASTA; leave
-                    // empty by default to preserve schema compatibility.
                     let hgvsc = "";
                     let hgvsp = "";
-                    // VEP only emits SOURCE when using --merged cache.
                     let source_val = if merged { source } else { "" };
+
+                    // Batch 1 fields from transcript metadata.
+                    let canonical = tx_opt
+                        .map(|tx| if tx.is_canonical { "YES" } else { "" })
+                        .unwrap_or("");
+                    let tsl_str = tx_opt
+                        .and_then(|tx| tx.tsl)
+                        .map(|v| v.to_string())
+                        .unwrap_or_default();
+                    let mane_select = tx_opt
+                        .and_then(|tx| tx.mane_select.as_deref())
+                        .unwrap_or("");
+                    let mane_plus = tx_opt
+                        .and_then(|tx| tx.mane_plus_clinical.as_deref())
+                        .unwrap_or("");
+                    let ensp = tx_opt
+                        .and_then(|tx| tx.translation_stable_id.as_deref())
+                        .unwrap_or("");
+                    let gene_pheno = tx_opt
+                        .map(|tx| if tx.gene_phenotype { "1" } else { "" })
+                        .unwrap_or("");
+                    let ccds = tx_opt
+                        .and_then(|tx| tx.ccds.as_deref())
+                        .unwrap_or("");
+                    let swissprot = tx_opt
+                        .and_then(|tx| tx.swissprot.as_deref())
+                        .unwrap_or("");
+                    let trembl = tx_opt
+                        .and_then(|tx| tx.trembl.as_deref())
+                        .unwrap_or("");
+                    let uniparc = tx_opt
+                        .and_then(|tx| tx.uniparc.as_deref())
+                        .unwrap_or("");
+                    let uniprot_isoform = tx_opt
+                        .and_then(|tx| tx.uniprot_isoform.as_deref())
+                        .unwrap_or("");
+
                     csq_entries.push(format!(
                         "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                          {exon}|{intron}|{hgvsc}|{hgvsp}|\
                          {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                          |{distance}|{strand_str}|{flags}|{symbol_source}|{hgnc_id}|\
-                         |||||{source_val}"
+                         |||||{source_val}|\
+                         {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
+                         {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}"
                     ));
                 }
                 if csq_entries.is_empty() {
                     let impact = impact_label(SoImpact::Modifier);
                     csq_entries.push(format!(
-                        "{vep_allele}|sequence_variant|{impact}|||||||||||||||||||||||||||"
+                        "{vep_allele}|sequence_variant|{impact}|||||||||||||||||||||||||||\
+                         {variant_class}||||||||||||"
                     ));
                 }
                 (csq_entries.join(","), most_str)
@@ -1266,6 +1351,17 @@ fn impact_label(impact: SoImpact) -> &'static str {
         SoImpact::Moderate => "MODERATE",
         SoImpact::Low => "LOW",
         SoImpact::Modifier => "MODIFIER",
+    }
+}
+
+/// Classify a variant from VEP-minimized REF/ALT alleles.
+fn classify_variant(vep_ref: &str, vep_alt: &str) -> &'static str {
+    match (vep_ref, vep_alt) {
+        ("-", a) if !a.is_empty() => "insertion",
+        (r, "-") if !r.is_empty() => "deletion",
+        (r, a) if r.len() == 1 && a.len() == 1 => "SNV",
+        (r, a) if r.len() == a.len() => "substitution",
+        _ => "indel",
     }
 }
 

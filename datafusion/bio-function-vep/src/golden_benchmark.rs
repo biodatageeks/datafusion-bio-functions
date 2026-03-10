@@ -464,7 +464,7 @@ pub fn collect_discrepancies(
     out
 }
 
-/// CSQ field names matching VEP default `--fields` output order (29 fields).
+/// CSQ field names matching VEP `--fields` output order (41 fields).
 pub const CSQ_FIELD_NAMES: &[&str] = &[
     "Allele",
     "Consequence",
@@ -495,6 +495,19 @@ pub const CSQ_FIELD_NAMES: &[&str] = &[
     "MOTIF_SCORE_CHANGE",
     "TRANSCRIPTION_FACTORS",
     "SOURCE",
+    // Batch 1 fields.
+    "VARIANT_CLASS",
+    "CANONICAL",
+    "TSL",
+    "MANE_SELECT",
+    "MANE_PLUS_CLINICAL",
+    "ENSP",
+    "GENE_PHENO",
+    "CCDS",
+    "SWISSPROT",
+    "TREMBL",
+    "UNIPARC",
+    "UNIPROT_ISOFORM",
 ];
 
 /// Sample of a field-level mismatch for debugging.
@@ -943,14 +956,16 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
     }
 
     #[test]
-    fn csq_field_names_has_29_entries() {
-        assert_eq!(CSQ_FIELD_NAMES.len(), 29);
+    fn csq_field_names_has_41_entries() {
+        assert_eq!(CSQ_FIELD_NAMES.len(), 41);
         assert_eq!(CSQ_FIELD_NAMES[0], "Allele");
         assert_eq!(CSQ_FIELD_NAMES[1], "Consequence");
         assert_eq!(CSQ_FIELD_NAMES[6], "Feature");
         assert_eq!(CSQ_FIELD_NAMES[17], "Existing_variation");
         assert_eq!(CSQ_FIELD_NAMES[19], "STRAND");
         assert_eq!(CSQ_FIELD_NAMES[28], "SOURCE");
+        assert_eq!(CSQ_FIELD_NAMES[29], "VARIANT_CLASS");
+        assert_eq!(CSQ_FIELD_NAMES[40], "UNIPROT_ISOFORM");
     }
 
     #[test]
@@ -988,7 +1003,7 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         let ours = golden.clone();
         let report = compare_csq_fields(&golden, &ours);
         assert_eq!(report.total_entries_compared, 1);
-        assert_eq!(report.field_match_counts.len(), 29);
+        assert_eq!(report.field_match_counts.len(), 41);
         for &c in &report.field_match_counts {
             assert_eq!(c, 1, "all fields should match");
         }

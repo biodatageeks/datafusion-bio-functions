@@ -1863,7 +1863,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_annotate_vep_csq_has_29_pipe_delimited_fields_per_transcript() {
+    async fn test_annotate_vep_csq_has_41_pipe_delimited_fields_per_transcript() {
         let ctx = create_vep_session();
         ctx.register_table("vcf_data", Arc::new(vcf_table()))
             .expect("register vcf table");
@@ -1886,13 +1886,13 @@ mod tests {
 
         for csq_opt in &csq_values {
             let Some(csq) = csq_opt else { continue };
-            // Each CSQ entry (comma-separated) should have exactly 29 pipe-delimited fields.
+            // Each CSQ entry (comma-separated) should have exactly 41 pipe-delimited fields.
             for entry in csq.split(',') {
                 let fields: Vec<&str> = entry.split('|').collect();
                 assert_eq!(
                     fields.len(),
-                    29,
-                    "CSQ entry should have 29 pipe-delimited fields, got {}: {:?}",
+                    41,
+                    "CSQ entry should have 41 pipe-delimited fields, got {}: {:?}",
                     fields.len(),
                     entry
                 );

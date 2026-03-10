@@ -446,9 +446,19 @@ fn run_vep_docker(
     // Enable regulatory feature annotations (VEP skips them by default).
     cmd.arg("--regulatory");
 
-    // Use all default VEP CSQ fields for full per-field comparison.
+    // Batch 1 VEP flags — enable additional CSQ fields for comparison.
+    cmd.arg("--variant_class");
+    cmd.arg("--canonical");
+    cmd.arg("--tsl");
+    cmd.arg("--mane");
+    cmd.arg("--protein");
+    cmd.arg("--gene_phenotype");
+    cmd.arg("--ccds");
+    cmd.arg("--uniprot");
+
+    // Explicit field order matching CSQ_FIELD_NAMES (41 fields).
     cmd.arg("--fields")
-        .arg("Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,EXON,INTRON,HGVSc,HGVSp,cDNA_position,CDS_position,Protein_position,Amino_acids,Codons,Existing_variation,DISTANCE,STRAND,FLAGS,SYMBOL_SOURCE,HGNC_ID,MOTIF_NAME,MOTIF_POS,HIGH_INF_POS,MOTIF_SCORE_CHANGE,TRANSCRIPTION_FACTORS,SOURCE");
+        .arg("Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,EXON,INTRON,HGVSc,HGVSp,cDNA_position,CDS_position,Protein_position,Amino_acids,Codons,Existing_variation,DISTANCE,STRAND,FLAGS,SYMBOL_SOURCE,HGNC_ID,MOTIF_NAME,MOTIF_POS,HIGH_INF_POS,MOTIF_SCORE_CHANGE,TRANSCRIPTION_FACTORS,SOURCE,VARIANT_CLASS,CANONICAL,TSL,MANE_SELECT,MANE_PLUS_CLINICAL,ENSP,GENE_PHENO,CCDS,SWISSPROT,TREMBL,UNIPARC,UNIPROT_ISOFORM");
 
     if merged {
         cmd.arg("--merged");
