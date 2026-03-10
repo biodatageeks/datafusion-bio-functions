@@ -497,12 +497,24 @@ pub const CSQ_FIELD_NAMES: &[&str] = &[
     "SOURCE",
 ];
 
+/// Sample of a field-level mismatch for debugging.
+#[derive(Debug, Clone)]
+pub struct FieldMismatchSample {
+    pub variant_key: VariantKey,
+    pub allele: String,
+    pub feature: String,
+    pub golden_val: String,
+    pub ours_val: String,
+}
+
 /// Per-field match report for CSQ comparison.
 #[derive(Debug, Clone)]
 pub struct CsqFieldReport {
     pub field_names: Vec<String>,
     pub field_match_counts: Vec<usize>,
     pub total_entries_compared: usize,
+    /// Up to 5 mismatch samples per field index, for debugging.
+    pub field_mismatch_samples: HashMap<usize, Vec<FieldMismatchSample>>,
 }
 
 /// Diagnostic report for unmatched CSQ entries between golden and ours.
@@ -609,11 +621,7 @@ pub fn diagnose_unmatched_csq(
                 let ft = oe.fields.get(5).cloned().unwrap_or_default();
                 *ours_only_by_ft.entry(ft.clone()).or_default() += 1;
                 if ours_only_sample.len() < 30 {
-                    ours_only_sample.push((
-                        oe.allele().to_string(),
-                        oe.feature().to_string(),
-                        ft,
-                    ));
+                    ours_only_sample.push((oe.allele().to_string(), oe.feature().to_string(), ft));
                 }
             }
         }
@@ -663,6 +671,7 @@ pub fn compare_csq_fields(
 ) -> CsqFieldReport {
     let field_count = CSQ_FIELD_NAMES.len();
     let mut field_match_counts = vec![0usize; field_count];
+    let mut field_mismatch_samples: HashMap<usize, Vec<FieldMismatchSample>> = HashMap::new();
     let mut total_entries = 0usize;
 
     let golden_map: HashMap<VariantKey, &VariantAnnotation> =
@@ -711,6 +720,17 @@ pub fn compare_csq_fields(
                 let ours_val = ours_entry.fields.get(i).map(|s| s.as_str()).unwrap_or("");
                 if golden_val == ours_val {
                     field_match_counts[i] += 1;
+                } else {
+                    let samples = field_mismatch_samples.entry(i).or_insert_with(Vec::new);
+                    if samples.len() < 10 {
+                        samples.push(FieldMismatchSample {
+                            variant_key: key.clone(),
+                            allele: golden_entry.allele().to_string(),
+                            feature: golden_entry.feature().to_string(),
+                            golden_val: golden_val.to_string(),
+                            ours_val: ours_val.to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -720,6 +740,7 @@ pub fn compare_csq_fields(
         field_names: CSQ_FIELD_NAMES.iter().map(|s| s.to_string()).collect(),
         field_match_counts,
         total_entries_compared: total_entries,
+        field_mismatch_samples,
     }
 }
 

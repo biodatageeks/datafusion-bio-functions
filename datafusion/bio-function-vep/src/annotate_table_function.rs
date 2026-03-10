@@ -160,8 +160,7 @@ mod tests {
             columns.push(Arc::new(StringArray::from(vec![val])));
         }
         let schema = Arc::new(Schema::new(fields));
-        let batch =
-            RecordBatch::try_new(schema.clone(), columns).expect("valid cache batch");
+        let batch = RecordBatch::try_new(schema.clone(), columns).expect("valid cache batch");
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid cache memtable")
     }
 

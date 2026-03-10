@@ -665,6 +665,22 @@ fn print_csq_field_report(report: &CsqFieldReport) {
             "  {:<20} {}/{} ({:.1}%)",
             name, matches, report.total_entries_compared, pct
         );
+        // Print mismatch samples for fields with mismatches
+        if matches < report.total_entries_compared {
+            if let Some(samples) = report.field_mismatch_samples.get(&i) {
+                for s in samples {
+                    println!(
+                        "    mismatch: {}:{} {}|{} golden={:?} ours={:?}",
+                        s.variant_key.chrom,
+                        s.variant_key.pos,
+                        s.allele,
+                        s.feature,
+                        s.golden_val,
+                        s.ours_val
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -687,7 +703,11 @@ fn print_unmatched_report(report: &CsqUnmatchedReport) {
         let mut sorted: Vec<_> = report.golden_only_by_ft.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         for (ft, count) in &sorted {
-            let label = if ft.is_empty() { "(empty)" } else { ft.as_str() };
+            let label = if ft.is_empty() {
+                "(empty)"
+            } else {
+                ft.as_str()
+            };
             println!("    {:<25} {}", label, count);
         }
     }
@@ -696,7 +716,11 @@ fn print_unmatched_report(report: &CsqUnmatchedReport) {
         let mut sorted: Vec<_> = report.ours_only_by_ft.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
         for (ft, count) in &sorted {
-            let label = if ft.is_empty() { "(empty)" } else { ft.as_str() };
+            let label = if ft.is_empty() {
+                "(empty)"
+            } else {
+                ft.as_str()
+            };
             println!("    {:<25} {}", label, count);
         }
     }

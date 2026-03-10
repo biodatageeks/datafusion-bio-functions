@@ -17,7 +17,7 @@ use std::sync::Arc;
 /// VCF: REF="A", ALT="G"       → VEP: "A/G"     (SNV)
 /// VCF: REF="AC", ALT="GT"     → VEP: "AC/GT"   (MNV)
 /// VCF: REF="TCAC", ALT="T"    → VEP: "CAC/-"   (deletion, prefix+suffix)
-/// VCF: REF="ATCG", ALT="AGCG" → VEP: "T/G"     (shared prefix "A", shared suffix "CG")
+/// VCF: REF="ATCG", ALT="AGCG" → VEP: "TCG/GCG"  (MNV: prefix-only trim, no suffix trim)
 pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String) {
     if ref_allele.len() == 1 && alt_allele.len() == 1 {
         // SNV
@@ -34,15 +34,19 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
         .take_while(|(a, b)| a == b)
         .count();
 
-    // Find common suffix (not overlapping with prefix)
+    // Find common suffix (not overlapping with prefix).
+    // VEP only suffix-trims indels (different-length alleles), not MNVs (same-length substitutions).
     let mut suffix_len = 0;
-    let ref_remaining = ref_bytes.len() - prefix_len;
-    let alt_remaining = alt_bytes.len() - prefix_len;
-    while suffix_len < ref_remaining
-        && suffix_len < alt_remaining
-        && ref_bytes[ref_bytes.len() - 1 - suffix_len] == alt_bytes[alt_bytes.len() - 1 - suffix_len]
-    {
-        suffix_len += 1;
+    if ref_bytes.len() != alt_bytes.len() {
+        let ref_remaining = ref_bytes.len() - prefix_len;
+        let alt_remaining = alt_bytes.len() - prefix_len;
+        while suffix_len < ref_remaining
+            && suffix_len < alt_remaining
+            && ref_bytes[ref_bytes.len() - 1 - suffix_len]
+                == alt_bytes[alt_bytes.len() - 1 - suffix_len]
+        {
+            suffix_len += 1;
+        }
     }
 
     let ref_trimmed = &ref_allele[prefix_len..ref_allele.len() - suffix_len];
@@ -438,12 +442,28 @@ mod tests {
     }
 
     #[test]
-    fn test_vcf_to_vep_allele_suffix_trim_complex() {
-        // REF=ATCG ALT=AGCG → shared prefix "A", shared suffix "CG"
-        // Net: ref="T" alt="G"
+    fn test_vcf_to_vep_allele_mnv_no_suffix_trim() {
+        // REF=ATCG ALT=AGCG → same length (MNV), only prefix-trim "A"
+        // VEP does NOT suffix-trim MNVs
         let (r, a) = vcf_to_vep_allele("ATCG", "AGCG");
-        assert_eq!(r, "T");
-        assert_eq!(a, "G");
+        assert_eq!(r, "TCG");
+        assert_eq!(a, "GCG");
+    }
+
+    #[test]
+    fn test_vcf_to_vep_allele_mnv_2bp() {
+        // REF=GT ALT=TT → same length, prefix-trim nothing (G != T)
+        let (r, a) = vcf_to_vep_allele("GT", "TT");
+        assert_eq!(r, "GT");
+        assert_eq!(a, "TT");
+    }
+
+    #[test]
+    fn test_vcf_to_vep_allele_mnv_with_prefix() {
+        // REF=CTA ALT=ATA → same length, no common prefix (C != A)
+        let (r, a) = vcf_to_vep_allele("CTA", "ATA");
+        assert_eq!(r, "CTA");
+        assert_eq!(a, "ATA");
     }
 
     #[test]

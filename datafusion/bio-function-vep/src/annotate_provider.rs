@@ -420,7 +420,7 @@ impl AnnotateProvider {
                 };
 
                 // Parse CDS incompleteness flags from raw_object_json attributes.
-                let (cds_start_nf, cds_end_nf) =
+                let (cds_start_nf, cds_end_nf, flags_str) =
                     parse_transcript_flags(raw_json.as_deref());
 
                 let gene_stable_id =
@@ -450,6 +450,7 @@ impl AnnotateProvider {
                     source,
                     cds_start_nf,
                     cds_end_nf,
+                    flags_str,
                 });
             }
         }
@@ -1068,8 +1069,7 @@ impl AnnotateProvider {
 
             // VEP-style allele minimization: strip shared prefix and suffix between REF and ALT.
             let vep_allele = {
-                let ref_al = string_at(batch.column(ref_idx).as_ref(), row)
-                    .unwrap_or_default();
+                let ref_al = string_at(batch.column(ref_idx).as_ref(), row).unwrap_or_default();
                 let (_vep_ref, vep_alt) = vcf_to_vep_allele(&ref_al, &alt_allele);
                 vep_alt
             };
@@ -1094,9 +1094,8 @@ impl AnnotateProvider {
                 // EXON|INTRON|HGVSc|HGVSp|cDNA_pos|CDS_pos|Protein_pos|AA|Codons|
                 // Existing_variation|DISTANCE|STRAND|FLAGS|SYMBOL_SOURCE|HGNC_ID|
                 // MOTIF_NAME|MOTIF_POS|HIGH_INF_POS|MOTIF_SCORE_CHANGE|TRANSCRIPTION_FACTORS|SOURCE
-                let csq_entry = format!(
-                    "{vep_allele}|{csq_val}|{impact}|||||||||||||||||||||||||||"
-                );
+                let csq_entry =
+                    format!("{vep_allele}|{csq_val}|{impact}|||||||||||||||||||||||||||");
                 (csq_entry, most_val.clone())
             } else {
                 // Cache miss — compute via transcript engine and produce per-transcript CSQ.
@@ -1163,10 +1162,7 @@ impl AnnotateProvider {
                         } else {
                             ("", "", "", "", "", "")
                         };
-                    let biotype = tc
-                        .biotype_override
-                        .as_deref()
-                        .unwrap_or(biotype_tx);
+                    let biotype = tc.biotype_override.as_deref().unwrap_or(biotype_tx);
                     let exon = tc.exon_str.as_deref().unwrap_or("");
                     let intron = tc.intron_str.as_deref().unwrap_or("");
                     let cdna_pos = tc.cdna_position.as_deref().unwrap_or("");
@@ -1322,32 +1318,44 @@ fn parse_mirna_regions_from_json(
 /// Parse `cds_start_NF` and `cds_end_NF` flags from `raw_object_json` attributes.
 /// These indicate incomplete CDS (5' or 3' truncation).
 /// Only returns true when the attribute has `"value":"1"` (not just presence of the key).
-fn parse_transcript_flags(raw_json: Option<&str>) -> (bool, bool) {
+/// Returns (start_nf, end_nf, flags_str) where flags_str preserves VEP's encounter order.
+fn parse_transcript_flags(raw_json: Option<&str>) -> (bool, bool, Option<String>) {
     let Some(json_str) = raw_json else {
-        return (false, false);
+        return (false, false, None);
     };
     let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
-        return (false, false);
+        return (false, false, None);
     };
     let attrs = val
         .pointer("/__value/attributes")
         .and_then(|a| a.as_array());
     let Some(attrs) = attrs else {
-        return (false, false);
+        return (false, false, None);
     };
     let mut start_nf = false;
     let mut end_nf = false;
+    let mut flags: Vec<&str> = Vec::new();
     for attr in attrs {
-        let code = attr.get("code").and_then(|c| c.as_str()).unwrap_or("");
-        let value = attr.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        // Each attribute may be wrapped: {"__class":"...","__value":{"code":"...","value":"..."}}
+        // Unwrap to the inner object if present, otherwise use the attribute directly.
+        let inner = attr.get("__value").unwrap_or(attr);
+        let code = inner.get("code").and_then(|c| c.as_str()).unwrap_or("");
+        let value = inner.get("value").and_then(|v| v.as_str()).unwrap_or("");
         if code == "cds_start_NF" && value == "1" {
             start_nf = true;
+            flags.push("cds_start_NF");
         }
         if code == "cds_end_NF" && value == "1" {
             end_nf = true;
+            flags.push("cds_end_NF");
         }
     }
-    (start_nf, end_nf)
+    let flags_str = if flags.is_empty() {
+        None
+    } else {
+        Some(flags.join("&"))
+    };
+    (start_nf, end_nf, flags_str)
 }
 
 fn parse_cdna_range(s: &str) -> Option<(i64, i64)> {
@@ -1474,10 +1482,7 @@ impl TableProvider for AnnotateProvider {
             .map(|f| f.name().clone())
             .collect();
 
-        let mut preferred_columns = vec![
-            "consequence_types",
-            "most_severe_consequence",
-        ];
+        let mut preferred_columns = vec!["consequence_types", "most_severe_consequence"];
         for &col in CACHE_OUTPUT_COLUMNS {
             if !preferred_columns.contains(&col) {
                 preferred_columns.push(col);
@@ -1654,30 +1659,63 @@ mod tests {
     #[test]
     fn test_parse_flags_cds_start_nf_value_1() {
         let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"1"}]}}"#;
-        assert_eq!(parse_transcript_flags(Some(json)), (true, false));
+        assert_eq!(
+            parse_transcript_flags(Some(json)),
+            (true, false, Some("cds_start_NF".to_string()))
+        );
     }
 
     #[test]
     fn test_parse_flags_cds_start_nf_value_0() {
-        // This was the bug — key present but value is "0", should NOT set the flag.
         let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"0"}]}}"#;
-        assert_eq!(parse_transcript_flags(Some(json)), (false, false));
+        assert_eq!(parse_transcript_flags(Some(json)), (false, false, None));
     }
 
     #[test]
-    fn test_parse_flags_both_nf() {
+    fn test_parse_flags_both_nf_start_first() {
         let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"1"},{"code":"cds_end_NF","value":"1"}]}}"#;
-        assert_eq!(parse_transcript_flags(Some(json)), (true, true));
+        assert_eq!(
+            parse_transcript_flags(Some(json)),
+            (true, true, Some("cds_start_NF&cds_end_NF".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_both_nf_end_first() {
+        // VEP preserves encounter order: end before start.
+        let json = r#"{"__value":{"attributes":[{"code":"cds_end_NF","value":"1"},{"code":"cds_start_NF","value":"1"}]}}"#;
+        assert_eq!(
+            parse_transcript_flags(Some(json)),
+            (true, true, Some("cds_end_NF&cds_start_NF".to_string()))
+        );
     }
 
     #[test]
     fn test_parse_flags_no_attributes() {
         let json = r#"{"__value":{}}"#;
-        assert_eq!(parse_transcript_flags(Some(json)), (false, false));
+        assert_eq!(parse_transcript_flags(Some(json)), (false, false, None));
     }
 
     #[test]
     fn test_parse_flags_none_input() {
-        assert_eq!(parse_transcript_flags(None), (false, false));
+        assert_eq!(parse_transcript_flags(None), (false, false, None));
+    }
+
+    #[test]
+    fn test_parse_flags_nested_attribute_format() {
+        let json = r#"{"__value":{"attributes":[{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"cds_start_NF","value":"1"}},{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"cds_end_NF","value":"1"}}]}}"#;
+        assert_eq!(
+            parse_transcript_flags(Some(json)),
+            (true, true, Some("cds_start_NF&cds_end_NF".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_nested_single_flag() {
+        let json = r#"{"__value":{"attributes":[{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"cds_end_NF","value":"1"}}]}}"#;
+        assert_eq!(
+            parse_transcript_flags(Some(json)),
+            (false, true, Some("cds_end_NF".to_string()))
+        );
     }
 }

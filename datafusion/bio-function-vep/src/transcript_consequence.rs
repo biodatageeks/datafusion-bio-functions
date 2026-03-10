@@ -50,28 +50,44 @@ impl VariantInput {
 
         let trimmed_ref = &ref_bytes[prefix_len..];
         let trimmed_alt = &alt_bytes[prefix_len..];
+
+        // Also suffix-trim for indels (different lengths), matching VEP's
+        // full allele minimization for coordinate computation.
+        let mut suffix_len = 0;
+        if trimmed_ref.len() != trimmed_alt.len() {
+            let max_suffix = trimmed_ref.len().min(trimmed_alt.len());
+            while suffix_len < max_suffix
+                && trimmed_ref[trimmed_ref.len() - 1 - suffix_len]
+                    == trimmed_alt[trimmed_alt.len() - 1 - suffix_len]
+            {
+                suffix_len += 1;
+            }
+        }
+        let final_ref = &trimmed_ref[..trimmed_ref.len() - suffix_len];
+        let final_alt = &trimmed_alt[..trimmed_alt.len() - suffix_len];
+
         let new_start = pos + prefix_len as i64;
-        let new_end = if trimmed_ref.is_empty() {
+        let new_end = if final_ref.is_empty() {
             // Pure insertion: the affected position is the insertion point
             // itself, not a 2-base span.
             new_start
         } else {
-            pos + ref_bytes.len() as i64 - 1
+            new_start + final_ref.len() as i64 - 1
         };
 
         Self {
             chrom,
             start: new_start,
             end: new_end,
-            ref_allele: if trimmed_ref.is_empty() {
+            ref_allele: if final_ref.is_empty() {
                 "-".to_string()
             } else {
-                String::from_utf8_lossy(trimmed_ref).to_string()
+                String::from_utf8_lossy(final_ref).to_string()
             },
-            alt_allele: if trimmed_alt.is_empty() {
+            alt_allele: if final_alt.is_empty() {
                 "-".to_string()
             } else {
-                String::from_utf8_lossy(trimmed_alt).to_string()
+                String::from_utf8_lossy(final_alt).to_string()
             },
         }
     }
@@ -99,6 +115,8 @@ pub struct TranscriptFeature {
     pub cds_start_nf: bool,
     /// CDS end not found (incomplete 3' end).
     pub cds_end_nf: bool,
+    /// Pre-formatted FLAGS string preserving VEP's attribute encounter order.
+    pub flags_str: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,11 +416,12 @@ impl TranscriptConsequenceEngine {
                                     (Some(s), Some(e)) => Some(format!("{s}-{e}")),
                                     _ => None,
                                 };
-                                let prot_pos = match (cc.protein_position_start, cc.protein_position_end) {
-                                    (Some(s), Some(e)) if s == e => Some(s.to_string()),
-                                    (Some(s), Some(e)) => Some(format!("{s}-{e}")),
-                                    _ => None,
-                                };
+                                let prot_pos =
+                                    match (cc.protein_position_start, cc.protein_position_end) {
+                                        (Some(s), Some(e)) if s == e => Some(s.to_string()),
+                                        (Some(s), Some(e)) => Some(format!("{s}-{e}")),
+                                        _ => None,
+                                    };
                                 (cds_pos, prot_pos, cc.amino_acids.clone(), cc.codons.clone())
                             } else {
                                 (None, None, None, None)
@@ -1810,10 +1829,12 @@ fn classify_coding_change(
     let ref_genomic = normalize_allele_seq(&variant.ref_allele);
     let alt_genomic = normalize_allele_seq(&variant.alt_allele);
     let ref_len = ref_genomic.len();
-    if ref_len == 0 {
-        return None;
-    }
     let alt_len = alt_genomic.len();
+
+    // Handle pure insertions (ref = "-") separately.
+    if ref_len == 0 {
+        return classify_insertion(tx, tx_exons, &cds_seq, variant, &alt_genomic);
+    }
 
     let genomic_positions = genomic_range(variant.start, variant.end)?;
     if genomic_positions.len() != ref_len {
@@ -1896,7 +1917,7 @@ fn classify_coding_change(
         }
     }
 
-    let frameshift = ref_len.abs_diff(alt_len) % 3 != 0;
+    let frameshift = !ref_len.abs_diff(alt_len).is_multiple_of(3);
     let stop_might_be_disrupted = if let Some(old_stop_idx) = old_stop {
         let stop_nt_start = old_stop_idx.saturating_mul(3);
         let stop_nt_end = stop_nt_start.saturating_add(2);
@@ -1972,6 +1993,7 @@ fn classify_coding_change(
     class.protein_position_end = Some(last_codon + 1);
 
     // Amino acids
+    let frameshift = !ref_len.abs_diff(alt_len).is_multiple_of(3);
     if first_codon < old_aas.len() {
         let ref_end = (last_codon + 1).min(old_aas.len());
         let ref_aa: String = old_aas[first_codon..ref_end].iter().collect();
@@ -1985,8 +2007,18 @@ fn classify_coding_change(
                     class.amino_acids = Some(format!("{ref_aa}/{alt_aa}"));
                 }
             }
+        } else if frameshift {
+            // Frameshifts: VEP uses X for the altered downstream sequence.
+            // If the first affected codon's amino acid is preserved, show it
+            // before X (e.g., "H/HX"); otherwise just "L/X".
+            if first_codon < new_aas.len() && new_aas[first_codon] == old_aas[first_codon] {
+                let preserved: String = std::iter::once(new_aas[first_codon]).collect();
+                class.amino_acids = Some(format!("{ref_aa}/{preserved}X"));
+            } else {
+                class.amino_acids = Some(format!("{ref_aa}/X"));
+            }
         } else {
-            // Indels: show affected ref AAs and alt AAs
+            // Inframe indels: show affected ref AAs and alt AAs
             let alt_first_codon = first_codon;
             let alt_last_codon = if mutated.len() >= 3 {
                 (start_idx + alt_len).saturating_sub(1) / 3
@@ -2029,34 +2061,268 @@ fn classify_coding_change(
             class.codons = Some(format!("{ref_codon}/{alt_codon}"));
         }
     } else {
-        // In-frame indels: show affected codons with changed bases uppercase
+        // Indels: different formatting for frameshift vs inframe
         let codon_nt_start = first_codon * 3;
         let codon_nt_end = ((last_codon + 1) * 3).min(cds_seq.len());
         if codon_nt_end <= cds_seq.len() {
-            let ref_codon = format_codon_display(
-                &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
-                start_idx,
-                end_idx,
-                codon_nt_start,
-            );
-            // For the alt codon, compute the corresponding region in the mutated CDS.
-            // The alt spans from the same codon start to the end of the affected region.
-            let alt_end_idx = start_idx + alt_len;
-            let alt_last_codon = if alt_end_idx > 0 {
-                (alt_end_idx - 1) / 3
-            } else {
-                first_codon
-            };
-            let alt_codon_nt_end = ((alt_last_codon + 1) * 3).min(mutated.len());
-            if alt_codon_nt_end <= mutated.len() {
-                let alt_codon = format_codon_display(
-                    &mutated[codon_nt_start..alt_codon_nt_end],
+            if frameshift {
+                // Frameshift: ref codon with changed bases uppercase,
+                // alt codon is the corresponding region from mutated CDS.
+                // Deletion: alt is shorter (remaining bases, all lowercase).
+                // Insertion within codon: alt is longer (inserted bases uppercase).
+                let ref_codon = format_codon_display(
+                    &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
                     start_idx,
-                    start_idx + alt_len.max(1) - 1,
+                    end_idx,
                     codon_nt_start,
                 );
-                class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+                let ref_codon_len = codon_nt_end - codon_nt_start;
+                let len_diff = alt_len as isize - ref_len as isize;
+                let alt_codon_len = (ref_codon_len as isize + len_diff).max(0) as usize;
+                let alt_codon_end = (codon_nt_start + alt_codon_len).min(mutated.len());
+                if alt_len > ref_len {
+                    // Frameshift insertion: mark inserted bases uppercase
+                    let alt_codon = format_codon_display(
+                        &mutated[codon_nt_start..alt_codon_end],
+                        start_idx,
+                        start_idx + alt_len - 1,
+                        codon_nt_start,
+                    );
+                    class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+                } else {
+                    // Frameshift deletion: all alt bases lowercase
+                    let alt_codon: String = mutated
+                        .get(codon_nt_start..alt_codon_end)
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|&b| (b as char).to_ascii_lowercase())
+                        .collect();
+                    class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+                }
+            } else if alt_len < ref_len {
+                // Inframe deletion: ref codon with deleted bases uppercase, context lowercase.
+                // Alt codon: remaining bases (all lowercase), or "-" if nothing left.
+                let ref_codon = format_codon_display(
+                    &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
+                    start_idx,
+                    end_idx,
+                    codon_nt_start,
+                );
+                let ref_codon_len = codon_nt_end - codon_nt_start;
+                let len_diff = alt_len as isize - ref_len as isize;
+                let alt_codon_len = (ref_codon_len as isize + len_diff).max(0) as usize;
+                let alt_codon_end = (codon_nt_start + alt_codon_len).min(mutated.len());
+                let alt_codon: String = mutated
+                    .get(codon_nt_start..alt_codon_end)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|&b| (b as char).to_ascii_lowercase())
+                    .collect();
+                if alt_codon.is_empty() {
+                    class.codons = Some(format!("{ref_codon}/-"));
+                } else {
+                    class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+                }
+            } else {
+                // Inframe insertion (ref_len < alt_len, handled in classify_insertion)
+                // This branch shouldn't be reached for pure insertions (ref="-"),
+                // but handle complex cases with both ref and alt bases.
+                let ref_codon = format_codon_display(
+                    &cds_seq.as_bytes()[codon_nt_start..codon_nt_end],
+                    start_idx,
+                    end_idx,
+                    codon_nt_start,
+                );
+                let alt_end_idx = start_idx + alt_len;
+                let alt_last_codon = if alt_end_idx > 0 {
+                    (alt_end_idx - 1) / 3
+                } else {
+                    first_codon
+                };
+                let alt_codon_nt_end = ((alt_last_codon + 1) * 3).min(mutated.len());
+                if alt_codon_nt_end <= mutated.len() {
+                    let alt_codon = format_codon_display(
+                        &mutated[codon_nt_start..alt_codon_nt_end],
+                        start_idx,
+                        start_idx + alt_len - 1,
+                        codon_nt_start,
+                    );
+                    class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+                }
             }
+        }
+    }
+
+    Some(class)
+}
+
+/// Handle pure insertions (ref = "-") for coding classification.
+///
+/// For insertions, the variant position marks the insertion point (between
+/// two bases in the CDS). We map this to CDS coordinates, build the mutated
+/// CDS, and compute codons/amino acids/positions.
+fn classify_insertion(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    cds_seq: &str,
+    variant: &VariantInput,
+    alt_genomic: &str,
+) -> Option<CodingClassification> {
+    let alt_len = alt_genomic.len();
+    if alt_len == 0 {
+        return None;
+    }
+
+    // VEP prepends N characters for non-zero phase.
+    let leading_n_offset = cds_seq.bytes().take_while(|&b| b == b'N').count();
+
+    // Map the anchor base to CDS coordinates.  On positive strand, the
+    // anchor is the base before the insertion (start-1).  On negative strand,
+    // genomic coordinates are reversed relative to CDS, so the anchor is
+    // variant.start itself (which maps to the earlier CDS position).
+    let anchor_pos = if tx.strand >= 0 {
+        variant.start.saturating_sub(1)
+    } else {
+        variant.start
+    };
+    let cds_idx = genomic_to_cds_index(tx, tx_exons, anchor_pos).map(|i| i + leading_n_offset)?;
+
+    // Build alt sequence in transcript orientation
+    let alt_tx = if tx.strand >= 0 {
+        alt_genomic.to_ascii_uppercase()
+    } else {
+        reverse_complement(alt_genomic)?.to_ascii_uppercase()
+    };
+
+    // Build mutated CDS: insert alt bases after cds_idx (i.e., at cds_idx+1).
+    let ins_point = cds_idx + 1;
+    let mut mutated = Vec::with_capacity(cds_seq.len() + alt_len);
+    mutated.extend_from_slice(&cds_seq.as_bytes()[..ins_point]);
+    mutated.extend_from_slice(alt_tx.as_bytes());
+    mutated.extend_from_slice(&cds_seq.as_bytes()[ins_point..]);
+
+    let old_aas = translate_protein_from_cds(cds_seq.as_bytes())?;
+    let new_aas = translate_protein_from_cds(&mutated)?;
+    let mut class = CodingClassification::default();
+
+    let frameshift = !alt_len.is_multiple_of(3);
+
+    // CDS position: insertion between cds_idx and cds_idx+1 in 0-based,
+    // which is (cds_idx+1)-(cds_idx+2) in 1-based VEP convention.
+    class.cds_position_start = Some(cds_idx + 1);
+    class.cds_position_end = Some(cds_idx + 2);
+
+    // Protein position: VEP uses the codon containing the insertion point.
+    // For inframe insertions at codon boundaries, VEP shows a range spanning
+    // the codons on either side of the boundary.
+    let codon_at = cds_idx / 3;
+    let ins_at_boundary = ins_point % 3 == 0;
+    if !frameshift && ins_at_boundary {
+        // Inframe insertion at codon boundary: VEP shows the flanking codons.
+        class.protein_position_start = Some(codon_at + 1);
+        class.protein_position_end = Some(codon_at + 2);
+    } else {
+        class.protein_position_start = Some(codon_at + 1);
+        class.protein_position_end = Some(codon_at + 1);
+    }
+
+    // Start codon check
+    if cds_idx < 3 && old_aas.first() == Some(&'M') {
+        if new_aas.first() == Some(&'M') {
+            class.start_retained = true;
+        } else {
+            class.start_lost = true;
+        }
+    }
+
+    // Amino acids
+    let first_codon = codon_at;
+    if first_codon < old_aas.len() {
+        let ref_aa = old_aas[first_codon];
+        if frameshift {
+            // VEP always uses X for frameshift insertions.
+            class.amino_acids = Some(format!("{ref_aa}/X"));
+        } else {
+            // Inframe insertion
+            // For insertions, the alt spans from the insertion point through
+            // the last codon affected by the inserted bases.
+            let alt_end_codon = (ins_point + alt_len).saturating_sub(1) / 3;
+            let alt_end = (alt_end_codon + 1).min(new_aas.len());
+            let at_boundary = ins_point % 3 == 0;
+            if at_boundary {
+                // At codon boundary: ref="-", alt=inserted AAs only
+                let ins_start_codon = ins_point / 3;
+                let ins_end_codon = (ins_point + alt_len).saturating_sub(1) / 3;
+                let ins_end = (ins_end_codon + 1).min(new_aas.len());
+                if ins_start_codon < new_aas.len() {
+                    let alt_aa: String = new_aas[ins_start_codon..ins_end].iter().collect();
+                    class.amino_acids = Some(format!("-/{alt_aa}"));
+                }
+            } else if first_codon < new_aas.len() {
+                let alt_aa: String = new_aas[first_codon..alt_end].iter().collect();
+                class.amino_acids = Some(format!("{ref_aa}/{alt_aa}"));
+            } else {
+                class.amino_acids = Some(format!("{ref_aa}/-"));
+            }
+        }
+    }
+
+    // Codons — inserted bases start at ins_point in the mutated CDS.
+    let at_codon_boundary = ins_point % 3 == 0;
+    if frameshift {
+        // Frameshift insertion: ref codon all lowercase, alt codon with inserted bases uppercase
+        let codon_start = first_codon * 3;
+        let codon_end = ((first_codon + 1) * 3).min(cds_seq.len());
+        if codon_end <= cds_seq.len() {
+            let ref_codon: String = cds_seq.as_bytes()[codon_start..codon_end]
+                .iter()
+                .map(|&b| (b as char).to_ascii_lowercase())
+                .collect();
+            let alt_codon_len = (codon_end - codon_start) + alt_len;
+            let alt_end = (codon_start + alt_codon_len).min(mutated.len());
+            // Mark inserted bases uppercase: they start at ins_point in mutated
+            let alt_codon: String = mutated[codon_start..alt_end]
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| {
+                    let abs_pos = codon_start + i;
+                    if abs_pos >= ins_point && abs_pos < ins_point + alt_len {
+                        (b as char).to_ascii_uppercase()
+                    } else {
+                        (b as char).to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            class.codons = Some(format!("{ref_codon}/{alt_codon}"));
+        }
+    } else if at_codon_boundary {
+        // Inframe insertion at codon boundary: ref="-", alt=UPPERCASE
+        let alt_codon: String = alt_tx.chars().map(|c| c.to_ascii_uppercase()).collect();
+        class.codons = Some(format!("-/{alt_codon}"));
+    } else {
+        // Inframe insertion within codon: ref=lowercase, alt=codon+inserted(uppercase)
+        let codon_start = first_codon * 3;
+        let codon_end = ((first_codon + 1) * 3).min(cds_seq.len());
+        if codon_end <= cds_seq.len() {
+            let ref_codon: String = cds_seq.as_bytes()[codon_start..codon_end]
+                .iter()
+                .map(|&b| (b as char).to_ascii_lowercase())
+                .collect();
+            let alt_codon_len = (codon_end - codon_start) + alt_len;
+            let alt_end = (codon_start + alt_codon_len).min(mutated.len());
+            let alt_codon: String = mutated[codon_start..alt_end]
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| {
+                    let abs_pos = codon_start + i;
+                    if abs_pos >= ins_point && abs_pos < ins_point + alt_len {
+                        (b as char).to_ascii_uppercase()
+                    } else {
+                        (b as char).to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            class.codons = Some(format!("{ref_codon}/{alt_codon}"));
         }
     }
 
@@ -2065,15 +2331,24 @@ fn classify_coding_change(
 
 /// Format codon bases with VEP case convention: changed positions uppercase,
 /// unchanged positions lowercase.
-fn format_codon_display(bases: &[u8], changed_start: usize, changed_end: usize, codon_nt_offset: usize) -> String {
-    bases.iter().enumerate().map(|(i, &b)| {
-        let abs_pos = codon_nt_offset + i;
-        if abs_pos >= changed_start && abs_pos <= changed_end {
-            (b as char).to_ascii_uppercase()
-        } else {
-            (b as char).to_ascii_lowercase()
-        }
-    }).collect()
+fn format_codon_display(
+    bases: &[u8],
+    changed_start: usize,
+    changed_end: usize,
+    codon_nt_offset: usize,
+) -> String {
+    bases
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            let abs_pos = codon_nt_offset + i;
+            if abs_pos >= changed_start && abs_pos <= changed_end {
+                (b as char).to_ascii_uppercase()
+            } else {
+                (b as char).to_ascii_lowercase()
+            }
+        })
+        .collect()
 }
 
 /// Determine which exon (if any) the variant overlaps.
@@ -2099,7 +2374,11 @@ fn which_exon_str(variant: &VariantInput, tx_exons: &[&ExonFeature]) -> Option<S
 
 /// Determine which intron (if any) the variant overlaps.
 /// Returns "N/total" string for the INTRON CSQ field.
-fn which_intron_str(variant: &VariantInput, tx_exons: &[&ExonFeature], strand: i8) -> Option<String> {
+fn which_intron_str(
+    variant: &VariantInput,
+    tx_exons: &[&ExonFeature],
+    strand: i8,
+) -> Option<String> {
     if tx_exons.len() < 2 {
         return None;
     }
@@ -2164,7 +2443,11 @@ fn genomic_to_cdna_index(tx_exons: &[&ExonFeature], strand: i8, pos: i64) -> Opt
 }
 
 /// Compute the cDNA_position string for a variant overlapping an exon.
-fn compute_cdna_position(variant: &VariantInput, tx_exons: &[&ExonFeature], strand: i8) -> Option<String> {
+fn compute_cdna_position(
+    variant: &VariantInput,
+    tx_exons: &[&ExonFeature],
+    strand: i8,
+) -> Option<String> {
     if tx_exons.is_empty() {
         return None;
     }
@@ -2192,20 +2475,44 @@ fn compute_cdna_position(variant: &VariantInput, tx_exons: &[&ExonFeature], stra
             _ => None,
         }
     } else {
-        let start_cdna = genomic_to_cdna_index(tx_exons, strand, variant.start)?;
-        let end_cdna = genomic_to_cdna_index(tx_exons, strand, variant.end)?;
-        if start_cdna == end_cdna {
-            Some(start_cdna.to_string())
-        } else {
-            let lo = start_cdna.min(end_cdna);
-            let hi = start_cdna.max(end_cdna);
-            Some(format!("{lo}-{hi}"))
+        let start_cdna = genomic_to_cdna_index(tx_exons, strand, variant.start);
+        let end_cdna = genomic_to_cdna_index(tx_exons, strand, variant.end);
+        match (start_cdna, end_cdna) {
+            (Some(s), Some(e)) if s == e => Some(s.to_string()),
+            (Some(s), Some(e)) => {
+                let lo = s.min(e);
+                let hi = s.max(e);
+                Some(format!("{lo}-{hi}"))
+            }
+            // Boundary-spanning deletions: one end maps, the other extends
+            // beyond the transcript. VEP uses "?" for the unknown boundary.
+            // On negative strand, genomic start maps to higher cDNA pos and
+            // genomic end maps to lower, so we must orient correctly.
+            (Some(s), None) => {
+                if strand < 0 {
+                    Some(format!("?-{s}"))
+                } else {
+                    Some(format!("{s}-?"))
+                }
+            }
+            (None, Some(e)) => {
+                if strand < 0 {
+                    Some(format!("{e}-?"))
+                } else {
+                    Some(format!("?-{e}"))
+                }
+            }
+            (None, None) => None,
         }
     }
 }
 
 /// Compute FLAGS field from transcript attributes.
 fn compute_flags(tx: &TranscriptFeature) -> Option<String> {
+    // Prefer pre-formatted flags string that preserves encounter order from cache.
+    if let Some(ref s) = tx.flags_str {
+        return Some(s.clone());
+    }
     match (tx.cds_start_nf, tx.cds_end_nf) {
         (true, true) => Some("cds_start_NF&cds_end_NF".to_string()),
         (true, false) => Some("cds_start_NF".to_string()),
@@ -2374,6 +2681,7 @@ mod tests {
             source: None,
             cds_start_nf: false,
             cds_end_nf: false,
+            flags_str: None,
         }
     }
 
@@ -3065,10 +3373,7 @@ mod tests {
             .filter(|tc| tc.feature_type == FeatureType::RegulatoryFeature)
             .collect();
         assert_eq!(reg_entries.len(), 1);
-        assert_eq!(
-            reg_entries[0].transcript_id.as_deref(),
-            Some("ENSR22_A")
-        );
+        assert_eq!(reg_entries[0].transcript_id.as_deref(), Some("ENSR22_A"));
     }
 
     #[test]
@@ -3739,10 +4044,7 @@ mod tests {
 
     #[test]
     fn genomic_to_cdna_index_intronic_returns_none() {
-        let exons = vec![
-            exon("tx1", 1, 100, 110),
-            exon("tx1", 2, 200, 210),
-        ];
+        let exons = vec![exon("tx1", 1, 100, 110), exon("tx1", 2, 200, 210)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         // Position 150 is intronic
         assert_eq!(genomic_to_cdna_index(&refs, 1, 150), None);
@@ -3758,20 +4060,47 @@ mod tests {
 
     #[test]
     fn compute_flags_none_when_both_false() {
-        let t = tx("t1", "22", 100, 200, 1, "protein_coding", Some(110), Some(190));
+        let t = tx(
+            "t1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(190),
+        );
         assert_eq!(compute_flags(&t), None);
     }
 
     #[test]
     fn compute_flags_cds_start_nf() {
-        let mut t = tx("t1", "22", 100, 200, 1, "protein_coding", Some(110), Some(190));
+        let mut t = tx(
+            "t1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(190),
+        );
         t.cds_start_nf = true;
         assert_eq!(compute_flags(&t), Some("cds_start_NF".to_string()));
     }
 
     #[test]
     fn compute_flags_both() {
-        let mut t = tx("t1", "22", 100, 200, 1, "protein_coding", Some(110), Some(190));
+        let mut t = tx(
+            "t1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(190),
+        );
         t.cds_start_nf = true;
         t.cds_end_nf = true;
         assert_eq!(

@@ -1,5 +1,6 @@
 use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
+use datafusion_bio_function_vep::register_vortex_cache;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -13,7 +14,7 @@ async fn main() -> Result<()> {
     let path = &args[1];
     let do_count = matches!(args.get(2).map(String::as_str), Some("count"));
     let ctx = SessionContext::new();
-    ctx.register_parquet("vx", path, Default::default()).await?;
+    register_vortex_cache(&ctx, "vx", path).await?;
     if do_count {
         let batches = ctx
             .sql("SELECT COUNT(*) AS cnt FROM vx")
