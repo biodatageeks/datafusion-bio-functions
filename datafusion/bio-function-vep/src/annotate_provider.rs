@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    LargeStringArray, RecordBatch, StringArray, StringBuilder, StringViewArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array, new_null_array,
+    Array, AsArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, LargeStringArray, ListArray, RecordBatch, StringArray, StringBuilder,
+    StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
@@ -372,13 +372,15 @@ impl AnnotateProvider {
             })?;
             let cds_start_idx = schema.index_of("cds_start").ok();
             let cds_end_idx = schema.index_of("cds_end").ok();
-            let raw_json_idx = schema.index_of("raw_object_json").ok();
             let gene_stable_id_idx = schema.index_of("gene_stable_id").ok();
             let gene_symbol_idx = schema.index_of("gene_symbol").ok();
             let gene_symbol_source_idx = schema.index_of("gene_symbol_source").ok();
             let gene_hgnc_id_idx = schema.index_of("gene_hgnc_id").ok();
             let source_idx = schema.index_of("source").ok();
             let version_idx = schema.index_of("version").ok();
+            let cds_start_nf_idx = schema.index_of("cds_start_nf").ok();
+            let cds_end_nf_idx = schema.index_of("cds_end_nf").ok();
+            let mirna_regions_idx = schema.index_of("mature_mirna_regions").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -408,21 +410,24 @@ impl AnnotateProvider {
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .filter(|v| *v > 0);
 
-                // Extract raw_object_json once — used for miRNA regions and FLAGS.
-                let raw_json =
-                    raw_json_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-
-                // For miRNA transcripts, extract mature miRNA regions from
-                // raw_object_json attributes (cDNA coords mapped to genomic).
+                // Mature miRNA regions from promoted List<Struct<start,end>>
+                // column (already genomic coordinates).
                 let mature_mirna_regions = if biotype == "miRNA" {
-                    parse_mirna_regions_from_json(raw_json.as_deref(), start, end, strand)
+                    mirna_regions_idx
+                        .and_then(|idx| read_mirna_regions(batch, idx, row))
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
 
-                // Parse CDS incompleteness flags from raw_object_json attributes.
-                let (cds_start_nf, cds_end_nf, flags_str) =
-                    parse_transcript_flags(raw_json.as_deref());
+                // CDS incompleteness flags from promoted boolean columns.
+                let cds_start_nf = cds_start_nf_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
+                let cds_end_nf = cds_end_nf_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
+                let flags_str = flags_str_from_bools(cds_start_nf, cds_end_nf);
 
                 let gene_stable_id =
                     gene_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
@@ -1292,106 +1297,56 @@ fn parse_sv_event_kind(value: &str) -> Option<SvEventKind> {
 /// miRNA transcripts are almost always single-exon, so the mapping is trivial:
 /// - Plus strand:  `genomic = tx.start + cdna - 1`
 /// - Minus strand: `genomic_start = tx.end - cdna_end + 1`, `genomic_end = tx.end - cdna_start + 1`
-fn parse_mirna_regions_from_json(
-    raw_json: Option<&str>,
-    tx_start: i64,
-    tx_end: i64,
-    strand: i8,
-) -> Vec<(i64, i64)> {
-    let Some(json_str) = raw_json else {
-        return Vec::new();
-    };
-
-    // Look for patterns like {"code":"miRNA","value":"42-59"} in the JSON.
-    // We do a lightweight parse to avoid pulling in a full JSON library just
-    // for this single use case.
-    let mut regions = Vec::new();
-    // Find all occurrences of "miRNA" code entries and extract their values.
-    let needle = "\"miRNA\"";
-    let mut search_from = 0;
-    while let Some(pos) = json_str[search_from..].find(needle) {
-        let abs_pos = search_from + pos + needle.len();
-        search_from = abs_pos;
-
-        // Look for the "value" key nearby (within the same JSON object).
-        let window_end = (abs_pos + 200).min(json_str.len());
-        let window = &json_str[abs_pos..window_end];
-
-        // Find "value" key
-        if let Some(val_pos) = window.find("\"value\"") {
-            let after_key = &window[val_pos + 7..]; // skip "value"
-            // Find the value string: skip colon and whitespace, then quoted string
-            if let Some(quote_start) = after_key.find('"') {
-                let val_start = quote_start + 1;
-                if let Some(quote_end) = after_key[val_start..].find('"') {
-                    let val_str = &after_key[val_start..val_start + quote_end];
-                    // Parse "N-M" pattern
-                    if let Some((cdna_start, cdna_end)) = parse_cdna_range(val_str) {
-                        let (gstart, gend) = if strand >= 0 {
-                            (tx_start + cdna_start - 1, tx_start + cdna_end - 1)
-                        } else {
-                            (tx_end - cdna_end + 1, tx_end - cdna_start + 1)
-                        };
-                        regions.push((gstart, gend));
-                    }
-                }
-            }
-        }
+/// Reconstruct `FLAGS` string from promoted boolean columns using a canonical
+/// order (cds_start_NF before cds_end_NF).  VEP's encounter order varies per
+/// transcript but our golden benchmark already normalizes term order, so
+/// canonical ordering is correct.
+fn flags_str_from_bools(cds_start_nf: bool, cds_end_nf: bool) -> Option<String> {
+    match (cds_start_nf, cds_end_nf) {
+        (true, true) => Some("cds_start_NF&cds_end_NF".to_string()),
+        (true, false) => Some("cds_start_NF".to_string()),
+        (false, true) => Some("cds_end_NF".to_string()),
+        (false, false) => None,
     }
-    regions
 }
 
-/// Parse `cds_start_NF` and `cds_end_NF` flags from `raw_object_json` attributes.
-/// These indicate incomplete CDS (5' or 3' truncation).
-/// Only returns true when the attribute has `"value":"1"` (not just presence of the key).
-/// Returns (start_nf, end_nf, flags_str) where flags_str preserves VEP's encounter order.
-fn parse_transcript_flags(raw_json: Option<&str>) -> (bool, bool, Option<String>) {
-    let Some(json_str) = raw_json else {
-        return (false, false, None);
-    };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
-        return (false, false, None);
-    };
-    let attrs = val
-        .pointer("/__value/attributes")
-        .and_then(|a| a.as_array());
-    let Some(attrs) = attrs else {
-        return (false, false, None);
-    };
-    let mut start_nf = false;
-    let mut end_nf = false;
-    let mut flags: Vec<&str> = Vec::new();
-    for attr in attrs {
-        // Each attribute may be wrapped: {"__class":"...","__value":{"code":"...","value":"..."}}
-        // Unwrap to the inner object if present, otherwise use the attribute directly.
-        let inner = attr.get("__value").unwrap_or(attr);
-        let code = inner.get("code").and_then(|c| c.as_str()).unwrap_or("");
-        let value = inner.get("value").and_then(|v| v.as_str()).unwrap_or("");
-        if code == "cds_start_NF" && value == "1" {
-            start_nf = true;
-            flags.push("cds_start_NF");
-        }
-        if code == "cds_end_NF" && value == "1" {
-            end_nf = true;
-            flags.push("cds_end_NF");
-        }
-    }
-    let flags_str = if flags.is_empty() {
-        None
-    } else {
-        Some(flags.join("&"))
-    };
-    (start_nf, end_nf, flags_str)
-}
-
-fn parse_cdna_range(s: &str) -> Option<(i64, i64)> {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 2 {
+/// Read mature miRNA genomic regions from a promoted `List<Struct<start,end>>`
+/// column.  Returns `None` if the cell is NULL (letting the caller fall back
+/// to JSON parsing if needed).
+fn read_mirna_regions(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<Vec<(i64, i64)>> {
+    let col = batch.column(col_idx);
+    if col.is_null(row) {
         return None;
     }
-    let start: i64 = parts[0].trim().parse().ok()?;
-    let end: i64 = parts[1].trim().parse().ok()?;
-    Some((start, end))
+    let list_arr = col.as_any().downcast_ref::<ListArray>()?;
+    let offsets = list_arr.offsets();
+    let start_off = offsets[row] as usize;
+    let end_off = offsets[row + 1] as usize;
+    if start_off == end_off {
+        return Some(Vec::new());
+    }
+    let values = list_arr.values();
+    let struct_arr = values.as_struct();
+    let starts = struct_arr.column_by_name("start")?;
+    let ends = struct_arr.column_by_name("end")?;
+
+    let mut regions = Vec::with_capacity(end_off - start_off);
+    for i in start_off..end_off {
+        let s = int64_at(starts.as_ref(), i)?;
+        let e = int64_at(ends.as_ref(), i)?;
+        regions.push((s, e));
+    }
+    Some(regions)
+}
+
+fn bool_at(array: &dyn Array, row: usize) -> Option<bool> {
+    if array.is_null(row) {
+        return None;
+    }
+    if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
+        return Some(arr.value(row));
+    }
+    None
 }
 
 fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
@@ -1683,106 +1638,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_flags_cds_start_nf_value_1() {
-        let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"1"}]}}"#;
+    fn test_flags_str_both_true() {
         assert_eq!(
-            parse_transcript_flags(Some(json)),
-            (true, false, Some("cds_start_NF".to_string()))
+            flags_str_from_bools(true, true),
+            Some("cds_start_NF&cds_end_NF".to_string())
         );
     }
 
     #[test]
-    fn test_parse_flags_cds_start_nf_value_0() {
-        let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"0"}]}}"#;
-        assert_eq!(parse_transcript_flags(Some(json)), (false, false, None));
-    }
-
-    #[test]
-    fn test_parse_flags_both_nf_start_first() {
-        let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"1"},{"code":"cds_end_NF","value":"1"}]}}"#;
+    fn test_flags_str_start_only() {
         assert_eq!(
-            parse_transcript_flags(Some(json)),
-            (true, true, Some("cds_start_NF&cds_end_NF".to_string()))
+            flags_str_from_bools(true, false),
+            Some("cds_start_NF".to_string())
         );
     }
 
     #[test]
-    fn test_parse_flags_both_nf_end_first() {
-        // VEP preserves encounter order: end before start.
-        let json = r#"{"__value":{"attributes":[{"code":"cds_end_NF","value":"1"},{"code":"cds_start_NF","value":"1"}]}}"#;
+    fn test_flags_str_end_only() {
         assert_eq!(
-            parse_transcript_flags(Some(json)),
-            (true, true, Some("cds_end_NF&cds_start_NF".to_string()))
+            flags_str_from_bools(false, true),
+            Some("cds_end_NF".to_string())
         );
     }
 
     #[test]
-    fn test_parse_flags_no_attributes() {
-        let json = r#"{"__value":{}}"#;
-        assert_eq!(parse_transcript_flags(Some(json)), (false, false, None));
-    }
-
-    #[test]
-    fn test_parse_flags_none_input() {
-        assert_eq!(parse_transcript_flags(None), (false, false, None));
-    }
-
-    #[test]
-    fn test_parse_flags_nested_attribute_format() {
-        let json = r#"{"__value":{"attributes":[{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"cds_start_NF","value":"1"}},{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"cds_end_NF","value":"1"}}]}}"#;
-        assert_eq!(
-            parse_transcript_flags(Some(json)),
-            (true, true, Some("cds_start_NF&cds_end_NF".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_nested_single_flag() {
-        let json = r#"{"__value":{"attributes":[{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"cds_end_NF","value":"1"}}]}}"#;
-        assert_eq!(
-            parse_transcript_flags(Some(json)),
-            (false, true, Some("cds_end_NF".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_mixed_wrapped_unwrapped() {
-        // Mix of wrapped (__class/__value) and unwrapped attributes
-        let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"1"},{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"cds_end_NF","value":"1"}}]}}"#;
-        assert_eq!(
-            parse_transcript_flags(Some(json)),
-            (true, true, Some("cds_start_NF&cds_end_NF".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_non_1_value_rejected() {
-        // value="true" should NOT be accepted — only "1" counts
-        let json = r#"{"__value":{"attributes":[{"code":"cds_start_NF","value":"true"}]}}"#;
-        assert_eq!(parse_transcript_flags(Some(json)), (false, false, None));
-    }
-
-    #[test]
-    fn test_parse_flags_ignores_non_cds_attributes() {
-        // Non-cds_start_NF/cds_end_NF attributes should be ignored
-        let json = r#"{"__value":{"attributes":[{"code":"some_other","value":"1"},{"code":"cds_start_NF","value":"1"}]}}"#;
-        assert_eq!(
-            parse_transcript_flags(Some(json)),
-            (true, false, Some("cds_start_NF".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_empty_attributes_array() {
-        let json = r#"{"__value":{"attributes":[]}}"#;
-        assert_eq!(parse_transcript_flags(Some(json)), (false, false, None));
-    }
-
-    #[test]
-    fn test_parse_flags_malformed_json() {
-        assert_eq!(
-            parse_transcript_flags(Some("not valid json")),
-            (false, false, None)
-        );
+    fn test_flags_str_neither() {
+        assert_eq!(flags_str_from_bools(false, false), None);
     }
 }

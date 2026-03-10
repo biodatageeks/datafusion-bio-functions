@@ -22,7 +22,6 @@ zstd = { version = "0.13.3", optional = true }
 ahash = { version = "0.8.6", optional = true }
 flate2 = "1.1.0"
 coitrees = "0.4.0"
-serde_json = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
