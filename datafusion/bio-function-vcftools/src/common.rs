@@ -136,27 +136,6 @@ pub fn extract_list_values(
     )))
 }
 
-/// Check if a row in a list array is null, supporting all list types.
-pub fn is_list_null(column: &dyn Array, row_idx: usize, col_name: &str) -> Result<bool> {
-    use datafusion::arrow::array::{FixedSizeListArray, LargeListArray};
-
-    if let Some(list_arr) = column.as_any().downcast_ref::<ListArray>() {
-        return Ok(list_arr.is_null(row_idx));
-    }
-
-    if let Some(list_arr) = column.as_any().downcast_ref::<LargeListArray>() {
-        return Ok(list_arr.is_null(row_idx));
-    }
-
-    if let Some(list_arr) = column.as_any().downcast_ref::<FixedSizeListArray>() {
-        return Ok(list_arr.is_null(row_idx));
-    }
-
-    Err(DataFusionError::Plan(format!(
-        "Column '{col_name}' is not a List, LargeList, or FixedSizeList type"
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

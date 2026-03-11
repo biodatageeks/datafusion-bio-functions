@@ -200,12 +200,14 @@ impl PartialEq for FusedArrayTransform {
             && self.passthrough_columns == other.passthrough_columns
             && self.output_columns == other.output_columns
             && self.transform_exprs.len() == other.transform_exprs.len()
-            // Use Expr's structural PartialEq directly instead of Debug string comparison
+            // Use Display string comparison for consistency with Hash and Ord.
+            // Expr doesn't implement Ord, so we use Display as the canonical representation
+            // across all three traits to satisfy the invariant: a == b implies a.cmp(b) == Equal.
             && self
                 .transform_exprs
                 .iter()
                 .zip(other.transform_exprs.iter())
-                .all(|(a, b)| a == b)
+                .all(|(a, b)| a.to_string() == b.to_string())
     }
 }
 
