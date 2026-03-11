@@ -1308,11 +1308,6 @@ async fn test_arithmetic_transform() {
 #[tokio::test]
 #[serial]
 async fn test_conditional_transform() {
-    // NOTE: This test currently FAILS because the FusedArrayTransform optimization
-    //       does NOT support transformations in a separate CTE yet.
-    //
-    // Same limitation as test_arithmetic_transform - transformation CTEs not detected.
-    // This test uses create_optimized_context() so it will PASS once support is added.
     use datafusion::physical_plan::displayable;
 
     let ctx = create_optimized_context().await; // Use optimized context
