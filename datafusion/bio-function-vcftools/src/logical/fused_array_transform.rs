@@ -12,7 +12,8 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, UserDefinedLogicalNodeCore};
-use log::warn;
+
+use crate::common::build_element_schema_from_df;
 
 /// A custom logical node that fuses unnest + transform + array_agg into a single operation.
 ///
@@ -74,24 +75,22 @@ impl FusedArrayTransform {
 
         // Build element-level schema for type inference
         // This represents the scalar types of array elements (as if unnested)
-        let element_schema = build_element_schema(input_schema, &array_columns)?;
+        let element_schema = build_element_schema_from_df(input_schema, &array_columns)?;
 
         // Helper to get element type from array column
         let get_array_element_type = |array_col: &str| -> Result<DataType> {
-            let input_field = input_schema.field_with_unqualified_name(array_col)?;
-            match input_field.data_type() {
-                DataType::List(inner) | DataType::LargeList(inner) => Ok(inner.data_type().clone()),
-                DataType::FixedSizeList(inner, _) => Ok(inner.data_type().clone()),
-                other => Err(datafusion::common::DataFusionError::Plan(format!(
-                    "Column '{array_col}' has type {other}, expected List type"
-                ))),
-            }
+            crate::common::extract_list_element_type(
+                input_schema
+                    .field_with_unqualified_name(array_col)?
+                    .data_type(),
+                array_col,
+            )
         };
 
         // Add output array columns - infer type from corresponding transform expression
         for (idx, output_col) in output_columns.iter().enumerate() {
             // Infer element type from the transform expression
-            // If type inference fails (e.g., column not in element schema), fall back to array column's type
+            // Type inference must succeed - no silent fallbacks to avoid schema mismatches
             let element_type = if idx < transform_exprs.len() {
                 let inferred = transform_exprs[idx].get_type(&element_schema);
                 match inferred {
@@ -99,22 +98,17 @@ impl FusedArrayTransform {
                     Err(e) => {
                         // Try falling back to array column's element type
                         if let Some(array_col) = array_columns.get(idx) {
-                            if let Ok(dt) = get_array_element_type(array_col) {
-                                warn!(
-                                    "Type inference failed for output '{output_col}': {e}. Falling back to array column type: {dt:?}"
-                                );
-                                dt
-                            } else {
-                                warn!(
-                                    "Type inference failed for output '{output_col}': {e}. Using Float64 fallback."
-                                );
-                                DataType::Float64
-                            }
+                            get_array_element_type(array_col).map_err(|_| {
+                                datafusion::common::DataFusionError::Plan(format!(
+                                    "Type inference failed for output '{output_col}': {e}. \
+                                     Could not determine element type from array column '{array_col}'."
+                                ))
+                            })?
                         } else {
-                            warn!(
-                                "Type inference failed for output '{output_col}': {e}. Using Float64 fallback."
-                            );
-                            DataType::Float64
+                            return Err(datafusion::common::DataFusionError::Plan(format!(
+                                "Type inference failed for output '{output_col}': {e}. \
+                                 No corresponding array column to fall back to."
+                            )));
                         }
                     }
                 }
@@ -122,11 +116,12 @@ impl FusedArrayTransform {
                 // No transform expression, use array column's element type
                 get_array_element_type(&array_columns[idx])?
             } else {
-                // Default fallback for extra outputs without corresponding array columns
-                warn!(
-                    "No type information for output '{output_col}' at index {idx}. Using Float64 fallback."
-                );
-                DataType::Float64
+                return Err(datafusion::common::DataFusionError::Plan(format!(
+                    "No type information for output '{output_col}' at index {idx}. \
+                     Number of outputs ({}) exceeds number of array columns ({}).",
+                    output_columns.len(),
+                    array_columns.len()
+                )));
             };
 
             fields.push(Field::new(
@@ -191,9 +186,10 @@ impl Hash for FusedArrayTransform {
         self.array_columns.hash(state);
         self.passthrough_columns.hash(state);
         self.output_columns.hash(state);
-        // Note: Expr doesn't implement Hash, so we hash its debug representation
+        // Note: Expr doesn't implement Hash, so we hash its Display representation.
+        // Display is more canonical than Debug for expressions.
         for expr in &self.transform_exprs {
-            format!("{expr:?}").hash(state);
+            expr.to_string().hash(state);
         }
     }
 }
@@ -204,11 +200,12 @@ impl PartialEq for FusedArrayTransform {
             && self.passthrough_columns == other.passthrough_columns
             && self.output_columns == other.output_columns
             && self.transform_exprs.len() == other.transform_exprs.len()
+            // Use Expr's structural PartialEq directly instead of Debug string comparison
             && self
                 .transform_exprs
                 .iter()
                 .zip(other.transform_exprs.iter())
-                .all(|(a, b)| format!("{a:?}") == format!("{b:?}"))
+                .all(|(a, b)| a == b)
     }
 }
 
@@ -226,6 +223,23 @@ impl Ord for FusedArrayTransform {
             .cmp(&other.array_columns)
             .then_with(|| self.passthrough_columns.cmp(&other.passthrough_columns))
             .then_with(|| self.output_columns.cmp(&other.output_columns))
+            // Compare transform_exprs to maintain consistency with PartialEq.
+            // Since Expr doesn't implement Ord, we compare by length first,
+            // then by Display string representation for deterministic ordering.
+            .then_with(|| self.transform_exprs.len().cmp(&other.transform_exprs.len()))
+            .then_with(|| {
+                for (a, b) in self
+                    .transform_exprs
+                    .iter()
+                    .zip(other.transform_exprs.iter())
+                {
+                    let cmp = a.to_string().cmp(&b.to_string());
+                    if cmp != Ordering::Equal {
+                        return cmp;
+                    }
+                }
+                Ordering::Equal
+            })
     }
 }
 
@@ -271,34 +285,6 @@ impl UserDefinedLogicalNodeCore for FusedArrayTransform {
             exprs,
         )
     }
-}
-
-/// Build a schema representing the element types of array columns.
-///
-/// For each array column, we extract the element type and create a
-/// column with the same name but the scalar (element) type. This schema
-/// is used for inferring the output type of transform expressions.
-fn build_element_schema(input_schema: &DFSchemaRef, array_columns: &[String]) -> Result<DFSchema> {
-    let mut fields: Vec<Field> = Vec::with_capacity(array_columns.len());
-
-    for col_name in array_columns {
-        let input_field = input_schema.field_with_unqualified_name(col_name)?;
-
-        // Extract element type from List/LargeList/FixedSizeList
-        let element_type = match input_field.data_type() {
-            DataType::List(inner) | DataType::LargeList(inner) => inner.data_type().clone(),
-            DataType::FixedSizeList(inner, _) => inner.data_type().clone(),
-            other => {
-                return Err(datafusion::common::DataFusionError::Plan(format!(
-                    "Column '{col_name}' has type {other}, expected List type"
-                )));
-            }
-        };
-
-        fields.push(Field::new(col_name, element_type, true));
-    }
-
-    DFSchema::try_from(Schema::new(fields))
 }
 
 #[cfg(test)]

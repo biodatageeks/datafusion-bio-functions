@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use datafusion::common::Result;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -26,6 +27,86 @@ use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use log::{debug, trace};
 
 use super::fused_array_transform::FusedArrayTransform;
+
+/// Global thread-safe flag to enable/disable the fused array transform optimization.
+///
+/// This is the preferred way to enable the optimization in production code.
+/// Use [`enable_fused_array_transform`] and [`disable_fused_array_transform`]
+/// to control this flag, or use [`set_fused_array_transform_enabled`] for
+/// conditional enabling.
+///
+/// The environment variable `BIO_FUSED_ARRAY_TRANSFORM` is still supported
+/// for backward compatibility, but the atomic flag takes precedence.
+static FUSED_ARRAY_TRANSFORM_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable the fused array transform optimization globally.
+///
+/// This is thread-safe and can be called from any thread.
+///
+/// # Example
+///
+/// ```
+/// use datafusion_bio_function_vcftools::logical::optimizer_rule::enable_fused_array_transform;
+///
+/// enable_fused_array_transform();
+/// ```
+pub fn enable_fused_array_transform() {
+    FUSED_ARRAY_TRANSFORM_ENABLED.store(true, Ordering::SeqCst);
+}
+
+/// Disable the fused array transform optimization globally.
+///
+/// This is thread-safe and can be called from any thread.
+///
+/// # Example
+///
+/// ```
+/// use datafusion_bio_function_vcftools::logical::optimizer_rule::disable_fused_array_transform;
+///
+/// disable_fused_array_transform();
+/// ```
+pub fn disable_fused_array_transform() {
+    FUSED_ARRAY_TRANSFORM_ENABLED.store(false, Ordering::SeqCst);
+}
+
+/// Set the fused array transform optimization state.
+///
+/// This is thread-safe and can be called from any thread.
+///
+/// # Arguments
+///
+/// * `enabled` - `true` to enable the optimization, `false` to disable it.
+///
+/// # Example
+///
+/// ```
+/// use datafusion_bio_function_vcftools::logical::optimizer_rule::set_fused_array_transform_enabled;
+///
+/// // Enable conditionally based on a configuration
+/// set_fused_array_transform_enabled(true);
+/// ```
+pub fn set_fused_array_transform_enabled(enabled: bool) {
+    FUSED_ARRAY_TRANSFORM_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
+/// Check if the fused array transform optimization is currently enabled.
+///
+/// This checks the global atomic flag first, then falls back to the
+/// environment variable `BIO_FUSED_ARRAY_TRANSFORM` for backward compatibility.
+///
+/// # Returns
+///
+/// `true` if the optimization is enabled, `false` otherwise.
+pub fn is_fused_array_transform_enabled() -> bool {
+    // Check atomic flag first (takes precedence)
+    if FUSED_ARRAY_TRANSFORM_ENABLED.load(Ordering::SeqCst) {
+        return true;
+    }
+    // Fall back to environment variable for backward compatibility
+    std::env::var("BIO_FUSED_ARRAY_TRANSFORM")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
 
 /// Get a human-readable name for a LogicalPlan node type.
 fn plan_type_name(plan: &LogicalPlan) -> &'static str {
@@ -71,11 +152,13 @@ impl FusedArrayTransformOptimizerRule {
         Self
     }
 
-    /// Check if the optimization is enabled via environment variable.
-    fn is_enabled(&self) -> bool {
-        std::env::var("BIO_FUSED_ARRAY_TRANSFORM")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false)
+    /// Check if the optimization is enabled.
+    ///
+    /// This delegates to the global [`is_fused_array_transform_enabled`] function,
+    /// which checks the atomic flag first, then falls back to the environment
+    /// variable `BIO_FUSED_ARRAY_TRANSFORM` for backward compatibility.
+    pub fn is_enabled(&self) -> bool {
+        is_fused_array_transform_enabled()
     }
 }
 
@@ -459,25 +542,23 @@ mod tests {
 
     #[test]
     fn test_rule_disabled_by_default() {
-        // Clear the env var if set
-        // SAFETY: Test runs single-threaded, env var modification is safe
-        unsafe { std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM") };
+        // Ensure the optimization is disabled
+        disable_fused_array_transform();
 
         let rule = FusedArrayTransformOptimizerRule::new();
         assert!(!rule.is_enabled());
     }
 
     #[test]
-    fn test_rule_enabled_via_env() {
-        // SAFETY: Test runs single-threaded, env var modification is safe
-        unsafe { std::env::set_var("BIO_FUSED_ARRAY_TRANSFORM", "1") };
+    fn test_rule_enabled_via_api() {
+        // Enable the optimization using the thread-safe API
+        enable_fused_array_transform();
 
         let rule = FusedArrayTransformOptimizerRule::new();
         assert!(rule.is_enabled());
 
         // Clean up
-        // SAFETY: Test runs single-threaded, env var modification is safe
-        unsafe { std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM") };
+        disable_fused_array_transform();
     }
 
     #[test]
