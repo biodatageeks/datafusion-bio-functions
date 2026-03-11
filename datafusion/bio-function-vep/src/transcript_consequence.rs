@@ -439,16 +439,25 @@ impl TranscriptConsequenceEngine {
                         let cdna_position = compute_cdna_position(variant, &tx_exons, tx.strand);
                         let (cds_position, protein_position, amino_acids, codons) =
                             if let Some(ref cc) = coding_class {
+                                // VEP only uses the "?" prefix when cds_start_nf is true
+                                // AND the first coding exon has non-zero phase (the CDS
+                                // sequence starts with N padding).  cds_start_nf alone
+                                // is not sufficient — many transcripts have the flag set
+                                // but still have a known CDS start at codon boundary.
+                                let use_question = tx.cds_start_nf
+                                    && tx_translation
+                                        .and_then(|t| t.cds_sequence.as_deref())
+                                        .is_some_and(|s| s.starts_with('N'));
                                 let cds_pos = match (cc.cds_position_start, cc.cds_position_end) {
                                     (Some(s), Some(e)) if s == e => {
-                                        if tx.cds_start_nf {
+                                        if use_question {
                                             Some(format!("?-{s}"))
                                         } else {
                                             Some(s.to_string())
                                         }
                                     }
                                     (Some(s), Some(e)) => {
-                                        if tx.cds_start_nf {
+                                        if use_question {
                                             Some(format!("?-{e}"))
                                         } else {
                                             Some(format!("{s}-{e}"))
@@ -459,14 +468,14 @@ impl TranscriptConsequenceEngine {
                                 let prot_pos =
                                     match (cc.protein_position_start, cc.protein_position_end) {
                                         (Some(s), Some(e)) if s == e => {
-                                            if tx.cds_start_nf {
+                                            if use_question {
                                                 Some(format!("?-{s}"))
                                             } else {
                                                 Some(s.to_string())
                                             }
                                         }
                                         (Some(s), Some(e)) => {
-                                            if tx.cds_start_nf {
+                                            if use_question {
                                                 Some(format!("?-{e}"))
                                             } else {
                                                 Some(format!("{s}-{e}"))
@@ -1835,6 +1844,14 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         terms.remove(&SoTerm::SplicePolypyrimidineTractVariant);
     }
 
+    // SO hierarchy: splice_acceptor/donor_variant IS-A intron_variant.
+    // VEP strips the parent (intron_variant) when the more specific
+    // child term is present.
+    if terms.contains(&SoTerm::SpliceDonorVariant) || terms.contains(&SoTerm::SpliceAcceptorVariant)
+    {
+        terms.remove(&SoTerm::IntronVariant);
+    }
+
     // VEP doesn't emit incomplete_terminal_codon_variant when a more specific
     // stop consequence (stop_lost, stop_gained) is already present.
     if terms.contains(&SoTerm::StopLost) || terms.contains(&SoTerm::StopGained) {
@@ -2367,7 +2384,11 @@ fn classify_insertion(
     let first_codon = codon_at;
     if first_codon < old_aas.len() {
         let ref_aa = old_aas[first_codon];
-        if frameshift {
+        if frameshift && ins_at_boundary {
+            // Frameshift insertion at codon boundary: VEP uses "-/X" because
+            // no existing codon is disrupted — the insertion happens between codons.
+            class.amino_acids = Some("-/X".to_string());
+        } else if frameshift {
             // Frameshifts: VEP uses X for the altered downstream sequence.
             // If the first affected codon's amino acid is preserved, show it
             // before X (e.g., "H/HX"); otherwise just "L/X".
@@ -4101,9 +4122,18 @@ mod tests {
             &[],
         );
         let terms = &assignments[0].terms;
+        // VEP strips intron_variant when the more specific splice_donor_variant
+        // is present (SO hierarchy: splice_donor_variant IS-A intron_variant).
+        // The deletion extends deep into the intron but the parent term is
+        // still suppressed by strip_parent_terms.
         assert!(
-            terms.contains(&SoTerm::IntronVariant),
-            "Large exon-spanning deletion should get intron_variant: {:?}",
+            terms.contains(&SoTerm::SpliceDonorVariant),
+            "Large exon-spanning deletion should get splice_donor_variant: {:?}",
+            terms
+        );
+        assert!(
+            !terms.contains(&SoTerm::IntronVariant),
+            "intron_variant should be stripped when splice_donor_variant is present: {:?}",
             terms
         );
     }
@@ -4843,22 +4873,43 @@ mod tests {
     // ---- format_codon_display: additional edge cases ----
 
     // ---- cds_start_nf: "?-N" formatting for CDS_position and Protein_position ----
+    // VEP only applies the "?" prefix when cds_start_nf is true AND the first
+    // coding exon has non-zero phase (CDS sequence starts with N padding).
 
     #[test]
-    fn cds_position_question_mark_when_cds_start_nf_single() {
-        // When cds_start_nf is true and CDS position is a single value (start == end),
-        // format should be "?-N" instead of just "N".
+    fn cds_position_question_mark_when_cds_start_nf_and_phase() {
+        // CDS with N padding (phase=2) + cds_start_nf → "?-N" format.
+        // "NN" + "GCTGAATGA" = 11 bases, SNV at pos 1003 → CDS idx 5 (offset 2+3)
+        let cds = "NNGCTGAATGA";
+        let mut t = tx("T1", "22", 1000, 1010, 1, "protein_coding", Some(1000), Some(1010));
+        t.cds_start_nf = true;
+        let e = exon("T1", 1, 1000, 1010);
+        let tr = translation("T1", Some(11), Some(3), None, Some(cds));
+        let v = var("22", 1003, 1003, "G", "A");
+        let engine = TranscriptConsequenceEngine::default();
+        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
+        let entry = result.iter().find(|e| e.cds_position.is_some()).unwrap();
+        let cds_pos = entry.cds_position.as_deref().unwrap();
+        assert!(
+            cds_pos.starts_with("?-"),
+            "CDS with N-padding + cds_start_nf should use '?-' prefix: {cds_pos}"
+        );
+    }
+
+    #[test]
+    fn cds_position_no_question_mark_when_cds_start_nf_but_no_phase() {
+        // CDS starts with ATG (no N padding) + cds_start_nf → plain "N" format.
+        // VEP doesn't use "?" when phase is zero even with cds_start_nf.
         let cds = "ATGGCTGAATGA";
         let mut t = tx("T1", "22", 1000, 1011, 1, "protein_coding", Some(1000), Some(1011));
         t.cds_start_nf = true;
         let e = exon("T1", 1, 1000, 1011);
         let tr = translation("T1", Some(12), Some(4), None, Some(cds));
-        // SNV at pos 1003 → CDS idx 3, single position (start==end)
         let v = var("22", 1003, 1003, "G", "A");
         let engine = TranscriptConsequenceEngine::default();
         let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
         let entry = result.iter().find(|e| e.cds_position.is_some()).unwrap();
-        assert_eq!(entry.cds_position.as_deref(), Some("?-4"));
+        assert_eq!(entry.cds_position.as_deref(), Some("4"));
     }
 
     #[test]
@@ -4876,30 +4927,27 @@ mod tests {
     }
 
     #[test]
-    fn cds_position_question_mark_when_cds_start_nf_range() {
-        // When cds_start_nf is true and CDS position is a range (start != end),
-        // format should be "?-E" instead of "S-E".
-        let cds = "ATGGCTGAAAAATGA";
-        let mut t = tx("T1", "22", 1000, 1014, 1, "protein_coding", Some(1000), Some(1014));
+    fn protein_position_question_mark_when_cds_start_nf_and_phase() {
+        // N-padded CDS + cds_start_nf → "?-N" for protein position.
+        let cds = "NNGCTGAATGA";
+        let mut t = tx("T1", "22", 1000, 1010, 1, "protein_coding", Some(1000), Some(1010));
         t.cds_start_nf = true;
-        let e = exon("T1", 1, 1000, 1014);
-        let tr = translation("T1", Some(15), Some(5), None, Some(cds));
-        // Insertion at pos 1004 → CDS range (start != end)
-        let v = var("22", 1004, 1004, "-", "TT");
+        let e = exon("T1", 1, 1000, 1010);
+        let tr = translation("T1", Some(11), Some(3), None, Some(cds));
+        let v = var("22", 1003, 1003, "G", "A");
         let engine = TranscriptConsequenceEngine::default();
         let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
-        let entry = result.iter().find(|e| e.cds_position.is_some()).unwrap();
-        let cds_pos = entry.cds_position.as_deref().unwrap();
+        let entry = result.iter().find(|e| e.protein_position.is_some()).unwrap();
+        let prot_pos = entry.protein_position.as_deref().unwrap();
         assert!(
-            cds_pos.starts_with("?-"),
-            "CDS position range with cds_start_nf should start with '?-': {cds_pos}"
+            prot_pos.starts_with("?-"),
+            "Protein position with N-padding + cds_start_nf should use '?-': {prot_pos}"
         );
     }
 
     #[test]
-    fn protein_position_question_mark_when_cds_start_nf_single() {
-        // When cds_start_nf is true and protein position is a single value,
-        // format should be "?-N".
+    fn protein_position_no_question_mark_when_cds_start_nf_but_no_phase() {
+        // CDS starts with ATG + cds_start_nf → plain number for protein position.
         let cds = "ATGGCTGAATGA";
         let mut t = tx("T1", "22", 1000, 1011, 1, "protein_coding", Some(1000), Some(1011));
         t.cds_start_nf = true;
@@ -4909,28 +4957,7 @@ mod tests {
         let engine = TranscriptConsequenceEngine::default();
         let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
         let entry = result.iter().find(|e| e.protein_position.is_some()).unwrap();
-        assert_eq!(entry.protein_position.as_deref(), Some("?-2"));
-    }
-
-    #[test]
-    fn protein_position_question_mark_when_cds_start_nf_range() {
-        // When cds_start_nf is true and protein position is a range,
-        // format should be "?-E".
-        let cds = "ATGGCTGAAAAATGA";
-        let mut t = tx("T1", "22", 1000, 1014, 1, "protein_coding", Some(1000), Some(1014));
-        t.cds_start_nf = true;
-        let e = exon("T1", 1, 1000, 1014);
-        let tr = translation("T1", Some(15), Some(5), None, Some(cds));
-        // Inframe insertion at codon boundary → protein_position range
-        let v = var("22", 1006, 1006, "-", "AAA");
-        let engine = TranscriptConsequenceEngine::default();
-        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
-        let entry = result.iter().find(|e| e.protein_position.is_some()).unwrap();
-        let prot_pos = entry.protein_position.as_deref().unwrap();
-        assert!(
-            prot_pos.starts_with("?-"),
-            "Protein position range with cds_start_nf should start with '?-': {prot_pos}"
-        );
+        assert_eq!(entry.protein_position.as_deref(), Some("2"));
     }
 
     // ---- frameshift insertion at codon boundary: protein_position range ----
@@ -5226,5 +5253,52 @@ mod tests {
     fn format_codon_display_multi_base_range() {
         // Two of three bases changed: positions 0 and 1
         assert_eq!(format_codon_display(b"ACG", 0, 1, 0), "ACg");
+    }
+
+    #[test]
+    fn classify_frameshift_insertion_at_codon_boundary_uses_dash_ref() {
+        // CDS: ATG GCT GAA TGA (12 bases) → M A E *
+        // Insert "TT" (2 bases, frameshift) at codon boundary after pos 1005
+        // (CDS index 6, between codon 1 "GCT" and codon 2 "GAA").
+        // VEP uses "-/X" for codon-boundary frameshift insertions because no
+        // existing codon is disrupted.
+        let cds = "ATGGCTGAATGA";
+        let c = classify_ins(cds, 1006, "TT").unwrap();
+        assert_eq!(c.amino_acids.as_deref(), Some("-/X"));
+    }
+
+    #[test]
+    fn strip_intron_variant_with_splice_acceptor() {
+        // SO hierarchy: splice_acceptor_variant IS-A intron_variant.
+        // VEP strips the parent (intron_variant) when splice_acceptor is present.
+        let mut terms = BTreeSet::new();
+        terms.insert(SoTerm::SpliceAcceptorVariant);
+        terms.insert(SoTerm::IntronVariant);
+        terms.insert(SoTerm::NonCodingTranscriptVariant);
+        strip_parent_terms(&mut terms);
+        assert!(!terms.contains(&SoTerm::IntronVariant));
+        assert!(terms.contains(&SoTerm::SpliceAcceptorVariant));
+        assert!(terms.contains(&SoTerm::NonCodingTranscriptVariant));
+    }
+
+    #[test]
+    fn strip_intron_variant_with_splice_donor() {
+        // SO hierarchy: splice_donor_variant IS-A intron_variant.
+        let mut terms = BTreeSet::new();
+        terms.insert(SoTerm::SpliceDonorVariant);
+        terms.insert(SoTerm::IntronVariant);
+        strip_parent_terms(&mut terms);
+        assert!(!terms.contains(&SoTerm::IntronVariant));
+        assert!(terms.contains(&SoTerm::SpliceDonorVariant));
+    }
+
+    #[test]
+    fn intron_variant_kept_without_splice_donor_acceptor() {
+        // When no splice_donor/acceptor is present, intron_variant is kept.
+        let mut terms = BTreeSet::new();
+        terms.insert(SoTerm::IntronVariant);
+        terms.insert(SoTerm::SpliceRegionVariant);
+        strip_parent_terms(&mut terms);
+        assert!(terms.contains(&SoTerm::IntronVariant));
     }
 }
