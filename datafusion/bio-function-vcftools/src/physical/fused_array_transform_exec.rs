@@ -300,15 +300,14 @@ impl FusedArrayTransformStream {
         // Filter passthrough columns to only include rows that have at least one element
         // after UNNEST (max_len > 0).
         let bool_mask = BooleanArray::from(row_mask.clone());
-        let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(
-            self.passthrough_columns.len() + self.transform_exprs.len(),
-        );
+        let mut output_columns: Vec<ArrayRef> =
+            Vec::with_capacity(self.passthrough_columns.len() + self.transform_exprs.len());
 
         for array in passthrough_arrays {
             let filtered =
-                datafusion::arrow::compute::filter(array.as_ref(), &bool_mask).map_err(
-                    |e| DataFusionError::Execution(format!("Error filtering passthrough column: {e}")),
-                )?;
+                datafusion::arrow::compute::filter(array.as_ref(), &bool_mask).map_err(|e| {
+                    DataFusionError::Execution(format!("Error filtering passthrough column: {e}"))
+                })?;
             output_columns.push(filtered);
         }
 
@@ -375,7 +374,7 @@ impl FusedArrayTransformStream {
         let mut null_bitmap: Vec<bool> = Vec::with_capacity(num_rows);
         let mut current_offset: i32 = 0;
 
-    for row_idx in 0..num_rows {
+        for row_idx in 0..num_rows {
             if !row_mask[row_idx] {
                 // This row would produce no UNNEST output, skip it.
                 continue;
@@ -573,7 +572,9 @@ fn infer_output_element_type(
     }
 
     // Default fallback for extra outputs without corresponding array columns
-    warn!("No type information for output '{output_col}' at index {index}. Using Float64 fallback.");
+    warn!(
+        "No type information for output '{output_col}' at index {index}. Using Float64 fallback."
+    );
     Ok(DataType::Float64)
 }
 
@@ -610,7 +611,10 @@ fn build_padded_array(
 ) -> Result<ArrayRef> {
     if list_arr.is_null(row_idx) {
         // Entire array is NULL -> all-null values after UNNEST padding
-        return Ok(datafusion::arrow::array::new_null_array(element_type, max_len));
+        return Ok(datafusion::arrow::array::new_null_array(
+            element_type,
+            max_len,
+        ));
     }
 
     let values = list_arr.value(row_idx);
