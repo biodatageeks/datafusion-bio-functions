@@ -54,6 +54,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion_bio_function_vcftools::{
     FusedArrayTransformOptimizerRule,
     VcfQueryPlanner,
+    enable_fused_array_transform,
 };
 
 // Build SessionState with the custom query planner
@@ -67,8 +68,8 @@ let ctx = SessionContext::new_with_state(state);
 // Register the optimizer rule
 ctx.add_optimizer_rule(Arc::new(FusedArrayTransformOptimizerRule::new()));
 
-// Enable the optimization via environment variable
-std::env::set_var("BIO_FUSED_ARRAY_TRANSFORM", "1");
+// Enable the optimization
+enable_fused_array_transform();
 
 // Execute queries - the optimizer will automatically detect and optimize matching patterns
 let df = ctx.sql("...").await?;
@@ -76,12 +77,33 @@ let df = ctx.sql("...").await?;
 
 ### Configuration
 
-The optimization is controlled via the `BIO_FUSED_ARRAY_TRANSFORM` environment variable:
+The optimization is disabled by default. Use the API functions to control it:
+
+```rust
+use datafusion_bio_function_vcftools::{
+    enable_fused_array_transform,
+    disable_fused_array_transform,
+    set_fused_array_transform_enabled,
+};
+
+// Enable globally
+enable_fused_array_transform();
+
+// Disable globally
+disable_fused_array_transform();
+
+// Conditional enabling
+set_fused_array_transform_enabled(config.use_fused_transform);
+```
+
+For backward compatibility, the environment variable `BIO_FUSED_ARRAY_TRANSFORM` is still supported:
 
 | Value | Behavior |
 |-------|----------|
 | `1` or `true` | Optimization enabled |
 | Not set or any other value | Optimization disabled |
+
+**Note:** The API takes precedence over the environment variable.
 
 ## Supported Query Patterns
 
@@ -89,10 +111,31 @@ The optimizer detects queries matching this structure:
 
 ```
 Aggregate (all array_agg functions)
-  → Projection* (optional transformation layers)
-    → Unnest (one or more array columns)
-      → Input
+  → SubqueryAlias* (optional, transparent wrappers)
+    → Projection* (optional transformation layers)
+      → SubqueryAlias* (optional)
+        → Unnest (one or more array columns)
+          → Input
 ```
+
+### Requirements
+
+The optimization is applied **only when all** of the following conditions are met:
+
+1. **Aggregate node with only `array_agg`/`list_agg` functions** — all aggregate expressions must be `array_agg` or `list_agg`. Mixed aggregates (e.g., `array_agg` + `sum`) are not supported.
+
+2. **No unsupported modifiers** — the `array_agg` functions must not use:
+   - `DISTINCT` (`array_agg(DISTINCT col)`)
+   - `FILTER` (`array_agg(col) FILTER (WHERE ...)`) 
+   - `ORDER BY` inside the aggregate (`array_agg(col ORDER BY other_col)`)
+
+3. **Unnest node reachable** — below the Aggregate, through zero or more Projection and SubqueryAlias nodes, there must be an `Unnest` node.
+
+4. **At least one array column** — the Unnest must operate on at least one array column.
+
+### Order Preservation
+
+The fused transformation **preserves element order** within arrays. Unlike the SQL-based `unnest → transform → array_agg` pattern (where `array_agg` order depends on `GROUP BY` execution and is not guaranteed without `ORDER BY` inside the aggregate), this optimization processes elements sequentially and outputs them in the same order as the input arrays.
 
 ### Transforms
 
@@ -151,8 +194,10 @@ Look for `FusedArrayTransformExec` in the physical plan output.
 
 ## Limitations
 
-- All aggregate functions must be `array_agg` (mixed aggregates not supported)
-- Requires a row identifier column (typically from `ROW_NUMBER()`)
+- All aggregate functions must be `array_agg` or `list_agg` (mixed aggregates not supported)
+- `DISTINCT`, `FILTER`, and `ORDER BY` modifiers on `array_agg` are not supported
+- Requires a row identifier column for grouping (typically from `ROW_NUMBER()`)
+- The query must follow the `Aggregate → Projection* → Unnest` structure
 
 ## File Structure
 
@@ -160,9 +205,9 @@ Look for `FusedArrayTransformExec` in the physical plan output.
 datafusion/bio-function-vcftools/
 ├── Cargo.toml
 ├── README.md                              # This file
-├── FUSED_ARRAY_TRANSFORM.md               # Detailed design document
 ├── src/
 │   ├── lib.rs                             # Crate root, re-exports
+│   ├── common.rs                          # Common functions
 │   ├── logical/
 │   │   ├── fused_array_transform.rs       # Logical node
 │   │   └── optimizer_rule.rs              # Pattern detection
