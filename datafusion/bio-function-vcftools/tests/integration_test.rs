@@ -1810,7 +1810,6 @@ async fn test_parquet_round_trip_with_transform() {
             SELECT 
                 row_idx,
                 metadata,
-                ROW_NUMBER() OVER (PARTITION BY row_idx ORDER BY row_idx) as val_idx,
                 unnest(values_a) as val_a,
                 unnest(values_b) as val_b,
                 unnest(values_c) as val_c
@@ -1819,7 +1818,6 @@ async fn test_parquet_round_trip_with_transform() {
         transformed AS (
             SELECT
                 row_idx,
-                val_idx,
                 metadata,
                 val_a,
                 val_b,
@@ -1830,10 +1828,10 @@ async fn test_parquet_round_trip_with_transform() {
         SELECT
             row_idx,
             metadata,
-            array_agg(val_a ORDER BY val_idx) AS values_a,
-            array_agg(val_b ORDER BY val_idx) AS values_b,
-            array_agg(val_c ORDER BY val_idx) AS values_c,
-            array_agg(val_d ORDER BY val_idx) AS values_d
+            array_agg(val_a) AS values_a,
+            array_agg(val_b) AS values_b,
+            array_agg(val_c) AS values_c,
+            array_agg(val_d) AS values_d
         FROM transformed
         GROUP BY row_idx, metadata
         ORDER BY row_idx
