@@ -282,8 +282,9 @@ async fn test_simple_identity_baseline_vs_optimized_same_results() {
 
     let df_baseline = ctx_baseline.sql(sql).await.unwrap();
     let physical_plan_baseline = df_baseline.create_physical_plan().await.unwrap();
-    let plan_str_baseline =
-        displayable(physical_plan_baseline.as_ref()).indent(true).to_string();
+    let plan_str_baseline = displayable(physical_plan_baseline.as_ref())
+        .indent(true)
+        .to_string();
     assert!(
         !plan_str_baseline.contains("FusedArrayTransform"),
         "Baseline physical plan unexpectedly contains FusedArrayTransform:\n{plan_str_baseline}"
@@ -303,8 +304,9 @@ async fn test_simple_identity_baseline_vs_optimized_same_results() {
 
     let df_optimized = ctx_optimized.sql(sql).await.unwrap();
     let physical_plan_optimized = df_optimized.create_physical_plan().await.unwrap();
-    let plan_str_optimized =
-        displayable(physical_plan_optimized.as_ref()).indent(true).to_string();
+    let plan_str_optimized = displayable(physical_plan_optimized.as_ref())
+        .indent(true)
+        .to_string();
     assert!(
         plan_str_optimized.contains("FusedArrayTransform"),
         "FusedArrayTransform optimization was NOT applied for simple identity baseline-vs-optimized test! Physical plan:\n{plan_str_optimized}"
@@ -767,8 +769,9 @@ async fn test_null_arrays() {
 
     let df_baseline = ctx_baseline.sql(sql).await.unwrap();
     let physical_plan_baseline = df_baseline.create_physical_plan().await.unwrap();
-    let plan_str_baseline =
-        displayable(physical_plan_baseline.as_ref()).indent(true).to_string();
+    let plan_str_baseline = displayable(physical_plan_baseline.as_ref())
+        .indent(true)
+        .to_string();
     assert!(
         !plan_str_baseline.contains("FusedArrayTransform"),
         "Baseline physical plan unexpectedly contains FusedArrayTransform:\n{plan_str_baseline}"
@@ -785,8 +788,9 @@ async fn test_null_arrays() {
 
     let df_optimized = ctx_optimized.sql(sql).await.unwrap();
     let physical_plan_optimized = df_optimized.create_physical_plan().await.unwrap();
-    let plan_str_optimized =
-        displayable(physical_plan_optimized.as_ref()).indent(true).to_string();
+    let plan_str_optimized = displayable(physical_plan_optimized.as_ref())
+        .indent(true)
+        .to_string();
     assert!(
         plan_str_optimized.contains("FusedArrayTransform"),
         "FusedArrayTransform optimization was NOT applied for null arrays case! Physical plan:\n{plan_str_optimized}"
@@ -850,8 +854,9 @@ async fn test_empty_arrays() {
 
     let df_baseline = ctx_baseline.sql(sql).await.unwrap();
     let physical_plan_baseline = df_baseline.create_physical_plan().await.unwrap();
-    let plan_str_baseline =
-        displayable(physical_plan_baseline.as_ref()).indent(true).to_string();
+    let plan_str_baseline = displayable(physical_plan_baseline.as_ref())
+        .indent(true)
+        .to_string();
     assert!(
         !plan_str_baseline.contains("FusedArrayTransform"),
         "Baseline physical plan unexpectedly contains FusedArrayTransform:\n{plan_str_baseline}"
@@ -868,8 +873,9 @@ async fn test_empty_arrays() {
 
     let df_optimized = ctx_optimized.sql(sql).await.unwrap();
     let physical_plan_optimized = df_optimized.create_physical_plan().await.unwrap();
-    let plan_str_optimized =
-        displayable(physical_plan_optimized.as_ref()).indent(true).to_string();
+    let plan_str_optimized = displayable(physical_plan_optimized.as_ref())
+        .indent(true)
+        .to_string();
     assert!(
         plan_str_optimized.contains("FusedArrayTransform"),
         "FusedArrayTransform optimization was NOT applied for empty arrays case! Physical plan:\n{plan_str_optimized}"
@@ -936,8 +942,9 @@ async fn test_mismatched_array_lengths() {
 
     let df_baseline = ctx_baseline.sql(sql).await.unwrap();
     let physical_plan_baseline = df_baseline.create_physical_plan().await.unwrap();
-    let plan_str_baseline =
-        displayable(physical_plan_baseline.as_ref()).indent(true).to_string();
+    let plan_str_baseline = displayable(physical_plan_baseline.as_ref())
+        .indent(true)
+        .to_string();
     assert!(
         !plan_str_baseline.contains("FusedArrayTransform"),
         "Baseline physical plan unexpectedly contains FusedArrayTransform:\n{plan_str_baseline}"
@@ -954,8 +961,9 @@ async fn test_mismatched_array_lengths() {
 
     let df_optimized = ctx_optimized.sql(sql).await.unwrap();
     let physical_plan_optimized = df_optimized.create_physical_plan().await.unwrap();
-    let plan_str_optimized =
-        displayable(physical_plan_optimized.as_ref()).indent(true).to_string();
+    let plan_str_optimized = displayable(physical_plan_optimized.as_ref())
+        .indent(true)
+        .to_string();
     assert!(
         plan_str_optimized.contains("FusedArrayTransform"),
         "FusedArrayTransform optimization was NOT applied for empty arrays case! Physical plan:\n{plan_str_optimized}"
@@ -1116,8 +1124,9 @@ async fn test_nulls_and_mismatched_lengths_baseline_vs_optimized_same_results() 
 
     let df_baseline = ctx_baseline.sql(sql).await.unwrap();
     let physical_plan_baseline = df_baseline.create_physical_plan().await.unwrap();
-    let plan_str_baseline =
-        displayable(physical_plan_baseline.as_ref()).indent(true).to_string();
+    let plan_str_baseline = displayable(physical_plan_baseline.as_ref())
+        .indent(true)
+        .to_string();
     assert!(
         !plan_str_baseline.contains("FusedArrayTransform"),
         "Baseline physical plan unexpectedly contains FusedArrayTransform:\n{plan_str_baseline}"
@@ -1137,8 +1146,9 @@ async fn test_nulls_and_mismatched_lengths_baseline_vs_optimized_same_results() 
 
     let df_optimized = ctx_optimized.sql(sql).await.unwrap();
     let physical_plan_optimized = df_optimized.create_physical_plan().await.unwrap();
-    let plan_str_optimized =
-        displayable(physical_plan_optimized.as_ref()).indent(true).to_string();
+    let plan_str_optimized = displayable(physical_plan_optimized.as_ref())
+        .indent(true)
+        .to_string();
     assert!(
         plan_str_optimized.contains("FusedArrayTransform"),
         "FusedArrayTransform optimization was NOT applied for nulls+mismatched-lengths case! Physical plan:\n{plan_str_optimized}"
