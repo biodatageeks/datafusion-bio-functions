@@ -414,6 +414,7 @@ impl FusedArrayTransformStream {
 
         for (col_name, list_arr) in list_arrays {
             let values = list_arr.value(row_idx);
+            let values_len = values.len();
 
             // Get the element type from the list's value type
             let element_type = match list_arr.data_type() {
@@ -428,12 +429,9 @@ impl FusedArrayTransformStream {
             };
 
             // Verify lengths match (or skip this check for scalar expansion)
-            if values.len() != array_len {
+            if values_len != array_len {
                 return Err(DataFusionError::Plan(format!(
-                    "Array length mismatch: '{}' has {} elements, expected {}",
-                    col_name,
-                    values.len(),
-                    array_len
+                    "Array length mismatch: '{col_name}' has {values_len} elements, expected {array_len}"
                 )));
             }
 
