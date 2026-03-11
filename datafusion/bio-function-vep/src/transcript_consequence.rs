@@ -2587,6 +2587,9 @@ fn compute_cdna_position(
 /// Compute FLAGS field from transcript attributes.
 fn compute_flags(tx: &TranscriptFeature) -> Option<String> {
     // Prefer pre-formatted flags string that preserves encounter order from cache.
+    // Note: VEP's flag ordering is inconsistent between transcripts (some use
+    // cds_start_NF&cds_end_NF, others cds_end_NF&cds_start_NF). We preserve
+    // the cache's order when available and use a fixed fallback otherwise.
     if let Some(ref s) = tx.flags_str {
         return Some(s.clone());
     }

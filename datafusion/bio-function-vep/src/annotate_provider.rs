@@ -193,6 +193,17 @@ impl VepFlags {
     }
 }
 
+/// A single co-located variant entry with allele and clinical metadata.
+#[derive(Debug, Clone)]
+struct ColocatedEntry {
+    variation_name: String,
+    allele_string: String,
+    somatic: i64,
+    pheno: i64,
+    clin_sig_allele: Option<String>,
+    pubmed: Option<String>,
+}
+
 /// Aggregated data from ALL co-located variants at the same position.
 ///
 /// VEP collects every variant at the same chromosomal position (regardless of
@@ -202,24 +213,136 @@ impl VepFlags {
 struct ColocatedData {
     /// All variation names joined with `&`, ordered non-somatic first.
     existing_variation: String,
-    /// Somatic flags ("0"/"1") for each co-located variant, joined with `&`.
-    /// Empty string when there is exactly one non-somatic variant.
-    somatic_flags: String,
-    /// Phenotype flags ("0"/"1") for each co-located variant, joined with `&`.
-    /// Empty string when there is exactly one non-phenotype variant.
-    pheno_flags: String,
+    /// Raw entries for allele-specific filtering of SOMATIC, PHENO, CLIN_SIG, PUBMED.
+    entries: Vec<ColocatedEntry>,
+}
+
+impl ColocatedData {
+    /// Build allele-filtered SOMATIC flags.
+    ///
+    /// VEP includes only allele-matching variants (plus COSMIC_MUTATION/HGMD_MUTATION)
+    /// for SOMATIC/PHENO, while Existing_variation includes ALL variants at the position.
+    fn somatic_flags_for_allele(&self, vcf_ref: &str, vcf_alt: &str) -> String {
+        let filtered = self.allele_filtered_entries(vcf_ref, vcf_alt);
+        let strs: Vec<&str> = filtered
+            .iter()
+            .map(|e| if e.somatic != 0 { "1" } else { "0" })
+            .collect();
+        if strs.iter().all(|s| *s == "0") {
+            String::new()
+        } else {
+            strs.join("&")
+        }
+    }
+
+    /// Build allele-filtered PHENO flags.
+    fn pheno_flags_for_allele(&self, vcf_ref: &str, vcf_alt: &str) -> String {
+        let filtered = self.allele_filtered_entries(vcf_ref, vcf_alt);
+        let strs: Vec<&str> = filtered
+            .iter()
+            .map(|e| if e.pheno != 0 { "1" } else { "0" })
+            .collect();
+        if strs.iter().all(|s| *s == "0") {
+            String::new()
+        } else {
+            strs.join("&")
+        }
+    }
+
+    /// Build allele-filtered CLIN_SIG from clin_sig_allele column.
+    ///
+    /// VEP extracts per-allele clinical significance from clin_sig_allele entries
+    /// like `"C:benign;C:benign/likely_benign"` — filtering for the VEP allele and
+    /// preserving compound terms like `benign/likely_benign`.
+    fn clin_sig_for_allele(&self, vcf_ref: &str, vcf_alt: &str) -> String {
+        use crate::allele::vcf_to_vep_allele;
+        let (_, vep_allele) = vcf_to_vep_allele(vcf_ref, vcf_alt);
+        let filtered = self.allele_filtered_entries(vcf_ref, vcf_alt);
+        let mut terms: Vec<String> = Vec::new();
+        for entry in &filtered {
+            if let Some(csa) = &entry.clin_sig_allele {
+                for pair in csa.split(';') {
+                    let pair = pair.trim();
+                    if let Some(colon) = pair.find(':') {
+                        let allele_part = &pair[..colon];
+                        let sig_part = &pair[colon + 1..];
+                        if allele_part == vep_allele && !sig_part.is_empty() {
+                            // Preserve compound terms (e.g. "benign/likely_benign") as-is.
+                            if !terms.contains(&sig_part.to_string()) {
+                                terms.push(sig_part.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        terms.join("&")
+    }
+
+    /// Build allele-filtered PUBMED by aggregating across all allele-matched variants.
+    fn pubmed_for_allele(&self, vcf_ref: &str, vcf_alt: &str) -> String {
+        let filtered = self.allele_filtered_entries(vcf_ref, vcf_alt);
+        let mut ids: Vec<String> = Vec::new();
+        for entry in &filtered {
+            if let Some(pm) = &entry.pubmed {
+                for id in pm.split(',') {
+                    let id = id.trim();
+                    if !id.is_empty() && !ids.iter().any(|x| x == id) {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+        }
+        ids.join("&")
+    }
+
+    /// Filter entries by allele compatibility.
+    ///
+    /// Always includes COSMIC_MUTATION and HGMD_MUTATION entries (no allele check).
+    /// For others, uses `allele_matches` to check VCF REF/ALT against cache allele_string.
+    ///
+    /// Returns entries sorted to match VEP's co-located ordering for SOMATIC/PHENO:
+    /// non-somatic first, then somatic, with rs* before others within each group.
+    fn allele_filtered_entries(&self, vcf_ref: &str, vcf_alt: &str) -> Vec<&ColocatedEntry> {
+        use crate::allele::allele_matches;
+        let mut filtered: Vec<&ColocatedEntry> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                // COSMIC and HGMD mutations are always included (no allele check).
+                if e.allele_string.starts_with("COSMIC_MUTATION")
+                    || e.allele_string.starts_with("HGMD_MUTATION")
+                {
+                    return true;
+                }
+                allele_matches(vcf_ref, vcf_alt, &e.allele_string)
+            })
+            .collect();
+        // Sort: non-somatic (0) before somatic (1), then rs* before others, then alphabetical.
+        filtered.sort_by(|a, b| {
+            let a_som = if a.somatic != 0 { 1 } else { 0 };
+            let b_som = if b.somatic != 0 { 1 } else { 0 };
+            a_som.cmp(&b_som).then_with(|| {
+                let a_rs = a.variation_name.starts_with("rs");
+                let b_rs = b.variation_name.starts_with("rs");
+                b_rs.cmp(&a_rs)
+                    .then_with(|| a.variation_name.cmp(&b.variation_name))
+            })
+        });
+        filtered
+    }
 }
 
 /// Build co-located variant aggregation from cache entries.
 ///
 /// Groups cache rows by (chrom, start, end) and produces one `ColocatedData`
-/// per position. Variants are ordered: non-somatic first, then somatic, with
-/// alphabetical tie-breaking on variation_name within each group.
+/// per position. Variants are ordered: rs* IDs first, then others (HGMD, COSMIC),
+/// alphabetical within each group.
 fn build_colocated_map(
     coloc_batches: &[RecordBatch],
 ) -> HashMap<(String, i64, i64), ColocatedData> {
     // Collect raw entries keyed by position.
-    let mut raw: HashMap<(String, i64, i64), Vec<(String, i64, i64)>> = HashMap::new();
+    let mut raw: HashMap<(String, i64, i64), Vec<ColocatedEntry>> = HashMap::new();
 
     for batch in coloc_batches {
         let schema = batch.schema();
@@ -229,6 +352,9 @@ fn build_colocated_map(
         let var_name_idx = schema.index_of("coloc_variation_name").unwrap_or(3);
         let somatic_idx = schema.index_of("coloc_somatic").unwrap_or(4);
         let pheno_idx = schema.index_of("coloc_pheno").unwrap_or(5);
+        let allele_str_idx = schema.index_of("coloc_allele_string").ok();
+        let clin_sig_allele_idx = schema.index_of("coloc_clin_sig_allele").ok();
+        let pubmed_col_idx = schema.index_of("coloc_pubmed").ok();
 
         for row in 0..batch.num_rows() {
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
@@ -242,13 +368,25 @@ fn build_colocated_map(
                 .unwrap_or_default();
             let somatic = int64_at(batch.column(somatic_idx).as_ref(), row).unwrap_or(0);
             let pheno = int64_at(batch.column(pheno_idx).as_ref(), row).unwrap_or(0);
+            let allele_string = allele_str_idx
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                .unwrap_or_default();
+            let clin_sig_allele = clin_sig_allele_idx
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+            let pubmed = pubmed_col_idx
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
 
             if var_name.is_empty() {
                 continue;
             }
-            raw.entry((chrom, start, end))
-                .or_default()
-                .push((var_name, somatic, pheno));
+            raw.entry((chrom, start, end)).or_default().push(ColocatedEntry {
+                variation_name: var_name,
+                allele_string,
+                somatic,
+                pheno,
+                clin_sig_allele,
+                pubmed,
+            });
         }
     }
 
@@ -258,42 +396,19 @@ fn build_colocated_map(
         // Sort to match VEP's co-located variant ordering:
         // rs* IDs (dbSNP) first, then others (HGMD, COSMIC), alphabetical within.
         entries.sort_by(|a, b| {
-            let a_rs = a.0.starts_with("rs");
-            let b_rs = b.0.starts_with("rs");
-            b_rs.cmp(&a_rs).then_with(|| a.0.cmp(&b.0))
+            let a_rs = a.variation_name.starts_with("rs");
+            let b_rs = b.variation_name.starts_with("rs");
+            b_rs.cmp(&a_rs).then_with(|| a.variation_name.cmp(&b.variation_name))
         });
 
-        let names: Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
+        let names: Vec<&str> = entries.iter().map(|e| e.variation_name.as_str()).collect();
         let existing_variation = names.join("&");
-
-        let somatic_strs: Vec<&str> = entries
-            .iter()
-            .map(|(_, s, _)| if *s != 0 { "1" } else { "0" })
-            .collect();
-        let pheno_strs: Vec<&str> = entries
-            .iter()
-            .map(|(_, _, p)| if *p != 0 { "1" } else { "0" })
-            .collect();
-
-        // VEP behavior: when all co-located variants are non-somatic (0),
-        // output empty string. Only output "0&1" style when at least one is somatic.
-        let somatic_flags = if somatic_strs.iter().all(|s| *s == "0") {
-            String::new()
-        } else {
-            somatic_strs.join("&")
-        };
-        let pheno_flags = if pheno_strs.iter().all(|s| *s == "0") {
-            String::new()
-        } else {
-            pheno_strs.join("&")
-        };
 
         map.insert(
             key,
             ColocatedData {
                 existing_variation,
-                somatic_flags,
-                pheno_flags,
+                entries,
             },
         );
     }
@@ -1308,7 +1423,10 @@ impl AnnotateProvider {
                     CAST(c.`end` AS BIGINT) AS coloc_end, \
                     c.`variation_name` AS coloc_variation_name, \
                     CAST(COALESCE(c.`somatic`, 0) AS BIGINT) AS coloc_somatic, \
-                    CAST(COALESCE(c.`phenotype_or_disease`, 0) AS BIGINT) AS coloc_pheno \
+                    CAST(COALESCE(c.`phenotype_or_disease`, 0) AS BIGINT) AS coloc_pheno, \
+                    c.`allele_string` AS coloc_allele_string, \
+                    CAST(c.`clin_sig_allele` AS VARCHAR) AS coloc_clin_sig_allele, \
+                    CAST(c.`pubmed` AS VARCHAR) AS coloc_pubmed \
              FROM `{cache_table}` AS c \
              INNER JOIN __vep_coloc_positions AS p \
              ON c.`chrom` = p.`p_chrom` \
@@ -1643,19 +1761,19 @@ impl AnnotateProvider {
                 (String::new(), String::new())
             };
 
-            // Clinical / phenotype fields.
-            // Values may contain commas (e.g. "benign,likely_benign") — escape for CSQ.
-            let clin_sig = if flags.check_existing {
-                clin_sig_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .map(|v| csq_escape(&v).into_owned())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
+            // Clinical / phenotype fields — allele-filtered from co-located data.
+            // SOMATIC/PHENO: filter by allele compatibility (always include COSMIC/HGMD).
+            // CLIN_SIG: extract from clin_sig_allele column, preserving compound terms.
+            // PUBMED: aggregate across all allele-matched co-located variants.
+            let allele_filtered_somatic: String;
+            let allele_filtered_pheno: String;
+            let allele_filtered_clin_sig: String;
+            let allele_filtered_pubmed: String;
+
             let somatic_val: &str = if flags.check_existing {
                 if let Some(c) = coloc {
-                    &c.somatic_flags
+                    allele_filtered_somatic = c.somatic_flags_for_allele(&ref_al, &alt_allele);
+                    &allele_filtered_somatic
                 } else {
                     somatic_idx
                         .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
@@ -1667,7 +1785,8 @@ impl AnnotateProvider {
             };
             let pheno_val: &str = if flags.check_existing {
                 if let Some(c) = coloc {
-                    &c.pheno_flags
+                    allele_filtered_pheno = c.pheno_flags_for_allele(&ref_al, &alt_allele);
+                    &allele_filtered_pheno
                 } else {
                     pheno_idx
                         .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
@@ -1677,11 +1796,29 @@ impl AnnotateProvider {
             } else {
                 ""
             };
+            let clin_sig: String = if flags.check_existing {
+                if let Some(c) = coloc {
+                    allele_filtered_clin_sig = c.clin_sig_for_allele(&ref_al, &alt_allele);
+                    allele_filtered_clin_sig
+                } else {
+                    clin_sig_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .map(|v| csq_escape(&v).into_owned())
+                        .unwrap_or_default()
+                }
+            } else {
+                String::new()
+            };
             let pubmed_val = if flags.pubmed {
-                pubmed_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .map(|v| csq_escape(&v).into_owned())
-                    .unwrap_or_default()
+                if let Some(c) = coloc {
+                    allele_filtered_pubmed = c.pubmed_for_allele(&ref_al, &alt_allele);
+                    allele_filtered_pubmed
+                } else {
+                    pubmed_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .map(|v| csq_escape(&v).into_owned())
+                        .unwrap_or_default()
+                }
             } else {
                 String::new()
             };
@@ -1702,7 +1839,7 @@ impl AnnotateProvider {
                     .unwrap_or_else(|| impact_label(SoImpact::Modifier));
                 // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
                 let csq_entry = format!(
-                    "{vep_allele}|{csq_val}|{impact}|||||||||||||||||{existing_var}||||||||||\
+                    "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
                      {variant_class}||||||||||||{batch3_suffix}"
                 );
                 (csq_entry, most_val.clone())
@@ -1838,7 +1975,7 @@ impl AnnotateProvider {
                 if csq_entries.is_empty() {
                     let impact = impact_label(SoImpact::Modifier);
                     csq_entries.push(format!(
-                        "{vep_allele}|sequence_variant|{impact}|||||||||||||||||{existing_var}||||||||||\
+                        "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
                          {variant_class}||||||||||||{batch3_suffix}"
                     ));
                 }
@@ -2274,6 +2411,10 @@ impl TableProvider for AnnotateProvider {
 mod tests {
     use super::*;
 
+    // =======================================================================
+    // flags_str_from_bools
+    // =======================================================================
+
     #[test]
     fn test_flags_str_both_true() {
         assert_eq!(
@@ -2303,7 +2444,39 @@ mod tests {
         assert_eq!(flags_str_from_bools(false, false), None);
     }
 
-    // --- extract_af_for_allele tests ---
+    // =======================================================================
+    // csq_escape
+    // =======================================================================
+
+    #[test]
+    fn test_csq_escape_no_comma() {
+        let result = csq_escape("benign");
+        assert_eq!(result.as_ref(), "benign");
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_csq_escape_with_comma() {
+        let result = csq_escape("benign,likely_benign");
+        assert_eq!(result.as_ref(), "benign&likely_benign");
+        assert!(matches!(result, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_csq_escape_multiple_commas() {
+        assert_eq!(csq_escape("a,b,c").as_ref(), "a&b&c");
+    }
+
+    #[test]
+    fn test_csq_escape_empty() {
+        let result = csq_escape("");
+        assert_eq!(result.as_ref(), "");
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+    }
+
+    // =======================================================================
+    // extract_af_for_allele
+    // =======================================================================
 
     #[test]
     fn test_extract_af_single_allele() {
@@ -2336,7 +2509,20 @@ mod tests {
         assert_eq!(extract_af_for_allele("T:0", "T"), "0");
     }
 
-    // --- format_af_4f tests ---
+    #[test]
+    fn test_extract_af_no_colon_in_entry() {
+        // Malformed entry without colon — should be skipped, return empty.
+        assert_eq!(extract_af_for_allele("T0.5", "T"), "");
+    }
+
+    #[test]
+    fn test_extract_af_insertion_allele() {
+        assert_eq!(extract_af_for_allele("AGT:0.01,-:0.99", "AGT"), "0.01");
+    }
+
+    // =======================================================================
+    // format_af_4f
+    // =======================================================================
 
     #[test]
     fn test_format_af_4f_rounds_to_4_decimals() {
@@ -2357,7 +2543,20 @@ mod tests {
         assert_eq!(format_af_4f(""), "");
     }
 
-    // --- compute_max_af tests ---
+    #[test]
+    fn test_format_af_4f_unparseable() {
+        // Non-numeric input — returned as-is.
+        assert_eq!(format_af_4f("not_a_number"), "not_a_number");
+    }
+
+    #[test]
+    fn test_format_af_4f_one() {
+        assert_eq!(format_af_4f("1"), "1.0000");
+    }
+
+    // =======================================================================
+    // compute_max_af
+    // =======================================================================
 
     #[test]
     fn test_compute_max_af_single_pop() {
@@ -2403,13 +2602,141 @@ mod tests {
         assert_eq!(max_pops, "gnomADg_NFE");
     }
 
-    // --- VepFlags tests ---
+    #[test]
+    fn test_compute_max_af_skips_unparseable_freq() {
+        let entries = vec![("AF", "bad"), ("gnomADg_NFE", "0.03")];
+        let (max_af, max_pops) = compute_max_af(&entries);
+        assert_eq!(max_af, "0.03");
+        assert_eq!(max_pops, "gnomADg_NFE");
+    }
+
+    #[test]
+    fn test_compute_max_af_all_empty_freqs() {
+        let entries = vec![("AF", ""), ("gnomADg_NFE", "")];
+        let (max_af, max_pops) = compute_max_af(&entries);
+        assert_eq!(max_af, "");
+        assert_eq!(max_pops, "");
+    }
+
+    // =======================================================================
+    // classify_variant
+    // =======================================================================
+
+    #[test]
+    fn test_classify_variant_snv() {
+        assert_eq!(classify_variant("A", "G"), "SNV");
+        assert_eq!(classify_variant("C", "T"), "SNV");
+    }
+
+    #[test]
+    fn test_classify_variant_insertion() {
+        assert_eq!(classify_variant("-", "T"), "insertion");
+        assert_eq!(classify_variant("-", "AGT"), "insertion");
+    }
+
+    #[test]
+    fn test_classify_variant_deletion() {
+        assert_eq!(classify_variant("A", "-"), "deletion");
+        assert_eq!(classify_variant("AGT", "-"), "deletion");
+    }
+
+    #[test]
+    fn test_classify_variant_substitution() {
+        assert_eq!(classify_variant("AT", "GC"), "substitution");
+        assert_eq!(classify_variant("ATG", "GCA"), "substitution");
+    }
+
+    #[test]
+    fn test_classify_variant_indel() {
+        assert_eq!(classify_variant("AT", "G"), "indel");
+        assert_eq!(classify_variant("A", "GC"), "indel");
+    }
+
+    // =======================================================================
+    // impact_label
+    // =======================================================================
+
+    #[test]
+    fn test_impact_label_all_variants() {
+        assert_eq!(impact_label(SoImpact::High), "HIGH");
+        assert_eq!(impact_label(SoImpact::Moderate), "MODERATE");
+        assert_eq!(impact_label(SoImpact::Low), "LOW");
+        assert_eq!(impact_label(SoImpact::Modifier), "MODIFIER");
+    }
+
+    // =======================================================================
+    // parse_sv_feature_kind
+    // =======================================================================
+
+    #[test]
+    fn test_parse_sv_feature_kind_known() {
+        assert_eq!(parse_sv_feature_kind("transcript"), Some(SvFeatureKind::Transcript));
+        assert_eq!(parse_sv_feature_kind("tx"), Some(SvFeatureKind::Transcript));
+        assert_eq!(parse_sv_feature_kind("regulatory"), Some(SvFeatureKind::Regulatory));
+        assert_eq!(parse_sv_feature_kind("reg"), Some(SvFeatureKind::Regulatory));
+        assert_eq!(parse_sv_feature_kind("tfbs"), Some(SvFeatureKind::Tfbs));
+        assert_eq!(parse_sv_feature_kind("motif"), Some(SvFeatureKind::Tfbs));
+        assert_eq!(parse_sv_feature_kind("feature"), Some(SvFeatureKind::Generic));
+        assert_eq!(parse_sv_feature_kind("generic"), Some(SvFeatureKind::Generic));
+    }
+
+    #[test]
+    fn test_parse_sv_feature_kind_case_insensitive() {
+        assert_eq!(parse_sv_feature_kind("TRANSCRIPT"), Some(SvFeatureKind::Transcript));
+        assert_eq!(parse_sv_feature_kind("Regulatory"), Some(SvFeatureKind::Regulatory));
+    }
+
+    #[test]
+    fn test_parse_sv_feature_kind_unknown() {
+        assert_eq!(parse_sv_feature_kind("unknown"), None);
+        assert_eq!(parse_sv_feature_kind(""), None);
+    }
+
+    // =======================================================================
+    // parse_sv_event_kind
+    // =======================================================================
+
+    #[test]
+    fn test_parse_sv_event_kind_known() {
+        assert_eq!(parse_sv_event_kind("ablation"), Some(SvEventKind::Ablation));
+        assert_eq!(parse_sv_event_kind("deletion"), Some(SvEventKind::Ablation));
+        assert_eq!(parse_sv_event_kind("del"), Some(SvEventKind::Ablation));
+        assert_eq!(parse_sv_event_kind("amplification"), Some(SvEventKind::Amplification));
+        assert_eq!(parse_sv_event_kind("duplication"), Some(SvEventKind::Amplification));
+        assert_eq!(parse_sv_event_kind("dup"), Some(SvEventKind::Amplification));
+        assert_eq!(parse_sv_event_kind("amp"), Some(SvEventKind::Amplification));
+        assert_eq!(parse_sv_event_kind("elongation"), Some(SvEventKind::Elongation));
+        assert_eq!(parse_sv_event_kind("elongate"), Some(SvEventKind::Elongation));
+        assert_eq!(parse_sv_event_kind("truncation"), Some(SvEventKind::Truncation));
+        assert_eq!(parse_sv_event_kind("truncate"), Some(SvEventKind::Truncation));
+    }
+
+    #[test]
+    fn test_parse_sv_event_kind_case_insensitive() {
+        assert_eq!(parse_sv_event_kind("ABLATION"), Some(SvEventKind::Ablation));
+        assert_eq!(parse_sv_event_kind("Truncation"), Some(SvEventKind::Truncation));
+    }
+
+    #[test]
+    fn test_parse_sv_event_kind_unknown() {
+        assert_eq!(parse_sv_event_kind("unknown"), None);
+        assert_eq!(parse_sv_event_kind(""), None);
+    }
+
+    // =======================================================================
+    // VepFlags
+    // =======================================================================
 
     #[test]
     fn test_vep_flags_none() {
         let flags = VepFlags::from_options_json(None);
         assert!(!flags.check_existing);
         assert!(!flags.af);
+        assert!(!flags.af_1kg);
+        assert!(!flags.af_gnomade);
+        assert!(!flags.af_gnomadg);
+        assert!(!flags.max_af);
+        assert!(!flags.pubmed);
     }
 
     #[test]
@@ -2440,5 +2767,1190 @@ mod tests {
         assert!(flags.af_group_enabled(3)); // gnomADg
         assert!(!flags.af_group_enabled(0)); // global AF
         assert!(!flags.af_group_enabled(2)); // gnomADe
+    }
+
+    #[test]
+    fn test_vep_flags_af_group_enabled_out_of_range() {
+        let flags = VepFlags::from_options_json(Some(r#"{"af":true}"#));
+        assert!(!flags.af_group_enabled(99));
+    }
+
+    #[test]
+    fn test_vep_flags_all_af_flags() {
+        let flags = VepFlags::from_options_json(Some(
+            r#"{"af":true,"af_1kg":true,"af_gnomade":true,"af_gnomadg":true,"max_af":true}"#,
+        ));
+        assert!(flags.af);
+        assert!(flags.af_1kg);
+        assert!(flags.af_gnomade);
+        assert!(flags.af_gnomadg);
+        assert!(flags.max_af);
+        assert!(flags.check_existing);
+    }
+
+    #[test]
+    fn test_vep_flags_explicit_false() {
+        let flags = VepFlags::from_options_json(Some(r#"{"af":false}"#));
+        assert!(!flags.af);
+        assert!(!flags.check_existing);
+    }
+
+    #[test]
+    fn test_vep_flags_empty_json() {
+        let flags = VepFlags::from_options_json(Some("{}"));
+        assert!(!flags.check_existing);
+        assert!(!flags.af);
+    }
+
+    #[test]
+    fn test_vep_flags_max_af_implies_check_existing() {
+        let flags = VepFlags::from_options_json(Some(r#"{"max_af":true}"#));
+        assert!(flags.max_af);
+        assert!(flags.check_existing);
+    }
+
+    #[test]
+    fn test_vep_flags_af_1kg_implies_check_existing() {
+        let flags = VepFlags::from_options_json(Some(r#"{"af_1kg":true}"#));
+        assert!(flags.af_1kg);
+        assert!(flags.check_existing);
+    }
+
+    #[test]
+    fn test_vep_flags_af_gnomade_implies_check_existing() {
+        let flags = VepFlags::from_options_json(Some(r#"{"af_gnomade":true}"#));
+        assert!(flags.af_gnomade);
+        assert!(flags.check_existing);
+    }
+
+    // =======================================================================
+    // parse_json_string_option / parse_json_bool_option
+    // =======================================================================
+
+    #[test]
+    fn test_parse_json_string_option_basic() {
+        let json = r#"{"key":"value"}"#;
+        assert_eq!(
+            AnnotateProvider::parse_json_string_option(json, "key"),
+            Some("value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_json_string_option_missing_key() {
+        let json = r#"{"other":"value"}"#;
+        assert_eq!(AnnotateProvider::parse_json_string_option(json, "key"), None);
+    }
+
+    #[test]
+    fn test_parse_json_string_option_empty_value() {
+        let json = r#"{"key":""}"#;
+        assert_eq!(AnnotateProvider::parse_json_string_option(json, "key"), None);
+    }
+
+    #[test]
+    fn test_parse_json_string_option_backtick_rejected() {
+        let json = r#"{"key":"val`ue"}"#;
+        assert_eq!(AnnotateProvider::parse_json_string_option(json, "key"), None);
+    }
+
+    #[test]
+    fn test_parse_json_string_option_with_spaces() {
+        let json = r#"{"key" : "value"}"#;
+        assert_eq!(
+            AnnotateProvider::parse_json_string_option(json, "key"),
+            Some("value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_json_string_option_multiple_keys() {
+        let json = r#"{"a":"first","b":"second"}"#;
+        assert_eq!(
+            AnnotateProvider::parse_json_string_option(json, "b"),
+            Some("second".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_json_bool_option_true() {
+        let json = r#"{"flag":true}"#;
+        assert_eq!(AnnotateProvider::parse_json_bool_option(json, "flag"), Some(true));
+    }
+
+    #[test]
+    fn test_parse_json_bool_option_false() {
+        let json = r#"{"flag":false}"#;
+        assert_eq!(
+            AnnotateProvider::parse_json_bool_option(json, "flag"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_parse_json_bool_option_missing_key() {
+        let json = r#"{"other":true}"#;
+        assert_eq!(AnnotateProvider::parse_json_bool_option(json, "flag"), None);
+    }
+
+    #[test]
+    fn test_parse_json_bool_option_non_bool_value() {
+        let json = r#"{"flag":"yes"}"#;
+        assert_eq!(AnnotateProvider::parse_json_bool_option(json, "flag"), None);
+    }
+
+    #[test]
+    fn test_parse_json_bool_option_with_spaces() {
+        let json = r#"{"flag" :  true}"#;
+        assert_eq!(AnnotateProvider::parse_json_bool_option(json, "flag"), Some(true));
+    }
+
+    // =======================================================================
+    // escaped_sql_literal
+    // =======================================================================
+
+    #[test]
+    fn test_escaped_sql_literal_no_quotes() {
+        assert_eq!(AnnotateProvider::escaped_sql_literal("table_name"), "table_name");
+    }
+
+    #[test]
+    fn test_escaped_sql_literal_single_quote() {
+        assert_eq!(AnnotateProvider::escaped_sql_literal("it's"), "it''s");
+    }
+
+    #[test]
+    fn test_escaped_sql_literal_multiple_quotes() {
+        assert_eq!(AnnotateProvider::escaped_sql_literal("a'b'c"), "a''b''c");
+    }
+
+    // =======================================================================
+    // ColocatedData — allele filtering methods
+    // =======================================================================
+
+    fn make_entry(
+        name: &str,
+        allele_string: &str,
+        somatic: i64,
+        pheno: i64,
+        clin_sig_allele: Option<&str>,
+        pubmed: Option<&str>,
+    ) -> ColocatedEntry {
+        ColocatedEntry {
+            variation_name: name.to_string(),
+            allele_string: allele_string.to_string(),
+            somatic,
+            pheno,
+            clin_sig_allele: clin_sig_allele.map(|s| s.to_string()),
+            pubmed: pubmed.map(|s| s.to_string()),
+        }
+    }
+
+    fn make_coloc_data(entries: Vec<ColocatedEntry>) -> ColocatedData {
+        let names: Vec<&str> = entries.iter().map(|e| e.variation_name.as_str()).collect();
+        ColocatedData {
+            existing_variation: names.join("&"),
+            entries,
+        }
+    }
+
+    #[test]
+    fn test_allele_filtered_entries_exact_match() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, None, None),
+            make_entry("rs2", "T/A", 0, 0, None, None),
+        ]);
+        // VCF T>C should match T/C but not T/A.
+        let filtered = data.allele_filtered_entries("T", "C");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].variation_name, "rs1");
+    }
+
+    #[test]
+    fn test_allele_filtered_entries_cosmic_always_included() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, None, None),
+            make_entry("COSV123", "COSMIC_MUTATION", 1, 0, None, None),
+        ]);
+        let filtered = data.allele_filtered_entries("T", "A");
+        // rs1 (T/C) doesn't match T/A, but COSMIC always included.
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].variation_name, "COSV123");
+    }
+
+    #[test]
+    fn test_allele_filtered_entries_hgmd_always_included() {
+        let data = make_coloc_data(vec![
+            make_entry("HGMD1", "HGMD_MUTATION", 0, 1, None, None),
+        ]);
+        let filtered = data.allele_filtered_entries("A", "G");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].variation_name, "HGMD1");
+    }
+
+    #[test]
+    fn test_allele_filtered_entries_sort_non_somatic_first() {
+        let data = make_coloc_data(vec![
+            make_entry("COSV1", "COSMIC_MUTATION", 1, 0, None, None),
+            make_entry("rs1", "T/C", 0, 0, None, None),
+        ]);
+        let filtered = data.allele_filtered_entries("T", "C");
+        assert_eq!(filtered.len(), 2);
+        // Non-somatic (rs1) should come before somatic (COSV1).
+        assert_eq!(filtered[0].variation_name, "rs1");
+        assert_eq!(filtered[1].variation_name, "COSV1");
+    }
+
+    #[test]
+    fn test_allele_filtered_entries_empty_result() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/A", 0, 0, None, None),
+        ]);
+        let filtered = data.allele_filtered_entries("G", "C");
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_allele_filtered_entries_rs_before_others_within_group() {
+        let data = make_coloc_data(vec![
+            make_entry("COSV1", "COSMIC_MUTATION", 0, 0, None, None),
+            make_entry("rs1", "T/C", 0, 0, None, None),
+            make_entry("rs2", "T/C", 0, 0, None, None),
+        ]);
+        let filtered = data.allele_filtered_entries("T", "C");
+        assert_eq!(filtered.len(), 3);
+        // All non-somatic: rs before COSV, alphabetical within.
+        assert_eq!(filtered[0].variation_name, "rs1");
+        assert_eq!(filtered[1].variation_name, "rs2");
+        assert_eq!(filtered[2].variation_name, "COSV1");
+    }
+
+    // --- somatic_flags_for_allele ---
+
+    #[test]
+    fn test_somatic_flags_all_non_somatic() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, None, None),
+            make_entry("rs2", "T/C", 0, 0, None, None),
+        ]);
+        // All zeros → empty string.
+        assert_eq!(data.somatic_flags_for_allele("T", "C"), "");
+    }
+
+    #[test]
+    fn test_somatic_flags_mixed() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, None, None),
+            make_entry("COSV1", "COSMIC_MUTATION", 1, 0, None, None),
+        ]);
+        // Non-somatic first: rs1(0), COSV1(1).
+        assert_eq!(data.somatic_flags_for_allele("T", "C"), "0&1");
+    }
+
+    #[test]
+    fn test_somatic_flags_single_somatic() {
+        let data = make_coloc_data(vec![
+            make_entry("COSV1", "COSMIC_MUTATION", 1, 0, None, None),
+        ]);
+        assert_eq!(data.somatic_flags_for_allele("A", "G"), "1");
+    }
+
+    #[test]
+    fn test_somatic_flags_no_matching_entries() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/A", 1, 0, None, None),
+        ]);
+        // No allele match, no COSMIC → empty (no entries).
+        assert_eq!(data.somatic_flags_for_allele("G", "C"), "");
+    }
+
+    // --- pheno_flags_for_allele ---
+
+    #[test]
+    fn test_pheno_flags_all_non_pheno() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, None, None),
+        ]);
+        assert_eq!(data.pheno_flags_for_allele("T", "C"), "");
+    }
+
+    #[test]
+    fn test_pheno_flags_mixed() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, None, None),
+            make_entry("rs2", "T/C", 0, 1, None, None),
+        ]);
+        assert_eq!(data.pheno_flags_for_allele("T", "C"), "0&1");
+    }
+
+    // --- clin_sig_for_allele ---
+
+    #[test]
+    fn test_clin_sig_for_allele_simple() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, Some("C:benign"), None),
+        ]);
+        assert_eq!(data.clin_sig_for_allele("T", "C"), "benign");
+    }
+
+    #[test]
+    fn test_clin_sig_for_allele_compound_term() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, Some("C:benign;C:benign/likely_benign"), None),
+        ]);
+        assert_eq!(
+            data.clin_sig_for_allele("T", "C"),
+            "benign&benign/likely_benign"
+        );
+    }
+
+    #[test]
+    fn test_clin_sig_for_allele_wrong_allele_filtered() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, Some("A:pathogenic"), None),
+        ]);
+        // VEP allele for T>C is "C", but clin_sig_allele has "A:pathogenic" → no match.
+        assert_eq!(data.clin_sig_for_allele("T", "C"), "");
+    }
+
+    #[test]
+    fn test_clin_sig_for_allele_no_clin_sig() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, None, None),
+        ]);
+        assert_eq!(data.clin_sig_for_allele("T", "C"), "");
+    }
+
+    #[test]
+    fn test_clin_sig_for_allele_deduplicates() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, Some("C:benign"), None),
+            make_entry("rs2", "T/C", 0, 0, Some("C:benign"), None),
+        ]);
+        assert_eq!(data.clin_sig_for_allele("T", "C"), "benign");
+    }
+
+    #[test]
+    fn test_clin_sig_for_allele_multiple_entries() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, Some("C:benign"), None),
+            make_entry("rs2", "T/C", 0, 0, Some("C:pathogenic"), None),
+        ]);
+        assert_eq!(data.clin_sig_for_allele("T", "C"), "benign&pathogenic");
+    }
+
+    #[test]
+    fn test_clin_sig_for_allele_missing_colon() {
+        // Malformed clin_sig_allele without colon → skipped.
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, Some("benign_only"), None),
+        ]);
+        assert_eq!(data.clin_sig_for_allele("T", "C"), "");
+    }
+
+    #[test]
+    fn test_clin_sig_for_allele_empty_sig_part() {
+        // Empty significance after colon → skipped.
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, Some("C:"), None),
+        ]);
+        assert_eq!(data.clin_sig_for_allele("T", "C"), "");
+    }
+
+    // --- pubmed_for_allele ---
+
+    #[test]
+    fn test_pubmed_for_allele_single() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, None, Some("12345")),
+        ]);
+        assert_eq!(data.pubmed_for_allele("T", "C"), "12345");
+    }
+
+    #[test]
+    fn test_pubmed_for_allele_aggregation() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, None, Some("111")),
+            make_entry("rs2", "T/C", 0, 0, None, Some("222")),
+        ]);
+        assert_eq!(data.pubmed_for_allele("T", "C"), "111&222");
+    }
+
+    #[test]
+    fn test_pubmed_for_allele_deduplication() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, None, Some("111,222")),
+            make_entry("rs2", "T/C", 0, 0, None, Some("222,333")),
+        ]);
+        assert_eq!(data.pubmed_for_allele("T", "C"), "111&222&333");
+    }
+
+    #[test]
+    fn test_pubmed_for_allele_no_pubmed() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/C", 0, 0, None, None),
+        ]);
+        assert_eq!(data.pubmed_for_allele("T", "C"), "");
+    }
+
+    #[test]
+    fn test_pubmed_for_allele_non_matching_allele_excluded() {
+        let data = make_coloc_data(vec![
+            make_entry("rs1", "T/A", 0, 0, None, Some("12345")),
+        ]);
+        // T/A doesn't match VCF T>C.
+        assert_eq!(data.pubmed_for_allele("T", "C"), "");
+    }
+
+    #[test]
+    fn test_pubmed_for_allele_cosmic_included() {
+        let data = make_coloc_data(vec![
+            make_entry("COSV1", "COSMIC_MUTATION", 1, 0, None, Some("99999")),
+        ]);
+        assert_eq!(data.pubmed_for_allele("A", "G"), "99999");
+    }
+
+    // =======================================================================
+    // build_colocated_map
+    // =======================================================================
+
+    fn make_coloc_batch(
+        rows: &[(&str, i64, i64, &str, i64, i64, &str, Option<&str>, Option<&str>)],
+    ) -> RecordBatch {
+        let chroms: Vec<&str> = rows.iter().map(|r| r.0).collect();
+        let starts: Vec<i64> = rows.iter().map(|r| r.1).collect();
+        let ends: Vec<i64> = rows.iter().map(|r| r.2).collect();
+        let names: Vec<&str> = rows.iter().map(|r| r.3).collect();
+        let somatics: Vec<i64> = rows.iter().map(|r| r.4).collect();
+        let phenos: Vec<i64> = rows.iter().map(|r| r.5).collect();
+        let allele_strings: Vec<&str> = rows.iter().map(|r| r.6).collect();
+        let clin_sig_alleles: Vec<Option<&str>> = rows.iter().map(|r| r.7).collect();
+        let pubmeds: Vec<Option<&str>> = rows.iter().map(|r| r.8).collect();
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("coloc_chrom", DataType::Utf8, false),
+                Field::new("coloc_start", DataType::Int64, false),
+                Field::new("coloc_end", DataType::Int64, false),
+                Field::new("coloc_variation_name", DataType::Utf8, false),
+                Field::new("coloc_somatic", DataType::Int64, false),
+                Field::new("coloc_pheno", DataType::Int64, false),
+                Field::new("coloc_allele_string", DataType::Utf8, false),
+                Field::new("coloc_clin_sig_allele", DataType::Utf8, true),
+                Field::new("coloc_pubmed", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(chroms)),
+                Arc::new(Int64Array::from(starts)),
+                Arc::new(Int64Array::from(ends)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(Int64Array::from(somatics)),
+                Arc::new(Int64Array::from(phenos)),
+                Arc::new(StringArray::from(allele_strings)),
+                Arc::new(StringArray::from(clin_sig_alleles)),
+                Arc::new(StringArray::from(pubmeds)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_build_colocated_map_single_entry() {
+        let batch = make_coloc_batch(&[
+            ("22", 100, 100, "rs123", 0, 0, "T/C", None, None),
+        ]);
+        let map = build_colocated_map(&[batch]);
+        assert_eq!(map.len(), 1);
+        let data = &map[&("22".to_string(), 100, 100)];
+        assert_eq!(data.existing_variation, "rs123");
+        assert_eq!(data.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_build_colocated_map_rs_sorted_first() {
+        let batch = make_coloc_batch(&[
+            ("22", 100, 100, "COSV123", 1, 0, "COSMIC_MUTATION", None, None),
+            ("22", 100, 100, "rs456", 0, 0, "T/C", None, None),
+            ("22", 100, 100, "rs123", 0, 0, "T/A", None, None),
+        ]);
+        let map = build_colocated_map(&[batch]);
+        let data = &map[&("22".to_string(), 100, 100)];
+        // rs* first (alphabetical), then COSV.
+        assert_eq!(data.existing_variation, "rs123&rs456&COSV123");
+    }
+
+    #[test]
+    fn test_build_colocated_map_skips_empty_variation_name() {
+        let batch = make_coloc_batch(&[
+            ("22", 100, 100, "", 0, 0, "T/C", None, None),
+            ("22", 100, 100, "rs1", 0, 0, "T/C", None, None),
+        ]);
+        let map = build_colocated_map(&[batch]);
+        let data = &map[&("22".to_string(), 100, 100)];
+        assert_eq!(data.existing_variation, "rs1");
+        assert_eq!(data.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_build_colocated_map_multiple_positions() {
+        let batch = make_coloc_batch(&[
+            ("22", 100, 100, "rs1", 0, 0, "T/C", None, None),
+            ("22", 200, 200, "rs2", 0, 0, "A/G", None, None),
+        ]);
+        let map = build_colocated_map(&[batch]);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key(&("22".to_string(), 100, 100)));
+        assert!(map.contains_key(&("22".to_string(), 200, 200)));
+    }
+
+    #[test]
+    fn test_build_colocated_map_preserves_clinical_metadata() {
+        let batch = make_coloc_batch(&[
+            ("22", 100, 100, "rs1", 0, 1, "T/C", Some("C:benign"), Some("12345")),
+        ]);
+        let map = build_colocated_map(&[batch]);
+        let data = &map[&("22".to_string(), 100, 100)];
+        let entry = &data.entries[0];
+        assert_eq!(entry.clin_sig_allele.as_deref(), Some("C:benign"));
+        assert_eq!(entry.pubmed.as_deref(), Some("12345"));
+        assert_eq!(entry.pheno, 1);
+    }
+
+    #[test]
+    fn test_build_colocated_map_empty_batches() {
+        let map = build_colocated_map(&[]);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_build_colocated_map_multiple_batches() {
+        let batch1 = make_coloc_batch(&[
+            ("22", 100, 100, "rs1", 0, 0, "T/C", None, None),
+        ]);
+        let batch2 = make_coloc_batch(&[
+            ("22", 100, 100, "rs2", 0, 0, "T/A", None, None),
+        ]);
+        let map = build_colocated_map(&[batch1, batch2]);
+        let data = &map[&("22".to_string(), 100, 100)];
+        assert_eq!(data.entries.len(), 2);
+        assert_eq!(data.existing_variation, "rs1&rs2");
+    }
+
+    // =======================================================================
+    // int64_at — type coercion
+    // =======================================================================
+
+    #[test]
+    fn test_int64_at_int64() {
+        let arr = Int64Array::from(vec![42]);
+        assert_eq!(int64_at(&arr, 0), Some(42));
+    }
+
+    #[test]
+    fn test_int64_at_int32() {
+        let arr = Int32Array::from(vec![42]);
+        assert_eq!(int64_at(&arr, 0), Some(42));
+    }
+
+    #[test]
+    fn test_int64_at_int16() {
+        let arr = Int16Array::from(vec![42]);
+        assert_eq!(int64_at(&arr, 0), Some(42));
+    }
+
+    #[test]
+    fn test_int64_at_int8() {
+        let arr = Int8Array::from(vec![42]);
+        assert_eq!(int64_at(&arr, 0), Some(42));
+    }
+
+    #[test]
+    fn test_int64_at_uint64() {
+        let arr = UInt64Array::from(vec![42u64]);
+        assert_eq!(int64_at(&arr, 0), Some(42));
+    }
+
+    #[test]
+    fn test_int64_at_uint64_overflow() {
+        let arr = UInt64Array::from(vec![u64::MAX]);
+        // u64::MAX can't fit in i64 → None.
+        assert_eq!(int64_at(&arr, 0), None);
+    }
+
+    #[test]
+    fn test_int64_at_uint32() {
+        let arr = UInt32Array::from(vec![42u32]);
+        assert_eq!(int64_at(&arr, 0), Some(42));
+    }
+
+    #[test]
+    fn test_int64_at_uint16() {
+        let arr = UInt16Array::from(vec![42u16]);
+        assert_eq!(int64_at(&arr, 0), Some(42));
+    }
+
+    #[test]
+    fn test_int64_at_uint8() {
+        let arr = UInt8Array::from(vec![42u8]);
+        assert_eq!(int64_at(&arr, 0), Some(42));
+    }
+
+    #[test]
+    fn test_int64_at_null() {
+        let arr = Int64Array::from(vec![None as Option<i64>]);
+        assert_eq!(int64_at(&arr, 0), None);
+    }
+
+    #[test]
+    fn test_int64_at_unsupported_type() {
+        let arr = Float64Array::from(vec![42.0]);
+        assert_eq!(int64_at(&arr, 0), None);
+    }
+
+    // =======================================================================
+    // string_at — type coercion
+    // =======================================================================
+
+    #[test]
+    fn test_string_at_string_array() {
+        let arr = StringArray::from(vec!["hello"]);
+        assert_eq!(string_at(&arr, 0), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_string_at_large_string_array() {
+        let arr = LargeStringArray::from(vec!["large"]);
+        assert_eq!(string_at(&arr, 0), Some("large".to_string()));
+    }
+
+    #[test]
+    fn test_string_at_string_view_array() {
+        let arr = StringViewArray::from(vec!["view"]);
+        assert_eq!(string_at(&arr, 0), Some("view".to_string()));
+    }
+
+    #[test]
+    fn test_string_at_float64() {
+        let arr = Float64Array::from(vec![3.14]);
+        assert_eq!(string_at(&arr, 0), Some("3.14".to_string()));
+    }
+
+    #[test]
+    fn test_string_at_float32() {
+        let arr = Float32Array::from(vec![2.5f32]);
+        assert_eq!(string_at(&arr, 0), Some("2.5".to_string()));
+    }
+
+    #[test]
+    fn test_string_at_int64() {
+        let arr = Int64Array::from(vec![42]);
+        assert_eq!(string_at(&arr, 0), Some("42".to_string()));
+    }
+
+    #[test]
+    fn test_string_at_int32() {
+        let arr = Int32Array::from(vec![42]);
+        assert_eq!(string_at(&arr, 0), Some("42".to_string()));
+    }
+
+    #[test]
+    fn test_string_at_uint64() {
+        let arr = UInt64Array::from(vec![42u64]);
+        assert_eq!(string_at(&arr, 0), Some("42".to_string()));
+    }
+
+    #[test]
+    fn test_string_at_uint32() {
+        let arr = UInt32Array::from(vec![42u32]);
+        assert_eq!(string_at(&arr, 0), Some("42".to_string()));
+    }
+
+    #[test]
+    fn test_string_at_null() {
+        let arr = StringArray::from(vec![None as Option<&str>]);
+        assert_eq!(string_at(&arr, 0), None);
+    }
+
+    #[test]
+    fn test_string_at_unsupported_type() {
+        let arr = BooleanArray::from(vec![true]);
+        assert_eq!(string_at(&arr, 0), None);
+    }
+
+    // =======================================================================
+    // bool_at
+    // =======================================================================
+
+    #[test]
+    fn test_bool_at_true() {
+        let arr = BooleanArray::from(vec![true]);
+        assert_eq!(bool_at(&arr, 0), Some(true));
+    }
+
+    #[test]
+    fn test_bool_at_false() {
+        let arr = BooleanArray::from(vec![false]);
+        assert_eq!(bool_at(&arr, 0), Some(false));
+    }
+
+    #[test]
+    fn test_bool_at_null() {
+        let arr = BooleanArray::from(vec![None as Option<bool>]);
+        assert_eq!(bool_at(&arr, 0), None);
+    }
+
+    #[test]
+    fn test_bool_at_unsupported_type() {
+        let arr = Int64Array::from(vec![1]);
+        assert_eq!(bool_at(&arr, 0), None);
+    }
+
+    // =======================================================================
+    // read_mirna_regions
+    // =======================================================================
+
+    #[test]
+    fn test_read_mirna_regions_null_cell() {
+        use datafusion::arrow::datatypes::Fields;
+
+        let struct_fields = Fields::from(vec![
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]);
+        let list_field = Field::new("item", DataType::Struct(struct_fields.clone()), true);
+        let list_dt = DataType::List(Arc::new(list_field));
+
+        let null_arr = new_null_array(&list_dt, 1);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("mirna", list_dt, true)])),
+            vec![null_arr],
+        )
+        .unwrap();
+
+        assert_eq!(read_mirna_regions(&batch, 0, 0), None);
+    }
+
+    // =======================================================================
+    // AF_COLUMNS constant validation
+    // =======================================================================
+
+    #[test]
+    fn test_af_columns_count() {
+        // 1 global + 5 continental + 1 gnomADe global + 9 gnomADe sub + 1 gnomADg global + 10 gnomADg sub = 27
+        assert_eq!(AF_COLUMNS.len(), 27);
+    }
+
+    #[test]
+    fn test_af_columns_only_global_af_has_format_4f() {
+        let formatted: Vec<&str> = AF_COLUMNS
+            .iter()
+            .filter(|c| c.format_4f)
+            .map(|c| c.cache_col)
+            .collect();
+        assert_eq!(formatted, vec!["AF"]);
+    }
+
+    #[test]
+    fn test_af_columns_emit_in_csq_count() {
+        // Emitted in CSQ: AF, AFR, AMR, EAS, EUR, SAS, gnomADe, gnomADg = 8
+        let emitted: Vec<&str> = AF_COLUMNS
+            .iter()
+            .filter(|c| c.emit_in_csq)
+            .map(|c| c.cache_col)
+            .collect();
+        assert_eq!(emitted.len(), 8);
+        assert!(emitted.contains(&"AF"));
+        assert!(emitted.contains(&"gnomADe"));
+        assert!(emitted.contains(&"gnomADg"));
+    }
+
+    #[test]
+    fn test_af_columns_max_af_pop_excludes_globals() {
+        // Globals (AF, gnomADe, gnomADg) should have max_af_pop = None.
+        for col in AF_COLUMNS {
+            if col.cache_col == "AF" || col.cache_col == "gnomADe" || col.cache_col == "gnomADg" {
+                assert!(col.max_af_pop.is_none(), "{} should not have max_af_pop", col.cache_col);
+            }
+        }
+    }
+
+    #[test]
+    fn test_af_columns_flag_groups() {
+        // Group 0 = af (1 entry), 1 = af_1kg (5), 2 = af_gnomade (10), 3 = af_gnomadg (11)
+        assert_eq!(AF_COLUMNS.iter().filter(|c| c.flag_group == 0).count(), 1);
+        assert_eq!(AF_COLUMNS.iter().filter(|c| c.flag_group == 1).count(), 5);
+        assert_eq!(AF_COLUMNS.iter().filter(|c| c.flag_group == 2).count(), 10);
+        assert_eq!(AF_COLUMNS.iter().filter(|c| c.flag_group == 3).count(), 11);
+    }
+
+    // =======================================================================
+    // CSQ format string pipe-count correctness
+    //
+    // The 74-field CSQ format is critical — if any format string has the wrong
+    // number of pipes, all downstream fields shift and the annotation is corrupt.
+    // These tests replicate the exact format!() patterns from
+    // annotate_batch_with_transcript_engine() and verify field count + positions.
+    // =======================================================================
+
+    /// Build the batch3 suffix exactly as the production code does.
+    fn build_test_batch3_suffix(
+        af_vals: &[&str],
+        max_af: &str,
+        max_af_pops: &str,
+        clin_sig: &str,
+        somatic: &str,
+        pheno: &str,
+        pubmed: &str,
+    ) -> String {
+        let af_joined: Vec<String> = af_vals.iter().map(|s| s.to_string()).collect();
+        format!(
+            "{}|{}|{}|{clin_sig}|{somatic}|{pheno}|{pubmed}",
+            af_joined.join("|"),
+            max_af,
+            max_af_pops,
+        )
+    }
+
+    #[test]
+    fn test_batch3_suffix_field_count() {
+        let af_vals: Vec<&str> = vec![""; AF_COLUMNS.len()];
+        let suffix = build_test_batch3_suffix(&af_vals, "", "", "", "", "", "");
+        // batch3 has 33 fields (27 AF + max_af + max_af_pops + clin_sig + somatic + pheno + pubmed).
+        let field_count = suffix.split('|').count();
+        assert_eq!(field_count, 33, "batch3_suffix must have 33 fields, got {field_count}");
+    }
+
+    #[test]
+    fn test_cache_hit_csq_has_74_fields() {
+        let vep_allele = "C";
+        let csq_val = "missense_variant";
+        let impact = "MODERATE";
+        let existing_var = "rs123";
+        let variant_class = "SNV";
+        let af_vals: Vec<&str> = vec![""; AF_COLUMNS.len()];
+        let batch3_suffix = build_test_batch3_suffix(&af_vals, "", "", "", "", "", "");
+
+        // This is the exact format from line 1841-1843.
+        let csq = format!(
+            "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
+             {variant_class}||||||||||||{batch3_suffix}"
+        );
+        let field_count = csq.split('|').count();
+        assert_eq!(field_count, 74, "cache-hit CSQ must have 74 fields, got {field_count}");
+
+        // Verify key field positions (0-indexed).
+        let fields: Vec<&str> = csq.split('|').collect();
+        assert_eq!(fields[0], "C", "field 0 = Allele");
+        assert_eq!(fields[1], "missense_variant", "field 1 = Consequence");
+        assert_eq!(fields[2], "MODERATE", "field 2 = IMPACT");
+        assert_eq!(fields[17], "rs123", "field 17 = Existing_variation");
+        assert_eq!(fields[29], "SNV", "field 29 = VARIANT_CLASS");
+    }
+
+    #[test]
+    fn test_cache_miss_csq_has_74_fields() {
+        let vep_allele = "G";
+        let terms_str = "missense_variant&splice_region_variant";
+        let tc_impact = "MODERATE";
+        let symbol = "BRCA1";
+        let gene = "ENSG00000012048";
+        let feature_type = "Transcript";
+        let feature = "ENST00000357654";
+        let biotype = "protein_coding";
+        let exon = "10/23";
+        let intron = "";
+        let hgvsc = "";
+        let hgvsp = "";
+        let cdna_pos = "1234";
+        let cds_pos = "1001";
+        let protein_pos = "334";
+        let amino_acids = "V/G";
+        let codons_str = "gTc/gGc";
+        let existing_var = "rs12345";
+        let distance = "";
+        let strand_str = "1";
+        let tc_flags = "";
+        let symbol_source = "HGNC";
+        let hgnc_id = "HGNC:1100";
+        let source_val = "";
+        let variant_class = "SNV";
+        let canonical = "YES";
+        let tsl_str = "1";
+        let mane_select = "NM_007294.4";
+        let mane_plus = "";
+        let ensp = "ENSP00000350283";
+        let gene_pheno = "1";
+        let ccds = "CCDS11453.1";
+        let swissprot = "P38398";
+        let trembl = "";
+        let uniparc = "UPI000002ED67";
+        let uniprot_isoform = "";
+        let af_vals: Vec<&str> = vec![""; AF_COLUMNS.len()];
+        let batch3_suffix = build_test_batch3_suffix(&af_vals, "", "", "benign", "", "1", "");
+
+        // This is the exact format from lines 1964-1972.
+        let csq = format!(
+            "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+             {exon}|{intron}|{hgvsc}|{hgvsp}|\
+             {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+             {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
+             |||||{source_val}|\
+             {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
+             {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
+             {batch3_suffix}"
+        );
+        let fields: Vec<&str> = csq.split('|').collect();
+        assert_eq!(
+            fields.len(),
+            74,
+            "cache-miss CSQ must have 74 fields, got {}",
+            fields.len()
+        );
+
+        // Verify field positions match VEP CSQ spec.
+        assert_eq!(fields[0], "G", "field 0 = Allele");
+        assert_eq!(fields[1], "missense_variant&splice_region_variant", "field 1 = Consequence");
+        assert_eq!(fields[2], "MODERATE", "field 2 = IMPACT");
+        assert_eq!(fields[3], "BRCA1", "field 3 = SYMBOL");
+        assert_eq!(fields[4], "ENSG00000012048", "field 4 = Gene");
+        assert_eq!(fields[5], "Transcript", "field 5 = Feature_type");
+        assert_eq!(fields[6], "ENST00000357654", "field 6 = Feature");
+        assert_eq!(fields[7], "protein_coding", "field 7 = BIOTYPE");
+        assert_eq!(fields[8], "10/23", "field 8 = EXON");
+        assert_eq!(fields[9], "", "field 9 = INTRON");
+        assert_eq!(fields[10], "", "field 10 = HGVSc");
+        assert_eq!(fields[11], "", "field 11 = HGVSp");
+        assert_eq!(fields[12], "1234", "field 12 = cDNA_position");
+        assert_eq!(fields[13], "1001", "field 13 = CDS_position");
+        assert_eq!(fields[14], "334", "field 14 = Protein_position");
+        assert_eq!(fields[15], "V/G", "field 15 = Amino_acids");
+        assert_eq!(fields[16], "gTc/gGc", "field 16 = Codons");
+        assert_eq!(fields[17], "rs12345", "field 17 = Existing_variation");
+        assert_eq!(fields[18], "", "field 18 = DISTANCE");
+        assert_eq!(fields[19], "1", "field 19 = STRAND");
+        assert_eq!(fields[20], "", "field 20 = FLAGS");
+        assert_eq!(fields[21], "HGNC", "field 21 = SYMBOL_SOURCE");
+        assert_eq!(fields[22], "HGNC:1100", "field 22 = HGNC_ID");
+        // Fields 23-27: MOTIF_NAME, MOTIF_POS, HIGH_INF_POS, MOTIF_SCORE_CHANGE, TRANSCRIPTION_FACTORS
+        for i in 23..28 {
+            assert_eq!(fields[i], "", "field {i} should be empty (motif/TF placeholder)");
+        }
+        assert_eq!(fields[28], "", "field 28 = SOURCE (empty when not merged)");
+        assert_eq!(fields[29], "SNV", "field 29 = VARIANT_CLASS");
+        assert_eq!(fields[30], "YES", "field 30 = CANONICAL");
+        assert_eq!(fields[31], "1", "field 31 = TSL");
+        assert_eq!(fields[32], "NM_007294.4", "field 32 = MANE_SELECT");
+        assert_eq!(fields[33], "", "field 33 = MANE_PLUS_CLINICAL");
+        assert_eq!(fields[34], "ENSP00000350283", "field 34 = ENSP");
+        assert_eq!(fields[35], "1", "field 35 = GENE_PHENO");
+        assert_eq!(fields[36], "CCDS11453.1", "field 36 = CCDS");
+        assert_eq!(fields[37], "P38398", "field 37 = SWISSPROT");
+        assert_eq!(fields[38], "", "field 38 = TREMBL");
+        assert_eq!(fields[39], "UPI000002ED67", "field 39 = UNIPARC");
+        assert_eq!(fields[40], "", "field 40 = UNIPROT_ISOFORM");
+        // Fields 41-67: 27 AF values (all empty in this test).
+        for i in 41..68 {
+            assert_eq!(fields[i], "", "field {i} should be empty (AF placeholder)");
+        }
+        assert_eq!(fields[68], "", "field 68 = MAX_AF");
+        assert_eq!(fields[69], "", "field 69 = MAX_AF_POPS");
+        assert_eq!(fields[70], "benign", "field 70 = CLIN_SIG");
+        assert_eq!(fields[71], "", "field 71 = SOMATIC");
+        assert_eq!(fields[72], "1", "field 72 = PHENO");
+        assert_eq!(fields[73], "", "field 73 = PUBMED");
+    }
+
+    #[test]
+    fn test_fallback_csq_has_74_fields() {
+        let vep_allele = "T";
+        let impact = impact_label(SoImpact::Modifier);
+        let existing_var = "";
+        let variant_class = "SNV";
+        let af_vals: Vec<&str> = vec![""; AF_COLUMNS.len()];
+        let batch3_suffix = build_test_batch3_suffix(&af_vals, "", "", "", "", "", "");
+
+        // This is the exact format from lines 1977-1979.
+        let csq = format!(
+            "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
+             {variant_class}||||||||||||{batch3_suffix}"
+        );
+        let field_count = csq.split('|').count();
+        assert_eq!(field_count, 74, "fallback CSQ must have 74 fields, got {field_count}");
+
+        let fields: Vec<&str> = csq.split('|').collect();
+        assert_eq!(fields[0], "T", "field 0 = Allele");
+        assert_eq!(fields[1], "sequence_variant", "field 1 = Consequence");
+        assert_eq!(fields[2], "MODIFIER", "field 2 = IMPACT");
+        assert_eq!(fields[29], "SNV", "field 29 = VARIANT_CLASS");
+    }
+
+    #[test]
+    fn test_cache_hit_csq_and_cache_miss_csq_field_alignment() {
+        // Verify that cache-hit and cache-miss CSQ format strings agree on field positions
+        // for the fields they both populate: Allele(0), Consequence(1), IMPACT(2),
+        // Existing_variation(17), VARIANT_CLASS(29), and all Batch 3 fields (41-73).
+        let af_vals: Vec<&str> = vec![""; AF_COLUMNS.len()];
+        let batch3 = build_test_batch3_suffix(&af_vals, "0.05", "AFR", "benign", "0&1", "1", "999");
+
+        let hit = format!(
+            "C|missense_variant|MODERATE|||||||||||||||rs1||||||||||||SNV||||||||||||{batch3}"
+        );
+        let miss = format!(
+            "C|missense_variant|MODERATE|SYM|ENSG|Transcript|ENST|pc|\
+             1/2|||||||||rs1||1||HGNC|H1|||||||\
+             SNV|YES|1|NM|NP|ENSP|1|CCDS|SP||UP|UI|{batch3}"
+        );
+        let hit_fields: Vec<&str> = hit.split('|').collect();
+        let miss_fields: Vec<&str> = miss.split('|').collect();
+        assert_eq!(hit_fields.len(), 74);
+        assert_eq!(miss_fields.len(), 74);
+
+        // Shared fields must be at the same position.
+        assert_eq!(hit_fields[0], miss_fields[0], "Allele");
+        assert_eq!(hit_fields[1], miss_fields[1], "Consequence");
+        assert_eq!(hit_fields[2], miss_fields[2], "IMPACT");
+        assert_eq!(hit_fields[17], miss_fields[17], "Existing_variation");
+        assert_eq!(hit_fields[29], miss_fields[29], "VARIANT_CLASS");
+        // All batch3 fields (41-73) must be identical.
+        for i in 41..74 {
+            assert_eq!(hit_fields[i], miss_fields[i], "batch3 field {i}");
+        }
+    }
+
+    #[test]
+    fn test_batch3_suffix_with_populated_af_fields() {
+        // Verify AF fields land in correct positions within batch3.
+        let mut af_vals = vec![""; AF_COLUMNS.len()];
+        af_vals[0] = "0.0301"; // AF (global, format_4f)
+        af_vals[1] = "0.05";   // AFR
+        af_vals[6] = "0.03";   // gnomADe (global)
+        af_vals[16] = "0.02";  // gnomADg (global)
+
+        let suffix = build_test_batch3_suffix(&af_vals, "0.05", "AFR", "benign", "0&1", "1", "123");
+        let fields: Vec<&str> = suffix.split('|').collect();
+        assert_eq!(fields.len(), 33);
+        assert_eq!(fields[0], "0.0301", "AF");
+        assert_eq!(fields[1], "0.05", "AFR");
+        assert_eq!(fields[6], "0.03", "gnomADe");
+        assert_eq!(fields[16], "0.02", "gnomADg");
+        assert_eq!(fields[27], "0.05", "MAX_AF");
+        assert_eq!(fields[28], "AFR", "MAX_AF_POPS");
+        assert_eq!(fields[29], "benign", "CLIN_SIG");
+        assert_eq!(fields[30], "0&1", "SOMATIC");
+        assert_eq!(fields[31], "1", "PHENO");
+        assert_eq!(fields[32], "123", "PUBMED");
+    }
+
+    #[test]
+    fn test_source_field_only_populated_when_merged() {
+        let af_vals: Vec<&str> = vec![""; AF_COLUMNS.len()];
+        let batch3 = build_test_batch3_suffix(&af_vals, "", "", "", "", "", "");
+
+        // Not merged: source_val = ""
+        let csq_not_merged = format!(
+            "C|x|HIGH|SYM|G|Transcript|ENST|pc||||||||||\
+             rs1||1||HGNC|H1|||||||\
+             SNV||||||||||||{batch3}"
+        );
+        let fields: Vec<&str> = csq_not_merged.split('|').collect();
+        assert_eq!(fields.len(), 74);
+        assert_eq!(fields[28], "", "SOURCE should be empty when not merged");
+
+        // Merged: source_val = "Ensembl"
+        let csq_merged = format!(
+            "C|x|HIGH|SYM|G|Transcript|ENST|pc||||||||||\
+             rs1||1||HGNC|H1||||||Ensembl|\
+             SNV||||||||||||{batch3}"
+        );
+        let fields_merged: Vec<&str> = csq_merged.split('|').collect();
+        assert_eq!(fields_merged.len(), 74);
+        assert_eq!(fields_merged[28], "Ensembl", "SOURCE should be 'Ensembl' when merged");
+    }
+
+    #[test]
+    fn test_csq_multiple_transcript_entries_comma_joined() {
+        // When multiple transcripts match, entries are joined with comma.
+        let entry1 = "C|missense_variant|MODERATE|A|B|Transcript|ENST1|pc||||||||||||||||||||||SNV||||||||||||||||||||||||||||||||||||||||||||";
+        let entry2 = "C|synonymous_variant|LOW|A|B|Transcript|ENST2|pc||||||||||||||||||||||SNV||||||||||||||||||||||||||||||||||||||||||||";
+        let joined = [entry1, entry2].join(",");
+        let entries: Vec<&str> = joined.split(',').collect();
+        assert_eq!(entries.len(), 2);
+        // Each entry should have 74 fields.
+        // Note: this breaks if any field value contains a comma — csq_escape handles that.
+        assert_eq!(entries[0].split('|').count(), 74);
+        assert_eq!(entries[1].split('|').count(), 74);
+    }
+
+    #[test]
+    fn test_csq_escape_prevents_comma_splitting() {
+        // TREMBL values like "B0QYZ8.91,X5DR28.81" would corrupt CSV-like CSQ splitting.
+        // csq_escape replaces commas with '&'.
+        let trembl_raw = "B0QYZ8.91,X5DR28.81";
+        let trembl = csq_escape(trembl_raw);
+        assert_eq!(trembl.as_ref(), "B0QYZ8.91&X5DR28.81");
+        assert!(!trembl.contains(','), "escaped value must not contain commas");
+    }
+
+    // =======================================================================
+    // Existing_variation fallback logic
+    // =======================================================================
+
+    #[test]
+    fn test_existing_var_prefers_coloc_over_variation_name() {
+        // When co-located data exists, use it; otherwise fall back to variation_name.
+        let coloc = ColocatedData {
+            existing_variation: "rs1&rs2".to_string(),
+            entries: vec![],
+        };
+        let variation_name = "rs1";
+
+        // With co-located data → use co-located.
+        let existing = Some(&coloc).map(|c| c.existing_variation.as_str()).unwrap_or(variation_name);
+        assert_eq!(existing, "rs1&rs2");
+
+        // Without co-located data → fall back to variation_name.
+        let existing_fallback: Option<&ColocatedData> = None;
+        let existing2 = existing_fallback
+            .map(|c| c.existing_variation.as_str())
+            .unwrap_or(variation_name);
+        assert_eq!(existing2, "rs1");
+    }
+
+    #[test]
+    fn test_existing_var_empty_when_check_existing_false() {
+        // When check_existing=false, Existing_variation should be empty.
+        let flags = VepFlags::from_options_json(None);
+        let existing = if flags.check_existing { "rs1" } else { "" };
+        assert_eq!(existing, "");
+    }
+
+    // =======================================================================
+    // chrom_filter_clause
+    // =======================================================================
+
+    #[test]
+    fn test_chrom_filter_clause_empty_set() {
+        let chroms: HashSet<String> = HashSet::new();
+        let clause = AnnotateProvider::chrom_filter_clause(&chroms);
+        assert_eq!(clause, "");
+    }
+
+    #[test]
+    fn test_chrom_filter_clause_with_chr_prefix() {
+        let mut chroms = HashSet::new();
+        chroms.insert("chr22".to_string());
+        let clause = AnnotateProvider::chrom_filter_clause(&chroms);
+        // Should produce WHERE clause with both chr22 and 22.
+        assert!(clause.contains("'chr22'"), "should include chr22");
+        assert!(clause.contains("'22'"), "should include 22 without prefix");
+    }
+
+    #[test]
+    fn test_chrom_filter_clause_without_chr_prefix() {
+        let mut chroms = HashSet::new();
+        chroms.insert("22".to_string());
+        let clause = AnnotateProvider::chrom_filter_clause(&chroms);
+        assert!(clause.contains("'22'"), "should include 22");
+        assert!(clause.contains("'chr22'"), "should include chr22 with prefix");
     }
 }
