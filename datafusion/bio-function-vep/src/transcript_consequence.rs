@@ -434,14 +434,38 @@ impl TranscriptConsequenceEngine {
                         let (cds_position, protein_position, amino_acids, codons) =
                             if let Some(ref cc) = coding_class {
                                 let cds_pos = match (cc.cds_position_start, cc.cds_position_end) {
-                                    (Some(s), Some(e)) if s == e => Some(s.to_string()),
-                                    (Some(s), Some(e)) => Some(format!("{s}-{e}")),
+                                    (Some(s), Some(e)) if s == e => {
+                                        if tx.cds_start_nf {
+                                            Some(format!("?-{s}"))
+                                        } else {
+                                            Some(s.to_string())
+                                        }
+                                    }
+                                    (Some(s), Some(e)) => {
+                                        if tx.cds_start_nf {
+                                            Some(format!("?-{e}"))
+                                        } else {
+                                            Some(format!("{s}-{e}"))
+                                        }
+                                    }
                                     _ => None,
                                 };
                                 let prot_pos =
                                     match (cc.protein_position_start, cc.protein_position_end) {
-                                        (Some(s), Some(e)) if s == e => Some(s.to_string()),
-                                        (Some(s), Some(e)) => Some(format!("{s}-{e}")),
+                                        (Some(s), Some(e)) if s == e => {
+                                            if tx.cds_start_nf {
+                                                Some(format!("?-{s}"))
+                                            } else {
+                                                Some(s.to_string())
+                                            }
+                                        }
+                                        (Some(s), Some(e)) => {
+                                            if tx.cds_start_nf {
+                                                Some(format!("?-{e}"))
+                                            } else {
+                                                Some(format!("{s}-{e}"))
+                                            }
+                                        }
                                         _ => None,
                                     };
                                 (cds_pos, prot_pos, cc.amino_acids.clone(), cc.codons.clone())
@@ -2052,11 +2076,10 @@ fn classify_coding_change(
             }
         } else if frameshift {
             // Frameshifts: VEP uses X for the altered downstream sequence.
-            // For insertion frameshifts only: if the first affected codon's
-            // amino acid is preserved, show it before X (e.g., "H/HX").
-            // Deletion frameshifts always use "{ref}/X".
-            if alt_len > ref_len
-                && first_codon < new_aas.len()
+            // If the first affected codon's amino acid is preserved in the
+            // mutant, show it before X (e.g., "H/HX"); otherwise just "L/X".
+            // This applies to both insertion and deletion frameshifts.
+            if first_codon < new_aas.len()
                 && new_aas[first_codon] == old_aas[first_codon]
             {
                 let preserved: String = std::iter::once(new_aas[first_codon]).collect();
@@ -2264,8 +2287,8 @@ fn classify_insertion(
     // the codons on either side of the boundary.
     let codon_at = cds_idx / 3;
     let ins_at_boundary = ins_point % 3 == 0;
-    if !frameshift && ins_at_boundary {
-        // Inframe insertion at codon boundary: VEP shows the flanking codons.
+    if ins_at_boundary {
+        // Insertion at codon boundary: VEP shows the flanking codons.
         class.protein_position_start = Some(codon_at + 1);
         class.protein_position_end = Some(codon_at + 2);
     } else {
@@ -2323,8 +2346,12 @@ fn classify_insertion(
 
     // Codons — inserted bases start at ins_point in the mutated CDS.
     let at_codon_boundary = ins_point % 3 == 0;
-    if frameshift {
-        // Frameshift insertion: ref codon all lowercase, alt codon with inserted bases uppercase
+    if at_codon_boundary {
+        // Insertion at codon boundary (both frameshift and inframe): ref="-", alt=UPPERCASE
+        let alt_codon: String = alt_tx.chars().map(|c| c.to_ascii_uppercase()).collect();
+        class.codons = Some(format!("-/{alt_codon}"));
+    } else if frameshift {
+        // Frameshift insertion within codon: ref codon all lowercase, alt codon with inserted bases uppercase
         let codon_start = first_codon * 3;
         let codon_end = ((first_codon + 1) * 3).min(cds_seq.len());
         if codon_end <= cds_seq.len() {
@@ -2349,10 +2376,6 @@ fn classify_insertion(
                 .collect();
             class.codons = Some(format!("{ref_codon}/{alt_codon}"));
         }
-    } else if at_codon_boundary {
-        // Inframe insertion at codon boundary: ref="-", alt=UPPERCASE
-        let alt_codon: String = alt_tx.chars().map(|c| c.to_ascii_uppercase()).collect();
-        class.codons = Some(format!("-/{alt_codon}"));
     } else {
         // Inframe insertion within codon: ref=lowercase, alt=codon+inserted(uppercase)
         let codon_start = first_codon * 3;
@@ -4760,6 +4783,190 @@ mod tests {
     }
 
     // ---- format_codon_display: additional edge cases ----
+
+    // ---- cds_start_nf: "?-N" formatting for CDS_position and Protein_position ----
+
+    #[test]
+    fn cds_position_question_mark_when_cds_start_nf_single() {
+        // When cds_start_nf is true and CDS position is a single value (start == end),
+        // format should be "?-N" instead of just "N".
+        let cds = "ATGGCTGAATGA";
+        let mut t = tx("T1", "22", 1000, 1011, 1, "protein_coding", Some(1000), Some(1011));
+        t.cds_start_nf = true;
+        let e = exon("T1", 1, 1000, 1011);
+        let tr = translation("T1", Some(12), Some(4), None, Some(cds));
+        // SNV at pos 1003 → CDS idx 3, single position (start==end)
+        let v = var("22", 1003, 1003, "G", "A");
+        let engine = TranscriptConsequenceEngine::default();
+        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
+        let entry = result.iter().find(|e| e.cds_position.is_some()).unwrap();
+        assert_eq!(entry.cds_position.as_deref(), Some("?-4"));
+    }
+
+    #[test]
+    fn cds_position_normal_when_no_cds_start_nf() {
+        // When cds_start_nf is false, CDS position should be just "N".
+        let cds = "ATGGCTGAATGA";
+        let t = tx("T1", "22", 1000, 1011, 1, "protein_coding", Some(1000), Some(1011));
+        let e = exon("T1", 1, 1000, 1011);
+        let tr = translation("T1", Some(12), Some(4), None, Some(cds));
+        let v = var("22", 1003, 1003, "G", "A");
+        let engine = TranscriptConsequenceEngine::default();
+        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
+        let entry = result.iter().find(|e| e.cds_position.is_some()).unwrap();
+        assert_eq!(entry.cds_position.as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn cds_position_question_mark_when_cds_start_nf_range() {
+        // When cds_start_nf is true and CDS position is a range (start != end),
+        // format should be "?-E" instead of "S-E".
+        let cds = "ATGGCTGAAAAATGA";
+        let mut t = tx("T1", "22", 1000, 1014, 1, "protein_coding", Some(1000), Some(1014));
+        t.cds_start_nf = true;
+        let e = exon("T1", 1, 1000, 1014);
+        let tr = translation("T1", Some(15), Some(5), None, Some(cds));
+        // Insertion at pos 1004 → CDS range (start != end)
+        let v = var("22", 1004, 1004, "-", "TT");
+        let engine = TranscriptConsequenceEngine::default();
+        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
+        let entry = result.iter().find(|e| e.cds_position.is_some()).unwrap();
+        let cds_pos = entry.cds_position.as_deref().unwrap();
+        assert!(
+            cds_pos.starts_with("?-"),
+            "CDS position range with cds_start_nf should start with '?-': {cds_pos}"
+        );
+    }
+
+    #[test]
+    fn protein_position_question_mark_when_cds_start_nf_single() {
+        // When cds_start_nf is true and protein position is a single value,
+        // format should be "?-N".
+        let cds = "ATGGCTGAATGA";
+        let mut t = tx("T1", "22", 1000, 1011, 1, "protein_coding", Some(1000), Some(1011));
+        t.cds_start_nf = true;
+        let e = exon("T1", 1, 1000, 1011);
+        let tr = translation("T1", Some(12), Some(4), None, Some(cds));
+        let v = var("22", 1003, 1003, "G", "A");
+        let engine = TranscriptConsequenceEngine::default();
+        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
+        let entry = result.iter().find(|e| e.protein_position.is_some()).unwrap();
+        assert_eq!(entry.protein_position.as_deref(), Some("?-2"));
+    }
+
+    #[test]
+    fn protein_position_question_mark_when_cds_start_nf_range() {
+        // When cds_start_nf is true and protein position is a range,
+        // format should be "?-E".
+        let cds = "ATGGCTGAAAAATGA";
+        let mut t = tx("T1", "22", 1000, 1014, 1, "protein_coding", Some(1000), Some(1014));
+        t.cds_start_nf = true;
+        let e = exon("T1", 1, 1000, 1014);
+        let tr = translation("T1", Some(15), Some(5), None, Some(cds));
+        // Inframe insertion at codon boundary → protein_position range
+        let v = var("22", 1006, 1006, "-", "AAA");
+        let engine = TranscriptConsequenceEngine::default();
+        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
+        let entry = result.iter().find(|e| e.protein_position.is_some()).unwrap();
+        let prot_pos = entry.protein_position.as_deref().unwrap();
+        assert!(
+            prot_pos.starts_with("?-"),
+            "Protein position range with cds_start_nf should start with '?-': {prot_pos}"
+        );
+    }
+
+    // ---- frameshift insertion at codon boundary: protein_position range ----
+
+    #[test]
+    fn classify_frameshift_insertion_at_boundary_protein_position_range() {
+        // Frameshift insertion at codon boundary should still show a protein
+        // position range (X-Y), not just a single codon.
+        // CDS: ATG GCT GAA AAA TGA (15 bases)
+        // Insert "TT" (2 bases, frameshift) at codon boundary after pos 1005 (CDS idx 6)
+        let cds = "ATGGCTGAAAAATGA";
+        let c = classify_ins(cds, 1006, "TT").unwrap();
+        assert_ne!(
+            c.protein_position_start, c.protein_position_end,
+            "Frameshift insertion at codon boundary should have protein position range, \
+             got start={:?} end={:?}",
+            c.protein_position_start, c.protein_position_end
+        );
+        assert_eq!(c.protein_position_start, Some(2));
+        assert_eq!(c.protein_position_end, Some(3));
+    }
+
+    // ---- deletion frameshift: preserve last ref AA before X ----
+
+    #[test]
+    fn classify_deletion_frameshift_preserves_ref_aa_before_x() {
+        // CDS: ATG AAA AAA GCT GAA TGA (18 bases → M K K A E *)
+        // Delete 1 base "A" at pos 1003 (CDS idx 3, first base of codon 1 "AAA")
+        // After mutation, CDS = ATG AA AAA GCT GAA TGA → frameshift
+        // The first affected codon (K) should be preserved if mutation doesn't
+        // change it: "K/KX" rather than "K/X".
+        let cds = "ATGAAAAAAGCTGAATGA";
+        let c = classify_deletion(cds, 1003, 1003, "A").unwrap();
+        assert!(c.amino_acids.is_some());
+        let aa = c.amino_acids.unwrap();
+        assert!(aa.contains('X'), "Frameshift deletion should use X: {aa}");
+        let parts: Vec<&str> = aa.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        // When first affected codon AA is preserved in mutant, format is "K/KX"
+        if parts[1] != "X" {
+            assert!(
+                parts[1].ends_with('X'),
+                "Preserved AA deletion frameshift should end with X: {aa}"
+            );
+            // The preserved AA should match the first char of ref
+            let ref_last = parts[0].chars().last().unwrap();
+            let alt_first = parts[1].chars().next().unwrap();
+            assert_eq!(
+                ref_last, alt_first,
+                "Preserved AA should match ref's last AA: {aa}"
+            );
+        }
+    }
+
+    // ---- frameshift insertion at codon boundary: codons "-/X" ----
+
+    #[test]
+    fn classify_frameshift_insertion_at_boundary_codons_dash_format() {
+        // Frameshift insertion at codon boundary should use "-/X" format
+        // (same as inframe at boundary), not the within-codon format.
+        // CDS: ATG GCT GAA AAA TGA (15 bases)
+        // Insert "TT" (2 bases, frameshift) at codon boundary (CDS idx 6)
+        let cds = "ATGGCTGAAAAATGA";
+        let c = classify_ins(cds, 1006, "TT").unwrap();
+        assert!(c.codons.is_some());
+        let codons = c.codons.unwrap();
+        let parts: Vec<&str> = codons.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0], "-",
+            "Frameshift insertion at codon boundary ref should be '-': {codons}"
+        );
+        assert!(
+            parts[1].chars().all(|c| c.is_uppercase()),
+            "Frameshift insertion at codon boundary alt should be uppercase: {codons}"
+        );
+    }
+
+    #[test]
+    fn classify_frameshift_insertion_within_codon_not_dash_format() {
+        // Frameshift insertion within a codon should NOT use "-/X" format.
+        // CDS: ATG GCT GAA TGA (12 bases)
+        // Insert "TT" at pos 1004 (CDS idx 4, within codon 1 "GCT")
+        let cds = "ATGGCTGAATGA";
+        let c = classify_ins(cds, 1004, "TT").unwrap();
+        assert!(c.codons.is_some());
+        let codons = c.codons.unwrap();
+        let parts: Vec<&str> = codons.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        assert_ne!(
+            parts[0], "-",
+            "Frameshift insertion within codon ref should NOT be '-': {codons}"
+        );
+    }
 
     #[test]
     fn format_codon_display_all_changed() {
