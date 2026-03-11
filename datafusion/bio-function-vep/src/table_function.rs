@@ -2,20 +2,13 @@
 //!
 //! # Join semantics
 //!
-//! By default, `lookup_variants()` uses **equi-join** on exact normalized
-//! coordinates `(chrom, start, end)` with `match_allele()` as a post-filter.
-//! DataFusion plans this as `HashJoinExec` (equi on 3 keys) + `JoinFilter`.
+//! By default, `lookup_variants()` uses a self-contained left interval join
+//! (`VariantLookupExec`) with exact coordinate matching after VEP normalization
+//! and `match_allele()` as a post-filter.
 //!
-//! This means VCF variants only match cache entries at exactly the same
-//! position. Insertions or deletions whose VEP cache coordinates differ from
-//! VCF coordinates (e.g., insertion-style `start > end`, prefix-trimmed
-//! deletion shifts, tandem-repeat coordinate normalization) will **not** match
-//! unless `extended_probes = true` is set.
-//!
-//! When `extended_probes = true`, the SQL uses interval-overlap conditions
-//! (`>=` / `<=`) instead of equality, and the KV path probes multiple
-//! coordinate encodings per variant. This handles insertion-style and
-//! shifted-deletion cache coordinates at the cost of a wider join.
+//! When `extended_probes = true`, the join uses interval-overlap matching
+//! instead of exact coordinate equality, handling insertion-style coordinates
+//! and shifted-deletion cache coordinates.
 
 use std::sync::Arc;
 
@@ -26,7 +19,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::SessionContext;
 
-use crate::lookup_provider::{LookupProvider, MatchMode};
+use crate::lookup_provider::LookupProvider;
 use crate::schema_contract::{COORDINATE_COLUMNS, parse_column_list, validate_requested_columns};
 
 /// Table function implementing
@@ -80,32 +73,20 @@ impl TableFunctionImpl for LookupFunction {
                 .collect()
         };
 
-        // Optional fourth argument: match mode (default: "exact")
-        // - exact: equi-join on (chrom, start, end) + exact allele matching.
-        //   Only matches cache entries at the same normalized coordinates.
-        //   Insertions/deletions with VEP-style shifted coordinates require
-        //   extended_probes=true.
-        // - exact_or_colocated_ids: exact mode, but for unmatched rows also fills
-        //   fallback-capable columns (`variation_name`, `somatic`) from co-located
-        //   entries at the same position.
-        // - exact_or_vep_existing: exact mode, but for unmatched rows fills
-        //   fallback-capable columns using indel-aware relaxed allele-compatible
-        //   co-located rows; for `variation_name` it prefers rs* identifiers.
-        let match_mode = if args.len() > 3 {
+        // Optional fourth argument: match mode (default: "exact").
+        // Only "exact" is supported. The parameter is accepted for backwards
+        // compatibility but other values are rejected.
+        if args.len() > 3 {
             let mode = extract_string_arg(&args[3], "match_mode", "lookup_variants")?;
-            parse_match_mode(&mode)?
-        } else {
-            MatchMode::Exact
-        };
+            if mode != "exact" {
+                return Err(DataFusionError::Plan(format!(
+                    "lookup_variants() match_mode must be 'exact'; got: {mode}"
+                )));
+            }
+        }
 
         // Optional fifth argument: extended_probes (default: false)
-        // When true, uses interval-overlap SQL (instead of equi-join) and
-        // multi-probe KV lookups to match VEP-style coordinate encodings:
-        //   - insertion-style (start > end)
-        //   - prefix-trimmed deletion shifts
-        //   - tandem-repeat right/left shifted deletion windows
-        // Set to true when the cache contains VEP-normalized indel coordinates
-        // that differ from the VCF input coordinates.
+        // When true, uses interval-overlap matching and multi-probe KV lookups.
         let extended_probes = if args.len() > 4 {
             extract_bool_arg(&args[4], "extended_probes", "lookup_variants")?
         } else {
@@ -123,20 +104,8 @@ impl TableFunctionImpl for LookupFunction {
             vcf_schema,
             cache_schema,
             columns,
-            match_mode,
             extended_probes,
         )?))
-    }
-}
-
-fn parse_match_mode(value: &str) -> Result<MatchMode> {
-    match value {
-        "exact" => Ok(MatchMode::Exact),
-        "exact_or_colocated_ids" => Ok(MatchMode::ExactOrColocatedIds),
-        "exact_or_vep_existing" => Ok(MatchMode::ExactOrVepExisting),
-        other => Err(DataFusionError::Plan(format!(
-            "lookup_variants() match_mode must be one of: exact, exact_or_colocated_ids, exact_or_vep_existing; got: {other}"
-        ))),
     }
 }
 

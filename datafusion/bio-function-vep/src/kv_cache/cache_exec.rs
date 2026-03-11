@@ -27,15 +27,11 @@ use super::key_encoding::chrom_to_code;
 use super::kv_store::VepKvStore;
 use super::position_entry::{PositionEntryReader, make_builder};
 
-/// Lookup match mode (mirrors MatchMode from bio-function-vep).
+/// Lookup match mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvMatchMode {
     /// Exact allele matching only.
     Exact,
-    /// Exact first, then positional co-location fallback.
-    ExactOrColocated,
-    /// Exact first, then relaxed (indel-aware) fallback.
-    ExactOrRelaxed,
 }
 
 /// Physical execution plan for KV-backed variant lookup.
@@ -48,7 +44,6 @@ pub struct KvLookupExec {
     cache_columns: Vec<String>,
     match_mode: KvMatchMode,
     exact_matcher: AlleleMatcher,
-    relaxed_matcher: Option<AlleleMatcher>,
     schema: SchemaRef,
     vcf_has_chr: bool,
     vcf_zero_based: bool,
@@ -70,7 +65,6 @@ impl KvLookupExec {
         cache_columns: Vec<String>,
         match_mode: KvMatchMode,
         exact_matcher: AlleleMatcher,
-        relaxed_matcher: Option<AlleleMatcher>,
         vcf_has_chr: bool,
         vcf_zero_based: bool,
         cache_zero_based: bool,
@@ -108,7 +102,6 @@ impl KvLookupExec {
             cache_columns,
             match_mode,
             exact_matcher,
-            relaxed_matcher,
             schema,
             vcf_has_chr,
             vcf_zero_based,
@@ -172,7 +165,6 @@ impl ExecutionPlan for KvLookupExec {
             self.cache_columns.clone(),
             self.match_mode,
             self.exact_matcher,
-            self.relaxed_matcher,
             self.vcf_has_chr,
             self.vcf_zero_based,
             self.cache_zero_based,
@@ -194,7 +186,6 @@ impl ExecutionPlan for KvLookupExec {
             self.cache_columns.clone(),
             self.match_mode,
             self.exact_matcher,
-            self.relaxed_matcher,
             self.vcf_has_chr,
             self.vcf_zero_based,
             self.cache_zero_based,
@@ -210,9 +201,8 @@ struct KvLookupStream {
     store: Arc<VepKvStore>,
     schema: SchemaRef,
     cache_columns: Vec<String>,
-    match_mode: KvMatchMode,
+    _match_mode: KvMatchMode,
     exact_matcher: AlleleMatcher,
-    relaxed_matcher: Option<AlleleMatcher>,
     vcf_has_chr: bool,
     vcf_zero_based: bool,
     cache_zero_based: bool,
@@ -325,7 +315,6 @@ impl KvLookupStream {
         cache_columns: Vec<String>,
         match_mode: KvMatchMode,
         exact_matcher: AlleleMatcher,
-        relaxed_matcher: Option<AlleleMatcher>,
         vcf_has_chr: bool,
         vcf_zero_based: bool,
         cache_zero_based: bool,
@@ -337,9 +326,8 @@ impl KvLookupStream {
             store,
             schema,
             cache_columns,
-            match_mode,
+            _match_mode: match_mode,
             exact_matcher,
-            relaxed_matcher,
             vcf_has_chr,
             vcf_zero_based,
             cache_zero_based,
@@ -559,44 +547,10 @@ impl KvLookupStream {
 
                 // Match alleles within this position entry (reuse buffer).
                 matched_allele_rows.clear();
-                match self.match_mode {
-                    KvMatchMode::Exact => {
-                        for allele_idx in 0..reader.num_alleles() {
-                            let allele_str = reader.allele_string(allele_idx);
-                            if (self.exact_matcher)(vcf_ref, vcf_alt, allele_str) {
-                                matched_allele_rows.push(allele_idx);
-                            }
-                        }
-                    }
-                    KvMatchMode::ExactOrColocated => {
-                        for allele_idx in 0..reader.num_alleles() {
-                            let allele_str = reader.allele_string(allele_idx);
-                            if (self.exact_matcher)(vcf_ref, vcf_alt, allele_str) {
-                                matched_allele_rows.push(allele_idx);
-                            }
-                        }
-                        if matched_allele_rows.is_empty() {
-                            // Colocated fallback: all alleles at this position.
-                            matched_allele_rows.extend(0..reader.num_alleles());
-                        }
-                    }
-                    KvMatchMode::ExactOrRelaxed => {
-                        for allele_idx in 0..reader.num_alleles() {
-                            let allele_str = reader.allele_string(allele_idx);
-                            if (self.exact_matcher)(vcf_ref, vcf_alt, allele_str) {
-                                matched_allele_rows.push(allele_idx);
-                            }
-                        }
-                        if matched_allele_rows.is_empty() {
-                            if let Some(relaxed) = self.relaxed_matcher {
-                                for allele_idx in 0..reader.num_alleles() {
-                                    let allele_str = reader.allele_string(allele_idx);
-                                    if relaxed(vcf_ref, vcf_alt, allele_str) {
-                                        matched_allele_rows.push(allele_idx);
-                                    }
-                                }
-                            }
-                        }
+                for allele_idx in 0..reader.num_alleles() {
+                    let allele_str = reader.allele_string(allele_idx);
+                    if (self.exact_matcher)(vcf_ref, vcf_alt, allele_str) {
+                        matched_allele_rows.push(allele_idx);
                     }
                 }
 

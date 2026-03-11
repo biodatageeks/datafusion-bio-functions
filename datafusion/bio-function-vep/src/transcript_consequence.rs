@@ -674,7 +674,8 @@ impl TranscriptConsequenceEngine {
         // VEP's _after_coding: insertions right at an exon boundary where
         // the exon contains CDS get a UTR term even though the insertion
         // doesn't overlap the exon (it falls in the intron).
-        if is_ins && !terms.contains(&SoTerm::ThreePrimeUtrVariant)
+        if is_ins
+            && !terms.contains(&SoTerm::ThreePrimeUtrVariant)
             && !terms.contains(&SoTerm::FivePrimeUtrVariant)
         {
             if let Some(utr) = self.utr_boundary_insertion_term(variant, tx, tx_exons) {
@@ -744,9 +745,7 @@ impl TranscriptConsequenceEngine {
 
         // Emit one CSQ entry per overlapping regulatory feature (matching VEP behavior).
         for r in regulatory {
-            if normalize_chrom(&r.chrom) != chrom
-                || !feature_overlaps(variant, r.start, r.end)
-            {
+            if normalize_chrom(&r.chrom) != chrom || !feature_overlaps(variant, r.start, r.end) {
                 continue;
             }
             let mut terms: BTreeSet<SoTerm> = sv_terms.clone();
@@ -765,8 +764,7 @@ impl TranscriptConsequenceEngine {
         // If no regulatory features overlap but SV terms exist, emit a single entry.
         if !sv_terms.is_empty()
             && !regulatory.iter().any(|r| {
-                normalize_chrom(&r.chrom) == chrom
-                    && feature_overlaps(variant, r.start, r.end)
+                normalize_chrom(&r.chrom) == chrom && feature_overlaps(variant, r.start, r.end)
             })
         {
             let mut ordered: Vec<SoTerm> = sv_terms.into_iter().collect();
@@ -789,8 +787,7 @@ impl TranscriptConsequenceEngine {
         let mut terms = BTreeSet::new();
         let chrom = normalize_chrom(&variant.chrom);
         let overlaps_tfbs = motifs.iter().any(|m| {
-            normalize_chrom(&m.chrom) == chrom
-                && feature_overlaps(variant, m.start, m.end)
+            normalize_chrom(&m.chrom) == chrom && feature_overlaps(variant, m.start, m.end)
         });
         if overlaps_tfbs {
             terms.insert(SoTerm::TfBindingSiteVariant);
@@ -833,8 +830,7 @@ impl TranscriptConsequenceEngine {
     ) {
         let chrom = normalize_chrom(&variant.chrom);
         let overlaps_mirna = mirnas.iter().any(|m| {
-            normalize_chrom(&m.chrom) == chrom
-                && feature_overlaps(variant, m.start, m.end)
+            normalize_chrom(&m.chrom) == chrom && feature_overlaps(variant, m.start, m.end)
         });
         if overlaps_mirna {
             out.push(TranscriptConsequence {
@@ -1051,8 +1047,7 @@ impl TranscriptConsequenceEngine {
                 terms.insert(SoTerm::ProteinAlteringVariant);
                 return Some(classification);
             } else {
-                let cds = tx_translation
-                    .and_then(|t| t.cds_sequence.as_deref());
+                let cds = tx_translation.and_then(|t| t.cds_sequence.as_deref());
                 self.add_start_stop_heuristic_terms(terms, variant, tx, cds);
             }
             terms.insert(SoTerm::ProteinAlteringVariant);
@@ -1084,8 +1079,7 @@ impl TranscriptConsequenceEngine {
         // No translation data available. Apply start/stop heuristics
         // (position + allele pattern based) but do NOT guess
         // missense/synonymous without codon evidence.
-        let cds = tx_translation
-            .and_then(|t| t.cds_sequence.as_deref());
+        let cds = tx_translation.and_then(|t| t.cds_sequence.as_deref());
         self.add_start_stop_heuristic_terms(terms, variant, tx, cds);
 
         // Detect premature stop gain from allele pattern (in-frame
@@ -1122,8 +1116,7 @@ impl TranscriptConsequenceEngine {
                     let cds_start = tx.cds_start.unwrap_or(0);
                     // Build a simple mutated CDS by applying the indel
                     // at the variant's position relative to CDS start.
-                    let mutated_first3 =
-                        mutated_cds_first3(cds, variant, tx, cds_start);
+                    let mutated_first3 = mutated_cds_first3(cds, variant, tx, cds_start);
                     // Check if the deletion is at the CDS start boundary.
                     // VEP uses full transcript context (including UTR) for its
                     // mutation, so a boundary deletion might preserve ATG via
@@ -1187,9 +1180,9 @@ impl TranscriptConsequenceEngine {
             return None;
         };
         // Only applies to insertions at an exon boundary.
-        let at_exon_boundary = tx_exons.iter().any(|e| {
-            variant.start == e.end + 1 || variant.start == e.start
-        });
+        let at_exon_boundary = tx_exons
+            .iter()
+            .any(|e| variant.start == e.end + 1 || variant.start == e.start);
         if !at_exon_boundary {
             return None;
         }
@@ -2299,9 +2292,7 @@ fn classify_coding_change(
             // If the first affected codon's amino acid is preserved in the
             // mutant, show it before X (e.g., "H/HX"); otherwise just "L/X".
             // This applies to both insertion and deletion frameshifts.
-            if first_codon < new_aas.len()
-                && new_aas[first_codon] == old_aas[first_codon]
-            {
+            if first_codon < new_aas.len() && new_aas[first_codon] == old_aas[first_codon] {
                 let preserved: String = std::iter::once(new_aas[first_codon]).collect();
                 class.amino_acids = Some(format!("{ref_aa}/{preserved}X"));
             } else {
@@ -2711,7 +2702,8 @@ fn mutated_cds_first3(
             leading_n
         };
         let end_idx = (start_idx + ref_len_in_cds).min(cds_seq.len());
-        let mut mutated = Vec::with_capacity(cds_seq.len().saturating_sub(ref_len_in_cds) + alt_allele.len());
+        let mut mutated =
+            Vec::with_capacity(cds_seq.len().saturating_sub(ref_len_in_cds) + alt_allele.len());
         mutated.extend_from_slice(&cds_bytes[..start_idx]);
         mutated.extend_from_slice(alt_allele.to_ascii_uppercase().as_bytes());
         if end_idx < cds_bytes.len() {
@@ -2735,12 +2727,16 @@ fn mutated_cds_first3(
         let ref_rc = if ref_allele.is_empty() {
             String::new()
         } else {
-            reverse_complement(&ref_allele).unwrap_or_default().to_ascii_uppercase()
+            reverse_complement(&ref_allele)
+                .unwrap_or_default()
+                .to_ascii_uppercase()
         };
         let alt_rc = if alt_allele.is_empty() {
             String::new()
         } else {
-            reverse_complement(&alt_allele).unwrap_or_default().to_ascii_uppercase()
+            reverse_complement(&alt_allele)
+                .unwrap_or_default()
+                .to_ascii_uppercase()
         };
 
         if is_ins {
@@ -2784,7 +2780,8 @@ fn mutated_cds_first3(
             leading_n
         };
         let end_idx = (start_idx + ref_len_in_cds).min(cds_seq.len());
-        let mut mutated = Vec::with_capacity(cds_seq.len().saturating_sub(ref_len_in_cds) + alt_rc.len());
+        let mut mutated =
+            Vec::with_capacity(cds_seq.len().saturating_sub(ref_len_in_cds) + alt_rc.len());
         mutated.extend_from_slice(&cds_bytes[..start_idx]);
         mutated.extend_from_slice(alt_rc.as_bytes());
         if end_idx < cds_bytes.len() {
@@ -2962,7 +2959,11 @@ fn compute_cdna_position(
                 Some(format!("{lo}-{hi}"))
             }
             (Some(a), None) => {
-                let other = if strand >= 0 { a + 1 } else { a.saturating_sub(1) };
+                let other = if strand >= 0 {
+                    a + 1
+                } else {
+                    a.saturating_sub(1)
+                };
                 let lo = a.min(other);
                 let hi = a.max(other);
                 Some(format!("{lo}-{hi}"))
@@ -4737,7 +4738,16 @@ mod tests {
         // Single exon from 1000..(1000+cds_len-1), positive strand
         let cds_len = cds_seq.len();
         let tx_end = 1000 + cds_len as i64 - 1;
-        let t = tx("T1", "22", 1000, tx_end, 1, "protein_coding", Some(1000), Some(tx_end));
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
         let e = exon("T1", 1, 1000, tx_end);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
@@ -4782,7 +4792,16 @@ mod tests {
     ) -> Option<CodingClassification> {
         let cds_len = cds_seq.len();
         let tx_end = 1000 + cds_len as i64 - 1;
-        let t = tx("T1", "22", 1000, tx_end, 1, "protein_coding", Some(1000), Some(tx_end));
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
         let e = exon("T1", 1, 1000, tx_end);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
@@ -4833,7 +4852,10 @@ mod tests {
         assert!(c.amino_acids.is_some());
         let aa = c.amino_acids.unwrap();
         assert!(!aa.contains('X'), "Inframe deletion should not use X: {aa}");
-        assert!(aa.contains('/'), "Amino acids should be ref/alt format: {aa}");
+        assert!(
+            aa.contains('/'),
+            "Amino acids should be ref/alt format: {aa}"
+        );
     }
 
     #[test]
@@ -4847,7 +4869,10 @@ mod tests {
         // Should be "REF_AA/X" format (no preserved AA for deletions)
         let parts: Vec<&str> = aa.split('/').collect();
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[1], "X", "Deletion frameshift alt should be just X: {aa}");
+        assert_eq!(
+            parts[1], "X",
+            "Deletion frameshift alt should be just X: {aa}"
+        );
     }
 
     #[test]
@@ -4864,14 +4889,19 @@ mod tests {
     // ---- classify_insertion: codons, amino acids, positions ----
 
     /// Helper for insertion classification in a single-exon transcript.
-    fn classify_ins(
-        cds_seq: &str,
-        ins_pos: i64,
-        alt_allele: &str,
-    ) -> Option<CodingClassification> {
+    fn classify_ins(cds_seq: &str, ins_pos: i64, alt_allele: &str) -> Option<CodingClassification> {
         let cds_len = cds_seq.len();
         let tx_end = 1000 + cds_len as i64 - 1;
-        let t = tx("T1", "22", 1000, tx_end, 1, "protein_coding", Some(1000), Some(tx_end));
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
         let e = exon("T1", 1, 1000, tx_end);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
@@ -4914,10 +4944,7 @@ mod tests {
         let c = classify_ins(cds, 1007, "TT").unwrap();
         assert!(c.amino_acids.is_some());
         let aa = c.amino_acids.unwrap();
-        assert!(
-            aa.contains('X'),
-            "Frameshift insertion should use X: {aa}"
-        );
+        assert!(aa.contains('X'), "Frameshift insertion should use X: {aa}");
         // Should be either "H/HX" (preserved) or "H/X" (not preserved)
         let parts: Vec<&str> = aa.split('/').collect();
         assert_eq!(parts.len(), 2);
@@ -4983,7 +5010,10 @@ mod tests {
         let c = classify_ins(cds, 1006, "AAA").unwrap();
         assert!(c.amino_acids.is_some());
         let aa = c.amino_acids.unwrap();
-        assert!(!aa.contains('X'), "Inframe insertion should not use X: {aa}");
+        assert!(
+            !aa.contains('X'),
+            "Inframe insertion should not use X: {aa}"
+        );
     }
 
     #[test]
@@ -5001,8 +5031,7 @@ mod tests {
         let cds = "ATGGCTGAATGA";
         let c = classify_ins(cds, 1004, "TT").unwrap();
         assert_eq!(
-            c.protein_position_start,
-            c.protein_position_end,
+            c.protein_position_start, c.protein_position_end,
             "Frameshift insertion protein position should be a single codon"
         );
     }
@@ -5062,7 +5091,10 @@ mod tests {
         );
         let s = pos.unwrap();
         // pos 200 = cDNA index 101, inferred adjacent = 102
-        assert!(s.contains("101"), "Should reference last exonic cDNA position: {s}");
+        assert!(
+            s.contains("101"),
+            "Should reference last exonic cDNA position: {s}"
+        );
     }
 
     #[test]
@@ -5125,7 +5157,16 @@ mod tests {
 
     #[test]
     fn compute_flags_cds_end_nf_only() {
-        let mut t = tx("t1", "22", 100, 200, 1, "protein_coding", Some(110), Some(190));
+        let mut t = tx(
+            "t1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(190),
+        );
         t.cds_end_nf = true;
         assert_eq!(compute_flags(&t), Some("cds_end_NF".to_string()));
     }
@@ -5134,7 +5175,16 @@ mod tests {
     fn compute_flags_uses_flags_str_when_present() {
         // When flags_str is set (from VEP cache parsing), it should be used
         // to preserve encounter order.
-        let mut t = tx("t1", "22", 100, 200, 1, "protein_coding", Some(110), Some(190));
+        let mut t = tx(
+            "t1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(190),
+        );
         t.cds_start_nf = true;
         t.cds_end_nf = true;
         t.flags_str = Some("cds_end_NF&cds_start_NF".to_string());
@@ -5156,7 +5206,11 @@ mod tests {
         let variant = var("22", 150, 150, "A", "G");
         let mut out = Vec::new();
         engine.append_regulatory_terms(&mut out, &variant, &[r1, r2], &[]);
-        assert_eq!(out.len(), 2, "Each regulatory feature should get its own entry");
+        assert_eq!(
+            out.len(),
+            2,
+            "Each regulatory feature should get its own entry"
+        );
         assert_eq!(out[0].biotype_override, Some("promoter".to_string()));
         assert_eq!(out[1].biotype_override, Some("enhancer".to_string()));
     }
@@ -5197,13 +5251,23 @@ mod tests {
         // CDS with N padding (phase=2) + cds_start_nf → "?-N" format.
         // "NN" + "GCTGAATGA" = 11 bases, SNV at pos 1003 → CDS idx 5 (offset 2+3)
         let cds = "NNGCTGAATGA";
-        let mut t = tx("T1", "22", 1000, 1010, 1, "protein_coding", Some(1000), Some(1010));
+        let mut t = tx(
+            "T1",
+            "22",
+            1000,
+            1010,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1010),
+        );
         t.cds_start_nf = true;
         let e = exon("T1", 1, 1000, 1010);
         let tr = translation("T1", Some(11), Some(3), None, Some(cds));
         let v = var("22", 1003, 1003, "G", "A");
         let engine = TranscriptConsequenceEngine::default();
-        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
+        let result =
+            engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
         let entry = result.iter().find(|e| e.cds_position.is_some()).unwrap();
         let cds_pos = entry.cds_position.as_deref().unwrap();
         assert!(
@@ -5217,13 +5281,23 @@ mod tests {
         // CDS starts with ATG (no N padding) + cds_start_nf → plain "N" format.
         // VEP doesn't use "?" when phase is zero even with cds_start_nf.
         let cds = "ATGGCTGAATGA";
-        let mut t = tx("T1", "22", 1000, 1011, 1, "protein_coding", Some(1000), Some(1011));
+        let mut t = tx(
+            "T1",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
         t.cds_start_nf = true;
         let e = exon("T1", 1, 1000, 1011);
         let tr = translation("T1", Some(12), Some(4), None, Some(cds));
         let v = var("22", 1003, 1003, "G", "A");
         let engine = TranscriptConsequenceEngine::default();
-        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
+        let result =
+            engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
         let entry = result.iter().find(|e| e.cds_position.is_some()).unwrap();
         assert_eq!(entry.cds_position.as_deref(), Some("4"));
     }
@@ -5232,12 +5306,22 @@ mod tests {
     fn cds_position_normal_when_no_cds_start_nf() {
         // When cds_start_nf is false, CDS position should be just "N".
         let cds = "ATGGCTGAATGA";
-        let t = tx("T1", "22", 1000, 1011, 1, "protein_coding", Some(1000), Some(1011));
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
         let e = exon("T1", 1, 1000, 1011);
         let tr = translation("T1", Some(12), Some(4), None, Some(cds));
         let v = var("22", 1003, 1003, "G", "A");
         let engine = TranscriptConsequenceEngine::default();
-        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
+        let result =
+            engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
         let entry = result.iter().find(|e| e.cds_position.is_some()).unwrap();
         assert_eq!(entry.cds_position.as_deref(), Some("4"));
     }
@@ -5246,14 +5330,27 @@ mod tests {
     fn protein_position_question_mark_when_cds_start_nf_and_phase() {
         // N-padded CDS + cds_start_nf → "?-N" for protein position.
         let cds = "NNGCTGAATGA";
-        let mut t = tx("T1", "22", 1000, 1010, 1, "protein_coding", Some(1000), Some(1010));
+        let mut t = tx(
+            "T1",
+            "22",
+            1000,
+            1010,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1010),
+        );
         t.cds_start_nf = true;
         let e = exon("T1", 1, 1000, 1010);
         let tr = translation("T1", Some(11), Some(3), None, Some(cds));
         let v = var("22", 1003, 1003, "G", "A");
         let engine = TranscriptConsequenceEngine::default();
-        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
-        let entry = result.iter().find(|e| e.protein_position.is_some()).unwrap();
+        let result =
+            engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
+        let entry = result
+            .iter()
+            .find(|e| e.protein_position.is_some())
+            .unwrap();
         let prot_pos = entry.protein_position.as_deref().unwrap();
         assert!(
             prot_pos.starts_with("?-"),
@@ -5265,14 +5362,27 @@ mod tests {
     fn protein_position_no_question_mark_when_cds_start_nf_but_no_phase() {
         // CDS starts with ATG + cds_start_nf → plain number for protein position.
         let cds = "ATGGCTGAATGA";
-        let mut t = tx("T1", "22", 1000, 1011, 1, "protein_coding", Some(1000), Some(1011));
+        let mut t = tx(
+            "T1",
+            "22",
+            1000,
+            1011,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
         t.cds_start_nf = true;
         let e = exon("T1", 1, 1000, 1011);
         let tr = translation("T1", Some(12), Some(4), None, Some(cds));
         let v = var("22", 1003, 1003, "G", "A");
         let engine = TranscriptConsequenceEngine::default();
-        let result = engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
-        let entry = result.iter().find(|e| e.protein_position.is_some()).unwrap();
+        let result =
+            engine.evaluate_variant_with_context(&v, &[t], &[e], &[tr], &[], &[], &[], &[]);
+        let entry = result
+            .iter()
+            .find(|e| e.protein_position.is_some())
+            .unwrap();
         assert_eq!(entry.protein_position.as_deref(), Some("2"));
     }
 
@@ -5376,7 +5486,16 @@ mod tests {
         // Star alleles (e.g., G/*) represent upstream deletions that remove
         // the variant site. VEP skips them — no consequence terms emitted.
         let engine = TranscriptConsequenceEngine::default();
-        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(120), Some(180));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(120),
+            Some(180),
+        );
         let e = exon("tx1", 1, 100, 200);
         let v = var("22", 150, 150, "G", "*");
         let result = engine.evaluate_variant(&v, &[t], &[e]);
@@ -5397,12 +5516,10 @@ mod tests {
         let reg = regulatory("REG1", "22", 150, 200);
         // Insertion at pos 150 (== reg start) — should not overlap.
         let v = var("22", 150, 150, "-", "ACG");
-        let result = engine.evaluate_variant_with_context(
-            &v, &[], &[], &[], &[reg], &[], &[], &[],
-        );
-        let has_reg = result.iter().any(|e| {
-            e.terms.contains(&SoTerm::RegulatoryRegionVariant)
-        });
+        let result = engine.evaluate_variant_with_context(&v, &[], &[], &[], &[reg], &[], &[], &[]);
+        let has_reg = result
+            .iter()
+            .any(|e| e.terms.contains(&SoTerm::RegulatoryRegionVariant));
         assert!(
             !has_reg,
             "Insertion at regulatory feature boundary should not emit regulatory_region_variant"
@@ -5416,12 +5533,10 @@ mod tests {
         let reg = regulatory("REG1", "22", 150, 200);
         // Insertion at pos 175 (strictly inside) — should overlap.
         let v = var("22", 175, 175, "-", "ACG");
-        let result = engine.evaluate_variant_with_context(
-            &v, &[], &[], &[], &[reg], &[], &[], &[],
-        );
-        let has_reg = result.iter().any(|e| {
-            e.terms.contains(&SoTerm::RegulatoryRegionVariant)
-        });
+        let result = engine.evaluate_variant_with_context(&v, &[], &[], &[], &[reg], &[], &[], &[]);
+        let has_reg = result
+            .iter()
+            .any(|e| e.terms.contains(&SoTerm::RegulatoryRegionVariant));
         assert!(
             has_reg,
             "Insertion inside regulatory feature should emit regulatory_region_variant"
@@ -5434,12 +5549,10 @@ mod tests {
         let engine = TranscriptConsequenceEngine::default();
         let reg = regulatory("REG1", "22", 150, 200);
         let v = var("22", 150, 150, "A", "G");
-        let result = engine.evaluate_variant_with_context(
-            &v, &[], &[], &[], &[reg], &[], &[], &[],
-        );
-        let has_reg = result.iter().any(|e| {
-            e.terms.contains(&SoTerm::RegulatoryRegionVariant)
-        });
+        let result = engine.evaluate_variant_with_context(&v, &[], &[], &[], &[reg], &[], &[], &[]);
+        let has_reg = result
+            .iter()
+            .any(|e| e.terms.contains(&SoTerm::RegulatoryRegionVariant));
         assert!(
             has_reg,
             "SNV at regulatory feature boundary should emit regulatory_region_variant"
@@ -5525,7 +5638,16 @@ mod tests {
         let engine = TranscriptConsequenceEngine::default();
         // Transcript: 100..200, CDS: 100..200, positive strand.
         // Start codon at positions 100-102.
-        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
         let e = exon("tx1", 1, 100, 200);
         // Deletion at pos 103 — overlaps_start_codon is true (overlaps
         // region 100-102 via generic overlap because the function checks
@@ -5551,7 +5673,16 @@ mod tests {
         // Deletion entirely past the start codon should emit start_retained
         // when overlaps_start_codon returns true (due to proximity).
         let engine = TranscriptConsequenceEngine::default();
-        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
         let e = exon("tx1", 1, 100, 200);
         // Deletion at pos 103 — strictly after start codon end (102).
         let v = var("22", 103, 103, "T", "-");
@@ -5642,7 +5773,16 @@ mod tests {
         // Transcript: 100..500, CDS: 150..350, exon: 100..350.
         // Insertion at 351 (just past exon end) → 3' UTR.
         let engine = TranscriptConsequenceEngine::default();
-        let t = tx("tx1", "22", 100, 500, 1, "protein_coding", Some(150), Some(350));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            500,
+            1,
+            "protein_coding",
+            Some(150),
+            Some(350),
+        );
         let e = exon("tx1", 1, 100, 350);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let v = var("22", 351, 351, "-", "C");
@@ -5656,7 +5796,16 @@ mod tests {
         // Transcript: 100..500, CDS: 200..400, exon: 100..400.
         // Insertion at 100 (exon start) → before CDS → 5' UTR.
         let engine = TranscriptConsequenceEngine::default();
-        let t = tx("tx1", "22", 100, 500, 1, "protein_coding", Some(200), Some(400));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            500,
+            1,
+            "protein_coding",
+            Some(200),
+            Some(400),
+        );
         let e = exon("tx1", 1, 100, 400);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let v = var("22", 100, 100, "-", "C");
@@ -5670,7 +5819,16 @@ mod tests {
         // Transcript: 100..500, CDS: 200..400, exon: 200..500.
         // Insertion at 200 (exon start) → below CDS start → 3' UTR.
         let engine = TranscriptConsequenceEngine::default();
-        let t = tx("tx1", "22", 100, 500, -1, "protein_coding", Some(200), Some(400));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            500,
+            -1,
+            "protein_coding",
+            Some(200),
+            Some(400),
+        );
         let e1 = exon("tx1", 1, 200, 500);
         // Insertion at exon start (200), which is exactly cds_start → not below.
         // Use a second exon that starts below CDS.
@@ -5685,7 +5843,16 @@ mod tests {
     fn utr_boundary_insertion_not_at_exon_boundary() {
         // Insertion NOT at exon boundary → None.
         let engine = TranscriptConsequenceEngine::default();
-        let t = tx("tx1", "22", 100, 500, 1, "protein_coding", Some(150), Some(350));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            500,
+            1,
+            "protein_coding",
+            Some(150),
+            Some(350),
+        );
         let e = exon("tx1", 1, 100, 350);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let v = var("22", 360, 360, "-", "C"); // Not at exon boundary
@@ -5697,7 +5864,16 @@ mod tests {
     fn utr_boundary_insertion_within_cds() {
         // Insertion at exon boundary but within CDS → None (not UTR).
         let engine = TranscriptConsequenceEngine::default();
-        let t = tx("tx1", "22", 100, 500, 1, "protein_coding", Some(100), Some(500));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            500,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(500),
+        );
         let e1 = exon("tx1", 1, 100, 300);
         let e2 = exon("tx1", 2, 310, 500);
         let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
@@ -5772,7 +5948,16 @@ mod tests {
         // Negative strand transcript: CDS: 200..220 (21bp = 7 codons).
         // Start codon at genomic 218-220 (negative strand = high end).
         // Deletion at 218..228 (11 bases: 3 in CDS + 8 past CDS end into UTR).
-        let t = tx("tx1", "22", 100, 300, -1, "protein_coding", Some(200), Some(220));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            300,
+            -1,
+            "protein_coding",
+            Some(200),
+            Some(220),
+        );
         let _e = exon("tx1", 1, 100, 300);
         let v = var("22", 218, 228, "TTTTTTTTTTT", "-");
         let mut terms = BTreeSet::new();

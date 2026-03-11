@@ -1,11 +1,11 @@
 //! Lookup provider for `lookup_variants()` table function.
 //!
-//! Implements equi-join between a VCF table and a variation cache table using
-//! DataFusion's built-in `HashJoinExec`. When `extended_probes` is enabled,
-//! falls back to interval-overlap SQL for insertion-style coordinate matching.
+//! Implements variant lookup using a self-contained left interval join
+//! (`VariantLookupExec`) that builds VCF rows into per-chromosome COITrees
+//! and streams cache rows as the probe side. When the cache is a KV store,
+//! dispatches to `KvLookupExec` instead.
 
 use std::any::Any;
-use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -13,55 +13,71 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::Result;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
 
 use crate::coordinate::CoordinateNormalizer;
 use crate::schema_contract::validate_variation_schema;
+use crate::variant_lookup_exec::VariantLookupExec;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchMode {
-    Exact,
-    ExactOrColocatedIds,
-    ExactOrVepExisting,
+/// Wrap an execution plan with a `ProjectionExec` if projection is requested.
+///
+/// DataFusion's physical planner expects `scan()` to return a plan whose schema
+/// matches the projected schema. When a projection is provided, we wrap the
+/// full-schema plan with a `ProjectionExec` that selects only the projected columns.
+fn wrap_with_projection(
+    plan: Arc<dyn ExecutionPlan>,
+    projection: Option<&Vec<usize>>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_plan::projection::ProjectionExec;
+
+    match projection {
+        Some(indices) if indices.len() < plan.schema().fields().len() => {
+            let schema = plan.schema();
+            let exprs: Vec<_> = indices
+                .iter()
+                .map(|&idx| {
+                    let field = schema.field(idx);
+                    let expr = Arc::new(Column::new(field.name(), idx))
+                        as Arc<dyn datafusion::physical_plan::PhysicalExpr>;
+                    (expr, field.name().clone())
+                })
+                .collect();
+            Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
+        }
+        _ => Ok(plan),
+    }
 }
 
-/// Table provider that implements variant lookup via equi-join (or interval join
-/// when `extended_probes` is enabled).
+/// Table provider that implements variant lookup via self-contained left
+/// interval join (`VariantLookupExec`).
 ///
-/// Generates an internal SQL plan that joins VCF variants against the variation
-/// cache using exact-position matching on normalized `(chrom, start, end)`,
-/// with `match_allele()` as a post-filter. DataFusion plans this as
-/// `HashJoinExec` (equi on 3 keys) + `JoinFilter`.
+/// VCF variants are collected into per-chromosome COITrees (build side).
+/// Cache rows are streamed as the probe side with `match_allele()` as a
+/// post-filter. Unmatched VCF rows appear with NULL cache columns.
 ///
 /// # Default mode (equi-join)
 ///
-/// Requires VCF and cache coordinates to match exactly after normalization.
-/// SNVs and simple indels with consistent VCF/cache coordinates work well.
-/// Insertions or deletions where VEP normalizes coordinates differently
-/// (e.g., `start > end` for insertions, prefix-trimmed shifts for deletions,
-/// tandem-repeat right-shifting) will produce NULL cache columns.
+/// Requires VCF and cache coordinates to match exactly after VEP
+/// normalization (prefix/suffix stripping). SNVs and simple indels work well.
 ///
 /// # Extended probes mode
 ///
-/// When `extended_probes = true`, uses interval-overlap SQL conditions and
-/// multi-probe KV lookups to handle VEP-style coordinate encodings. This
-/// matches more variants at the cost of a wider join (IntervalJoinExec
-/// instead of HashJoinExec).
+/// When `extended_probes = true`, uses interval-overlap matching to handle
+/// VEP-style coordinate encodings (insertion-style start > end,
+/// prefix-trimmed deletion shifts, tandem-repeat right-shifting).
 pub struct LookupProvider {
     session: Arc<SessionContext>,
     vcf_table: String,
     cache_table: String,
-    vcf_schema: Schema,
     /// Columns to select from the cache table.
     cache_columns: Vec<String>,
-    /// Lookup matching strategy.
-    match_mode: MatchMode,
     /// Coordinate normalizer for handling different coordinate systems.
     coord_normalizer: CoordinateNormalizer,
-    /// When true, use interval-overlap SQL and multi-probe KV lookups.
+    /// When true, use interval-overlap matching instead of exact coordinate match.
     extended_probes: bool,
     /// Output schema.
     schema: SchemaRef,
@@ -83,7 +99,6 @@ impl LookupProvider {
         vcf_schema: Schema,
         cache_schema: Schema,
         cache_columns: Vec<String>,
-        match_mode: MatchMode,
         extended_probes: bool,
     ) -> Result<Self> {
         let cache_schema_ref: SchemaRef = Arc::new(cache_schema.clone());
@@ -94,8 +109,6 @@ impl LookupProvider {
             CoordinateNormalizer::from_schemas(&vcf_schema_ref, &cache_schema_ref);
 
         // Build output schema: all VCF columns + selected cache columns (prefixed with cache_).
-        // Preserve column names/types/nullability but drop field metadata because SQL projections
-        // used to build the physical plan do not retain source field metadata.
         let mut fields: Vec<Arc<Field>> = vcf_schema
             .fields()
             .iter()
@@ -122,9 +135,7 @@ impl LookupProvider {
             session,
             vcf_table,
             cache_table,
-            vcf_schema,
             cache_columns,
-            match_mode,
             coord_normalizer,
             extended_probes,
             schema,
@@ -183,10 +194,10 @@ impl TableProvider for LookupProvider {
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // KV cache dispatch: if the cache table is a KvCacheTableProvider,
-        // use the window-based KvLookupExec instead of SQL/IntervalJoinExec.
+        // use the KvLookupExec instead.
         #[cfg(feature = "kv-cache")]
         {
-            use crate::allele::{allele_matches, allele_matches_relaxed};
+            use crate::allele::allele_matches;
             use crate::kv_cache::KvCacheTableProvider;
             use crate::kv_cache::cache_exec::{KvLookupExec, KvMatchMode};
 
@@ -204,355 +215,52 @@ impl TableProvider for LookupProvider {
                     let vcf_df = self.session.table(&self.vcf_table).await?;
                     let vcf_plan = vcf_df.create_physical_plan().await?;
 
-                    let (kv_mode, relaxed) = match self.match_mode {
-                        MatchMode::Exact => (KvMatchMode::Exact, None),
-                        MatchMode::ExactOrColocatedIds => (KvMatchMode::ExactOrColocated, None),
-                        MatchMode::ExactOrVepExisting => (
-                            KvMatchMode::ExactOrRelaxed,
-                            Some(allele_matches_relaxed as fn(&str, &str, &str) -> bool),
-                        ),
-                    };
-
-                    return Ok(Arc::new(KvLookupExec::new(
+                    let plan: Arc<dyn ExecutionPlan> = Arc::new(KvLookupExec::new(
                         vcf_plan,
                         store,
                         self.cache_columns.clone(),
-                        kv_mode,
+                        KvMatchMode::Exact,
                         allele_matches as fn(&str, &str, &str) -> bool,
-                        relaxed,
                         vcf_has_chr,
                         self.coord_normalizer.input_zero_based,
                         self.coord_normalizer.cache_zero_based,
                         self.extended_probes,
-                    )?));
+                    )?);
+                    return wrap_with_projection(plan, projection);
                 }
             }
         }
-        let total_output_fields = self.schema.fields().len();
-        let vcf_output_fields = self.vcf_schema.fields().len();
-        let projected_indices: Vec<usize> = projection
-            .cloned()
-            .unwrap_or_else(|| (0..total_output_fields).collect());
 
-        let mut projected_output_exprs = Vec::with_capacity(projected_indices.len());
-        let mut required_vcf_columns = BTreeSet::<String>::new();
-        let has_variation_name_column = self.cache_columns.iter().any(|c| c == "variation_name");
-        let has_somatic_column = self.cache_columns.iter().any(|c| c == "somatic");
-        let has_fallback_capable_column = has_variation_name_column || has_somatic_column;
-        let colocated_mode_enabled =
-            self.match_mode == MatchMode::ExactOrColocatedIds && has_fallback_capable_column;
-        let vep_existing_mode_enabled =
-            self.match_mode == MatchMode::ExactOrVepExisting && has_fallback_capable_column;
-        let mut projects_cache_variation_name = false;
-        let mut projects_cache_somatic = false;
-
-        for idx in projected_indices {
-            if idx >= total_output_fields {
-                return Err(DataFusionError::Execution(format!(
-                    "lookup_variants(): projection index {idx} out of bounds for schema with {total_output_fields} fields"
-                )));
-            }
-
-            if idx < vcf_output_fields {
-                let name = self.schema.field(idx).name().clone();
-                projected_output_exprs.push(format!("a.`{name}` AS `{name}`"));
-                required_vcf_columns.insert(name);
-            } else {
-                // Output schema appends cache columns in the same order as `self.cache_columns`.
-                let cache_idx = idx - vcf_output_fields;
-                let cache_col_name = self.cache_columns.get(cache_idx).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "lookup_variants(): cache projection index {cache_idx} out of bounds for {} cache columns",
-                        self.cache_columns.len()
-                    ))
-                })?;
-                let output_field = self.schema.field(idx);
-                let needs_utf8_cast = output_field.data_type() == &DataType::Utf8;
-                let project_cache_expr = |raw_expr: &str| -> String {
-                    if needs_utf8_cast {
-                        format!("CAST(({raw_expr}) AS VARCHAR) AS `cache_{cache_col_name}`")
-                    } else {
-                        format!("{raw_expr} AS `cache_{cache_col_name}`")
-                    }
-                };
-                if cache_col_name == "variation_name" {
-                    projects_cache_variation_name = true;
-                    if colocated_mode_enabled || vep_existing_mode_enabled {
-                        projected_output_exprs.push(project_cache_expr(
-                            "COALESCE(b.`variation_name`, f.`__lookup_fallback_variation_name`)",
-                        ));
-                    } else {
-                        projected_output_exprs.push(project_cache_expr("b.`variation_name`"));
-                    }
-                } else if cache_col_name == "somatic" {
-                    projects_cache_somatic = true;
-                    if colocated_mode_enabled || vep_existing_mode_enabled {
-                        projected_output_exprs.push(project_cache_expr(
-                            "COALESCE(b.`somatic`, CAST(f.`__lookup_fallback_somatic` AS TINYINT))",
-                        ));
-                    } else {
-                        projected_output_exprs.push(project_cache_expr("b.`somatic`"));
-                    }
-                } else {
-                    projected_output_exprs
-                        .push(project_cache_expr(&format!("b.`{cache_col_name}`")));
-                }
-            }
-        }
-        let projects_fallback_column = projects_cache_variation_name || projects_cache_somatic;
-        let use_colocated_id_fallback = colocated_mode_enabled && projects_fallback_column;
-        let use_vep_existing_fallback = vep_existing_mode_enabled && projects_fallback_column;
-
-        // Join and allele-match columns are always required from the VCF side.
-        for col in ["chrom", "start", "end", "ref", "alt"] {
-            required_vcf_columns.insert(col.to_string());
-        }
-
-        // Detect whether VCF uses "chr"-prefixed chromosome names.
-        // Ensembl VEP cache always uses bare names (e.g. "1", "22").
+        // Parquet / MemTable path: use VariantLookupExec.
         let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
 
-        // Build the VCF FROM source.
-        // Always project only required columns so table scans can prune aggressively.
-        // Keep output columns exactly as input; apply chrom normalization only in join expressions.
-        let vcf_inner_cols = required_vcf_columns
-            .iter()
-            .map(|name| format!("`{name}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let vcf_from_subquery = format!("(SELECT {vcf_inner_cols} FROM `{}`)", self.vcf_table);
-        let vcf_from = format!("{vcf_from_subquery} AS a");
+        let vcf_df = self.session.table(&self.vcf_table).await?;
+        let vcf_plan = vcf_df.create_physical_plan().await?;
 
-        // Build cache-side source with explicit columns only:
-        // join keys + allele string + annotation columns involved in output/null-filter.
-        let mut required_cache_columns = BTreeSet::<String>::from([
-            "chrom".to_string(),
-            "start".to_string(),
-            "end".to_string(),
-            "allele_string".to_string(),
-        ]);
-        required_cache_columns.extend(self.cache_columns.iter().cloned());
-
-        let cache_base_cols = required_cache_columns
-            .iter()
-            .map(|c| format!("`{c}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let cache_normalized_start_expr = if self.coord_normalizer.cache_zero_based {
-            "CAST(`start` AS BIGINT) + 1"
-        } else {
-            "CAST(`start` AS BIGINT)"
-        };
-        let cache_normalized_end_expr = "CAST(`end` AS BIGINT)";
-
-        // Normalize both tables to 1-based closed coordinates based on
-        // `bio.coordinate_system_zero_based` metadata:
-        // - zero-based half-open [start, end) -> [start + 1, end]
-        // - one-based closed [start, end]     -> [start, end]
-        let vcf_start_expr = |alias: &str| -> String {
-            if self.coord_normalizer.input_zero_based {
-                format!("CAST({alias}.`start` AS BIGINT) + 1")
-            } else {
-                format!("CAST({alias}.`start` AS BIGINT)")
+        // Project cache to only the columns needed: join keys + requested output columns.
+        // This avoids reading all 78 parquet columns when only ~10 are needed.
+        let cache_df = self.session.table(&self.cache_table).await?;
+        let mut required_cols: Vec<&str> = vec!["chrom", "start", "end", "allele_string"];
+        for col in &self.cache_columns {
+            if !required_cols.contains(&col.as_str()) {
+                required_cols.push(col.as_str());
             }
-        };
-        let vcf_end_expr = |alias: &str| -> String { format!("CAST({alias}.`end` AS BIGINT)") };
-        let vcf_start_expr_a = vcf_start_expr("a");
-        let vcf_end_expr_a = vcf_end_expr("a");
-        let vcf_join_chrom_expr_a = if vcf_has_chr {
-            "replace(a.`chrom`, 'chr', '')"
-        } else {
-            "a.`chrom`"
-        };
+        }
+        let cache_plan = cache_df
+            .select_columns(&required_cols)?
+            .create_physical_plan()
+            .await?;
 
-        // Build the cache subquery and ON clause depending on the probing mode.
-        let (cache_inner_cols, on_clause, cache_join_start_expr);
-
-        if self.extended_probes {
-            // Extended probes: interval-overlap SQL for insertion-style coordinates.
-            // Normalize insertion rows (start>end) to a point at `end`.
-            cache_join_start_expr = format!(
-                "CASE WHEN {cache_normalized_start_expr} > {cache_normalized_end_expr} \
-                 THEN {cache_normalized_end_expr} ELSE {cache_normalized_start_expr} END"
-            );
-            cache_inner_cols = format!(
-                "{cache_base_cols}, {cache_join_start_expr} AS `__lookup_join_start`, \
-                 {cache_normalized_end_expr} AS `__lookup_join_end`"
-            );
-            on_clause = format!(
-                "{vcf_join_chrom_expr_a} = b.`chrom` \
-                 AND {vcf_end_expr_a} >= b.`__lookup_join_start` \
-                 AND {vcf_start_expr_a} <= b.`__lookup_join_end` \
-                 AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
-            );
-        } else {
-            // Default: equi-join on VEP-normalized positions.
-            // Use vep_norm_start/vep_norm_end UDFs to shift VCF coordinates by the
-            // common prefix/suffix length, matching VEP's coordinate convention.
-            // DataFusion plans this as HashJoinExec (equi on 3 keys) + JoinFilter (match_allele).
-            cache_join_start_expr = cache_normalized_start_expr.to_string();
-            cache_inner_cols = format!(
-                "{cache_base_cols}, {cache_normalized_start_expr} AS `__norm_start`, \
-                 {cache_normalized_end_expr} AS `__norm_end`"
-            );
-            let vcf_vep_start_a = format!(
-                "vep_norm_start({vcf_start_expr_a}, a.`ref`, a.`alt`)"
-            );
-            let vcf_vep_end_a = format!(
-                "vep_norm_end({vcf_start_expr_a}, a.`ref`, a.`alt`)"
-            );
-            on_clause = format!(
-                "{vcf_join_chrom_expr_a} = b.`chrom` \
-                 AND {vcf_vep_start_a} = b.`__norm_start` \
-                 AND {vcf_vep_end_a} = b.`__norm_end` \
-                 AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
-            );
-        };
-
-        // Build the LEFT JOIN query.
-        // VCF is the left (build) side — small, fully indexed in memory.
-        // Cache is the right (probe) side — potentially huge, streamed.
-        // LEFT JOIN ensures all VCF variants appear in output.
-        //
-        // Note: VEP caches may contain duplicate rows at the same
-        // (chrom, start, end, allele_string) with different variation_name
-        // values (e.g. dbSNP + COSMIC IDs). These produce ~0.03% extra
-        // output rows compared to VEP (which deduplicates internally).
-        // A post-join GROUP BY would fix this but turns the streaming
-        // pipeline into a blocking operation with high memory usage, so
-        // we accept the minor discrepancy for performance.
-        let cache_where = if self.cache_columns.is_empty() {
-            String::new()
-        } else {
-            // Pre-filter cache rows where all selected annotation columns are NULL
-            let null_filter = self
-                .cache_columns
-                .iter()
-                .map(|c| format!("`{c}` IS NOT NULL"))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            format!(" WHERE {null_filter}")
-        };
-
-        let select_output = projected_output_exprs.join(", ");
-        let query = if use_colocated_id_fallback || use_vep_existing_fallback {
-            let vcf_start_expr_fa = vcf_start_expr("fa");
-            let vcf_end_expr_fa = vcf_end_expr("fa");
-            let vcf_join_chrom_expr_fa = if vcf_has_chr {
-                "replace(fa.`chrom`, 'chr', '')"
-            } else {
-                "fa.`chrom`"
-            };
-            // Always use allele-aware matching in the fallback join.
-            // Without it, position-only matching can pick the wrong co-located
-            // variant when multiple variants exist at the same locus.
-            let fallback_join_on = if self.extended_probes {
-                format!(
-                    "{vcf_join_chrom_expr_fa} = c.`chrom` \
-                     AND {vcf_end_expr_fa} >= c.`__lookup_join_start` \
-                     AND {vcf_start_expr_fa} <= c.`__lookup_join_end` \
-                     AND match_allele_relaxed(fa.`ref`, fa.`alt`, c.`allele_string`)"
-                )
-            } else {
-                let vcf_vep_start_fa = format!(
-                    "vep_norm_start({vcf_start_expr_fa}, fa.`ref`, fa.`alt`)"
-                );
-                let vcf_vep_end_fa = format!(
-                    "vep_norm_end({vcf_start_expr_fa}, fa.`ref`, fa.`alt`)"
-                );
-                format!(
-                    "{vcf_join_chrom_expr_fa} = c.`chrom` \
-                     AND {vcf_vep_start_fa} = c.`__norm_start` \
-                     AND {vcf_vep_end_fa} = c.`__norm_end` \
-                     AND match_allele_relaxed(fa.`ref`, fa.`alt`, c.`allele_string`)"
-                )
-            };
-            let mut fallback_cache_cols = vec!["`chrom`".to_string()];
-            if projects_cache_variation_name {
-                fallback_cache_cols.push("`variation_name`".to_string());
-            }
-            if projects_cache_somatic {
-                fallback_cache_cols.push("`somatic`".to_string());
-            }
-            // Always include allele_string for allele-aware matching in fallback.
-            fallback_cache_cols.push("`allele_string`".to_string());
-            if self.extended_probes {
-                fallback_cache_cols
-                    .push(format!("{cache_join_start_expr} AS `__lookup_join_start`"));
-                fallback_cache_cols.push(format!(
-                    "{cache_normalized_end_expr} AS `__lookup_join_end`"
-                ));
-            } else {
-                fallback_cache_cols
-                    .push(format!("{cache_normalized_start_expr} AS `__norm_start`"));
-                fallback_cache_cols.push(format!("{cache_normalized_end_expr} AS `__norm_end`"));
-            }
-            let fallback_cache_inner_cols = fallback_cache_cols.join(", ");
-
-            let mut fallback_select_exprs = Vec::new();
-            if projects_cache_variation_name {
-                // Prefer rsID variants, fall back to any other ID.
-                let fallback_variation_name_expr =
-                    "COALESCE(\
-                     MIN(CASE WHEN c.`variation_name` LIKE 'rs%' THEN c.`variation_name` END), \
-                     MIN(c.`variation_name`)) AS `__lookup_fallback_variation_name`"
-                        .to_string();
-                fallback_select_exprs.push(fallback_variation_name_expr);
-            }
-            if projects_cache_somatic {
-                fallback_select_exprs.push(
-                    "MAX(CAST(c.`somatic` AS INTEGER)) AS `__lookup_fallback_somatic`".to_string(),
-                );
-            }
-            let fallback_select_expr_sql = fallback_select_exprs.join(", ");
-
-            let mut fallback_not_null_conditions = Vec::new();
-            if projects_cache_variation_name {
-                fallback_not_null_conditions.push("`variation_name` IS NOT NULL".to_string());
-            }
-            if projects_cache_somatic {
-                fallback_not_null_conditions.push("`somatic` IS NOT NULL".to_string());
-            }
-            let fallback_not_null_sql = fallback_not_null_conditions.join(" OR ");
-            let fallback_subquery = format!(
-                "(SELECT fa.`chrom`, fa.`start`, fa.`end`, fa.`ref`, fa.`alt`, \
-                        {fallback_select_expr_sql} \
-                 FROM {vcf_from_subquery} AS fa \
-                 LEFT JOIN \
-                 (SELECT {fallback_cache_inner_cols} FROM `{}` WHERE {fallback_not_null_sql}) AS c \
-                 ON {fallback_join_on} \
-                 GROUP BY fa.`chrom`, fa.`start`, fa.`end`, fa.`ref`, fa.`alt`) AS f",
-                self.cache_table,
-            );
-            let fallback_key_join = "\
-a.`chrom` = f.`chrom` \
-AND CAST(a.`start` AS BIGINT) = CAST(f.`start` AS BIGINT) \
-AND CAST(a.`end` AS BIGINT) = CAST(f.`end` AS BIGINT) \
-AND a.`ref` = f.`ref` \
-AND a.`alt` = f.`alt`";
-
-            format!(
-                "SELECT {select_output} \
-                 FROM {vcf_from} LEFT JOIN \
-                 (SELECT {cache_inner_cols} FROM `{}`{cache_where}) AS b \
-                 ON {on_clause} \
-                 LEFT JOIN {fallback_subquery} \
-                 ON {fallback_key_join}",
-                self.cache_table,
-            )
-        } else {
-            format!(
-                "SELECT {select_output} \
-                 FROM {vcf_from} LEFT JOIN \
-                 (SELECT {cache_inner_cols} FROM `{}`{cache_where}) AS b \
-                 ON {on_clause}",
-                self.cache_table,
-            )
-        };
-
-        let df = self.session.sql(&query).await?;
-        df.create_physical_plan().await
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(VariantLookupExec::new(
+            vcf_plan,
+            cache_plan,
+            self.cache_columns.clone(),
+            vcf_has_chr,
+            self.coord_normalizer.clone(),
+            self.extended_probes,
+            self.schema.clone(),
+        ));
+        wrap_with_projection(plan, projection)
     }
 }
 
@@ -564,7 +272,7 @@ mod tests {
         KvCacheTableProvider, VepKvStore, position_entry::serialize_position_entry,
     };
     use datafusion::arrow::array::{
-        Array, ArrayRef, Int8Array, Int64Array, RecordBatch, StringArray, StringViewArray,
+        Array, ArrayRef, Int64Array, RecordBatch, StringArray, StringViewArray,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
@@ -615,22 +323,6 @@ mod tests {
         }
     }
 
-    fn int8_values(col: &ArrayRef) -> Vec<Option<i8>> {
-        if let Some(arr) = col.as_any().downcast_ref::<Int8Array>() {
-            (0..arr.len())
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        Some(arr.value(i))
-                    }
-                })
-                .collect()
-        } else {
-            panic!("expected Int8, got {:?}", col.data_type());
-        }
-    }
-
     fn schema_with_coord_metadata(fields: Vec<Field>, zero_based: bool) -> Arc<Schema> {
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -672,7 +364,7 @@ mod tests {
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
         ]));
-        // Cache coordinates must exactly match VCF after normalization (equi-join).
+        // Cache coordinates must exactly match VCF after normalization.
         // VCF has chr1:(100,101) and chr1:(200,201), cache uses bare chrom names.
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -701,7 +393,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_lookup_generates_hash_join() {
+    async fn test_lookup_generates_variant_lookup_exec() {
         let ctx = create_vep_session();
 
         ctx.register_table("vcf_data", Arc::new(vcf_table()))
@@ -718,12 +410,8 @@ mod tests {
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
 
         assert!(
-            plan_str.contains("HashJoinExec"),
-            "Expected HashJoinExec in plan, got:\n{plan_str}"
-        );
-        assert!(
-            plan_str.contains("Left"),
-            "Expected LEFT join type in plan, got:\n{plan_str}"
+            plan_str.contains("VariantLookupExec"),
+            "Expected VariantLookupExec in plan, got:\n{plan_str}"
         );
     }
 
@@ -1000,12 +688,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify the plan uses HashJoinExec with LEFT join
+        // Verify the plan uses VariantLookupExec
         let plan = df.clone().create_physical_plan().await.unwrap();
         let plan_str = displayable(plan.as_ref()).indent(true).to_string();
         assert!(
-            plan_str.contains("HashJoinExec"),
-            "Expected HashJoinExec in plan, got:\n{plan_str}"
+            plan_str.contains("VariantLookupExec"),
+            "Expected VariantLookupExec in plan, got:\n{plan_str}"
         );
 
         let batches = df.collect().await.unwrap();
@@ -1303,203 +991,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_lookup_exact_or_colocated_ids_fills_variation_name_on_exact_miss() {
-        let ctx = create_vep_session();
-
-        // VCF: deletion AC→A at pos 100 (VEP-trimmed: ref=C, alt=-).
-        let vcf_schema = Arc::new(Schema::new(vec![
-            Field::new("chrom", DataType::Utf8, false),
-            Field::new("start", DataType::Int64, false),
-            Field::new("end", DataType::Int64, false),
-            Field::new("ref", DataType::Utf8, false),
-            Field::new("alt", DataType::Utf8, false),
-        ]));
-        let vcf_batch = RecordBatch::try_new(
-            vcf_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["1"])),
-                Arc::new(Int64Array::from(vec![100])),
-                Arc::new(Int64Array::from(vec![100])),
-                Arc::new(StringArray::from(vec!["AC"])),
-                Arc::new(StringArray::from(vec!["A"])),
-            ],
-        )
-        .unwrap();
-        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
-
-        // Cache: deletion at VEP-normalized position (101, 101) with different
-        // representation (TG/T vs C/-). Strict match_allele fails because
-        // ref "TG" != "C"/"AC", but match_allele_relaxed succeeds because both
-        // are 1-base deletions. VCF start=100, ref="AC", alt="A" normalizes to
-        // vep_start=101, vep_end=101 (prefix "A" stripped), matching cache coords.
-        let cache_schema = Arc::new(Schema::new(vec![
-            Field::new("chrom", DataType::Utf8, false),
-            Field::new("start", DataType::Int64, false),
-            Field::new("end", DataType::Int64, false),
-            Field::new("variation_name", DataType::Utf8, true),
-            Field::new("allele_string", DataType::Utf8, false),
-            Field::new("somatic", DataType::Int8, true),
-            Field::new("clin_sig", DataType::Utf8, true),
-        ]));
-        let cache_batch = RecordBatch::try_new(
-            cache_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["1"])),
-                Arc::new(Int64Array::from(vec![101])),
-                Arc::new(Int64Array::from(vec![101])),
-                Arc::new(StringArray::from(vec!["rs_coloc_only"])),
-                Arc::new(StringArray::from(vec!["TG/T"])),
-                Arc::new(Int8Array::from(vec![Some(1)])),
-                Arc::new(StringArray::from(vec!["benign"])),
-            ],
-        )
-        .unwrap();
-        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
-
-        ctx.register_table("vcf_coloc_mode", Arc::new(vcf)).unwrap();
-        ctx.register_table("cache_coloc_mode", Arc::new(cache))
-            .unwrap();
-
-        // Exact mode: no allele match => NULL variation_name.
-        let exact_df = ctx
-            .sql(
-                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name,somatic', 'exact')",
-            )
-            .await
-            .unwrap();
-        let exact_batches = exact_df.collect().await.unwrap();
-        let exact_var_values: Vec<Option<String>> = exact_batches
-            .iter()
-            .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
-            .collect();
-        let exact_somatic_values: Vec<Option<i8>> = exact_batches
-            .iter()
-            .flat_map(|b| int8_values(b.column_by_name("cache_somatic").unwrap()))
-            .collect();
-        assert_eq!(exact_var_values, vec![None]);
-        assert_eq!(exact_somatic_values, vec![None]);
-
-        // Fallback mode: fill variation_name and somatic from co-located rows.
-        let coloc_df = ctx
-            .sql(
-                "SELECT * FROM lookup_variants('vcf_coloc_mode', 'cache_coloc_mode', 'variation_name,somatic', 'exact_or_colocated_ids')",
-            )
-            .await
-            .unwrap();
-        let coloc_batches = coloc_df.collect().await.unwrap();
-        let coloc_var_values: Vec<Option<String>> = coloc_batches
-            .iter()
-            .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
-            .collect();
-        let coloc_somatic_values: Vec<Option<i8>> = coloc_batches
-            .iter()
-            .flat_map(|b| int8_values(b.column_by_name("cache_somatic").unwrap()))
-            .collect();
-        assert_eq!(coloc_var_values, vec![Some("rs_coloc_only".to_string())]);
-        assert_eq!(coloc_somatic_values, vec![Some(1)]);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_lookup_exact_or_vep_existing_uses_relaxed_indel_and_prefers_rs() {
-        let ctx = create_vep_session();
-
-        let vcf_schema = Arc::new(Schema::new(vec![
-            Field::new("chrom", DataType::Utf8, false),
-            Field::new("start", DataType::Int64, false),
-            Field::new("end", DataType::Int64, false),
-            Field::new("ref", DataType::Utf8, false),
-            Field::new("alt", DataType::Utf8, false),
-        ]));
-        let vcf_batch = RecordBatch::try_new(
-            vcf_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["1"])),
-                Arc::new(Int64Array::from(vec![100])),
-                Arc::new(Int64Array::from(vec![100])),
-                Arc::new(StringArray::from(vec!["AA"])),
-                Arc::new(StringArray::from(vec!["A"])),
-            ],
-        )
-        .unwrap();
-        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
-
-        // Two co-located deletion-like rows at VEP-normalized position (101, 101)
-        // have ref mismatch for strict matching, but both are indel-length compatible
-        // under relaxed matching. VCF start=100, ref="AA", alt="A" normalizes to
-        // vep_start=101, vep_end=101. Mode should prefer rs* IDs over other namespaces.
-        let cache_schema = Arc::new(Schema::new(vec![
-            Field::new("chrom", DataType::Utf8, false),
-            Field::new("start", DataType::Int64, false),
-            Field::new("end", DataType::Int64, false),
-            Field::new("variation_name", DataType::Utf8, true),
-            Field::new("allele_string", DataType::Utf8, false),
-            Field::new("somatic", DataType::Int8, true),
-            Field::new("clin_sig", DataType::Utf8, true),
-        ]));
-        let cache_batch = RecordBatch::try_new(
-            cache_schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["1", "1"])),
-                Arc::new(Int64Array::from(vec![101, 101])),
-                Arc::new(Int64Array::from(vec![101, 101])),
-                Arc::new(StringArray::from(vec!["COSM_relaxed", "rs_relaxed"])),
-                Arc::new(StringArray::from(vec!["C/-", "T/-"])),
-                Arc::new(Int8Array::from(vec![Some(1), Some(1)])),
-                Arc::new(StringArray::from(vec!["benign", "benign"])),
-            ],
-        )
-        .unwrap();
-        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
-
-        ctx.register_table("vcf_vep_existing_mode", Arc::new(vcf))
-            .unwrap();
-        ctx.register_table("cache_vep_existing_mode", Arc::new(cache))
-            .unwrap();
-
-        // Exact mode must miss because both cache refs mismatch ("C/-", "T/-").
-        let exact_df = ctx
-            .sql(
-                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name,somatic', 'exact')",
-            )
-            .await
-            .unwrap();
-        let exact_batches = exact_df.collect().await.unwrap();
-        let exact_var_values: Vec<Option<String>> = exact_batches
-            .iter()
-            .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
-            .collect();
-        let exact_somatic_values: Vec<Option<i8>> = exact_batches
-            .iter()
-            .flat_map(|b| int8_values(b.column_by_name("cache_somatic").unwrap()))
-            .collect();
-        assert_eq!(exact_var_values, vec![None]);
-        assert_eq!(exact_somatic_values, vec![None]);
-
-        // VEP-existing mode: relaxed indel compatibility fills fallback
-        // variation_name and somatic, preferring rs* IDs when available.
-        let vep_existing_df = ctx
-            .sql(
-                "SELECT * FROM lookup_variants('vcf_vep_existing_mode', 'cache_vep_existing_mode', 'variation_name,somatic', 'exact_or_vep_existing')",
-            )
-            .await
-            .unwrap();
-        let vep_existing_batches = vep_existing_df.collect().await.unwrap();
-        let vep_existing_var_values: Vec<Option<String>> = vep_existing_batches
-            .iter()
-            .flat_map(|b| string_values(b.column_by_name("cache_variation_name").unwrap()))
-            .collect();
-        let vep_existing_somatic_values: Vec<Option<i8>> = vep_existing_batches
-            .iter()
-            .flat_map(|b| int8_values(b.column_by_name("cache_somatic").unwrap()))
-            .collect();
-        assert_eq!(
-            vep_existing_var_values,
-            vec![Some("rs_relaxed".to_string())]
-        );
-        assert_eq!(vep_existing_somatic_values, vec![Some(1)]);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn test_lookup_one_based_metadata_matches_point_variants() {
         let ctx = create_vep_session();
 
@@ -1747,10 +1238,7 @@ mod tests {
     }
 
     /// Duplicate cache rows on (chrom, start, end, allele_string) with different
-    /// variation_names each produce a separate output row. This is a conscious
-    /// trade-off: a post-join GROUP BY would match VEP's one-row-per-variant
-    /// semantics but turns the streaming pipeline into a blocking operation.
-    /// The ~0.03% extra rows from cache duplicates are acceptable.
+    /// variation_names each produce a separate output row.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_lookup_cache_duplicates_produce_separate_rows() {
         let ctx = create_vep_session();

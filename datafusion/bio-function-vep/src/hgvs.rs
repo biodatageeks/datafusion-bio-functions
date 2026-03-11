@@ -65,7 +65,14 @@ pub fn format_hgvsc(
     }
 
     // Intronic: compute offset from nearest exon boundary.
-    if let Some(intronic) = compute_intronic_hgvsc(tx, tx_exons, variant_start, variant_end, ref_allele, alt_allele) {
+    if let Some(intronic) = compute_intronic_hgvsc(
+        tx,
+        tx_exons,
+        variant_start,
+        variant_end,
+        ref_allele,
+        alt_allele,
+    ) {
         return Some(format!("{tx_id}:c.{intronic}"));
     }
 
@@ -127,14 +134,17 @@ fn compute_intronic_hgvsc(
     exon_boundaries.sort_by_key(|(s, _)| *s);
 
     // Find the nearest exon boundary and compute the offset.
-    let (cdna_boundary, offset) = nearest_exon_boundary(
-        tx, tx_exons, &exon_boundaries, variant_start, variant_end,
-    )?;
+    let (cdna_boundary, offset) =
+        nearest_exon_boundary(tx, tx_exons, &exon_boundaries, variant_start, variant_end)?;
 
     if is_ins {
         // Intronic insertion
         let (cdna_boundary2, offset2) = nearest_exon_boundary(
-            tx, tx_exons, &exon_boundaries, variant_start - 1, variant_start - 1,
+            tx,
+            tx_exons,
+            &exon_boundaries,
+            variant_start - 1,
+            variant_start - 1,
         )?;
         let pos1 = format_intronic_pos(cdna_boundary2, offset2);
         let pos2 = format_intronic_pos(cdna_boundary, offset);
@@ -145,9 +155,8 @@ fn compute_intronic_hgvsc(
             let pos = format_intronic_pos(cdna_boundary, offset);
             Some(format!("{pos}del"))
         } else {
-            let (cdna_boundary2, offset2) = nearest_exon_boundary(
-                tx, tx_exons, &exon_boundaries, variant_end, variant_end,
-            )?;
+            let (cdna_boundary2, offset2) =
+                nearest_exon_boundary(tx, tx_exons, &exon_boundaries, variant_end, variant_end)?;
             let pos1 = format_intronic_pos(cdna_boundary, offset);
             let pos2 = format_intronic_pos(cdna_boundary2, offset2);
             Some(format!("{pos1}_{pos2}del"))
@@ -162,9 +171,8 @@ fn compute_intronic_hgvsc(
         if variant_start == variant_end {
             Some(format!("{pos}delins{alt_allele}"))
         } else {
-            let (cdna_boundary2, offset2) = nearest_exon_boundary(
-                tx, tx_exons, &exon_boundaries, variant_end, variant_end,
-            )?;
+            let (cdna_boundary2, offset2) =
+                nearest_exon_boundary(tx, tx_exons, &exon_boundaries, variant_end, variant_end)?;
             let pos2 = format_intronic_pos(cdna_boundary2, offset2);
             Some(format!("{pos}_{pos2}delins{alt_allele}"))
         }
@@ -287,10 +295,7 @@ pub fn format_hgvsp(
 ) -> Option<String> {
     use crate::so_terms::SoTerm;
 
-    let protein_id = versioned_id(
-        translation.stable_id.as_deref()?,
-        translation.version,
-    );
+    let protein_id = versioned_id(translation.stable_id.as_deref()?, translation.version);
 
     let aa = amino_acids?;
     let pos_str = protein_position?;
@@ -380,29 +385,23 @@ fn format_hgvsp_stop_gained(
     Some(format!("{protein_id}:p.{ref3}{pos_num}Ter"))
 }
 
-fn format_hgvsp_synonymous(
-    protein_id: &str,
-    pos_str: &str,
-    ref_aa: &str,
-) -> Option<String> {
+fn format_hgvsp_synonymous(protein_id: &str, pos_str: &str, ref_aa: &str) -> Option<String> {
     let pos_num = pos_str.split('-').next()?;
     let ref3 = aa_one_to_three(ref_aa.chars().next()?);
     // VEP URL-encodes the "=" sign as %3D
     Some(format!("{protein_id}:p.{ref3}{pos_num}%3D"))
 }
 
-fn format_hgvsp_inframe_del(
-    protein_id: &str,
-    pos_str: &str,
-    ref_aa: &str,
-) -> Option<String> {
+fn format_hgvsp_inframe_del(protein_id: &str, pos_str: &str, ref_aa: &str) -> Option<String> {
     let parts: Vec<&str> = pos_str.split('-').collect();
     if parts.len() == 2 {
         let start_pos = parts[0];
         let end_pos = parts[1];
         let first_ref3 = aa_one_to_three(ref_aa.chars().next()?);
         let last_ref3 = aa_one_to_three(ref_aa.chars().last()?);
-        Some(format!("{protein_id}:p.{first_ref3}{start_pos}_{last_ref3}{end_pos}del"))
+        Some(format!(
+            "{protein_id}:p.{first_ref3}{start_pos}_{last_ref3}{end_pos}del"
+        ))
     } else {
         let ref3 = aa_one_to_three(ref_aa.chars().next()?);
         Some(format!("{protein_id}:p.{ref3}{pos_str}del"))
@@ -418,7 +417,10 @@ fn format_hgvsp_inframe_ins(
     let parts: Vec<&str> = pos_str.split('-').collect();
     // The inserted sequence is the extra AAs in alt beyond ref
     let ins_seq: String = if alt_aa.len() > ref_aa.len() {
-        alt_aa[ref_aa.len()..].chars().map(aa_one_to_three).collect()
+        alt_aa[ref_aa.len()..]
+            .chars()
+            .map(aa_one_to_three)
+            .collect()
     } else {
         alt_aa.chars().map(aa_one_to_three).collect()
     };
@@ -439,7 +441,9 @@ fn format_hgvsp_inframe_ins(
         let ref3 = aa_one_to_three(ref_aa.chars().next()?);
         let pos_num: usize = pos_str.parse().ok()?;
         let next_pos = pos_num + 1;
-        Some(format!("{protein_id}:p.{ref3}{pos_num}_{ref3}{next_pos}ins{ins_seq}"))
+        Some(format!(
+            "{protein_id}:p.{ref3}{pos_num}_{ref3}{next_pos}ins{ins_seq}"
+        ))
     }
 }
 
@@ -457,24 +461,36 @@ mod tests {
 
     #[test]
     fn test_versioned_id() {
-        assert_eq!(versioned_id("ENST00000379410", Some(6)), "ENST00000379410.6");
+        assert_eq!(
+            versioned_id("ENST00000379410", Some(6)),
+            "ENST00000379410.6"
+        );
         assert_eq!(versioned_id("ENST00000379410", None), "ENST00000379410");
     }
 
     #[test]
     fn test_format_cdna_change_snv() {
-        assert_eq!(format_cdna_change("1043", "G", "A", false, false), "1043G>A");
+        assert_eq!(
+            format_cdna_change("1043", "G", "A", false, false),
+            "1043G>A"
+        );
     }
 
     #[test]
     fn test_format_cdna_change_insertion() {
-        assert_eq!(format_cdna_change("10-11", "-", "ACG", true, false), "10-11insACG");
+        assert_eq!(
+            format_cdna_change("10-11", "-", "ACG", true, false),
+            "10-11insACG"
+        );
     }
 
     #[test]
     fn test_format_cdna_change_deletion() {
         assert_eq!(format_cdna_change("10", "A", "-", false, true), "10del");
-        assert_eq!(format_cdna_change("10-12", "ACG", "-", false, true), "10-12del");
+        assert_eq!(
+            format_cdna_change("10-12", "ACG", "-", false, true),
+            "10-12del"
+        );
     }
 
     #[test]

@@ -413,14 +413,10 @@ fn vep_norm_coord_impl(
             ))
         })?;
     let refs = refs.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        datafusion::common::DataFusionError::Internal(format!(
-            "{fn_name}: second arg must be Utf8"
-        ))
+        datafusion::common::DataFusionError::Internal(format!("{fn_name}: second arg must be Utf8"))
     })?;
     let alts = alts.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        datafusion::common::DataFusionError::Internal(format!(
-            "{fn_name}: third arg must be Utf8"
-        ))
+        datafusion::common::DataFusionError::Internal(format!("{fn_name}: third arg must be Utf8"))
     })?;
 
     let len = positions.len().max(refs.len()).max(alts.len());

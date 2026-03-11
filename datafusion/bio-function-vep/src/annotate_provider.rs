@@ -108,36 +108,198 @@ struct AfColumn {
 
 const AF_COLUMNS: &[AfColumn] = &[
     // --af (global 1000 Genomes) — emitted in CSQ, excluded from MAX_AF_POPS, formatted %.4f
-    AfColumn { cache_col: "AF", format_4f: true, flag_group: 0, emit_in_csq: true, max_af_pop: None },
+    AfColumn {
+        cache_col: "AF",
+        format_4f: true,
+        flag_group: 0,
+        emit_in_csq: true,
+        max_af_pop: None,
+    },
     // --af_1kg (continental) — emitted, MAX_AF uses short names (AFR not AFR_AF)
-    AfColumn { cache_col: "AFR", format_4f: false, flag_group: 1, emit_in_csq: true, max_af_pop: Some("AFR") },
-    AfColumn { cache_col: "AMR", format_4f: false, flag_group: 1, emit_in_csq: true, max_af_pop: Some("AMR") },
-    AfColumn { cache_col: "EAS", format_4f: false, flag_group: 1, emit_in_csq: true, max_af_pop: Some("EAS") },
-    AfColumn { cache_col: "EUR", format_4f: false, flag_group: 1, emit_in_csq: true, max_af_pop: Some("EUR") },
-    AfColumn { cache_col: "SAS", format_4f: false, flag_group: 1, emit_in_csq: true, max_af_pop: Some("SAS") },
+    AfColumn {
+        cache_col: "AFR",
+        format_4f: false,
+        flag_group: 1,
+        emit_in_csq: true,
+        max_af_pop: Some("AFR"),
+    },
+    AfColumn {
+        cache_col: "AMR",
+        format_4f: false,
+        flag_group: 1,
+        emit_in_csq: true,
+        max_af_pop: Some("AMR"),
+    },
+    AfColumn {
+        cache_col: "EAS",
+        format_4f: false,
+        flag_group: 1,
+        emit_in_csq: true,
+        max_af_pop: Some("EAS"),
+    },
+    AfColumn {
+        cache_col: "EUR",
+        format_4f: false,
+        flag_group: 1,
+        emit_in_csq: true,
+        max_af_pop: Some("EUR"),
+    },
+    AfColumn {
+        cache_col: "SAS",
+        format_4f: false,
+        flag_group: 1,
+        emit_in_csq: true,
+        max_af_pop: Some("SAS"),
+    },
     // --af_gnomade — only global emitted in CSQ; sub-pops used for MAX_AF only
-    AfColumn { cache_col: "gnomADe", format_4f: false, flag_group: 2, emit_in_csq: true, max_af_pop: None },
-    AfColumn { cache_col: "gnomADe_AFR", format_4f: false, flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_AFR") },
-    AfColumn { cache_col: "gnomADe_AMR", format_4f: false, flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_AMR") },
-    AfColumn { cache_col: "gnomADe_ASJ", format_4f: false, flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_ASJ") },
-    AfColumn { cache_col: "gnomADe_EAS", format_4f: false, flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_EAS") },
-    AfColumn { cache_col: "gnomADe_FIN", format_4f: false, flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_FIN") },
-    AfColumn { cache_col: "gnomADe_MID", format_4f: false, flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_MID") },
-    AfColumn { cache_col: "gnomADe_NFE", format_4f: false, flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_NFE") },
-    AfColumn { cache_col: "gnomADe_REMAINING", format_4f: false, flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_REMAINING") },
-    AfColumn { cache_col: "gnomADe_SAS", format_4f: false, flag_group: 2, emit_in_csq: false, max_af_pop: Some("gnomADe_SAS") },
+    AfColumn {
+        cache_col: "gnomADe",
+        format_4f: false,
+        flag_group: 2,
+        emit_in_csq: true,
+        max_af_pop: None,
+    },
+    AfColumn {
+        cache_col: "gnomADe_AFR",
+        format_4f: false,
+        flag_group: 2,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADe_AFR"),
+    },
+    AfColumn {
+        cache_col: "gnomADe_AMR",
+        format_4f: false,
+        flag_group: 2,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADe_AMR"),
+    },
+    AfColumn {
+        cache_col: "gnomADe_ASJ",
+        format_4f: false,
+        flag_group: 2,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADe_ASJ"),
+    },
+    AfColumn {
+        cache_col: "gnomADe_EAS",
+        format_4f: false,
+        flag_group: 2,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADe_EAS"),
+    },
+    AfColumn {
+        cache_col: "gnomADe_FIN",
+        format_4f: false,
+        flag_group: 2,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADe_FIN"),
+    },
+    AfColumn {
+        cache_col: "gnomADe_MID",
+        format_4f: false,
+        flag_group: 2,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADe_MID"),
+    },
+    AfColumn {
+        cache_col: "gnomADe_NFE",
+        format_4f: false,
+        flag_group: 2,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADe_NFE"),
+    },
+    AfColumn {
+        cache_col: "gnomADe_REMAINING",
+        format_4f: false,
+        flag_group: 2,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADe_REMAINING"),
+    },
+    AfColumn {
+        cache_col: "gnomADe_SAS",
+        format_4f: false,
+        flag_group: 2,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADe_SAS"),
+    },
     // --af_gnomadg — only global emitted in CSQ; sub-pops used for MAX_AF only
-    AfColumn { cache_col: "gnomADg", format_4f: false, flag_group: 3, emit_in_csq: true, max_af_pop: None },
-    AfColumn { cache_col: "gnomADg_AFR", format_4f: false, flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_AFR") },
-    AfColumn { cache_col: "gnomADg_AMI", format_4f: false, flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_AMI") },
-    AfColumn { cache_col: "gnomADg_AMR", format_4f: false, flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_AMR") },
-    AfColumn { cache_col: "gnomADg_ASJ", format_4f: false, flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_ASJ") },
-    AfColumn { cache_col: "gnomADg_EAS", format_4f: false, flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_EAS") },
-    AfColumn { cache_col: "gnomADg_FIN", format_4f: false, flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_FIN") },
-    AfColumn { cache_col: "gnomADg_MID", format_4f: false, flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_MID") },
-    AfColumn { cache_col: "gnomADg_NFE", format_4f: false, flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_NFE") },
-    AfColumn { cache_col: "gnomADg_REMAINING", format_4f: false, flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_REMAINING") },
-    AfColumn { cache_col: "gnomADg_SAS", format_4f: false, flag_group: 3, emit_in_csq: false, max_af_pop: Some("gnomADg_SAS") },
+    AfColumn {
+        cache_col: "gnomADg",
+        format_4f: false,
+        flag_group: 3,
+        emit_in_csq: true,
+        max_af_pop: None,
+    },
+    AfColumn {
+        cache_col: "gnomADg_AFR",
+        format_4f: false,
+        flag_group: 3,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADg_AFR"),
+    },
+    AfColumn {
+        cache_col: "gnomADg_AMI",
+        format_4f: false,
+        flag_group: 3,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADg_AMI"),
+    },
+    AfColumn {
+        cache_col: "gnomADg_AMR",
+        format_4f: false,
+        flag_group: 3,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADg_AMR"),
+    },
+    AfColumn {
+        cache_col: "gnomADg_ASJ",
+        format_4f: false,
+        flag_group: 3,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADg_ASJ"),
+    },
+    AfColumn {
+        cache_col: "gnomADg_EAS",
+        format_4f: false,
+        flag_group: 3,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADg_EAS"),
+    },
+    AfColumn {
+        cache_col: "gnomADg_FIN",
+        format_4f: false,
+        flag_group: 3,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADg_FIN"),
+    },
+    AfColumn {
+        cache_col: "gnomADg_MID",
+        format_4f: false,
+        flag_group: 3,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADg_MID"),
+    },
+    AfColumn {
+        cache_col: "gnomADg_NFE",
+        format_4f: false,
+        flag_group: 3,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADg_NFE"),
+    },
+    AfColumn {
+        cache_col: "gnomADg_REMAINING",
+        format_4f: false,
+        flag_group: 3,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADg_REMAINING"),
+    },
+    AfColumn {
+        cache_col: "gnomADg_SAS",
+        format_4f: false,
+        flag_group: 3,
+        emit_in_csq: false,
+        max_af_pop: Some("gnomADg_SAS"),
+    },
 ];
 
 /// Parsed VEP option flags controlling which Batch 3 CSQ fields are emitted.
@@ -364,29 +526,29 @@ fn build_colocated_map(
                 continue;
             };
             let end = int64_at(batch.column(end_idx).as_ref(), row).unwrap_or(start);
-            let var_name = string_at(batch.column(var_name_idx).as_ref(), row)
-                .unwrap_or_default();
+            let var_name = string_at(batch.column(var_name_idx).as_ref(), row).unwrap_or_default();
             let somatic = int64_at(batch.column(somatic_idx).as_ref(), row).unwrap_or(0);
             let pheno = int64_at(batch.column(pheno_idx).as_ref(), row).unwrap_or(0);
             let allele_string = allele_str_idx
                 .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 .unwrap_or_default();
-            let clin_sig_allele = clin_sig_allele_idx
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-            let pubmed = pubmed_col_idx
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+            let clin_sig_allele =
+                clin_sig_allele_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+            let pubmed = pubmed_col_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
 
             if var_name.is_empty() {
                 continue;
             }
-            raw.entry((chrom, start, end)).or_default().push(ColocatedEntry {
-                variation_name: var_name,
-                allele_string,
-                somatic,
-                pheno,
-                clin_sig_allele,
-                pubmed,
-            });
+            raw.entry((chrom, start, end))
+                .or_default()
+                .push(ColocatedEntry {
+                    variation_name: var_name,
+                    allele_string,
+                    somatic,
+                    pheno,
+                    clin_sig_allele,
+                    pubmed,
+                });
         }
     }
 
@@ -398,7 +560,8 @@ fn build_colocated_map(
         entries.sort_by(|a, b| {
             let a_rs = a.variation_name.starts_with("rs");
             let b_rs = b.variation_name.starts_with("rs");
-            b_rs.cmp(&a_rs).then_with(|| a.variation_name.cmp(&b.variation_name))
+            b_rs.cmp(&a_rs)
+                .then_with(|| a.variation_name.cmp(&b.variation_name))
         });
 
         let names: Vec<&str> = entries.iter().map(|e| e.variation_name.as_str()).collect();
@@ -872,8 +1035,8 @@ impl AnnotateProvider {
                 let tsl = tsl_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .and_then(|v| i32::try_from(v).ok());
-                let mane_select = mane_select_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let mane_select =
+                    mane_select_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let mane_plus_clinical = mane_plus_clinical_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let translation_stable_id = translation_stable_id_idx
@@ -881,16 +1044,14 @@ impl AnnotateProvider {
                 let gene_phenotype = gene_phenotype_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                     .unwrap_or(false);
-                let ccds =
-                    ccds_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let ccds = ccds_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let swissprot =
                     swissprot_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let trembl =
-                    trembl_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let trembl = trembl_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let uniparc =
                     uniparc_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let uniprot_isoform = uniprot_isoform_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let uniprot_isoform =
+                    uniprot_isoform_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
 
                 out.push(TranscriptFeature {
                     transcript_id,
@@ -1372,10 +1533,8 @@ impl AnnotateProvider {
                     string_at(batch.column(ci).as_ref(), row),
                     int64_at(batch.column(si).as_ref(), row),
                 ) {
-                    let ref_allele = ref_idx
-                        .and_then(|i| string_at(batch.column(i).as_ref(), row));
-                    let alt_allele = alt_idx
-                        .and_then(|i| string_at(batch.column(i).as_ref(), row));
+                    let ref_allele = ref_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
+                    let alt_allele = alt_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
                     let (vep_start, vep_end) =
                         if let (Some(ref_a), Some(alt_a)) = (&ref_allele, &alt_allele) {
                             (
@@ -1385,10 +1544,7 @@ impl AnnotateProvider {
                         } else {
                             (start, start)
                         };
-                    let chrom_norm = chrom
-                        .strip_prefix("chr")
-                        .unwrap_or(&chrom)
-                        .to_string();
+                    let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom).to_string();
                     positions.insert((chrom_norm, vep_start, vep_end));
                 }
             }
@@ -1749,7 +1905,11 @@ impl AnnotateProvider {
                     raw_freq.to_string()
                 };
                 // CSQ output: only emit for columns VEP emits in offline/cache mode.
-                let csq_val = if col.emit_in_csq { freq.clone() } else { String::new() };
+                let csq_val = if col.emit_in_csq {
+                    freq.clone()
+                } else {
+                    String::new()
+                };
                 af_csq_values.push(csq_val);
                 af_raw_formatted.push(freq);
             }
@@ -1957,19 +2117,11 @@ impl AnnotateProvider {
                     let gene_pheno = tx_opt
                         .map(|tx| if tx.gene_phenotype { "1" } else { "" })
                         .unwrap_or("");
-                    let ccds = tx_opt
-                        .and_then(|tx| tx.ccds.as_deref())
-                        .unwrap_or("");
-                    let swissprot = tx_opt
-                        .and_then(|tx| tx.swissprot.as_deref())
-                        .unwrap_or("");
-                    let trembl_raw = tx_opt
-                        .and_then(|tx| tx.trembl.as_deref())
-                        .unwrap_or("");
+                    let ccds = tx_opt.and_then(|tx| tx.ccds.as_deref()).unwrap_or("");
+                    let swissprot = tx_opt.and_then(|tx| tx.swissprot.as_deref()).unwrap_or("");
+                    let trembl_raw = tx_opt.and_then(|tx| tx.trembl.as_deref()).unwrap_or("");
                     let trembl = csq_escape(trembl_raw);
-                    let uniparc = tx_opt
-                        .and_then(|tx| tx.uniparc.as_deref())
-                        .unwrap_or("");
+                    let uniparc = tx_opt.and_then(|tx| tx.uniparc.as_deref()).unwrap_or("");
                     let uniprot_isoform = tx_opt
                         .and_then(|tx| tx.uniprot_isoform.as_deref())
                         .unwrap_or("");
@@ -2684,20 +2836,41 @@ mod tests {
 
     #[test]
     fn test_parse_sv_feature_kind_known() {
-        assert_eq!(parse_sv_feature_kind("transcript"), Some(SvFeatureKind::Transcript));
+        assert_eq!(
+            parse_sv_feature_kind("transcript"),
+            Some(SvFeatureKind::Transcript)
+        );
         assert_eq!(parse_sv_feature_kind("tx"), Some(SvFeatureKind::Transcript));
-        assert_eq!(parse_sv_feature_kind("regulatory"), Some(SvFeatureKind::Regulatory));
-        assert_eq!(parse_sv_feature_kind("reg"), Some(SvFeatureKind::Regulatory));
+        assert_eq!(
+            parse_sv_feature_kind("regulatory"),
+            Some(SvFeatureKind::Regulatory)
+        );
+        assert_eq!(
+            parse_sv_feature_kind("reg"),
+            Some(SvFeatureKind::Regulatory)
+        );
         assert_eq!(parse_sv_feature_kind("tfbs"), Some(SvFeatureKind::Tfbs));
         assert_eq!(parse_sv_feature_kind("motif"), Some(SvFeatureKind::Tfbs));
-        assert_eq!(parse_sv_feature_kind("feature"), Some(SvFeatureKind::Generic));
-        assert_eq!(parse_sv_feature_kind("generic"), Some(SvFeatureKind::Generic));
+        assert_eq!(
+            parse_sv_feature_kind("feature"),
+            Some(SvFeatureKind::Generic)
+        );
+        assert_eq!(
+            parse_sv_feature_kind("generic"),
+            Some(SvFeatureKind::Generic)
+        );
     }
 
     #[test]
     fn test_parse_sv_feature_kind_case_insensitive() {
-        assert_eq!(parse_sv_feature_kind("TRANSCRIPT"), Some(SvFeatureKind::Transcript));
-        assert_eq!(parse_sv_feature_kind("Regulatory"), Some(SvFeatureKind::Regulatory));
+        assert_eq!(
+            parse_sv_feature_kind("TRANSCRIPT"),
+            Some(SvFeatureKind::Transcript)
+        );
+        assert_eq!(
+            parse_sv_feature_kind("Regulatory"),
+            Some(SvFeatureKind::Regulatory)
+        );
     }
 
     #[test]
@@ -2715,20 +2888,41 @@ mod tests {
         assert_eq!(parse_sv_event_kind("ablation"), Some(SvEventKind::Ablation));
         assert_eq!(parse_sv_event_kind("deletion"), Some(SvEventKind::Ablation));
         assert_eq!(parse_sv_event_kind("del"), Some(SvEventKind::Ablation));
-        assert_eq!(parse_sv_event_kind("amplification"), Some(SvEventKind::Amplification));
-        assert_eq!(parse_sv_event_kind("duplication"), Some(SvEventKind::Amplification));
+        assert_eq!(
+            parse_sv_event_kind("amplification"),
+            Some(SvEventKind::Amplification)
+        );
+        assert_eq!(
+            parse_sv_event_kind("duplication"),
+            Some(SvEventKind::Amplification)
+        );
         assert_eq!(parse_sv_event_kind("dup"), Some(SvEventKind::Amplification));
         assert_eq!(parse_sv_event_kind("amp"), Some(SvEventKind::Amplification));
-        assert_eq!(parse_sv_event_kind("elongation"), Some(SvEventKind::Elongation));
-        assert_eq!(parse_sv_event_kind("elongate"), Some(SvEventKind::Elongation));
-        assert_eq!(parse_sv_event_kind("truncation"), Some(SvEventKind::Truncation));
-        assert_eq!(parse_sv_event_kind("truncate"), Some(SvEventKind::Truncation));
+        assert_eq!(
+            parse_sv_event_kind("elongation"),
+            Some(SvEventKind::Elongation)
+        );
+        assert_eq!(
+            parse_sv_event_kind("elongate"),
+            Some(SvEventKind::Elongation)
+        );
+        assert_eq!(
+            parse_sv_event_kind("truncation"),
+            Some(SvEventKind::Truncation)
+        );
+        assert_eq!(
+            parse_sv_event_kind("truncate"),
+            Some(SvEventKind::Truncation)
+        );
     }
 
     #[test]
     fn test_parse_sv_event_kind_case_insensitive() {
         assert_eq!(parse_sv_event_kind("ABLATION"), Some(SvEventKind::Ablation));
-        assert_eq!(parse_sv_event_kind("Truncation"), Some(SvEventKind::Truncation));
+        assert_eq!(
+            parse_sv_event_kind("Truncation"),
+            Some(SvEventKind::Truncation)
+        );
     }
 
     #[test]
@@ -2853,19 +3047,28 @@ mod tests {
     #[test]
     fn test_parse_json_string_option_missing_key() {
         let json = r#"{"other":"value"}"#;
-        assert_eq!(AnnotateProvider::parse_json_string_option(json, "key"), None);
+        assert_eq!(
+            AnnotateProvider::parse_json_string_option(json, "key"),
+            None
+        );
     }
 
     #[test]
     fn test_parse_json_string_option_empty_value() {
         let json = r#"{"key":""}"#;
-        assert_eq!(AnnotateProvider::parse_json_string_option(json, "key"), None);
+        assert_eq!(
+            AnnotateProvider::parse_json_string_option(json, "key"),
+            None
+        );
     }
 
     #[test]
     fn test_parse_json_string_option_backtick_rejected() {
         let json = r#"{"key":"val`ue"}"#;
-        assert_eq!(AnnotateProvider::parse_json_string_option(json, "key"), None);
+        assert_eq!(
+            AnnotateProvider::parse_json_string_option(json, "key"),
+            None
+        );
     }
 
     #[test]
@@ -2889,7 +3092,10 @@ mod tests {
     #[test]
     fn test_parse_json_bool_option_true() {
         let json = r#"{"flag":true}"#;
-        assert_eq!(AnnotateProvider::parse_json_bool_option(json, "flag"), Some(true));
+        assert_eq!(
+            AnnotateProvider::parse_json_bool_option(json, "flag"),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2916,7 +3122,10 @@ mod tests {
     #[test]
     fn test_parse_json_bool_option_with_spaces() {
         let json = r#"{"flag" :  true}"#;
-        assert_eq!(AnnotateProvider::parse_json_bool_option(json, "flag"), Some(true));
+        assert_eq!(
+            AnnotateProvider::parse_json_bool_option(json, "flag"),
+            Some(true)
+        );
     }
 
     // =======================================================================
@@ -2925,7 +3134,10 @@ mod tests {
 
     #[test]
     fn test_escaped_sql_literal_no_quotes() {
-        assert_eq!(AnnotateProvider::escaped_sql_literal("table_name"), "table_name");
+        assert_eq!(
+            AnnotateProvider::escaped_sql_literal("table_name"),
+            "table_name"
+        );
     }
 
     #[test]
@@ -2994,9 +3206,7 @@ mod tests {
 
     #[test]
     fn test_allele_filtered_entries_hgmd_always_included() {
-        let data = make_coloc_data(vec![
-            make_entry("HGMD1", "HGMD_MUTATION", 0, 1, None, None),
-        ]);
+        let data = make_coloc_data(vec![make_entry("HGMD1", "HGMD_MUTATION", 0, 1, None, None)]);
         let filtered = data.allele_filtered_entries("A", "G");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].variation_name, "HGMD1");
@@ -3017,9 +3227,7 @@ mod tests {
 
     #[test]
     fn test_allele_filtered_entries_empty_result() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/A", 0, 0, None, None),
-        ]);
+        let data = make_coloc_data(vec![make_entry("rs1", "T/A", 0, 0, None, None)]);
         let filtered = data.allele_filtered_entries("G", "C");
         assert!(filtered.is_empty());
     }
@@ -3063,17 +3271,20 @@ mod tests {
 
     #[test]
     fn test_somatic_flags_single_somatic() {
-        let data = make_coloc_data(vec![
-            make_entry("COSV1", "COSMIC_MUTATION", 1, 0, None, None),
-        ]);
+        let data = make_coloc_data(vec![make_entry(
+            "COSV1",
+            "COSMIC_MUTATION",
+            1,
+            0,
+            None,
+            None,
+        )]);
         assert_eq!(data.somatic_flags_for_allele("A", "G"), "1");
     }
 
     #[test]
     fn test_somatic_flags_no_matching_entries() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/A", 1, 0, None, None),
-        ]);
+        let data = make_coloc_data(vec![make_entry("rs1", "T/A", 1, 0, None, None)]);
         // No allele match, no COSMIC → empty (no entries).
         assert_eq!(data.somatic_flags_for_allele("G", "C"), "");
     }
@@ -3082,9 +3293,7 @@ mod tests {
 
     #[test]
     fn test_pheno_flags_all_non_pheno() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, None, None),
-        ]);
+        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, None, None)]);
         assert_eq!(data.pheno_flags_for_allele("T", "C"), "");
     }
 
@@ -3101,17 +3310,20 @@ mod tests {
 
     #[test]
     fn test_clin_sig_for_allele_simple() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, Some("C:benign"), None),
-        ]);
+        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, Some("C:benign"), None)]);
         assert_eq!(data.clin_sig_for_allele("T", "C"), "benign");
     }
 
     #[test]
     fn test_clin_sig_for_allele_compound_term() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, Some("C:benign;C:benign/likely_benign"), None),
-        ]);
+        let data = make_coloc_data(vec![make_entry(
+            "rs1",
+            "T/C",
+            0,
+            0,
+            Some("C:benign;C:benign/likely_benign"),
+            None,
+        )]);
         assert_eq!(
             data.clin_sig_for_allele("T", "C"),
             "benign&benign/likely_benign"
@@ -3120,18 +3332,21 @@ mod tests {
 
     #[test]
     fn test_clin_sig_for_allele_wrong_allele_filtered() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, Some("A:pathogenic"), None),
-        ]);
+        let data = make_coloc_data(vec![make_entry(
+            "rs1",
+            "T/C",
+            0,
+            0,
+            Some("A:pathogenic"),
+            None,
+        )]);
         // VEP allele for T>C is "C", but clin_sig_allele has "A:pathogenic" → no match.
         assert_eq!(data.clin_sig_for_allele("T", "C"), "");
     }
 
     #[test]
     fn test_clin_sig_for_allele_no_clin_sig() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, None, None),
-        ]);
+        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, None, None)]);
         assert_eq!(data.clin_sig_for_allele("T", "C"), "");
     }
 
@@ -3156,18 +3371,21 @@ mod tests {
     #[test]
     fn test_clin_sig_for_allele_missing_colon() {
         // Malformed clin_sig_allele without colon → skipped.
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, Some("benign_only"), None),
-        ]);
+        let data = make_coloc_data(vec![make_entry(
+            "rs1",
+            "T/C",
+            0,
+            0,
+            Some("benign_only"),
+            None,
+        )]);
         assert_eq!(data.clin_sig_for_allele("T", "C"), "");
     }
 
     #[test]
     fn test_clin_sig_for_allele_empty_sig_part() {
         // Empty significance after colon → skipped.
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, Some("C:"), None),
-        ]);
+        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, Some("C:"), None)]);
         assert_eq!(data.clin_sig_for_allele("T", "C"), "");
     }
 
@@ -3175,9 +3393,7 @@ mod tests {
 
     #[test]
     fn test_pubmed_for_allele_single() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, None, Some("12345")),
-        ]);
+        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, None, Some("12345"))]);
         assert_eq!(data.pubmed_for_allele("T", "C"), "12345");
     }
 
@@ -3201,26 +3417,27 @@ mod tests {
 
     #[test]
     fn test_pubmed_for_allele_no_pubmed() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, None, None),
-        ]);
+        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, None, None)]);
         assert_eq!(data.pubmed_for_allele("T", "C"), "");
     }
 
     #[test]
     fn test_pubmed_for_allele_non_matching_allele_excluded() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/A", 0, 0, None, Some("12345")),
-        ]);
+        let data = make_coloc_data(vec![make_entry("rs1", "T/A", 0, 0, None, Some("12345"))]);
         // T/A doesn't match VCF T>C.
         assert_eq!(data.pubmed_for_allele("T", "C"), "");
     }
 
     #[test]
     fn test_pubmed_for_allele_cosmic_included() {
-        let data = make_coloc_data(vec![
-            make_entry("COSV1", "COSMIC_MUTATION", 1, 0, None, Some("99999")),
-        ]);
+        let data = make_coloc_data(vec![make_entry(
+            "COSV1",
+            "COSMIC_MUTATION",
+            1,
+            0,
+            None,
+            Some("99999"),
+        )]);
         assert_eq!(data.pubmed_for_allele("A", "G"), "99999");
     }
 
@@ -3229,7 +3446,17 @@ mod tests {
     // =======================================================================
 
     fn make_coloc_batch(
-        rows: &[(&str, i64, i64, &str, i64, i64, &str, Option<&str>, Option<&str>)],
+        rows: &[(
+            &str,
+            i64,
+            i64,
+            &str,
+            i64,
+            i64,
+            &str,
+            Option<&str>,
+            Option<&str>,
+        )],
     ) -> RecordBatch {
         let chroms: Vec<&str> = rows.iter().map(|r| r.0).collect();
         let starts: Vec<i64> = rows.iter().map(|r| r.1).collect();
@@ -3270,9 +3497,7 @@ mod tests {
 
     #[test]
     fn test_build_colocated_map_single_entry() {
-        let batch = make_coloc_batch(&[
-            ("22", 100, 100, "rs123", 0, 0, "T/C", None, None),
-        ]);
+        let batch = make_coloc_batch(&[("22", 100, 100, "rs123", 0, 0, "T/C", None, None)]);
         let map = build_colocated_map(&[batch]);
         assert_eq!(map.len(), 1);
         let data = &map[&("22".to_string(), 100, 100)];
@@ -3283,7 +3508,17 @@ mod tests {
     #[test]
     fn test_build_colocated_map_rs_sorted_first() {
         let batch = make_coloc_batch(&[
-            ("22", 100, 100, "COSV123", 1, 0, "COSMIC_MUTATION", None, None),
+            (
+                "22",
+                100,
+                100,
+                "COSV123",
+                1,
+                0,
+                "COSMIC_MUTATION",
+                None,
+                None,
+            ),
             ("22", 100, 100, "rs456", 0, 0, "T/C", None, None),
             ("22", 100, 100, "rs123", 0, 0, "T/A", None, None),
         ]);
@@ -3319,9 +3554,17 @@ mod tests {
 
     #[test]
     fn test_build_colocated_map_preserves_clinical_metadata() {
-        let batch = make_coloc_batch(&[
-            ("22", 100, 100, "rs1", 0, 1, "T/C", Some("C:benign"), Some("12345")),
-        ]);
+        let batch = make_coloc_batch(&[(
+            "22",
+            100,
+            100,
+            "rs1",
+            0,
+            1,
+            "T/C",
+            Some("C:benign"),
+            Some("12345"),
+        )]);
         let map = build_colocated_map(&[batch]);
         let data = &map[&("22".to_string(), 100, 100)];
         let entry = &data.entries[0];
@@ -3338,12 +3581,8 @@ mod tests {
 
     #[test]
     fn test_build_colocated_map_multiple_batches() {
-        let batch1 = make_coloc_batch(&[
-            ("22", 100, 100, "rs1", 0, 0, "T/C", None, None),
-        ]);
-        let batch2 = make_coloc_batch(&[
-            ("22", 100, 100, "rs2", 0, 0, "T/A", None, None),
-        ]);
+        let batch1 = make_coloc_batch(&[("22", 100, 100, "rs1", 0, 0, "T/C", None, None)]);
+        let batch2 = make_coloc_batch(&[("22", 100, 100, "rs2", 0, 0, "T/A", None, None)]);
         let map = build_colocated_map(&[batch1, batch2]);
         let data = &map[&("22".to_string(), 100, 100)];
         assert_eq!(data.entries.len(), 2);
@@ -3583,7 +3822,11 @@ mod tests {
         // Globals (AF, gnomADe, gnomADg) should have max_af_pop = None.
         for col in AF_COLUMNS {
             if col.cache_col == "AF" || col.cache_col == "gnomADe" || col.cache_col == "gnomADg" {
-                assert!(col.max_af_pop.is_none(), "{} should not have max_af_pop", col.cache_col);
+                assert!(
+                    col.max_af_pop.is_none(),
+                    "{} should not have max_af_pop",
+                    col.cache_col
+                );
             }
         }
     }
@@ -3631,7 +3874,10 @@ mod tests {
         let suffix = build_test_batch3_suffix(&af_vals, "", "", "", "", "", "");
         // batch3 has 33 fields (27 AF + max_af + max_af_pops + clin_sig + somatic + pheno + pubmed).
         let field_count = suffix.split('|').count();
-        assert_eq!(field_count, 33, "batch3_suffix must have 33 fields, got {field_count}");
+        assert_eq!(
+            field_count, 33,
+            "batch3_suffix must have 33 fields, got {field_count}"
+        );
     }
 
     #[test]
@@ -3650,7 +3896,10 @@ mod tests {
              {variant_class}||||||||||||{batch3_suffix}"
         );
         let field_count = csq.split('|').count();
-        assert_eq!(field_count, 74, "cache-hit CSQ must have 74 fields, got {field_count}");
+        assert_eq!(
+            field_count, 74,
+            "cache-hit CSQ must have 74 fields, got {field_count}"
+        );
 
         // Verify key field positions (0-indexed).
         let fields: Vec<&str> = csq.split('|').collect();
@@ -3723,7 +3972,10 @@ mod tests {
 
         // Verify field positions match VEP CSQ spec.
         assert_eq!(fields[0], "G", "field 0 = Allele");
-        assert_eq!(fields[1], "missense_variant&splice_region_variant", "field 1 = Consequence");
+        assert_eq!(
+            fields[1], "missense_variant&splice_region_variant",
+            "field 1 = Consequence"
+        );
         assert_eq!(fields[2], "MODERATE", "field 2 = IMPACT");
         assert_eq!(fields[3], "BRCA1", "field 3 = SYMBOL");
         assert_eq!(fields[4], "ENSG00000012048", "field 4 = Gene");
@@ -3747,7 +3999,10 @@ mod tests {
         assert_eq!(fields[22], "HGNC:1100", "field 22 = HGNC_ID");
         // Fields 23-27: MOTIF_NAME, MOTIF_POS, HIGH_INF_POS, MOTIF_SCORE_CHANGE, TRANSCRIPTION_FACTORS
         for i in 23..28 {
-            assert_eq!(fields[i], "", "field {i} should be empty (motif/TF placeholder)");
+            assert_eq!(
+                fields[i], "",
+                "field {i} should be empty (motif/TF placeholder)"
+            );
         }
         assert_eq!(fields[28], "", "field 28 = SOURCE (empty when not merged)");
         assert_eq!(fields[29], "SNV", "field 29 = VARIANT_CLASS");
@@ -3789,7 +4044,10 @@ mod tests {
              {variant_class}||||||||||||{batch3_suffix}"
         );
         let field_count = csq.split('|').count();
-        assert_eq!(field_count, 74, "fallback CSQ must have 74 fields, got {field_count}");
+        assert_eq!(
+            field_count, 74,
+            "fallback CSQ must have 74 fields, got {field_count}"
+        );
 
         let fields: Vec<&str> = csq.split('|').collect();
         assert_eq!(fields[0], "T", "field 0 = Allele");
@@ -3836,9 +4094,9 @@ mod tests {
         // Verify AF fields land in correct positions within batch3.
         let mut af_vals = vec![""; AF_COLUMNS.len()];
         af_vals[0] = "0.0301"; // AF (global, format_4f)
-        af_vals[1] = "0.05";   // AFR
-        af_vals[6] = "0.03";   // gnomADe (global)
-        af_vals[16] = "0.02";  // gnomADg (global)
+        af_vals[1] = "0.05"; // AFR
+        af_vals[6] = "0.03"; // gnomADe (global)
+        af_vals[16] = "0.02"; // gnomADg (global)
 
         let suffix = build_test_batch3_suffix(&af_vals, "0.05", "AFR", "benign", "0&1", "1", "123");
         let fields: Vec<&str> = suffix.split('|').collect();
@@ -3878,7 +4136,10 @@ mod tests {
         );
         let fields_merged: Vec<&str> = csq_merged.split('|').collect();
         assert_eq!(fields_merged.len(), 74);
-        assert_eq!(fields_merged[28], "Ensembl", "SOURCE should be 'Ensembl' when merged");
+        assert_eq!(
+            fields_merged[28], "Ensembl",
+            "SOURCE should be 'Ensembl' when merged"
+        );
     }
 
     #[test]
@@ -3902,7 +4163,10 @@ mod tests {
         let trembl_raw = "B0QYZ8.91,X5DR28.81";
         let trembl = csq_escape(trembl_raw);
         assert_eq!(trembl.as_ref(), "B0QYZ8.91&X5DR28.81");
-        assert!(!trembl.contains(','), "escaped value must not contain commas");
+        assert!(
+            !trembl.contains(','),
+            "escaped value must not contain commas"
+        );
     }
 
     // =======================================================================
@@ -3919,7 +4183,9 @@ mod tests {
         let variation_name = "rs1";
 
         // With co-located data → use co-located.
-        let existing = Some(&coloc).map(|c| c.existing_variation.as_str()).unwrap_or(variation_name);
+        let existing = Some(&coloc)
+            .map(|c| c.existing_variation.as_str())
+            .unwrap_or(variation_name);
         assert_eq!(existing, "rs1&rs2");
 
         // Without co-located data → fall back to variation_name.
@@ -3965,6 +4231,9 @@ mod tests {
         chroms.insert("22".to_string());
         let clause = AnnotateProvider::chrom_filter_clause(&chroms);
         assert!(clause.contains("'22'"), "should include 22");
-        assert!(clause.contains("'chr22'"), "should include chr22 with prefix");
+        assert!(
+            clause.contains("'chr22'"),
+            "should include chr22 with prefix"
+        );
     }
 }

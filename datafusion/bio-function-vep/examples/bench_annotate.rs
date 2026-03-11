@@ -86,7 +86,6 @@ async fn main() -> Result<()> {
             cache_columns.clone(),
             KvMatchMode::Exact,
             allele_matches,
-            None,
             true,  // vcf_has_chr
             true,  // vcf_zero_based
             false, // cache_zero_based (VEP cache is 1-based)

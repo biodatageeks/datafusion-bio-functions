@@ -39,6 +39,11 @@ struct Args {
     context_dir: Option<PathBuf>,
     /// Whether to use VEP --merged flag (for merged Ensembl+RefSeq cache).
     merged: bool,
+    /// Which steps to run: "ensembl", "datafusion", or "ensembl,datafusion" (default: both).
+    /// Comparison only runs when both steps are enabled.
+    steps: Vec<String>,
+    /// Use interval-overlap fallback for shifted indels (--extended-probes).
+    extended_probes: bool,
 }
 
 impl Args {
@@ -47,6 +52,18 @@ impl Args {
 
         // Check for --merged flag anywhere in args.
         let merged = args.iter().any(|a| a == "--merged");
+        // Parse --steps=ensembl,datafusion (default: both).
+        let steps: Vec<String> = args
+            .iter()
+            .find(|a| a.starts_with("--steps="))
+            .map(|a| {
+                a.strip_prefix("--steps=")
+                    .unwrap()
+                    .split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["ensembl".to_string(), "datafusion".to_string()]);
         // Filter out flags for positional parsing.
         let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
 
@@ -89,7 +106,17 @@ impl Args {
             ),
             context_dir: positional.get(8).map(|s| PathBuf::from(s.as_str())),
             merged,
+            steps,
+            extended_probes: args.iter().any(|a| a == "--extended-probes"),
         }
+    }
+
+    fn run_ensembl(&self) -> bool {
+        self.steps.iter().any(|s| s == "ensembl")
+    }
+
+    fn run_datafusion(&self) -> bool {
+        self.steps.iter().any(|s| s == "datafusion")
     }
 }
 
@@ -117,6 +144,8 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "(auto-discover)".to_string())
     );
     println!("  merged: {}", args.merged);
+    println!("  steps: {:?}", args.steps);
+    println!("  extended_probes: {}", args.extended_probes);
 
     fs::create_dir_all(&args.work_dir).map_err(io_err)?;
 
@@ -146,8 +175,14 @@ async fn main() -> Result<()> {
     ));
 
     let sampling_start = Instant::now();
+    // sample_limit=0 means "all rows" — use usize::MAX as the limit.
+    let effective_limit = if args.sample_limit == 0 {
+        usize::MAX
+    } else {
+        args.sample_limit
+    };
     let sampled_rows =
-        sample_gz_vcf_first_n(&args.local_copy_vcf_gz, &sampled_vcf, args.sample_limit)?;
+        sample_gz_vcf_first_n(&args.local_copy_vcf_gz, &sampled_vcf, effective_limit)?;
     let sampling_elapsed = sampling_start.elapsed().as_secs_f64();
     println!(
         "sampled rows: {} (elapsed {:.3}s) -> {}",
@@ -168,91 +203,106 @@ async fn main() -> Result<()> {
         normalized_vcf.display()
     );
 
-    let docker_elapsed = if golden_vcf.exists() {
+    // --- Step: Ensembl VEP (Docker) ---
+    let mut docker_elapsed = 0.0;
+    let mut golden_annotations = None;
+    if args.run_ensembl() {
+        docker_elapsed = if golden_vcf.exists() {
+            println!(
+                "reusing existing golden VEP output -> {}",
+                golden_vcf.display()
+            );
+            0.0
+        } else {
+            let docker_start = Instant::now();
+            run_vep_docker(
+                &normalized_vcf,
+                &golden_vcf,
+                &args.work_dir,
+                &args.vep_cache_dir,
+                args.merged,
+            )?;
+            let elapsed = docker_start.elapsed().as_secs_f64();
+            println!(
+                "golden VEP output generated (elapsed {:.3}s) -> {}",
+                elapsed,
+                golden_vcf.display()
+            );
+            elapsed
+        };
+
+        let parse_start = Instant::now();
+        let parsed = parse_vep_vcf_annotations(&golden_vcf)?;
+        let parse_elapsed = parse_start.elapsed().as_secs_f64();
         println!(
-            "reusing existing golden VEP output -> {}",
-            golden_vcf.display()
+            "golden parsed rows: {} (elapsed {:.3}s)",
+            parsed.len(),
+            parse_elapsed
         );
-        0.0
-    } else {
-        let docker_start = Instant::now();
-        run_vep_docker(
+        golden_annotations = Some(parsed);
+    }
+
+    // --- Step: DataFusion annotate_vep ---
+    let mut ours_annotations = None;
+    let mut ours_elapsed = 0.0;
+    if args.run_datafusion() {
+        let options_json = build_options_json(&args);
+        let effective_context_dir = args
+            .context_dir
+            .as_deref()
+            .or_else(|| Path::new(&args.cache_source).parent());
+        let ours_start = Instant::now();
+        let ours = run_annotate_vep(
             &normalized_vcf,
-            &golden_vcf,
-            &args.work_dir,
-            &args.vep_cache_dir,
-            args.merged,
-        )?;
-        let elapsed = docker_start.elapsed().as_secs_f64();
+            &args.cache_source,
+            &args.backend,
+            options_json.as_deref(),
+            effective_context_dir,
+        )
+        .await?;
+        ours_elapsed = ours_start.elapsed().as_secs_f64();
         println!(
-            "golden VEP output generated (elapsed {:.3}s) -> {}",
-            elapsed,
-            golden_vcf.display()
+            "annotate_vep rows: {} (elapsed {:.3}s)",
+            ours.len(),
+            ours_elapsed
         );
-        elapsed
-    };
+        ours_annotations = Some(ours);
+    }
 
-    let parse_start = Instant::now();
-    let golden_annotations = parse_vep_vcf_annotations(&golden_vcf)?;
-    let parse_elapsed = parse_start.elapsed().as_secs_f64();
-    println!(
-        "golden parsed rows: {} (elapsed {:.3}s)",
-        golden_annotations.len(),
-        parse_elapsed
-    );
+    // --- Comparison (only when both steps ran) ---
+    if let (Some(golden), Some(ours)) = (&golden_annotations, &ours_annotations) {
+        let report = compare_annotations(golden, ours);
+        let term_report = compare_annotation_terms(golden, ours);
+        let csq_field_report = compare_csq_fields(golden, ours);
+        let discrepancies = collect_discrepancies(golden, ours);
+        let unmatched_report = diagnose_unmatched_csq(golden, ours);
 
-    // Build options_json if context_dir is provided.
-    let options_json = build_options_json(&args);
+        print_report(&report, &term_report);
+        print_csq_field_report(&csq_field_report);
+        print_unmatched_report(&unmatched_report);
+        print_discrepancy_summary(&discrepancies, &report);
 
-    let effective_context_dir = args
-        .context_dir
-        .as_deref()
-        .or_else(|| Path::new(&args.cache_source).parent());
-    let ours_start = Instant::now();
-    let ours_annotations = run_annotate_vep(
-        &normalized_vcf,
-        &args.cache_source,
-        &args.backend,
-        options_json.as_deref(),
-        effective_context_dir,
-    )
-    .await?;
-    let ours_elapsed = ours_start.elapsed().as_secs_f64();
-    println!(
-        "annotate_vep rows: {} (elapsed {:.3}s)",
-        ours_annotations.len(),
-        ours_elapsed
-    );
+        write_report(
+            &report_path,
+            &report,
+            &term_report,
+            &csq_field_report,
+            sampled_rows,
+            sampling_elapsed,
+            docker_elapsed,
+            0.0,
+            ours_elapsed,
+        )?;
+        write_discrepancies(&diff_path, &discrepancies)?;
+        println!("report written to {}", report_path.display());
+        println!(
+            "discrepancies written to {} ({} variants)",
+            diff_path.display(),
+            discrepancies.len()
+        );
 
-    let report = compare_annotations(&golden_annotations, &ours_annotations);
-    let term_report = compare_annotation_terms(&golden_annotations, &ours_annotations);
-    let csq_field_report = compare_csq_fields(&golden_annotations, &ours_annotations);
-    let discrepancies = collect_discrepancies(&golden_annotations, &ours_annotations);
-    let unmatched_report = diagnose_unmatched_csq(&golden_annotations, &ours_annotations);
-
-    print_report(&report, &term_report);
-    print_csq_field_report(&csq_field_report);
-    print_unmatched_report(&unmatched_report);
-    print_discrepancy_summary(&discrepancies, &report);
-
-    write_report(
-        &report_path,
-        &report,
-        &term_report,
-        &csq_field_report,
-        sampled_rows,
-        sampling_elapsed,
-        docker_elapsed,
-        parse_elapsed,
-        ours_elapsed,
-    )?;
-    write_discrepancies(&diff_path, &discrepancies)?;
-    println!("report written to {}", report_path.display());
-    println!(
-        "discrepancies written to {} ({} variants)",
-        diff_path.display(),
-        discrepancies.len()
-    );
+        print_summary_table(&report, &term_report, &csq_field_report, ours_elapsed);
+    }
 
     Ok(())
 }
@@ -315,8 +365,8 @@ fn build_options_json(args: &Args) -> Option<String> {
         }
     }
 
-    // Disable extended probes for faster equi-join.
-    entries.push("\"extended_probes\":false".to_string());
+    // Extended probes: use interval-overlap fallback for shifted indels.
+    entries.push(format!("\"extended_probes\":{}", args.extended_probes));
 
     // Batch 3 flags — enable frequency and clinical CSQ fields.
     entries.push("\"check_existing\":true".to_string());
@@ -475,8 +525,8 @@ fn run_vep_docker(
     cmd.arg("--pubmed");
 
     // Explicit field order matching CSQ_FIELD_NAMES (74 fields).
-    cmd.arg("--fields")
-        .arg("Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,EXON,INTRON,\
+    cmd.arg("--fields").arg(
+        "Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,EXON,INTRON,\
               HGVSc,HGVSp,cDNA_position,CDS_position,Protein_position,Amino_acids,Codons,\
               Existing_variation,DISTANCE,STRAND,FLAGS,SYMBOL_SOURCE,HGNC_ID,\
               MOTIF_NAME,MOTIF_POS,HIGH_INF_POS,MOTIF_SCORE_CHANGE,TRANSCRIPTION_FACTORS,SOURCE,\
@@ -487,7 +537,8 @@ fn run_vep_docker(
               gnomADe_MID,gnomADe_NFE,gnomADe_REMAINING,gnomADe_SAS,\
               gnomADg_AF,gnomADg_AFR,gnomADg_AMI,gnomADg_AMR,gnomADg_ASJ,gnomADg_EAS,\
               gnomADg_FIN,gnomADg_MID,gnomADg_NFE,gnomADg_REMAINING,gnomADg_SAS,\
-              MAX_AF,MAX_AF_POPS,CLIN_SIG,SOMATIC,PHENO,PUBMED");
+              MAX_AF,MAX_AF_POPS,CLIN_SIG,SOMATIC,PHENO,PUBMED",
+    );
 
     if merged {
         cmd.arg("--merged");
@@ -838,6 +889,94 @@ fn print_discrepancy_summary(discrepancies: &[VariantDiscrepancy], report: &Comp
                 * 100.0,
         );
     }
+}
+
+fn print_summary_table(
+    report: &ComparisonReport,
+    term_report: &TermComparisonReport,
+    csq: &CsqFieldReport,
+    elapsed_s: f64,
+) {
+    println!("\n{}", "=".repeat(80));
+    println!("SUMMARY");
+    println!("{}", "=".repeat(80));
+
+    // Variant-level stats
+    println!(
+        "\nVariants: {} golden, {} ours, {} matched, {} missing, {} extra",
+        report.golden_rows,
+        report.ours_rows,
+        report.intersection_rows,
+        report.missing_in_ours,
+        report.extra_in_ours,
+    );
+    if report.intersection_rows > 0 {
+        let ms_pct = report.most_severe_exact_matches as f64
+            / report.intersection_rows as f64
+            * 100.0;
+        let ts_pct = term_report.term_set_exact_matches as f64
+            / term_report.comparable_rows.max(1) as f64
+            * 100.0;
+        println!(
+            "Accuracy: most_severe={:.2}%, term_set={:.2}%",
+            ms_pct, ts_pct,
+        );
+    }
+    println!("Time: {:.1}s", elapsed_s);
+
+    // Per-field table
+    if csq.total_entries_compared > 0 {
+        let total = csq.total_entries_compared;
+        println!(
+            "\nCSQ per-field accuracy ({} entries across {} fields):",
+            total,
+            csq.field_names.len(),
+        );
+        println!(
+            "{:<25} {:>12} {:>12} {:>8}",
+            "Field", "Matched", "Mismatches", "Accuracy"
+        );
+        println!("{}", "-".repeat(60));
+
+        let mut perfect_count = 0usize;
+        let mut imperfect: Vec<(&str, usize, f64)> = Vec::new();
+
+        for (i, name) in csq.field_names.iter().enumerate() {
+            let matched = csq.field_match_counts[i];
+            let mismatches = total - matched;
+            let pct = matched as f64 / total as f64 * 100.0;
+            let status = if mismatches == 0 { " " } else { "*" };
+            println!(
+                "{}{:<24} {:>12} {:>12} {:>7.2}%",
+                status, name, matched, mismatches, pct,
+            );
+            if mismatches == 0 {
+                perfect_count += 1;
+            } else {
+                imperfect.push((name, mismatches, pct));
+            }
+        }
+
+        println!("{}", "-".repeat(60));
+        println!(
+            "Perfect (0 mismatches): {}/{} fields",
+            perfect_count,
+            csq.field_names.len(),
+        );
+        if !imperfect.is_empty() {
+            imperfect.sort_by(|a, b| b.1.cmp(&a.1));
+            println!(
+                "Imperfect: {}/{} fields",
+                imperfect.len(),
+                csq.field_names.len(),
+            );
+            for (name, mm, pct) in &imperfect {
+                println!("  {:<24} {:>8} mismatches ({:.2}% accuracy)", name, mm, pct);
+            }
+        }
+    }
+
+    println!("{}", "=".repeat(80));
 }
 
 fn write_report(

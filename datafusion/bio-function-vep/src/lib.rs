@@ -20,6 +20,7 @@ pub mod schema_contract;
 pub mod so_terms;
 pub mod table_function;
 pub mod transcript_consequence;
+pub mod variant_lookup_exec;
 
 pub use config::AnnotationConfig;
 
