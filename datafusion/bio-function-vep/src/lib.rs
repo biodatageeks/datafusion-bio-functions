@@ -27,7 +27,10 @@ use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
 
-use crate::allele::{match_allele_relaxed_udf, match_allele_udf, vep_allele_udf};
+use crate::allele::{
+    match_allele_relaxed_udf, match_allele_udf, vep_allele_udf, vep_norm_end_udf,
+    vep_norm_start_udf,
+};
 use crate::annotate_table_function::AnnotateFunction;
 use crate::table_function::LookupFunction;
 
@@ -51,6 +54,8 @@ pub fn register_vep_functions(ctx: &SessionContext) {
     ctx.register_udf(match_allele_udf());
     ctx.register_udf(match_allele_relaxed_udf());
     ctx.register_udf(vep_allele_udf());
+    ctx.register_udf(vep_norm_start_udf());
+    ctx.register_udf(vep_norm_end_udf());
 
     let session = Arc::new(ctx.clone());
     ctx.register_udtf("lookup_variants", Arc::new(LookupFunction::new(session)));

@@ -1239,13 +1239,17 @@ impl AnnotateProvider {
         base_batches: &[RecordBatch],
         cache_table: &str,
     ) -> Result<HashMap<(String, i64, i64), ColocatedData>> {
-        // Extract distinct (chrom, start, end) from base_batches.
+        use crate::allele::{vep_norm_end, vep_norm_start};
+
+        // Extract distinct (chrom, vep_start, vep_end) from base_batches.
+        // Use VEP-normalized coordinates so they match the cache's coordinate convention.
         let mut positions: HashSet<(String, i64, i64)> = HashSet::new();
         for batch in base_batches {
             let chrom_idx = batch.schema().index_of("chrom").ok();
             let start_idx = batch.schema().index_of("start").ok();
-            let end_idx = batch.schema().index_of("end").ok();
-            let (Some(ci), Some(si), Some(ei)) = (chrom_idx, start_idx, end_idx) else {
+            let ref_idx = batch.schema().index_of("ref").ok();
+            let alt_idx = batch.schema().index_of("alt").ok();
+            let (Some(ci), Some(si)) = (chrom_idx, start_idx) else {
                 continue;
             };
             for row in 0..batch.num_rows() {
@@ -1253,12 +1257,24 @@ impl AnnotateProvider {
                     string_at(batch.column(ci).as_ref(), row),
                     int64_at(batch.column(si).as_ref(), row),
                 ) {
-                    let end = int64_at(batch.column(ei).as_ref(), row).unwrap_or(start);
+                    let ref_allele = ref_idx
+                        .and_then(|i| string_at(batch.column(i).as_ref(), row));
+                    let alt_allele = alt_idx
+                        .and_then(|i| string_at(batch.column(i).as_ref(), row));
+                    let (vep_start, vep_end) =
+                        if let (Some(ref_a), Some(alt_a)) = (&ref_allele, &alt_allele) {
+                            (
+                                vep_norm_start(start, ref_a, alt_a),
+                                vep_norm_end(start, ref_a, alt_a),
+                            )
+                        } else {
+                            (start, start)
+                        };
                     let chrom_norm = chrom
                         .strip_prefix("chr")
                         .unwrap_or(&chrom)
                         .to_string();
-                    positions.insert((chrom_norm, start, end));
+                    positions.insert((chrom_norm, vep_start, vep_end));
                 }
             }
         }
@@ -1562,10 +1578,17 @@ impl AnnotateProvider {
 
             // --- Batch 3: per-variant fields (same for every transcript entry) ---
             // Look up co-located variant aggregation (all variants at same position).
+            // Use VEP-normalized coordinates to match the cache's coordinate convention.
             let start_val = int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0);
-            let end_val = int64_at(batch.column(end_idx).as_ref(), row).unwrap_or(start_val);
             let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
-            let coloc = colocated_map.get(&(chrom_norm.to_string(), start_val, end_val));
+            let (vep_start, vep_end) = {
+                use crate::allele::{vep_norm_end, vep_norm_start};
+                (
+                    vep_norm_start(start_val, &ref_al, &alt_allele),
+                    vep_norm_end(start_val, &ref_al, &alt_allele),
+                )
+            };
+            let coloc = colocated_map.get(&(chrom_norm.to_string(), vep_start, vep_end));
 
             let coloc_existing = coloc.map(|c| c.existing_variation.as_str());
             let existing_var = if flags.check_existing {

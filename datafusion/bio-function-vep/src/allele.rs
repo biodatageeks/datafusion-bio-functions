@@ -1,7 +1,7 @@
 //! VCF ↔ VEP allele conversion and matching.
 
 use datafusion::arrow::array::builder::StringBuilder;
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
@@ -304,6 +304,150 @@ fn vep_allele_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     Ok(ColumnarValue::Array(Arc::new(builder.finish()) as ArrayRef))
 }
 
+/// Compute the common prefix length between VCF REF and ALT alleles.
+///
+/// This is the number of leading bases that are identical in both alleles.
+/// For SNVs (single-base REF and ALT), the prefix length is 0.
+/// For indels, this equals the "anchor base" count that VEP strips when
+/// normalizing coordinates.
+fn vep_prefix_suffix_len(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
+    let ref_bytes = ref_allele.as_bytes();
+    let alt_bytes = alt_allele.as_bytes();
+
+    if ref_bytes.len() == 1 && alt_bytes.len() == 1 {
+        return (0, 0);
+    }
+
+    let prefix_len = ref_bytes
+        .iter()
+        .zip(alt_bytes.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // VEP only suffix-trims indels (different-length alleles), not MNVs.
+    let mut suffix_len = 0;
+    if ref_bytes.len() != alt_bytes.len() {
+        let ref_remaining = ref_bytes.len() - prefix_len;
+        let alt_remaining = alt_bytes.len() - prefix_len;
+        while suffix_len < ref_remaining
+            && suffix_len < alt_remaining
+            && ref_bytes[ref_bytes.len() - 1 - suffix_len]
+                == alt_bytes[alt_bytes.len() - 1 - suffix_len]
+        {
+            suffix_len += 1;
+        }
+    }
+
+    (prefix_len, suffix_len)
+}
+
+/// Compute VEP-normalized start coordinate from VCF POS, REF, ALT.
+///
+/// VEP strips the common prefix between REF and ALT and shifts the start
+/// coordinate accordingly: `vep_start = vcf_pos + prefix_len`.
+///
+/// Examples:
+/// - SNV `A>G` at POS=100: vep_start = 100 (no prefix)
+/// - Deletion `CT>C` at POS=100: vep_start = 101 (prefix "C", len=1)
+/// - Insertion `C>CT` at POS=100: vep_start = 101 (prefix "C", len=1)
+pub fn vep_norm_start(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> i64 {
+    let (prefix_len, _) = vep_prefix_suffix_len(ref_allele, alt_allele);
+    vcf_pos + prefix_len as i64
+}
+
+/// Compute VEP-normalized end coordinate from VCF POS, REF, ALT.
+///
+/// `vep_end = vcf_pos + len(REF) - 1 - suffix_len`
+///
+/// For insertions this produces `start > end` (VEP convention).
+pub fn vep_norm_end(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> i64 {
+    let (_, suffix_len) = vep_prefix_suffix_len(ref_allele, alt_allele);
+    vcf_pos + ref_allele.len() as i64 - 1 - suffix_len as i64
+}
+
+/// Create the `vep_norm_start(pos, ref, alt)` scalar UDF.
+pub fn vep_norm_start_udf() -> ScalarUDF {
+    create_udf(
+        "vep_norm_start",
+        vec![DataType::Int64, DataType::Utf8, DataType::Utf8],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(vep_norm_start_impl),
+    )
+}
+
+/// Create the `vep_norm_end(pos, ref, alt)` scalar UDF.
+pub fn vep_norm_end_udf() -> ScalarUDF {
+    create_udf(
+        "vep_norm_end",
+        vec![DataType::Int64, DataType::Utf8, DataType::Utf8],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(vep_norm_end_impl),
+    )
+}
+
+fn vep_norm_start_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    vep_norm_coord_impl(args, true, "vep_norm_start")
+}
+
+fn vep_norm_end_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    vep_norm_coord_impl(args, false, "vep_norm_end")
+}
+
+fn vep_norm_coord_impl(
+    args: &[ColumnarValue],
+    is_start: bool,
+    fn_name: &str,
+) -> Result<ColumnarValue> {
+    let positions = args[0].to_owned().into_array(1)?;
+    let refs = args[1].to_owned().into_array(1)?;
+    let alts = args[2].to_owned().into_array(1)?;
+
+    let positions = positions
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            datafusion::common::DataFusionError::Internal(format!(
+                "{fn_name}: first arg must be Int64"
+            ))
+        })?;
+    let refs = refs.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        datafusion::common::DataFusionError::Internal(format!(
+            "{fn_name}: second arg must be Utf8"
+        ))
+    })?;
+    let alts = alts.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        datafusion::common::DataFusionError::Internal(format!(
+            "{fn_name}: third arg must be Utf8"
+        ))
+    })?;
+
+    let len = positions.len().max(refs.len()).max(alts.len());
+    let mut builder = Int64Array::builder(len);
+
+    for i in 0..len {
+        let pos_idx = if positions.len() == 1 { 0 } else { i };
+        let ref_idx = if refs.len() == 1 { 0 } else { i };
+        let alt_idx = if alts.len() == 1 { 0 } else { i };
+
+        if positions.is_null(pos_idx) || refs.is_null(ref_idx) || alts.is_null(alt_idx) {
+            builder.append_null();
+        } else {
+            let pos = positions.value(pos_idx);
+            let r = refs.value(ref_idx);
+            let a = alts.value(alt_idx);
+            if is_start {
+                builder.append_value(vep_norm_start(pos, r, a));
+            } else {
+                builder.append_value(vep_norm_end(pos, r, a));
+            }
+        }
+    }
+
+    Ok(ColumnarValue::Array(Arc::new(builder.finish()) as ArrayRef))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +633,42 @@ mod tests {
         let (r, a) = vcf_to_vep_allele("A", "A");
         assert_eq!(r, "A");
         assert_eq!(a, "A");
+    }
+
+    #[test]
+    fn test_vep_norm_coords_snv() {
+        // SNV: A>G at POS=100 → no shift
+        assert_eq!(vep_norm_start(100, "A", "G"), 100);
+        assert_eq!(vep_norm_end(100, "A", "G"), 100);
+    }
+
+    #[test]
+    fn test_vep_norm_coords_deletion() {
+        // Deletion: CT>C at POS=35295124 → shift start by 1
+        assert_eq!(vep_norm_start(35295124, "CT", "C"), 35295125);
+        assert_eq!(vep_norm_end(35295124, "CT", "C"), 35295125);
+    }
+
+    #[test]
+    fn test_vep_norm_coords_insertion() {
+        // Insertion: C>CT at POS=32519310 → start > end (VEP convention)
+        assert_eq!(vep_norm_start(32519310, "C", "CT"), 32519311);
+        assert_eq!(vep_norm_end(32519310, "C", "CT"), 32519310);
+    }
+
+    #[test]
+    fn test_vep_norm_coords_multi_base_deletion() {
+        // Deletion: CCTGGTAGCA>C at POS=17817013 → shift start by 1, end = start + 8
+        assert_eq!(vep_norm_start(17817013, "CCTGGTAGCA", "C"), 17817014);
+        assert_eq!(vep_norm_end(17817013, "CCTGGTAGCA", "C"), 17817022);
+    }
+
+    #[test]
+    fn test_vep_norm_coords_deletion_with_suffix() {
+        // Deletion with suffix: TCAC>T at POS=100 → prefix "T" (len=1), suffix "C" (len=1 for indel)
+        // But wait: vcf_to_vep_allele("TCAC","T") → prefix=1 ("T"), remaining ref="CAC", alt=""
+        // No suffix since alt_remaining=0. So: start=101, end=103
+        assert_eq!(vep_norm_start(100, "TCAC", "T"), 101);
+        assert_eq!(vep_norm_end(100, "TCAC", "T"), 103);
     }
 }

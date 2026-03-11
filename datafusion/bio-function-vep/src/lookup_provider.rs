@@ -387,17 +387,25 @@ impl TableProvider for LookupProvider {
                  AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
             );
         } else {
-            // Default: equi-join on exact normalized positions.
+            // Default: equi-join on VEP-normalized positions.
+            // Use vep_norm_start/vep_norm_end UDFs to shift VCF coordinates by the
+            // common prefix/suffix length, matching VEP's coordinate convention.
             // DataFusion plans this as HashJoinExec (equi on 3 keys) + JoinFilter (match_allele).
             cache_join_start_expr = cache_normalized_start_expr.to_string();
             cache_inner_cols = format!(
                 "{cache_base_cols}, {cache_normalized_start_expr} AS `__norm_start`, \
                  {cache_normalized_end_expr} AS `__norm_end`"
             );
+            let vcf_vep_start_a = format!(
+                "vep_norm_start({vcf_start_expr_a}, a.`ref`, a.`alt`)"
+            );
+            let vcf_vep_end_a = format!(
+                "vep_norm_end({vcf_start_expr_a}, a.`ref`, a.`alt`)"
+            );
             on_clause = format!(
                 "{vcf_join_chrom_expr_a} = b.`chrom` \
-                 AND {vcf_start_expr_a} = b.`__norm_start` \
-                 AND {vcf_end_expr_a} = b.`__norm_end` \
+                 AND {vcf_vep_start_a} = b.`__norm_start` \
+                 AND {vcf_vep_end_a} = b.`__norm_end` \
                  AND match_allele(a.`ref`, a.`alt`, b.`allele_string`)"
             );
         };
@@ -447,10 +455,16 @@ impl TableProvider for LookupProvider {
                      AND match_allele_relaxed(fa.`ref`, fa.`alt`, c.`allele_string`)"
                 )
             } else {
+                let vcf_vep_start_fa = format!(
+                    "vep_norm_start({vcf_start_expr_fa}, fa.`ref`, fa.`alt`)"
+                );
+                let vcf_vep_end_fa = format!(
+                    "vep_norm_end({vcf_start_expr_fa}, fa.`ref`, fa.`alt`)"
+                );
                 format!(
                     "{vcf_join_chrom_expr_fa} = c.`chrom` \
-                     AND {vcf_start_expr_fa} = c.`__norm_start` \
-                     AND {vcf_end_expr_fa} = c.`__norm_end` \
+                     AND {vcf_vep_start_fa} = c.`__norm_start` \
+                     AND {vcf_vep_end_fa} = c.`__norm_end` \
                      AND match_allele_relaxed(fa.`ref`, fa.`alt`, c.`allele_string`)"
                 )
             };
@@ -1313,9 +1327,11 @@ mod tests {
         .unwrap();
         let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
 
-        // Cache: deletion at same position but with different representation
-        // (TG/T vs C/-). Strict match_allele fails because ref "TG" != "C"/"AC",
-        // but match_allele_relaxed succeeds because both are 1-base deletions.
+        // Cache: deletion at VEP-normalized position (101, 101) with different
+        // representation (TG/T vs C/-). Strict match_allele fails because
+        // ref "TG" != "C"/"AC", but match_allele_relaxed succeeds because both
+        // are 1-base deletions. VCF start=100, ref="AC", alt="A" normalizes to
+        // vep_start=101, vep_end=101 (prefix "A" stripped), matching cache coords.
         let cache_schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -1329,8 +1345,8 @@ mod tests {
             cache_schema.clone(),
             vec![
                 Arc::new(StringArray::from(vec!["1"])),
-                Arc::new(Int64Array::from(vec![100])),
-                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![101])),
+                Arc::new(Int64Array::from(vec![101])),
                 Arc::new(StringArray::from(vec!["rs_coloc_only"])),
                 Arc::new(StringArray::from(vec!["TG/T"])),
                 Arc::new(Int8Array::from(vec![Some(1)])),
@@ -1407,9 +1423,10 @@ mod tests {
         .unwrap();
         let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
 
-        // Two co-located deletion-like rows have ref mismatch for strict matching,
-        // but both are indel-length compatible under relaxed matching.
-        // Mode should prefer rs* IDs over other namespaces.
+        // Two co-located deletion-like rows at VEP-normalized position (101, 101)
+        // have ref mismatch for strict matching, but both are indel-length compatible
+        // under relaxed matching. VCF start=100, ref="AA", alt="A" normalizes to
+        // vep_start=101, vep_end=101. Mode should prefer rs* IDs over other namespaces.
         let cache_schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -1423,8 +1440,8 @@ mod tests {
             cache_schema.clone(),
             vec![
                 Arc::new(StringArray::from(vec!["1", "1"])),
-                Arc::new(Int64Array::from(vec![100, 100])),
-                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(Int64Array::from(vec![101, 101])),
+                Arc::new(Int64Array::from(vec![101, 101])),
                 Arc::new(StringArray::from(vec!["COSM_relaxed", "rs_relaxed"])),
                 Arc::new(StringArray::from(vec!["C/-", "T/-"])),
                 Arc::new(Int8Array::from(vec![Some(1), Some(1)])),
