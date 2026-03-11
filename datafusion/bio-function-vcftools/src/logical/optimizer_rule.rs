@@ -370,12 +370,20 @@ fn try_optimize(plan: &LogicalPlan) -> Option<Result<LogicalPlan>> {
     }))
 }
 
-/// Check if all aggregate expressions are array_agg or list_agg.
+/// Check if all aggregate expressions are array_agg or list_agg without unsupported modifiers.
+///
+/// We reject ORDER BY, DISTINCT and FILTER as these require semantics that the fused transform doesn't currently implement.
 fn all_array_agg(exprs: &[Expr]) -> bool {
     exprs.iter().all(|expr| {
-        if let Expr::AggregateFunction(AggregateFunction { func, .. }) = expr {
+        if let Expr::AggregateFunction(AggregateFunction { func, params }) = expr {
             let name = func.name().to_lowercase();
-            name.contains("array_agg") || name.contains("list_agg")
+            let is_array_agg = name.contains("array_agg") || name.contains("list_agg");
+
+            // Reject unsupported modifiers
+            let has_unsupported_modifiers =
+                params.distinct || params.filter.is_some() || !params.order_by.is_empty();
+
+            is_array_agg && !has_unsupported_modifiers
         } else {
             false
         }
@@ -385,6 +393,63 @@ fn all_array_agg(exprs: &[Expr]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::functions_aggregate::array_agg::array_agg;
+    use datafusion::logical_expr::expr::{AggregateFunctionParams, Sort};
+    use datafusion::logical_expr::{AggregateUDF, col};
+
+    /// Helper to create a simple array_agg(col) expression.
+    fn simple_array_agg(column_name: &str) -> Expr {
+        array_agg(col(column_name))
+    }
+
+    /// Helper to create an array_agg with ORDER BY modifier.
+    fn array_agg_with_order_by(agg_col: &str, order_col: &str) -> Expr {
+        // Get the array_agg UDF
+        let func: Arc<AggregateUDF> = datafusion::functions_aggregate::array_agg::array_agg_udaf();
+
+        Expr::AggregateFunction(AggregateFunction {
+            func,
+            params: AggregateFunctionParams {
+                args: vec![col(agg_col)],
+                distinct: false,
+                filter: None,
+                order_by: vec![Sort::new(col(order_col), true, false)],
+                null_treatment: None,
+            },
+        })
+    }
+
+    /// Helper to create an array_agg with DISTINCT modifier.
+    fn array_agg_with_distinct(column_name: &str) -> Expr {
+        let func: Arc<AggregateUDF> = datafusion::functions_aggregate::array_agg::array_agg_udaf();
+
+        Expr::AggregateFunction(AggregateFunction {
+            func,
+            params: AggregateFunctionParams {
+                args: vec![col(column_name)],
+                distinct: true,
+                filter: None,
+                order_by: vec![],
+                null_treatment: None,
+            },
+        })
+    }
+
+    /// Helper to create an array_agg with FILTER modifier.
+    fn array_agg_with_filter(agg_col: &str, filter_expr: Expr) -> Expr {
+        let func: Arc<AggregateUDF> = datafusion::functions_aggregate::array_agg::array_agg_udaf();
+
+        Expr::AggregateFunction(AggregateFunction {
+            func,
+            params: AggregateFunctionParams {
+                args: vec![col(agg_col)],
+                distinct: false,
+                filter: Some(Box::new(filter_expr)),
+                order_by: vec![],
+                null_treatment: None,
+            },
+        })
+    }
 
     #[test]
     fn test_rule_name() {
@@ -413,5 +478,59 @@ mod tests {
         // Clean up
         // SAFETY: Test runs single-threaded, env var modification is safe
         unsafe { std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM") };
+    }
+
+    #[test]
+    fn test_all_array_agg_simple() {
+        // Simple array_agg without modifiers should be accepted
+        let exprs = vec![simple_array_agg("col_a"), simple_array_agg("col_b")];
+        assert!(all_array_agg(&exprs), "Simple array_agg should be accepted");
+    }
+
+    #[test]
+    fn test_all_array_agg_rejects_order_by() {
+        // array_agg with ORDER BY should be REJECTED because the fused transform
+        // doesn't preserve element ordering
+        let exprs = vec![array_agg_with_order_by("val", "sort_key")];
+        assert!(
+            !all_array_agg(&exprs),
+            "array_agg with ORDER BY should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_all_array_agg_rejects_distinct() {
+        // array_agg with DISTINCT should be REJECTED because the fused transform
+        // doesn't remove duplicates
+        let exprs = vec![array_agg_with_distinct("val")];
+        assert!(
+            !all_array_agg(&exprs),
+            "array_agg with DISTINCT should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_all_array_agg_rejects_filter() {
+        // array_agg with FILTER should be REJECTED because the fused transform
+        // doesn't apply filtering
+        let filter = col("flag").eq(datafusion::logical_expr::lit(true));
+        let exprs = vec![array_agg_with_filter("val", filter)];
+        assert!(
+            !all_array_agg(&exprs),
+            "array_agg with FILTER should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_all_array_agg_mixed_simple_and_with_modifiers() {
+        // If any aggregate has modifiers, the whole set should be rejected
+        let exprs = vec![
+            simple_array_agg("col_a"),
+            array_agg_with_order_by("col_b", "sort_key"),
+        ];
+        assert!(
+            !all_array_agg(&exprs),
+            "Mixed simple and ORDER BY should be rejected"
+        );
     }
 }
