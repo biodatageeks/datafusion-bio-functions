@@ -1937,8 +1937,8 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 /// VEP never emits `coding_sequence_variant` alongside a specific
 /// coding consequence (missense, synonymous, etc.), and never emits
 /// `protein_altering_variant` alongside `missense_variant`.
-/// Also strips `intron_variant` alongside splice_donor/acceptor
-/// (per-transcript level only).
+/// Also strips `splice_polypyrimidine_tract_variant` and `intron_variant`
+/// when `splice_acceptor/donor_variant` is present.
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
@@ -1975,8 +1975,13 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         terms.remove(&SoTerm::SpliceRegionVariant);
     }
 
-    // VEP's PPT predicate evaluates independently of splice_acceptor/donor
-    // (both are tier-3 predicates). Both terms can coexist.
+    // VEP Perl evaluates splice_polypyrimidine_tract_variant independently,
+    // but when splice_acceptor_variant is present, the PPT check effectively
+    // returns false because the position is already classified as the more
+    // specific splice acceptor site.
+    if terms.contains(&SoTerm::SpliceAcceptorVariant) {
+        terms.remove(&SoTerm::SplicePolypyrimidineTractVariant);
+    }
 
     // SO hierarchy: splice_acceptor/donor_variant IS-A intron_variant.
     // VEP strips the parent (intron_variant) when the more specific
@@ -4445,8 +4450,6 @@ mod tests {
         let terms = &assignments[0].terms;
         // VEP strips intron_variant when the more specific splice_donor_variant
         // is present (SO hierarchy: splice_donor_variant IS-A intron_variant).
-        // The deletion extends deep into the intron but the parent term is
-        // still suppressed by strip_parent_terms.
         assert!(
             terms.contains(&SoTerm::SpliceDonorVariant),
             "Large exon-spanning deletion should get splice_donor_variant: {:?}",
@@ -5569,15 +5572,16 @@ mod tests {
     // ---- PPT kept alongside splice_acceptor/donor ----
 
     #[test]
-    fn splice_ppt_kept_with_acceptor() {
-        // VEP's PPT predicate is tier-3, evaluated independently of splice_acceptor.
+    fn splice_ppt_stripped_with_acceptor() {
+        // VEP suppresses PPT when splice_acceptor is present — the acceptor
+        // site subsumes the polypyrimidine tract region.
         let mut terms = BTreeSet::new();
         terms.insert(SoTerm::SpliceAcceptorVariant);
         terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
         strip_parent_terms(&mut terms);
         assert!(
-            terms.contains(&SoTerm::SplicePolypyrimidineTractVariant),
-            "PPT should be kept alongside splice_acceptor"
+            !terms.contains(&SoTerm::SplicePolypyrimidineTractVariant),
+            "PPT should be stripped when splice_acceptor is present"
         );
         assert!(terms.contains(&SoTerm::SpliceAcceptorVariant));
     }
@@ -5597,16 +5601,15 @@ mod tests {
     }
 
     #[test]
-    fn splice_ppt_and_acceptor_both_present() {
-        // Variant spanning both splice_acceptor and PPT regions → both terms present.
+    fn splice_ppt_and_intron_both_stripped_with_acceptor() {
+        // splice_acceptor strips both PPT and intron_variant.
         let mut terms = BTreeSet::new();
         terms.insert(SoTerm::SpliceAcceptorVariant);
         terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
         terms.insert(SoTerm::IntronVariant);
         strip_parent_terms(&mut terms);
         assert!(terms.contains(&SoTerm::SpliceAcceptorVariant));
-        assert!(terms.contains(&SoTerm::SplicePolypyrimidineTractVariant));
-        // intron_variant should be stripped (it's a parent of splice_acceptor)
+        assert!(!terms.contains(&SoTerm::SplicePolypyrimidineTractVariant));
         assert!(!terms.contains(&SoTerm::IntronVariant));
     }
 
@@ -5738,14 +5741,15 @@ mod tests {
     }
 
     #[test]
-    fn strip_intron_variant_with_splice_acceptor() {
-        // SO hierarchy: splice_acceptor_variant IS-A intron_variant.
-        // VEP strips the parent (intron_variant) when splice_acceptor is present.
+    fn strip_ppt_and_intron_with_splice_acceptor() {
+        // VEP suppresses both PPT and intron_variant when splice_acceptor is present.
         let mut terms = BTreeSet::new();
         terms.insert(SoTerm::SpliceAcceptorVariant);
+        terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
         terms.insert(SoTerm::IntronVariant);
         terms.insert(SoTerm::NonCodingTranscriptVariant);
         strip_parent_terms(&mut terms);
+        assert!(!terms.contains(&SoTerm::SplicePolypyrimidineTractVariant));
         assert!(!terms.contains(&SoTerm::IntronVariant));
         assert!(terms.contains(&SoTerm::SpliceAcceptorVariant));
         assert!(terms.contains(&SoTerm::NonCodingTranscriptVariant));

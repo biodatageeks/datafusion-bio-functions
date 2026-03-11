@@ -196,6 +196,9 @@ struct BuildRow {
     vep_start: i64,
     /// VEP-normalized end (1-based, may be < start for insertions).
     vep_end: i64,
+    /// Original 1-based start before VEP normalization. Used for co-located
+    /// fallback: VEP Perl also checks `unshifted_start` for indels.
+    orig_start: i64,
 }
 
 /// Materialized build side: VCF data + dual lookup indices.
@@ -442,6 +445,7 @@ impl VariantLookupStream {
                 vcf_alt,
                 vep_start,
                 vep_end,
+                orig_start: one_based_start,
             });
         }
 
@@ -612,9 +616,8 @@ impl VariantLookupStream {
                     let vcf_idx = *interval.metadata as usize;
                     let vcf_row = &build.rows[vcf_idx];
 
-                    // Co-located = exact position match (same as old SQL equi-join).
-                    // Unlike the main allele-matched join, co-located collection
-                    // requires cache (start,end) == VCF (vep_start,vep_end).
+                    // Co-located = exact position match.
+                    // Requires cache (start,end) == VCF (vep_start,vep_end).
                     if cs1 != vcf_row.vep_start || ce1 != vcf_row.vep_end {
                         return;
                     }
