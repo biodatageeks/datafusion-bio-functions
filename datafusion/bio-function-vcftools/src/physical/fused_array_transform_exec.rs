@@ -376,6 +376,9 @@ impl FusedArrayTransformStream {
         let mut null_bitmap: Vec<bool> = Vec::with_capacity(num_rows);
         let mut current_offset: i32 = 0;
 
+        // Pre-compute the mini-batch schema once - it's the same for all rows.
+        let mini_batch_schema = build_mini_batch_schema(list_arrays)?;
+
         for row_idx in 0..num_rows {
             if !row_mask[row_idx] {
                 // This row would produce no UNNEST output, skip it.
@@ -388,7 +391,8 @@ impl FusedArrayTransformStream {
                 continue;
             }
 
-            let mini_batch = build_row_mini_batch(list_arrays, row_idx, max_len)?;
+            let mini_batch =
+                build_row_mini_batch(list_arrays, row_idx, max_len, &mini_batch_schema)?;
             let result = expr.evaluate(&mini_batch)?;
             let result_array = result.into_array(mini_batch.num_rows())?;
 
@@ -477,6 +481,21 @@ impl RecordBatchStream for FusedArrayTransformStream {
     }
 }
 
+/// Build the schema for mini-batches. This is computed once and reused for all rows.
+///
+/// Since the schema structure (column names and element types) is the same for all rows,
+/// we avoid creating a new Schema object for every row.
+fn build_mini_batch_schema(list_arrays: &[(&String, ArrayRef)]) -> Result<SchemaRef> {
+    let mut fields: Vec<Field> = Vec::with_capacity(list_arrays.len());
+
+    for (col_name, array) in list_arrays {
+        let element_type = extract_list_element_type(array.data_type(), col_name)?;
+        fields.push(Field::new(col_name.as_str(), element_type, true));
+    }
+
+    Ok(Arc::new(Schema::new(fields)))
+}
+
 /// Build a mini-batch for a single row's array elements following UNNEST semantics.
 ///
 /// - Uses the longest array length across all columns (max_len).
@@ -487,21 +506,18 @@ fn build_row_mini_batch(
     list_arrays: &[(&String, ArrayRef)],
     row_idx: usize,
     max_len: usize,
+    schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(list_arrays.len());
-    let mut fields: Vec<Field> = Vec::with_capacity(list_arrays.len());
 
-    for (col_name, array) in list_arrays {
-        let element_type = extract_list_element_type(array.data_type(), col_name)?;
+    for (idx, (col_name, array)) in list_arrays.iter().enumerate() {
+        let element_type = schema.field(idx).data_type();
         let padded_values =
-            build_padded_array(array.as_ref(), row_idx, max_len, &element_type, col_name)?;
-
-        fields.push(Field::new(col_name.as_str(), element_type, true));
+            build_padded_array(array.as_ref(), row_idx, max_len, element_type, col_name)?;
         columns.push(padded_values);
     }
 
-    let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+    RecordBatch::try_new(schema.clone(), columns).map_err(DataFusionError::from)
 }
 
 /// Infer the output element type for a transformed array column.
