@@ -2,8 +2,8 @@
 //!
 //! These tests verify the full pipeline: SQL → optimize → execute.
 //!
-//! NOTE: All tests use `#[serial]` because they modify the shared
-//! `BIO_FUSED_ARRAY_TRANSFORM` environment variable.
+//! NOTE: Tests that modify the global optimization state use `#[serial]`
+//! to prevent concurrent access.
 
 use std::sync::Arc;
 
@@ -15,7 +15,10 @@ use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
 use datafusion::datasource::MemTable;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::*;
-use datafusion_bio_function_vcftools::{FusedArrayTransformOptimizerRule, VcfQueryPlanner};
+use datafusion_bio_function_vcftools::{
+    FusedArrayTransformOptimizerRule, VcfQueryPlanner, disable_fused_array_transform,
+    enable_fused_array_transform,
+};
 use serial_test::serial;
 
 /// Create test data with array columns.
@@ -89,22 +92,16 @@ async fn create_optimized_context() -> SessionContext {
     // Register the optimizer rule
     ctx.add_optimizer_rule(Arc::new(FusedArrayTransformOptimizerRule::new()));
 
-    // Enable the optimization via environment variable
-    // SAFETY: Tests run single-threaded
-    unsafe {
-        std::env::set_var("BIO_FUSED_ARRAY_TRANSFORM", "1");
-    }
+    // Enable the optimization (thread-safe)
+    enable_fused_array_transform();
 
     ctx
 }
 
 /// Create a SessionContext without the optimization.
 async fn create_baseline_context() -> SessionContext {
-    // Disable the optimization
-    // SAFETY: Tests run single-threaded
-    unsafe {
-        std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM");
-    }
+    // Disable the optimization (thread-safe)
+    disable_fused_array_transform();
 
     SessionContext::new()
 }
@@ -231,9 +228,7 @@ async fn test_optimizer_rule_detection() {
     assert_eq!(total_rows, 3, "Expected 3 rows in result");
 
     // Clean up
-    unsafe {
-        std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM");
-    }
+    disable_fused_array_transform();
 }
 
 #[tokio::test]
@@ -529,9 +524,7 @@ async fn test_struct_field_access_optimized() {
     println!("Struct field access test passed - verified GT and DP values");
 
     // Clean up
-    unsafe {
-        std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM");
-    }
+    disable_fused_array_transform();
 }
 // =============================================================================
 // Edge Case Tests
@@ -1309,9 +1302,7 @@ async fn test_arithmetic_transform() {
     println!("Arithmetic transform test passed - all sums and products verified");
 
     // Clean up
-    unsafe {
-        std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM");
-    }
+    disable_fused_array_transform();
 }
 
 #[tokio::test]
@@ -1465,9 +1456,7 @@ async fn test_conditional_transform() {
     println!("Conditional transform test passed - verified CASE expression values");
 
     // Clean up
-    unsafe {
-        std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM");
-    }
+    disable_fused_array_transform();
 }
 
 // =============================================================================
@@ -1539,9 +1528,7 @@ async fn test_optimization_not_applied_mixed_aggregates() {
     println!("Mixed aggregates test passed - optimization correctly NOT applied");
 
     // Clean up
-    unsafe {
-        std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM");
-    }
+    disable_fused_array_transform();
 }
 
 #[tokio::test]
@@ -1591,9 +1578,7 @@ async fn test_optimization_not_applied_no_unnest() {
     println!("No-unnest test passed - optimization correctly NOT applied");
 
     // Clean up
-    unsafe {
-        std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM");
-    }
+    disable_fused_array_transform();
 }
 
 #[tokio::test]
@@ -1659,9 +1644,7 @@ async fn test_explain_shows_optimization() {
     );
 
     // Clean up
-    unsafe {
-        std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM");
-    }
+    disable_fused_array_transform();
 }
 
 // =============================================================================
@@ -2062,7 +2045,5 @@ async fn test_parquet_round_trip_with_transform() {
     println!("Row 2 values_d: {row2_d:?}");
 
     // Clean up
-    unsafe {
-        std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM");
-    }
+    disable_fused_array_transform();
 }

@@ -22,7 +22,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use futures::{Stream, StreamExt, ready};
-use log::warn;
+
+use crate::common::{build_element_schema_from_arrow, extract_list_element_type};
 
 /// Physical execution plan for fused array transformation.
 ///
@@ -76,7 +77,7 @@ impl FusedArrayTransformExec {
         }
 
         // Build element-level schema for type inference
-        let element_schema = build_element_schema(&input_schema, &array_columns)?;
+        let element_schema = build_element_schema_from_arrow(&input_schema, &array_columns)?;
 
         // Add output array columns - infer type from corresponding transform expression
         for (i, output_col) in output_columns.iter().enumerate() {
@@ -244,17 +245,22 @@ impl FusedArrayTransformStream {
                 .map_err(DataFusionError::from);
         }
 
-        // Extract all array columns as ListArrays
-        let list_arrays: Vec<(&String, &ListArray)> = self
+        // Extract all array columns (supports List, LargeList, FixedSizeList)
+        let list_arrays: Vec<(&String, ArrayRef)> = self
             .array_columns
             .iter()
             .map(|col_name| {
                 let idx = input_schema.index_of(col_name)?;
-                let col = batch.column(idx);
-                let list_arr = col.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                    DataFusionError::Plan(format!("Column '{col_name}' is not a List type"))
-                })?;
-                Ok((col_name, list_arr))
+                let col = batch.column(idx).clone();
+                // Verify it's a list type
+                match col.data_type() {
+                    DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+                        Ok((col_name, col))
+                    }
+                    other => Err(DataFusionError::Plan(format!(
+                        "Column '{col_name}' has type {other}, expected List, LargeList, or FixedSizeList"
+                    ))),
+                }
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -268,14 +274,14 @@ impl FusedArrayTransformStream {
         for row_idx in 0..num_rows {
             let mut max_len = 0_usize;
 
-            for (_, list_arr) in &list_arrays {
-                if list_arr.is_null(row_idx) {
-                    continue;
-                }
-                let values = list_arr.value(row_idx);
-                let len = values.len();
-                if len > max_len {
-                    max_len = len;
+            for (col_name, array) in &list_arrays {
+                let values_opt =
+                    crate::common::extract_list_values(array.as_ref(), row_idx, col_name)?;
+                if let Some(values) = values_opt {
+                    let len = values.len();
+                    if len > max_len {
+                        max_len = len;
+                    }
                 }
             }
 
@@ -317,11 +323,7 @@ impl FusedArrayTransformStream {
             for col_name in &self.array_columns {
                 let idx = input_schema.index_of(col_name)?;
                 let col = batch.column(idx);
-                let list_arr = col.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                    DataFusionError::Plan(format!("Column '{col_name}' is not a List type"))
-                })?;
-
-                let output_array = self.apply_identity_transform(list_arr, num_rows)?;
+                let output_array = self.apply_identity_transform(col, col_name)?;
                 output_columns.push(output_array);
             }
         } else {
@@ -339,7 +341,7 @@ impl FusedArrayTransformStream {
         &self,
         _batch: &RecordBatch,
         num_rows: usize,
-        list_arrays: &[(&String, &ListArray)],
+        list_arrays: &[(&String, ArrayRef)],
         row_max_lengths: &[usize],
         row_mask: &[bool],
     ) -> Result<Vec<ArrayRef>> {
@@ -365,7 +367,7 @@ impl FusedArrayTransformStream {
         expr_idx: usize,
         expr: &dyn PhysicalExpr,
         num_rows: usize,
-        list_arrays: &[(&String, &ListArray)],
+        list_arrays: &[(&String, ArrayRef)],
         row_max_lengths: &[usize],
         row_mask: &[bool],
     ) -> Result<ArrayRef> {
@@ -434,9 +436,17 @@ impl FusedArrayTransformStream {
     }
 
     /// Apply identity transformation (pass through arrays unchanged).
-    fn apply_identity_transform(&self, list_arr: &ListArray, _num_rows: usize) -> Result<ArrayRef> {
-        // For identity transform, just clone the array
-        Ok(Arc::new(list_arr.clone()))
+    /// Supports List, LargeList, and FixedSizeList types.
+    fn apply_identity_transform(&self, array: &ArrayRef, col_name: &str) -> Result<ArrayRef> {
+        // Verify the array is a list type
+        match array.data_type() {
+            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+                Ok(array.clone())
+            }
+            other => Err(DataFusionError::Plan(format!(
+                "Column '{col_name}' has type {other}, expected List, LargeList, or FixedSizeList"
+            ))),
+        }
     }
 }
 
@@ -467,51 +477,24 @@ impl RecordBatchStream for FusedArrayTransformStream {
     }
 }
 
-/// Build a schema representing the element types of array columns.
-///
-/// For each array column, we extract the element type and create a
-/// column with the same name but the scalar (element) type. This schema
-/// is used for inferring the output type of transform expressions.
-fn build_element_schema(input_schema: &SchemaRef, array_columns: &[String]) -> Result<Schema> {
-    let mut fields: Vec<Field> = Vec::with_capacity(array_columns.len());
-
-    for col_name in array_columns {
-        let idx = input_schema.index_of(col_name)?;
-        let input_field = input_schema.field(idx);
-
-        // Extract element type from List/LargeList/FixedSizeList
-        let element_type = match input_field.data_type() {
-            DataType::List(inner) | DataType::LargeList(inner) => inner.data_type().clone(),
-            DataType::FixedSizeList(inner, _) => inner.data_type().clone(),
-            other => {
-                return Err(DataFusionError::Plan(format!(
-                    "Column '{col_name}' has type {other}, expected List type"
-                )));
-            }
-        };
-
-        fields.push(Field::new(col_name, element_type, true));
-    }
-
-    Ok(Schema::new(fields))
-}
-
 /// Build a mini-batch for a single row's array elements following UNNEST semantics.
 ///
 /// - Uses the longest array length across all columns (max_len).
 /// - Shorter arrays are padded with NULLs.
 /// - NULL arrays become all-null arrays of length max_len.
+/// - Supports List, LargeList, and FixedSizeList types.
 fn build_row_mini_batch(
-    list_arrays: &[(&String, &ListArray)],
+    list_arrays: &[(&String, ArrayRef)],
     row_idx: usize,
     max_len: usize,
 ) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(list_arrays.len());
     let mut fields: Vec<Field> = Vec::with_capacity(list_arrays.len());
 
-    for (col_name, list_arr) in list_arrays {
-        let element_type = extract_list_element_type(list_arr.data_type(), col_name)?;
-        let padded_values = build_padded_array(list_arr, row_idx, max_len, &element_type)?;
+    for (col_name, array) in list_arrays {
+        let element_type = extract_list_element_type(array.data_type(), col_name)?;
+        let padded_values =
+            build_padded_array(array.as_ref(), row_idx, max_len, &element_type, col_name)?;
 
         fields.push(Field::new(col_name.as_str(), element_type, true));
         columns.push(padded_values);
@@ -521,23 +504,16 @@ fn build_row_mini_batch(
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
 }
 
-/// Extract the element type from a List/LargeList/FixedSizeList data type.
-fn extract_list_element_type(data_type: &DataType, col_name: &str) -> Result<DataType> {
-    match data_type {
-        DataType::List(inner) | DataType::LargeList(inner) => Ok(inner.data_type().clone()),
-        DataType::FixedSizeList(inner, _) => Ok(inner.data_type().clone()),
-        other => Err(DataFusionError::Plan(format!(
-            "Expected list type for '{col_name}', got {other}"
-        ))),
-    }
-}
-
 /// Infer the output element type for a transformed array column.
 ///
 /// Attempts type inference in the following order:
 /// 1. From the transform expression's data type (if expression exists)
 /// 2. From the corresponding array column's element type (as fallback)
-/// 3. Float64 as ultimate fallback
+///
+/// # Errors
+///
+/// Returns an error if type inference fails and no fallback is available.
+/// This is intentional to avoid silent schema mismatches caused by Float64 fallback.
 fn infer_output_element_type(
     index: usize,
     output_col: &str,
@@ -551,17 +527,19 @@ fn infer_output_element_type(
         match transform_exprs[index].data_type(element_schema) {
             Ok(dt) => return Ok(dt),
             Err(e) => {
-                // Fall back to array column's element type
-                if let Some(dt) = try_get_array_element_type(index, array_columns, input_schema) {
-                    warn!(
-                        "Type inference failed for output '{output_col}': {e}. Falling back to array column type: {dt:?}"
-                    );
-                    return Ok(dt);
+                // Try falling back to array column's element type
+                if let Some(array_col) = array_columns.get(index) {
+                    return get_array_element_type(array_col, input_schema).map_err(|_| {
+                        DataFusionError::Plan(format!(
+                            "Type inference failed for output '{output_col}': {e}. \
+                             Could not determine element type from array column '{array_col}'."
+                        ))
+                    });
                 }
-                warn!(
-                    "Type inference failed for output '{output_col}': {e}. Using Float64 fallback."
-                );
-                return Ok(DataType::Float64);
+                return Err(DataFusionError::Plan(format!(
+                    "Type inference failed for output '{output_col}': {e}. \
+                     No corresponding array column to fall back to."
+                )));
             }
         }
     }
@@ -571,68 +549,59 @@ fn infer_output_element_type(
         return get_array_element_type(&array_columns[index], input_schema);
     }
 
-    // Default fallback for extra outputs without corresponding array columns
-    warn!(
-        "No type information for output '{output_col}' at index {index}. Using Float64 fallback."
-    );
-    Ok(DataType::Float64)
+    // No fallback available
+    Err(DataFusionError::Plan(format!(
+        "No type information for output '{output_col}' at index {index}. \
+         Number of outputs exceeds number of array columns ({}).",
+        array_columns.len()
+    )))
 }
 
 /// Get the element type from an array column in the schema.
 fn get_array_element_type(array_col: &str, schema: &SchemaRef) -> Result<DataType> {
     let idx = schema.index_of(array_col)?;
     let field = schema.field(idx);
-    match field.data_type() {
-        DataType::List(inner) | DataType::LargeList(inner) => Ok(inner.data_type().clone()),
-        DataType::FixedSizeList(inner, _) => Ok(inner.data_type().clone()),
-        other => Err(DataFusionError::Plan(format!(
-            "Column '{array_col}' has type {other}, expected List type"
-        ))),
-    }
-}
-
-/// Try to get the element type from an array column, returning None on failure.
-fn try_get_array_element_type(
-    index: usize,
-    array_columns: &[String],
-    schema: &SchemaRef,
-) -> Option<DataType> {
-    array_columns
-        .get(index)
-        .and_then(|col| get_array_element_type(col, schema).ok())
+    extract_list_element_type(field.data_type(), array_col)
 }
 
 /// Build a padded array for a single row, extending shorter arrays with NULLs.
+/// Supports List, LargeList, and FixedSizeList types.
 fn build_padded_array(
-    list_arr: &ListArray,
+    array: &dyn Array,
     row_idx: usize,
     max_len: usize,
     element_type: &DataType,
+    col_name: &str,
 ) -> Result<ArrayRef> {
-    if list_arr.is_null(row_idx) {
-        // Entire array is NULL -> all-null values after UNNEST padding
-        return Ok(datafusion::arrow::array::new_null_array(
-            element_type,
-            max_len,
-        ));
+    // Extract values using the common module function
+    let values_opt = crate::common::extract_list_values(array, row_idx, col_name)?;
+
+    match values_opt {
+        None => {
+            // Entire array is NULL -> all-null values after UNNEST padding
+            Ok(datafusion::arrow::array::new_null_array(
+                element_type,
+                max_len,
+            ))
+        }
+        Some(values) => {
+            let values_len = values.len();
+
+            if values_len == max_len {
+                return Ok(values);
+            }
+
+            // Pad shorter arrays with NULLs to reach max_len
+            let array_data = values.to_data();
+            let mut mutable = MutableArrayData::new(vec![&array_data], true, max_len);
+            mutable.extend(0, 0, values_len);
+            if max_len > values_len {
+                mutable.extend_nulls(max_len - values_len);
+            }
+
+            Ok(datafusion::arrow::array::make_array(mutable.freeze()))
+        }
     }
-
-    let values = list_arr.value(row_idx);
-    let values_len = values.len();
-
-    if values_len == max_len {
-        return Ok(values);
-    }
-
-    // Pad shorter arrays with NULLs to reach max_len
-    let array_data = values.to_data();
-    let mut mutable = MutableArrayData::new(vec![&array_data], true, max_len);
-    mutable.extend(0, 0, values_len);
-    if max_len > values_len {
-        mutable.extend_nulls(max_len - values_len);
-    }
-
-    Ok(datafusion::arrow::array::make_array(mutable.freeze()))
 }
 
 #[cfg(test)]

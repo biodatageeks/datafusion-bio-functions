@@ -34,10 +34,11 @@
 //! use datafusion_bio_function_vcftools::{
 //!     FusedArrayTransformOptimizerRule,
 //!     FusedArrayTransformPlanner,
+//!     enable_fused_array_transform,
 //! };
 //!
-//! // Enable via environment variable
-//! std::env::set_var("BIO_FUSED_ARRAY_TRANSFORM", "1");
+//! // Enable the optimization (thread-safe)
+//! enable_fused_array_transform();
 //!
 //! let ctx = SessionContext::new();
 //!
@@ -46,15 +47,17 @@
 //!
 //! // The optimizer will automatically detect and optimize matching patterns
 //! ```
-//!
-//! See `FUSED_ARRAY_TRANSFORM.md` for detailed design documentation.
 
+pub mod common;
 pub mod logical;
 pub mod physical;
 
 // Re-export logical types
 pub use logical::fused_array_transform::FusedArrayTransform;
-pub use logical::optimizer_rule::FusedArrayTransformOptimizerRule;
+pub use logical::optimizer_rule::{
+    FusedArrayTransformOptimizerRule, disable_fused_array_transform, enable_fused_array_transform,
+    is_fused_array_transform_enabled, set_fused_array_transform_enabled,
+};
 
 // Re-export physical types
 pub use physical::extension_planner::FusedArrayTransformPlanner;
