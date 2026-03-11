@@ -11,13 +11,13 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use coitrees::{COITree, Interval, IntervalTree};
 use datafusion::arrow::array::{
-    Array, ArrayRef, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch,
+    StringArray, StringViewArray, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
@@ -31,6 +31,21 @@ use futures::{Stream, StreamExt};
 
 use crate::allele::{allele_matches, vep_norm_end, vep_norm_start};
 use crate::coordinate::CoordinateNormalizer;
+
+/// A cache row's co-located metadata collected during streaming.
+#[derive(Debug, Clone)]
+pub struct ColocatedCacheEntry {
+    pub variation_name: String,
+    pub allele_string: String,
+    pub somatic: i64,
+    pub pheno: i64,
+    pub clin_sig_allele: Option<String>,
+    pub pubmed: Option<String>,
+}
+
+/// Shared sink for co-located data collected during `VariantLookupExec` streaming.
+/// Key = VCF (chrom, vep_start, vep_end), value = cache entries at that position.
+pub type ColocatedSink = Arc<Mutex<HashMap<(String, i64, i64), Vec<ColocatedCacheEntry>>>>;
 
 /// Physical execution plan for self-contained left interval join.
 ///
@@ -47,6 +62,8 @@ pub struct VariantLookupExec {
     extended_probes: bool,
     output_schema: SchemaRef,
     properties: PlanProperties,
+    /// Optional sink for co-located data collected during probe phase.
+    colocated_sink: Option<ColocatedSink>,
 }
 
 impl VariantLookupExec {
@@ -76,7 +93,14 @@ impl VariantLookupExec {
             extended_probes,
             output_schema,
             properties,
+            colocated_sink: None,
         }
+    }
+
+    /// Set the co-located data sink for piggybacked collection during probe.
+    pub fn with_colocated_sink(mut self, sink: ColocatedSink) -> Self {
+        self.colocated_sink = Some(sink);
+        self
     }
 }
 
@@ -126,7 +150,7 @@ impl ExecutionPlan for VariantLookupExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 2);
-        Ok(Arc::new(VariantLookupExec::new(
+        let mut exec = VariantLookupExec::new(
             children[0].clone(),
             children[1].clone(),
             self.cache_columns.clone(),
@@ -134,7 +158,9 @@ impl ExecutionPlan for VariantLookupExec {
             self.coord_normalizer.clone(),
             self.extended_probes,
             self.output_schema.clone(),
-        )))
+        );
+        exec.colocated_sink = self.colocated_sink.clone();
+        Ok(Arc::new(exec))
     }
 
     fn execute(
@@ -153,6 +179,7 @@ impl ExecutionPlan for VariantLookupExec {
             self.vcf_has_chr,
             self.coord_normalizer.clone(),
             self.extended_probes,
+            self.colocated_sink.clone(),
         )))
     }
 }
@@ -215,6 +242,16 @@ enum StreamState {
     Done,
 }
 
+/// Cached column indices for co-located metadata in the cache schema.
+struct ColocIndices {
+    variation_name: usize,
+    allele_string: usize,
+    somatic: Option<usize>,
+    pheno: Option<usize>,
+    clin_sig_allele: Option<usize>,
+    pubmed: Option<usize>,
+}
+
 struct VariantLookupStream {
     vcf_stream: Option<SendableRecordBatchStream>,
     cache_stream: Option<SendableRecordBatchStream>,
@@ -233,6 +270,10 @@ struct VariantLookupStream {
     num_vcf_cols: usize,
     /// Cached cache-schema column indices (resolved on first probe batch).
     cache_indices: Option<CacheIndices>,
+    /// Shared sink for co-located data.
+    colocated_sink: Option<ColocatedSink>,
+    /// Cached column indices for co-located collection.
+    coloc_indices: Option<ColocIndices>,
 }
 
 impl VariantLookupStream {
@@ -244,6 +285,7 @@ impl VariantLookupStream {
         vcf_has_chr: bool,
         coord_normalizer: CoordinateNormalizer,
         extended_probes: bool,
+        colocated_sink: Option<ColocatedSink>,
     ) -> Self {
         let num_vcf_cols = schema.fields().len() - cache_columns.len();
         Self {
@@ -259,6 +301,8 @@ impl VariantLookupStream {
             build: None,
             num_vcf_cols,
             cache_indices: None,
+            colocated_sink,
+            coloc_indices: None,
         }
     }
 
@@ -289,6 +333,25 @@ impl VariantLookupStream {
             output_col_types,
         });
         Ok(())
+    }
+
+    /// Resolve co-located column indices from cache schema (best-effort).
+    fn resolve_coloc_indices(&mut self, cache_schema: &SchemaRef) {
+        if self.coloc_indices.is_some() || self.colocated_sink.is_none() {
+            return;
+        }
+        let variation_name = match cache_schema.index_of("variation_name") {
+            Ok(idx) => idx,
+            Err(_) => return, // no variation_name column → nothing to collect
+        };
+        self.coloc_indices = Some(ColocIndices {
+            variation_name,
+            allele_string: cache_schema.index_of("allele_string").unwrap_or(usize::MAX),
+            somatic: cache_schema.index_of("somatic").ok(),
+            pheno: cache_schema.index_of("phenotype_or_disease").ok(),
+            clin_sig_allele: cache_schema.index_of("clin_sig_allele").ok(),
+            pubmed: cache_schema.index_of("pubmed").ok(),
+        });
     }
 
     /// Materialize all VCF batches and build dual lookup indices (hash + COITree).
@@ -407,6 +470,7 @@ impl VariantLookupStream {
     fn process_probe_batch(&mut self, cache_batch: &RecordBatch) -> Result<Option<RecordBatch>> {
         let cache_schema = cache_batch.schema();
         self.resolve_cache_indices(&cache_schema)?;
+        self.resolve_coloc_indices(&cache_schema);
         let ci = self.cache_indices.as_ref().unwrap();
 
         let build = self.build.as_mut().unwrap();
@@ -499,6 +563,123 @@ impl VariantLookupStream {
                             build.matched[vcf_idx as usize] = true;
                         }
                     });
+                }
+            }
+        }
+
+        // --- Co-located data collection (piggybacked on same cache scan) ---
+        // For every cache row with a non-empty variation_name, probe the VCF
+        // COITree to find overlapping VCF positions and collect the entry.
+        if let (Some(sink), Some(coloc_idx)) =
+            (&self.colocated_sink, &self.coloc_indices)
+        {
+            let var_name_col = cache_batch.column(coloc_idx.variation_name);
+            let var_names = StringAccessor::new(var_name_col, "variation_name")?;
+
+            let mut local_buf: HashMap<(String, i64, i64), Vec<ColocatedCacheEntry>> =
+                HashMap::new();
+
+            for cache_row in 0..num_cache_rows {
+                if var_name_col.is_null(cache_row) {
+                    continue;
+                }
+                let var_name = var_names.value(cache_row);
+                if var_name.is_empty() {
+                    continue;
+                }
+
+                let cache_chrom = cache_chroms.value(cache_row);
+                let cache_start_raw = cache_starts.value(cache_row);
+                let cache_end_raw = cache_ends.value(cache_row);
+                let cs1 = if cache_zero_based {
+                    cache_start_raw + 1
+                } else {
+                    cache_start_raw
+                };
+                let ce1 = cache_end_raw;
+
+                let Some(tree) = build.trees.get(cache_chrom) else {
+                    continue;
+                };
+
+                let probe_s = cs1.min(ce1);
+                let probe_e = cs1.max(ce1);
+
+                // Build entry lazily (only when tree has hits).
+                let mut entry: Option<ColocatedCacheEntry> = None;
+
+                tree.query(probe_s as i32, probe_e as i32, |interval| {
+                    let vcf_idx = *interval.metadata as usize;
+                    let vcf_row = &build.rows[vcf_idx];
+
+                    // Co-located = exact position match (same as old SQL equi-join).
+                    // Unlike the main allele-matched join, co-located collection
+                    // requires cache (start,end) == VCF (vep_start,vep_end).
+                    if cs1 != vcf_row.vep_start || ce1 != vcf_row.vep_end {
+                        return;
+                    }
+
+                    let e = entry.get_or_insert_with(|| {
+                        let allele_str_val = if coloc_idx.allele_string != usize::MAX {
+                            StringAccessor::new(
+                                cache_batch.column(coloc_idx.allele_string),
+                                "allele_string",
+                            )
+                            .map(|a| a.value(cache_row).to_string())
+                            .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        ColocatedCacheEntry {
+                            variation_name: var_name.to_string(),
+                            allele_string: allele_str_val,
+                            somatic: coloc_idx
+                                .somatic
+                                .and_then(|idx| {
+                                    I64Accessor::new(cache_batch.column(idx), "somatic")
+                                        .ok()
+                                        .map(|a| a.value(cache_row))
+                                })
+                                .unwrap_or(0),
+                            pheno: coloc_idx
+                                .pheno
+                                .and_then(|idx| {
+                                    I64Accessor::new(cache_batch.column(idx), "pheno")
+                                        .ok()
+                                        .map(|a| a.value(cache_row))
+                                })
+                                .unwrap_or(0),
+                            clin_sig_allele: coloc_idx.clin_sig_allele.and_then(|idx| {
+                                let col = cache_batch.column(idx);
+                                if col.is_null(cache_row) {
+                                    return None;
+                                }
+                                StringAccessor::new(col, "clin_sig_allele")
+                                    .ok()
+                                    .map(|a| a.value(cache_row).to_string())
+                            }),
+                            pubmed: coloc_idx.pubmed.and_then(|idx| {
+                                let col = cache_batch.column(idx);
+                                if col.is_null(cache_row) {
+                                    return None;
+                                }
+                                StringAccessor::new(col, "pubmed")
+                                    .ok()
+                                    .map(|a| a.value(cache_row).to_string())
+                            }),
+                        }
+                    });
+
+                    let key =
+                        (cache_chrom.to_string(), vcf_row.vep_start, vcf_row.vep_end);
+                    local_buf.entry(key).or_default().push(e.clone());
+                });
+            }
+
+            if !local_buf.is_empty() {
+                let mut guard = sink.lock().unwrap();
+                for (key, entries) in local_buf {
+                    guard.entry(key).or_default().extend(entries);
                 }
             }
         }
@@ -725,6 +906,8 @@ impl<'a> StringAccessor<'a> {
 enum I64Accessor<'a> {
     Int64(&'a Int64Array),
     Int32(&'a Int32Array),
+    Int16(&'a Int16Array),
+    Int8(&'a Int8Array),
     UInt64(&'a UInt64Array),
     UInt32(&'a UInt32Array),
 }
@@ -736,6 +919,12 @@ impl<'a> I64Accessor<'a> {
         }
         if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
             return Ok(Self::Int32(arr));
+        }
+        if let Some(arr) = col.as_any().downcast_ref::<Int16Array>() {
+            return Ok(Self::Int16(arr));
+        }
+        if let Some(arr) = col.as_any().downcast_ref::<Int8Array>() {
+            return Ok(Self::Int8(arr));
         }
         if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
             return Ok(Self::UInt64(arr));
@@ -760,6 +949,20 @@ impl<'a> I64Accessor<'a> {
                 }
             }
             Self::Int32(arr) => {
+                if arr.is_null(i) {
+                    0
+                } else {
+                    i64::from(arr.value(i))
+                }
+            }
+            Self::Int16(arr) => {
+                if arr.is_null(i) {
+                    0
+                } else {
+                    i64::from(arr.value(i))
+                }
+            }
+            Self::Int8(arr) => {
                 if arr.is_null(i) {
                     0
                 } else {

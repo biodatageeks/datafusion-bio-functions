@@ -20,7 +20,7 @@ use datafusion::prelude::{Expr, SessionContext};
 
 use crate::coordinate::CoordinateNormalizer;
 use crate::schema_contract::validate_variation_schema;
-use crate::variant_lookup_exec::VariantLookupExec;
+use crate::variant_lookup_exec::{ColocatedSink, VariantLookupExec};
 
 /// Wrap an execution plan with a `ProjectionExec` if projection is requested.
 ///
@@ -81,6 +81,8 @@ pub struct LookupProvider {
     extended_probes: bool,
     /// Output schema.
     schema: SchemaRef,
+    /// Optional sink for co-located data collection during probe phase.
+    colocated_sink: Option<ColocatedSink>,
 }
 
 fn normalize_cache_output_type(data_type: &DataType) -> DataType {
@@ -139,7 +141,13 @@ impl LookupProvider {
             coord_normalizer,
             extended_probes,
             schema,
+            colocated_sink: None,
         })
+    }
+
+    /// Set the co-located data sink for piggybacked collection during probe.
+    pub fn set_colocated_sink(&mut self, sink: ColocatedSink) {
+        self.colocated_sink = Some(sink);
     }
 }
 
@@ -251,7 +259,7 @@ impl TableProvider for LookupProvider {
             .create_physical_plan()
             .await?;
 
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(VariantLookupExec::new(
+        let mut exec = VariantLookupExec::new(
             vcf_plan,
             cache_plan,
             self.cache_columns.clone(),
@@ -259,7 +267,11 @@ impl TableProvider for LookupProvider {
             self.coord_normalizer.clone(),
             self.extended_probes,
             self.schema.clone(),
-        ));
+        );
+        if let Some(ref sink) = self.colocated_sink {
+            exec = exec.with_colocated_sink(Arc::clone(sink));
+        }
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
         wrap_with_projection(plan, projection)
     }
 }

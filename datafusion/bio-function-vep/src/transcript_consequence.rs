@@ -441,13 +441,17 @@ impl TranscriptConsequenceEngine {
                             if let Some(ref cc) = coding_class {
                                 // VEP only uses the "?" prefix when cds_start_nf is true
                                 // AND the first coding exon has non-zero phase (the CDS
-                                // sequence starts with N padding).  cds_start_nf alone
-                                // is not sufficient — many transcripts have the flag set
-                                // but still have a known CDS start at codon boundary.
+                                // sequence starts with N padding) AND the variant's CDS
+                                // position falls within the N-padded region (i.e. the
+                                // first exon where uncertainty exists).
+                                let n_pad_len = tx_translation
+                                    .and_then(|t| t.cds_sequence.as_deref())
+                                    .map(|s| s.as_bytes().iter().take_while(|&&b| b == b'N').count())
+                                    .unwrap_or(0);
                                 let use_question = tx.cds_start_nf
-                                    && tx_translation
-                                        .and_then(|t| t.cds_sequence.as_deref())
-                                        .is_some_and(|s| s.starts_with('N'));
+                                    && n_pad_len > 0
+                                    && cc.cds_position_start
+                                        .is_some_and(|p| p <= n_pad_len);
                                 let cds_pos = match (cc.cds_position_start, cc.cds_position_end) {
                                     (Some(s), Some(e)) if s == e => {
                                         if use_question {
@@ -5247,9 +5251,10 @@ mod tests {
     // coding exon has non-zero phase (CDS sequence starts with N padding).
 
     #[test]
-    fn cds_position_question_mark_when_cds_start_nf_and_phase() {
-        // CDS with N padding (phase=2) + cds_start_nf → "?-N" format.
-        // "NN" + "GCTGAATGA" = 11 bases, SNV at pos 1003 → CDS idx 5 (offset 2+3)
+    fn cds_position_no_question_mark_when_variant_past_n_pad() {
+        // CDS with N padding (phase=2) + cds_start_nf, but variant at pos 1003
+        // which gives CDS index ~4-6, beyond the 2-char N pad → plain number.
+        // VEP only uses "?-" when the variant falls within the N-padded region.
         let cds = "NNGCTGAATGA";
         let mut t = tx(
             "T1",
@@ -5271,10 +5276,11 @@ mod tests {
         let entry = result.iter().find(|e| e.cds_position.is_some()).unwrap();
         let cds_pos = entry.cds_position.as_deref().unwrap();
         assert!(
-            cds_pos.starts_with("?-"),
-            "CDS with N-padding + cds_start_nf should use '?-' prefix: {cds_pos}"
+            !cds_pos.starts_with("?-"),
+            "CDS position past N-pad region should NOT use '?-' prefix: {cds_pos}"
         );
     }
+
 
     #[test]
     fn cds_position_no_question_mark_when_cds_start_nf_but_no_phase() {
@@ -5327,8 +5333,8 @@ mod tests {
     }
 
     #[test]
-    fn protein_position_question_mark_when_cds_start_nf_and_phase() {
-        // N-padded CDS + cds_start_nf → "?-N" for protein position.
+    fn protein_position_no_question_mark_when_variant_past_n_pad() {
+        // N-padded CDS + cds_start_nf, but variant past N-pad region → plain number.
         let cds = "NNGCTGAATGA";
         let mut t = tx(
             "T1",
@@ -5353,10 +5359,11 @@ mod tests {
             .unwrap();
         let prot_pos = entry.protein_position.as_deref().unwrap();
         assert!(
-            prot_pos.starts_with("?-"),
-            "Protein position with N-padding + cds_start_nf should use '?-': {prot_pos}"
+            !prot_pos.starts_with("?-"),
+            "Protein position past N-pad region should NOT use '?-': {prot_pos}"
         );
     }
+
 
     #[test]
     fn protein_position_no_question_mark_when_cds_start_nf_but_no_phase() {
