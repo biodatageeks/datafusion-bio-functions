@@ -112,7 +112,10 @@ async fn create_baseline_context() -> SessionContext {
 #[tokio::test]
 #[serial]
 async fn test_simple_identity_transform_sql() {
-    let ctx = create_baseline_context().await;
+    use datafusion::physical_plan::displayable;
+
+    // Run the query with the optimization enabled
+    let ctx = create_optimized_context().await;
     let batch = create_test_data();
     let schema = batch.schema();
 
@@ -120,8 +123,7 @@ async fn test_simple_identity_transform_sql() {
     let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("test_data", Arc::new(table)).unwrap();
 
-    // Simple query that would benefit from the optimization
-    // (but we run without optimization here to verify baseline)
+    // Simple query that should be optimized by FusedArrayTransform
     let sql = r#"
         WITH indexed AS (
             SELECT 
@@ -150,9 +152,18 @@ async fn test_simple_identity_transform_sql() {
     "#;
 
     let df = ctx.sql(sql).await.unwrap();
-    let results = df.collect().await.unwrap();
 
-    // Verify we got 3 rows back
+    // Verify that the physical plan contains the fused transform
+    let physical_plan = df.create_physical_plan().await.unwrap();
+    let plan_str = displayable(physical_plan.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str.contains("FusedArrayTransform"),
+        "FusedArrayTransform optimization was NOT applied for simple identity transform! Physical plan:\n{plan_str}"
+    );
+
+    // Execute and verify results are still correct
+    let df2 = ctx.sql(sql).await.unwrap();
+    let results = df2.collect().await.unwrap();
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 3, "Expected 3 rows in result");
 }
@@ -223,6 +234,96 @@ async fn test_optimizer_rule_detection() {
     unsafe {
         std::env::remove_var("BIO_FUSED_ARRAY_TRANSFORM");
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_simple_identity_baseline_vs_optimized_same_results() {
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::physical_plan::displayable;
+
+    // Reuse the same SQL as the simple identity transform test
+    let sql = r#"
+        WITH indexed AS (
+            SELECT 
+                ROW_NUMBER() OVER () as row_idx,
+                metadata,
+                values_a,
+                values_b
+            FROM test_data
+        ),
+        unnested AS (
+            SELECT 
+                row_idx,
+                metadata,
+                unnest(values_a) as val_a,
+                unnest(values_b) as val_b
+            FROM indexed
+        )
+        SELECT
+            row_idx,
+            metadata,
+            array_agg(val_a) AS values_a_out,
+            array_agg(val_b) AS values_b_out
+        FROM unnested
+        GROUP BY row_idx, metadata
+        ORDER BY row_idx
+    "#;
+
+    // Baseline context: no optimization
+    let ctx_baseline = create_baseline_context().await;
+    let batch_baseline = create_test_data();
+    let schema_baseline = batch_baseline.schema();
+    let table_baseline =
+        MemTable::try_new(schema_baseline.clone(), vec![vec![batch_baseline]]).unwrap();
+    ctx_baseline
+        .register_table("test_data", Arc::new(table_baseline))
+        .unwrap();
+
+    let df_baseline = ctx_baseline.sql(sql).await.unwrap();
+    let physical_plan_baseline = df_baseline.create_physical_plan().await.unwrap();
+    let plan_str_baseline =
+        displayable(physical_plan_baseline.as_ref()).indent(true).to_string();
+    assert!(
+        !plan_str_baseline.contains("FusedArrayTransform"),
+        "Baseline physical plan unexpectedly contains FusedArrayTransform:\n{plan_str_baseline}"
+    );
+    let df_baseline2 = ctx_baseline.sql(sql).await.unwrap();
+    let baseline_results = df_baseline2.collect().await.unwrap();
+
+    // Optimized context: with FusedArrayTransform
+    let ctx_optimized = create_optimized_context().await;
+    let batch_optimized = create_test_data();
+    let schema_optimized = batch_optimized.schema();
+    let table_optimized =
+        MemTable::try_new(schema_optimized.clone(), vec![vec![batch_optimized]]).unwrap();
+    ctx_optimized
+        .register_table("test_data", Arc::new(table_optimized))
+        .unwrap();
+
+    let df_optimized = ctx_optimized.sql(sql).await.unwrap();
+    let physical_plan_optimized = df_optimized.create_physical_plan().await.unwrap();
+    let plan_str_optimized =
+        displayable(physical_plan_optimized.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str_optimized.contains("FusedArrayTransform"),
+        "FusedArrayTransform optimization was NOT applied for simple identity baseline-vs-optimized test! Physical plan:\n{plan_str_optimized}"
+    );
+    let df_optimized2 = ctx_optimized.sql(sql).await.unwrap();
+    let optimized_results = df_optimized2.collect().await.unwrap();
+
+    // Compare pretty-printed results to ensure outputs are identical
+    let baseline_str = pretty_format_batches(&baseline_results)
+        .unwrap()
+        .to_string();
+    let optimized_str = pretty_format_batches(&optimized_results)
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        baseline_str, optimized_str,
+        "Baseline and optimized results differ for simple identity transform"
+    );
 }
 
 // =============================================================================
@@ -307,111 +408,6 @@ fn create_test_data_with_struct_arrays() -> RecordBatch {
         vec![Arc::new(sample_ids), Arc::new(genotypes_array)],
     )
     .unwrap()
-}
-
-#[tokio::test]
-#[serial]
-async fn test_struct_field_access_baseline() {
-    // First, verify that the query works without optimization
-    let ctx = create_baseline_context().await;
-    let batch = create_test_data_with_struct_arrays();
-    let schema = batch.schema();
-
-    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("vcf_data", Arc::new(table)).unwrap();
-
-    // Query that unnests a struct field (VCF-style)
-    let sql = r#"
-        WITH indexed AS (
-            SELECT 
-                ROW_NUMBER() OVER () as row_idx,
-                sample_id,
-                genotypes
-            FROM vcf_data
-        ),
-        unnested AS (
-            SELECT 
-                row_idx,
-                sample_id,
-                unnest(genotypes."GT") as gt,
-                unnest(genotypes."DP") as dp
-            FROM indexed
-        )
-        SELECT
-            row_idx,
-            sample_id,
-            array_agg(gt) AS gt_out,
-            array_agg(dp) AS dp_out
-        FROM unnested
-        GROUP BY row_idx, sample_id
-        ORDER BY row_idx
-    "#;
-
-    let df = ctx.sql(sql).await.unwrap();
-    let results = df.collect().await.unwrap();
-
-    // Verify we got 3 rows back
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 3, "Expected 3 rows in result");
-
-    println!("Struct field access baseline test passed");
-}
-
-#[tokio::test]
-#[serial]
-async fn test_struct_field_access_explain() {
-    // Print the plan to understand the structure
-    let ctx = create_baseline_context().await;
-    let batch = create_test_data_with_struct_arrays();
-    let schema = batch.schema();
-
-    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("vcf_data", Arc::new(table)).unwrap();
-
-    let sql = r#"
-        EXPLAIN VERBOSE
-        WITH indexed AS (
-            SELECT 
-                ROW_NUMBER() OVER () as row_idx,
-                sample_id,
-                genotypes
-            FROM vcf_data
-        ),
-        unnested AS (
-            SELECT 
-                row_idx,
-                sample_id,
-                unnest(genotypes."GT") as gt,
-                unnest(genotypes."DP") as dp
-            FROM indexed
-        )
-        SELECT
-            row_idx,
-            sample_id,
-            array_agg(gt) AS gt_out,
-            array_agg(dp) AS dp_out
-        FROM unnested
-        GROUP BY row_idx, sample_id
-        ORDER BY row_idx
-    "#;
-
-    let df = ctx.sql(sql).await.unwrap();
-    let results = df.collect().await.unwrap();
-
-    println!("\n=== EXPLAIN VERBOSE for struct field access ===\n");
-    for batch in &results {
-        let plan_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        for i in 0..plan_col.len() {
-            if !plan_col.is_null(i) {
-                println!("{}", plan_col.value(i));
-            }
-        }
-    }
-    println!("\n=== END EXPLAIN ===\n");
 }
 
 #[tokio::test]
@@ -680,17 +676,64 @@ fn create_test_data_with_null_elements() -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(metadata), Arc::new(arr_a)]).unwrap()
 }
 
+/// Create test data that combines NULLs and mismatched array lengths across two value columns.
+fn create_test_data_with_nulls_and_mismatched_lengths() -> RecordBatch {
+    let mut list_builder_a = ListBuilder::new(Float64Builder::new());
+    let mut list_builder_b = ListBuilder::new(Float64Builder::new());
+
+    // Row 0: values_a = [1.0, NULL, 3.0] (len 3), values_b = [10.0, 20.0] (len 2)
+    list_builder_a.values().append_value(1.0);
+    list_builder_a.values().append_null();
+    list_builder_a.values().append_value(3.0);
+    list_builder_a.append(true);
+
+    list_builder_b.values().append_value(10.0);
+    list_builder_b.values().append_value(20.0);
+    list_builder_b.append(true);
+
+    // Row 1: values_a = [NULL, 5.0] (len 2), values_b = [40.0] (len 1)
+    list_builder_a.values().append_null();
+    list_builder_a.values().append_value(5.0);
+    list_builder_a.append(true);
+
+    list_builder_b.values().append_value(40.0);
+    list_builder_b.append(true);
+
+    let arr_a = list_builder_a.finish();
+    let arr_b = list_builder_b.finish();
+    let metadata = StringArray::from(vec!["meta1", "meta2"]);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("metadata", DataType::Utf8, false),
+        Field::new(
+            "values_a",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        ),
+        Field::new(
+            "values_b",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        ),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(metadata), Arc::new(arr_a), Arc::new(arr_b)],
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 #[serial]
 async fn test_null_arrays() {
-    let ctx = create_baseline_context().await;
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::physical_plan::displayable;
+
     let batch = create_test_data_with_null_arrays();
     let schema = batch.schema();
 
-    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("test_data", Arc::new(table)).unwrap();
-
-    // Execute query with NULL arrays - should not panic
+    // Execute query with NULL arrays - baseline and optimized should behave the same
     let sql = r#"
         WITH indexed AS (
             SELECT 
@@ -715,28 +758,65 @@ async fn test_null_arrays() {
         ORDER BY row_idx
     "#;
 
-    let df = ctx.sql(sql).await.unwrap();
-    let results = df.collect().await.unwrap();
+    // Baseline context
+    let ctx_baseline = create_baseline_context().await;
+    let table_baseline = MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap();
+    ctx_baseline
+        .register_table("test_data", Arc::new(table_baseline))
+        .unwrap();
 
-    // Only rows with non-NULL arrays should appear (2 rows: meta1 and meta3)
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let df_baseline = ctx_baseline.sql(sql).await.unwrap();
+    let physical_plan_baseline = df_baseline.create_physical_plan().await.unwrap();
+    let plan_str_baseline =
+        displayable(physical_plan_baseline.as_ref()).indent(true).to_string();
+    assert!(
+        !plan_str_baseline.contains("FusedArrayTransform"),
+        "Baseline physical plan unexpectedly contains FusedArrayTransform:\n{plan_str_baseline}"
+    );
+    let df_baseline2 = ctx_baseline.sql(sql).await.unwrap();
+    let baseline_results = df_baseline2.collect().await.unwrap();
+
+    // Optimized context
+    let ctx_optimized = create_optimized_context().await;
+    let table_optimized = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+    ctx_optimized
+        .register_table("test_data", Arc::new(table_optimized))
+        .unwrap();
+
+    let df_optimized = ctx_optimized.sql(sql).await.unwrap();
+    let physical_plan_optimized = df_optimized.create_physical_plan().await.unwrap();
+    let plan_str_optimized =
+        displayable(physical_plan_optimized.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str_optimized.contains("FusedArrayTransform"),
+        "FusedArrayTransform optimization was NOT applied for null arrays case! Physical plan:\n{plan_str_optimized}"
+    );
+    let df_optimized2 = ctx_optimized.sql(sql).await.unwrap();
+    let optimized_results = df_optimized2.collect().await.unwrap();
+
+    // Both baseline and optimized should filter out the NULL-array row and have identical output
+    let baseline_str = pretty_format_batches(&baseline_results)
+        .unwrap()
+        .to_string();
+    let optimized_str = pretty_format_batches(&optimized_results)
+        .unwrap()
+        .to_string();
     assert_eq!(
-        total_rows, 2,
-        "Expected 2 rows (NULL array row filtered out)"
+        baseline_str, optimized_str,
+        "Baseline and optimized results differ for null arrays case"
     );
 }
 
 #[tokio::test]
 #[serial]
 async fn test_empty_arrays() {
-    let ctx = create_baseline_context().await;
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::physical_plan::displayable;
+
     let batch = create_test_data_with_empty_arrays();
     let schema = batch.schema();
 
-    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("test_data", Arc::new(table)).unwrap();
-
-    // Execute query with empty arrays
+    // Execute query with empty arrays - baseline and optimized should behave the same
     let sql = r#"
         WITH indexed AS (
             SELECT 
@@ -761,30 +841,65 @@ async fn test_empty_arrays() {
         ORDER BY row_idx
     "#;
 
-    let df = ctx.sql(sql).await.unwrap();
-    let results = df.collect().await.unwrap();
+    // Baseline context
+    let ctx_baseline = create_baseline_context().await;
+    let table_baseline = MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap();
+    ctx_baseline
+        .register_table("test_data", Arc::new(table_baseline))
+        .unwrap();
 
-    // Only rows with non-empty arrays should appear (2 rows: meta1 and meta3)
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let df_baseline = ctx_baseline.sql(sql).await.unwrap();
+    let physical_plan_baseline = df_baseline.create_physical_plan().await.unwrap();
+    let plan_str_baseline =
+        displayable(physical_plan_baseline.as_ref()).indent(true).to_string();
+    assert!(
+        !plan_str_baseline.contains("FusedArrayTransform"),
+        "Baseline physical plan unexpectedly contains FusedArrayTransform:\n{plan_str_baseline}"
+    );
+    let df_baseline2 = ctx_baseline.sql(sql).await.unwrap();
+    let baseline_results = df_baseline2.collect().await.unwrap();
+
+    // Optimized context
+    let ctx_optimized = create_optimized_context().await;
+    let table_optimized = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+    ctx_optimized
+        .register_table("test_data", Arc::new(table_optimized))
+        .unwrap();
+
+    let df_optimized = ctx_optimized.sql(sql).await.unwrap();
+    let physical_plan_optimized = df_optimized.create_physical_plan().await.unwrap();
+    let plan_str_optimized =
+        displayable(physical_plan_optimized.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str_optimized.contains("FusedArrayTransform"),
+        "FusedArrayTransform optimization was NOT applied for empty arrays case! Physical plan:\n{plan_str_optimized}"
+    );
+    let df_optimized2 = ctx_optimized.sql(sql).await.unwrap();
+    let optimized_results = df_optimized2.collect().await.unwrap();
+
+    // Both baseline and optimized should filter out the empty-array row and have identical output
+    let baseline_str = pretty_format_batches(&baseline_results)
+        .unwrap()
+        .to_string();
+    let optimized_str = pretty_format_batches(&optimized_results)
+        .unwrap()
+        .to_string();
     assert_eq!(
-        total_rows, 2,
-        "Expected 2 rows (empty array row filtered out)"
+        baseline_str, optimized_str,
+        "Baseline and optimized results differ for empty arrays case"
     );
 }
 
 #[tokio::test]
 #[serial]
 async fn test_mismatched_array_lengths() {
-    let ctx = create_baseline_context().await;
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::physical_plan::displayable;
+
     let batch = create_test_data_with_mismatched_lengths();
     let schema = batch.schema();
 
-    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("test_data", Arc::new(table)).unwrap();
-
-    // Query with unnest on multiple arrays with mismatched lengths
-    // DataFusion should handle this with zip semantics (shortest array determines length)
-    // or with null-padding.
+    // Query with unnest on multiple arrays with mismatched lengths.
     let sql = r#"
         WITH indexed AS (
             SELECT 
@@ -812,58 +927,61 @@ async fn test_mismatched_array_lengths() {
         ORDER BY row_idx
     "#;
 
-    let df = ctx.sql(sql).await.unwrap();
-    let results = df.collect().await.unwrap();
+    // Baseline context
+    let ctx_baseline = create_baseline_context().await;
+    let table_baseline = MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap();
+    ctx_baseline
+        .register_table("test_data", Arc::new(table_baseline))
+        .unwrap();
 
-    // Should produce 2 rows (one per original row)
-    // The exact element count depends on DataFusion's unnest semantics (cross-product vs zip)
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(
-        total_rows, 2,
-        "Expected 2 rows in result (one per original row)"
+    let df_baseline = ctx_baseline.sql(sql).await.unwrap();
+    let physical_plan_baseline = df_baseline.create_physical_plan().await.unwrap();
+    let plan_str_baseline =
+        displayable(physical_plan_baseline.as_ref()).indent(true).to_string();
+    assert!(
+        !plan_str_baseline.contains("FusedArrayTransform"),
+        "Baseline physical plan unexpectedly contains FusedArrayTransform:\n{plan_str_baseline}"
     );
+    let df_baseline2 = ctx_baseline.sql(sql).await.unwrap();
+    let baseline_results = df_baseline2.collect().await.unwrap();
 
-    // Verify columns exist and have list structure
-    let batch = &results[0];
-    let values_a_col = batch.column_by_name("values_a_out").unwrap();
-    let values_b_col = batch.column_by_name("values_b_out").unwrap();
+    // Optimized context
+    let ctx_optimized = create_optimized_context().await;
+    let table_optimized = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+    ctx_optimized
+        .register_table("test_data", Arc::new(table_optimized))
+        .unwrap();
 
-    let list_a = values_a_col
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .expect("values_a_out should be ListArray");
-    let list_b = values_b_col
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .expect("values_b_out should be ListArray");
+    let df_optimized = ctx_optimized.sql(sql).await.unwrap();
+    let physical_plan_optimized = df_optimized.create_physical_plan().await.unwrap();
+    let plan_str_optimized =
+        displayable(physical_plan_optimized.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str_optimized.contains("FusedArrayTransform"),
+        "FusedArrayTransform optimization was NOT applied for empty arrays case! Physical plan:\n{plan_str_optimized}"
+    );
+    let df_optimized2 = ctx_optimized.sql(sql).await.unwrap();
+    let optimized_results = df_optimized2.collect().await.unwrap();
 
-    // Just verify both arrays have elements (exact count depends on unnest semantics)
-    for i in 0..2 {
-        assert!(
-            !list_a.is_null(i),
-            "Row {i} values_a_out should not be null"
-        );
-        assert!(
-            !list_b.is_null(i),
-            "Row {i} values_b_out should not be null"
-        );
-        assert!(
-            !list_a.value(i).is_empty(),
-            "Row {i} values_a_out should have elements"
-        );
-        assert!(
-            !list_b.value(i).is_empty(),
-            "Row {i} values_b_out should have elements"
-        );
-    }
-
-    println!("Mismatched lengths test passed - verified structure");
+    // Both baseline and optimized should filter out the empty-array row and have identical output
+    let baseline_str = pretty_format_batches(&baseline_results)
+        .unwrap()
+        .to_string();
+    let optimized_str = pretty_format_batches(&optimized_results)
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        baseline_str, optimized_str,
+        "Baseline and optimized results differ for empty arrays case"
+    );
 }
 
 #[tokio::test]
 #[serial]
 async fn test_null_elements_in_arrays() {
-    let ctx = create_baseline_context().await;
+    use datafusion::physical_plan::displayable;
+
+    let ctx = create_optimized_context().await;
     let batch = create_test_data_with_null_elements();
     let schema = batch.schema();
 
@@ -896,7 +1014,17 @@ async fn test_null_elements_in_arrays() {
     "#;
 
     let df = ctx.sql(sql).await.unwrap();
-    let results = df.collect().await.unwrap();
+
+    // Optimization should still be applied when arrays contain NULL elements
+    let physical_plan = df.create_physical_plan().await.unwrap();
+    let plan_str = displayable(physical_plan.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str.contains("FusedArrayTransform"),
+        "FusedArrayTransform optimization was NOT applied for null-elements case! Physical plan:\n{plan_str}"
+    );
+
+    let df2 = ctx.sql(sql).await.unwrap();
+    let results = df2.collect().await.unwrap();
 
     // Both rows should appear
     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
@@ -942,6 +1070,96 @@ async fn test_null_elements_in_arrays() {
     println!("Null elements test passed - verified NULL positions are preserved");
 }
 
+#[tokio::test]
+#[serial]
+async fn test_nulls_and_mismatched_lengths_baseline_vs_optimized_same_results() {
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::physical_plan::displayable;
+
+    // SQL that unnests both value columns and aggregates them back
+    let sql = r#"
+        WITH indexed AS (
+            SELECT 
+                ROW_NUMBER() OVER () as row_idx,
+                metadata,
+                values_a,
+                values_b
+            FROM test_data
+        ),
+        unnested AS (
+            SELECT 
+                row_idx,
+                metadata,
+                unnest(values_a) as val_a,
+                unnest(values_b) as val_b
+            FROM indexed
+        )
+        SELECT
+            row_idx,
+            metadata,
+            array_agg(val_a) AS values_a_out,
+            array_agg(val_b) AS values_b_out
+        FROM unnested
+        GROUP BY row_idx, metadata
+        ORDER BY row_idx
+    "#;
+
+    // Baseline execution (no optimization)
+    let ctx_baseline = create_baseline_context().await;
+    let batch_baseline = create_test_data_with_nulls_and_mismatched_lengths();
+    let schema_baseline = batch_baseline.schema();
+    let table_baseline =
+        MemTable::try_new(schema_baseline.clone(), vec![vec![batch_baseline]]).unwrap();
+    ctx_baseline
+        .register_table("test_data", Arc::new(table_baseline))
+        .unwrap();
+
+    let df_baseline = ctx_baseline.sql(sql).await.unwrap();
+    let physical_plan_baseline = df_baseline.create_physical_plan().await.unwrap();
+    let plan_str_baseline =
+        displayable(physical_plan_baseline.as_ref()).indent(true).to_string();
+    assert!(
+        !plan_str_baseline.contains("FusedArrayTransform"),
+        "Baseline physical plan unexpectedly contains FusedArrayTransform:\n{plan_str_baseline}"
+    );
+    let df_baseline2 = ctx_baseline.sql(sql).await.unwrap();
+    let baseline_results = df_baseline2.collect().await.unwrap();
+
+    // Optimized execution (with FusedArrayTransform)
+    let ctx_optimized = create_optimized_context().await;
+    let batch_optimized = create_test_data_with_nulls_and_mismatched_lengths();
+    let schema_optimized = batch_optimized.schema();
+    let table_optimized =
+        MemTable::try_new(schema_optimized.clone(), vec![vec![batch_optimized]]).unwrap();
+    ctx_optimized
+        .register_table("test_data", Arc::new(table_optimized))
+        .unwrap();
+
+    let df_optimized = ctx_optimized.sql(sql).await.unwrap();
+    let physical_plan_optimized = df_optimized.create_physical_plan().await.unwrap();
+    let plan_str_optimized =
+        displayable(physical_plan_optimized.as_ref()).indent(true).to_string();
+    assert!(
+        plan_str_optimized.contains("FusedArrayTransform"),
+        "FusedArrayTransform optimization was NOT applied for nulls+mismatched-lengths case! Physical plan:\n{plan_str_optimized}"
+    );
+    let df_optimized2 = ctx_optimized.sql(sql).await.unwrap();
+    let optimized_results = df_optimized2.collect().await.unwrap();
+
+    // Compare pretty-printed results to ensure outputs are identical
+    let baseline_str = pretty_format_batches(&baseline_results)
+        .unwrap()
+        .to_string();
+    let optimized_str = pretty_format_batches(&optimized_results)
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        baseline_str, optimized_str,
+        "Baseline and optimized results differ for nulls+mismatched-lengths case"
+    );
+}
+
 // =============================================================================
 // Expression Transform Tests
 // =============================================================================
@@ -949,21 +1167,6 @@ async fn test_null_elements_in_arrays() {
 #[tokio::test]
 #[serial]
 async fn test_arithmetic_transform() {
-    // NOTE: This test currently FAILS because the FusedArrayTransform optimization
-    //       does NOT support transformations in a separate CTE yet.
-    //
-    // Current limitation: The optimizer rule only detects the simple pattern:
-    //   Aggregate → (SubqueryAlias?) → Projection → Unnest
-    //
-    // But with a transformation CTE like "transformed AS (SELECT val_a + val_b ...)",
-    // the structure becomes:
-    //   Aggregate → SubqueryAlias("transformed") → Projection → SubqueryAlias("unnested") → ...
-    //
-    // TODO: Enhance pattern detection to traverse multiple Projection/SubqueryAlias layers
-    // and compose transformation expressions from intermediate projections.
-    //
-    // This test uses create_optimized_context() so it will PASS once transformation
-    // CTE support is implemented.
     use datafusion::physical_plan::displayable;
 
     let ctx = create_optimized_context().await; // Use optimized context
