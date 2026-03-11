@@ -9,7 +9,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use datafusion::arrow::array::{Array, ArrayRef, ListArray, RecordBatch};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, ListArray, MutableArrayData, RecordBatch,
+};
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
@@ -267,43 +269,23 @@ impl FusedArrayTransformStream {
         if num_rows == 0 {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
-
         let input_schema = batch.schema();
-        let mut output_columns: Vec<ArrayRef> =
-            Vec::with_capacity(self.passthrough_columns.len() + self.array_columns.len());
+
+        // Collect passthrough columns (we may later filter some rows out)
+        let mut passthrough_arrays: Vec<ArrayRef> =
+            Vec::with_capacity(self.passthrough_columns.len());
 
         // Collect passthrough columns
         for col_name in &self.passthrough_columns {
             let idx = input_schema.index_of(col_name)?;
-            output_columns.push(batch.column(idx).clone());
+            passthrough_arrays.push(batch.column(idx).clone());
         }
 
-        // Check if we have expressions to evaluate or do identity transform
-        if self.transform_exprs.is_empty() {
-            // No transform expressions: identity transform (pass through arrays unchanged)
-            for col_name in &self.array_columns {
-                let idx = input_schema.index_of(col_name)?;
-                let col = batch.column(idx);
-
-                let list_arr = col.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                    DataFusionError::Plan(format!("Column '{col_name}' is not a List type"))
-                })?;
-
-                let output_array = self.apply_identity_transform(list_arr, num_rows)?;
-                output_columns.push(output_array);
-            }
-        } else {
-            // Transform expressions: evaluate element-wise
-            let transformed = self.apply_transforms(batch, num_rows)?;
-            output_columns.extend(transformed);
+        // If there are no array columns, just passthrough
+        if self.array_columns.is_empty() {
+            return RecordBatch::try_new(self.schema.clone(), passthrough_arrays)
+                .map_err(DataFusionError::from);
         }
-
-        RecordBatch::try_new(self.schema.clone(), output_columns).map_err(DataFusionError::from)
-    }
-
-    /// Apply transform expressions element-wise to array columns.
-    fn apply_transforms(&self, batch: &RecordBatch, num_rows: usize) -> Result<Vec<ArrayRef>> {
-        let input_schema = batch.schema();
 
         // Extract all array columns as ListArrays
         let list_arrays: Vec<(&String, &ListArray)> = self
@@ -319,34 +301,166 @@ impl FusedArrayTransformStream {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // Compute, for each input row, the maximum array length across all unnest columns.
+        // Rows where this maximum length is zero correspond to rows that would produce
+        // no output rows after UNNEST + GROUP BY and thus must be dropped to match
+        // baseline semantics.
+        let mut row_max_lengths: Vec<usize> = Vec::with_capacity(num_rows);
+        let mut row_mask: Vec<bool> = Vec::with_capacity(num_rows);
+
+        for row_idx in 0..num_rows {
+            let mut max_len = 0_usize;
+
+            for (_, list_arr) in &list_arrays {
+                if list_arr.is_null(row_idx) {
+                    continue;
+                }
+                let values = list_arr.value(row_idx);
+                let len = values.len();
+                if len > max_len {
+                    max_len = len;
+                }
+            }
+
+            row_max_lengths.push(max_len);
+            row_mask.push(max_len > 0);
+        }
+
+        let num_output_rows = row_mask.iter().filter(|&&b| b).count();
+
+        // If no rows would survive UNNEST, return an empty batch with the correct schema.
+        if num_output_rows == 0 {
+            let empty_columns: Vec<ArrayRef> = self
+                .schema
+                .fields()
+                .iter()
+                .map(|f| datafusion::arrow::array::new_empty_array(f.data_type()))
+                .collect();
+            return RecordBatch::try_new(self.schema.clone(), empty_columns)
+                .map_err(DataFusionError::from);
+        }
+
+        // Filter passthrough columns to only include rows that have at least one element
+        // after UNNEST (max_len > 0).
+        let bool_mask = BooleanArray::from(row_mask.clone());
+        let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(
+            self.passthrough_columns.len() + self.transform_exprs.len(),
+        );
+
+        for array in passthrough_arrays {
+            let filtered =
+                datafusion::arrow::compute::filter(array.as_ref(), &bool_mask).map_err(
+                    |e| DataFusionError::Execution(format!("Error filtering passthrough column: {e}")),
+                )?;
+            output_columns.push(filtered);
+        }
+
+        // Check if we have expressions to evaluate or do identity transform
+        if self.transform_exprs.is_empty() {
+            // No transform expressions: identity transform (pass through arrays unchanged)
+            for col_name in &self.array_columns {
+                let idx = input_schema.index_of(col_name)?;
+                let col = batch.column(idx);
+                let list_arr = col.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                    DataFusionError::Plan(format!("Column '{col_name}' is not a List type"))
+                })?;
+
+                let output_array = self.apply_identity_transform(list_arr, num_rows)?;
+                output_columns.push(output_array);
+            }
+        } else {
+            // Transform expressions: evaluate element-wise
+            let transformed =
+                self.apply_transforms(batch, num_rows, &list_arrays, &row_max_lengths, &row_mask)?;
+            output_columns.extend(transformed);
+        }
+
+        RecordBatch::try_new(self.schema.clone(), output_columns).map_err(DataFusionError::from)
+    }
+
+    /// Apply transform expressions element-wise to array columns.
+    fn apply_transforms(
+        &self,
+        batch: &RecordBatch,
+        num_rows: usize,
+        list_arrays: &[(&String, &ListArray)],
+        row_max_lengths: &[usize],
+        row_mask: &[bool],
+    ) -> Result<Vec<ArrayRef>> {
         // For each output expression, build a ListArray by evaluating element-wise
         let mut output_arrays: Vec<ArrayRef> = Vec::with_capacity(self.transform_exprs.len());
 
         for (expr_idx, expr) in self.transform_exprs.iter().enumerate() {
-            // Collect evaluated arrays and offsets for each row
+            // Collect evaluated arrays and offsets for each *included* row
             let mut all_values: Vec<ArrayRef> = Vec::with_capacity(num_rows);
             let mut offsets: Vec<i32> = vec![0];
             let mut null_bitmap: Vec<bool> = Vec::with_capacity(num_rows);
             let mut current_offset: i32 = 0;
 
             for row_idx in 0..num_rows {
-                // Check if any input is null -> produce null output
-                let any_null = list_arrays.iter().any(|(_, arr)| arr.is_null(row_idx));
-
-                if any_null {
-                    null_bitmap.push(false);
-                    offsets.push(current_offset);
+                if !row_mask[row_idx] {
+                    // This row would produce no UNNEST output, so it is not present
+                    // in the fused result at all.
                     continue;
                 }
 
-                // Build a mini-batch for this row's array elements
-                let mini_batch = self.build_element_batch(&list_arrays, row_idx)?;
-
-                if mini_batch.num_rows() == 0 {
-                    null_bitmap.push(true);
-                    offsets.push(current_offset);
+                let max_len = row_max_lengths[row_idx];
+                if max_len == 0 {
+                    // Should not happen given the row_mask, but guard just in case.
                     continue;
                 }
+
+                // Build a mini-batch for this row's array elements, following
+                // UNNEST semantics:
+                // - Use the longest array length across all columns.
+                // - Shorter arrays are padded with NULLs.
+                // - NULL arrays become all-null arrays of length max_len.
+                let mut columns: Vec<ArrayRef> = Vec::with_capacity(list_arrays.len());
+                let mut fields: Vec<Field> = Vec::with_capacity(list_arrays.len());
+
+                for (col_name, list_arr) in list_arrays {
+                    let element_type = match list_arr.data_type() {
+                        DataType::List(inner) => inner.data_type().clone(),
+                        DataType::LargeList(inner) => inner.data_type().clone(),
+                        DataType::FixedSizeList(inner, _) => inner.data_type().clone(),
+                        other => {
+                            return Err(DataFusionError::Plan(format!(
+                                "Expected list type for '{col_name}', got {other}"
+                            )));
+                        }
+                    };
+
+                    let padded_values: ArrayRef = if list_arr.is_null(row_idx) {
+                        // Entire array is NULL -> all-null values after UNNEST padding.
+                        datafusion::arrow::array::new_null_array(&element_type, max_len)
+                    } else {
+                        let values = list_arr.value(row_idx);
+                        let values_len = values.len();
+
+                        if values_len == max_len {
+                            values
+                        } else {
+                            // Pad shorter arrays with NULLs to reach max_len.
+                            let array_data = values.to_data();
+                            let mut mutable =
+                                MutableArrayData::new(vec![&array_data], true, max_len);
+                            // Copy existing values
+                            mutable.extend(0, 0, values_len);
+                            // Append NULLs for padding
+                            if max_len > values_len {
+                                mutable.extend_nulls(max_len - values_len);
+                            }
+                            datafusion::arrow::array::make_array(mutable.freeze())
+                        }
+                    };
+
+                    fields.push(Field::new(col_name.as_str(), element_type, true));
+                    columns.push(padded_values);
+                }
+
+                let schema = Arc::new(Schema::new(fields));
+                let mini_batch =
+                    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)?;
 
                 // Evaluate the expression on the mini-batch
                 let result = expr.evaluate(&mini_batch)?;
@@ -354,6 +468,8 @@ impl FusedArrayTransformStream {
 
                 current_offset += result_array.len() as i32;
                 all_values.push(result_array);
+                // The list itself is present (non-null) for this row; element nulls
+                // are represented inside result_array.
                 null_bitmap.push(true);
                 offsets.push(current_offset);
             }
@@ -390,57 +506,6 @@ impl FusedArrayTransformStream {
         }
 
         Ok(output_arrays)
-    }
-
-    /// Build a mini-batch from array elements at a specific row index.
-    ///
-    /// For arrays at row_idx, we create a batch where each column has the
-    /// elements of that array. The column names match the array column names
-    /// (these are the "unnested" element columns that expressions reference).
-    fn build_element_batch(
-        &self,
-        list_arrays: &[(&String, &ListArray)],
-        row_idx: usize,
-    ) -> Result<RecordBatch> {
-        // All arrays should have the same length (zip semantics)
-        let array_len = list_arrays
-            .first()
-            .map(|(_, arr)| arr.value(row_idx).len())
-            .unwrap_or(0);
-
-        // Build columns for the mini-batch
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(list_arrays.len());
-        let mut fields: Vec<Field> = Vec::with_capacity(list_arrays.len());
-
-        for (col_name, list_arr) in list_arrays {
-            let values = list_arr.value(row_idx);
-            let values_len = values.len();
-
-            // Get the element type from the list's value type
-            let element_type = match list_arr.data_type() {
-                DataType::List(inner) => inner.data_type().clone(),
-                DataType::LargeList(inner) => inner.data_type().clone(),
-                DataType::FixedSizeList(inner, _) => inner.data_type().clone(),
-                other => {
-                    return Err(DataFusionError::Plan(format!(
-                        "Expected list type for '{col_name}', got {other}"
-                    )));
-                }
-            };
-
-            // Verify lengths match (or skip this check for scalar expansion)
-            if values_len != array_len {
-                return Err(DataFusionError::Plan(format!(
-                    "Array length mismatch: '{col_name}' has {values_len} elements, expected {array_len}"
-                )));
-            }
-
-            fields.push(Field::new(col_name.as_str(), element_type, true));
-            columns.push(values);
-        }
-
-        let schema = Arc::new(Schema::new(fields));
-        RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
     }
 
     /// Apply identity transformation (pass through arrays unchanged).
