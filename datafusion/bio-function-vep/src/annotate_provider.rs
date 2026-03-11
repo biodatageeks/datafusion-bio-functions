@@ -1679,6 +1679,13 @@ impl AnnotateProvider {
                 continue;
             };
 
+            // VEP skips star alleles entirely — no CSQ produced.
+            if alt_allele == "*" {
+                csq_builder.append_null();
+                most_builder.append_null();
+                continue;
+            }
+
             // VEP-style allele minimization: strip shared prefix and suffix between REF and ALT.
             let ref_al = string_at(batch.column(ref_idx).as_ref(), row).unwrap_or_default();
             let (vep_ref, vep_allele) = vcf_to_vep_allele(&ref_al, &alt_allele);
@@ -1860,6 +1867,13 @@ impl AnnotateProvider {
                     most_builder.append_null();
                     continue;
                 };
+
+                // VEP skips star alleles entirely — no CSQ produced.
+                if alt_allele == "*" {
+                    csq_builder.append_null();
+                    most_builder.append_null();
+                    continue;
+                }
 
                 let variant = VariantInput::from_vcf(
                     chrom.clone(),
