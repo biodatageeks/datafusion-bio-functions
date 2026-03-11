@@ -841,23 +841,19 @@ async fn test_mismatched_array_lengths() {
     for i in 0..2 {
         assert!(
             !list_a.is_null(i),
-            "Row {} values_a_out should not be null",
-            i
+            "Row {i} values_a_out should not be null"
         );
         assert!(
             !list_b.is_null(i),
-            "Row {} values_b_out should not be null",
-            i
+            "Row {i} values_b_out should not be null"
         );
         assert!(
-            list_a.value(i).len() > 0,
-            "Row {} values_a_out should have elements",
-            i
+            !list_a.value(i).is_empty(),
+            "Row {i} values_a_out should have elements"
         );
         assert!(
-            list_b.value(i).len() > 0,
-            "Row {} values_b_out should have elements",
-            i
+            !list_b.value(i).is_empty(),
+            "Row {i} values_b_out should have elements"
         );
     }
 
@@ -1081,23 +1077,17 @@ async fn test_arithmetic_transform() {
                 let b = b_vals.value(j);
                 let expected_sum = a + b;
                 let expected_product = a * b;
+                let sum_j = sum_vals.value(j);
+                let product_j = product_vals.value(j);
 
                 assert!(
-                    (sum_vals.value(j) - expected_sum).abs() < 1e-10,
-                    "Sum mismatch at row {i}, element {j}: {} + {} = {}, got {}",
-                    a,
-                    b,
-                    expected_sum,
-                    sum_vals.value(j)
+                    (sum_j - expected_sum).abs() < 1e-10,
+                    "Sum mismatch at row {i}, element {j}: {a} + {b} = {expected_sum}, got {sum_j}"
                 );
 
                 assert!(
-                    (product_vals.value(j) - expected_product).abs() < 1e-10,
-                    "Product mismatch at row {i}, element {j}: {} * {} = {}, got {}",
-                    a,
-                    b,
-                    expected_product,
-                    product_vals.value(j)
+                    (product_j - expected_product).abs() < 1e-10,
+                    "Product mismatch at row {i}, element {j}: {a} * {b} = {expected_product}, got {product_j}"
                 );
             }
         }
@@ -1441,7 +1431,7 @@ async fn test_explain_shows_optimization() {
         for i in 0..plan_col.len() {
             if !plan_col.is_null(i) {
                 let line = plan_col.value(i);
-                println!("{}", line);
+                println!("{line}");
                 explain_output.push_str(line);
                 explain_output.push('\n');
             }
@@ -1698,9 +1688,8 @@ async fn test_parquet_round_trip_with_transform() {
         let inner_type = inner_field.data_type();
         assert!(
             matches!(inner_type, DataType::Float32 | DataType::Float64),
-            "values_d inner type should be Float32 or Float64, got {:?}. \
-            This indicates a type inference bug in the optimizer!",
-            inner_type
+            "values_d inner type should be Float32 or Float64, got {inner_type:?}. \
+            This indicates a type inference bug in the optimizer!"
         );
     } else {
         panic!(
@@ -1857,9 +1846,9 @@ async fn test_parquet_round_trip_with_transform() {
     assert_eq!(row2_b.len(), 1, "Row 2 values_b should have 1 element");
 
     println!("Parquet round-trip test passed!");
-    println!("Row 0 values_d: {:?}", row0_d);
-    println!("Row 1 values_d: {:?}", row1_d);
-    println!("Row 2 values_d: {:?}", row2_d);
+    println!("Row 0 values_d: {row0_d:?}");
+    println!("Row 1 values_d: {row1_d:?}");
+    println!("Row 2 values_d: {row2_d:?}");
 
     // Clean up
     unsafe {
