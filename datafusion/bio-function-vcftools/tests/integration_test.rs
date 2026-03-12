@@ -959,7 +959,7 @@ async fn test_mismatched_array_lengths() {
         .to_string();
     assert!(
         plan_str_optimized.contains("FusedArrayTransform"),
-        "FusedArrayTransform optimization was NOT applied for empty arrays case! Physical plan:\n{plan_str_optimized}"
+        "FusedArrayTransform optimization was NOT applied for mismatched lengths case! Physical plan:\n{plan_str_optimized}"
     );
     let df_optimized2 = ctx_optimized.sql(sql).await.unwrap();
     let optimized_results = df_optimized2.collect().await.unwrap();
@@ -973,7 +973,7 @@ async fn test_mismatched_array_lengths() {
         .to_string();
     assert_eq!(
         baseline_str, optimized_str,
-        "Baseline and optimized results differ for empty arrays case"
+        "Baseline and optimized results differ for mismatched lengths case"
     );
 }
 

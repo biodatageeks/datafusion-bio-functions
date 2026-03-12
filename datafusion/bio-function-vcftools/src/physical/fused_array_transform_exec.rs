@@ -323,7 +323,9 @@ impl FusedArrayTransformStream {
             for col_name in &self.array_columns {
                 let idx = input_schema.index_of(col_name)?;
                 let col = batch.column(idx);
-                let output_array = self.apply_identity_transform(col, col_name)?;
+
+                let filtered_col = datafusion::arrow::compute::filter(col.as_ref(), &bool_mask)?;
+                let output_array = self.apply_identity_transform(&filtered_col, col_name)?;
                 output_columns.push(output_array);
             }
         } else {
@@ -627,28 +629,35 @@ mod tests {
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::physical_plan::test::TestMemoryExec;
 
-    fn create_test_batch() -> RecordBatch {
+    fn create_test_batch(
+        row0_lista: Vec<f64>,
+        row0_listb: Vec<f64>,
+        row1_lista: Vec<f64>,
+        row1_listb: Vec<f64>,
+    ) -> RecordBatch {
         let mut list_builder_a = ListBuilder::new(Float64Builder::new());
         let mut list_builder_b = ListBuilder::new(Float64Builder::new());
 
-        // Row 0: [1.0, 2.0, 3.0], [10.0, 20.0, 30.0]
-        list_builder_a.values().append_value(1.0);
-        list_builder_a.values().append_value(2.0);
-        list_builder_a.values().append_value(3.0);
+        // Row 0
+        for val in row0_lista {
+            list_builder_a.values().append_value(val);
+        }
         list_builder_a.append(true);
 
-        list_builder_b.values().append_value(10.0);
-        list_builder_b.values().append_value(20.0);
-        list_builder_b.values().append_value(30.0);
+        for val in row0_listb {
+            list_builder_b.values().append_value(val);
+        }
         list_builder_b.append(true);
 
-        // Row 1: [4.0, 5.0], [40.0, 50.0]
-        list_builder_a.values().append_value(4.0);
-        list_builder_a.values().append_value(5.0);
+        // Row 1
+        for val in row1_lista {
+            list_builder_a.values().append_value(val);
+        }
         list_builder_a.append(true);
 
-        list_builder_b.values().append_value(40.0);
-        list_builder_b.values().append_value(50.0);
+        for val in row1_listb {
+            list_builder_b.values().append_value(val);
+        }
         list_builder_b.append(true);
 
         let arr_a = list_builder_a.finish();
@@ -677,9 +686,23 @@ mod tests {
         .unwrap()
     }
 
+    macro_rules! create_test_batch {
+        ($row0_lista: expr, $row0_listb: expr, $row1_lista: expr, $row1_listb: expr) => {
+            create_test_batch($row0_lista, $row0_listb, $row1_lista, $row1_listb)
+        };
+        () => {
+            create_test_batch(
+                vec![1.0, 2.0, 3.0],
+                vec![10.0, 20.0, 30.0],
+                vec![4.0, 5.0],
+                vec![40.0, 50.0],
+            )
+        };
+    }
+
     #[tokio::test]
     async fn test_identity_transform() {
-        let batch = create_test_batch();
+        let batch = create_test_batch!();
         let schema = batch.schema();
 
         let mem_exec = TestMemoryExec::try_new(&[vec![batch.clone()]], schema, None).unwrap();
@@ -695,11 +718,41 @@ mod tests {
 
         // Schema should have 2 fields: metadata + values_a_out
         assert_eq!(fused.schema().fields().len(), 2);
+
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = fused.execute(0, ctx).unwrap();
+        let result_batch = stream.next().await.unwrap().unwrap();
+        assert_eq!(result_batch.num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_identity_transform_with_empty_array() {
+        let batch = create_test_batch!(vec![], vec![], vec![4.0, 5.0], vec![40.0, 50.0]);
+        let schema = batch.schema();
+
+        let mem_exec = TestMemoryExec::try_new(&[vec![batch.clone()]], schema, None).unwrap();
+
+        let fused = FusedArrayTransformExec::try_new(
+            Arc::new(mem_exec),
+            vec!["values_a".to_string(), "values_b".to_string()],
+            vec!["metadata".to_string()],
+            vec!["values_a_out".to_string(), "values_b_out".to_string()],
+            vec![],
+        )
+        .unwrap();
+
+        // Schema should have 3 fields: metadata + values_a_out + values_b_out
+        assert_eq!(fused.schema().fields().len(), 3);
+        // row0 should be filtered out due to empty array, so only row1 remains
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = fused.execute(0, ctx).unwrap();
+        let result_batch = stream.next().await.unwrap().unwrap();
+        assert_eq!(result_batch.num_rows(), 1);
     }
 
     #[tokio::test]
     async fn test_execution() {
-        let batch = create_test_batch();
+        let batch = create_test_batch!();
         let schema = batch.schema();
 
         let mem_exec = TestMemoryExec::try_new(&[vec![batch.clone()]], schema, None).unwrap();
