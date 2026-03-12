@@ -27,7 +27,7 @@ use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext};
 
-use crate::allele::vcf_to_vep_allele;
+use crate::allele::{MatchedVariantAllele, vcf_to_vep_allele};
 use crate::annotation_store::{AnnotationBackend, build_store};
 use crate::lookup_provider::LookupProvider;
 use crate::variant_lookup_exec::{ColocatedCacheEntry, ColocatedSink};
@@ -362,172 +362,307 @@ impl VepFlags {
 struct ColocatedEntry {
     variation_name: String,
     allele_string: String,
+    matched_alleles: Vec<MatchedVariantAllele>,
     somatic: i64,
     pheno: i64,
+    clin_sig: Option<String>,
     clin_sig_allele: Option<String>,
     pubmed: Option<String>,
     /// Raw AF column values (same order as `AF_COL_NAMES` / `AF_COLUMNS`).
     af_values: Vec<String>,
 }
 
-/// Aggregated data from ALL co-located variants at the same position.
-///
-/// VEP collects every variant at the same chromosomal position (regardless of
-/// allele matching) and aggregates their metadata into `&`-separated strings.
-/// This struct holds the pre-aggregated values for a given (chrom, start, end).
 #[derive(Debug, Default, Clone)]
 struct ColocatedData {
-    /// All variation names joined with `&`, ordered non-somatic first.
-    existing_variation: String,
-    /// Raw entries for allele-specific filtering of SOMATIC, PHENO, CLIN_SIG, PUBMED.
     entries: Vec<ColocatedEntry>,
 }
 
+#[derive(Debug, Default)]
+struct ColocatedVariantFields {
+    existing_variation: String,
+    clin_sig: String,
+    somatic: String,
+    pheno: String,
+    pubmed: String,
+}
+
+#[derive(Debug, Default)]
+struct ColocatedFrequencyFields {
+    af_values: Vec<String>,
+    max_af: String,
+    max_af_pops: String,
+}
+
+fn variant_prefix_rank(variation_name: &str) -> u8 {
+    match variation_name
+        .get(..2)
+        .unwrap_or(variation_name)
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "rs" => 1,
+        "cm" | "ci" | "cd" => 2,
+        "co" => 3,
+        _ => 100,
+    }
+}
+
+fn push_unique_value(values: &mut Vec<String>, value: impl Into<String>) {
+    let value = value.into();
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+impl ColocatedEntry {
+    fn matching_allele<'a>(
+        &'a self,
+        output_allele: &str,
+        output_allele_unshifted: &str,
+    ) -> Option<&'a MatchedVariantAllele> {
+        self.matched_alleles
+            .iter()
+            .find(|matched| {
+                matched.a_allele == output_allele || matched.a_allele == output_allele_unshifted
+            })
+    }
+
+    fn matches_output_allele(&self, output_allele: &str, output_allele_unshifted: &str) -> bool {
+        self.matched_alleles.is_empty()
+            || self
+                .matching_allele(output_allele, output_allele_unshifted)
+                .is_some()
+    }
+}
+
 impl ColocatedData {
-    /// Build allele-filtered SOMATIC flags.
-    ///
-    /// VEP includes only allele-matching variants (plus COSMIC_MUTATION/HGMD_MUTATION)
-    /// for SOMATIC/PHENO, while Existing_variation includes ALL variants at the position.
-    fn somatic_flags_for_allele(&self, vcf_ref: &str, vcf_alt: &str) -> String {
-        let filtered = self.allele_filtered_entries(vcf_ref, vcf_alt);
-        let strs: Vec<&str> = filtered
-            .iter()
-            .map(|e| if e.somatic != 0 { "1" } else { "0" })
-            .collect();
-        if strs.iter().all(|s| *s == "0") {
-            String::new()
-        } else {
-            strs.join("&")
-        }
+    fn sorted_entries(&self) -> Vec<&ColocatedEntry> {
+        let mut entries: Vec<&ColocatedEntry> = self.entries.iter().collect();
+        entries.sort_by(|a, b| {
+            (a.somatic != 0)
+                .cmp(&(b.somatic != 0))
+                .then_with(|| variant_prefix_rank(&a.variation_name).cmp(&variant_prefix_rank(&b.variation_name)))
+        });
+        entries
     }
 
-    /// Build allele-filtered PHENO flags.
-    fn pheno_flags_for_allele(&self, vcf_ref: &str, vcf_alt: &str) -> String {
-        let filtered = self.allele_filtered_entries(vcf_ref, vcf_alt);
-        let strs: Vec<&str> = filtered
-            .iter()
-            .map(|e| if e.pheno != 0 { "1" } else { "0" })
-            .collect();
-        if strs.iter().all(|s| *s == "0") {
-            String::new()
-        } else {
-            strs.join("&")
+    /// Traceability:
+    /// - Ensembl VEP `add_colocated_variant_info()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1005-L1120
+    ///
+    /// This mirrors OutputFactory's co-located ID and clinical-field assembly:
+    /// sort existing variants the same way, filter by `matched_alleles` using
+    /// both current and unshifted output alleles, and preserve the `clin_sig`
+    /// vs `clin_sig_allele` split.
+    fn variant_fields(
+        &self,
+        output_allele: &str,
+        output_allele_unshifted: &str,
+        include_pubmed: bool,
+    ) -> ColocatedVariantFields {
+        let mut fields = ColocatedVariantFields::default();
+        let mut clin_sig_values: Vec<String> = Vec::new();
+        let mut clin_sig_allele_values: Vec<String> = Vec::new();
+        let mut clin_sig_allele_exists = false;
+        let mut somatic_values: Vec<&str> = Vec::new();
+        let mut pheno_values: Vec<&str> = Vec::new();
+        let mut pubmed_values: Vec<String> = Vec::new();
+
+        for entry in self.sorted_entries() {
+            if !entry.matches_output_allele(output_allele, output_allele_unshifted) {
+                continue;
+            }
+
+            if !entry.variation_name.is_empty() {
+                if !fields.existing_variation.is_empty() {
+                    fields.existing_variation.push('&');
+                }
+                fields.existing_variation.push_str(&entry.variation_name);
+            }
+
+            if let Some(clin_sig_allele) = &entry.clin_sig_allele {
+                let mut allele_terms: HashMap<String, String> = HashMap::new();
+                for chunk in clin_sig_allele.split(';') {
+                    let Some((allele, value)) = chunk.split_once(':') else {
+                        continue;
+                    };
+                    let slot = allele_terms.entry(allele.to_string()).or_default();
+                    if !slot.is_empty() {
+                        slot.push(',');
+                    }
+                    slot.push_str(value);
+                }
+                if let Some(value) = allele_terms.get(output_allele) {
+                    push_unique_value(&mut clin_sig_allele_values, value.clone());
+                }
+                clin_sig_allele_exists = true;
+            }
+
+            if let Some(clin_sig) = &entry.clin_sig {
+                if !clin_sig_allele_exists {
+                    for value in clin_sig.split(',') {
+                        if !value.is_empty() {
+                            clin_sig_values.push(value.to_string());
+                        }
+                    }
+                }
+            }
+
+            somatic_values.push(if entry.somatic != 0 { "1" } else { "0" });
+            pheno_values.push(if entry.pheno != 0 { "1" } else { "0" });
+
+            if include_pubmed {
+                if let Some(pubmed) = &entry.pubmed {
+                    for value in pubmed.split(',') {
+                        if !value.is_empty() {
+                            pubmed_values.push(value.to_string());
+                        }
+                    }
+                }
+            }
         }
+
+        if somatic_values.iter().any(|value| *value == "1") {
+            fields.somatic = somatic_values.join("&");
+        }
+        if pheno_values.iter().any(|value| *value == "1") {
+            fields.pheno = pheno_values.join("&");
+        }
+        if !pubmed_values.is_empty() {
+            fields.pubmed = csq_escape(&pubmed_values.join("&")).into_owned();
+        }
+        if !clin_sig_allele_values.is_empty() {
+            fields.clin_sig = csq_escape(&clin_sig_allele_values.join(";")).into_owned();
+        } else if !clin_sig_values.is_empty() {
+            fields.clin_sig = csq_escape(&clin_sig_values.join("&")).into_owned();
+        }
+
+        fields
     }
 
-    /// Build allele-filtered CLIN_SIG from clin_sig_allele column.
+    /// Traceability:
+    /// - Ensembl VEP `add_colocated_frequency_data()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1139-L1232
+    /// - Ensembl VEP `get_frequency_data()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationSource/Cache/BaseCacheVariation.pm#L179-L255
     ///
-    /// VEP extracts per-allele clinical significance from clin_sig_allele entries
-    /// like `"C:benign;C:benign/likely_benign"` — filtering for the VEP allele and
-    /// preserving compound terms like `benign/likely_benign`.
-    fn clin_sig_for_allele(&self, vcf_ref: &str, vcf_alt: &str) -> String {
-        use crate::allele::vcf_to_vep_allele;
-        let (_, vep_allele) = vcf_to_vep_allele(vcf_ref, vcf_alt);
-        let filtered = self.allele_filtered_entries(vcf_ref, vcf_alt);
-        let mut terms: Vec<String> = Vec::new();
-        for entry in &filtered {
-            if let Some(csa) = &entry.clin_sig_allele {
-                for pair in csa.split(';') {
-                    let pair = pair.trim();
-                    if let Some(colon) = pair.find(':') {
-                        let allele_part = &pair[..colon];
-                        let sig_part = &pair[colon + 1..];
-                        if allele_part == vep_allele && !sig_part.is_empty() {
-                            // Preserve compound terms (e.g. "benign/likely_benign") as-is.
-                            if !terms.contains(&sig_part.to_string()) {
-                                terms.push(sig_part.to_string());
+    /// This mirrors VEP's per-existing-variant frequency projection: build
+    /// allele-to-frequency maps from the matched existing variant, select the
+    /// `b_allele` named in `matched_alleles`, and only interpolate the global
+    /// `AF` field in the same biallelic case VEP allows.
+    fn frequency_fields(
+        &self,
+        output_allele: &str,
+        output_allele_unshifted: &str,
+        flags: &VepFlags,
+    ) -> ColocatedFrequencyFields {
+        let mut per_column: Vec<Vec<String>> = vec![Vec::new(); AF_COLUMNS.len()];
+        let mut max_af: Option<f64> = None;
+        let mut max_af_pops: Vec<String> = Vec::new();
+
+        for entry in self.sorted_entries() {
+            let Some(matched_allele) =
+                entry.matching_allele(output_allele, output_allele_unshifted)
+            else {
+                continue;
+            };
+
+            let existing_alleles: Vec<&str> = entry.allele_string.split('/').collect();
+
+            for (idx, column) in AF_COLUMNS.iter().enumerate() {
+                let should_process = flags.max_af || flags.af_group_enabled(column.flag_group);
+                if !should_process || idx >= entry.af_values.len() {
+                    continue;
+                }
+
+                let raw = &entry.af_values[idx];
+                if raw.is_empty() {
+                    continue;
+                }
+
+                let mut freq_data: HashMap<String, String> = HashMap::new();
+                let mut remaining: HashSet<String> =
+                    existing_alleles.iter().map(|allele| (*allele).to_string()).collect();
+                let mut total = 0.0_f64;
+
+                for pair in raw.split(',') {
+                    let Some((allele, freq)) = pair.split_once(':') else {
+                        continue;
+                    };
+                    let formatted = if column.cache_col == "AF" {
+                        format_af_4f(freq)
+                    } else {
+                        freq.to_string()
+                    };
+                    freq_data.insert(allele.to_string(), formatted);
+                    total += freq.parse::<f64>().unwrap_or(0.0);
+                    remaining.remove(allele);
+                }
+
+                let mut interpolated = false;
+                if existing_alleles.len() == 2 && remaining.len() == 1 && column.cache_col == "AF" {
+                    let remaining_allele = remaining.into_iter().next().unwrap();
+                    freq_data.insert(remaining_allele, format!("{}", 1.0 - total));
+                    interpolated = true;
+                }
+
+                let chosen = if let Some(value) = freq_data.get(&matched_allele.b_allele) {
+                    Some(value.clone())
+                } else if interpolated {
+                    freq_data.get(output_allele).cloned()
+                } else {
+                    None
+                };
+                let Some(chosen) = chosen else {
+                    continue;
+                };
+
+                if flags.af_group_enabled(column.flag_group) {
+                    push_unique_value(&mut per_column[idx], chosen.clone());
+                }
+
+                if flags.max_af {
+                    if let Some(pop_name) = column.max_af_pop {
+                        if let Ok(freq) = chosen.parse::<f64>() {
+                            match max_af {
+                                None => {
+                                    max_af = Some(freq);
+                                    max_af_pops.clear();
+                                    max_af_pops.push(pop_name.to_string());
+                                }
+                                Some(current) if freq > current => {
+                                    max_af = Some(freq);
+                                    max_af_pops.clear();
+                                    max_af_pops.push(pop_name.to_string());
+                                }
+                                Some(current) if (freq - current).abs() < f64::EPSILON => {
+                                    push_unique_value(&mut max_af_pops, pop_name.to_string());
+                                }
+                                _ => {}
                             }
                         }
                     }
                 }
             }
         }
-        terms.join("&")
-    }
 
-    /// Build allele-filtered PUBMED by aggregating across all allele-matched variants.
-    fn pubmed_for_allele(&self, vcf_ref: &str, vcf_alt: &str) -> String {
-        let filtered = self.allele_filtered_entries(vcf_ref, vcf_alt);
-        let mut ids: Vec<String> = Vec::new();
-        for entry in &filtered {
-            if let Some(pm) = &entry.pubmed {
-                for id in pm.split(',') {
-                    let id = id.trim();
-                    if !id.is_empty() && !ids.iter().any(|x| x == id) {
-                        ids.push(id.to_string());
-                    }
-                }
-            }
-        }
-        ids.join("&")
-    }
-
-    /// Filter entries by allele compatibility.
-    ///
-    /// Always includes COSMIC_MUTATION and HGMD_MUTATION entries (no allele check).
-    /// For others, uses `allele_matches` to check VCF REF/ALT against cache allele_string.
-    ///
-    /// Returns entries sorted to match VEP's co-located ordering for SOMATIC/PHENO:
-    /// non-somatic first, then somatic, with rs* before others within each group.
-    fn allele_filtered_entries(&self, vcf_ref: &str, vcf_alt: &str) -> Vec<&ColocatedEntry> {
-        use crate::allele::allele_matches;
-        let mut filtered: Vec<&ColocatedEntry> = self
-            .entries
+        let af_values = AF_COLUMNS
             .iter()
-            .filter(|e| {
-                // COSMIC and HGMD mutations are always included (no allele check).
-                if e.allele_string.starts_with("COSMIC_MUTATION")
-                    || e.allele_string.starts_with("HGMD_MUTATION")
-                {
-                    return true;
+            .enumerate()
+            .map(|(idx, column)| {
+                if column.emit_in_csq {
+                    per_column[idx].join("&")
+                } else {
+                    String::new()
                 }
-                allele_matches(vcf_ref, vcf_alt, &e.allele_string)
             })
             .collect();
-        // Sort: non-somatic (0) before somatic (1), then rs* before others, then alphabetical.
-        filtered.sort_by(|a, b| {
-            let a_som = if a.somatic != 0 { 1 } else { 0 };
-            let b_som = if b.somatic != 0 { 1 } else { 0 };
-            a_som.cmp(&b_som).then_with(|| {
-                let a_rs = a.variation_name.starts_with("rs");
-                let b_rs = b.variation_name.starts_with("rs");
-                b_rs.cmp(&a_rs)
-                    .then_with(|| a.variation_name.cmp(&b.variation_name))
-            })
-        });
-        filtered
-    }
 
-    /// Get AF value for a specific column index from co-located entries.
-    ///
-    /// Iterates allele-filtered entries and returns the first non-empty AF
-    /// value for the given column index. The caller provides the VEP allele
-    /// for matching within the AF string (e.g. "T:0.93").
-    fn af_for_allele(&self, af_col_idx: usize, vep_allele: &str, vcf_ref: &str, vcf_alt: &str) -> &str {
-        for entry in &self.entries {
-            if af_col_idx >= entry.af_values.len() {
-                continue;
-            }
-            let raw = &entry.af_values[af_col_idx];
-            if raw.is_empty() {
-                continue;
-            }
-            // Check allele compatibility.
-            if !entry.allele_string.starts_with("COSMIC_MUTATION")
-                && !entry.allele_string.starts_with("HGMD_MUTATION")
-            {
-                use crate::allele::allele_matches;
-                if !allele_matches(vcf_ref, vcf_alt, &entry.allele_string) {
-                    continue;
-                }
-            }
-            // Extract frequency for matching allele.
-            let freq = extract_af_for_allele(raw, vep_allele);
-            if !freq.is_empty() {
-                return freq;
-            }
+        ColocatedFrequencyFields {
+            af_values,
+            max_af: max_af.map(|value| value.to_string()).unwrap_or_default(),
+            max_af_pops: max_af_pops.join("&"),
         }
-        ""
     }
 }
 
@@ -535,44 +670,53 @@ impl ColocatedData {
 ///
 /// Converts `ColocatedCacheEntry` entries (collected during `VariantLookupExec`
 /// probe phase) into the same `ColocatedData` format used by the CSQ assembler.
+///
+/// Traceability:
+/// - Ensembl VEP `compare_existing()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L199-L206
+/// - Ensembl VEP `add_colocated_variant_info()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1032-L1049
+///
+/// Each existing variant must retain the `matched_alleles` attached during
+/// `compare_existing()`, merged across duplicate probe hits but without
+/// re-synthesizing allele matches from local heuristics.
 fn build_colocated_map_from_sink(
     sink: &HashMap<(String, i64, i64), Vec<ColocatedCacheEntry>>,
 ) -> HashMap<(String, i64, i64), ColocatedData> {
     let mut map = HashMap::with_capacity(sink.len());
     for (key, cache_entries) in sink {
-        // Convert ColocatedCacheEntry → ColocatedEntry, deduplicating by variation_name.
-        let mut seen = HashSet::new();
         let mut entries: Vec<ColocatedEntry> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
         for ce in cache_entries {
-            if ce.variation_name.is_empty() || !seen.insert(ce.variation_name.clone()) {
+            if ce.variation_name.is_empty() {
                 continue;
             }
+            if let Some(existing_idx) = seen.get(&ce.variation_name) {
+                let existing = &mut entries[*existing_idx];
+                for matched in &ce.matched_alleles {
+                    if !existing.matched_alleles.iter().any(|entry| entry == matched) {
+                        existing.matched_alleles.push(matched.clone());
+                    }
+                }
+                continue;
+            }
+            seen.insert(ce.variation_name.clone(), entries.len());
             entries.push(ColocatedEntry {
                 variation_name: ce.variation_name.clone(),
                 allele_string: ce.allele_string.clone(),
+                matched_alleles: ce.matched_alleles.clone(),
                 somatic: ce.somatic,
                 pheno: ce.pheno,
+                clin_sig: ce.clin_sig.clone(),
                 clin_sig_allele: ce.clin_sig_allele.clone(),
                 pubmed: ce.pubmed.clone(),
                 af_values: ce.af_values.clone(),
             });
         }
 
-        // Sort: rs* IDs first, then others, alphabetical within each group.
-        entries.sort_by(|a, b| {
-            let a_rs = a.variation_name.starts_with("rs");
-            let b_rs = b.variation_name.starts_with("rs");
-            b_rs.cmp(&a_rs)
-                .then_with(|| a.variation_name.cmp(&b.variation_name))
-        });
-
-        let names: Vec<&str> = entries.iter().map(|e| e.variation_name.as_str()).collect();
-        let existing_variation = names.join("&");
-
         map.insert(
             key.clone(),
             ColocatedData {
-                existing_variation,
                 entries,
             },
         );
@@ -580,16 +724,41 @@ fn build_colocated_map_from_sink(
     map
 }
 
-/// Replace commas with `&` in a CSQ field value.
+/// Traceability:
+/// - Ensembl VEP `output_hash_to_vcf_info_chunk()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory/VCF.pm#L379-L405
 ///
-/// CSQ entries are comma-separated, so any literal comma in a field value
-/// (e.g. TREMBL `"B0QYZ8.91,X5DR28.81"` or PUBMED `"123,456"`) would split
-/// the entry and corrupt field alignment.  VEP uses `&` as the multi-value
-/// separator within CSQ fields.
+/// This applies the same CSQ field escaping VEP uses for VCF output:
+/// array separators become `&`, semicolons are percent-encoded, spaces become
+/// underscores, pipes become `&`, and `-` is serialized as an empty field.
 #[inline]
 fn csq_escape(val: &str) -> std::borrow::Cow<'_, str> {
-    if val.contains(',') {
-        std::borrow::Cow::Owned(val.replace(',', "&"))
+    if val == "-" {
+        return std::borrow::Cow::Borrowed("");
+    }
+
+    let mut changed = false;
+    let mut escaped = String::with_capacity(val.len());
+    for ch in val.chars() {
+        match ch {
+            ',' | '|' => {
+                escaped.push('&');
+                changed = true;
+            }
+            ';' => {
+                escaped.push_str("%3B");
+                changed = true;
+            }
+            ch if ch.is_whitespace() => {
+                escaped.push('_');
+                changed = true;
+            }
+            _ => escaped.push(ch),
+        }
+    }
+
+    if changed {
+        std::borrow::Cow::Owned(escaped)
     } else {
         std::borrow::Cow::Borrowed(val)
     }
@@ -1738,17 +1907,6 @@ impl AnnotateProvider {
             .unwrap_or(false);
         let flags = VepFlags::from_options_json(self.options_json.as_deref());
 
-        // Resolve cache column indices for Batch 3 AF columns.
-        let af_col_indices: Vec<Option<usize>> = AF_COLUMNS
-            .iter()
-            .map(|col| schema.index_of(&format!("cache_{}", col.cache_col)).ok())
-            .collect();
-        // Clinical/frequency metadata indices.
-        let clin_sig_idx = schema.index_of("cache_clin_sig").ok();
-        let somatic_idx = schema.index_of("cache_somatic").ok();
-        let pheno_idx = schema.index_of("cache_phenotype_or_disease").ok();
-        let pubmed_idx = schema.index_of("cache_pubmed").ok();
-
         let mut csq_builder = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 40);
         let mut most_builder =
             StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
@@ -1783,7 +1941,7 @@ impl AnnotateProvider {
             let cached_csq =
                 cached_csq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
 
-            let variation_name = variation_name_idx
+            let _variation_name = variation_name_idx
                 .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 .unwrap_or_default();
 
@@ -1800,142 +1958,38 @@ impl AnnotateProvider {
                 )
             };
             let coloc = colocated_map.get(&(chrom_norm.to_string(), vep_start, vep_end));
-
-            let coloc_existing = coloc.map(|c| c.existing_variation.as_str());
-            let existing_var = if flags.check_existing {
-                coloc_existing.unwrap_or(&variation_name)
+            let variant_fields = if flags.check_existing {
+                coloc.map(|data| data.variant_fields(&vep_allele, &alt_allele, flags.pubmed))
+                    .unwrap_or_default()
             } else {
-                ""
+                ColocatedVariantFields::default()
             };
-
-            // Extract allele frequencies from cache columns.
-            let af_raw: Vec<String> = af_col_indices
-                .iter()
-                .map(|opt_idx| {
-                    opt_idx
-                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                        .unwrap_or_default()
-                })
-                .collect();
-            // Parse allele:freq for each AF column. Build two vectors:
-            // 1. af_csq_values: what goes into CSQ fields (empty for gnomAD sub-pops)
-            // 2. max_af_entries: sub-population (name, freq) pairs for MAX_AF computation
-            let mut af_csq_values: Vec<String> = Vec::with_capacity(AF_COLUMNS.len());
-            let mut af_raw_formatted: Vec<String> = Vec::with_capacity(AF_COLUMNS.len());
-            for (i, col) in AF_COLUMNS.iter().enumerate() {
-                let main_freq = if flags.af_group_enabled(col.flag_group) {
-                    extract_af_for_allele(&af_raw[i], &vep_allele)
-                } else {
-                    ""
-                };
-                // Fallback to co-located AF when main join's value is empty
-                // (common for shifted indels where the matched cache row has
-                // empty AF but a co-located entry at the original position has it).
-                let raw_freq = if main_freq.is_empty() && flags.af_group_enabled(col.flag_group) {
-                    coloc
-                        .map(|c| c.af_for_allele(i, &vep_allele, &ref_al, &alt_allele))
-                        .unwrap_or("")
-                } else {
-                    main_freq
-                };
-                // VEP applies sprintf("%.4f") to the global AF field only.
-                let freq = if col.format_4f && !raw_freq.is_empty() {
-                    format_af_4f(raw_freq)
-                } else {
-                    raw_freq.to_string()
-                };
-                // CSQ output: only emit for columns VEP emits in offline/cache mode.
-                let csq_val = if col.emit_in_csq {
-                    freq.clone()
-                } else {
-                    String::new()
-                };
-                af_csq_values.push(csq_val);
-                af_raw_formatted.push(freq);
-            }
-            // MAX_AF: collect sub-population (name, freq) pairs.
-            let mut max_af_entries: Vec<(&str, &str)> = Vec::new();
-            for (i, col) in AF_COLUMNS.iter().enumerate() {
-                if let Some(pop_name) = col.max_af_pop {
-                    if !af_raw_formatted[i].is_empty() {
-                        max_af_entries.push((pop_name, &af_raw_formatted[i]));
-                    }
+            let frequency_fields = if flags.check_existing {
+                coloc.map(|data| data.frequency_fields(&vep_allele, &alt_allele, &flags))
+                    .unwrap_or_else(|| ColocatedFrequencyFields {
+                        af_values: vec![String::new(); AF_COLUMNS.len()],
+                        max_af: String::new(),
+                        max_af_pops: String::new(),
+                    })
+            } else {
+                ColocatedFrequencyFields {
+                    af_values: vec![String::new(); AF_COLUMNS.len()],
+                    max_af: String::new(),
+                    max_af_pops: String::new(),
                 }
-            }
-            let (max_af, max_af_pops) = if flags.max_af {
-                compute_max_af(&max_af_entries)
-            } else {
-                (String::new(), String::new())
             };
-
-            // Clinical / phenotype fields — allele-filtered from co-located data.
-            // SOMATIC/PHENO: filter by allele compatibility (always include COSMIC/HGMD).
-            // CLIN_SIG: extract from clin_sig_allele column, preserving compound terms.
-            // PUBMED: aggregate across all allele-matched co-located variants.
-            let allele_filtered_somatic: String;
-            let allele_filtered_pheno: String;
-            let allele_filtered_clin_sig: String;
-            let allele_filtered_pubmed: String;
-
-            let somatic_val: &str = if flags.check_existing {
-                if let Some(c) = coloc {
-                    allele_filtered_somatic = c.somatic_flags_for_allele(&ref_al, &alt_allele);
-                    &allele_filtered_somatic
-                } else {
-                    somatic_idx
-                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
-                        .map(|v| if v != 0 { "1" } else { "" })
-                        .unwrap_or("")
-                }
-            } else {
-                ""
-            };
-            let pheno_val: &str = if flags.check_existing {
-                if let Some(c) = coloc {
-                    allele_filtered_pheno = c.pheno_flags_for_allele(&ref_al, &alt_allele);
-                    &allele_filtered_pheno
-                } else {
-                    pheno_idx
-                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
-                        .map(|v| if v != 0 { "1" } else { "" })
-                        .unwrap_or("")
-                }
-            } else {
-                ""
-            };
-            let clin_sig: String = if flags.check_existing {
-                if let Some(c) = coloc {
-                    allele_filtered_clin_sig = c.clin_sig_for_allele(&ref_al, &alt_allele);
-                    allele_filtered_clin_sig
-                } else {
-                    clin_sig_idx
-                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                        .map(|v| csq_escape(&v).into_owned())
-                        .unwrap_or_default()
-                }
-            } else {
-                String::new()
-            };
-            let pubmed_val = if flags.pubmed {
-                if let Some(c) = coloc {
-                    allele_filtered_pubmed = c.pubmed_for_allele(&ref_al, &alt_allele);
-                    allele_filtered_pubmed
-                } else {
-                    pubmed_idx
-                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                        .map(|v| csq_escape(&v).into_owned())
-                        .unwrap_or_default()
-                }
-            } else {
-                String::new()
-            };
+            let existing_var = variant_fields.existing_variation.as_str();
 
             // Build the 33-field Batch 3 suffix (positions 41-73) shared across all transcripts.
             let batch3_suffix = format!(
-                "{}|{}|{}|{clin_sig}|{somatic_val}|{pheno_val}|{pubmed_val}",
-                af_csq_values.join("|"),
-                max_af,
-                max_af_pops,
+                "{}|{}|{}|{}|{}|{}|{}",
+                frequency_fields.af_values.join("|"),
+                frequency_fields.max_af,
+                frequency_fields.max_af_pops,
+                variant_fields.clin_sig,
+                variant_fields.somatic,
+                variant_fields.pheno,
+                variant_fields.pubmed,
             );
 
             let (csq_string, most_str) = if let Some(most_val) = &cached_most {
@@ -3091,295 +3145,177 @@ mod tests {
     }
 
     // =======================================================================
-    // ColocatedData — allele filtering methods
+    // ColocatedData parity helpers
     // =======================================================================
+
+    fn make_match(a_allele: &str, b_allele: &str) -> MatchedVariantAllele {
+        MatchedVariantAllele {
+            a_allele: a_allele.to_string(),
+            a_index: 0,
+            b_allele: b_allele.to_string(),
+            b_index: 0,
+        }
+    }
 
     fn make_entry(
         name: &str,
         allele_string: &str,
+        matched_alleles: Vec<MatchedVariantAllele>,
         somatic: i64,
         pheno: i64,
+        clin_sig: Option<&str>,
         clin_sig_allele: Option<&str>,
         pubmed: Option<&str>,
+        af_values: Vec<&str>,
     ) -> ColocatedEntry {
         ColocatedEntry {
             variation_name: name.to_string(),
             allele_string: allele_string.to_string(),
+            matched_alleles,
             somatic,
             pheno,
-            clin_sig_allele: clin_sig_allele.map(|s| s.to_string()),
-            pubmed: pubmed.map(|s| s.to_string()),
-            af_values: Vec::new(),
+            clin_sig: clin_sig.map(|value| value.to_string()),
+            clin_sig_allele: clin_sig_allele.map(|value| value.to_string()),
+            pubmed: pubmed.map(|value| value.to_string()),
+            af_values: af_values.into_iter().map(|value| value.to_string()).collect(),
         }
     }
 
     fn make_coloc_data(entries: Vec<ColocatedEntry>) -> ColocatedData {
-        let names: Vec<&str> = entries.iter().map(|e| e.variation_name.as_str()).collect();
-        ColocatedData {
-            existing_variation: names.join("&"),
-            entries,
-        }
+        ColocatedData { entries }
     }
 
     #[test]
-    fn test_allele_filtered_entries_exact_match() {
+    fn test_colocated_variant_fields_follow_output_factory_sorting_and_filtering() {
         let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, None, None),
-            make_entry("rs2", "T/A", 0, 0, None, None),
+            make_entry(
+                "COSV1",
+                "A/G",
+                vec![make_match("G", "G")],
+                1,
+                1,
+                Some("pathogenic"),
+                None,
+                Some("222"),
+                vec![],
+            ),
+            make_entry(
+                "rs1",
+                "A/G",
+                vec![make_match("G", "G")],
+                0,
+                0,
+                Some("benign"),
+                None,
+                Some("111"),
+                vec![],
+            ),
+            make_entry(
+                "rs2",
+                "A/T",
+                vec![make_match("T", "T")],
+                0,
+                0,
+                Some("likely_benign"),
+                None,
+                Some("333"),
+                vec![],
+            ),
         ]);
-        // VCF T>C should match T/C but not T/A.
-        let filtered = data.allele_filtered_entries("T", "C");
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].variation_name, "rs1");
+
+        let fields = data.variant_fields("G", "G", true);
+        assert_eq!(fields.existing_variation, "rs1&COSV1");
+        assert_eq!(fields.clin_sig, "benign&pathogenic");
+        assert_eq!(fields.somatic, "0&1");
+        assert_eq!(fields.pheno, "0&1");
+        assert_eq!(fields.pubmed, "111&222");
     }
 
     #[test]
-    fn test_allele_filtered_entries_cosmic_always_included() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, None, None),
-            make_entry("COSV123", "COSMIC_MUTATION", 1, 0, None, None),
-        ]);
-        let filtered = data.allele_filtered_entries("T", "A");
-        // rs1 (T/C) doesn't match T/A, but COSMIC always included.
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].variation_name, "COSV123");
-    }
-
-    #[test]
-    fn test_allele_filtered_entries_hgmd_always_included() {
-        let data = make_coloc_data(vec![make_entry("HGMD1", "HGMD_MUTATION", 0, 1, None, None)]);
-        let filtered = data.allele_filtered_entries("A", "G");
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].variation_name, "HGMD1");
-    }
-
-    #[test]
-    fn test_allele_filtered_entries_sort_non_somatic_first() {
-        let data = make_coloc_data(vec![
-            make_entry("COSV1", "COSMIC_MUTATION", 1, 0, None, None),
-            make_entry("rs1", "T/C", 0, 0, None, None),
-        ]);
-        let filtered = data.allele_filtered_entries("T", "C");
-        assert_eq!(filtered.len(), 2);
-        // Non-somatic (rs1) should come before somatic (COSV1).
-        assert_eq!(filtered[0].variation_name, "rs1");
-        assert_eq!(filtered[1].variation_name, "COSV1");
-    }
-
-    #[test]
-    fn test_allele_filtered_entries_empty_result() {
-        let data = make_coloc_data(vec![make_entry("rs1", "T/A", 0, 0, None, None)]);
-        let filtered = data.allele_filtered_entries("G", "C");
-        assert!(filtered.is_empty());
-    }
-
-    #[test]
-    fn test_allele_filtered_entries_rs_before_others_within_group() {
-        let data = make_coloc_data(vec![
-            make_entry("COSV1", "COSMIC_MUTATION", 0, 0, None, None),
-            make_entry("rs1", "T/C", 0, 0, None, None),
-            make_entry("rs2", "T/C", 0, 0, None, None),
-        ]);
-        let filtered = data.allele_filtered_entries("T", "C");
-        assert_eq!(filtered.len(), 3);
-        // All non-somatic: rs before COSV, alphabetical within.
-        assert_eq!(filtered[0].variation_name, "rs1");
-        assert_eq!(filtered[1].variation_name, "rs2");
-        assert_eq!(filtered[2].variation_name, "COSV1");
-    }
-
-    // --- somatic_flags_for_allele ---
-
-    #[test]
-    fn test_somatic_flags_all_non_somatic() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, None, None),
-            make_entry("rs2", "T/C", 0, 0, None, None),
-        ]);
-        // All zeros → empty string.
-        assert_eq!(data.somatic_flags_for_allele("T", "C"), "");
-    }
-
-    #[test]
-    fn test_somatic_flags_mixed() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, None, None),
-            make_entry("COSV1", "COSMIC_MUTATION", 1, 0, None, None),
-        ]);
-        // Non-somatic first: rs1(0), COSV1(1).
-        assert_eq!(data.somatic_flags_for_allele("T", "C"), "0&1");
-    }
-
-    #[test]
-    fn test_somatic_flags_single_somatic() {
-        let data = make_coloc_data(vec![make_entry(
-            "COSV1",
-            "COSMIC_MUTATION",
-            1,
-            0,
-            None,
-            None,
-        )]);
-        assert_eq!(data.somatic_flags_for_allele("A", "G"), "1");
-    }
-
-    #[test]
-    fn test_somatic_flags_no_matching_entries() {
-        let data = make_coloc_data(vec![make_entry("rs1", "T/A", 1, 0, None, None)]);
-        // No allele match, no COSMIC → empty (no entries).
-        assert_eq!(data.somatic_flags_for_allele("G", "C"), "");
-    }
-
-    // --- pheno_flags_for_allele ---
-
-    #[test]
-    fn test_pheno_flags_all_non_pheno() {
-        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, None, None)]);
-        assert_eq!(data.pheno_flags_for_allele("T", "C"), "");
-    }
-
-    #[test]
-    fn test_pheno_flags_mixed() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, None, None),
-            make_entry("rs2", "T/C", 0, 1, None, None),
-        ]);
-        assert_eq!(data.pheno_flags_for_allele("T", "C"), "0&1");
-    }
-
-    // --- clin_sig_for_allele ---
-
-    #[test]
-    fn test_clin_sig_for_allele_simple() {
-        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, Some("C:benign"), None)]);
-        assert_eq!(data.clin_sig_for_allele("T", "C"), "benign");
-    }
-
-    #[test]
-    fn test_clin_sig_for_allele_compound_term() {
+    fn test_colocated_variant_fields_use_clin_sig_allele_and_escape_semicolons() {
         let data = make_coloc_data(vec![make_entry(
             "rs1",
-            "T/C",
+            "A/G",
+            vec![make_match("G", "G")],
             0,
             0,
-            Some("C:benign;C:benign/likely_benign"),
+            Some("benign"),
+            Some("G:pathogenic;G:likely_benign"),
             None,
+            vec![],
         )]);
-        assert_eq!(
-            data.clin_sig_for_allele("T", "C"),
-            "benign&benign/likely_benign"
-        );
+
+        let fields = data.variant_fields("G", "G", false);
+        assert_eq!(fields.clin_sig, "pathogenic%3Blikely_benign");
     }
 
     #[test]
-    fn test_clin_sig_for_allele_wrong_allele_filtered() {
+    fn test_colocated_frequency_fields_use_matched_b_allele_and_max_af() {
+        let mut af_values = vec![""; AF_COLUMNS.len()];
+        af_values[0] = "G:0.1250";
+        af_values[1] = "G:0.25";
+        af_values[6] = "G:0.5";
+        af_values[16] = "G:0.8";
+
         let data = make_coloc_data(vec![make_entry(
             "rs1",
-            "T/C",
+            "A/G",
+            vec![make_match("G", "G")],
             0,
             0,
-            Some("A:pathogenic"),
             None,
+            None,
+            None,
+            af_values,
         )]);
-        // VEP allele for T>C is "C", but clin_sig_allele has "A:pathogenic" → no match.
-        assert_eq!(data.clin_sig_for_allele("T", "C"), "");
+
+        let flags = VepFlags {
+            check_existing: true,
+            af: true,
+            af_1kg: true,
+            af_gnomade: true,
+            af_gnomadg: true,
+            max_af: true,
+            pubmed: false,
+        };
+        let fields = data.frequency_fields("G", "G", &flags);
+
+        assert_eq!(fields.af_values[0], "0.1250");
+        assert_eq!(fields.af_values[1], "0.25");
+        assert_eq!(fields.af_values[6], "0.5");
+        assert_eq!(fields.af_values[16], "0.8");
+        assert_eq!(fields.max_af, "0.25");
+        assert_eq!(fields.max_af_pops, "AFR");
     }
 
     #[test]
-    fn test_clin_sig_for_allele_no_clin_sig() {
-        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, None, None)]);
-        assert_eq!(data.clin_sig_for_allele("T", "C"), "");
-    }
+    fn test_colocated_frequency_fields_support_unshifted_input_match() {
+        let mut af_values = vec![""; AF_COLUMNS.len()];
+        af_values[0] = "-:0.9301";
 
-    #[test]
-    fn test_clin_sig_for_allele_deduplicates() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, Some("C:benign"), None),
-            make_entry("rs2", "T/C", 0, 0, Some("C:benign"), None),
-        ]);
-        assert_eq!(data.clin_sig_for_allele("T", "C"), "benign");
-    }
-
-    #[test]
-    fn test_clin_sig_for_allele_multiple_entries() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, Some("C:benign"), None),
-            make_entry("rs2", "T/C", 0, 0, Some("C:pathogenic"), None),
-        ]);
-        assert_eq!(data.clin_sig_for_allele("T", "C"), "benign&pathogenic");
-    }
-
-    #[test]
-    fn test_clin_sig_for_allele_missing_colon() {
-        // Malformed clin_sig_allele without colon → skipped.
         let data = make_coloc_data(vec![make_entry(
             "rs1",
-            "T/C",
+            "AA/-",
+            vec![make_match("A", "-")],
             0,
-            0,
-            Some("benign_only"),
-            None,
-        )]);
-        assert_eq!(data.clin_sig_for_allele("T", "C"), "");
-    }
-
-    #[test]
-    fn test_clin_sig_for_allele_empty_sig_part() {
-        // Empty significance after colon → skipped.
-        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, Some("C:"), None)]);
-        assert_eq!(data.clin_sig_for_allele("T", "C"), "");
-    }
-
-    // --- pubmed_for_allele ---
-
-    #[test]
-    fn test_pubmed_for_allele_single() {
-        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, None, Some("12345"))]);
-        assert_eq!(data.pubmed_for_allele("T", "C"), "12345");
-    }
-
-    #[test]
-    fn test_pubmed_for_allele_aggregation() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, None, Some("111")),
-            make_entry("rs2", "T/C", 0, 0, None, Some("222")),
-        ]);
-        assert_eq!(data.pubmed_for_allele("T", "C"), "111&222");
-    }
-
-    #[test]
-    fn test_pubmed_for_allele_deduplication() {
-        let data = make_coloc_data(vec![
-            make_entry("rs1", "T/C", 0, 0, None, Some("111,222")),
-            make_entry("rs2", "T/C", 0, 0, None, Some("222,333")),
-        ]);
-        assert_eq!(data.pubmed_for_allele("T", "C"), "111&222&333");
-    }
-
-    #[test]
-    fn test_pubmed_for_allele_no_pubmed() {
-        let data = make_coloc_data(vec![make_entry("rs1", "T/C", 0, 0, None, None)]);
-        assert_eq!(data.pubmed_for_allele("T", "C"), "");
-    }
-
-    #[test]
-    fn test_pubmed_for_allele_non_matching_allele_excluded() {
-        let data = make_coloc_data(vec![make_entry("rs1", "T/A", 0, 0, None, Some("12345"))]);
-        // T/A doesn't match VCF T>C.
-        assert_eq!(data.pubmed_for_allele("T", "C"), "");
-    }
-
-    #[test]
-    fn test_pubmed_for_allele_cosmic_included() {
-        let data = make_coloc_data(vec![make_entry(
-            "COSV1",
-            "COSMIC_MUTATION",
-            1,
             0,
             None,
-            Some("99999"),
+            None,
+            None,
+            af_values,
         )]);
-        assert_eq!(data.pubmed_for_allele("A", "G"), "99999");
+
+        let flags = VepFlags {
+            check_existing: true,
+            af: true,
+            af_1kg: false,
+            af_gnomade: false,
+            af_gnomadg: false,
+            max_af: false,
+            pubmed: false,
+        };
+        let fields = data.frequency_fields("-", "A", &flags);
+        assert_eq!(fields.af_values[0], "0.9301");
     }
 
     // =======================================================================
@@ -3962,36 +3898,8 @@ mod tests {
         );
     }
 
-    // =======================================================================
-    // Existing_variation fallback logic
-    // =======================================================================
-
     #[test]
-    fn test_existing_var_prefers_coloc_over_variation_name() {
-        // When co-located data exists, use it; otherwise fall back to variation_name.
-        let coloc = ColocatedData {
-            existing_variation: "rs1&rs2".to_string(),
-            entries: vec![],
-        };
-        let variation_name = "rs1";
-
-        // With co-located data → use co-located.
-        let existing = Some(&coloc)
-            .map(|c| c.existing_variation.as_str())
-            .unwrap_or(variation_name);
-        assert_eq!(existing, "rs1&rs2");
-
-        // Without co-located data → fall back to variation_name.
-        let existing_fallback: Option<&ColocatedData> = None;
-        let existing2 = existing_fallback
-            .map(|c| c.existing_variation.as_str())
-            .unwrap_or(variation_name);
-        assert_eq!(existing2, "rs1");
-    }
-
-    #[test]
-    fn test_existing_var_empty_when_check_existing_false() {
-        // When check_existing=false, Existing_variation should be empty.
+    fn test_existing_variation_empty_when_check_existing_false() {
         let flags = VepFlags::from_options_json(None);
         let existing = if flags.check_existing { "rs1" } else { "" };
         assert_eq!(existing, "");

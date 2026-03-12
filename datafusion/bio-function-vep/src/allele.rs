@@ -5,7 +5,224 @@ use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, String
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
+use std::collections::HashSet;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MatchedVariantAllele {
+    pub a_allele: String,
+    pub a_index: usize,
+    pub b_allele: String,
+    pub b_index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VariantAlleleInput<'a> {
+    pub allele_string: &'a str,
+    pub pos: i64,
+    pub strand: i8,
+}
+
+/// Traceability:
+/// - Ensembl Variation `trim_sequences()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///
+/// This is a source-equivalent port of the release/115 allele minimization
+/// used by Ensembl VEP's matched-alleles flow.
+pub fn trim_sequences_ensembl(
+    ref_allele: &str,
+    alt_allele: &str,
+    start: i64,
+    end_first: bool,
+    strand: i8,
+) -> (String, String, i64, i64, bool) {
+    let mut ref_allele = ref_allele.as_bytes().to_vec();
+    let mut alt_allele = alt_allele.as_bytes().to_vec();
+    let mut start = start;
+    let mut end = start + ref_allele.len() as i64 - 1;
+    let mut changed = false;
+
+    if end_first {
+        while !ref_allele.is_empty()
+            && !alt_allele.is_empty()
+            && ref_allele[ref_allele.len() - 1] == alt_allele[alt_allele.len() - 1]
+        {
+            ref_allele.pop();
+            alt_allele.pop();
+            if strand == -1 {
+                start += 1;
+            } else {
+                end -= 1;
+            }
+            changed = true;
+        }
+
+        while !ref_allele.is_empty() && !alt_allele.is_empty() && ref_allele[0] == alt_allele[0] {
+            ref_allele.remove(0);
+            alt_allele.remove(0);
+            if strand == -1 {
+                end -= 1;
+            } else {
+                start += 1;
+            }
+            changed = true;
+        }
+    } else {
+        while !ref_allele.is_empty() && !alt_allele.is_empty() && ref_allele[0] == alt_allele[0] {
+            ref_allele.remove(0);
+            alt_allele.remove(0);
+            if strand == -1 {
+                end -= 1;
+            } else {
+                start += 1;
+            }
+            changed = true;
+        }
+
+        while !ref_allele.is_empty()
+            && !alt_allele.is_empty()
+            && ref_allele[ref_allele.len() - 1] == alt_allele[alt_allele.len() - 1]
+        {
+            ref_allele.pop();
+            alt_allele.pop();
+            if strand == -1 {
+                start += 1;
+            } else {
+                end -= 1;
+            }
+            changed = true;
+        }
+    }
+
+    let ref_allele = if ref_allele.is_empty() {
+        "-".to_string()
+    } else {
+        String::from_utf8(ref_allele).unwrap_or_default()
+    };
+    let alt_allele = if alt_allele.is_empty() {
+        "-".to_string()
+    } else {
+        String::from_utf8(alt_allele).unwrap_or_default()
+    };
+
+    (ref_allele, alt_allele, start, end, changed)
+}
+
+fn reverse_complement_ascii(seq: &str) -> Option<String> {
+    let mut out = String::with_capacity(seq.len());
+    for b in seq.as_bytes().iter().rev() {
+        out.push(match b.to_ascii_uppercase() {
+            b'A' => 'T',
+            b'C' => 'G',
+            b'G' => 'C',
+            b'T' => 'A',
+            b'N' => 'N',
+            b'-' => '-',
+            _ => return None,
+        });
+    }
+    Some(out)
+}
+
+fn parse_variant_allele_string(allele_string: &str) -> Option<(&str, Vec<&str>)> {
+    if allele_string.starts_with('/') || !allele_string.contains('/') {
+        return None;
+    }
+    let mut parts = allele_string.split('/');
+    let ref_allele = parts.next()?;
+    let alts: Vec<&str> = parts.collect();
+    if alts.is_empty() {
+        return None;
+    }
+    Some((ref_allele, alts))
+}
+
+fn trim_directions(ref_allele: &str, alt_allele: &str) -> &'static [bool] {
+    if ref_allele.len() > 1 || alt_allele.len() > 1 {
+        &[false, true]
+    } else {
+        &[false]
+    }
+}
+
+/// Traceability:
+/// - Ensembl Variation `get_matched_variant_alleles()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258
+///
+/// This is a source-equivalent port of the release/115 matched-alleles
+/// algorithm used by Ensembl VEP `compare_existing()`.
+pub fn get_matched_variant_alleles(
+    a: VariantAlleleInput<'_>,
+    b: VariantAlleleInput<'_>,
+) -> Vec<MatchedVariantAllele> {
+    let Some((a_ref_raw, a_alts_raw)) = parse_variant_allele_string(a.allele_string) else {
+        return Vec::new();
+    };
+    let Some((b_ref_raw, b_alts_raw)) = parse_variant_allele_string(b.allele_string) else {
+        return Vec::new();
+    };
+    if a.pos == 0 || b.pos == 0 {
+        return Vec::new();
+    }
+
+    let mut a_ref = a_ref_raw.to_string();
+    if a.strand != b.strand {
+        let Some(reverse_ref) = reverse_complement_ascii(&a_ref) else {
+            return Vec::new();
+        };
+        a_ref = reverse_ref;
+    }
+
+    let mut minimised_a_alleles: Vec<(String, String, String, usize)> = Vec::new();
+    for (a_index, orig_a_alt) in a_alts_raw.iter().enumerate() {
+        let mut a_alt = (*orig_a_alt).to_string();
+        if a.strand != b.strand {
+            let Some(reverse_alt) = reverse_complement_ascii(&a_alt) else {
+                return Vec::new();
+            };
+            a_alt = reverse_alt;
+        }
+
+        for &end_first in trim_directions(&a_ref, orig_a_alt) {
+            let (trimmed_ref, trimmed_alt, trimmed_pos, _, _) =
+                trim_sequences_ensembl(&a_ref, &a_alt, a.pos, end_first, 1);
+            minimised_a_alleles.push((
+                format!("{trimmed_ref}_{trimmed_alt}_{trimmed_pos}"),
+                (*orig_a_alt).to_string(),
+                a_alt.clone(),
+                a_index,
+            ));
+        }
+    }
+
+    let mut matches = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (b_index, orig_b_alt) in b_alts_raw.iter().enumerate() {
+        for &end_first in trim_directions(b_ref_raw, orig_b_alt) {
+            let (trimmed_ref, trimmed_alt, trimmed_pos, _, _) =
+                trim_sequences_ensembl(b_ref_raw, orig_b_alt, b.pos, end_first, 1);
+            let key = format!("{trimmed_ref}_{trimmed_alt}_{trimmed_pos}");
+
+            if let Some((_, orig_a_alt, _, a_index)) =
+                minimised_a_alleles.iter().find(|(candidate, ..)| candidate == &key)
+            {
+                let matched = MatchedVariantAllele {
+                    a_allele: orig_a_alt.clone(),
+                    a_index: *a_index,
+                    b_allele: (*orig_b_alt).to_string(),
+                    b_index,
+                };
+                if seen.insert(matched.clone()) {
+                    matches.push(matched);
+                }
+                break;
+            }
+        }
+    }
+
+    matches
+}
 
 /// Convert VCF REF/ALT pair to VEP allele format.
 ///
@@ -453,6 +670,68 @@ mod tests {
         let (r, a) = vcf_to_vep_allele("A", "G");
         assert_eq!(r, "A");
         assert_eq!(a, "G");
+    }
+
+    #[test]
+    fn test_trim_sequences_ensembl_left_first_deletion() {
+        let (r, a, start, end, changed) = trim_sequences_ensembl("ACGT", "A", 100, false, 1);
+        assert_eq!((r.as_str(), a.as_str(), start, end, changed), ("CGT", "-", 101, 103, true));
+    }
+
+    #[test]
+    fn test_trim_sequences_ensembl_right_first_homopolymer() {
+        let (r, a, start, end, changed) = trim_sequences_ensembl("AAAA", "AAA", 100, true, 1);
+        assert_eq!((r.as_str(), a.as_str(), start, end, changed), ("A", "-", 100, 100, true));
+    }
+
+    #[test]
+    fn test_get_matched_variant_alleles_repeat_shifted_deletion() {
+        let matches = get_matched_variant_alleles(
+            VariantAlleleInput {
+                allele_string: "AAA/A",
+                pos: 100,
+                strand: 1,
+            },
+            VariantAlleleInput {
+                allele_string: "AA/-",
+                pos: 101,
+                strand: 1,
+            },
+        );
+        assert_eq!(
+            matches,
+            vec![MatchedVariantAllele {
+                a_allele: "A".to_string(),
+                a_index: 0,
+                b_allele: "-".to_string(),
+                b_index: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_get_matched_variant_alleles_multiallelic() {
+        let matches = get_matched_variant_alleles(
+            VariantAlleleInput {
+                allele_string: "A/G/T",
+                pos: 100,
+                strand: 1,
+            },
+            VariantAlleleInput {
+                allele_string: "A/C/T",
+                pos: 100,
+                strand: 1,
+            },
+        );
+        assert_eq!(
+            matches,
+            vec![MatchedVariantAllele {
+                a_allele: "T".to_string(),
+                a_index: 1,
+                b_allele: "T".to_string(),
+                b_index: 1,
+            }]
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! - Emits unmatched VCF rows with NULL cache columns (LEFT JOIN semantics)
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -29,96 +29,21 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt};
 
-use crate::allele::{allele_matches, vep_norm_end, vep_norm_start};
+use crate::allele::{
+    MatchedVariantAllele, VariantAlleleInput, allele_matches, get_matched_variant_alleles,
+    vcf_to_vep_allele, vep_norm_end, vep_norm_start,
+};
 use crate::coordinate::CoordinateNormalizer;
-
-/// Trim common prefix/suffix from ref and alt, adjusting position.
-/// Equivalent to VEP Perl's `trim_sequences()`.
-/// `end_first`: if true, trim suffix before prefix (direction=1 in VEP).
-fn trim_sequences(
-    ref_allele: &str,
-    alt_allele: &str,
-    start: i64,
-    end_first: bool,
-) -> (String, String, i64) {
-    let mut r: Vec<u8> = ref_allele.as_bytes().to_vec();
-    let mut a: Vec<u8> = alt_allele.as_bytes().to_vec();
-    let mut pos = start;
-
-    if end_first {
-        // Trim from right first
-        while !r.is_empty() && !a.is_empty() && r[r.len() - 1] == a[a.len() - 1] {
-            r.pop();
-            a.pop();
-        }
-        // Then trim from left
-        while !r.is_empty() && !a.is_empty() && r[0] == a[0] {
-            r.remove(0);
-            a.remove(0);
-            pos += 1;
-        }
-    } else {
-        // Trim from left first
-        while !r.is_empty() && !a.is_empty() && r[0] == a[0] {
-            r.remove(0);
-            a.remove(0);
-            pos += 1;
-        }
-        // Then trim from right
-        while !r.is_empty() && !a.is_empty() && r[r.len() - 1] == a[a.len() - 1] {
-            r.pop();
-            a.pop();
-        }
-    }
-
-    let ref_out = if r.is_empty() {
-        "-".to_string()
-    } else {
-        String::from_utf8(r).unwrap_or_default()
-    };
-    let alt_out = if a.is_empty() {
-        "-".to_string()
-    } else {
-        String::from_utf8(a).unwrap_or_default()
-    };
-    (ref_out, alt_out, pos)
-}
-
-/// Build normalized allele key(s) for co-located matching.
-/// VEP tries both trim directions when either allele length > 1.
-fn normalized_allele_keys(ref_allele: &str, alt_allele: &str, pos: i64) -> Vec<String> {
-    let mut keys = Vec::with_capacity(2);
-    let (r, a, p) = trim_sequences(ref_allele, alt_allele, pos, false);
-    keys.push(format!("{}\0{}\0{}", r, a, p));
-    if ref_allele.len() > 1 || alt_allele.len() > 1 {
-        let (r2, a2, p2) = trim_sequences(ref_allele, alt_allele, pos, true);
-        let key2 = format!("{}\0{}\0{}", r2, a2, p2);
-        if key2 != keys[0] {
-            keys.push(key2);
-        }
-    }
-    keys
-}
-
-/// Parse cache allele_string (e.g. "A/G" or "AC/A/G") into (ref, Vec<alt>).
-fn parse_cache_allele_string(allele_string: &str) -> Option<(&str, Vec<&str>)> {
-    if !allele_string.contains('/') {
-        return None;
-    }
-    let parts: Vec<&str> = allele_string.split('/').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    Some((parts[0], parts[1..].to_vec()))
-}
 
 /// A cache row's co-located metadata collected during streaming.
 #[derive(Debug, Clone)]
 pub struct ColocatedCacheEntry {
     pub variation_name: String,
     pub allele_string: String,
+    pub matched_alleles: Vec<MatchedVariantAllele>,
     pub somatic: i64,
     pub pheno: i64,
+    pub clin_sig: Option<String>,
     pub clin_sig_allele: Option<String>,
     pub pubmed: Option<String>,
     /// Raw AF column values (indexed same as `AF_COL_NAMES`).
@@ -135,7 +60,7 @@ pub const AF_COL_NAMES: &[&str] = &[
     "EAS",
     "EUR",
     "SAS",
-    "gnomADe_AF",
+    "gnomADe",
     "gnomADe_AFR",
     "gnomADe_AMR",
     "gnomADe_ASJ",
@@ -145,7 +70,7 @@ pub const AF_COL_NAMES: &[&str] = &[
     "gnomADe_NFE",
     "gnomADe_REMAINING",
     "gnomADe_SAS",
-    "gnomADg_AF",
+    "gnomADg",
     "gnomADg_AFR",
     "gnomADg_AMI",
     "gnomADg_AMR",
@@ -157,6 +82,142 @@ pub const AF_COL_NAMES: &[&str] = &[
     "gnomADg_REMAINING",
     "gnomADg_SAS",
 ];
+
+fn read_optional_i64(
+    batch: &RecordBatch,
+    row: usize,
+    column_idx: Option<usize>,
+    name: &str,
+) -> Option<i64> {
+    column_idx.and_then(|idx| {
+        let column = batch.column(idx);
+        if column.is_null(row) {
+            None
+        } else {
+            I64Accessor::new(column, name).ok().map(|accessor| accessor.value(row))
+        }
+    })
+}
+
+fn read_optional_string(
+    batch: &RecordBatch,
+    row: usize,
+    column_idx: Option<usize>,
+    name: &str,
+) -> Option<String> {
+    column_idx.and_then(|idx| {
+        let column = batch.column(idx);
+        if column.is_null(row) {
+            None
+        } else {
+            StringAccessor::new(column, name)
+                .ok()
+                .map(|accessor| accessor.value(row).to_string())
+        }
+    })
+}
+
+fn push_unique_candidate(candidates: &mut Vec<usize>, seen: &mut HashSet<usize>, candidate: usize) {
+    if seen.insert(candidate) {
+        candidates.push(candidate);
+    }
+}
+
+/// Traceability:
+/// - Ensembl VEP `InputBuffer::get_overlapping_vfs()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/InputBuffer.pm#L311-L329
+///
+/// This mirrors VEP's prefilter by considering overlaps against both shifted
+/// and unshifted input coordinates before `compare_existing()` decides whether
+/// the existing variant is allele-compatible.
+fn collect_overlapping_candidates(
+    build: &BuildSide,
+    chrom: &str,
+    start: i64,
+    end: i64,
+) -> Vec<usize> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let probe_start = start.min(end);
+    let probe_end = start.max(end);
+
+    if let Some(tree) = build.trees.get(chrom) {
+        tree.query(probe_start as i32, probe_end as i32, |interval| {
+            push_unique_candidate(&mut candidates, &mut seen, *interval.metadata as usize);
+        });
+    }
+
+    if let Some(tree) = build.unshifted_trees.get(chrom) {
+        tree.query(probe_start as i32, probe_end as i32, |interval| {
+            push_unique_candidate(&mut candidates, &mut seen, *interval.metadata as usize);
+        });
+    }
+
+    candidates
+}
+
+/// Traceability:
+/// - Ensembl VEP `compare_existing()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206
+/// - Ensembl Variation `get_matched_variant_alleles()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258
+///
+/// This ports VEP's existing-variant decision exactly for the offline cache
+/// path: unknown-allele records match only on exact shifted coordinates, while
+/// known-allele records are accepted only when shifted or unshifted input
+/// alleles produce non-empty `matched_alleles`.
+fn compare_existing_variant(
+    input_row: &BuildRow,
+    existing_allele_string: &str,
+    existing_start: i64,
+    existing_end: i64,
+) -> Option<Vec<MatchedVariantAllele>> {
+    if !existing_allele_string.contains('/') {
+        return (existing_start == input_row.vep_start && existing_end == input_row.vep_end)
+            .then_some(Vec::new());
+    }
+
+    let mut matched_alleles = get_matched_variant_alleles(
+        VariantAlleleInput {
+            allele_string: &input_row.shifted_allele_string,
+            pos: input_row.vep_start,
+            strand: 1,
+        },
+        VariantAlleleInput {
+            allele_string: existing_allele_string,
+            pos: existing_start,
+            strand: 1,
+        },
+    );
+
+    if input_row.unshifted_allele_string != input_row.shifted_allele_string
+        || input_row.unshifted_start != input_row.vep_start
+    {
+        let mut seen = matched_alleles.iter().cloned().collect::<HashSet<_>>();
+        for matched in get_matched_variant_alleles(
+            VariantAlleleInput {
+                allele_string: &input_row.unshifted_allele_string,
+                pos: input_row.unshifted_start,
+                strand: 1,
+            },
+            VariantAlleleInput {
+                allele_string: existing_allele_string,
+                pos: existing_start,
+                strand: 1,
+            },
+        ) {
+            if seen.insert(matched.clone()) {
+                matched_alleles.push(matched);
+            }
+        }
+    }
+
+    if matched_alleles.is_empty() {
+        None
+    } else {
+        Some(matched_alleles)
+    }
+}
 
 /// Shared sink for co-located data collected during `VariantLookupExec` streaming.
 /// Key = VCF (chrom, vep_start, vep_end), value = cache entries at that position.
@@ -307,14 +368,14 @@ impl ExecutionPlan for VariantLookupExec {
 struct BuildRow {
     vcf_ref: String,
     vcf_alt: String,
+    shifted_allele_string: String,
+    unshifted_allele_string: String,
     /// VEP-normalized start (1-based). Stored for tree fallback coordinate check.
     vep_start: i64,
     /// VEP-normalized end (1-based, may be < start for insertions).
     vep_end: i64,
-    /// Original 1-based start before VEP normalization. Used for co-located
-    /// fallback: VEP Perl also checks `unshifted_start` for indels.
-    #[allow(dead_code)]
-    orig_start: i64,
+    /// Original 1-based coordinates before VEP normalization.
+    unshifted_start: i64,
 }
 
 /// Materialized build side: VCF data + dual lookup indices.
@@ -334,13 +395,11 @@ struct BuildSide {
     /// Intervals use raw 1-based coordinates (not VEP-normalized) so that
     /// shifted indels can be found via range overlap.
     trees: HashMap<String, COITree<u32, u32>>,
+    /// Unshifted input coordinates used by VEP's overlap prefilter before
+    /// `compare_existing()` checks the unshifted allele string.
+    unshifted_trees: HashMap<String, COITree<u32, u32>>,
     /// Track which build rows have been matched.
     matched: Vec<bool>,
-    /// Normalized allele keys for co-located matching.
-    /// Key = (chrom, "trimmed_ref\0trimmed_alt\0trimmed_pos"), value = VCF row indices.
-    /// VEP Perl's `get_matched_variant_alleles` normalizes both input and cache
-    /// alleles then compares — this index pre-computes the VCF side.
-    coloc_norm_index: HashMap<String, HashMap<String, Vec<u32>>>,
 }
 
 /// Cached column indices for the cache (probe) schema, resolved once on first batch.
@@ -369,9 +428,9 @@ enum StreamState {
 /// Cached column indices for co-located metadata in the cache schema.
 struct ColocIndices {
     variation_name: usize,
-    allele_string: usize,
     somatic: Option<usize>,
     pheno: Option<usize>,
+    clin_sig: Option<usize>,
     clin_sig_allele: Option<usize>,
     pubmed: Option<usize>,
     /// Column indices for AF fields (same order as `AF_COL_NAMES`).
@@ -477,15 +536,23 @@ impl VariantLookupStream {
             .collect();
         self.coloc_indices = Some(ColocIndices {
             variation_name,
-            allele_string: cache_schema.index_of("allele_string").unwrap_or(usize::MAX),
             somatic: cache_schema.index_of("somatic").ok(),
             pheno: cache_schema.index_of("phenotype_or_disease").ok(),
+            clin_sig: cache_schema.index_of("clin_sig").ok(),
             clin_sig_allele: cache_schema.index_of("clin_sig_allele").ok(),
             pubmed: cache_schema.index_of("pubmed").ok(),
             af_indices,
         });
     }
 
+    /// Traceability:
+    /// - Ensembl VEP `InputBuffer::get_overlapping_vfs()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/InputBuffer.pm#L311-L329
+    /// - Ensembl VEP `compare_existing()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L168-L196
+    ///
+    /// The build side must retain both the shifted lookup coordinates and the
+    /// upstream input state required for later shifted/unshifted matching.
     /// Materialize all VCF batches and build dual lookup indices (hash + COITree).
     fn materialize_build_side(&mut self) -> Result<()> {
         if self.vcf_batches.is_empty() {
@@ -522,6 +589,7 @@ impl VariantLookupStream {
         let mut rows = Vec::with_capacity(num_rows);
         let mut hash_index: HashMap<String, HashMap<(i64, i64), Vec<u32>>> = HashMap::new();
         let mut intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
+        let mut unshifted_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
 
         for i in 0..num_rows {
             let raw_chrom = &chroms[i];
@@ -538,13 +606,16 @@ impl VariantLookupStream {
             let end = ends[i];
             let vcf_ref = refs[i].clone();
             let vcf_alt = alts[i].clone();
+            let (shifted_ref, shifted_alt) = vcf_to_vep_allele(&vcf_ref, &vcf_alt);
+            let shifted_allele_string = format!("{shifted_ref}/{shifted_alt}");
+            let unshifted_allele_string = format!("{vcf_ref}/{vcf_alt}");
 
             let one_based_start = if self.coord_normalizer.input_zero_based {
                 start + 1
             } else {
                 start
             };
-            let _one_based_end = end;
+            let one_based_end = end;
 
             // VEP-normalized coordinates for the hash index (exact matching).
             let vep_start = vep_norm_start(one_based_start, &vcf_ref, &vcf_alt);
@@ -569,12 +640,25 @@ impl VariantLookupStream {
                 .or_default()
                 .push(Interval::new(tree_start as i32, tree_end as i32, i as u32));
 
+            let unshifted_tree_start = one_based_start.min(one_based_end);
+            let unshifted_tree_end = one_based_start.max(one_based_end);
+            unshifted_intervals_by_chrom
+                .entry(norm_chrom.clone())
+                .or_default()
+                .push(Interval::new(
+                    unshifted_tree_start as i32,
+                    unshifted_tree_end as i32,
+                    i as u32,
+                ));
+
             rows.push(BuildRow {
                 vcf_ref,
                 vcf_alt,
+                shifted_allele_string,
+                unshifted_allele_string,
                 vep_start,
                 vep_end,
-                orig_start: one_based_start,
+                unshifted_start: one_based_start,
             });
         }
 
@@ -583,37 +667,20 @@ impl VariantLookupStream {
             trees.insert(chrom, COITree::new(&intervals));
         }
 
-        let matched = vec![false; num_rows];
-
-        // Build normalized allele index for co-located matching.
-        // For each VCF row, compute normalized keys (VEP Perl trim_sequences)
-        // so that during probe we can match shifted indels by allele identity.
-        let mut coloc_norm_index: HashMap<String, HashMap<String, Vec<u32>>> = HashMap::new();
-        for (i, row) in rows.iter().enumerate() {
-            let chrom = {
-                let raw = &chroms[i];
-                if self.vcf_has_chr {
-                    raw.strip_prefix("chr").unwrap_or(raw).to_string()
-                } else {
-                    raw.clone()
-                }
-            };
-            // Use orig_start (raw VCF position) for normalization, matching
-            // VEP Perl which normalizes from the original input coordinates.
-            let keys = normalized_allele_keys(&row.vcf_ref, &row.vcf_alt, row.orig_start);
-            let chrom_map = coloc_norm_index.entry(chrom).or_default();
-            for key in keys {
-                chrom_map.entry(key).or_default().push(i as u32);
-            }
+        let mut unshifted_trees = HashMap::new();
+        for (chrom, intervals) in unshifted_intervals_by_chrom {
+            unshifted_trees.insert(chrom, COITree::new(&intervals));
         }
+
+        let matched = vec![false; num_rows];
 
         self.build = Some(BuildSide {
             vcf_batch,
             rows,
             hash_index,
             trees,
+            unshifted_trees,
             matched,
-            coloc_norm_index,
         });
 
         Ok(())
@@ -753,126 +820,51 @@ impl VariantLookupStream {
                     cache_start_raw
                 };
                 let ce1 = cache_end_raw;
+                let allele_str = cache_alleles.value(cache_row);
 
-                let Some(tree) = build.trees.get(cache_chrom) else {
+                if !build.trees.contains_key(cache_chrom) && !build.unshifted_trees.contains_key(cache_chrom)
+                {
                     continue;
-                };
-
-                let probe_s = cs1.min(ce1);
-                let probe_e = cs1.max(ce1);
-
-                // Build entry lazily (only when tree has hits).
-                let mut entry: Option<ColocatedCacheEntry> = None;
-
-                // First try exact position match via tree overlap.
-                let mut matched_vcf_indices: Vec<usize> = Vec::new();
-                let mut tree_had_overlaps = false;
-                tree.query(probe_s as i32, probe_e as i32, |interval| {
-                    tree_had_overlaps = true;
-                    let vcf_idx = *interval.metadata as usize;
-                    let vcf_row = &build.rows[vcf_idx];
-
-                    // Co-located = exact position match.
-                    if cs1 == vcf_row.vep_start && ce1 == vcf_row.vep_end {
-                        matched_vcf_indices.push(vcf_idx);
-                    }
-                });
-
-                // Fallback: normalized allele matching for shifted indels.
-                // Only when tree found overlaps (nearby VCF variants exist) but
-                // none matched exactly — avoids expensive normalization for the
-                // vast majority of cache rows that have no nearby VCF variants.
-                if matched_vcf_indices.is_empty() && tree_had_overlaps {
-                    let allele_str = cache_alleles.value(cache_row);
-                    if let Some((cache_ref, cache_alts)) = parse_cache_allele_string(allele_str) {
-                        if let Some(chrom_map) = build.coloc_norm_index.get(cache_chrom) {
-                            for cache_alt in &cache_alts {
-                                let keys = normalized_allele_keys(cache_ref, cache_alt, cs1);
-                                for key in &keys {
-                                    if let Some(vcf_idxs) = chrom_map.get(key) {
-                                        for &vi in vcf_idxs {
-                                            matched_vcf_indices.push(vi as usize);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
-
-                for &vcf_idx in &matched_vcf_indices {
-                    let e = entry.get_or_insert_with(|| {
-                        let allele_str_val = if coloc_idx.allele_string != usize::MAX {
-                            StringAccessor::new(
-                                cache_batch.column(coloc_idx.allele_string),
-                                "allele_string",
-                            )
-                            .map(|a| a.value(cache_row).to_string())
-                            .unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
-                        ColocatedCacheEntry {
-                            variation_name: var_name.to_string(),
-                            allele_string: allele_str_val,
-                            somatic: coloc_idx
-                                .somatic
-                                .and_then(|idx| {
-                                    I64Accessor::new(cache_batch.column(idx), "somatic")
-                                        .ok()
-                                        .map(|a| a.value(cache_row))
-                                })
-                                .unwrap_or(0),
-                            pheno: coloc_idx
-                                .pheno
-                                .and_then(|idx| {
-                                    I64Accessor::new(cache_batch.column(idx), "pheno")
-                                        .ok()
-                                        .map(|a| a.value(cache_row))
-                                })
-                                .unwrap_or(0),
-                            clin_sig_allele: coloc_idx.clin_sig_allele.and_then(|idx| {
-                                let col = cache_batch.column(idx);
-                                if col.is_null(cache_row) {
-                                    return None;
-                                }
-                                StringAccessor::new(col, "clin_sig_allele")
-                                    .ok()
-                                    .map(|a| a.value(cache_row).to_string())
-                            }),
-                            pubmed: coloc_idx.pubmed.and_then(|idx| {
-                                let col = cache_batch.column(idx);
-                                if col.is_null(cache_row) {
-                                    return None;
-                                }
-                                StringAccessor::new(col, "pubmed")
-                                    .ok()
-                                    .map(|a| a.value(cache_row).to_string())
-                            }),
-                            af_values: coloc_idx
-                                .af_indices
-                                .iter()
-                                .map(|opt_idx| {
-                                    opt_idx
-                                        .and_then(|idx| {
-                                            let col = cache_batch.column(idx);
-                                            if col.is_null(cache_row) {
-                                                return None;
-                                            }
-                                            StringAccessor::new(col, "af")
-                                                .ok()
-                                                .map(|a| a.value(cache_row).to_string())
-                                        })
-                                        .unwrap_or_default()
-                                })
-                                .collect(),
-                        }
-                    });
-
+                for vcf_idx in collect_overlapping_candidates(build, cache_chrom, cs1, ce1) {
                     let vcf_row = &build.rows[vcf_idx];
-                    let key =
-                        (cache_chrom.to_string(), vcf_row.vep_start, vcf_row.vep_end);
-                    local_buf.entry(key).or_default().push(e.clone());
+                    let Some(matched_alleles) =
+                        compare_existing_variant(vcf_row, allele_str, cs1, ce1)
+                    else {
+                        continue;
+                    };
+
+                    let key = (cache_chrom.to_string(), vcf_row.vep_start, vcf_row.vep_end);
+                    local_buf.entry(key).or_default().push(ColocatedCacheEntry {
+                        variation_name: var_name.to_string(),
+                        allele_string: allele_str.to_string(),
+                        matched_alleles,
+                        somatic: read_optional_i64(cache_batch, cache_row, coloc_idx.somatic, "somatic")
+                            .unwrap_or(0),
+                        pheno: read_optional_i64(
+                            cache_batch,
+                            cache_row,
+                            coloc_idx.pheno,
+                            "phenotype_or_disease",
+                        )
+                        .unwrap_or(0),
+                        clin_sig: read_optional_string(cache_batch, cache_row, coloc_idx.clin_sig, "clin_sig"),
+                        clin_sig_allele: read_optional_string(
+                            cache_batch,
+                            cache_row,
+                            coloc_idx.clin_sig_allele,
+                            "clin_sig_allele",
+                        ),
+                        pubmed: read_optional_string(cache_batch, cache_row, coloc_idx.pubmed, "pubmed"),
+                        af_values: coloc_idx
+                            .af_indices
+                            .iter()
+                            .map(|opt_idx| {
+                                read_optional_string(cache_batch, cache_row, *opt_idx, "af")
+                                    .unwrap_or_default()
+                            })
+                            .collect(),
+                    });
                 }
             }
 
@@ -1281,80 +1273,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trim_sequences_snv_no_change() {
-        // SNV: single bases, no common prefix/suffix.
-        let (r, a, p) = trim_sequences("A", "G", 100, false);
-        assert_eq!((r.as_str(), a.as_str(), p), ("A", "G", 100));
+    fn compare_existing_variant_matches_shifted_or_unshifted_input() {
+        let row = BuildRow {
+            vcf_ref: "AAA".to_string(),
+            vcf_alt: "A".to_string(),
+            shifted_allele_string: "AA/-".to_string(),
+            unshifted_allele_string: "AAA/A".to_string(),
+            vep_start: 101,
+            vep_end: 102,
+            unshifted_start: 100,
+        };
+
+        let matched = compare_existing_variant(&row, "AA/-", 101, 102).unwrap();
+        assert_eq!(
+            matched,
+            vec![
+                MatchedVariantAllele {
+                    a_allele: "-".to_string(),
+                    a_index: 0,
+                    b_allele: "-".to_string(),
+                    b_index: 0,
+                },
+                MatchedVariantAllele {
+                    a_allele: "A".to_string(),
+                    a_index: 0,
+                    b_allele: "-".to_string(),
+                    b_index: 0,
+                },
+            ]
+        );
     }
 
     #[test]
-    fn trim_sequences_deletion_left_first() {
-        // ACGT/A → left trim A → CGT/- at 101
-        let (r, a, p) = trim_sequences("ACGT", "A", 100, false);
-        assert_eq!((r.as_str(), a.as_str(), p), ("CGT", "-", 101));
-    }
+    fn compare_existing_variant_allows_unknown_alleles_on_exact_shifted_coords_only() {
+        let row = BuildRow {
+            vcf_ref: "ACGT".to_string(),
+            vcf_alt: "A".to_string(),
+            shifted_allele_string: "CGT/-".to_string(),
+            unshifted_allele_string: "ACGT/A".to_string(),
+            vep_start: 101,
+            vep_end: 103,
+            unshifted_start: 100,
+        };
 
-    #[test]
-    fn trim_sequences_insertion_left_first() {
-        // A/ACGT → left trim A → -/CGT at 101
-        let (r, a, p) = trim_sequences("A", "ACGT", 100, false);
-        assert_eq!((r.as_str(), a.as_str(), p), ("-", "CGT", 101));
-    }
-
-    #[test]
-    fn trim_sequences_homopolymer_deletion_both_directions() {
-        // AAAA/AAA at pos 100
-        // left-first: trim 3 A's from left → A/- at 103
-        let (r, a, p) = trim_sequences("AAAA", "AAA", 100, false);
-        assert_eq!((r.as_str(), a.as_str(), p), ("A", "-", 103));
-        // right-first: trim 3 A's from right → A/- at 100
-        let (r, a, p) = trim_sequences("AAAA", "AAA", 100, true);
-        assert_eq!((r.as_str(), a.as_str(), p), ("A", "-", 100));
-    }
-
-    #[test]
-    fn normalized_allele_keys_snv_single_key() {
-        let keys = normalized_allele_keys("A", "G", 100);
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0], "A\0G\0100");
-    }
-
-    #[test]
-    fn normalized_allele_keys_indel_two_directions() {
-        // AAAA/AAA: both trim directions give different positions.
-        let keys = normalized_allele_keys("AAAA", "AAA", 100);
-        assert_eq!(keys.len(), 2);
-        assert!(keys.contains(&"A\0-\0103".to_string()));
-        assert!(keys.contains(&"A\0-\0100".to_string()));
-    }
-
-    #[test]
-    fn normalized_allele_keys_dedup_when_same() {
-        // AC/A at pos 100: left-first: C/- at 101, right-first: A/- at 100... wait
-        // left-first: trim A prefix → C/- at 101. Then right trim: nothing.
-        // right-first: trim nothing from right (C≠A). Then left trim A → C/- at 101.
-        // Same result → only 1 key.
-        let keys = normalized_allele_keys("AC", "A", 100);
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0], "C\0-\0101");
-    }
-
-    #[test]
-    fn parse_cache_allele_string_basic() {
-        let (r, alts) = parse_cache_allele_string("A/G").unwrap();
-        assert_eq!(r, "A");
-        assert_eq!(alts, vec!["G"]);
-    }
-
-    #[test]
-    fn parse_cache_allele_string_multi_allelic() {
-        let (r, alts) = parse_cache_allele_string("AC/A/G").unwrap();
-        assert_eq!(r, "AC");
-        assert_eq!(alts, vec!["A", "G"]);
-    }
-
-    #[test]
-    fn parse_cache_allele_string_no_slash() {
-        assert!(parse_cache_allele_string("COSMIC_MUTATION").is_none());
+        assert_eq!(
+            compare_existing_variant(&row, "HGMD_MUTATION", 101, 103),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            compare_existing_variant(&row, "HGMD_MUTATION", 100, 103),
+            None
+        );
     }
 }
