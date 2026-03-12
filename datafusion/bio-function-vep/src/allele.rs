@@ -29,17 +29,18 @@ pub struct VariantAlleleInput<'a> {
 ///
 /// This is a source-equivalent port of the release/115 allele minimization
 /// used by Ensembl VEP's matched-alleles flow.
-pub fn trim_sequences_ensembl(
+pub fn trim_sequences_ensembl_with_end(
     ref_allele: &str,
     alt_allele: &str,
     start: i64,
+    end: i64,
     end_first: bool,
     strand: i8,
 ) -> (String, String, i64, i64, bool) {
     let mut ref_allele = ref_allele.as_bytes().to_vec();
     let mut alt_allele = alt_allele.as_bytes().to_vec();
     let mut start = start;
-    let mut end = start + ref_allele.len() as i64 - 1;
+    let mut end = end;
     let mut changed = false;
 
     if end_first {
@@ -106,6 +107,23 @@ pub fn trim_sequences_ensembl(
     };
 
     (ref_allele, alt_allele, start, end, changed)
+}
+
+/// Traceability:
+/// - Ensembl Variation `trim_sequences()`
+///   https://github.com/ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///
+/// Convenience wrapper for callers that start from a REF allele span where the
+/// end coordinate can be derived directly from `start + len(ref) - 1`.
+pub fn trim_sequences_ensembl(
+    ref_allele: &str,
+    alt_allele: &str,
+    start: i64,
+    end_first: bool,
+    strand: i8,
+) -> (String, String, i64, i64, bool) {
+    let end = start + ref_allele.len() as i64 - 1;
+    trim_sequences_ensembl_with_end(ref_allele, alt_allele, start, end, end_first, strand)
 }
 
 fn reverse_complement_ascii(seq: &str) -> Option<String> {

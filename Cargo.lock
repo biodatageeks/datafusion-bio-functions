@@ -1170,6 +1170,8 @@ dependencies = [
  "futures",
  "log",
  "lz4_flex 0.12.0",
+ "noodles-core 0.16.0",
+ "noodles-fasta",
  "serde_json",
  "tempfile",
  "tokio",

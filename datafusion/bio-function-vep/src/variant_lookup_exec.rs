@@ -10,6 +10,7 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
+use std::io::{BufRead, Seek};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -28,6 +29,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use futures::{Stream, StreamExt};
+use noodles_core::{Position, Region};
+use noodles_fasta as fasta;
 
 use crate::allele::{
     MatchedVariantAllele, VariantAlleleInput, allele_matches, get_matched_variant_alleles,
@@ -125,13 +128,178 @@ fn push_unique_candidate(candidates: &mut Vec<usize>, seen: &mut HashSet<usize>,
     }
 }
 
+#[derive(Clone, Copy)]
+enum ShiftableIndelKind {
+    Insertion,
+    Deletion,
+}
+
+fn parse_shiftable_indel(allele_string: &str) -> Option<(&str, &str, ShiftableIndelKind)> {
+    let (ref_allele, alt_allele) = allele_string.split_once('/')?;
+    if ref_allele == "-" && !alt_allele.is_empty() && alt_allele != "-" {
+        return Some((ref_allele, alt_allele, ShiftableIndelKind::Insertion));
+    }
+    if alt_allele == "-" && !ref_allele.is_empty() && ref_allele != "-" {
+        return Some((ref_allele, alt_allele, ShiftableIndelKind::Deletion));
+    }
+    None
+}
+
+fn build_reference_region(chrom: &str, start: i64, end: i64) -> Result<Region> {
+    let start = usize::try_from(start).map_err(|_| {
+        DataFusionError::Execution(format!(
+            "reference query start is negative or overflowed for {chrom}:{start}-{end}"
+        ))
+    })?;
+    let end = usize::try_from(end).map_err(|_| {
+        DataFusionError::Execution(format!(
+            "reference query end is negative or overflowed for {chrom}:{start}-{end}"
+        ))
+    })?;
+    let start = Position::try_from(start).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "reference query start is invalid for {chrom}:{start}-{end}: {e}"
+        ))
+    })?;
+    let end = Position::try_from(end).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "reference query end is invalid for {chrom}:{start}-{end}: {e}"
+        ))
+    })?;
+    Ok(Region::new(chrom, start..=end))
+}
+
+fn read_reference_sequence<R>(
+    reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
+    chrom: &str,
+    start: i64,
+    end: i64,
+) -> Result<String>
+where
+    R: BufRead + Seek,
+{
+    let region = build_reference_region(chrom, start, end)?;
+    let record = reader.query(&region).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "failed to query reference FASTA for {chrom}:{start}-{end}: {e}"
+        ))
+    })?;
+    String::from_utf8(record.sequence().as_ref().to_vec()).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "reference FASTA returned non-UTF8 sequence for {chrom}:{start}-{end}: {e}"
+        ))
+    })
+}
+
+/// Traceability:
+/// - Ensembl Variation `perform_shift()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351
+///
+/// This is the source-equivalent positive-strand genomic branch of VEP's
+/// indel shifting loop. It rotates the shifted sequence through the 3' flank
+/// and advances genomic coordinates one base at a time until the next flank
+/// base no longer matches.
+fn perform_forward_genomic_shift(
+    seq_to_check: &str,
+    post_seq: &str,
+    start: i64,
+    end: i64,
+) -> (usize, String, i64, i64) {
+    let mut seq_to_check = seq_to_check.as_bytes().to_vec();
+    let post_seq = post_seq.as_bytes();
+    let indel_length = seq_to_check.len();
+    let mut shift_length = 0usize;
+    let mut start = start;
+    let mut end = end;
+
+    if indel_length == 0 || post_seq.len() < indel_length {
+        return (
+            0,
+            String::from_utf8(seq_to_check).unwrap_or_default(),
+            start,
+            end,
+        );
+    }
+
+    let loop_limiter = post_seq.len() - indel_length;
+    for n in 0..=loop_limiter {
+        let check_next = seq_to_check[0];
+        if check_next != post_seq[n] {
+            break;
+        }
+
+        shift_length += 1;
+        seq_to_check.rotate_left(1);
+        start += 1;
+        end += 1;
+    }
+
+    (
+        shift_length,
+        String::from_utf8(seq_to_check).unwrap_or_default(),
+        start,
+        end,
+    )
+}
+
+/// Traceability:
+/// - Ensembl Variation `create_shift_hash()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400
+/// - Ensembl Variation `_genomic_shift()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L411-L466
+///
+/// This materializes the VF-level genomic shift state VEP uses for colocated
+/// matching: active compare space becomes the shifted indel representation,
+/// while the original minimized representation is retained separately as
+/// `unshifted_*`.
+fn build_shifted_compare_state<R>(
+    reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
+    chrom: &str,
+    allele_string: &str,
+    start: i64,
+    end: i64,
+) -> Result<Option<(String, i64, i64)>>
+where
+    R: BufRead + Seek,
+{
+    let Some((ref_allele, alt_allele, kind)) = parse_shiftable_indel(allele_string) else {
+        return Ok(None);
+    };
+
+    let seq_to_check = match kind {
+        ShiftableIndelKind::Insertion => alt_allele,
+        ShiftableIndelKind::Deletion => ref_allele,
+    };
+
+    let flank_start = end + 1;
+    if flank_start <= 0 {
+        return Ok(None);
+    }
+    let flank_end = flank_start + 999;
+    let post_seq = read_reference_sequence(reader, chrom, flank_start, flank_end)?;
+    let (shift_length, shifted_seq, shifted_start, shifted_end) =
+        perform_forward_genomic_shift(seq_to_check, &post_seq, start, end);
+
+    if shift_length == 0 {
+        return Ok(None);
+    }
+
+    let shifted_allele_string = match kind {
+        ShiftableIndelKind::Insertion => format!("-/{shifted_seq}"),
+        ShiftableIndelKind::Deletion => format!("{shifted_seq}/-"),
+    };
+
+    Ok(Some((shifted_allele_string, shifted_start, shifted_end)))
+}
+
 /// Traceability:
 /// - Ensembl VEP `InputBuffer::get_overlapping_vfs()`
 ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/InputBuffer.pm#L311-L329
 ///
 /// This mirrors VEP's prefilter by considering overlaps against both shifted
-/// and, when defined, unshifted input coordinates before `compare_existing()`
-/// decides whether the existing variant is allele-compatible.
+/// active coordinates and, when defined, unshifted minimized coordinates
+/// before `compare_existing()` decides whether the existing variant is
+/// allele-compatible.
 fn collect_overlapping_candidates(
     build: &BuildSide,
     chrom: &str,
@@ -143,7 +311,7 @@ fn collect_overlapping_candidates(
     let probe_start = start.min(end);
     let probe_end = start.max(end);
 
-    if let Some(tree) = build.parser_trees.get(chrom) {
+    if let Some(tree) = build.compare_trees.get(chrom) {
         tree.query(probe_start as i32, probe_end as i32, |interval| {
             push_unique_candidate(&mut candidates, &mut seen, *interval.metadata as usize);
         });
@@ -248,6 +416,7 @@ pub struct VariantLookupExec {
     coord_normalizer: CoordinateNormalizer,
     extended_probes: bool,
     allowed_failed: i64,
+    reference_fasta_path: Option<String>,
     output_schema: SchemaRef,
     properties: PlanProperties,
     /// Optional sink for co-located data collected during probe phase.
@@ -264,6 +433,7 @@ impl VariantLookupExec {
         coord_normalizer: CoordinateNormalizer,
         extended_probes: bool,
         allowed_failed: i64,
+        reference_fasta_path: Option<String>,
         output_schema: SchemaRef,
     ) -> Self {
         let properties = PlanProperties::new(
@@ -281,6 +451,7 @@ impl VariantLookupExec {
             coord_normalizer,
             extended_probes,
             allowed_failed,
+            reference_fasta_path,
             output_schema,
             properties,
             colocated_sink: None,
@@ -348,6 +519,7 @@ impl ExecutionPlan for VariantLookupExec {
             self.coord_normalizer.clone(),
             self.extended_probes,
             self.allowed_failed,
+            self.reference_fasta_path.clone(),
             self.output_schema.clone(),
         );
         exec.colocated_sink = self.colocated_sink.clone();
@@ -371,6 +543,7 @@ impl ExecutionPlan for VariantLookupExec {
             self.coord_normalizer.clone(),
             self.extended_probes,
             self.allowed_failed,
+            self.reference_fasta_path.clone(),
             self.colocated_sink.clone(),
         )))
     }
@@ -426,9 +599,10 @@ struct BuildSide {
     /// Intervals use raw 1-based coordinates (not VEP-normalized) so that
     /// shifted indels can be found via range overlap.
     trees: HashMap<String, COITree<u32, u32>>,
-    /// Parser/input-space overlap trees used by VEP `get_overlapping_vfs()`
-    /// before `compare_existing()` evaluates allele compatibility.
-    parser_trees: HashMap<String, COITree<u32, u32>>,
+    /// Active minimized or shifted compare-space overlap trees used by VEP
+    /// `get_overlapping_vfs()` before `compare_existing()` evaluates allele
+    /// compatibility.
+    compare_trees: HashMap<String, COITree<u32, u32>>,
     /// Unshifted input coordinates used by VEP's overlap prefilter before
     /// `compare_existing()` checks the unshifted allele string. Populated only
     /// for rows where upstream shift state exists.
@@ -485,6 +659,9 @@ struct VariantLookupStream {
     extended_probes: bool,
     /// Maximum allowed cache `failed` value.
     allowed_failed: i64,
+    /// Optional indexed reference FASTA used to materialize Ensembl genomic
+    /// shift state for colocated existing-variant matching.
+    reference_fasta_path: Option<String>,
     state: StreamState,
     /// Accumulated VCF batches (before build side is materialized).
     vcf_batches: Vec<RecordBatch>,
@@ -510,6 +687,7 @@ impl VariantLookupStream {
         coord_normalizer: CoordinateNormalizer,
         extended_probes: bool,
         allowed_failed: i64,
+        reference_fasta_path: Option<String>,
         colocated_sink: Option<ColocatedSink>,
     ) -> Self {
         let num_vcf_cols = schema.fields().len() - cache_columns.len();
@@ -522,6 +700,7 @@ impl VariantLookupStream {
             coord_normalizer,
             extended_probes,
             allowed_failed,
+            reference_fasta_path,
             state: StreamState::CollectBuild,
             vcf_batches: Vec::new(),
             build: None,
@@ -628,10 +807,24 @@ impl VariantLookupStream {
         let alts = as_string_values(vcf_batch.column(alt_idx), "alt")?;
 
         let num_rows = vcf_batch.num_rows();
+        let mut reference_reader = self
+            .reference_fasta_path
+            .as_deref()
+            .map(|path| {
+                fasta::io::indexed_reader::Builder::default()
+                    .build_from_path(path)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "failed to open indexed reference FASTA '{path}': {e}"
+                        ))
+                    })
+            })
+            .transpose()?;
+
         let mut rows = Vec::with_capacity(num_rows);
         let mut hash_index: HashMap<String, HashMap<(i64, i64), Vec<u32>>> = HashMap::new();
         let mut intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
-        let mut parser_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
+        let mut compare_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
         let mut unshifted_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
 
         for i in 0..num_rows {
@@ -684,14 +877,40 @@ impl VariantLookupStream {
                 .or_default()
                 .push(Interval::new(tree_start as i32, tree_end as i32, i as u32));
 
-            let parser_tree_start = input_start.min(one_based_end);
-            let parser_tree_end = input_start.max(one_based_end);
-            parser_intervals_by_chrom
+            let mut active_compare_allele_string = compare_allele_string.clone();
+            let mut active_compare_start = vep_start;
+            let mut active_compare_end = vep_end;
+            let mut unshifted_allele_string = None;
+            let mut unshifted_start = None;
+            let mut unshifted_end = None;
+
+            if let Some(reader) = reference_reader.as_mut() {
+                if let Some((shifted_allele_string, shifted_start, shifted_end)) =
+                    build_shifted_compare_state(
+                        reader,
+                        &norm_chrom,
+                        &compare_allele_string,
+                        vep_start,
+                        vep_end,
+                    )?
+                {
+                    unshifted_allele_string = Some(compare_allele_string.clone());
+                    unshifted_start = Some(vep_start);
+                    unshifted_end = Some(vep_end);
+                    active_compare_allele_string = shifted_allele_string;
+                    active_compare_start = shifted_start;
+                    active_compare_end = shifted_end;
+                }
+            }
+
+            let compare_tree_start = active_compare_start.min(active_compare_end);
+            let compare_tree_end = active_compare_start.max(active_compare_end);
+            compare_intervals_by_chrom
                 .entry(norm_chrom.clone())
                 .or_default()
                 .push(Interval::new(
-                    parser_tree_start as i32,
-                    parser_tree_end as i32,
+                    compare_tree_start as i32,
+                    compare_tree_end as i32,
                     i as u32,
                 ));
 
@@ -701,14 +920,14 @@ impl VariantLookupStream {
                 input_allele_string,
                 input_start,
                 input_end: one_based_end,
-                compare_allele_string,
-                compare_start: vep_start,
-                compare_end: vep_end,
-                unshifted_allele_string: None,
+                compare_allele_string: active_compare_allele_string,
+                compare_start: active_compare_start,
+                compare_end: active_compare_end,
+                unshifted_allele_string,
                 vep_start,
                 vep_end,
-                unshifted_start: None,
-                unshifted_end: None,
+                unshifted_start,
+                unshifted_end,
             });
         }
 
@@ -744,9 +963,9 @@ impl VariantLookupStream {
             trees.insert(chrom, COITree::new(&intervals));
         }
 
-        let mut parser_trees = HashMap::new();
-        for (chrom, intervals) in parser_intervals_by_chrom {
-            parser_trees.insert(chrom, COITree::new(&intervals));
+        let mut compare_trees = HashMap::new();
+        for (chrom, intervals) in compare_intervals_by_chrom {
+            compare_trees.insert(chrom, COITree::new(&intervals));
         }
 
         let mut unshifted_trees = HashMap::new();
@@ -761,7 +980,7 @@ impl VariantLookupStream {
             rows,
             hash_index,
             trees,
-            parser_trees,
+            compare_trees,
             unshifted_trees,
             matched,
         });
@@ -923,7 +1142,7 @@ impl VariantLookupStream {
                 let ce1 = cache_end_raw;
                 let allele_str = cache_alleles.value(cache_row);
 
-                if !build.parser_trees.contains_key(cache_chrom)
+                if !build.compare_trees.contains_key(cache_chrom)
                     && !build.unshifted_trees.contains_key(cache_chrom)
                 {
                     continue;
@@ -1393,6 +1612,9 @@ fn as_i64_values(col: &ArrayRef, column_name: &str) -> Result<Vec<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use datafusion::arrow::array::StringArray;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -1400,6 +1622,28 @@ mod tests {
     fn empty_sendable_stream(schema: SchemaRef) -> SendableRecordBatchStream {
         let iter = futures::stream::iter(Vec::<Result<RecordBatch>>::new());
         Box::pin(RecordBatchStreamAdapter::new(schema, Box::pin(iter)))
+    }
+
+    fn write_reference_fasta(prefix: &str, chrom: &str, sequence: &str) -> String {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fasta_path = std::env::temp_dir().join(format!("{prefix}_{unique}.fa"));
+        let header = format!(">{chrom}\n");
+        fs::write(&fasta_path, format!("{header}{sequence}\n")).unwrap();
+        fs::write(
+            fasta_path.with_extension("fa.fai"),
+            format!(
+                "{chrom}\t{}\t{}\t{}\t{}\n",
+                sequence.len(),
+                header.len(),
+                sequence.len(),
+                sequence.len() + 1,
+            ),
+        )
+        .unwrap();
+        fasta_path.display().to_string()
     }
 
     #[test]
@@ -1518,7 +1762,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_overlapping_candidates_uses_parser_space_coordinates() {
+    fn collect_overlapping_candidates_uses_active_compare_coordinates() {
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
         let empty_batch = RecordBatch::new_empty(schema);
         let build = BuildSide {
@@ -1543,16 +1787,16 @@ mod tests {
                 "1".to_string(),
                 COITree::new(&[Interval::new(62689177, 62689188, 0)]),
             )]),
-            parser_trees: HashMap::from([(
+            compare_trees: HashMap::from([(
                 "1".to_string(),
-                COITree::new(&[Interval::new(62689176, 62689202, 0)]),
+                COITree::new(&[Interval::new(62689177, 62689188, 0)]),
             )]),
             unshifted_trees: HashMap::new(),
             matched: vec![false],
         };
 
         assert_eq!(
-            collect_overlapping_candidates(&build, "1", 62689176, 62689202),
+            collect_overlapping_candidates(&build, "1", 62689177, 62689188),
             vec![0]
         );
     }
@@ -1620,6 +1864,7 @@ mod tests {
             true,
             0,
             None,
+            None,
         );
         stream.vcf_batches.push(batch);
 
@@ -1635,5 +1880,55 @@ mod tests {
         assert_eq!(row.compare_end, 119247097);
         assert_eq!(row.vep_start, 119247098);
         assert_eq!(row.vep_end, 119247097);
+    }
+
+    #[test]
+    fn materialize_build_side_materializes_shifted_and_unshifted_compare_state() {
+        let fasta_path = write_reference_fasta("repeat_shift", "1", "ACACACACAC");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![3])),
+                Arc::new(StringArray::from(vec!["ACA"])),
+                Arc::new(StringArray::from(vec!["A"])),
+            ],
+        )
+        .unwrap();
+
+        let mut stream = VariantLookupStream::new(
+            empty_sendable_stream(schema.clone()),
+            empty_sendable_stream(schema.clone()),
+            schema,
+            Vec::new(),
+            false,
+            CoordinateNormalizer::new(false, false),
+            true,
+            0,
+            Some(fasta_path),
+            None,
+        );
+        stream.vcf_batches.push(batch);
+
+        stream.materialize_build_side().unwrap();
+        let build = stream.build.as_ref().unwrap();
+        let row = &build.rows[0];
+
+        assert_eq!(row.compare_allele_string, "CA/-");
+        assert_eq!(row.compare_start, 8);
+        assert_eq!(row.compare_end, 9);
+        assert_eq!(row.unshifted_allele_string.as_deref(), Some("CA/-"));
+        assert_eq!(row.unshifted_start, Some(2));
+        assert_eq!(row.unshifted_end, Some(3));
+        assert_eq!(collect_overlapping_candidates(build, "1", 8, 9), vec![0]);
+        assert_eq!(collect_overlapping_candidates(build, "1", 2, 3), vec![0]);
     }
 }

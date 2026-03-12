@@ -106,6 +106,7 @@ impl TableFunctionImpl for LookupFunction {
             columns,
             extended_probes,
             0,
+            None,
         )?))
     }
 }

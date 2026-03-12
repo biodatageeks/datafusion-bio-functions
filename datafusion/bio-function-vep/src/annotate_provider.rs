@@ -1770,6 +1770,10 @@ impl AnnotateProvider {
             .as_deref()
             .and_then(|opts| Self::parse_json_i64_option(opts, "failed"))
             .unwrap_or(0);
+        let reference_fasta_path = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_string_option(opts, "reference_fasta_path"));
         let mut provider = LookupProvider::new(
             Arc::clone(&self.session),
             self.vcf_table.clone(),
@@ -1779,6 +1783,7 @@ impl AnnotateProvider {
             cache_columns,
             extended_probes,
             allowed_failed,
+            reference_fasta_path,
         )?;
         if flags.check_existing {
             provider.set_colocated_sink(Arc::clone(&coloc_sink));
