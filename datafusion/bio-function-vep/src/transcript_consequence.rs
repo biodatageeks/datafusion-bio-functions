@@ -446,12 +446,13 @@ impl TranscriptConsequenceEngine {
                                 // first exon where uncertainty exists).
                                 let n_pad_len = tx_translation
                                     .and_then(|t| t.cds_sequence.as_deref())
-                                    .map(|s| s.as_bytes().iter().take_while(|&&b| b == b'N').count())
+                                    .map(|s| {
+                                        s.as_bytes().iter().take_while(|&&b| b == b'N').count()
+                                    })
                                     .unwrap_or(0);
                                 let use_question = tx.cds_start_nf
                                     && n_pad_len > 0
-                                    && cc.cds_position_start
-                                        .is_some_and(|p| p <= n_pad_len);
+                                    && cc.cds_position_start.is_some_and(|p| p <= n_pad_len);
                                 let cds_pos = match (cc.cds_position_start, cc.cds_position_end) {
                                     (Some(s), Some(e)) if s == e => {
                                         if use_question {
@@ -5282,7 +5283,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn cds_position_no_question_mark_when_cds_start_nf_but_no_phase() {
         // CDS starts with ATG (no N padding) + cds_start_nf → plain "N" format.
@@ -5364,7 +5364,6 @@ mod tests {
             "Protein position past N-pad region should NOT use '?-': {prot_pos}"
         );
     }
-
 
     #[test]
     fn protein_position_no_question_mark_when_cds_start_nf_but_no_phase() {

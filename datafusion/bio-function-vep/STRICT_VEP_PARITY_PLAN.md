@@ -557,6 +557,23 @@ cargo test --workspace --lib
     - parser-space candidate overlap and per-allele sink keys are necessary to avoid cross-allele contamination
     - those fixes are not sufficient to restore VEP parity on their own
 
+- a later exact serializer/traceability pass removed two non-semantic divergences without changing the remaining colocated-match diagnosis:
+  - report: `/tmp/annotate_vep_golden_bench_phase1j/HG002_chr1_0_comparison_report.txt`
+  - perfect fields: `56/74`
+  - remaining imperfect fields: `18`
+  - exact fixes validated on chr1:
+    - `FLAGS`: `428 -> 0` after parsing ordered `cds_*` attributes from `raw_object_json` instead of reconstructing canonical order from booleans
+    - `MAX_AF`: `1,884 -> 324` after preserving the raw winning frequency string instead of reformatting small values away from VEP's scientific notation
+  - remaining colocated failures after this pass are all true matching/allele-identity gaps, not serialization noise:
+    - `Existing_variation`: `341`
+    - `gnomADg_AF`: `324`
+    - `MAX_AF`: `324`
+    - `MAX_AF_POPS`: `324`
+    - `AF/AFR_AF/AMR_AF/EAS_AF/EUR_AF/SAS_AF`: `15` each
+    - `gnomADe_AF`: `2`
+    - `SOMATIC`: `12`
+    - `PHENO`: `12`
+
 New discrepancy diagnosis discovered during the later reruns:
 
 - there are two remaining strict Phase 1 gaps, both confirmed against upstream source and benchmark loci:

@@ -94,7 +94,9 @@ fn read_optional_i64(
         if column.is_null(row) {
             None
         } else {
-            I64Accessor::new(column, name).ok().map(|accessor| accessor.value(row))
+            I64Accessor::new(column, name)
+                .ok()
+                .map(|accessor| accessor.value(row))
         }
     })
 }
@@ -623,8 +625,7 @@ impl VariantLookupStream {
         let mut hash_index: HashMap<String, HashMap<(i64, i64), Vec<u32>>> = HashMap::new();
         let mut intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
         let mut parser_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
-        let mut unshifted_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> =
-            HashMap::new();
+        let mut unshifted_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
 
         for i in 0..num_rows {
             let raw_chrom = &chroms[i];
@@ -719,7 +720,11 @@ impl VariantLookupStream {
             unshifted_intervals_by_chrom
                 .entry(chrom)
                 .or_default()
-                .push(Interval::new(tree_start as i32, tree_end as i32, row_idx as u32));
+                .push(Interval::new(
+                    tree_start as i32,
+                    tree_end as i32,
+                    row_idx as u32,
+                ));
         }
 
         let mut trees = HashMap::new();
@@ -850,12 +855,12 @@ impl VariantLookupStream {
                         // 1. Exact match (same as hash would find)
                         // 2. Swapped (insertion-style: cache start/end flipped)
                         // 3. Cache range contains VEP point (half-open vs closed)
-                        let exact = cache_start_1based == row.vep_start
-                            && cache_end_1based == row.vep_end;
-                        let swapped = cache_start_1based == row.vep_end
-                            && cache_end_1based == row.vep_start;
-                        let contains = cache_start_1based <= row.vep_start
-                            && cache_end_1based >= row.vep_end;
+                        let exact =
+                            cache_start_1based == row.vep_start && cache_end_1based == row.vep_end;
+                        let swapped =
+                            cache_start_1based == row.vep_end && cache_end_1based == row.vep_start;
+                        let contains =
+                            cache_start_1based <= row.vep_start && cache_end_1based >= row.vep_end;
                         if !exact && !swapped && !contains {
                             return;
                         }
@@ -873,9 +878,7 @@ impl VariantLookupStream {
         // --- Co-located data collection (piggybacked on same cache scan) ---
         // For every cache row with a non-empty variation_name, probe the VCF
         // COITree to find overlapping VCF positions and collect the entry.
-        if let (Some(sink), Some(coloc_idx)) =
-            (&self.colocated_sink, &self.coloc_indices)
-        {
+        if let (Some(sink), Some(coloc_idx)) = (&self.colocated_sink, &self.coloc_indices) {
             let var_name_col = cache_batch.column(coloc_idx.variation_name);
             let var_names = StringAccessor::new(var_name_col, "variation_name")?;
 
@@ -931,8 +934,13 @@ impl VariantLookupStream {
                         variation_name: var_name.to_string(),
                         allele_string: allele_str.to_string(),
                         matched_alleles,
-                        somatic: read_optional_i64(cache_batch, cache_row, coloc_idx.somatic, "somatic")
-                            .unwrap_or(0),
+                        somatic: read_optional_i64(
+                            cache_batch,
+                            cache_row,
+                            coloc_idx.somatic,
+                            "somatic",
+                        )
+                        .unwrap_or(0),
                         pheno: read_optional_i64(
                             cache_batch,
                             cache_row,
@@ -940,14 +948,24 @@ impl VariantLookupStream {
                             "phenotype_or_disease",
                         )
                         .unwrap_or(0),
-                        clin_sig: read_optional_string(cache_batch, cache_row, coloc_idx.clin_sig, "clin_sig"),
+                        clin_sig: read_optional_string(
+                            cache_batch,
+                            cache_row,
+                            coloc_idx.clin_sig,
+                            "clin_sig",
+                        ),
                         clin_sig_allele: read_optional_string(
                             cache_batch,
                             cache_row,
                             coloc_idx.clin_sig_allele,
                             "clin_sig_allele",
                         ),
-                        pubmed: read_optional_string(cache_batch, cache_row, coloc_idx.pubmed, "pubmed"),
+                        pubmed: read_optional_string(
+                            cache_batch,
+                            cache_row,
+                            coloc_idx.pubmed,
+                            "pubmed",
+                        ),
                         af_values: coloc_idx
                             .af_indices
                             .iter()

@@ -204,8 +204,9 @@ pub fn get_matched_variant_alleles(
                 trim_sequences_ensembl(b_ref_raw, orig_b_alt, b.pos, end_first, 1);
             let key = format!("{trimmed_ref}_{trimmed_alt}_{trimmed_pos}");
 
-            if let Some((_, orig_a_alt, _, a_index)) =
-                minimised_a_alleles.iter().find(|(candidate, ..)| candidate == &key)
+            if let Some((_, orig_a_alt, _, a_index)) = minimised_a_alleles
+                .iter()
+                .find(|(candidate, ..)| candidate == &key)
             {
                 let matched = MatchedVariantAllele {
                     a_allele: orig_a_alt.clone(),
@@ -715,13 +716,19 @@ mod tests {
     #[test]
     fn test_trim_sequences_ensembl_left_first_deletion() {
         let (r, a, start, end, changed) = trim_sequences_ensembl("ACGT", "A", 100, false, 1);
-        assert_eq!((r.as_str(), a.as_str(), start, end, changed), ("CGT", "-", 101, 103, true));
+        assert_eq!(
+            (r.as_str(), a.as_str(), start, end, changed),
+            ("CGT", "-", 101, 103, true)
+        );
     }
 
     #[test]
     fn test_trim_sequences_ensembl_right_first_homopolymer() {
         let (r, a, start, end, changed) = trim_sequences_ensembl("AAAA", "AAA", 100, true, 1);
-        assert_eq!((r.as_str(), a.as_str(), start, end, changed), ("A", "-", 100, 100, true));
+        assert_eq!(
+            (r.as_str(), a.as_str(), start, end, changed),
+            ("A", "-", 100, 100, true)
+        );
     }
 
     #[test]

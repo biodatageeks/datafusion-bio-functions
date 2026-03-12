@@ -26,19 +26,20 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext};
+use serde_json::Value;
 
 use crate::allele::{MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele};
 use crate::annotation_store::{AnnotationBackend, build_store};
-use crate::lookup_provider::LookupProvider;
-use crate::variant_lookup_exec::{ColocatedCacheEntry, ColocatedKey, ColocatedSink};
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
+use crate::lookup_provider::LookupProvider;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     ExonFeature, MirnaFeature, MotifFeature, PreparedContext, RegulatoryFeature, StructuralFeature,
     SvEventKind, SvFeatureKind, TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature,
     VariantInput, is_vep_transcript,
 };
+use crate::variant_lookup_exec::{ColocatedCacheEntry, ColocatedKey, ColocatedSink};
 
 /// Known variation cache annotation columns exposed as top-level output fields.
 /// All are nullable Utf8. Columns not present in the actual cache emit NULLs.
@@ -442,9 +443,9 @@ impl ColocatedData {
     fn sorted_entries(&self) -> Vec<&ColocatedEntry> {
         let mut entries: Vec<&ColocatedEntry> = self.entries.iter().collect();
         entries.sort_by(|a, b| {
-            (a.somatic != 0)
-                .cmp(&(b.somatic != 0))
-                .then_with(|| variant_prefix_rank(&a.variation_name).cmp(&variant_prefix_rank(&b.variation_name)))
+            (a.somatic != 0).cmp(&(b.somatic != 0)).then_with(|| {
+                variant_prefix_rank(&a.variation_name).cmp(&variant_prefix_rank(&b.variation_name))
+            })
         });
         entries
     }
@@ -562,7 +563,7 @@ impl ColocatedData {
         flags: &VepFlags,
     ) -> ColocatedFrequencyFields {
         let mut per_column: Vec<Vec<String>> = vec![Vec::new(); AF_COLUMNS.len()];
-        let mut max_af: Option<f64> = None;
+        let mut max_af: Option<(f64, String)> = None;
         let mut max_af_pops: Vec<String> = Vec::new();
 
         for entry in self.sorted_entries() {
@@ -573,7 +574,7 @@ impl ColocatedData {
             };
 
             let existing_alleles: Vec<&str> = entry.allele_string.split('/').collect();
-            let mut entry_max_af: Option<f64> = None;
+            let mut entry_max_af: Option<(f64, String)> = None;
             let mut entry_max_af_pops: Vec<String> = Vec::new();
 
             for (idx, column) in AF_COLUMNS.iter().enumerate() {
@@ -588,15 +589,17 @@ impl ColocatedData {
                 }
 
                 let mut freq_data: HashMap<String, String> = HashMap::new();
-                let mut remaining: HashSet<String> =
-                    existing_alleles.iter().map(|allele| (*allele).to_string()).collect();
+                let mut remaining: HashSet<String> = existing_alleles
+                    .iter()
+                    .map(|allele| (*allele).to_string())
+                    .collect();
                 let mut total = 0.0_f64;
 
                 for pair in raw.split(',') {
                     let Some((allele, freq)) = pair.split_once(':') else {
                         continue;
                     };
-                    let formatted = if column.cache_col == "AF" {
+                    let formatted = if column.format_4f {
                         format_af_4f(freq)
                     } else {
                         freq.to_string()
@@ -633,16 +636,16 @@ impl ColocatedData {
                         if let Ok(freq) = chosen.parse::<f64>() {
                             match entry_max_af {
                                 None => {
-                                    entry_max_af = Some(freq);
+                                    entry_max_af = Some((freq, chosen.clone()));
                                     entry_max_af_pops.clear();
                                     entry_max_af_pops.push(pop_name.to_string());
                                 }
-                                Some(current) if freq > current => {
-                                    entry_max_af = Some(freq);
+                                Some((current, _)) if freq > current => {
+                                    entry_max_af = Some((freq, chosen.clone()));
                                     entry_max_af_pops.clear();
                                     entry_max_af_pops.push(pop_name.to_string());
                                 }
-                                Some(current) if (freq - current).abs() < f64::EPSILON => {
+                                Some((current, _)) if (freq - current).abs() < f64::EPSILON => {
                                     push_unique_value(&mut entry_max_af_pops, pop_name.to_string());
                                 }
                                 _ => {}
@@ -653,16 +656,18 @@ impl ColocatedData {
             }
 
             if flags.max_af && !entry_max_af_pops.is_empty() {
-                let entry_max = entry_max_af.unwrap_or(0.0);
-                let current_max = max_af.unwrap_or(0.0);
+                let (entry_max, entry_max_str) = entry_max_af.unwrap_or((0.0, String::new()));
+                let current_max = max_af.as_ref().map(|(value, _)| *value).unwrap_or(0.0);
 
                 if entry_max > current_max {
-                    max_af = Some(entry_max);
+                    max_af = Some((entry_max, entry_max_str.clone()));
                     max_af_pops.clear();
                 }
 
                 if entry_max >= current_max {
-                    max_af = Some(entry_max);
+                    if max_af.is_none() {
+                        max_af = Some((entry_max, entry_max_str));
+                    }
                     max_af_pops.extend(entry_max_af_pops);
                 }
             }
@@ -682,7 +687,7 @@ impl ColocatedData {
 
         ColocatedFrequencyFields {
             af_values,
-            max_af: max_af.map(|value| value.to_string()).unwrap_or_default(),
+            max_af: max_af.map(|(_, raw)| raw).unwrap_or_default(),
             max_af_pops: max_af_pops.join("&"),
         }
     }
@@ -718,7 +723,11 @@ fn build_colocated_map_from_sink(
             if let Some(existing_idx) = seen.get(&ce.variation_name) {
                 let existing = &mut entries[*existing_idx];
                 for matched in &ce.matched_alleles {
-                    if !existing.matched_alleles.iter().any(|entry| entry == matched) {
+                    if !existing
+                        .matched_alleles
+                        .iter()
+                        .any(|entry| entry == matched)
+                    {
                         existing.matched_alleles.push(matched.clone());
                     }
                 }
@@ -738,12 +747,7 @@ fn build_colocated_map_from_sink(
             });
         }
 
-        map.insert(
-            key.clone(),
-            ColocatedData {
-                entries,
-            },
-        );
+        map.insert(key.clone(), ColocatedData { entries });
     }
     map
 }
@@ -1226,7 +1230,13 @@ impl AnnotateProvider {
                 let cds_end_nf = cds_end_nf_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                     .unwrap_or(false);
-                let flags_str = flags_str_from_bools(cds_start_nf, cds_end_nf);
+                let flags_str = resolve_flags_str(
+                    raw_json_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .as_deref(),
+                    cds_start_nf,
+                    cds_end_nf,
+                );
 
                 let gene_stable_id =
                     gene_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
@@ -1754,8 +1764,7 @@ impl AnnotateProvider {
             .schema()
             .as_arrow()
             .clone();
-        let cache_columns: Vec<String> =
-            requested_columns.iter().map(|s| s.to_string()).collect();
+        let cache_columns: Vec<String> = requested_columns.iter().map(|s| s.to_string()).collect();
         let allowed_failed = self
             .options_json
             .as_deref()
@@ -2016,13 +2025,15 @@ impl AnnotateProvider {
                 input_allele_string,
             ));
             let variant_fields = if flags.check_existing {
-                coloc.map(|data| data.variant_fields(&vep_allele, None, flags.pubmed))
+                coloc
+                    .map(|data| data.variant_fields(&vep_allele, None, flags.pubmed))
                     .unwrap_or_default()
             } else {
                 ColocatedVariantFields::default()
             };
             let frequency_fields = if flags.check_existing {
-                coloc.map(|data| data.frequency_fields(&vep_allele, None, &flags))
+                coloc
+                    .map(|data| data.frequency_fields(&vep_allele, None, &flags))
                     .unwrap_or_else(|| ColocatedFrequencyFields {
                         af_values: vec![String::new(); AF_COLUMNS.len()],
                         max_af: String::new(),
@@ -2279,18 +2290,65 @@ fn parse_sv_event_kind(value: &str) -> Option<SvEventKind> {
     }
 }
 
-/// Parse mature miRNA genomic regions from the `raw_object_json` transcript
-/// attribute.  VEP stores miRNA cDNA coordinates in the transcript's attribute
-/// array as `{code: "miRNA", value: "42-59"}`.  We map those cDNA coords to
-/// genomic coordinates using the strand and transcript boundaries.
+/// Select transcript `FLAGS` using the same ordered attribute source Ensembl
+/// VEP uses, with a boolean fallback only when our cache row lacks a readable
+/// serialized attribute payload.
 ///
-/// miRNA transcripts are almost always single-exon, so the mapping is trivial:
-/// - Plus strand:  `genomic = tx.start + cdna - 1`
-/// - Minus strand: `genomic_start = tx.end - cdna_end + 1`, `genomic_end = tx.end - cdna_start + 1`
-/// Reconstruct `FLAGS` string from promoted boolean columns using a canonical
-/// order (cds_start_NF before cds_end_NF).  VEP's encounter order varies per
-/// transcript but our golden benchmark already normalizes term order, so
-/// canonical ordering is correct.
+/// Traceability:
+/// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1425-L1430
+fn resolve_flags_str(
+    raw_object_json: Option<&str>,
+    cds_start_nf: bool,
+    cds_end_nf: bool,
+) -> Option<String> {
+    if cds_start_nf || cds_end_nf {
+        raw_object_json
+            .and_then(flags_str_from_raw_object_json)
+            .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf))
+    } else {
+        None
+    }
+}
+
+/// Parse ordered transcript `FLAGS` from the serialized Ensembl transcript
+/// attributes.
+///
+/// Traceability:
+/// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1425-L1430
+///
+/// Upstream emits `FLAGS` by iterating `get_all_Attributes()` and preserving
+/// the encounter order of `cds_*` codes. Our transcript parquet stores the
+/// serialized attribute array in `raw_object_json`, so we must read it from
+/// there instead of synthesizing a canonical order from booleans.
+fn flags_str_from_raw_object_json(raw_json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(raw_json).ok()?;
+    let attributes = value
+        .get("__value")
+        .and_then(|inner| inner.get("attributes"))
+        .and_then(Value::as_array)?;
+
+    let mut flags = Vec::new();
+    for attribute in attributes {
+        let code = attribute
+            .get("__value")
+            .and_then(|inner| inner.get("code"))
+            .and_then(Value::as_str)?;
+        if code.starts_with("cds_") {
+            flags.push(code.to_string());
+        }
+    }
+
+    if flags.is_empty() {
+        None
+    } else {
+        Some(flags.join("&"))
+    }
+}
+
+/// Reconstruct `FLAGS` string from promoted boolean columns when the ordered
+/// transcript attributes are unavailable in `raw_object_json`.
 fn flags_str_from_bools(cds_start_nf: bool, cds_end_nf: bool) -> Option<String> {
     match (cds_start_nf, cds_end_nf) {
         (true, true) => Some("cds_start_NF&cds_end_NF".to_string()),
@@ -2299,6 +2357,15 @@ fn flags_str_from_bools(cds_start_nf: bool, cds_end_nf: bool) -> Option<String> 
         (false, false) => None,
     }
 }
+
+/// Parse mature miRNA genomic regions from the `raw_object_json` transcript
+/// attribute.  VEP stores miRNA cDNA coordinates in the transcript's attribute
+/// array as `{code: "miRNA", value: "42-59"}`.  We map those cDNA coords to
+/// genomic coordinates using the strand and transcript boundaries.
+///
+/// miRNA transcripts are almost always single-exon, so the mapping is trivial:
+/// - Plus strand:  `genomic = tx.start + cdna - 1`
+/// - Minus strand: `genomic_start = tx.end - cdna_end + 1`, `genomic_end = tx.end - cdna_start + 1`
 
 /// Read mature miRNA genomic regions from a promoted `List<Struct<start,end>>`
 /// column.  Returns `None` if the cell is NULL (letting the caller fall back
@@ -2629,8 +2696,79 @@ mod tests {
     use super::*;
 
     // =======================================================================
-    // flags_str_from_bools
+    // resolve_flags_str / flags_str_from_raw_object_json / flags_str_from_bools
     // =======================================================================
+
+    #[test]
+    fn test_resolve_flags_str_prefers_ordered_raw_object_json() {
+        let raw = r#"{
+            "__value": {
+                "attributes": [
+                    {"__value": {"code": "cds_end_NF"}},
+                    {"__value": {"code": "cds_start_NF"}}
+                ]
+            }
+        }"#;
+
+        assert_eq!(
+            resolve_flags_str(Some(raw), true, true),
+            Some("cds_end_NF&cds_start_NF".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_flags_str_falls_back_to_booleans_when_raw_json_is_invalid() {
+        assert_eq!(
+            resolve_flags_str(Some("{not-json"), true, false),
+            Some("cds_start_NF".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_flags_str_returns_none_without_promoted_flags() {
+        let raw = r#"{
+            "__value": {
+                "attributes": [
+                    {"__value": {"code": "cds_end_NF"}},
+                    {"__value": {"code": "cds_start_NF"}}
+                ]
+            }
+        }"#;
+
+        assert_eq!(resolve_flags_str(Some(raw), false, false), None);
+    }
+
+    #[test]
+    fn test_flags_str_from_raw_object_json_preserves_attribute_order() {
+        let raw = r#"{
+            "__value": {
+                "attributes": [
+                    {"__value": {"code": "cds_end_NF"}},
+                    {"__value": {"code": "cds_start_NF"}},
+                    {"__value": {"code": "TSL"}}
+                ]
+            }
+        }"#;
+
+        assert_eq!(
+            flags_str_from_raw_object_json(raw),
+            Some("cds_end_NF&cds_start_NF".to_string())
+        );
+    }
+
+    #[test]
+    fn test_flags_str_from_raw_object_json_returns_none_without_cds_flags() {
+        let raw = r#"{
+            "__value": {
+                "attributes": [
+                    {"__value": {"code": "TSL"}},
+                    {"__value": {"code": "MANE_Select"}}
+                ]
+            }
+        }"#;
+
+        assert_eq!(flags_str_from_raw_object_json(raw), None);
+    }
 
     #[test]
     fn test_flags_str_both_true() {
@@ -3182,19 +3320,28 @@ mod tests {
     #[test]
     fn test_parse_json_i64_option_basic() {
         let json = r#"{"failed":1}"#;
-        assert_eq!(AnnotateProvider::parse_json_i64_option(json, "failed"), Some(1));
+        assert_eq!(
+            AnnotateProvider::parse_json_i64_option(json, "failed"),
+            Some(1)
+        );
     }
 
     #[test]
     fn test_parse_json_i64_option_missing_key() {
         let json = r#"{"other":1}"#;
-        assert_eq!(AnnotateProvider::parse_json_i64_option(json, "failed"), None);
+        assert_eq!(
+            AnnotateProvider::parse_json_i64_option(json, "failed"),
+            None
+        );
     }
 
     #[test]
     fn test_parse_json_i64_option_rejects_non_integer() {
         let json = r#"{"failed":"yes"}"#;
-        assert_eq!(AnnotateProvider::parse_json_i64_option(json, "failed"), None);
+        assert_eq!(
+            AnnotateProvider::parse_json_i64_option(json, "failed"),
+            None
+        );
     }
 
     // =======================================================================
@@ -3252,7 +3399,10 @@ mod tests {
             clin_sig: clin_sig.map(|value| value.to_string()),
             clin_sig_allele: clin_sig_allele.map(|value| value.to_string()),
             pubmed: pubmed.map(|value| value.to_string()),
-            af_values: af_values.into_iter().map(|value| value.to_string()).collect(),
+            af_values: af_values
+                .into_iter()
+                .map(|value| value.to_string())
+                .collect(),
         }
     }
 
@@ -3439,6 +3589,86 @@ mod tests {
         };
         let fields = data.frequency_fields("-", Some("A"), &flags);
         assert_eq!(fields.af_values[0], "0.9301");
+    }
+
+    #[test]
+    fn test_colocated_frequency_fields_preserve_raw_max_af_string() {
+        let mut af_values = vec![""; AF_COLUMNS.len()];
+        af_values[7] = "G:7.535e-05";
+
+        let data = make_coloc_data(vec![make_entry(
+            "rs1",
+            "A/G",
+            vec![make_match("G", "G")],
+            0,
+            0,
+            None,
+            None,
+            None,
+            af_values,
+        )]);
+
+        let flags = VepFlags {
+            check_existing: true,
+            af: false,
+            af_1kg: false,
+            af_gnomade: false,
+            af_gnomadg: false,
+            max_af: true,
+            pubmed: false,
+        };
+        let fields = data.frequency_fields("G", None, &flags);
+
+        assert_eq!(fields.max_af, "7.535e-05");
+        assert_eq!(fields.max_af_pops, "gnomADe_AFR");
+    }
+
+    #[test]
+    fn test_colocated_frequency_fields_later_higher_entry_overwrites_max_af_and_pop() {
+        let mut af_values_a = vec![""; AF_COLUMNS.len()];
+        af_values_a[3] = "G:0.05";
+
+        let mut af_values_b = vec![""; AF_COLUMNS.len()];
+        af_values_b[7] = "G:0.25";
+
+        let data = make_coloc_data(vec![
+            make_entry(
+                "rs1",
+                "A/G",
+                vec![make_match("G", "G")],
+                0,
+                0,
+                None,
+                None,
+                None,
+                af_values_a,
+            ),
+            make_entry(
+                "rs2",
+                "A/G",
+                vec![make_match("G", "G")],
+                0,
+                0,
+                None,
+                None,
+                None,
+                af_values_b,
+            ),
+        ]);
+
+        let flags = VepFlags {
+            check_existing: true,
+            af: false,
+            af_1kg: false,
+            af_gnomade: false,
+            af_gnomadg: false,
+            max_af: true,
+            pubmed: false,
+        };
+        let fields = data.frequency_fields("G", None, &flags);
+
+        assert_eq!(fields.max_af, "0.25");
+        assert_eq!(fields.max_af_pops, "gnomADe_AFR");
     }
 
     // =======================================================================

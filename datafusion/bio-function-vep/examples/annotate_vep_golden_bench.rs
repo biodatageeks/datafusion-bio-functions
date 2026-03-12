@@ -927,9 +927,8 @@ fn print_summary_table(
         report.extra_in_ours,
     );
     if report.intersection_rows > 0 {
-        let ms_pct = report.most_severe_exact_matches as f64
-            / report.intersection_rows as f64
-            * 100.0;
+        let ms_pct =
+            report.most_severe_exact_matches as f64 / report.intersection_rows as f64 * 100.0;
         let ts_pct = term_report.term_set_exact_matches as f64
             / term_report.comparable_rows.max(1) as f64
             * 100.0;
