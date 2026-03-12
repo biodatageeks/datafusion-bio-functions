@@ -56,8 +56,21 @@ impl ExtensionPlanner for FusedArrayTransformPlanner {
 
         // Build the "element-level" schema for expression conversion
         // This schema represents the columns as if they were unnested (scalar element types)
-        let element_schema =
+        // We include both:
+        // 1. Array columns converted to their element types (for unnested value references)
+        // 2. Passthrough columns as-is (for transform expressions that reference metadata)
+        let array_element_schema =
             build_element_schema_from_arrow(&input_schema, fused_transform.array_columns())?;
+
+        // Add passthrough columns to the element schema
+        // These are already scalar types - transforms may reference them alongside array elements
+        let mut element_fields: Vec<_> = array_element_schema.fields().iter().cloned().collect();
+        for passthrough_col in fused_transform.passthrough_columns() {
+            if let Ok(idx) = input_schema.index_of(passthrough_col) {
+                element_fields.push(Arc::new(input_schema.field(idx).clone()));
+            }
+        }
+        let element_schema = datafusion::arrow::datatypes::Schema::new(element_fields);
         let element_df_schema = DFSchema::try_from(element_schema)?;
 
         // Convert logical expressions to physical expressions using the element schema

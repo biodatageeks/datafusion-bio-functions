@@ -241,9 +241,12 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Result<Option<TraversalResult<'_>>>
             // output schema contains: __unnest_placeholder(indexed.values_a,depth=1)
             for exec_col in &unnest.exec_columns {
                 let input_name = exec_col.name().to_string();
-                // The output column name typically has ",depth=1)" appended before the closing paren
-                // We'll map any column that starts with the input name (without closing paren)
+                // The output column name has ",depth=N)" appended before the closing paren
+                // Input: __unnest_placeholder(col) -> Output: __unnest_placeholder(col,depth=1)
+                // Use exact prefix match with ",depth=" to avoid matching columns that share a prefix
+                // (e.g., values_a and values_ab should not match each other)
                 let input_prefix = input_name.trim_end_matches(')');
+                let expected_output_prefix = format!("{input_prefix},depth=");
 
                 // Find the corresponding output column
                 let unnest_plan = LogicalPlan::Unnest(unnest.clone());
@@ -251,8 +254,9 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Result<Option<TraversalResult<'_>>>
 
                 for (_qualifier, field) in output_schema.iter() {
                     let output_name = field.name();
-                    // Check if this output column corresponds to this input column
-                    if output_name.starts_with(input_prefix) && output_name.contains(",depth=") {
+                    // Check if this output column corresponds to this input column exactly
+                    // by matching the expected pattern: input_prefix + ",depth=" + N + ")"
+                    if output_name.starts_with(&expected_output_prefix) {
                         // Map the output name to an expression referencing the INPUT name
                         column_definitions.insert(
                             output_name.to_string(),
