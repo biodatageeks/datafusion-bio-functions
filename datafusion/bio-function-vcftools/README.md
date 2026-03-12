@@ -168,6 +168,29 @@ The fused transformation **preserves element order** within arrays. Unlike the S
 
 ### Transforms
 
+Transforms can reference both array element columns and passthrough columns (non-array columns in GROUP BY):
+
+```sql
+WITH indexed AS (
+    SELECT ROW_NUMBER() OVER () as row_idx, metadata, values FROM input
+),
+unnested AS (
+    SELECT row_idx, metadata, unnest(values) as val FROM indexed
+),
+transformed AS (
+    -- Reference both unnested value (val) and passthrough column (metadata)
+    SELECT row_idx, metadata,
+           val * 2 AS doubled,
+           CONCAT(metadata, '_', CAST(val AS VARCHAR)) AS labeled
+    FROM unnested
+)
+SELECT row_idx, metadata, array_agg(doubled), array_agg(labeled)
+FROM transformed
+GROUP BY row_idx, metadata
+```
+
+Complex conditional expressions are also supported:
+
 ```sql
 WITH unnested AS (
     SELECT row_idx, unnest(values_a) as val_a, unnest(values_b) as val_b FROM indexed

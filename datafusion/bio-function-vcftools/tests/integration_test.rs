@@ -57,9 +57,11 @@ fn create_test_data() -> RecordBatch {
     let arr_b = list_builder_b.finish();
 
     let metadata = StringArray::from(vec!["meta1", "meta2", "meta3"]);
+    let metadata_int = Int32Array::from(vec![100, 200, 300]);
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("metadata", DataType::Utf8, false),
+        Field::new("metadata_int", DataType::Int32, false),
         Field::new(
             "values_a",
             DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
@@ -74,7 +76,12 @@ fn create_test_data() -> RecordBatch {
 
     RecordBatch::try_new(
         schema,
-        vec![Arc::new(metadata), Arc::new(arr_a), Arc::new(arr_b)],
+        vec![
+            Arc::new(metadata),
+            Arc::new(metadata_int),
+            Arc::new(arr_a),
+            Arc::new(arr_b),
+        ],
     )
     .unwrap()
 }
@@ -2177,6 +2184,201 @@ async fn test_optimization_applied_with_row_identity() {
     assert_eq!(total_rows, 3, "Expected 3 rows in result");
 
     println!("Row-identity validation test passed - optimization correctly applied");
+
+    // Clean up
+    disable_fused_array_transform();
+}
+
+// =============================================================================
+// Passthrough Column in Transform Tests
+// =============================================================================
+
+/// Test that passthrough columns (non-array columns in GROUP BY) can be used
+/// in transform expressions alongside unnested array values.
+///
+/// This validates that the optimizer correctly includes passthrough columns
+/// in the element-level schema used for physical expression planning.
+#[tokio::test]
+#[serial]
+async fn test_passthrough_column_in_transform() {
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::physical_plan::displayable;
+
+    // Use optimized context
+    let ctx = create_optimized_context().await;
+    let batch = create_test_data();
+    let schema = batch.schema();
+
+    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    ctx.register_table("test_data", Arc::new(table)).unwrap();
+
+    // Query that uses `metadata_int` (a passthrough column) in a transform expression
+    // along with the unnested `val_a` column. This requires the planner to include
+    // passthrough columns in the element schema.
+    let sql = r#"
+        WITH indexed AS (
+            SELECT 
+                ROW_NUMBER() OVER () as row_idx,
+                metadata,
+                metadata_int,
+                values_a
+            FROM test_data
+        ),
+        unnested AS (
+            SELECT 
+                row_idx,
+                metadata,
+                metadata_int,
+                unnest(values_a) as val_a
+            FROM indexed
+        ),
+        transformed AS (
+            SELECT
+                row_idx,
+                metadata,
+                metadata_int,
+                val_a,
+                -- Sum passthrough column (metadata_int) with unnested value (val_a)
+                metadata_int + val_a AS labeled_value,
+                -- Concat passthrough column (metadata) with unnested value (val_a)
+                CONCAT(metadata, '_', CAST(val_a AS STRING)) AS labeled_str
+            FROM unnested
+        )
+        SELECT
+            row_idx,
+            metadata,
+            metadata_int,
+            array_agg(val_a) AS values_out,
+            array_agg(labeled_value) AS labeled_values,
+            array_agg(labeled_str) AS labeled_strs
+        FROM transformed
+        GROUP BY row_idx, metadata, metadata_int
+        ORDER BY row_idx
+    "#;
+
+    let df = ctx.sql(sql).await.unwrap();
+
+    // Check the PHYSICAL plan includes our optimization
+    let physical_plan = df.create_physical_plan().await.unwrap();
+    let plan_str = displayable(physical_plan.as_ref()).indent(true).to_string();
+    println!("\n=== Physical plan for passthrough column in transform ===");
+    println!("{plan_str}");
+    println!("=== END ===\n");
+
+    // ASSERT: Optimization must be applied
+    let has_fused = plan_str.contains("FusedArrayTransform");
+    assert!(
+        has_fused,
+        "FusedArrayTransform optimization was NOT applied for passthrough column in transform! \
+         Physical plan:\n{plan_str}"
+    );
+
+    // Execute and get results
+    let df2 = ctx.sql(sql).await.unwrap();
+    let results = df2.collect().await.unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "Expected 3 rows in result");
+
+    // Verify the labeled values are correct
+    // Test data:
+    // - Row 0: metadata="meta1", metadata_int=100, values_a=[1.0, 2.0, 3.0] -> labeled_value=[101.0, 102.0, 103.0], labeled_str=["meta1_1.0", "meta1_2.0", "meta1_3.0"]
+    // - Row 1: metadata="meta2", metadata_int=200, values_a=[4.0, 5.0] -> labeled_value=[204.0, 205.0], labeled_str=["meta2_4.0", "meta2_5.0"]
+    // - Row 2: metadata="meta3", metadata_int=300, values_a=[6.0] -> labeled_value=[306.0], labeled_str=["meta3_6.0"]
+    let batch = &results[0];
+    let labeled_val_col = batch
+        .column_by_name("labeled_values")
+        .expect("labeled_values column not found")
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("labeled_values should be a ListArray");
+    let labeled_str_col = batch
+        .column_by_name("labeled_strs")
+        .expect("labeled_strs column not found")
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("labeled_strs should be a ListArray");
+
+    fn get_float_list(arr: &ListArray, row: usize) -> Vec<f64> {
+        let inner = arr.value(row);
+        let float_arr = inner
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Inner array should be Float64Array");
+        (0..float_arr.len()).map(|i| float_arr.value(i)).collect()
+    }
+
+    fn get_string_list(arr: &ListArray, row: usize) -> Vec<String> {
+        let inner = arr.value(row);
+        if let Some(str_arr) = inner.as_any().downcast_ref::<StringArray>() {
+            (0..str_arr.len())
+                .map(|i| str_arr.value(i).to_string())
+                .collect()
+        } else if let Some(str_view_arr) = inner
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringViewArray>()
+        {
+            (0..str_view_arr.len())
+                .map(|i| str_view_arr.value(i).to_string())
+                .collect()
+        } else {
+            panic!(
+                "Inner array should be StringArray or StringViewArray, got {:?}",
+                inner.data_type()
+            );
+        }
+    }
+
+    let labeled_val0 = get_float_list(labeled_val_col, 0);
+    let labeled_val1 = get_float_list(labeled_val_col, 1);
+    let labeled_val2 = get_float_list(labeled_val_col, 2);
+
+    let labeled_str0 = get_string_list(labeled_str_col, 0);
+    let labeled_str1 = get_string_list(labeled_str_col, 1);
+    let labeled_str2 = get_string_list(labeled_str_col, 2);
+
+    // Check the values - metadata_int is added to values_a elements and metadata is combined with the value
+    assert_eq!(
+        labeled_val0,
+        vec![101.0, 102.0, 103.0],
+        "Row 0 labeled values should be [101.0, 102.0, 103.0]"
+    );
+    assert_eq!(
+        labeled_val1,
+        vec![204.0, 205.0],
+        "Row 1 labeled values should be [204.0, 205.0]"
+    );
+    assert_eq!(
+        labeled_val2,
+        vec![306.0],
+        "Row 2 labeled values should be [306.0]"
+    );
+
+    assert_eq!(
+        labeled_str0,
+        vec!["meta1_1.0", "meta1_2.0", "meta1_3.0"],
+        "Row 0 labeled strings should be ['meta1_1.0', 'meta1_2.0', 'meta1_3.0']"
+    );
+    assert_eq!(
+        labeled_str1,
+        vec!["meta2_4.0", "meta2_5.0"],
+        "Row 1 labeled strings should be ['meta2_4.0', 'meta2_5.0']"
+    );
+    assert_eq!(
+        labeled_str2,
+        vec!["meta3_6.0"],
+        "Row 2 labeled strings should be ['meta3_6.0']"
+    );
+
+    // Verify the array lengths match the input
+    assert_eq!(labeled_val0.len(), 3, "Row 0 should have 3 labeled values");
+    assert_eq!(labeled_val1.len(), 2, "Row 1 should have 2 labeled values");
+    assert_eq!(labeled_val2.len(), 1, "Row 2 should have 1 labeled value");
+    assert_eq!(labeled_str0.len(), 3, "Row 0 should have 3 labeled strings");
+    assert_eq!(labeled_str1.len(), 2, "Row 1 should have 2 labeled strings");
+    assert_eq!(labeled_str2.len(), 1, "Row 2 should have 1 labeled string");
+
+    println!("Results:\n{}", pretty_format_batches(&results).unwrap());
+    println!("Passthrough column in transform test passed");
 
     // Clean up
     disable_fused_array_transform();
