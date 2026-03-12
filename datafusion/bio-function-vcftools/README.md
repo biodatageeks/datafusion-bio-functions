@@ -133,6 +133,35 @@ The optimization is applied **only when all** of the following conditions are me
 
 4. **At least one array column** — the Unnest must operate on at least one array column.
 
+5. **Row-identity column in GROUP BY** — the GROUP BY clause must include a column that uniquely identifies each original input row created using `ROW_NUMBER() OVER ()` with an **empty PARTITION BY** clause.
+
+   **Why this matters:** The `FusedArrayTransformExec` operator emits at most one output row per input row and does not perform cross-row aggregation. If the GROUP BY doesn't uniquely identify rows, the baseline `array_agg` would merge values across rows, but the optimized plan would return separate arrays per row — producing incorrect results.
+
+   **Valid example (optimization applied):**
+   ```sql
+   WITH indexed AS (
+       SELECT ROW_NUMBER() OVER () as row_idx, metadata, values FROM input
+   ),
+   unnested AS (
+       SELECT row_idx, metadata, unnest(values) as val FROM indexed
+   )
+   SELECT row_idx, metadata, array_agg(val)
+   FROM unnested
+   GROUP BY row_idx, metadata  -- row_idx uniquely identifies rows
+   ```
+
+   **Invalid example (optimization NOT applied, falls back to standard DataFusion):**
+   ```sql
+   WITH unnested AS (
+       SELECT metadata, unnest(values) as val FROM input
+   )
+   SELECT metadata, array_agg(val)
+   FROM unnested
+   GROUP BY metadata  -- metadata may not be unique across rows!
+   ```
+
+   The optimizer detects `ROW_NUMBER() OVER ()` (without PARTITION BY) in the plan and tracks its column name through projections and aliases to verify it appears in the GROUP BY.
+
 ### Order Preservation
 
 The fused transformation **preserves element order** within arrays. Unlike the SQL-based `unnest → transform → array_agg` pattern (where `array_agg` order depends on `GROUP BY` execution and is not guaranteed without `ORDER BY` inside the aggregate), this optimization processes elements sequentially and outputs them in the same order as the input arrays.
@@ -196,7 +225,7 @@ Look for `FusedArrayTransformExec` in the physical plan output.
 
 - All aggregate functions must be `array_agg` or `list_agg` (mixed aggregates not supported)
 - `DISTINCT`, `FILTER`, and `ORDER BY` modifiers on `array_agg` are not supported
-- Requires a row identifier column for grouping (typically from `ROW_NUMBER()`)
+- **GROUP BY must include a row-identity column** (from `ROW_NUMBER() OVER ()` without PARTITION BY) to ensure each input row maps to exactly one output row
 - The query must follow the `Aggregate → Projection* → Unnest` structure
 
 ## File Structure
