@@ -14,8 +14,7 @@ use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::golden_benchmark::{
     ComparisonReport, CsqFieldReport, CsqUnmatchedReport, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ,
-    DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI, DEFAULT_EXTERNAL_VEP_CACHE_DIR,
-    DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI, TermComparisonReport,
+    DEFAULT_EXTERNAL_VEP_CACHE_DIR, DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, TermComparisonReport,
     VariantAnnotation, VariantDiscrepancy, VariantKey, collect_discrepancies,
     compare_annotation_terms, compare_annotations, compare_csq_fields, diagnose_unmatched_csq,
     ensure_local_copy, normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
@@ -149,8 +148,25 @@ async fn main() -> Result<()> {
 
     fs::create_dir_all(&args.work_dir).map_err(io_err)?;
 
-    let source_tbi = PathBuf::from(DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI);
-    let local_tbi = PathBuf::from(DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI);
+    // Derive filename stem from source VCF (e.g., "HG002_chr1" from "HG002_chr1.vcf.gz").
+    let vcf_stem = args
+        .source_vcf_gz
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("input")
+        .strip_suffix(".vcf.gz")
+        .or_else(|| {
+            args.source_vcf_gz
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("input")
+                .strip_suffix(".vcf")
+        })
+        .unwrap_or("input")
+        .to_string();
+
+    let source_tbi = args.source_vcf_gz.with_extension("gz.tbi");
+    let local_tbi = args.local_copy_vcf_gz.with_extension("gz.tbi");
     ensure_local_copy(
         &args.source_vcf_gz,
         &args.local_copy_vcf_gz,
@@ -160,18 +176,18 @@ async fn main() -> Result<()> {
 
     let sampled_vcf = args
         .work_dir
-        .join(format!("HG002_chr22_{}.vcf", args.sample_limit));
+        .join(format!("{}_{}.vcf", vcf_stem, args.sample_limit));
     let golden_vcf = args.work_dir.join(format!(
-        "HG002_chr22_{}_vep115_golden.vcf",
-        args.sample_limit
+        "{}_{}_vep115_golden.vcf",
+        vcf_stem, args.sample_limit
     ));
     let report_path = args.work_dir.join(format!(
-        "HG002_chr22_{}_comparison_report.txt",
-        args.sample_limit
+        "{}_{}_comparison_report.txt",
+        vcf_stem, args.sample_limit
     ));
     let diff_path = args.work_dir.join(format!(
-        "HG002_chr22_{}_discrepancies.txt",
-        args.sample_limit
+        "{}_{}_discrepancies.txt",
+        vcf_stem, args.sample_limit
     ));
 
     let sampling_start = Instant::now();
@@ -194,7 +210,7 @@ async fn main() -> Result<()> {
     // Decompose multi-allelic sites so both VEP and our engine see single-alt records.
     let normalized_vcf = args
         .work_dir
-        .join(format!("HG002_chr22_{}_norm.vcf", args.sample_limit));
+        .join(format!("{}_{}_norm.vcf", vcf_stem, args.sample_limit));
     let norm_rows = normalize_vcf(&sampled_vcf, &normalized_vcf)?;
     println!(
         "normalized: {} -> {} rows (multi-allelic decomposed) -> {}",

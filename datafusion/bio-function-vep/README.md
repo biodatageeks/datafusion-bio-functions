@@ -82,14 +82,14 @@ When a golden VEP output file already exists in the work directory, the benchmar
 
 **Step 1: Set up the golden file (one-time)**
 
-The golden file must be named `HG002_chr22_{sample_limit}_vep115_golden.vcf` in the work directory. For `sample_limit=0` (all variants), the file is `HG002_chr22_0_vep115_golden.vcf`.
+Output filenames are derived from the source VCF stem. For `HG002_chr1.vcf.gz` with `sample_limit=0`, the golden file must be named `HG002_chr1_0_vep115_golden.vcf` in the work directory.
 
 Create a symlink to a precomputed golden file:
 
 ```bash
 mkdir -p /tmp/annotate_vep_golden_bench
 ln -sf /path/to/HG002_chr1_full_vep115_golden.vcf \
-  /tmp/annotate_vep_golden_bench/HG002_chr22_0_vep115_golden.vcf
+  /tmp/annotate_vep_golden_bench/HG002_chr1_0_vep115_golden.vcf
 ```
 
 **Step 2: Run the benchmark (both ensembl parse + datafusion annotation + comparison)**
@@ -101,7 +101,7 @@ cargo run --release --example annotate_vep_golden_bench -- \
   parquet \
   0 \
   /tmp/vep_golden \
-  vep-benchmark/data/HG002_chr22.vcf.gz \
+  vep-benchmark/data/HG002_chr1.vcf.gz \
   /tmp/annotate_vep_golden_bench \
   /Users/mwiewior/research/data/vep \
   --steps=ensembl,datafusion \
@@ -121,7 +121,7 @@ cargo run --release --example annotate_vep_golden_bench -- \
   parquet \
   0 \
   /tmp/vep_golden \
-  vep-benchmark/data/HG002_chr22.vcf.gz \
+  vep-benchmark/data/HG002_chr1.vcf.gz \
   /tmp/annotate_vep_golden_bench \
   /Users/mwiewior/research/data/vep \
   --steps=datafusion \
@@ -132,15 +132,15 @@ This skips golden parsing and comparison, only running `annotate_vep()` and prin
 
 ### Output files
 
-All output goes to `<work_dir>` (default: `/tmp/annotate_vep_golden_bench`):
+All output goes to `<work_dir>` (default: `/tmp/annotate_vep_golden_bench`). Filenames are derived from the source VCF stem (e.g., `HG002_chr1` from `HG002_chr1.vcf.gz`):
 
 | File | Description |
 |------|-------------|
-| `HG002_chr22_{N}.vcf` | Sampled VCF (first N variants, or all if N=0) |
-| `HG002_chr22_{N}_norm.vcf` | Normalized VCF (multi-allelic decomposed) |
-| `HG002_chr22_{N}_vep115_golden.vcf` | Golden VEP 115 output (or symlink to precomputed) |
-| `HG002_chr22_{N}_comparison_report.txt` | Full comparison report with per-field accuracy |
-| `HG002_chr22_{N}_discrepancies.txt` | Per-variant discrepancies (most_severe/term_set mismatches) |
+| `{stem}_{N}.vcf` | Sampled VCF (first N variants, or all if N=0) |
+| `{stem}_{N}_norm.vcf` | Normalized VCF (multi-allelic decomposed) |
+| `{stem}_{N}_vep115_golden.vcf` | Golden VEP 115 output (or symlink to precomputed) |
+| `{stem}_{N}_comparison_report.txt` | Full comparison report with per-field accuracy |
+| `{stem}_{N}_discrepancies.txt` | Per-variant discrepancies (most_severe/term_set mismatches) |
 
 ### Benchmark input data
 
@@ -163,8 +163,7 @@ cargo run --release --example annotate_vep_golden_bench -- \
   vep-benchmark/data/HG002_chr22.vcf.gz \
   /tmp/annotate_vep_golden_bench \
   /Users/mwiewior/research/data/vep \
-  --steps=ensembl,datafusion \
-  --extended-probes
+  --steps=ensembl,datafusion
 ```
 
 ### Generating a new golden standard (requires Docker)
@@ -178,7 +177,7 @@ cargo run --release --example annotate_vep_golden_bench -- \
   parquet \
   0 \
   /path/to/vep/cache \
-  vep-benchmark/data/HG002_chr22.vcf.gz \
+  vep-benchmark/data/HG002_chr1.vcf.gz \
   /tmp/annotate_vep_golden_bench \
   /Users/mwiewior/research/data/vep \
   --steps=ensembl,datafusion \
