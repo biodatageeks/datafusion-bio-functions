@@ -51,6 +51,7 @@ use std::task::Poll;
 struct JoinLeftData {
     hash_map: IntervalJoinAlgorithm,
     batch: RecordBatch,
+    projected_column_map: Vec<Option<usize>>,
     #[allow(dead_code)]
     reservation: MemoryReservation,
 }
@@ -59,11 +60,13 @@ impl JoinLeftData {
     fn new(
         hash_map: IntervalJoinAlgorithm,
         batch: RecordBatch,
+        projected_column_map: Vec<Option<usize>>,
         reservation: MemoryReservation,
     ) -> Self {
         Self {
             hash_map,
             batch,
+            projected_column_map,
             reservation,
         }
     }
@@ -449,6 +452,18 @@ impl ExecutionPlan for IntervalJoinExec {
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
         let on_left = self.on.iter().map(|on| on.0.clone()).collect::<Vec<_>>();
         let on_right = self.on.iter().map(|on| on.1.clone()).collect::<Vec<_>>();
+        let column_indices_after_projection = match &self.projection {
+            Some(projection) => projection
+                .iter()
+                .map(|i| self.column_indices[*i].clone())
+                .collect(),
+            None => self.column_indices.clone(),
+        };
+        let left_projection = required_left_columns(
+            self.left.schema().as_ref(),
+            &column_indices_after_projection,
+            self.residual_filter.as_ref(),
+        );
         let left_partitions = self.left.output_partitioning().partition_count();
         let right_partitions = self.right.output_partitioning().partition_count();
 
@@ -474,6 +489,7 @@ impl ExecutionPlan for IntervalJoinExec {
                     self.random_state.clone(),
                     self.left.clone(),
                     on_left.clone(),
+                    left_projection.clone(),
                     context.clone(),
                     join_metrics.clone(),
                     reservation,
@@ -490,6 +506,7 @@ impl ExecutionPlan for IntervalJoinExec {
                     self.random_state.clone(),
                     self.left.clone(),
                     on_left.clone(),
+                    left_projection.clone(),
                     context.clone(),
                     join_metrics.clone(),
                     reservation,
@@ -512,15 +529,6 @@ impl ExecutionPlan for IntervalJoinExec {
         // over the right that uses this information to issue new batches.
         let right_stream = self.right.execute(partition, context.clone())?;
 
-        // update column indices to reflect the projection
-        let column_indices_after_projection = match &self.projection {
-            Some(projection) => projection
-                .iter()
-                .map(|i| self.column_indices[*i].clone())
-                .collect(),
-            None => self.column_indices.clone(),
-        };
-
         Ok(Box::pin(IntervalJoinStream {
             schema: self.schema(),
             on_left,
@@ -542,7 +550,6 @@ impl ExecutionPlan for IntervalJoinExec {
             low_memory: self.low_memory,
             // Initialize memory pool optimization buffers (used by streaming path)
             reusable_match_buffer: Vec::with_capacity(256),
-            reusable_rle_buffer: Vec::with_capacity(1024),
             reusable_index_buffer: Vec::with_capacity(2048),
             // Default to 100K rows per output batch to prevent memory explosion
             // Can be overridden by env var BIO_MAX_OUTPUT_BATCH_SIZE
@@ -591,6 +598,7 @@ async fn collect_left_input(
     random_state: RandomState,
     left: Arc<dyn ExecutionPlan>,
     on_left: Vec<PhysicalExprRef>,
+    projected_left_columns: Vec<usize>,
     context: Arc<TaskContext>,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
@@ -643,7 +651,7 @@ async fn collect_left_input(
     reservation.try_grow(estimated_hastable_size)?;
     metrics.build_mem_used.add(estimated_hastable_size);
 
-    let mut hashmap = AHashMap::<u64, Vec<BioInterval>>::with_capacity(estimated_buckets);
+    let mut interval_builder = IntervalJoinBuilder::with_capacity(&algorithm, estimated_buckets);
     let mut hashes_buffer = Vec::new();
     let mut offset = 0;
 
@@ -652,11 +660,11 @@ async fn collect_left_input(
         // build a left hash map
         hashes_buffer.clear();
         hashes_buffer.resize(batch.num_rows(), 0);
-        update_hashmap(
+        update_builder(
             &on_left,
             &left_interval,
             batch,
-            &mut hashmap,
+            &mut interval_builder,
             offset,
             &random_state,
             &mut hashes_buffer,
@@ -664,44 +672,87 @@ async fn collect_left_input(
         offset += batch.num_rows();
     }
 
-    let hashmap = IntervalJoinAlgorithm::new(&algorithm, hashmap);
-
-    let single_batch = compute::concat_batches(&schema, &batches)?;
-    let data = JoinLeftData::new(hashmap, single_batch, reservation);
+    let hashmap = interval_builder.finish();
+    let (single_batch, projected_column_map) =
+        project_build_batch(schema.as_ref(), &batches, &projected_left_columns, num_rows)?;
+    let data = JoinLeftData::new(hashmap, single_batch, projected_column_map, reservation);
 
     Ok(data)
 }
 
-struct BioInterval {
-    start: i32,
-    end: i32,
-    position: Position,
+fn required_left_columns(
+    left_schema: &Schema,
+    output_columns: &[ColumnIndex],
+    residual_filter: Option<&JoinFilter>,
+) -> Vec<usize> {
+    let mut seen = vec![false; left_schema.fields().len()];
+    let mut required = Vec::new();
+
+    let mut push_column = |column_index: &ColumnIndex| {
+        if column_index.side == JoinSide::Left && !seen[column_index.index] {
+            seen[column_index.index] = true;
+            required.push(column_index.index);
+        }
+    };
+
+    output_columns.iter().for_each(&mut push_column);
+    if let Some(filter) = residual_filter {
+        filter.column_indices().iter().for_each(push_column);
+    }
+
+    required.sort_unstable();
+    required
 }
 
-impl BioInterval {
-    fn new(start: i32, end: i32, position: Position) -> BioInterval {
-        BioInterval {
-            start,
-            end,
-            position,
-        }
+fn project_build_batch(
+    left_schema: &Schema,
+    batches: &[RecordBatch],
+    projected_left_columns: &[usize],
+    row_count: usize,
+) -> Result<(RecordBatch, Vec<Option<usize>>)> {
+    let mut projected_column_map = vec![None; left_schema.fields().len()];
+    for (projected_idx, &original_idx) in projected_left_columns.iter().enumerate() {
+        projected_column_map[original_idx] = Some(projected_idx);
     }
-    fn into_coitrees(self) -> coitrees::Interval<Position> {
-        coitrees::Interval::new(self.start, self.end, self.position)
+
+    if projected_left_columns.is_empty() {
+        let options = RecordBatchOptions::new()
+            .with_match_field_names(true)
+            .with_row_count(Some(row_count));
+        return Ok((
+            RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options)?,
+            projected_column_map,
+        ));
     }
-    fn into_rust_bio(self) -> (std::ops::Range<i32>, Position) {
-        (self.start..self.end + 1, self.position)
-    }
-    fn into_lapper(self) -> rust_lapper::Interval<u32, Position> {
-        rust_lapper::Interval {
-            start: self.start as u32,
-            stop: self.end as u32 + 1,
-            val: self.position,
-        }
-    }
+
+    let projected_schema = Arc::new(Schema::new(
+        projected_left_columns
+            .iter()
+            .map(|&idx| left_schema.field(idx).clone())
+            .collect::<Vec<_>>(),
+    ));
+    let projected_batches = batches
+        .iter()
+        .map(|batch| {
+            let columns = projected_left_columns
+                .iter()
+                .map(|&idx| batch.column(idx).clone())
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(projected_schema.clone(), columns)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok((
+        compute::concat_batches(&projected_schema, &projected_batches)?,
+        projected_column_map,
+    ))
 }
 
 type CoitreesNearestMap = AHashMap<u64, NearestIntervalIndex>;
+type CoitreesGroup = Vec<coitrees::Interval<Position>>;
+type RustBioGroup = Vec<(std::ops::Range<i32>, Position)>;
+type LapperGroup = Vec<rust_lapper::Interval<u32, Position>>;
+type NearestGroup = Vec<IntervalRecord>;
 
 enum IntervalJoinAlgorithm {
     Coitrees(AHashMap<u64, coitrees::COITree<Position, u32>>),
@@ -711,6 +762,16 @@ enum IntervalJoinAlgorithm {
     SuperIntervals(AHashMap<u64, superintervals::IntervalMap<Position>>),
     CoitreesNearest(CoitreesNearestMap),
     CoitreesCountOverlaps(AHashMap<u64, coitrees::COITree<Position, u32>>),
+}
+
+enum IntervalJoinBuilder {
+    Coitrees(AHashMap<u64, CoitreesGroup>),
+    IntervalTree(AHashMap<u64, RustBioGroup>),
+    ArrayIntervalTree(AHashMap<u64, RustBioGroup>),
+    Lapper(AHashMap<u64, LapperGroup>),
+    SuperIntervals(AHashMap<u64, superintervals::IntervalMap<Position>>),
+    CoitreesNearest(AHashMap<u64, NearestGroup>),
+    CoitreesCountOverlaps(AHashMap<u64, CoitreesGroup>),
 }
 
 impl Debug for IntervalJoinAlgorithm {
@@ -747,114 +808,153 @@ impl Debug for IntervalJoinAlgorithm {
     }
 }
 
-impl IntervalJoinAlgorithm {
-    fn new(alg: &Algorithm, hash_map: AHashMap<u64, Vec<BioInterval>>) -> IntervalJoinAlgorithm {
+impl IntervalJoinBuilder {
+    fn with_capacity(alg: &Algorithm, estimated_buckets: usize) -> Self {
         match alg {
-            Algorithm::Coitrees | Algorithm::CoitreesCountOverlaps => {
-                use coitrees::{COITree, Interval, IntervalTree};
-
-                let hashmap = hash_map
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let intervals = v
-                            .into_iter()
-                            .map(BioInterval::into_coitrees)
-                            .collect::<Vec<Interval<Position>>>();
-
-                        // can hold up to u32::MAX intervals
-                        let tree: COITree<Position, u32> = COITree::new(intervals.iter());
-                        (k, tree)
-                    })
-                    .collect::<AHashMap<u64, COITree<Position, u32>>>();
-
-                match alg {
-                    Algorithm::Coitrees => IntervalJoinAlgorithm::Coitrees(hashmap),
-                    Algorithm::CoitreesCountOverlaps => {
-                        IntervalJoinAlgorithm::CoitreesCountOverlaps(hashmap)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            Algorithm::CoitreesNearest => {
-                let hashmap = hash_map
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let records = v
-                            .into_iter()
-                            .map(|r| IntervalRecord {
-                                start: r.start,
-                                end: r.end,
-                                position: r.position,
-                            })
-                            .collect::<Vec<_>>();
-                        (k, NearestIntervalIndex::from_records(records))
-                    })
-                    .collect::<CoitreesNearestMap>();
-                IntervalJoinAlgorithm::CoitreesNearest(hashmap)
+            Algorithm::Coitrees => {
+                IntervalJoinBuilder::Coitrees(AHashMap::with_capacity(estimated_buckets))
             }
             Algorithm::IntervalTree => {
-                let hashmap = hash_map
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let tree = rust_bio::IntervalTree::from_iter(
-                            v.into_iter().map(BioInterval::into_rust_bio),
-                        );
-                        (k, tree)
-                    })
-                    .collect::<AHashMap<u64, rust_bio::IntervalTree<i32, Position>>>();
-
-                IntervalJoinAlgorithm::IntervalTree(hashmap)
+                IntervalJoinBuilder::IntervalTree(AHashMap::with_capacity(estimated_buckets))
             }
             Algorithm::ArrayIntervalTree => {
-                let hashmap = hash_map
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let tree = rust_bio::ArrayBackedIntervalTree::<i32, Position>::from_iter(
-                            v.into_iter().map(BioInterval::into_rust_bio),
-                        );
-                        (k, tree)
-                    })
-                    .collect::<AHashMap<u64, rust_bio::ArrayBackedIntervalTree<i32, Position>>>();
-
-                IntervalJoinAlgorithm::ArrayIntervalTree(hashmap)
+                IntervalJoinBuilder::ArrayIntervalTree(AHashMap::with_capacity(estimated_buckets))
             }
             Algorithm::Lapper => {
-                use rust_lapper::*;
-                let hashmap = hash_map
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let intervals = v
-                            .into_iter()
-                            .map(BioInterval::into_lapper)
-                            .collect::<Vec<Interval<u32, Position>>>();
-
-                        (k, Lapper::new(intervals))
-                    })
-                    .collect::<AHashMap<u64, Lapper<u32, Position>>>();
-
-                IntervalJoinAlgorithm::Lapper(hashmap)
+                IntervalJoinBuilder::Lapper(AHashMap::with_capacity(estimated_buckets))
             }
             Algorithm::SuperIntervals => {
-                let hashmap = hash_map
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let mut map = superintervals::IntervalMap::new();
-                        for s in v {
-                            map.add(s.start, s.end, s.position);
-                        }
-                        map.build();
-                        (k, map)
-                    })
-                    .collect::<AHashMap<u64, superintervals::IntervalMap<Position>>>();
-                IntervalJoinAlgorithm::SuperIntervals(hashmap)
+                IntervalJoinBuilder::SuperIntervals(AHashMap::with_capacity(estimated_buckets))
+            }
+            Algorithm::CoitreesNearest => {
+                IntervalJoinBuilder::CoitreesNearest(AHashMap::with_capacity(estimated_buckets))
+            }
+            Algorithm::CoitreesCountOverlaps => IntervalJoinBuilder::CoitreesCountOverlaps(
+                AHashMap::with_capacity(estimated_buckets),
+            ),
+        }
+    }
+
+    fn push(&mut self, hash: u64, start: i32, end: i32, position: Position) {
+        match self {
+            IntervalJoinBuilder::Coitrees(hashmap)
+            | IntervalJoinBuilder::CoitreesCountOverlaps(hashmap) => {
+                hashmap
+                    .entry(hash)
+                    .or_insert_with(|| Vec::with_capacity(4096))
+                    .push(coitrees::Interval::new(start, end, position));
+            }
+            IntervalJoinBuilder::CoitreesNearest(hashmap) => {
+                hashmap
+                    .entry(hash)
+                    .or_insert_with(|| Vec::with_capacity(4096))
+                    .push(IntervalRecord {
+                        start,
+                        end,
+                        position,
+                    });
+            }
+            IntervalJoinBuilder::IntervalTree(hashmap)
+            | IntervalJoinBuilder::ArrayIntervalTree(hashmap) => {
+                hashmap
+                    .entry(hash)
+                    .or_insert_with(|| Vec::with_capacity(4096))
+                    .push((start..end + 1, position));
+            }
+            IntervalJoinBuilder::Lapper(hashmap) => {
+                hashmap
+                    .entry(hash)
+                    .or_insert_with(|| Vec::with_capacity(4096))
+                    .push(rust_lapper::Interval {
+                        start: start as u32,
+                        stop: end as u32 + 1,
+                        val: position,
+                    });
+            }
+            IntervalJoinBuilder::SuperIntervals(hashmap) => {
+                hashmap
+                    .entry(hash)
+                    .or_insert_with(superintervals::IntervalMap::new)
+                    .add(start, end, position);
             }
         }
     }
 
-    fn get<F>(&self, k: u64, start: i32, end: i32, mut f: F)
-    where
-        F: FnMut(Position),
-    {
+    fn finish(self) -> IntervalJoinAlgorithm {
+        match self {
+            IntervalJoinBuilder::Coitrees(hashmap) => {
+                use coitrees::{COITree, IntervalTree};
+                let hashmap = hashmap
+                    .into_iter()
+                    .map(|(k, intervals)| {
+                        let tree: COITree<Position, u32> = COITree::new(intervals.iter());
+                        (k, tree)
+                    })
+                    .collect::<AHashMap<u64, COITree<Position, u32>>>();
+                IntervalJoinAlgorithm::Coitrees(hashmap)
+            }
+            IntervalJoinBuilder::CoitreesCountOverlaps(hashmap) => {
+                use coitrees::{COITree, IntervalTree};
+                let hashmap = hashmap
+                    .into_iter()
+                    .map(|(k, intervals)| {
+                        let tree: COITree<Position, u32> = COITree::new(intervals.iter());
+                        (k, tree)
+                    })
+                    .collect::<AHashMap<u64, COITree<Position, u32>>>();
+                IntervalJoinAlgorithm::CoitreesCountOverlaps(hashmap)
+            }
+            IntervalJoinBuilder::CoitreesNearest(hashmap) => {
+                IntervalJoinAlgorithm::CoitreesNearest(
+                    hashmap
+                        .into_iter()
+                        .map(|(k, records)| (k, NearestIntervalIndex::from_records(records)))
+                        .collect::<CoitreesNearestMap>(),
+                )
+            }
+            IntervalJoinBuilder::IntervalTree(hashmap) => IntervalJoinAlgorithm::IntervalTree(
+                hashmap
+                    .into_iter()
+                    .map(|(k, intervals)| (k, rust_bio::IntervalTree::from_iter(intervals)))
+                    .collect::<AHashMap<u64, rust_bio::IntervalTree<i32, Position>>>(),
+            ),
+            IntervalJoinBuilder::ArrayIntervalTree(hashmap) => {
+                IntervalJoinAlgorithm::ArrayIntervalTree(
+                    hashmap
+                        .into_iter()
+                        .map(|(k, intervals)| {
+                            (
+                                k,
+                                rust_bio::ArrayBackedIntervalTree::<i32, Position>::from_iter(
+                                    intervals,
+                                ),
+                            )
+                        })
+                        .collect::<AHashMap<u64, rust_bio::ArrayBackedIntervalTree<i32, Position>>>(
+                        ),
+                )
+            }
+            IntervalJoinBuilder::Lapper(hashmap) => IntervalJoinAlgorithm::Lapper(
+                hashmap
+                    .into_iter()
+                    .map(|(k, intervals)| (k, rust_lapper::Lapper::new(intervals)))
+                    .collect::<AHashMap<u64, rust_lapper::Lapper<u32, Position>>>(),
+            ),
+            IntervalJoinBuilder::SuperIntervals(hashmap) => IntervalJoinAlgorithm::SuperIntervals(
+                hashmap
+                    .into_iter()
+                    .map(|(k, mut intervals)| {
+                        intervals.build();
+                        (k, intervals)
+                    })
+                    .collect::<AHashMap<u64, superintervals::IntervalMap<Position>>>(),
+            ),
+        }
+    }
+}
+
+impl IntervalJoinAlgorithm {
+    fn collect_matches(&self, k: u64, start: i32, end: i32, out: &mut Vec<u32>) {
         match self {
             IntervalJoinAlgorithm::Coitrees(hashmap)
             | IntervalJoinAlgorithm::CoitreesCountOverlaps(hashmap) => {
@@ -862,42 +962,42 @@ impl IntervalJoinAlgorithm {
                 if let Some(tree) = hashmap.get(&k) {
                     tree.query(start, end, |node| {
                         let position: Position = extract_coitree_position(node);
-                        f(position)
+                        out.push(position as u32)
                     });
                 }
             }
             IntervalJoinAlgorithm::CoitreesNearest(hashmap) => {
                 if let Some(index) = hashmap.get(&k) {
                     if let Some(position) = index.nearest_one(start, end, true) {
-                        f(position);
+                        out.push(position as u32);
                     }
                 }
             }
             IntervalJoinAlgorithm::IntervalTree(hashmap) => {
                 if let Some(tree) = hashmap.get(&k) {
                     for entry in tree.find(start..end + 1) {
-                        f(*entry.data())
+                        out.push(*entry.data() as u32)
                     }
                 }
             }
             IntervalJoinAlgorithm::ArrayIntervalTree(hashmap) => {
                 if let Some(tree) = hashmap.get(&k) {
                     for entry in tree.find(start..end + 1) {
-                        f(*entry.data())
+                        out.push(*entry.data() as u32)
                     }
                 }
             }
             IntervalJoinAlgorithm::Lapper(hashmap) => {
                 if let Some(lapper) = hashmap.get(&k) {
                     for interval in lapper.find(start as u32, end as u32 + 1) {
-                        f(interval.val)
+                        out.push(interval.val as u32)
                     }
                 }
             }
             IntervalJoinAlgorithm::SuperIntervals(hashmap) => {
                 if let Some(intervals) = hashmap.get(&k) {
                     for val in intervals.search_values_iter(start, end) {
-                        f(val);
+                        out.push(val as u32);
                     }
                 }
             }
@@ -905,11 +1005,11 @@ impl IntervalJoinAlgorithm {
     }
 }
 
-fn update_hashmap(
+fn update_builder(
     on: &[PhysicalExprRef],
     left_interval: &ColInterval,
     batch: &RecordBatch,
-    hash_map: &mut AHashMap<u64, Vec<BioInterval>>,
+    interval_builder: &mut IntervalJoinBuilder,
     offset: usize,
     random_state: &RandomState,
     hashes_buffer: &mut Vec<u64>,
@@ -926,10 +1026,7 @@ fn update_hashmap(
 
     hash_values.iter().enumerate().for_each(|(i, hash_val)| {
         let position: Position = i + offset;
-        let intervals: &mut Vec<BioInterval> = hash_map
-            .entry(*hash_val)
-            .or_insert_with(|| Vec::with_capacity(4096));
-        intervals.push(BioInterval::new(start.value(i), end.value(i), position))
+        interval_builder.push(*hash_val, start.value(i), end.value(i), position);
     });
 
     Ok(())
@@ -974,8 +1071,6 @@ struct IntervalJoinStream {
     // === Streaming optimizations ===
     /// Buffer reused for temporary matches
     reusable_match_buffer: Vec<u32>,
-    /// Buffer reused for right-side run-length encoding data
-    reusable_rle_buffer: Vec<u32>,
     /// Buffer reused for building right-side index arrays
     reusable_index_buffer: Vec<u32>,
     /// Maximum output batch size to emit when streaming
@@ -1045,14 +1140,14 @@ impl IntervalJoinStream {
 
     fn build_output_batch(
         &self,
-        build_batch: &RecordBatch,
+        build_side: &JoinLeftData,
         probe_batch: &RecordBatch,
         left_indices: PrimitiveArray<UInt32Type>,
         right_indices: PrimitiveArray<UInt32Type>,
     ) -> Result<RecordBatch> {
         let (left_indices, right_indices) = if let Some(filter) = &self.residual_filter {
             apply_join_filter_to_indices(
-                build_batch,
+                build_side,
                 probe_batch,
                 left_indices,
                 right_indices,
@@ -1064,7 +1159,7 @@ impl IntervalJoinStream {
 
         build_batch_from_indices(
             self.schema.as_ref(),
-            build_batch,
+            build_side,
             probe_batch,
             &left_indices,
             &right_indices,
@@ -1072,22 +1167,12 @@ impl IntervalJoinStream {
         )
     }
 
-    fn expand_probe_indices(&mut self) -> PrimitiveArray<UInt32Type> {
-        self.reusable_index_buffer.clear();
-        self.reusable_index_buffer.reserve(
-            self.reusable_rle_buffer
-                .iter()
-                .map(|&count| count as usize)
-                .sum(),
-        );
-
-        for (row_idx, &count) in self.reusable_rle_buffer.iter().enumerate() {
-            for _ in 0..count {
-                self.reusable_index_buffer.push(row_idx as u32);
-            }
+    fn append_probe_indices(buffer: &mut Vec<u32>, row_idx: u32, count: usize) {
+        if count == 0 {
+            return;
         }
-
-        PrimitiveArray::from(self.reusable_index_buffer.clone())
+        let len = buffer.len();
+        buffer.resize(len + count, row_idx);
     }
 
     fn take_nullable_left_indices(
@@ -1205,11 +1290,12 @@ impl IntervalJoinStream {
         for i in start_row_idx..chunk_end {
             self.reusable_match_buffer.clear();
 
-            build_side
-                .hash_map
-                .get(self.hashes_buffer[i], start.value(i), end.value(i), |pos| {
-                    self.reusable_match_buffer.push(pos as u32);
-                });
+            build_side.hash_map.collect_matches(
+                self.hashes_buffer[i],
+                start.value(i),
+                end.value(i),
+                &mut self.reusable_match_buffer,
+            );
 
             match &build_side.hash_map {
                 IntervalJoinAlgorithm::CoitreesNearest(_)
@@ -1276,7 +1362,6 @@ impl IntervalJoinStream {
             Some(build_side) => Ok(build_side),
             None => internal_err!("Expected build side in ready state"),
         }?;
-        let build_batch = build_side.batch.clone();
 
         if state.accumulated_left_matches.is_empty() {
             if state.probe_row_idx >= state.batch.num_rows() {
@@ -1303,7 +1388,7 @@ impl IntervalJoinStream {
         let probe_row_idx = state.probe_row_idx;
         let left_indexes = Self::take_nullable_left_indices(left_indices_with_nulls, validity);
         let right_indexes = PrimitiveArray::<UInt32Type>::from(state.accumulated_right_indices);
-        let result = self.build_output_batch(&build_batch, &batch, left_indexes, right_indexes)?;
+        let result = self.build_output_batch(build_side, &batch, left_indexes, right_indexes)?;
 
         if probe_row_idx >= batch.num_rows() {
             self.state = IntervalJoinStreamState::FetchProbeBatch;
@@ -1339,7 +1424,6 @@ impl IntervalJoinStream {
             Some(build_side) => Ok(build_side),
             None => internal_err!("Expected build side in ready state"),
         }?;
-        let build_batch = build_side.batch.clone();
 
         let join_time = self.join_metrics.join_time.clone();
         let timer = join_time.timer();
@@ -1351,7 +1435,7 @@ impl IntervalJoinStream {
         if self.low_memory {
             // Output-size limited processing to prevent memory explosion
             let mut builder_left = PrimitiveBuilder::<UInt32Type>::new();
-            self.reusable_rle_buffer.clear();
+            self.reusable_index_buffer.clear();
             self.reusable_match_buffer.clear();
 
             const MAX_OUTPUT_ROWS: usize = 1_000_000; // 1M rows max per output batch
@@ -1360,11 +1444,12 @@ impl IntervalJoinStream {
 
             for (i, hash_val) in self.hashes_buffer.iter().enumerate() {
                 self.reusable_match_buffer.clear();
-                build_side
-                    .hash_map
-                    .get(*hash_val, start.value(i), end.value(i), |pos| {
-                        self.reusable_match_buffer.push(pos as u32);
-                    });
+                build_side.hash_map.collect_matches(
+                    *hash_val,
+                    start.value(i),
+                    end.value(i),
+                    &mut self.reusable_match_buffer,
+                );
 
                 let matches_for_this_row = self.reusable_match_buffer.len();
 
@@ -1374,7 +1459,7 @@ impl IntervalJoinStream {
                         if total_output_rows >= MAX_OUTPUT_ROWS {
                             break;
                         }
-                        self.reusable_rle_buffer.push(1);
+                        Self::append_probe_indices(&mut self.reusable_index_buffer, i as u32, 1);
                         if self.reusable_match_buffer.is_empty() {
                             builder_left.append_null();
                         } else {
@@ -1388,8 +1473,11 @@ impl IntervalJoinStream {
                         {
                             break;
                         }
-                        self.reusable_rle_buffer
-                            .push(self.reusable_match_buffer.len() as u32);
+                        Self::append_probe_indices(
+                            &mut self.reusable_index_buffer,
+                            i as u32,
+                            matches_for_this_row,
+                        );
                         builder_left.append_slice(&self.reusable_match_buffer);
                         total_output_rows += matches_for_this_row;
                     }
@@ -1409,9 +1497,10 @@ impl IntervalJoinStream {
             };
 
             let left_indexes = builder_left.finish();
-            let right_indexes = self.expand_probe_indices();
+            let right_indexes =
+                PrimitiveArray::<UInt32Type>::from(self.reusable_index_buffer.clone());
             let result =
-                self.build_output_batch(&build_batch, &batch, left_indexes, right_indexes)?;
+                self.build_output_batch(build_side, &batch, left_indexes, right_indexes)?;
 
             if let Some((remaining_batch, remaining_hashes)) = continuation {
                 self.state = IntervalJoinStreamState::ProcessProbeBatch(ProcessProbeBatchState {
@@ -1445,21 +1534,22 @@ impl IntervalJoinStream {
         } else {
             // Full processing mode: process entire batch without capping or continuation
             let mut builder_left = PrimitiveBuilder::<UInt32Type>::new();
-            self.reusable_rle_buffer.clear();
+            self.reusable_index_buffer.clear();
             self.reusable_match_buffer.clear();
 
             for (i, hash_val) in self.hashes_buffer.iter().enumerate() {
                 self.reusable_match_buffer.clear();
-                build_side
-                    .hash_map
-                    .get(*hash_val, start.value(i), end.value(i), |pos| {
-                        self.reusable_match_buffer.push(pos as u32);
-                    });
+                build_side.hash_map.collect_matches(
+                    *hash_val,
+                    start.value(i),
+                    end.value(i),
+                    &mut self.reusable_match_buffer,
+                );
 
                 match &build_side.hash_map {
                     IntervalJoinAlgorithm::CoitreesNearest(_)
                     | IntervalJoinAlgorithm::CoitreesCountOverlaps(_) => {
-                        self.reusable_rle_buffer.push(1);
+                        Self::append_probe_indices(&mut self.reusable_index_buffer, i as u32, 1);
                         if self.reusable_match_buffer.is_empty() {
                             builder_left.append_null();
                         } else {
@@ -1467,17 +1557,21 @@ impl IntervalJoinStream {
                         }
                     }
                     _ => {
-                        self.reusable_rle_buffer
-                            .push(self.reusable_match_buffer.len() as u32);
+                        Self::append_probe_indices(
+                            &mut self.reusable_index_buffer,
+                            i as u32,
+                            self.reusable_match_buffer.len(),
+                        );
                         builder_left.append_slice(&self.reusable_match_buffer);
                     }
                 }
             }
 
             let left_indexes = builder_left.finish();
-            let right_indexes = self.expand_probe_indices();
+            let right_indexes =
+                PrimitiveArray::<UInt32Type>::from(self.reusable_index_buffer.clone());
             let result =
-                self.build_output_batch(&build_batch, &batch, left_indexes, right_indexes)?;
+                self.build_output_batch(build_side, &batch, left_indexes, right_indexes)?;
             timer.done();
             self.state = IntervalJoinStreamState::FetchProbeBatch;
 
@@ -1539,7 +1633,7 @@ fn evaluate_as_i32(
 
 fn build_batch_from_indices(
     schema: &Schema,
-    build_input_buffer: &RecordBatch,
+    build_side: &JoinLeftData,
     probe_batch: &RecordBatch,
     build_indices: &PrimitiveArray<UInt32Type>,
     probe_indices: &PrimitiveArray<UInt32Type>,
@@ -1561,7 +1655,14 @@ fn build_batch_from_indices(
     for column_index in column_indices {
         let array: Arc<dyn Array> = match column_index.side {
             JoinSide::Left => {
-                let array = build_input_buffer.column(column_index.index);
+                let projected_idx = build_side.projected_column_map[column_index.index]
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "Missing projected build column {}",
+                            column_index.index
+                        ))
+                    })?;
+                let array = build_side.batch.column(projected_idx);
                 if array.is_empty() || build_indices.null_count() == build_indices.len() {
                     new_null_array(array.data_type(), build_indices.len())
                 } else {
@@ -1590,7 +1691,7 @@ fn build_batch_from_indices(
 }
 
 fn apply_join_filter_to_indices(
-    build_input_buffer: &RecordBatch,
+    build_side: &JoinLeftData,
     probe_batch: &RecordBatch,
     build_indices: PrimitiveArray<UInt32Type>,
     probe_indices: PrimitiveArray<UInt32Type>,
@@ -1602,7 +1703,7 @@ fn apply_join_filter_to_indices(
 
     let intermediate_batch = build_batch_from_indices(
         filter.schema().as_ref(),
-        build_input_buffer,
+        build_side,
         probe_batch,
         &build_indices,
         &probe_indices,
