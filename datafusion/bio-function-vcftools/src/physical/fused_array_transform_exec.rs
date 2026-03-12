@@ -25,6 +25,17 @@ use futures::{Stream, StreamExt, ready};
 
 use crate::common::{build_element_schema_from_arrow, extract_list_element_type};
 
+/// Context for array transformation operations.
+///
+/// Groups related parameters to reduce function argument count.
+struct TransformContext<'a> {
+    batch: &'a RecordBatch,
+    num_rows: usize,
+    list_arrays: &'a [(&'a String, ArrayRef)],
+    row_max_lengths: &'a [usize],
+    row_mask: &'a [bool],
+}
+
 /// Physical execution plan for fused array transformation.
 ///
 /// This operator takes an input with array columns and applies transformations
@@ -341,25 +352,23 @@ impl FusedArrayTransformStream {
     /// Apply transform expressions element-wise to array columns.
     fn apply_transforms(
         &self,
-        _batch: &RecordBatch,
+        batch: &RecordBatch,
         num_rows: usize,
         list_arrays: &[(&String, ArrayRef)],
         row_max_lengths: &[usize],
         row_mask: &[bool],
     ) -> Result<Vec<ArrayRef>> {
+        let ctx = TransformContext {
+            batch,
+            num_rows,
+            list_arrays,
+            row_max_lengths,
+            row_mask,
+        };
         self.transform_exprs
             .iter()
             .enumerate()
-            .map(|(expr_idx, expr)| {
-                self.apply_single_transform(
-                    expr_idx,
-                    expr.as_ref(),
-                    num_rows,
-                    list_arrays,
-                    row_max_lengths,
-                    row_mask,
-                )
-            })
+            .map(|(expr_idx, expr)| self.apply_single_transform(expr_idx, expr.as_ref(), &ctx))
             .collect()
     }
 
@@ -368,33 +377,37 @@ impl FusedArrayTransformStream {
         &self,
         expr_idx: usize,
         expr: &dyn PhysicalExpr,
-        num_rows: usize,
-        list_arrays: &[(&String, ArrayRef)],
-        row_max_lengths: &[usize],
-        row_mask: &[bool],
+        ctx: &TransformContext,
     ) -> Result<ArrayRef> {
-        let mut all_values: Vec<ArrayRef> = Vec::with_capacity(num_rows);
+        let mut all_values: Vec<ArrayRef> = Vec::with_capacity(ctx.num_rows);
         let mut offsets: Vec<i32> = vec![0];
-        let mut null_bitmap: Vec<bool> = Vec::with_capacity(num_rows);
+        let mut null_bitmap: Vec<bool> = Vec::with_capacity(ctx.num_rows);
         let mut current_offset: i32 = 0;
 
         // Pre-compute the mini-batch schema once - it's the same for all rows.
-        let mini_batch_schema = build_mini_batch_schema(list_arrays)?;
+        let mini_batch_schema =
+            build_mini_batch_schema(ctx.list_arrays, ctx.batch, &self.passthrough_columns)?;
 
-        for row_idx in 0..num_rows {
-            if !row_mask[row_idx] {
+        for row_idx in 0..ctx.num_rows {
+            if !ctx.row_mask[row_idx] {
                 // This row would produce no UNNEST output, skip it.
                 continue;
             }
 
-            let max_len = row_max_lengths[row_idx];
+            let max_len = ctx.row_max_lengths[row_idx];
             if max_len == 0 {
                 // Should not happen given the row_mask, but guard just in case.
                 continue;
             }
 
-            let mini_batch =
-                build_row_mini_batch(list_arrays, row_idx, max_len, &mini_batch_schema)?;
+            let mini_batch = build_row_mini_batch(
+                ctx.list_arrays,
+                row_idx,
+                max_len,
+                &mini_batch_schema,
+                ctx.batch,
+                &self.passthrough_columns,
+            )?;
             let result = expr.evaluate(&mini_batch)?;
             let result_array = result.into_array(mini_batch.num_rows())?;
 
@@ -487,12 +500,32 @@ impl RecordBatchStream for FusedArrayTransformStream {
 ///
 /// Since the schema structure (column names and element types) is the same for all rows,
 /// we avoid creating a new Schema object for every row.
-fn build_mini_batch_schema(list_arrays: &[(&String, ArrayRef)]) -> Result<SchemaRef> {
-    let mut fields: Vec<Field> = Vec::with_capacity(list_arrays.len());
+///
+/// The schema includes both unnested array columns and passthrough columns,
+/// allowing transform expressions to reference passthrough columns.
+fn build_mini_batch_schema(
+    list_arrays: &[(&String, ArrayRef)],
+    batch: &RecordBatch,
+    passthrough_columns: &[String],
+) -> Result<SchemaRef> {
+    let mut fields: Vec<Field> = Vec::with_capacity(list_arrays.len() + passthrough_columns.len());
 
+    // Add unnested array column element types
     for (col_name, array) in list_arrays {
         let element_type = extract_list_element_type(array.data_type(), col_name)?;
         fields.push(Field::new(col_name.as_str(), element_type, true));
+    }
+
+    // Add passthrough columns with their original types
+    let input_schema = batch.schema();
+    for col_name in passthrough_columns {
+        let idx = input_schema.index_of(col_name)?;
+        let field = input_schema.field(idx);
+        fields.push(Field::new(
+            col_name.as_str(),
+            field.data_type().clone(),
+            true,
+        ));
     }
 
     Ok(Arc::new(Schema::new(fields)))
@@ -504,14 +537,19 @@ fn build_mini_batch_schema(list_arrays: &[(&String, ArrayRef)]) -> Result<Schema
 /// - Shorter arrays are padded with NULLs.
 /// - NULL arrays become all-null arrays of length max_len.
 /// - Supports List, LargeList, and FixedSizeList types.
+/// - Passthrough columns are broadcasted (repeated) to match max_len.
 fn build_row_mini_batch(
     list_arrays: &[(&String, ArrayRef)],
     row_idx: usize,
     max_len: usize,
     schema: &SchemaRef,
+    batch: &RecordBatch,
+    passthrough_columns: &[String],
 ) -> Result<RecordBatch> {
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(list_arrays.len());
+    let mut columns: Vec<ArrayRef> =
+        Vec::with_capacity(list_arrays.len() + passthrough_columns.len());
 
+    // Add unnested array columns
     for (idx, (col_name, array)) in list_arrays.iter().enumerate() {
         let element_type = schema.field(idx).data_type();
         let padded_values =
@@ -519,7 +557,30 @@ fn build_row_mini_batch(
         columns.push(padded_values);
     }
 
+    // Add passthrough columns - broadcast scalar value to max_len
+    let input_schema = batch.schema();
+    for col_name in passthrough_columns {
+        let idx = input_schema.index_of(col_name)?;
+        let col = batch.column(idx);
+        let broadcasted = broadcast_scalar_to_length(col, row_idx, max_len)?;
+        columns.push(broadcasted);
+    }
+
     RecordBatch::try_new(schema.clone(), columns).map_err(DataFusionError::from)
+}
+
+/// Broadcast a single scalar value from a column to an array of a given length.
+///
+/// This is used to repeat passthrough column values to match the unnested array length.
+fn broadcast_scalar_to_length(array: &ArrayRef, row_idx: usize, length: usize) -> Result<ArrayRef> {
+    use datafusion::arrow::compute::kernels::take::take;
+
+    // Create an indices array that repeats the row_idx `length` times
+    let indices = datafusion::arrow::array::UInt64Array::from(vec![row_idx as u64; length]);
+
+    // Use take to broadcast the scalar value
+    let result = take(array.as_ref(), &indices, None)?;
+    Ok(result)
 }
 
 /// Infer the output element type for a transformed array column.

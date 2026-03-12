@@ -5,15 +5,37 @@
 //! materializing all unnested rows, it processes arrays element-wise with bounded memory.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::common::{DFSchema, DFSchemaRef, Result};
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, Result};
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, UserDefinedLogicalNodeCore};
 
 use crate::common::build_element_schema_from_df;
+
+/// Strip table qualifiers from all column references in an expression.
+///
+/// This is needed because the element schema uses unqualified column names,
+/// but transform expressions from the optimizer may contain qualified references
+/// (e.g., `indexed.metadata_int` instead of just `metadata_int`).
+fn strip_column_qualifiers(expr: &Expr) -> Result<Expr> {
+    expr.clone()
+        .transform(|e| {
+            if let Expr::Column(col) = &e {
+                if col.relation.is_some() {
+                    // Strip the qualifier, keep only the column name
+                    let unqualified = Column::new_unqualified(col.name());
+                    return Ok(Transformed::yes(Expr::Column(unqualified)));
+                }
+            }
+            Ok(Transformed::no(e))
+        })
+        .map(|t| t.data)
+}
 
 /// A custom logical node that fuses unnest + transform + array_agg into a single operation.
 ///
@@ -75,7 +97,22 @@ impl FusedArrayTransform {
 
         // Build element-level schema for type inference
         // This represents the scalar types of array elements (as if unnested)
-        let element_schema = build_element_schema_from_df(input_schema, &array_columns)?;
+        // We include both:
+        // 1. Array columns converted to their element types (for unnested value references)
+        // 2. Passthrough columns as-is (for transform expressions that reference metadata)
+        let array_element_schema = build_element_schema_from_df(input_schema, &array_columns)?;
+
+        // Merge array element fields with passthrough fields for complete element schema
+        let mut element_fields: Vec<(Option<datafusion::common::TableReference>, Arc<Field>)> =
+            array_element_schema
+                .iter()
+                .map(|(q, f)| (q.cloned(), f.clone()))
+                .collect();
+        for col_name in &passthrough_columns {
+            let field = input_schema.field_with_unqualified_name(col_name)?;
+            element_fields.push((None, Arc::new(field.clone())));
+        }
+        let element_schema = DFSchema::new_with_metadata(element_fields, HashMap::new())?;
 
         // Helper to get element type from array column
         let get_array_element_type = |array_col: &str| -> Result<DataType> {
@@ -87,12 +124,18 @@ impl FusedArrayTransform {
             )
         };
 
+        // Strip column qualifiers from transform expressions
+        let normalized_transform_exprs: Vec<Expr> = transform_exprs
+            .iter()
+            .map(strip_column_qualifiers)
+            .collect::<Result<Vec<_>>>()?;
+
         // Add output array columns - infer type from corresponding transform expression
         for (idx, output_col) in output_columns.iter().enumerate() {
             // Infer element type from the transform expression
             // Type inference must succeed - no silent fallbacks to avoid schema mismatches
-            let element_type = if idx < transform_exprs.len() {
-                let inferred = transform_exprs[idx].get_type(&element_schema);
+            let element_type = if idx < normalized_transform_exprs.len() {
+                let inferred = normalized_transform_exprs[idx].get_type(&element_schema);
                 match inferred {
                     Ok(dt) => dt,
                     Err(e) => {
@@ -139,7 +182,7 @@ impl FusedArrayTransform {
             array_columns,
             passthrough_columns,
             output_columns,
-            transform_exprs,
+            transform_exprs: normalized_transform_exprs,
             schema,
         })
     }
