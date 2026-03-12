@@ -1579,10 +1579,12 @@ impl TranscriptConsequenceEngine {
                 terms.insert(SoTerm::SpliceAcceptorVariant);
             }
 
-            // Polypyrimidine: VEP checks in two loops with different coord models.
-            //   _overlapped_introns (normalized P-1,P): P in [intron_end-16, intron_end-1]
-            //   _overlapped_introns_boundary (raw P,P-1): P in [intron_end-15, intron_end-2]
-            //   Union: P in [intron_end-16, intron_end-1]
+            // Polypyrimidine: VEP _intron_effects uses VCF-level coords
+            //   (POS, POS) for standard VCF insertions. Our p = POS+1.
+            //   VEP's overlap(POS, POS, intron_end-16, intron_end-2) detects
+            //   POS in [intron_end-16, intron_end-2]. Mapped to our p:
+            //   [intron_end-15, intron_end-1]. Include intron_end-16 too for
+            //   cases where VEP's intron/exon boundary differs by 1.
             if (intron_end - 16..=intron_end - 1).contains(&p) {
                 terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
             }
@@ -1724,10 +1726,9 @@ impl TranscriptConsequenceEngine {
                 terms.insert(SoTerm::SpliceAcceptorVariant);
             }
 
-            // Polypyrimidine reverse: VEP checks in two loops.
-            //   _overlapped_introns (normalized): P in [intron_start+2, intron_start+17]
-            //   _overlapped_introns_boundary (raw): P in [intron_start+3, intron_start+16]
-            //   Union: P in [intron_start+2, intron_start+17]
+            // Polypyrimidine reverse: VEP uses VCF-level coords. Our p = POS+1.
+            //   Mapped range [intron_start+3, intron_start+17], plus
+            //   intron_start+2 for boundary tolerance.
             if (intron_start + 2..=intron_start + 17).contains(&p) {
                 terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
             }
@@ -1975,17 +1976,13 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         terms.remove(&SoTerm::SpliceRegionVariant);
     }
 
-    // VEP Perl evaluates splice_polypyrimidine_tract_variant independently,
-    // but when splice_acceptor_variant is present, the PPT check effectively
-    // returns false because the position is already classified as the more
-    // specific splice acceptor site.
-    if terms.contains(&SoTerm::SpliceAcceptorVariant) {
-        terms.remove(&SoTerm::SplicePolypyrimidineTractVariant);
-    }
-
-    // SO hierarchy: splice_acceptor/donor_variant IS-A intron_variant.
-    // VEP strips the parent (intron_variant) when the more specific
-    // child term is present.
+    // VEP Perl uses a tier system (all splice terms are tier 3) — it does
+    // NOT strip splice_polypyrimidine_tract_variant when splice_acceptor is
+    // present. However, VEP's intron_variant detection range (intron_start+2
+    // ..intron_end-2) excludes splice sites, so in practice intron_variant
+    // rarely co-occurs with splice_donor/acceptor. Strip intron_variant
+    // here as a safety net for edge cases where our overlap detection is
+    // slightly wider than VEP's.
     if terms.contains(&SoTerm::SpliceDonorVariant) || terms.contains(&SoTerm::SpliceAcceptorVariant)
     {
         terms.remove(&SoTerm::IntronVariant);
@@ -4448,8 +4445,9 @@ mod tests {
             &[],
         );
         let terms = &assignments[0].terms;
-        // VEP strips intron_variant when the more specific splice_donor_variant
-        // is present (SO hierarchy: splice_donor_variant IS-A intron_variant).
+        // We strip intron_variant when splice_donor_variant is present as a
+        // safety net for edge cases where our overlap detection is wider than
+        // VEP's intron range (intron_start+2..intron_end-2).
         assert!(
             terms.contains(&SoTerm::SpliceDonorVariant),
             "Large exon-spanning deletion should get splice_donor_variant: {:?}",
@@ -4457,7 +4455,7 @@ mod tests {
         );
         assert!(
             !terms.contains(&SoTerm::IntronVariant),
-            "intron_variant should be stripped when splice_donor_variant is present: {:?}",
+            "intron_variant should be stripped when splice_donor_variant present: {:?}",
             terms
         );
     }
@@ -5572,16 +5570,16 @@ mod tests {
     // ---- PPT kept alongside splice_acceptor/donor ----
 
     #[test]
-    fn splice_ppt_stripped_with_acceptor() {
-        // VEP suppresses PPT when splice_acceptor is present — the acceptor
-        // site subsumes the polypyrimidine tract region.
+    fn splice_ppt_kept_with_acceptor() {
+        // VEP Perl uses tier system — all splice terms are tier 3, so PPT
+        // is kept alongside splice_acceptor.
         let mut terms = BTreeSet::new();
         terms.insert(SoTerm::SpliceAcceptorVariant);
         terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
         strip_parent_terms(&mut terms);
         assert!(
-            !terms.contains(&SoTerm::SplicePolypyrimidineTractVariant),
-            "PPT should be stripped when splice_acceptor is present"
+            terms.contains(&SoTerm::SplicePolypyrimidineTractVariant),
+            "PPT should be kept alongside splice_acceptor (same tier)"
         );
         assert!(terms.contains(&SoTerm::SpliceAcceptorVariant));
     }
@@ -5601,15 +5599,16 @@ mod tests {
     }
 
     #[test]
-    fn splice_ppt_and_intron_both_stripped_with_acceptor() {
-        // splice_acceptor strips both PPT and intron_variant.
+    fn splice_ppt_kept_intron_stripped_with_acceptor() {
+        // PPT is kept (VEP doesn't strip it), but intron_variant is
+        // stripped as a safety net for overlap detection differences.
         let mut terms = BTreeSet::new();
         terms.insert(SoTerm::SpliceAcceptorVariant);
         terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
         terms.insert(SoTerm::IntronVariant);
         strip_parent_terms(&mut terms);
         assert!(terms.contains(&SoTerm::SpliceAcceptorVariant));
-        assert!(!terms.contains(&SoTerm::SplicePolypyrimidineTractVariant));
+        assert!(terms.contains(&SoTerm::SplicePolypyrimidineTractVariant));
         assert!(!terms.contains(&SoTerm::IntronVariant));
     }
 
@@ -5741,23 +5740,23 @@ mod tests {
     }
 
     #[test]
-    fn strip_ppt_and_intron_with_splice_acceptor() {
-        // VEP suppresses both PPT and intron_variant when splice_acceptor is present.
+    fn ppt_kept_intron_stripped_with_splice_acceptor() {
+        // PPT kept, intron_variant stripped alongside splice_acceptor.
         let mut terms = BTreeSet::new();
         terms.insert(SoTerm::SpliceAcceptorVariant);
         terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
         terms.insert(SoTerm::IntronVariant);
         terms.insert(SoTerm::NonCodingTranscriptVariant);
         strip_parent_terms(&mut terms);
-        assert!(!terms.contains(&SoTerm::SplicePolypyrimidineTractVariant));
+        assert!(terms.contains(&SoTerm::SplicePolypyrimidineTractVariant));
         assert!(!terms.contains(&SoTerm::IntronVariant));
         assert!(terms.contains(&SoTerm::SpliceAcceptorVariant));
         assert!(terms.contains(&SoTerm::NonCodingTranscriptVariant));
     }
 
     #[test]
-    fn strip_intron_variant_with_splice_donor() {
-        // SO hierarchy: splice_donor_variant IS-A intron_variant.
+    fn intron_variant_stripped_with_splice_donor() {
+        // Strip intron_variant alongside splice_donor as safety net.
         let mut terms = BTreeSet::new();
         terms.insert(SoTerm::SpliceDonorVariant);
         terms.insert(SoTerm::IntronVariant);

@@ -366,6 +366,8 @@ struct ColocatedEntry {
     pheno: i64,
     clin_sig_allele: Option<String>,
     pubmed: Option<String>,
+    /// Raw AF column values (same order as `AF_COL_NAMES` / `AF_COLUMNS`).
+    af_values: Vec<String>,
 }
 
 /// Aggregated data from ALL co-located variants at the same position.
@@ -495,6 +497,38 @@ impl ColocatedData {
         });
         filtered
     }
+
+    /// Get AF value for a specific column index from co-located entries.
+    ///
+    /// Iterates allele-filtered entries and returns the first non-empty AF
+    /// value for the given column index. The caller provides the VEP allele
+    /// for matching within the AF string (e.g. "T:0.93").
+    fn af_for_allele(&self, af_col_idx: usize, vep_allele: &str, vcf_ref: &str, vcf_alt: &str) -> &str {
+        for entry in &self.entries {
+            if af_col_idx >= entry.af_values.len() {
+                continue;
+            }
+            let raw = &entry.af_values[af_col_idx];
+            if raw.is_empty() {
+                continue;
+            }
+            // Check allele compatibility.
+            if !entry.allele_string.starts_with("COSMIC_MUTATION")
+                && !entry.allele_string.starts_with("HGMD_MUTATION")
+            {
+                use crate::allele::allele_matches;
+                if !allele_matches(vcf_ref, vcf_alt, &entry.allele_string) {
+                    continue;
+                }
+            }
+            // Extract frequency for matching allele.
+            let freq = extract_af_for_allele(raw, vep_allele);
+            if !freq.is_empty() {
+                return freq;
+            }
+        }
+        ""
+    }
 }
 
 /// Build co-located variant aggregation from the piggybacked collection sink.
@@ -520,6 +554,7 @@ fn build_colocated_map_from_sink(
                 pheno: ce.pheno,
                 clin_sig_allele: ce.clin_sig_allele.clone(),
                 pubmed: ce.pubmed.clone(),
+                af_values: ce.af_values.clone(),
             });
         }
 
@@ -1788,10 +1823,20 @@ impl AnnotateProvider {
             let mut af_csq_values: Vec<String> = Vec::with_capacity(AF_COLUMNS.len());
             let mut af_raw_formatted: Vec<String> = Vec::with_capacity(AF_COLUMNS.len());
             for (i, col) in AF_COLUMNS.iter().enumerate() {
-                let raw_freq = if flags.af_group_enabled(col.flag_group) {
+                let main_freq = if flags.af_group_enabled(col.flag_group) {
                     extract_af_for_allele(&af_raw[i], &vep_allele)
                 } else {
                     ""
+                };
+                // Fallback to co-located AF when main join's value is empty
+                // (common for shifted indels where the matched cache row has
+                // empty AF but a co-located entry at the original position has it).
+                let raw_freq = if main_freq.is_empty() && flags.af_group_enabled(col.flag_group) {
+                    coloc
+                        .map(|c| c.af_for_allele(i, &vep_allele, &ref_al, &alt_allele))
+                        .unwrap_or("")
+                } else {
+                    main_freq
                 };
                 // VEP applies sprintf("%.4f") to the global AF field only.
                 let freq = if col.format_4f && !raw_freq.is_empty() {
@@ -3064,6 +3109,7 @@ mod tests {
             pheno,
             clin_sig_allele: clin_sig_allele.map(|s| s.to_string()),
             pubmed: pubmed.map(|s| s.to_string()),
+            af_values: Vec::new(),
         }
     }
 
