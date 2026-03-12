@@ -3475,6 +3475,26 @@ mod tests {
     }
 
     #[test]
+    fn test_colocated_variant_fields_support_unshifted_output_match() {
+        let data = make_coloc_data(vec![make_entry(
+            "rs1",
+            "AA/-",
+            vec![make_match("A", "-")],
+            0,
+            0,
+            Some("benign"),
+            None,
+            Some("123"),
+            vec![],
+        )]);
+
+        let fields = data.variant_fields("-", Some("A"), true);
+        assert_eq!(fields.existing_variation, "rs1");
+        assert_eq!(fields.clin_sig, "benign");
+        assert_eq!(fields.pubmed, "123");
+    }
+
+    #[test]
     fn test_colocated_frequency_fields_use_matched_b_allele_and_max_af() {
         let mut af_values = vec![""; AF_COLUMNS.len()];
         af_values[0] = "G:0.1250";

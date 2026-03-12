@@ -31,7 +31,7 @@ use futures::{Stream, StreamExt};
 
 use crate::allele::{
     MatchedVariantAllele, VariantAlleleInput, allele_matches, get_matched_variant_alleles,
-    vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
+    vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::coordinate::CoordinateNormalizer;
 
@@ -176,14 +176,15 @@ fn compare_existing_variant(
     existing_end: i64,
 ) -> Option<Vec<MatchedVariantAllele>> {
     if !existing_allele_string.contains('/') {
-        return (existing_start == input_row.input_start && existing_end == input_row.input_end)
+        return (existing_start == input_row.compare_start
+            && existing_end == input_row.compare_end)
             .then_some(Vec::new());
     }
 
     let mut matched_alleles = get_matched_variant_alleles(
         VariantAlleleInput {
-            allele_string: &input_row.input_allele_string,
-            pos: input_row.input_start,
+            allele_string: &input_row.compare_allele_string,
+            pos: input_row.compare_start,
             strand: 1,
         },
         VariantAlleleInput {
@@ -383,12 +384,18 @@ impl ExecutionPlan for VariantLookupExec {
 struct BuildRow {
     vcf_ref: String,
     vcf_alt: String,
-    /// Parser-level input allele string used by VEP `compare_existing()`.
+    /// Parser-level input allele string used for sink identity.
     input_allele_string: String,
-    /// Parser-level input start used by VEP `compare_existing()`.
+    /// Parser-level input start used for sink identity.
     input_start: i64,
-    /// Parser-level input end used by VEP `compare_existing()`.
+    /// Parser-level input end used for sink identity.
     input_end: i64,
+    /// Minimized allele string used by VEP matched-alleles comparison.
+    compare_allele_string: String,
+    /// Minimized start used by VEP matched-alleles comparison.
+    compare_start: i64,
+    /// Minimized end used by exact unknown-allele shifted checks.
+    compare_end: i64,
     /// Mirrors VEP's `unshifted_allele_string`, which is only defined when
     /// shifting logic has produced an original input representation to retain.
     unshifted_allele_string: Option<String>,
@@ -651,6 +658,8 @@ impl VariantLookupStream {
             let (input_ref, input_alt, input_start) =
                 vcf_to_vep_input_allele(one_based_start, &vcf_ref, &vcf_alt);
             let input_allele_string = format!("{input_ref}/{input_alt}");
+            let (compare_ref, compare_alt) = vcf_to_vep_allele(&vcf_ref, &vcf_alt);
+            let compare_allele_string = format!("{compare_ref}/{compare_alt}");
 
             // VEP-normalized coordinates for the hash index (exact matching).
             let vep_start = vep_norm_start(one_based_start, &vcf_ref, &vcf_alt);
@@ -692,6 +701,9 @@ impl VariantLookupStream {
                 input_allele_string,
                 input_start,
                 input_end: one_based_end,
+                compare_allele_string,
+                compare_start: vep_start,
+                compare_end: vep_end,
                 unshifted_allele_string: None,
                 vep_start,
                 vep_end,
@@ -1381,6 +1393,14 @@ fn as_i64_values(col: &ArrayRef, column_name: &str) -> Result<Vec<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::StringArray;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+    fn empty_sendable_stream(schema: SchemaRef) -> SendableRecordBatchStream {
+        let iter = futures::stream::iter(Vec::<Result<RecordBatch>>::new());
+        Box::pin(RecordBatchStreamAdapter::new(schema, Box::pin(iter)))
+    }
 
     #[test]
     fn compare_existing_variant_matches_shifted_or_unshifted_input() {
@@ -1390,6 +1410,9 @@ mod tests {
             input_allele_string: "AA/-".to_string(),
             input_start: 101,
             input_end: 102,
+            compare_allele_string: "AA/-".to_string(),
+            compare_start: 101,
+            compare_end: 102,
             unshifted_allele_string: Some("AAA/A".to_string()),
             vep_start: 101,
             vep_end: 102,
@@ -1425,6 +1448,9 @@ mod tests {
             input_allele_string: "CGT/-".to_string(),
             input_start: 101,
             input_end: 103,
+            compare_allele_string: "CGT/-".to_string(),
+            compare_start: 101,
+            compare_end: 103,
             unshifted_allele_string: Some("ACGT/A".to_string()),
             vep_start: 101,
             vep_end: 103,
@@ -1450,6 +1476,9 @@ mod tests {
             input_allele_string: "AA/-".to_string(),
             input_start: 101,
             input_end: 102,
+            compare_allele_string: "AA/-".to_string(),
+            compare_start: 101,
+            compare_end: 102,
             unshifted_allele_string: None,
             vep_start: 101,
             vep_end: 102,
@@ -1458,6 +1487,34 @@ mod tests {
         };
 
         assert_eq!(compare_existing_variant(&row, "AA/-", 100, 102), None);
+    }
+
+    #[test]
+    fn compare_existing_variant_uses_compare_coords_for_unknown_insertions() {
+        let row = BuildRow {
+            vcf_ref: "TTA".to_string(),
+            vcf_alt: "TATATATA".to_string(),
+            input_allele_string: "TA/ATATATA".to_string(),
+            input_start: 119247098,
+            input_end: 119247099,
+            compare_allele_string: "-/ATATA".to_string(),
+            compare_start: 119247098,
+            compare_end: 119247097,
+            unshifted_allele_string: None,
+            vep_start: 119247098,
+            vep_end: 119247097,
+            unshifted_start: None,
+            unshifted_end: None,
+        };
+
+        assert_eq!(
+            compare_existing_variant(&row, "HGMD_MUTATION", 119247098, 119247097),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            compare_existing_variant(&row, "HGMD_MUTATION", 119247098, 119247099),
+            None
+        );
     }
 
     #[test]
@@ -1472,6 +1529,9 @@ mod tests {
                 input_allele_string: "ATACATATATATATATATATATATAT/ATATATATATATAT".to_string(),
                 input_start: 62689176,
                 input_end: 62689202,
+                compare_allele_string: "ACATATATATATATATATATATAT/-".to_string(),
+                compare_start: 62689177,
+                compare_end: 62689188,
                 unshifted_allele_string: None,
                 vep_start: 62689177,
                 vep_end: 62689188,
@@ -1495,5 +1555,85 @@ mod tests {
             collect_overlapping_candidates(&build, "1", 62689176, 62689202),
             vec![0]
         );
+    }
+
+    #[test]
+    fn compare_existing_variant_uses_minimized_compare_allele_space_for_repeat_insertions() {
+        let row = BuildRow {
+            vcf_ref: "TTA".to_string(),
+            vcf_alt: "TATATATA".to_string(),
+            input_allele_string: "TA/ATATATA".to_string(),
+            input_start: 119247098,
+            input_end: 119247099,
+            compare_allele_string: "-/ATATA".to_string(),
+            compare_start: 119247098,
+            compare_end: 119247097,
+            unshifted_allele_string: None,
+            vep_start: 119247098,
+            vep_end: 119247097,
+            unshifted_start: None,
+            unshifted_end: None,
+        };
+
+        let matched =
+            compare_existing_variant(&row, "-/A/ATA/ATATA/ATATATA", 119247098, 119247097).unwrap();
+
+        assert_eq!(
+            matched,
+            vec![MatchedVariantAllele {
+                a_allele: "ATATA".to_string(),
+                a_index: 0,
+                b_allele: "ATATA".to_string(),
+                b_index: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn materialize_build_side_tracks_compare_and_parser_spaces_separately() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![119247097])),
+                Arc::new(Int64Array::from(vec![119247099])),
+                Arc::new(StringArray::from(vec!["TTA"])),
+                Arc::new(StringArray::from(vec!["TATATATA"])),
+            ],
+        )
+        .unwrap();
+
+        let mut stream = VariantLookupStream::new(
+            empty_sendable_stream(schema.clone()),
+            empty_sendable_stream(schema.clone()),
+            schema,
+            Vec::new(),
+            false,
+            CoordinateNormalizer::new(false, false),
+            true,
+            0,
+            None,
+        );
+        stream.vcf_batches.push(batch);
+
+        stream.materialize_build_side().unwrap();
+        let build = stream.build.as_ref().unwrap();
+        let row = &build.rows[0];
+
+        assert_eq!(row.input_allele_string, "TA/ATATATA");
+        assert_eq!(row.input_start, 119247098);
+        assert_eq!(row.input_end, 119247099);
+        assert_eq!(row.compare_allele_string, "-/ATATA");
+        assert_eq!(row.compare_start, 119247098);
+        assert_eq!(row.compare_end, 119247097);
+        assert_eq!(row.vep_start, 119247098);
+        assert_eq!(row.vep_end, 119247097);
     }
 }

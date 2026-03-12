@@ -574,9 +574,47 @@ cargo test --workspace --lib
     - `SOMATIC`: `12`
     - `PHENO`: `12`
 
+- the next strict compare-space port closed the previously identified output-allele gap and restored a much stronger colocated baseline:
+  - report: `/tmp/annotate_vep_golden_bench_phase1j/HG002_chr1_0_comparison_report.txt`
+  - annotate time: `92.7s`
+  - perfect fields: `64/74`
+  - remaining imperfect fields: `10`
+  - exact improvements validated on chr1:
+    - `Existing_variation`: `341 -> 120`
+    - `AF/AFR_AF/AMR_AF/EAS_AF/EUR_AF/SAS_AF`: `15 -> 0`
+    - `gnomADg_AF`: `324 -> 120`
+    - `MAX_AF`: `324 -> 120`
+    - `MAX_AF_POPS`: `324 -> 120`
+    - `SOMATIC`: `12 -> 0`
+    - `PHENO`: `12 -> 0`
+    - `gnomADe_AF`: `2 -> 23`
+  - unchanged independent transcript-side gaps:
+    - `Consequence`: `15`
+    - `INTRON`: `19`
+    - `CDS_position`: `2`
+    - `Protein_position`: `2`
+    - `Amino_acids`: `43`
+    - `15` extra transcript CSQ entries
+  - current colocated gap is now tightly localized:
+    - VEP still suppresses a subset of repeat-shifted existing variants that Rust emits
+    - representative loci from the current report:
+      - `chr1:105272550` / golden suppresses `rs60126136`
+      - `chr1:98448445` / golden suppresses `rs1170278308`
+      - `chr1:56092823` / golden suppresses `rs1180305122`
+      - `chr1:27971599` / Rust emits `gnomADe_AF=0` where golden stays empty
+  - concrete code-level finding from this pass:
+    - `annotate_provider.rs` still calls `variant_fields(..., None, ...)` and `frequency_fields(..., None, ...)`
+    - the helper methods already model a second allele identity for VEP shift-state filtering, but the live CSQ path never supplies it
+    - this confirms that true upstream shift metadata is still missing in the assembled Rust variation-feature state, even though the compare-space match step is now much closer to VEP
+
 New discrepancy diagnosis discovered during the later reruns:
 
 - there are two remaining strict Phase 1 gaps, both confirmed against upstream source and benchmark loci:
+- the earlier Gap B diagnosis is now substantially resolved:
+  - passing minimized compare-space alleles into `compare_existing()` eliminated the broader downstream output-allele mismatch block
+  - the remaining colocated failures are no longer a general parser-vs-output allele identity problem
+  - they now point to the narrower missing-shift-metadata problem in the live CSQ assembly path
+- there is one remaining strict Phase 1 gap plus the already-separate transcript consequence work:
   - Gap A: real upstream shift-state on the input variation feature is still missing in Rust
     - representative locus: `chr1:203883527` / golden `rs146407839`
     - cache row is a shifted repeat representation at `203883528..203883536` with `allele_string=TGTATTTAT/T`
@@ -584,21 +622,23 @@ New discrepancy diagnosis discovered during the later reruns:
       - parser-trimmed input `TGTATTTATTTA/-` at `203883528`
       - raw VCF input `TTGTATTTATTTA/T` at `203883527`
     - therefore golden parity at this locus requires a third, shifted input state that Rust does not yet materialize
-  - Gap B: some matched-alleles survive `compare_existing()` in parser/input allele space but are later filtered in the wrong output allele space
-    - representative locus: `chr1:24636024` / golden `rs1491496105`
-    - upstream Perl `get_matched_variant_alleles()` does match parser-space input `TATG/TGTATG` at `24636025` against the cache allele string for `rs1491496105`
-    - Rust still drops the colocated result later because the downstream field builder is keyed primarily off the final CSQ allele representation
+  - Gap A now has a second validated manifestation in the output layer:
+    - representative loci: `chr1:105272550`, `chr1:98448445`, `chr1:56092823`, `chr1:27971599`
+    - Rust already stores secondary-allele-aware filtering helpers in `annotate_provider.rs`, but the live CSQ assembly still passes `None`
+    - upstream `add_colocated_variant_info()` filters on `hash->{Allele}` plus `vf->{shifted_allele_string}`
+    - upstream `add_colocated_frequency_data()` filters on `hash->{Allele}` plus `shift_hash->{alt_orig_allele_string}`
+    - until Rust materializes and threads the exact shift-hash state into those calls, a small repeat-shifted colocated mismatch set will survive
 
 Implication for the Phase 1 closure criteria:
 
 - the earlier assumption that the `phase1e` regression was only a sink-key or coordinate-key mismatch was incomplete
 - Phase 1 must now port the actual upstream shift-state model, not just parser-space `compare_existing()`
-- after that, Phase 1 must ensure colocated field emission uses the same allele identity VEP uses after `matched_alleles` are attached
+- after that, Phase 1 must thread the exact shift-state alleles into colocated field emission the same way upstream `OutputFactory.pm` does
 - no transcript-consequence work should proceed as if Phase 1 were closed until both of those parity gaps are eliminated
 
 Phase 1 acceptance:
 
-- all 15 co-located field mismatches are eliminated
+- all remaining co-located field mismatches are eliminated
 - no new regressions in the previously perfect 53 fields
 
 ## Phase 2: Replace Transcript Consequence Approximations with VEP Semantics
