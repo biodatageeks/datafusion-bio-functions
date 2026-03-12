@@ -582,7 +582,7 @@ mod tests {
             .residual_filter
             .expect("expected residual filter to be preserved");
         assert_eq!(residual.column_indices().len(), 2);
-        assert_eq!(format!("{}", residual), "l_start != r_start");
+        assert_eq!(format!("{residual}"), "l_start != r_start");
 
         Ok(())
     }
