@@ -27,10 +27,10 @@ use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext};
 
-use crate::allele::{MatchedVariantAllele, vcf_to_vep_allele};
+use crate::allele::{MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele};
 use crate::annotation_store::{AnnotationBackend, build_store};
 use crate::lookup_provider::LookupProvider;
-use crate::variant_lookup_exec::{ColocatedCacheEntry, ColocatedSink};
+use crate::variant_lookup_exec::{ColocatedCacheEntry, ColocatedKey, ColocatedSink};
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
@@ -418,16 +418,19 @@ impl ColocatedEntry {
     fn matching_allele<'a>(
         &'a self,
         output_allele: &str,
-        output_allele_unshifted: &str,
+        output_allele_unshifted: Option<&str>,
     ) -> Option<&'a MatchedVariantAllele> {
-        self.matched_alleles
-            .iter()
-            .find(|matched| {
-                matched.a_allele == output_allele || matched.a_allele == output_allele_unshifted
-            })
+        self.matched_alleles.iter().find(|matched| {
+            matched.a_allele == output_allele
+                || output_allele_unshifted.is_some_and(|allele| matched.a_allele == allele)
+        })
     }
 
-    fn matches_output_allele(&self, output_allele: &str, output_allele_unshifted: &str) -> bool {
+    fn matches_output_allele(
+        &self,
+        output_allele: &str,
+        output_allele_unshifted: Option<&str>,
+    ) -> bool {
         self.matched_alleles.is_empty()
             || self
                 .matching_allele(output_allele, output_allele_unshifted)
@@ -452,12 +455,13 @@ impl ColocatedData {
     ///
     /// This mirrors OutputFactory's co-located ID and clinical-field assembly:
     /// sort existing variants the same way, filter by `matched_alleles` using
-    /// both current and unshifted output alleles, and preserve the `clin_sig`
-    /// vs `clin_sig_allele` split.
+    /// the current output allele plus `alt_orig_allele_string` only when
+    /// upstream shift state exists, and preserve the `clin_sig` vs
+    /// `clin_sig_allele` split.
     fn variant_fields(
         &self,
         output_allele: &str,
-        output_allele_unshifted: &str,
+        output_allele_unshifted: Option<&str>,
         include_pubmed: bool,
     ) -> ColocatedVariantFields {
         let mut fields = ColocatedVariantFields::default();
@@ -548,12 +552,13 @@ impl ColocatedData {
     ///
     /// This mirrors VEP's per-existing-variant frequency projection: build
     /// allele-to-frequency maps from the matched existing variant, select the
-    /// `b_allele` named in `matched_alleles`, and only interpolate the global
+    /// `b_allele` named in `matched_alleles`, use `alt_orig_allele_string`
+    /// only when present on the output allele, and only interpolate the global
     /// `AF` field in the same biallelic case VEP allows.
     fn frequency_fields(
         &self,
         output_allele: &str,
-        output_allele_unshifted: &str,
+        output_allele_unshifted: Option<&str>,
         flags: &VepFlags,
     ) -> ColocatedFrequencyFields {
         let mut per_column: Vec<Vec<String>> = vec![Vec::new(); AF_COLUMNS.len()];
@@ -568,6 +573,8 @@ impl ColocatedData {
             };
 
             let existing_alleles: Vec<&str> = entry.allele_string.split('/').collect();
+            let mut entry_max_af: Option<f64> = None;
+            let mut entry_max_af_pops: Vec<String> = Vec::new();
 
             for (idx, column) in AF_COLUMNS.iter().enumerate() {
                 let should_process = flags.max_af || flags.af_group_enabled(column.flag_group);
@@ -624,24 +631,39 @@ impl ColocatedData {
                 if flags.max_af {
                     if let Some(pop_name) = column.max_af_pop {
                         if let Ok(freq) = chosen.parse::<f64>() {
-                            match max_af {
+                            match entry_max_af {
                                 None => {
-                                    max_af = Some(freq);
-                                    max_af_pops.clear();
-                                    max_af_pops.push(pop_name.to_string());
+                                    entry_max_af = Some(freq);
+                                    entry_max_af_pops.clear();
+                                    entry_max_af_pops.push(pop_name.to_string());
                                 }
                                 Some(current) if freq > current => {
-                                    max_af = Some(freq);
-                                    max_af_pops.clear();
-                                    max_af_pops.push(pop_name.to_string());
+                                    entry_max_af = Some(freq);
+                                    entry_max_af_pops.clear();
+                                    entry_max_af_pops.push(pop_name.to_string());
                                 }
                                 Some(current) if (freq - current).abs() < f64::EPSILON => {
-                                    push_unique_value(&mut max_af_pops, pop_name.to_string());
+                                    push_unique_value(&mut entry_max_af_pops, pop_name.to_string());
                                 }
                                 _ => {}
                             }
                         }
                     }
+                }
+            }
+
+            if flags.max_af && !entry_max_af_pops.is_empty() {
+                let entry_max = entry_max_af.unwrap_or(0.0);
+                let current_max = max_af.unwrap_or(0.0);
+
+                if entry_max > current_max {
+                    max_af = Some(entry_max);
+                    max_af_pops.clear();
+                }
+
+                if entry_max >= current_max {
+                    max_af = Some(entry_max);
+                    max_af_pops.extend(entry_max_af_pops);
                 }
             }
         }
@@ -669,7 +691,9 @@ impl ColocatedData {
 /// Build co-located variant aggregation from the piggybacked collection sink.
 ///
 /// Converts `ColocatedCacheEntry` entries (collected during `VariantLookupExec`
-/// probe phase) into the same `ColocatedData` format used by the CSQ assembler.
+/// probe phase) into the same `ColocatedData` format used by the CSQ assembler,
+/// preserving the per-input-allele separation VEP keeps between different
+/// parser/decomposed alleles at the same locus.
 ///
 /// Traceability:
 /// - Ensembl VEP `compare_existing()`
@@ -681,8 +705,8 @@ impl ColocatedData {
 /// `compare_existing()`, merged across duplicate probe hits but without
 /// re-synthesizing allele matches from local heuristics.
 fn build_colocated_map_from_sink(
-    sink: &HashMap<(String, i64, i64), Vec<ColocatedCacheEntry>>,
-) -> HashMap<(String, i64, i64), ColocatedData> {
+    sink: &HashMap<ColocatedKey, Vec<ColocatedCacheEntry>>,
+) -> HashMap<ColocatedKey, ColocatedData> {
     let mut map = HashMap::with_capacity(sink.len());
     for (key, cache_entries) in sink {
         let mut entries: Vec<ColocatedEntry> = Vec::new();
@@ -984,6 +1008,24 @@ impl AnnotateProvider {
             return Some(false);
         }
         None
+    }
+
+    fn parse_json_i64_option(json: &str, key: &str) -> Option<i64> {
+        let needle = format!("\"{key}\"");
+        let start = json.find(&needle)?;
+        let rest = &json[start + needle.len()..];
+        let colon = rest.find(':')?;
+        let after_colon = rest[colon + 1..].trim_start();
+
+        let digits_len = after_colon
+            .chars()
+            .take_while(|ch| *ch == '-' || ch.is_ascii_digit())
+            .count();
+        if digits_len == 0 {
+            return None;
+        }
+
+        after_colon[..digits_len].parse().ok()
     }
 
     async fn resolve_transcript_context_tables(
@@ -1714,6 +1756,11 @@ impl AnnotateProvider {
             .clone();
         let cache_columns: Vec<String> =
             requested_columns.iter().map(|s| s.to_string()).collect();
+        let allowed_failed = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "failed"))
+            .unwrap_or(0);
         let mut provider = LookupProvider::new(
             Arc::clone(&self.session),
             self.vcf_table.clone(),
@@ -1722,6 +1769,7 @@ impl AnnotateProvider {
             cache_schema,
             cache_columns,
             extended_probes,
+            allowed_failed,
         )?;
         if flags.check_existing {
             provider.set_colocated_sink(Arc::clone(&coloc_sink));
@@ -1869,7 +1917,7 @@ impl AnnotateProvider {
         batch: &RecordBatch,
         engine: &TranscriptConsequenceEngine,
         ctx: &PreparedContext<'_>,
-        colocated_map: &HashMap<(String, i64, i64), ColocatedData>,
+        colocated_map: &HashMap<ColocatedKey, ColocatedData>,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
@@ -1947,25 +1995,34 @@ impl AnnotateProvider {
 
             // --- Batch 3: per-variant fields (same for every transcript entry) ---
             // Look up co-located variant aggregation (all variants at same position).
-            // Use VEP-normalized coordinates to match the cache's coordinate convention.
+            // Traceability:
+            // - Ensembl VEP `Parser::VCF::create_VariationFeatures()`
+            //   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Parser/VCF.pm#L321-L345
+            // - Ensembl VEP `compare_existing()`
+            //   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206
+            //
+            // VEP keys the existing-variant overlap/matching flow in parser/input
+            // coordinate space, not the fully minimized VEP-normalized allele space.
             let start_val = int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0);
+            let end_val = int64_at(batch.column(end_idx).as_ref(), row).unwrap_or(0);
             let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
-            let (vep_start, vep_end) = {
-                use crate::allele::{vep_norm_end, vep_norm_start};
-                (
-                    vep_norm_start(start_val, &ref_al, &alt_allele),
-                    vep_norm_end(start_val, &ref_al, &alt_allele),
-                )
-            };
-            let coloc = colocated_map.get(&(chrom_norm.to_string(), vep_start, vep_end));
+            let (input_ref, input_alt, input_start) =
+                vcf_to_vep_input_allele(start_val, &ref_al, &alt_allele);
+            let input_allele_string = format!("{input_ref}/{input_alt}");
+            let coloc = colocated_map.get(&(
+                chrom_norm.to_string(),
+                input_start,
+                end_val,
+                input_allele_string,
+            ));
             let variant_fields = if flags.check_existing {
-                coloc.map(|data| data.variant_fields(&vep_allele, &alt_allele, flags.pubmed))
+                coloc.map(|data| data.variant_fields(&vep_allele, None, flags.pubmed))
                     .unwrap_or_default()
             } else {
                 ColocatedVariantFields::default()
             };
             let frequency_fields = if flags.check_existing {
-                coloc.map(|data| data.frequency_fields(&vep_allele, &alt_allele, &flags))
+                coloc.map(|data| data.frequency_fields(&vep_allele, None, &flags))
                     .unwrap_or_else(|| ColocatedFrequencyFields {
                         af_values: vec![String::new(); AF_COLUMNS.len()],
                         max_af: String::new(),
@@ -3122,6 +3179,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_json_i64_option_basic() {
+        let json = r#"{"failed":1}"#;
+        assert_eq!(AnnotateProvider::parse_json_i64_option(json, "failed"), Some(1));
+    }
+
+    #[test]
+    fn test_parse_json_i64_option_missing_key() {
+        let json = r#"{"other":1}"#;
+        assert_eq!(AnnotateProvider::parse_json_i64_option(json, "failed"), None);
+    }
+
+    #[test]
+    fn test_parse_json_i64_option_rejects_non_integer() {
+        let json = r#"{"failed":"yes"}"#;
+        assert_eq!(AnnotateProvider::parse_json_i64_option(json, "failed"), None);
+    }
+
     // =======================================================================
     // escaped_sql_literal
     // =======================================================================
@@ -3223,7 +3298,7 @@ mod tests {
             ),
         ]);
 
-        let fields = data.variant_fields("G", "G", true);
+        let fields = data.variant_fields("G", None, true);
         assert_eq!(fields.existing_variation, "rs1&COSV1");
         assert_eq!(fields.clin_sig, "benign&pathogenic");
         assert_eq!(fields.somatic, "0&1");
@@ -3232,7 +3307,7 @@ mod tests {
     }
 
     #[test]
-    fn test_colocated_variant_fields_use_clin_sig_allele_and_escape_semicolons() {
+    fn test_colocated_variant_fields_use_clin_sig_allele_and_escape_vcf_delimiters() {
         let data = make_coloc_data(vec![make_entry(
             "rs1",
             "A/G",
@@ -3245,8 +3320,8 @@ mod tests {
             vec![],
         )]);
 
-        let fields = data.variant_fields("G", "G", false);
-        assert_eq!(fields.clin_sig, "pathogenic%3Blikely_benign");
+        let fields = data.variant_fields("G", None, false);
+        assert_eq!(fields.clin_sig, "pathogenic&likely_benign");
     }
 
     #[test]
@@ -3278,7 +3353,7 @@ mod tests {
             max_af: true,
             pubmed: false,
         };
-        let fields = data.frequency_fields("G", "G", &flags);
+        let fields = data.frequency_fields("G", None, &flags);
 
         assert_eq!(fields.af_values[0], "0.1250");
         assert_eq!(fields.af_values[1], "0.25");
@@ -3286,6 +3361,54 @@ mod tests {
         assert_eq!(fields.af_values[16], "0.8");
         assert_eq!(fields.max_af, "0.25");
         assert_eq!(fields.max_af_pops, "AFR");
+    }
+
+    #[test]
+    fn test_colocated_frequency_fields_preserve_max_af_pop_duplicates_across_entries() {
+        let mut af_values_a = vec![""; AF_COLUMNS.len()];
+        af_values_a[3] = "G:0.7";
+
+        let mut af_values_b = vec![""; AF_COLUMNS.len()];
+        af_values_b[3] = "G:0.7";
+
+        let data = make_coloc_data(vec![
+            make_entry(
+                "rs1",
+                "A/G",
+                vec![make_match("G", "G")],
+                0,
+                0,
+                None,
+                None,
+                None,
+                af_values_a,
+            ),
+            make_entry(
+                "rs2",
+                "A/G",
+                vec![make_match("G", "G")],
+                0,
+                0,
+                None,
+                None,
+                None,
+                af_values_b,
+            ),
+        ]);
+
+        let flags = VepFlags {
+            check_existing: true,
+            af: false,
+            af_1kg: true,
+            af_gnomade: false,
+            af_gnomadg: false,
+            max_af: true,
+            pubmed: false,
+        };
+        let fields = data.frequency_fields("G", None, &flags);
+
+        assert_eq!(fields.max_af, "0.7");
+        assert_eq!(fields.max_af_pops, "EAS&EAS");
     }
 
     #[test]
@@ -3314,7 +3437,7 @@ mod tests {
             max_af: false,
             pubmed: false,
         };
-        let fields = data.frequency_fields("-", "A", &flags);
+        let fields = data.frequency_fields("-", Some("A"), &flags);
         assert_eq!(fields.af_values[0], "0.9301");
     }
 

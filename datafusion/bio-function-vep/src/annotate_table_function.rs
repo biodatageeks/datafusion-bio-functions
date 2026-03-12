@@ -142,12 +142,14 @@ mod tests {
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
             Field::new("allele_string", DataType::Utf8, false),
+            Field::new("failed", DataType::Int64, false),
         ];
         let mut columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = vec![
             Arc::new(StringArray::from(vec!["1"])),
             Arc::new(Int64Array::from(vec![100])),
             Arc::new(Int64Array::from(vec![101])),
             Arc::new(StringArray::from(vec!["A/G"])),
+            Arc::new(Int64Array::from(vec![0])),
         ];
         // Add all CACHE_OUTPUT_COLUMNS as nullable Utf8.
         for &col in CACHE_OUTPUT_COLUMNS {
@@ -249,6 +251,7 @@ mod tests {
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
             Field::new("AF", DataType::Float64, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -260,6 +263,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["GCT/GCC"])),
                 Arc::new(StringArray::from(vec!["benign"])),
                 Arc::new(Float64Array::from(vec![0.01_f64])),
+                Arc::new(Int64Array::from(vec![0])),
             ],
         )
         .expect("valid synonymous cache batch");
@@ -369,6 +373,7 @@ mod tests {
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
             Field::new("AF", DataType::Float64, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -380,6 +385,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A/G"])),
                 Arc::new(StringArray::from(vec!["pathogenic"])),
                 Arc::new(Float64Array::from(vec![0.42_f64])),
+                Arc::new(Int64Array::from(vec![0])),
             ],
         )
         .expect("valid context cache batch");
@@ -557,6 +563,7 @@ mod tests {
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
             Field::new("AF", DataType::Float64, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -568,6 +575,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A/G"])),
                 Arc::new(StringArray::from(vec!["pathogenic"])),
                 Arc::new(Float64Array::from(vec![0.11_f64])),
+                Arc::new(Int64Array::from(vec![0])),
             ],
         )
         .expect("valid golden context cache batch");
@@ -772,6 +780,7 @@ mod tests {
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
             Field::new("AF", DataType::Float64, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -783,6 +792,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A/G"])),
                 Arc::new(StringArray::from(vec!["uncertain_significance"])),
                 Arc::new(Float64Array::from(vec![0.2_f64])),
+                Arc::new(Int64Array::from(vec![0])),
             ],
         )
         .expect("valid splice cache batch");
@@ -871,6 +881,7 @@ mod tests {
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
             Field::new("AF", DataType::Float64, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -882,6 +893,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["AAGAAGAAGAAGAA/-"])),
                 Arc::new(StringArray::from(vec!["likely_pathogenic"])),
                 Arc::new(Float64Array::from(vec![0.005_f64])),
+                Arc::new(Int64Array::from(vec![0])),
             ],
         )
         .expect("valid repeat-shift cache batch");
@@ -968,6 +980,7 @@ mod tests {
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
             Field::new("AF", DataType::Float64, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -979,6 +992,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["A/G"])),
                 Arc::new(StringArray::from(vec!["benign"])),
                 Arc::new(Float64Array::from(vec![0.03_f64])),
+                Arc::new(Int64Array::from(vec![0])),
             ],
         )
         .expect("valid negative-strand cache batch");
@@ -1088,6 +1102,7 @@ mod tests {
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
             Field::new("AF", DataType::Float64, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -1099,6 +1114,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["TAA/-"])),
                 Arc::new(StringArray::from(vec!["pathogenic"])),
                 Arc::new(Float64Array::from(vec![0.001_f64])),
+                Arc::new(Int64Array::from(vec![0])),
             ],
         )
         .expect("valid stop-loss cache batch");

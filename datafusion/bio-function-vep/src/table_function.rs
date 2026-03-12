@@ -105,6 +105,7 @@ impl TableFunctionImpl for LookupFunction {
             cache_schema,
             columns,
             extended_probes,
+            0,
         )?))
     }
 }

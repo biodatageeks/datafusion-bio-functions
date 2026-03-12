@@ -79,6 +79,8 @@ pub struct LookupProvider {
     coord_normalizer: CoordinateNormalizer,
     /// When true, use interval-overlap matching instead of exact coordinate match.
     extended_probes: bool,
+    /// Maximum allowed `failed` flag value from the cache.
+    allowed_failed: i64,
     /// Output schema.
     schema: SchemaRef,
     /// Optional sink for co-located data collection during probe phase.
@@ -102,6 +104,7 @@ impl LookupProvider {
         cache_schema: Schema,
         cache_columns: Vec<String>,
         extended_probes: bool,
+        allowed_failed: i64,
     ) -> Result<Self> {
         let cache_schema_ref: SchemaRef = Arc::new(cache_schema.clone());
         validate_variation_schema(&cache_schema_ref)?;
@@ -140,6 +143,7 @@ impl LookupProvider {
             cache_columns,
             coord_normalizer,
             extended_probes,
+            allowed_failed,
             schema,
             colocated_sink: None,
         })
@@ -248,7 +252,7 @@ impl TableProvider for LookupProvider {
         // Project cache to only the columns needed: join keys + requested output columns.
         // This avoids reading all 78 parquet columns when only ~10 are needed.
         let cache_df = self.session.table(&self.cache_table).await?;
-        let mut required_cols: Vec<&str> = vec!["chrom", "start", "end", "allele_string"];
+        let mut required_cols: Vec<&str> = vec!["chrom", "start", "end", "allele_string", "failed"];
         for col in &self.cache_columns {
             if !required_cols.contains(&col.as_str()) {
                 required_cols.push(col.as_str());
@@ -266,6 +270,7 @@ impl TableProvider for LookupProvider {
             vcf_has_chr,
             self.coord_normalizer.clone(),
             self.extended_probes,
+            self.allowed_failed,
             self.schema.clone(),
         );
         if let Some(ref sink) = self.colocated_sink {
@@ -375,6 +380,7 @@ mod tests {
             Field::new("variation_name", DataType::Utf8, true),
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         // Cache coordinates must exactly match VCF after normalization.
         // VCF has chr1:(100,101) and chr1:(200,201), cache uses bare chrom names.
@@ -387,6 +393,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["rs123", "rs456"])),
                 Arc::new(StringArray::from(vec!["A/G", "C/T"])),
                 Arc::new(StringArray::from(vec!["benign", "pathogenic"])),
+                Arc::new(Int64Array::from(vec![0, 0])),
             ],
         )
         .unwrap();
@@ -441,6 +448,7 @@ mod tests {
             Field::new("variation_name", DataType::Utf8, true),
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
 
         let cache_batch = RecordBatch::try_new(
@@ -452,6 +460,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["rs123"])),
                 Arc::new(StringArray::from(vec!["A/G"])),
                 Arc::new(StringArray::from(vec!["benign"])),
+                Arc::new(Int64Array::from(vec![0])),
             ],
         )
         .unwrap();
@@ -537,6 +546,7 @@ mod tests {
             Field::new("variation_name", DataType::Utf8, true),
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let cache_batch = RecordBatch::try_new(
             cache_schema.clone(),
@@ -547,6 +557,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["rs_shifted"])),
                 Arc::new(StringArray::from(vec!["TA/-"])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(Int64Array::from(vec![0])),
             ],
         )
         .unwrap();
@@ -626,6 +637,7 @@ mod tests {
             Field::new("variation_name", DataType::Utf8, true),
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let cache_batch = RecordBatch::try_new(
             cache_schema.clone(),
@@ -636,6 +648,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["rs_repeat_shift"])),
                 Arc::new(StringArray::from(vec!["AAGAAGAAGAAGAA/-"])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(Int64Array::from(vec![0])),
             ],
         )
         .unwrap();
@@ -789,6 +802,7 @@ mod tests {
             Field::new("variation_name", DataType::Utf8, true),
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let cache_batch = RecordBatch::try_new(
             cache_schema.clone(),
@@ -806,6 +820,7 @@ mod tests {
                     "pathogenic",
                     "decoy_201",
                 ])),
+                Arc::new(Int64Array::from(vec![0, 0, 0, 0])),
             ],
         )
         .unwrap();
@@ -885,6 +900,7 @@ mod tests {
             Field::new("variation_name", DataType::Utf8, true),
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let cache_batch = RecordBatch::try_new(
             cache_schema.clone(),
@@ -895,6 +911,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["rs_g_match", "rs_c_miss"])),
                 Arc::new(StringArray::from(vec!["A/G", "A/C"])),
                 Arc::new(StringArray::from(vec!["benign", "benign"])),
+                Arc::new(Int64Array::from(vec![0, 0])),
             ],
         )
         .unwrap();
@@ -959,6 +976,7 @@ mod tests {
             Field::new("variation_name", DataType::Utf8, true),
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let cache_batch = RecordBatch::try_new(
             cache_schema.clone(),
@@ -969,6 +987,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["rs_ins_match", "rs_ins_miss"])),
                 Arc::new(StringArray::from(vec!["-/T", "-/T"])),
                 Arc::new(StringArray::from(vec!["pathogenic", "pathogenic"])),
+                Arc::new(Int64Array::from(vec![0, 0])),
             ],
         )
         .unwrap();
@@ -1038,6 +1057,7 @@ mod tests {
                 Field::new("variation_name", DataType::Utf8, true),
                 Field::new("allele_string", DataType::Utf8, false),
                 Field::new("clin_sig", DataType::Utf8, true),
+                Field::new("failed", DataType::Int64, false),
             ],
             false,
         );
@@ -1050,6 +1070,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["rs100"])),
                 Arc::new(StringArray::from(vec!["A/G"])),
                 Arc::new(StringArray::from(vec!["benign"])),
+                Arc::new(Int64Array::from(vec![0])),
             ],
         )
         .unwrap();
@@ -1118,6 +1139,7 @@ mod tests {
                 Field::new("variation_name", DataType::Utf8, true),
                 Field::new("allele_string", DataType::Utf8, false),
                 Field::new("clin_sig", DataType::Utf8, true),
+                Field::new("failed", DataType::Int64, false),
             ],
             false,
         );
@@ -1130,6 +1152,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["rs100", "rs101"])),
                 Arc::new(StringArray::from(vec!["A/G", "A/G"])),
                 Arc::new(StringArray::from(vec!["benign", "benign"])),
+                Arc::new(Int64Array::from(vec![0, 0])),
             ],
         )
         .unwrap();
@@ -1202,6 +1225,7 @@ mod tests {
                 Field::new("variation_name", DataType::Utf8, true),
                 Field::new("allele_string", DataType::Utf8, false),
                 Field::new("clin_sig", DataType::Utf8, true),
+                Field::new("failed", DataType::Int64, false),
             ],
             true,
         );
@@ -1214,6 +1238,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["rs100", "rs101"])),
                 Arc::new(StringArray::from(vec!["A/G", "A/G"])),
                 Arc::new(StringArray::from(vec!["benign", "benign"])),
+                Arc::new(Int64Array::from(vec![0, 0])),
             ],
         )
         .unwrap();
@@ -1284,6 +1309,7 @@ mod tests {
             Field::new("variation_name", DataType::Utf8, true),
             Field::new("allele_string", DataType::Utf8, false),
             Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
         ]));
         let cache_batch = RecordBatch::try_new(
             cache_schema.clone(),
@@ -1294,6 +1320,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["rs100", "COSM123", "rs100_dup"])),
                 Arc::new(StringArray::from(vec!["A/G", "A/G", "A/G"])),
                 Arc::new(StringArray::from(vec!["benign", "benign", "benign"])),
+                Arc::new(Int64Array::from(vec![0, 0, 0])),
             ],
         )
         .unwrap();

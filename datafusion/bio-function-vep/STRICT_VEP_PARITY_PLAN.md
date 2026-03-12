@@ -514,6 +514,71 @@ Current conclusion for remaining Phase 1 work:
 - until that is fixed, the remaining `Existing_variation`, AF, `MAX_AF*`, `CLIN_SIG`, `SOMATIC`, `PHENO`, and `PUBMED` mismatches will not reach zero
 - no Phase 2 transcript work should be treated as complete Phase 1 closure
 
+Additional validated findings after later March 12, 2026 reruns:
+
+- full workspace unit tests were rerun and passed after the cache-schema contract change:
+
+```bash
+cargo test --workspace --lib
+```
+
+- the failed-row filter port produced a much stronger interim state before the parser-space refactor:
+  - report: `/tmp/annotate_vep_golden_bench_phase1d/HG002_chr1_0_comparison_report.txt`
+  - perfect fields: `63/74`
+  - remaining imperfect fields: `11`
+  - key existing/co-located fields at that point:
+    - `Existing_variation`: `120`
+    - `gnomADg_AF`: `120`
+    - `MAX_AF_POPS`: `120`
+    - `MAX_AF`: `1,680`
+    - `gnomADe_AF`: `23`
+  - all 1000G AF fields were exact at that stage
+  - all clinical fields were exact at that stage
+
+- the parser-style `compare_existing()` refactor then regressed parity:
+  - report: `/tmp/annotate_vep_golden_bench_phase1e/HG002_chr1_0_comparison_report.txt`
+  - perfect fields: `55/74`
+  - remaining imperfect fields: `19`
+  - key existing/co-located fields after the refactor:
+    - `Existing_variation`: `341`
+    - `AF/AFR_AF/AMR_AF/EAS_AF/EUR_AF/SAS_AF`: `15` each
+    - `gnomADe_AF`: `2`
+    - `gnomADg_AF`: `324`
+    - `MAX_AF`: `1,884`
+    - `MAX_AF_POPS`: `324`
+    - `SOMATIC`: `12`
+    - `PHENO`: `12`
+
+- a later parser-space sink/key cleanup restored the refactor to the same `phase1e` benchmark state but did not recover the `phase1d` gains:
+  - report: `/tmp/annotate_vep_golden_bench_phase1g/HG002_chr1_0_comparison_report.txt`
+  - perfect fields: `55/74`
+  - remaining imperfect fields: `19`
+  - conclusion:
+    - parser-space candidate overlap and per-allele sink keys are necessary to avoid cross-allele contamination
+    - those fixes are not sufficient to restore VEP parity on their own
+
+New discrepancy diagnosis discovered during the later reruns:
+
+- there are two remaining strict Phase 1 gaps, both confirmed against upstream source and benchmark loci:
+  - Gap A: real upstream shift-state on the input variation feature is still missing in Rust
+    - representative locus: `chr1:203883527` / golden `rs146407839`
+    - cache row is a shifted repeat representation at `203883528..203883536` with `allele_string=TGTATTTAT/T`
+    - upstream Perl `get_matched_variant_alleles()` returns no match for both:
+      - parser-trimmed input `TGTATTTATTTA/-` at `203883528`
+      - raw VCF input `TTGTATTTATTTA/T` at `203883527`
+    - therefore golden parity at this locus requires a third, shifted input state that Rust does not yet materialize
+  - Gap B: some matched-alleles survive `compare_existing()` in parser/input allele space but are later filtered in the wrong output allele space
+    - representative locus: `chr1:24636024` / golden `rs1491496105`
+    - upstream Perl `get_matched_variant_alleles()` does match parser-space input `TATG/TGTATG` at `24636025` against the cache allele string for `rs1491496105`
+    - Rust still drops the colocated result later because the downstream field builder is keyed primarily off the final CSQ allele representation
+
+Implication for the Phase 1 closure criteria:
+
+- the earlier assumption that the `phase1e` regression was only a sink-key or coordinate-key mismatch was incomplete
+- Phase 1 must now port the actual upstream shift-state model, not just parser-space `compare_existing()`
+- after that, Phase 1 must ensure colocated field emission uses the same allele identity VEP uses after `matched_alleles` are attached
+- no transcript-consequence work should proceed as if Phase 1 were closed until both of those parity gaps are eliminated
+
 Phase 1 acceptance:
 
 - all 15 co-located field mismatches are eliminated

@@ -31,7 +31,7 @@ use futures::{Stream, StreamExt};
 
 use crate::allele::{
     MatchedVariantAllele, VariantAlleleInput, allele_matches, get_matched_variant_alleles,
-    vcf_to_vep_allele, vep_norm_end, vep_norm_start,
+    vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::coordinate::CoordinateNormalizer;
 
@@ -128,8 +128,8 @@ fn push_unique_candidate(candidates: &mut Vec<usize>, seen: &mut HashSet<usize>,
 ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/InputBuffer.pm#L311-L329
 ///
 /// This mirrors VEP's prefilter by considering overlaps against both shifted
-/// and unshifted input coordinates before `compare_existing()` decides whether
-/// the existing variant is allele-compatible.
+/// and, when defined, unshifted input coordinates before `compare_existing()`
+/// decides whether the existing variant is allele-compatible.
 fn collect_overlapping_candidates(
     build: &BuildSide,
     chrom: &str,
@@ -141,7 +141,7 @@ fn collect_overlapping_candidates(
     let probe_start = start.min(end);
     let probe_end = start.max(end);
 
-    if let Some(tree) = build.trees.get(chrom) {
+    if let Some(tree) = build.parser_trees.get(chrom) {
         tree.query(probe_start as i32, probe_end as i32, |interval| {
             push_unique_candidate(&mut candidates, &mut seen, *interval.metadata as usize);
         });
@@ -164,8 +164,9 @@ fn collect_overlapping_candidates(
 ///
 /// This ports VEP's existing-variant decision exactly for the offline cache
 /// path: unknown-allele records match only on exact shifted coordinates, while
-/// known-allele records are accepted only when shifted or unshifted input
-/// alleles produce non-empty `matched_alleles`.
+/// known-allele records are accepted only when shifted input alleles, or
+/// explicitly defined unshifted input alleles, produce non-empty
+/// `matched_alleles`.
 fn compare_existing_variant(
     input_row: &BuildRow,
     existing_allele_string: &str,
@@ -173,14 +174,14 @@ fn compare_existing_variant(
     existing_end: i64,
 ) -> Option<Vec<MatchedVariantAllele>> {
     if !existing_allele_string.contains('/') {
-        return (existing_start == input_row.vep_start && existing_end == input_row.vep_end)
+        return (existing_start == input_row.input_start && existing_end == input_row.input_end)
             .then_some(Vec::new());
     }
 
     let mut matched_alleles = get_matched_variant_alleles(
         VariantAlleleInput {
-            allele_string: &input_row.shifted_allele_string,
-            pos: input_row.vep_start,
+            allele_string: &input_row.input_allele_string,
+            pos: input_row.input_start,
             strand: 1,
         },
         VariantAlleleInput {
@@ -190,14 +191,15 @@ fn compare_existing_variant(
         },
     );
 
-    if input_row.unshifted_allele_string != input_row.shifted_allele_string
-        || input_row.unshifted_start != input_row.vep_start
-    {
+    if let (Some(unshifted_allele_string), Some(unshifted_start)) = (
+        input_row.unshifted_allele_string.as_deref(),
+        input_row.unshifted_start,
+    ) {
         let mut seen = matched_alleles.iter().cloned().collect::<HashSet<_>>();
         for matched in get_matched_variant_alleles(
             VariantAlleleInput {
-                allele_string: &input_row.unshifted_allele_string,
-                pos: input_row.unshifted_start,
+                allele_string: unshifted_allele_string,
+                pos: unshifted_start,
                 strand: 1,
             },
             VariantAlleleInput {
@@ -219,9 +221,15 @@ fn compare_existing_variant(
     }
 }
 
+/// Shared sink key for co-located data collected during `VariantLookupExec`
+/// streaming.
+///
+/// Key = VCF (chrom, input_start, input_end, input_allele_string), value =
+/// cache entries attached to that specific parser/input allele.
+pub type ColocatedKey = (String, i64, i64, String);
+
 /// Shared sink for co-located data collected during `VariantLookupExec` streaming.
-/// Key = VCF (chrom, vep_start, vep_end), value = cache entries at that position.
-pub type ColocatedSink = Arc<Mutex<HashMap<(String, i64, i64), Vec<ColocatedCacheEntry>>>>;
+pub type ColocatedSink = Arc<Mutex<HashMap<ColocatedKey, Vec<ColocatedCacheEntry>>>>;
 
 /// Physical execution plan for self-contained left interval join.
 ///
@@ -236,6 +244,7 @@ pub struct VariantLookupExec {
     vcf_has_chr: bool,
     coord_normalizer: CoordinateNormalizer,
     extended_probes: bool,
+    allowed_failed: i64,
     output_schema: SchemaRef,
     properties: PlanProperties,
     /// Optional sink for co-located data collected during probe phase.
@@ -251,6 +260,7 @@ impl VariantLookupExec {
         vcf_has_chr: bool,
         coord_normalizer: CoordinateNormalizer,
         extended_probes: bool,
+        allowed_failed: i64,
         output_schema: SchemaRef,
     ) -> Self {
         let properties = PlanProperties::new(
@@ -267,6 +277,7 @@ impl VariantLookupExec {
             vcf_has_chr,
             coord_normalizer,
             extended_probes,
+            allowed_failed,
             output_schema,
             properties,
             colocated_sink: None,
@@ -284,8 +295,8 @@ impl Debug for VariantLookupExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "VariantLookupExec {{ cache_columns: {:?}, extended_probes: {} }}",
-            self.cache_columns, self.extended_probes
+            "VariantLookupExec {{ cache_columns: {:?}, extended_probes: {}, allowed_failed: {} }}",
+            self.cache_columns, self.extended_probes, self.allowed_failed
         )
     }
 }
@@ -294,8 +305,8 @@ impl DisplayAs for VariantLookupExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "VariantLookupExec: columns={:?}, extended_probes={}",
-            self.cache_columns, self.extended_probes
+            "VariantLookupExec: columns={:?}, extended_probes={}, allowed_failed={}",
+            self.cache_columns, self.extended_probes, self.allowed_failed
         )
     }
 }
@@ -333,6 +344,7 @@ impl ExecutionPlan for VariantLookupExec {
             self.vcf_has_chr,
             self.coord_normalizer.clone(),
             self.extended_probes,
+            self.allowed_failed,
             self.output_schema.clone(),
         );
         exec.colocated_sink = self.colocated_sink.clone();
@@ -355,6 +367,7 @@ impl ExecutionPlan for VariantLookupExec {
             self.vcf_has_chr,
             self.coord_normalizer.clone(),
             self.extended_probes,
+            self.allowed_failed,
             self.colocated_sink.clone(),
         )))
     }
@@ -368,14 +381,23 @@ impl ExecutionPlan for VariantLookupExec {
 struct BuildRow {
     vcf_ref: String,
     vcf_alt: String,
-    shifted_allele_string: String,
-    unshifted_allele_string: String,
+    /// Parser-level input allele string used by VEP `compare_existing()`.
+    input_allele_string: String,
+    /// Parser-level input start used by VEP `compare_existing()`.
+    input_start: i64,
+    /// Parser-level input end used by VEP `compare_existing()`.
+    input_end: i64,
+    /// Mirrors VEP's `unshifted_allele_string`, which is only defined when
+    /// shifting logic has produced an original input representation to retain.
+    unshifted_allele_string: Option<String>,
     /// VEP-normalized start (1-based). Stored for tree fallback coordinate check.
     vep_start: i64,
     /// VEP-normalized end (1-based, may be < start for insertions).
     vep_end: i64,
-    /// Original 1-based coordinates before VEP normalization.
-    unshifted_start: i64,
+    /// Mirrors VEP's `unshifted_start`, only when defined upstream.
+    unshifted_start: Option<i64>,
+    /// Mirrors VEP's `unshifted_end`, only when defined upstream.
+    unshifted_end: Option<i64>,
 }
 
 /// Materialized build side: VCF data + dual lookup indices.
@@ -395,8 +417,12 @@ struct BuildSide {
     /// Intervals use raw 1-based coordinates (not VEP-normalized) so that
     /// shifted indels can be found via range overlap.
     trees: HashMap<String, COITree<u32, u32>>,
+    /// Parser/input-space overlap trees used by VEP `get_overlapping_vfs()`
+    /// before `compare_existing()` evaluates allele compatibility.
+    parser_trees: HashMap<String, COITree<u32, u32>>,
     /// Unshifted input coordinates used by VEP's overlap prefilter before
-    /// `compare_existing()` checks the unshifted allele string.
+    /// `compare_existing()` checks the unshifted allele string. Populated only
+    /// for rows where upstream shift state exists.
     unshifted_trees: HashMap<String, COITree<u32, u32>>,
     /// Track which build rows have been matched.
     matched: Vec<bool>,
@@ -408,6 +434,7 @@ struct CacheIndices {
     start: usize,
     end: usize,
     allele_string: usize,
+    failed: Option<usize>,
     /// Indices of requested cache columns in the cache batch schema.
     output_col_indices: Vec<usize>,
     /// Target data types for each output cache column (for casting).
@@ -447,6 +474,8 @@ struct VariantLookupStream {
     coord_normalizer: CoordinateNormalizer,
     /// When true, fall back to COITree on hash miss (for shifted indels).
     extended_probes: bool,
+    /// Maximum allowed cache `failed` value.
+    allowed_failed: i64,
     state: StreamState,
     /// Accumulated VCF batches (before build side is materialized).
     vcf_batches: Vec<RecordBatch>,
@@ -471,6 +500,7 @@ impl VariantLookupStream {
         vcf_has_chr: bool,
         coord_normalizer: CoordinateNormalizer,
         extended_probes: bool,
+        allowed_failed: i64,
         colocated_sink: Option<ColocatedSink>,
     ) -> Self {
         let num_vcf_cols = schema.fields().len() - cache_columns.len();
@@ -482,6 +512,7 @@ impl VariantLookupStream {
             vcf_has_chr,
             coord_normalizer,
             extended_probes,
+            allowed_failed,
             state: StreamState::CollectBuild,
             vcf_batches: Vec::new(),
             build: None,
@@ -502,6 +533,7 @@ impl VariantLookupStream {
         let start = cache_schema.index_of("start")?;
         let end = cache_schema.index_of("end")?;
         let allele_string = cache_schema.index_of("allele_string")?;
+        let failed = cache_schema.index_of("failed").ok();
 
         let mut output_col_indices = Vec::with_capacity(self.cache_columns.len());
         let mut output_col_types = Vec::with_capacity(self.cache_columns.len());
@@ -515,6 +547,7 @@ impl VariantLookupStream {
             start,
             end,
             allele_string,
+            failed,
             output_col_indices,
             output_col_types,
         });
@@ -589,7 +622,9 @@ impl VariantLookupStream {
         let mut rows = Vec::with_capacity(num_rows);
         let mut hash_index: HashMap<String, HashMap<(i64, i64), Vec<u32>>> = HashMap::new();
         let mut intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
-        let mut unshifted_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
+        let mut parser_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
+        let mut unshifted_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> =
+            HashMap::new();
 
         for i in 0..num_rows {
             let raw_chrom = &chroms[i];
@@ -606,16 +641,15 @@ impl VariantLookupStream {
             let end = ends[i];
             let vcf_ref = refs[i].clone();
             let vcf_alt = alts[i].clone();
-            let (shifted_ref, shifted_alt) = vcf_to_vep_allele(&vcf_ref, &vcf_alt);
-            let shifted_allele_string = format!("{shifted_ref}/{shifted_alt}");
-            let unshifted_allele_string = format!("{vcf_ref}/{vcf_alt}");
-
             let one_based_start = if self.coord_normalizer.input_zero_based {
                 start + 1
             } else {
                 start
             };
             let one_based_end = end;
+            let (input_ref, input_alt, input_start) =
+                vcf_to_vep_input_allele(one_based_start, &vcf_ref, &vcf_alt);
+            let input_allele_string = format!("{input_ref}/{input_alt}");
 
             // VEP-normalized coordinates for the hash index (exact matching).
             let vep_start = vep_norm_start(one_based_start, &vcf_ref, &vcf_alt);
@@ -640,31 +674,62 @@ impl VariantLookupStream {
                 .or_default()
                 .push(Interval::new(tree_start as i32, tree_end as i32, i as u32));
 
-            let unshifted_tree_start = one_based_start.min(one_based_end);
-            let unshifted_tree_end = one_based_start.max(one_based_end);
-            unshifted_intervals_by_chrom
+            let parser_tree_start = input_start.min(one_based_end);
+            let parser_tree_end = input_start.max(one_based_end);
+            parser_intervals_by_chrom
                 .entry(norm_chrom.clone())
                 .or_default()
                 .push(Interval::new(
-                    unshifted_tree_start as i32,
-                    unshifted_tree_end as i32,
+                    parser_tree_start as i32,
+                    parser_tree_end as i32,
                     i as u32,
                 ));
 
             rows.push(BuildRow {
                 vcf_ref,
                 vcf_alt,
-                shifted_allele_string,
-                unshifted_allele_string,
+                input_allele_string,
+                input_start,
+                input_end: one_based_end,
+                unshifted_allele_string: None,
                 vep_start,
                 vep_end,
-                unshifted_start: one_based_start,
+                unshifted_start: None,
+                unshifted_end: None,
             });
+        }
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            let Some(unshifted_start) = row.unshifted_start else {
+                continue;
+            };
+            let Some(unshifted_end) = row.unshifted_end else {
+                continue;
+            };
+            let chrom = if self.vcf_has_chr {
+                chroms[row_idx]
+                    .strip_prefix("chr")
+                    .unwrap_or(&chroms[row_idx])
+                    .to_string()
+            } else {
+                chroms[row_idx].clone()
+            };
+            let tree_start = unshifted_start.min(unshifted_end);
+            let tree_end = unshifted_start.max(unshifted_end);
+            unshifted_intervals_by_chrom
+                .entry(chrom)
+                .or_default()
+                .push(Interval::new(tree_start as i32, tree_end as i32, row_idx as u32));
         }
 
         let mut trees = HashMap::new();
         for (chrom, intervals) in intervals_by_chrom {
             trees.insert(chrom, COITree::new(&intervals));
+        }
+
+        let mut parser_trees = HashMap::new();
+        for (chrom, intervals) in parser_intervals_by_chrom {
+            parser_trees.insert(chrom, COITree::new(&intervals));
         }
 
         let mut unshifted_trees = HashMap::new();
@@ -679,6 +744,7 @@ impl VariantLookupStream {
             rows,
             hash_index,
             trees,
+            parser_trees,
             unshifted_trees,
             matched,
         });
@@ -704,6 +770,10 @@ impl VariantLookupStream {
         let cache_ends = I64Accessor::new(cache_batch.column(ci.end), "end")?;
         let cache_alleles =
             StringAccessor::new(cache_batch.column(ci.allele_string), "allele_string")?;
+        let cache_failed = ci
+            .failed
+            .map(|idx| I64Accessor::new(cache_batch.column(idx), "failed"))
+            .transpose()?;
 
         let num_cache_rows = cache_batch.num_rows();
         let cache_zero_based = self.coord_normalizer.cache_zero_based;
@@ -716,6 +786,16 @@ impl VariantLookupStream {
 
             let cache_start_raw = cache_starts.value(cache_row);
             let cache_end_raw = cache_ends.value(cache_row);
+            let failed = cache_failed
+                .as_ref()
+                .map(|accessor| accessor.value(cache_row))
+                .unwrap_or(0);
+            // Traceability:
+            // - Ensembl VEP `filter_variation()`
+            //   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L224-L227
+            if failed > self.allowed_failed {
+                continue;
+            }
             let cache_start_1based = if cache_zero_based {
                 cache_start_raw + 1
             } else {
@@ -799,8 +879,7 @@ impl VariantLookupStream {
             let var_name_col = cache_batch.column(coloc_idx.variation_name);
             let var_names = StringAccessor::new(var_name_col, "variation_name")?;
 
-            let mut local_buf: HashMap<(String, i64, i64), Vec<ColocatedCacheEntry>> =
-                HashMap::new();
+            let mut local_buf: HashMap<ColocatedKey, Vec<ColocatedCacheEntry>> = HashMap::new();
 
             for cache_row in 0..num_cache_rows {
                 if var_name_col.is_null(cache_row) {
@@ -814,6 +893,13 @@ impl VariantLookupStream {
                 let cache_chrom = cache_chroms.value(cache_row);
                 let cache_start_raw = cache_starts.value(cache_row);
                 let cache_end_raw = cache_ends.value(cache_row);
+                let failed = cache_failed
+                    .as_ref()
+                    .map(|accessor| accessor.value(cache_row))
+                    .unwrap_or(0);
+                if failed > self.allowed_failed {
+                    continue;
+                }
                 let cs1 = if cache_zero_based {
                     cache_start_raw + 1
                 } else {
@@ -822,7 +908,8 @@ impl VariantLookupStream {
                 let ce1 = cache_end_raw;
                 let allele_str = cache_alleles.value(cache_row);
 
-                if !build.trees.contains_key(cache_chrom) && !build.unshifted_trees.contains_key(cache_chrom)
+                if !build.parser_trees.contains_key(cache_chrom)
+                    && !build.unshifted_trees.contains_key(cache_chrom)
                 {
                     continue;
                 }
@@ -834,7 +921,12 @@ impl VariantLookupStream {
                         continue;
                     };
 
-                    let key = (cache_chrom.to_string(), vcf_row.vep_start, vcf_row.vep_end);
+                    let key = (
+                        cache_chrom.to_string(),
+                        vcf_row.input_start,
+                        vcf_row.input_end,
+                        vcf_row.input_allele_string.clone(),
+                    );
                     local_buf.entry(key).or_default().push(ColocatedCacheEntry {
                         variation_name: var_name.to_string(),
                         allele_string: allele_str.to_string(),
@@ -1277,11 +1369,14 @@ mod tests {
         let row = BuildRow {
             vcf_ref: "AAA".to_string(),
             vcf_alt: "A".to_string(),
-            shifted_allele_string: "AA/-".to_string(),
-            unshifted_allele_string: "AAA/A".to_string(),
+            input_allele_string: "AA/-".to_string(),
+            input_start: 101,
+            input_end: 102,
+            unshifted_allele_string: Some("AAA/A".to_string()),
             vep_start: 101,
             vep_end: 102,
-            unshifted_start: 100,
+            unshifted_start: Some(100),
+            unshifted_end: Some(102),
         };
 
         let matched = compare_existing_variant(&row, "AA/-", 101, 102).unwrap();
@@ -1309,11 +1404,14 @@ mod tests {
         let row = BuildRow {
             vcf_ref: "ACGT".to_string(),
             vcf_alt: "A".to_string(),
-            shifted_allele_string: "CGT/-".to_string(),
-            unshifted_allele_string: "ACGT/A".to_string(),
+            input_allele_string: "CGT/-".to_string(),
+            input_start: 101,
+            input_end: 103,
+            unshifted_allele_string: Some("ACGT/A".to_string()),
             vep_start: 101,
             vep_end: 103,
-            unshifted_start: 100,
+            unshifted_start: Some(100),
+            unshifted_end: Some(103),
         };
 
         assert_eq!(
@@ -1323,6 +1421,61 @@ mod tests {
         assert_eq!(
             compare_existing_variant(&row, "HGMD_MUTATION", 100, 103),
             None
+        );
+    }
+
+    #[test]
+    fn compare_existing_variant_does_not_use_unshifted_matching_when_state_is_absent() {
+        let row = BuildRow {
+            vcf_ref: "AAA".to_string(),
+            vcf_alt: "A".to_string(),
+            input_allele_string: "AA/-".to_string(),
+            input_start: 101,
+            input_end: 102,
+            unshifted_allele_string: None,
+            vep_start: 101,
+            vep_end: 102,
+            unshifted_start: None,
+            unshifted_end: None,
+        };
+
+        assert_eq!(compare_existing_variant(&row, "AA/-", 100, 102), None);
+    }
+
+    #[test]
+    fn collect_overlapping_candidates_uses_parser_space_coordinates() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+        let empty_batch = RecordBatch::new_empty(schema);
+        let build = BuildSide {
+            vcf_batch: empty_batch,
+            rows: vec![BuildRow {
+                vcf_ref: "CATACATATATATATATATATATATAT".to_string(),
+                vcf_alt: "CATATATATATATAT".to_string(),
+                input_allele_string: "ATACATATATATATATATATATATAT/ATATATATATATAT".to_string(),
+                input_start: 62689176,
+                input_end: 62689202,
+                unshifted_allele_string: None,
+                vep_start: 62689177,
+                vep_end: 62689188,
+                unshifted_start: None,
+                unshifted_end: None,
+            }],
+            hash_index: HashMap::new(),
+            trees: HashMap::from([(
+                "1".to_string(),
+                COITree::new(&[Interval::new(62689177, 62689188, 0)]),
+            )]),
+            parser_trees: HashMap::from([(
+                "1".to_string(),
+                COITree::new(&[Interval::new(62689176, 62689202, 0)]),
+            )]),
+            unshifted_trees: HashMap::new(),
+            matched: vec![false],
+        };
+
+        assert_eq!(
+            collect_overlapping_candidates(&build, "1", 62689176, 62689202),
+            vec![0]
         );
     }
 }

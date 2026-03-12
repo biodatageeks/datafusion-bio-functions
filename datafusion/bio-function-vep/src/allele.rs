@@ -283,6 +283,46 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
     (vep_ref, vep_alt)
 }
 
+/// Traceability:
+/// - Ensembl VEP `Parser::VCF::create_VariationFeatures()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Parser/VCF.pm#L321-L345
+///
+/// Converts a biallelic VCF REF/ALT pair into the parser-level
+/// `VariationFeature->allele_string` representation used by upstream
+/// `compare_existing()`: indels lose only a shared leading anchor base, and
+/// the reported start coordinate is incremented when that happens. Unlike
+/// `vcf_to_vep_allele()`, this does not perform suffix trimming.
+pub fn vcf_to_vep_input_allele(
+    pos: i64,
+    ref_allele: &str,
+    alt_allele: &str,
+) -> (String, String, i64) {
+    let is_indel = ref_allele.len() != 1 || alt_allele.len() != 1;
+    if is_indel
+        && !ref_allele.is_empty()
+        && !alt_allele.is_empty()
+        && ref_allele.as_bytes()[0] == alt_allele.as_bytes()[0]
+    {
+        let ref_trimmed = &ref_allele[1..];
+        let alt_trimmed = &alt_allele[1..];
+        return (
+            if ref_trimmed.is_empty() {
+                "-".to_string()
+            } else {
+                ref_trimmed.to_string()
+            },
+            if alt_trimmed.is_empty() {
+                "-".to_string()
+            } else {
+                alt_trimmed.to_string()
+            },
+            pos + 1,
+        );
+    }
+
+    (ref_allele.to_string(), alt_allele.to_string(), pos)
+}
+
 /// Check if a VCF variant matches a VEP-format allele_string.
 ///
 /// The cache `allele_string` is formatted as "REF/ALT1/ALT2" (e.g. "A/G", "A/G/T", "CGT/-").
@@ -858,6 +898,23 @@ mod tests {
         let (r, a) = vcf_to_vep_allele("TCAC", "T");
         assert_eq!(r, "CAC");
         assert_eq!(a, "-");
+    }
+
+    #[test]
+    fn test_vcf_to_vep_input_allele_only_trims_anchor_base() {
+        let (r, a, pos) =
+            vcf_to_vep_input_allele(62689175, "CATACATATATATATATATATATATAT", "CATATATATATATAT");
+        assert_eq!(r, "ATACATATATATATATATATATATAT");
+        assert_eq!(a, "ATATATATATATAT");
+        assert_eq!(pos, 62689176);
+    }
+
+    #[test]
+    fn test_vcf_to_vep_input_allele_insertion_uses_dash_after_anchor_trim() {
+        let (r, a, pos) = vcf_to_vep_input_allele(100, "A", "ATG");
+        assert_eq!(r, "-");
+        assert_eq!(a, "TG");
+        assert_eq!(pos, 101);
     }
 
     #[test]
