@@ -387,6 +387,15 @@ async fn test_nearest(ctx: SessionContext) -> Result<()> {
             AND a.start < b.end AND a.end > b.start
     "#;
 
+    let plan: Vec<RecordBatch> = ctx
+        .sql(format!("EXPLAIN {q}").as_str())
+        .await?
+        .collect()
+        .await?;
+    let formatted = pretty_format_batches(&plan)?.to_string();
+    assert_contains!(formatted.as_str(), "IntervalJoinExec");
+    assert_contains!(formatted.as_str(), "alg=CoitreesNearest");
+
     let result = ctx.sql(q).await?;
     result.clone().show().await?;
 
@@ -404,6 +413,122 @@ async fn test_nearest(ctx: SessionContext) -> Result<()> {
     ];
 
     assert_batches_sorted_eq!(expected, &results);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[rstest::rstest]
+async fn test_interval_join_with_residual_filter(ctx: SessionContext) -> Result<()> {
+    ctx.sql("SET bio.interval_join_algorithm TO Coitrees")
+        .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE a (contig TEXT, start INTEGER, end INTEGER) AS VALUES
+        ('a', 5, 10),
+        ('a', 20, 25)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE b (contig TEXT, start INTEGER, end INTEGER) AS VALUES
+        ('a', 8, 12),
+        ('a', 11, 15),
+        ('a', 22, 23)
+    "#,
+    )
+    .await?;
+
+    let query = r#"
+        SELECT * FROM a
+        JOIN b
+        ON a.contig = b.contig
+           AND a.start <= b.end
+           AND a.end >= b.start
+           AND a.start < b.start
+        ORDER BY a.start, b.start
+    "#;
+
+    let plan: Vec<RecordBatch> = ctx
+        .sql(format!("EXPLAIN {query}").as_str())
+        .await?
+        .collect()
+        .await?;
+    let formatted = pretty_format_batches(&plan)?.to_string();
+    assert_contains!(formatted.as_str(), "IntervalJoinExec");
+    assert_contains!(formatted.as_str(), "alg=Coitrees");
+
+    let result = ctx.sql(query).await?.collect().await?;
+    let expected = [
+        "+--------+-------+-----+--------+-------+-----+",
+        "| contig | start | end | contig | start | end |",
+        "+--------+-------+-----+--------+-------+-----+",
+        "| a      | 5     | 10  | a      | 8     | 12  |",
+        "| a      | 20    | 25  | a      | 22    | 23  |",
+        "+--------+-------+-----+--------+-------+-----+",
+    ];
+    assert_batches_sorted_eq!(expected, &result);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[rstest::rstest]
+async fn test_count_overlaps_join_selection_guard(ctx: SessionContext) -> Result<()> {
+    ctx.sql("SET bio.interval_join_algorithm TO CoitreesCountOverlaps")
+        .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE a (contig TEXT, start INTEGER, end INTEGER) AS VALUES
+        ('a', 0, 5),
+        ('a', 10, 15)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE b (contig TEXT, start INTEGER, end INTEGER) AS VALUES
+        ('a', 1, 2),
+        ('a', 11, 12),
+        ('a', 20, 21)
+    "#,
+    )
+    .await?;
+
+    let query = r#"
+        SELECT * FROM a
+        JOIN b
+        ON a.contig = b.contig
+           AND a.start <= b.end
+           AND a.end >= b.start
+        ORDER BY b.start
+    "#;
+
+    let plan: Vec<RecordBatch> = ctx
+        .sql(format!("EXPLAIN {query}").as_str())
+        .await?
+        .collect()
+        .await?;
+    let formatted = pretty_format_batches(&plan)?.to_string();
+    assert_contains!(formatted.as_str(), "IntervalJoinExec");
+    assert_contains!(formatted.as_str(), "alg=CoitreesCountOverlaps");
+
+    let result = ctx.sql(query).await?.collect().await?;
+    let expected = [
+        "+--------+-------+-----+--------+-------+-----+",
+        "| contig | start | end | contig | start | end |",
+        "+--------+-------+-----+--------+-------+-----+",
+        "| a      | 0     | 5   | a      | 1     | 2   |",
+        "| a      | 10    | 15  | a      | 11    | 12  |",
+        "|        |       |     | a      | 20    | 21  |",
+        "+--------+-------+-----+--------+-------+-----+",
+    ];
+    assert_batches_sorted_eq!(expected, &result);
 
     Ok(())
 }
