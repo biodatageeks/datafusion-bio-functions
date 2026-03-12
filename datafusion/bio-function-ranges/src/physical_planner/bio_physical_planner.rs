@@ -1,4 +1,4 @@
-use crate::physical_planner::intervals::{ColIntervals, parse};
+use crate::physical_planner::intervals::{ParsedIntervalJoin, parse};
 use crate::physical_planner::joins::interval_join::IntervalJoinExec;
 use crate::session_context::{Algorithm, BioConfig};
 use async_trait::async_trait;
@@ -21,8 +21,22 @@ pub struct BioPhysicalPlanner {
     planner: DefaultPhysicalPlanner,
 }
 
-#[derive(Debug, Default)]
-pub struct IntervalJoinPhysicalOptimizationRule;
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum IntervalJoinRewriteStage {
+    PreserveProbeSide,
+    AfterJoinSelection,
+}
+
+#[derive(Debug)]
+pub struct IntervalJoinPhysicalOptimizationRule {
+    stage: IntervalJoinRewriteStage,
+}
+
+impl IntervalJoinPhysicalOptimizationRule {
+    pub fn new(stage: IntervalJoinRewriteStage) -> Self {
+        Self { stage }
+    }
+}
 
 impl PhysicalOptimizerRule for IntervalJoinPhysicalOptimizationRule {
     fn optimize(
@@ -46,11 +60,14 @@ impl PhysicalOptimizerRule for IntervalJoinPhysicalOptimizationRule {
             match plan.as_any().downcast_ref::<HashJoinExec>() {
                 Some(join_exec) => {
                     info!("HashJoinExec detected");
-                    if let Some(intervals) = parse(join_exec.filter()) {
+                    if let Some(parsed) = parse(join_exec.filter()) {
+                        if !should_rewrite_join(self.stage, algorithm, join_exec.join_type) {
+                            return Ok(Transformed::no(plan));
+                        }
                         info!("Detected HashJoinExec with Range filters. Optimizing into IntervalJoinExec using {algorithm} algorithm...");
                         let new_plan = from_hash_join(
                             join_exec,
-                            intervals,
+                            parsed,
                             algorithm,
                             low_memory,
                         )?;
@@ -67,11 +84,18 @@ impl PhysicalOptimizerRule for IntervalJoinPhysicalOptimizationRule {
                     match plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
                         Some(join_exec) => {
                             info!("NestedLoopJoinExec detected");
-                            if let Some(intervals) = parse(join_exec.filter()) {
+                            if let Some(parsed) = parse(join_exec.filter()) {
+                                if !should_rewrite_join(
+                                    self.stage,
+                                    algorithm,
+                                    *join_exec.join_type(),
+                                ) {
+                                    return Ok(Transformed::no(plan));
+                                }
                                 info!("Detected NestedLoopJoinExec with Range filters. Optimizing into IntervalJoinExec using {algorithm} algorithm...");
                                 let new_plan = from_nested_loop_join(
                                     join_exec,
-                                    intervals,
+                                    parsed,
                                     algorithm,
                                     low_memory,
                                 )?;
@@ -92,7 +116,14 @@ impl PhysicalOptimizerRule for IntervalJoinPhysicalOptimizationRule {
     }
 
     fn name(&self) -> &str {
-        "IntervalJoinOptimizationRule"
+        match self.stage {
+            IntervalJoinRewriteStage::PreserveProbeSide => {
+                "IntervalJoinOptimizationRule[before_join_selection]"
+            }
+            IntervalJoinRewriteStage::AfterJoinSelection => {
+                "IntervalJoinOptimizationRule[after_join_selection]"
+            }
+        }
     }
 
     fn schema_check(&self) -> bool {
@@ -102,7 +133,7 @@ impl PhysicalOptimizerRule for IntervalJoinPhysicalOptimizationRule {
 
 fn from_hash_join(
     join_exec: &HashJoinExec,
-    intervals: ColIntervals,
+    parsed: ParsedIntervalJoin,
     algorithm: Algorithm,
     low_memory: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -111,7 +142,8 @@ fn from_hash_join(
         join_exec.right().clone(),
         join_exec.on.clone(),
         join_exec.filter.clone(),
-        intervals,
+        parsed.residual_filter,
+        parsed.intervals,
         &join_exec.join_type,
         join_exec.projection.clone(),
         *join_exec.partition_mode(),
@@ -124,7 +156,7 @@ fn from_hash_join(
 
 fn from_nested_loop_join(
     join_exec: &NestedLoopJoinExec,
-    intervals: ColIntervals,
+    parsed: ParsedIntervalJoin,
     algorithm: Algorithm,
     low_memory: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -133,7 +165,8 @@ fn from_nested_loop_join(
         join_exec.right().clone(),
         vec![(lit(1), lit(1))],
         join_exec.filter().cloned(),
-        intervals,
+        parsed.residual_filter,
+        parsed.intervals,
         join_exec.join_type(),
         None,
         PartitionMode::CollectLeft,
@@ -143,6 +176,33 @@ fn from_nested_loop_join(
     )?;
 
     Ok(Arc::new(new_plan))
+}
+
+fn should_rewrite_join(
+    stage: IntervalJoinRewriteStage,
+    algorithm: Algorithm,
+    join_type: datafusion::common::JoinType,
+) -> bool {
+    match stage {
+        IntervalJoinRewriteStage::PreserveProbeSide => {
+            !swap_safe_interval_join(algorithm, join_type)
+        }
+        IntervalJoinRewriteStage::AfterJoinSelection => {
+            swap_safe_interval_join(algorithm, join_type)
+        }
+    }
+}
+
+fn swap_safe_interval_join(algorithm: Algorithm, join_type: datafusion::common::JoinType) -> bool {
+    matches!(join_type, datafusion::common::JoinType::Inner)
+        && matches!(
+            algorithm,
+            Algorithm::Coitrees
+                | Algorithm::IntervalTree
+                | Algorithm::ArrayIntervalTree
+                | Algorithm::Lapper
+                | Algorithm::SuperIntervals
+        )
 }
 
 #[async_trait]

@@ -1,9 +1,10 @@
 use datafusion::common::JoinSide;
-use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column, lit};
 use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -13,6 +14,9 @@ pub struct ColInterval {
 }
 
 impl ColInterval {
+    pub fn new(start: Arc<dyn PhysicalExpr>, end: Arc<dyn PhysicalExpr>) -> Self {
+        Self { start, end }
+    }
     pub fn start(&self) -> Arc<dyn PhysicalExpr> {
         self.start.clone()
     }
@@ -27,7 +31,13 @@ pub struct ColIntervals {
     pub right_interval: ColInterval,
 }
 
-pub fn parse(filter: Option<&JoinFilter>) -> Option<ColIntervals> {
+#[derive(Debug, Clone)]
+pub struct ParsedIntervalJoin {
+    pub intervals: ColIntervals,
+    pub residual_filter: Option<JoinFilter>,
+}
+
+pub fn parse(filter: Option<&JoinFilter>) -> Option<ParsedIntervalJoin> {
     if let Some(filter) = filter {
         try_parse(filter).inspect_err(|e| log::debug!("{e}")).ok()
     } else {
@@ -83,7 +93,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (le, JoinSide::Left) => {
                     let le = if is_lt { minus_one(le) } else { le };
-                    inner.with_rs(rs).with_le(le);
+                    inner.with_rs(rs)?.with_le(le)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as rs </<= le".to_string()),
@@ -93,7 +103,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (re, JoinSide::Right) => {
                     let re = if is_lt { minus_one(re) } else { re };
-                    inner.with_re(re).with_ls(ls);
+                    inner.with_re(re)?.with_ls(ls)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as ls </<= re".to_string()),
@@ -103,7 +113,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (ls, JoinSide::Left) => {
                     let re = if is_gt { minus_one(re) } else { re };
-                    inner.with_re(re).with_ls(ls);
+                    inner.with_re(re)?.with_ls(ls)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as re >/>= ls".to_string()),
@@ -113,7 +123,7 @@ fn parse_condition(
             match map_column_to_source_schema(expr.right().clone(), indices) {
                 (rs, JoinSide::Right) => {
                     let le = if is_gt { minus_one(le) } else { le };
-                    inner.with_rs(rs).with_le(le);
+                    inner.with_rs(rs)?.with_le(le)?;
                     Ok(())
                 }
                 _ => Err("couldn't parse as le >/>= rs".to_string()),
@@ -140,33 +150,33 @@ impl IntervalBuilder {
         }
     }
 
-    fn with_ls(&mut self, ls: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_ls(&mut self, ls: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.ls.is_some() {
-            panic!("ls must not be called twice")
+            return Err("ls must not be called twice".to_string());
         }
         self.ls = Some(ls);
-        self
+        Ok(self)
     }
-    fn with_le(&mut self, le: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_le(&mut self, le: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.le.is_some() {
-            panic!("le must not be called twice")
+            return Err("le must not be called twice".to_string());
         }
         self.le = Some(le);
-        self
+        Ok(self)
     }
-    fn with_rs(&mut self, rs: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_rs(&mut self, rs: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.rs.is_some() {
-            panic!("rs must not be called twice")
+            return Err("rs must not be called twice".to_string());
         }
         self.rs = Some(rs);
-        self
+        Ok(self)
     }
-    fn with_re(&mut self, re: Arc<dyn PhysicalExpr>) -> &mut Self {
+    fn with_re(&mut self, re: Arc<dyn PhysicalExpr>) -> Result<&mut Self, String> {
         if self.re.is_some() {
-            panic!("re must not be called twice")
+            return Err("re must not be called twice".to_string());
         }
         self.re = Some(re);
-        self
+        Ok(self)
     }
 
     fn finish(self) -> ColIntervals {
@@ -184,37 +194,108 @@ impl IntervalBuilder {
             right_interval: r_interval,
         }
     }
+
+    fn is_complete(&self) -> bool {
+        self.ls.is_some() && self.le.is_some() && self.rs.is_some() && self.re.is_some()
+    }
 }
 
-fn try_parse(filter: &JoinFilter) -> Result<ColIntervals, String> {
+fn try_parse(filter: &JoinFilter) -> Result<ParsedIntervalJoin, String> {
+    let mut remaining = Vec::new();
     let mut inner = IntervalBuilder::empty();
-
-    let expr = filter
-        .expression()
-        .as_any()
-        .downcast_ref::<BinaryExpr>()
-        .ok_or("couldn't cast filter to BinaryExpr")?;
-
-    if !matches!(expr.op(), Operator::And) {
-        return Err("expr.op() is not AND".to_string());
-    }
-
-    let left = expr
-        .left()
-        .as_any()
-        .downcast_ref::<BinaryExpr>()
-        .ok_or("couldn't cast left side to BinaryExpr")?;
-    let right = expr
-        .right()
-        .as_any()
-        .downcast_ref::<BinaryExpr>()
-        .ok_or("couldn't cast right side to BinaryExpr")?;
     let indices = filter.column_indices();
 
-    parse_condition(left, indices, &mut inner)?;
-    parse_condition(right, indices, &mut inner)?;
+    for expr in split_and_conjuncts(filter.expression().clone()) {
+        let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() else {
+            remaining.push(expr);
+            continue;
+        };
 
-    Ok(inner.finish())
+        if parse_condition(binary, indices, &mut inner).is_err() {
+            remaining.push(expr);
+        }
+    }
+
+    if !inner.is_complete() {
+        return Err("couldn't extract interval bounds from join filter".to_string());
+    }
+
+    let residual_filter = rebuild_residual_filter(filter, remaining)?;
+
+    Ok(ParsedIntervalJoin {
+        intervals: inner.finish(),
+        residual_filter,
+    })
+}
+
+fn split_and_conjuncts(expr: Arc<dyn PhysicalExpr>) -> Vec<Arc<dyn PhysicalExpr>> {
+    if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        if matches!(binary.op(), Operator::And) {
+            let mut out = split_and_conjuncts(binary.left().clone());
+            out.extend(split_and_conjuncts(binary.right().clone()));
+            return out;
+        }
+    }
+
+    vec![expr]
+}
+
+fn rebuild_residual_filter(
+    filter: &JoinFilter,
+    conjuncts: Vec<Arc<dyn PhysicalExpr>>,
+) -> Result<Option<JoinFilter>, String> {
+    let mut conjuncts = conjuncts.into_iter();
+    let Some(mut expr) = conjuncts.next() else {
+        return Ok(None);
+    };
+
+    for rhs in conjuncts {
+        expr = Arc::new(BinaryExpr::new(expr, Operator::And, rhs));
+    }
+
+    let mut referenced = BTreeSet::new();
+    expr.apply(|node| {
+        if let Some(column) = node.as_any().downcast_ref::<Column>() {
+            referenced.insert(column.index());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(|e| e.to_string())?;
+
+    let remap = referenced
+        .iter()
+        .enumerate()
+        .map(|(new_idx, old_idx)| (*old_idx, new_idx))
+        .collect::<HashMap<_, _>>();
+
+    let remapped_expr = expr
+        .transform_up(|node| {
+            if let Some(column) = node.as_any().downcast_ref::<Column>() {
+                let new_idx = *remap
+                    .get(&column.index())
+                    .expect("referenced columns must have a remap entry");
+                Ok(Transformed::yes(
+                    Arc::new(Column::new(column.name(), new_idx)) as Arc<dyn PhysicalExpr>,
+                ))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })
+        .data()
+        .map_err(|e| e.to_string())?;
+
+    let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(
+        referenced
+            .iter()
+            .map(|idx| filter.schema().field(*idx).clone())
+            .collect::<Vec<_>>(),
+    ));
+    let column_indices = referenced
+        .iter()
+        .map(|idx| filter.column_indices()[*idx].clone())
+        .collect();
+
+    Ok(Some(JoinFilter::new(remapped_expr, column_indices, schema)))
 }
 
 #[cfg(test)]
@@ -226,7 +307,7 @@ mod tests {
     use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec};
     use datafusion::prelude::SessionContext;
 
-    async fn extract_filter(condition: &str) -> Result<ColIntervals> {
+    async fn extract_filter(condition: &str) -> Result<ParsedIntervalJoin> {
         let ctx = SessionContext::new();
         ctx.sql("CREATE TABLE IF NOT EXISTS a (contig TEXT, l_start INT, l_end INT) AS VALUES ('a', 1, 2), ('b', 3, 4)").await?;
         ctx.sql("CREATE TABLE IF NOT EXISTS b (contig TEXT, name TEXT, r_end INT, r_start INT) AS VALUES ('a','x', 1, 2), ('b','x', 3, 4)").await?;
@@ -252,7 +333,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(to_column(left.end), l_end);
@@ -263,7 +344,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(to_column(left.end), l_end);
@@ -274,7 +355,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(to_column(left.end), l_end);
@@ -285,7 +366,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(to_column(left.end), l_end);
@@ -296,7 +377,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(to_column(left.end), l_end);
@@ -307,7 +388,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(to_column(left.end), l_end);
@@ -318,7 +399,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(to_column(left.end), l_end);
@@ -329,7 +410,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(to_column(left.end), l_end);
@@ -354,7 +435,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(format!("{:?}", to_binary(left.end)), format!("{:?}", l_end));
@@ -368,7 +449,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(format!("{:?}", to_binary(left.end)), format!("{:?}", l_end));
@@ -382,7 +463,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(format!("{:?}", to_binary(left.end)), format!("{:?}", l_end));
@@ -396,7 +477,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(format!("{:?}", to_binary(left.end)), format!("{:?}", l_end));
@@ -410,7 +491,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(format!("{:?}", to_binary(left.end)), format!("{:?}", l_end));
@@ -424,7 +505,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(format!("{:?}", to_binary(left.end)), format!("{:?}", l_end));
@@ -438,7 +519,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(format!("{:?}", to_binary(left.end)), format!("{:?}", l_end));
@@ -452,7 +533,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(format!("{:?}", to_binary(left.end)), format!("{:?}", l_end));
@@ -466,7 +547,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(format!("{:?}", to_binary(left.end)), format!("{:?}", l_end));
@@ -477,7 +558,7 @@ mod tests {
         let ColIntervals {
             left_interval: left,
             right_interval: right,
-        } = extract_filter(condition).await?;
+        } = extract_filter(condition).await?.intervals;
 
         assert_eq!(to_column(left.start), l_start);
         assert_eq!(to_column(left.end), Column::new("l_end", 2));
@@ -486,6 +567,22 @@ mod tests {
             format!("{:?}", to_binary(right.end)),
             format!("{:?}", r_end)
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extracts_residual_filter() -> Result<()> {
+        let parsed = extract_filter(
+            "b.r_end >= a.l_start AND a.l_end >= b.r_start AND a.l_start != b.r_start",
+        )
+        .await?;
+
+        let residual = parsed
+            .residual_filter
+            .expect("expected residual filter to be preserved");
+        assert_eq!(residual.column_indices().len(), 2);
+        assert_eq!(format!("{residual}"), "l_start != r_start");
 
         Ok(())
     }

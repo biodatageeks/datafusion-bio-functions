@@ -1,5 +1,5 @@
 use crate::physical_planner::BioQueryPlanner;
-use crate::physical_planner::IntervalJoinPhysicalOptimizationRule;
+use crate::physical_planner::{IntervalJoinPhysicalOptimizationRule, IntervalJoinRewriteStage};
 use async_trait::async_trait;
 use datafusion::common::extensions_options;
 use datafusion::config::{ConfigExtension, ConfigField, ConfigOptions};
@@ -27,8 +27,28 @@ impl BioSessionExt for SessionContext {
 
     fn with_config_rt_bio(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> SessionContext {
         let mut rules = PhysicalOptimizer::new().rules;
-        rules.retain(|rule| rule.name() != "join_selection");
-        rules.push(Arc::new(IntervalJoinPhysicalOptimizationRule));
+        let join_selection_idx = rules
+            .iter()
+            .position(|rule| rule.name() == "join_selection");
+
+        if let Some(join_selection_idx) = join_selection_idx {
+            rules.insert(
+                join_selection_idx,
+                Arc::new(IntervalJoinPhysicalOptimizationRule::new(
+                    IntervalJoinRewriteStage::PreserveProbeSide,
+                )),
+            );
+            rules.insert(
+                join_selection_idx + 2,
+                Arc::new(IntervalJoinPhysicalOptimizationRule::new(
+                    IntervalJoinRewriteStage::AfterJoinSelection,
+                )),
+            );
+        } else {
+            rules.push(Arc::new(IntervalJoinPhysicalOptimizationRule::new(
+                IntervalJoinRewriteStage::AfterJoinSelection,
+            )));
+        }
 
         let ctx: SessionContext = SessionStateBuilder::new()
             .with_config(config)
