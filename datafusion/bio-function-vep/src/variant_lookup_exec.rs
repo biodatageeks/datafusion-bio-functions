@@ -327,6 +327,23 @@ fn collect_overlapping_candidates(
 }
 
 /// Traceability:
+/// - Ensembl VEP `AnnotationSource::Cache::VariationTabix::_annotate_pm()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationSource/Cache/VariationTabix.pm#L151-L189
+///
+/// The variation cache fetch path does not consider every overlapping existing
+/// variant on the chromosome. Tabix is queried only for records whose START
+/// coordinate falls inside the input VF window `start - 1 .. end + 1`, using
+/// the active VF coordinates. We must replicate that prefilter after our
+/// overlap-tree candidate collection, otherwise long existing variants that
+/// begin before the VEP query window are incorrectly exposed to
+/// `compare_existing()`.
+fn existing_start_is_visible_to_input_row(input_row: &BuildRow, existing_start: i64) -> bool {
+    let query_start = (input_row.compare_start - 1).min(input_row.compare_end + 1);
+    let query_end = (input_row.compare_start - 1).max(input_row.compare_end + 1);
+    existing_start >= query_start && existing_start <= query_end
+}
+
+/// Traceability:
 /// - Ensembl VEP `compare_existing()`
 ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206
 /// - Ensembl Variation `get_matched_variant_alleles()`
@@ -1149,6 +1166,9 @@ impl VariantLookupStream {
                 }
                 for vcf_idx in collect_overlapping_candidates(build, cache_chrom, cs1, ce1) {
                     let vcf_row = &build.rows[vcf_idx];
+                    if !existing_start_is_visible_to_input_row(vcf_row, cs1) {
+                        continue;
+                    }
                     let Some(matched_alleles) =
                         compare_existing_variant(vcf_row, allele_str, cs1, ce1)
                     else {
@@ -1930,5 +1950,57 @@ mod tests {
         assert_eq!(row.unshifted_end, Some(3));
         assert_eq!(collect_overlapping_candidates(build, "1", 8, 9), vec![0]);
         assert_eq!(collect_overlapping_candidates(build, "1", 2, 3), vec![0]);
+    }
+
+    #[test]
+    fn existing_start_visibility_matches_variation_tabix_query_window() {
+        let deletion_row = BuildRow {
+            vcf_ref: "CAACAACAAAAAA".to_string(),
+            vcf_alt: "CAAAA".to_string(),
+            input_allele_string: "AACAACAAAAAA/AAAA".to_string(),
+            input_start: 27971600,
+            input_end: 27971611,
+            compare_allele_string: "CAACAAAA/-".to_string(),
+            compare_start: 27971602,
+            compare_end: 27971609,
+            unshifted_allele_string: None,
+            vep_start: 27971602,
+            vep_end: 27971609,
+            unshifted_start: None,
+            unshifted_end: None,
+        };
+
+        assert!(existing_start_is_visible_to_input_row(
+            &deletion_row,
+            27971601
+        ));
+        assert!(existing_start_is_visible_to_input_row(
+            &deletion_row,
+            27971610
+        ));
+        assert!(!existing_start_is_visible_to_input_row(
+            &deletion_row,
+            27971600
+        ));
+
+        let insertion_row = BuildRow {
+            vcf_ref: "A".to_string(),
+            vcf_alt: "ATT".to_string(),
+            input_allele_string: "-/TT".to_string(),
+            input_start: 101,
+            input_end: 100,
+            compare_allele_string: "-/TT".to_string(),
+            compare_start: 101,
+            compare_end: 100,
+            unshifted_allele_string: None,
+            vep_start: 101,
+            vep_end: 100,
+            unshifted_start: None,
+            unshifted_end: None,
+        };
+
+        assert!(existing_start_is_visible_to_input_row(&insertion_row, 100));
+        assert!(existing_start_is_visible_to_input_row(&insertion_row, 101));
+        assert!(!existing_start_is_visible_to_input_row(&insertion_row, 99));
     }
 }
