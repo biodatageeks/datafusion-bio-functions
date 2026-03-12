@@ -439,56 +439,43 @@ impl TranscriptConsequenceEngine {
                         let cdna_position = compute_cdna_position(variant, &tx_exons, tx.strand);
                         let (cds_position, protein_position, amino_acids, codons) =
                             if let Some(ref cc) = coding_class {
-                                // VEP only uses the "?" prefix when cds_start_nf is true
-                                // AND the first coding exon has non-zero phase (the CDS
-                                // sequence starts with N padding) AND the variant's CDS
-                                // position falls within the N-padded region (i.e. the
-                                // first exon where uncertainty exists).
                                 let n_pad_len = tx_translation
                                     .and_then(|t| t.cds_sequence.as_deref())
                                     .map(|s| {
                                         s.as_bytes().iter().take_while(|&&b| b == b'N').count()
                                     })
                                     .unwrap_or(0);
-                                let use_question = tx.cds_start_nf
+                                let use_unknown_start_format = tx.cds_start_nf
                                     && n_pad_len > 0
                                     && cc.cds_position_start.is_some_and(|p| p <= n_pad_len);
-                                let cds_pos = match (cc.cds_position_start, cc.cds_position_end) {
-                                    (Some(s), Some(e)) if s == e => {
-                                        if use_question {
-                                            Some(format!("?-{s}"))
-                                        } else {
-                                            Some(s.to_string())
-                                        }
-                                    }
-                                    (Some(s), Some(e)) => {
-                                        if use_question {
-                                            Some(format!("?-{e}"))
-                                        } else {
-                                            Some(format!("{s}-{e}"))
-                                        }
-                                    }
-                                    _ => None,
+                                let cds_pos = if use_unknown_start_format {
+                                    format_coords_ensembl(
+                                        None,
+                                        cc.cds_position_end.or(cc.cds_position_start),
+                                    )
+                                } else {
+                                    format_coords_ensembl(
+                                        cc.cds_position_start,
+                                        cc.cds_position_end,
+                                    )
                                 };
-                                let prot_pos =
-                                    match (cc.protein_position_start, cc.protein_position_end) {
-                                        (Some(s), Some(e)) if s == e => {
-                                            if use_question {
-                                                Some(format!("?-{s}"))
-                                            } else {
-                                                Some(s.to_string())
-                                            }
-                                        }
-                                        (Some(s), Some(e)) => {
-                                            if use_question {
-                                                Some(format!("?-{e}"))
-                                            } else {
-                                                Some(format!("{s}-{e}"))
-                                            }
-                                        }
-                                        _ => None,
-                                    };
-                                (cds_pos, prot_pos, cc.amino_acids.clone(), cc.codons.clone())
+                                let prot_pos = if use_unknown_start_format {
+                                    format_coords_ensembl(
+                                        None,
+                                        cc.protein_position_end.or(cc.protein_position_start),
+                                    )
+                                } else {
+                                    format_coords_ensembl(
+                                        cc.protein_position_start,
+                                        cc.protein_position_end,
+                                    )
+                                };
+                                let codons = cc.codons.clone();
+                                let amino_acids = codons
+                                    .as_deref()
+                                    .and_then(pep_allele_string_from_codon_allele_string)
+                                    .or_else(|| cc.amino_acids.clone());
+                                (cds_pos, prot_pos, amino_acids, codons)
                             } else {
                                 (None, None, None, None)
                             };
@@ -2731,7 +2718,7 @@ fn mutated_cds_first3(
         // For negative strand, cds_start corresponds to the 3' end of the CDS
         // in genomic coordinates, and cds_end corresponds to the 5' end (start codon).
         let cds_end = tx.cds_end.unwrap_or(0);
-        let ref_rc = if ref_allele.is_empty() {
+        let _ref_rc = if ref_allele.is_empty() {
             String::new()
         } else {
             reverse_complement(&ref_allele)
@@ -3040,6 +3027,125 @@ fn genomic_range(start: i64, end: i64) -> Option<Vec<i64>> {
         out.push(p);
     }
     Some(out)
+}
+
+/// Traceability:
+/// - Ensembl VEP `format_coords()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159
+fn format_coords_ensembl(start: Option<usize>, end: Option<usize>) -> Option<String> {
+    match (start, end) {
+        (Some(s), Some(e)) if s > e => Some(format!("{e}-{s}")),
+        (Some(s), Some(e)) if s == e => Some(s.to_string()),
+        (Some(s), Some(e)) => Some(format!("{s}-{e}")),
+        (Some(s), None) => Some(format!("{s}-?")),
+        (None, Some(e)) => Some(format!("?-{e}")),
+        (None, None) => None,
+    }
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::pep_allele_string()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L618-L629
+/// - Ensembl Variation `TranscriptVariationAllele::peptide()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L692-L777
+fn pep_allele_string_from_codon_allele_string(codon_allele_string: &str) -> Option<String> {
+    let (ref_codon, alt_codon) = codon_allele_string.split_once('/')?;
+    let ref_pep = peptide_from_codon_allele(ref_codon)?;
+    let alt_pep = peptide_from_codon_allele(alt_codon)?;
+    if ref_pep == alt_pep {
+        Some(ref_pep)
+    } else {
+        Some(format!("{ref_pep}/{alt_pep}"))
+    }
+}
+
+fn peptide_from_codon_allele(codon: &str) -> Option<String> {
+    if codon == "-" {
+        return Some("-".to_string());
+    }
+
+    let mut peptide = String::with_capacity((codon.len() / 3).max(1));
+    let mut triplet = [0u8; 3];
+    let mut triplet_len = 0usize;
+    let mut saw_base = false;
+
+    for base in codon.bytes() {
+        if !base.is_ascii_alphabetic() {
+            continue;
+        }
+        saw_base = true;
+        triplet[triplet_len] = base.to_ascii_uppercase();
+        triplet_len += 1;
+        if triplet_len == 3 {
+            peptide.push(translate_codon_bytes(triplet)?);
+            triplet_len = 0;
+        }
+    }
+
+    if !saw_base {
+        return Some("-".to_string());
+    }
+
+    if triplet_len > 0 && peptide != "*" {
+        peptide.push('X');
+    }
+    if peptide.is_empty() {
+        peptide.push('-');
+    }
+    Some(peptide)
+}
+
+fn translate_codon_bytes(codon: [u8; 3]) -> Option<char> {
+    match codon {
+        [b'T', b'T', b'T'] | [b'T', b'T', b'C'] => Some('F'),
+        [b'T', b'T', b'A']
+        | [b'T', b'T', b'G']
+        | [b'C', b'T', b'T']
+        | [b'C', b'T', b'C']
+        | [b'C', b'T', b'A']
+        | [b'C', b'T', b'G'] => Some('L'),
+        [b'A', b'T', b'T'] | [b'A', b'T', b'C'] | [b'A', b'T', b'A'] => Some('I'),
+        [b'A', b'T', b'G'] => Some('M'),
+        [b'G', b'T', b'T'] | [b'G', b'T', b'C'] | [b'G', b'T', b'A'] | [b'G', b'T', b'G'] => {
+            Some('V')
+        }
+        [b'T', b'C', b'T']
+        | [b'T', b'C', b'C']
+        | [b'T', b'C', b'A']
+        | [b'T', b'C', b'G']
+        | [b'A', b'G', b'T']
+        | [b'A', b'G', b'C'] => Some('S'),
+        [b'C', b'C', b'T'] | [b'C', b'C', b'C'] | [b'C', b'C', b'A'] | [b'C', b'C', b'G'] => {
+            Some('P')
+        }
+        [b'A', b'C', b'T'] | [b'A', b'C', b'C'] | [b'A', b'C', b'A'] | [b'A', b'C', b'G'] => {
+            Some('T')
+        }
+        [b'G', b'C', b'T'] | [b'G', b'C', b'C'] | [b'G', b'C', b'A'] | [b'G', b'C', b'G'] => {
+            Some('A')
+        }
+        [b'T', b'A', b'T'] | [b'T', b'A', b'C'] => Some('Y'),
+        [b'C', b'A', b'T'] | [b'C', b'A', b'C'] => Some('H'),
+        [b'C', b'A', b'A'] | [b'C', b'A', b'G'] => Some('Q'),
+        [b'A', b'A', b'T'] | [b'A', b'A', b'C'] => Some('N'),
+        [b'A', b'A', b'A'] | [b'A', b'A', b'G'] => Some('K'),
+        [b'G', b'A', b'T'] | [b'G', b'A', b'C'] => Some('D'),
+        [b'G', b'A', b'A'] | [b'G', b'A', b'G'] => Some('E'),
+        [b'T', b'G', b'T'] | [b'T', b'G', b'C'] => Some('C'),
+        [b'T', b'G', b'G'] => Some('W'),
+        [b'C', b'G', b'T']
+        | [b'C', b'G', b'C']
+        | [b'C', b'G', b'A']
+        | [b'C', b'G', b'G']
+        | [b'A', b'G', b'A']
+        | [b'A', b'G', b'G'] => Some('R'),
+        [b'G', b'G', b'T'] | [b'G', b'G', b'C'] | [b'G', b'G', b'A'] | [b'G', b'G', b'G'] => {
+            Some('G')
+        }
+        [b'T', b'A', b'A'] | [b'T', b'A', b'G'] | [b'T', b'G', b'A'] => Some('*'),
+        [a, b, c] if a == b'N' || b == b'N' || c == b'N' => Some('X'),
+        _ => None,
+    }
 }
 
 fn genomic_to_cds_index(
@@ -5393,6 +5499,26 @@ mod tests {
         assert_eq!(entry.protein_position.as_deref(), Some("2"));
     }
 
+    #[test]
+    fn format_coords_ensembl_supports_unknown_bounds() {
+        assert_eq!(
+            format_coords_ensembl(None, Some(3)),
+            Some("?-3".to_string())
+        );
+        assert_eq!(
+            format_coords_ensembl(Some(100), None),
+            Some("100-?".to_string())
+        );
+        assert_eq!(
+            format_coords_ensembl(Some(7), Some(7)),
+            Some("7".to_string())
+        );
+        assert_eq!(
+            format_coords_ensembl(Some(7), Some(9)),
+            Some("7-9".to_string())
+        );
+    }
+
     // ---- frameshift insertion at codon boundary: protein_position range ----
 
     #[test]
@@ -5411,6 +5537,22 @@ mod tests {
         );
         assert_eq!(c.protein_position_start, Some(2));
         assert_eq!(c.protein_position_end, Some(3));
+    }
+
+    #[test]
+    fn pep_allele_string_from_codon_allele_string_matches_chr1_frameshifts() {
+        assert_eq!(
+            pep_allele_string_from_codon_allele_string("Ccc/cc"),
+            Some("P/X".to_string())
+        );
+        assert_eq!(
+            pep_allele_string_from_codon_allele_string("aaCAAGAAGAag/aaag"),
+            Some("NKKK/KX".to_string())
+        );
+        assert_eq!(
+            pep_allele_string_from_codon_allele_string("-/TT"),
+            Some("-/X".to_string())
+        );
     }
 
     // ---- deletion frameshift: preserve last ref AA before X ----
@@ -5656,7 +5798,7 @@ mod tests {
             Some(100),
             Some(200),
         );
-        let e = exon("tx1", 1, 100, 200);
+        let _e = exon("tx1", 1, 100, 200);
         // Deletion at pos 103 — overlaps_start_codon is true (overlaps
         // region 100-102 via generic overlap because the function checks
         // if the variant range overlaps 100..102). Actually overlaps() checks
@@ -5691,7 +5833,7 @@ mod tests {
             Some(100),
             Some(200),
         );
-        let e = exon("tx1", 1, 100, 200);
+        let _e = exon("tx1", 1, 100, 200);
         // Deletion at pos 103 — strictly after start codon end (102).
         let v = var("22", 103, 103, "T", "-");
         let mut terms = BTreeSet::new();
