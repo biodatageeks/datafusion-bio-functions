@@ -382,7 +382,7 @@ impl FusedArrayTransformStream {
         let mut all_values: Vec<ArrayRef> = Vec::with_capacity(ctx.num_rows);
         let mut offsets: Vec<i32> = vec![0];
         let mut null_bitmap: Vec<bool> = Vec::with_capacity(ctx.num_rows);
-        let mut current_offset: i32 = 0;
+        let mut current_offset: i32 = 0; // TODO: consider switching to i64
 
         // Pre-compute the mini-batch schema once - it's the same for all rows.
         let mini_batch_schema =

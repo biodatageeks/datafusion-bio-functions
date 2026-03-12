@@ -971,7 +971,7 @@ async fn test_mismatched_array_lengths() {
     let df_optimized2 = ctx_optimized.sql(sql).await.unwrap();
     let optimized_results = df_optimized2.collect().await.unwrap();
 
-    // Both baseline and optimized should filter out the empty-array row and have identical output
+    // Both baseline and optimized should handle mismatched lengths gracefully and produce identical output
     let baseline_str = pretty_format_batches(&baseline_results)
         .unwrap()
         .to_string();
