@@ -17,6 +17,6 @@ async-trait = "0.1.88"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-serial_test = "3.1"
-tempfile = "3.15"
-parquet = "56.1"
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+parquet = { workspace = true }

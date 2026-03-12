@@ -216,7 +216,13 @@ struct TraversalResult<'a> {
 ///
 /// This handles transformation CTEs by traversing multiple Projection layers and
 /// composing expressions.
-fn traverse_to_unnest(plan: &LogicalPlan) -> Option<TraversalResult<'_>> {
+///
+/// # Returns
+///
+/// - `Ok(Some(result))` if the pattern matches and traversal succeeded
+/// - `Ok(None)` if the pattern doesn't match (no Unnest found)
+/// - `Err(e)` if traversal failed due to expression resolution errors
+fn traverse_to_unnest(plan: &LogicalPlan) -> Result<Option<TraversalResult<'_>>> {
     // Skip SubqueryAlias wrappers
     let plan = skip_wrappers(plan);
 
@@ -266,14 +272,16 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Option<TraversalResult<'_>> {
                 });
             }
 
-            Some(TraversalResult {
+            Ok(Some(TraversalResult {
                 unnest,
                 column_definitions,
-            })
+            }))
         }
         LogicalPlan::Projection(projection) => {
             // Recurse into child
-            let child_result = traverse_to_unnest(projection.input.as_ref())?;
+            let Some(child_result) = traverse_to_unnest(projection.input.as_ref())? else {
+                return Ok(None);
+            };
 
             // Build new column definitions by resolving projection expressions
             let mut new_definitions = HashMap::new();
@@ -289,28 +297,33 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Option<TraversalResult<'_>> {
                 };
 
                 // Resolve the expression against child definitions
-                let resolved = resolve_expr(&inner_expr, &child_result.column_definitions);
+                let resolved = resolve_expr(&inner_expr, &child_result.column_definitions)?;
                 new_definitions.insert(alias, resolved);
             }
 
-            Some(TraversalResult {
+            Ok(Some(TraversalResult {
                 unnest: child_result.unnest,
                 column_definitions: new_definitions,
-            })
+            }))
         }
         _ => {
             trace!(
                 "traverse_to_unnest: expected Projection or Unnest, got {}",
                 plan_type_name(plan)
             );
-            None
+            Ok(None)
         }
     }
 }
 
 /// Resolve an expression by substituting column references with their definitions.
 /// Uses DataFusion's `transform` to recursively traverse all expression variants.
-fn resolve_expr(expr: &Expr, definitions: &HashMap<String, Expr>) -> Expr {
+///
+/// # Errors
+///
+/// Returns an error if the expression tree traversal fails (e.g., due to an
+/// unexpected expression variant or internal DataFusion error).
+fn resolve_expr(expr: &Expr, definitions: &HashMap<String, Expr>) -> Result<Expr> {
     expr.clone()
         .transform(|e| {
             if let Expr::Column(col) = &e {
@@ -321,7 +334,6 @@ fn resolve_expr(expr: &Expr, definitions: &HashMap<String, Expr>) -> Expr {
             Ok(Transformed::no(e))
         })
         .map(|t| t.data)
-        .unwrap_or_else(|_| expr.clone())
 }
 
 /// Attempt to detect and optimize the pattern.
@@ -355,9 +367,16 @@ fn try_optimize(plan: &LogicalPlan) -> Option<Result<LogicalPlan>> {
     };
 
     // Traverse to find Unnest while collecting column definitions
-    let Some(traversal) = traverse_to_unnest(aggregate.input.as_ref()) else {
-        trace!("traverse_to_unnest returned None");
-        return None;
+    let traversal = match traverse_to_unnest(aggregate.input.as_ref()) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            trace!("traverse_to_unnest returned None");
+            return None;
+        }
+        Err(e) => {
+            // Pattern matched but traversal failed - propagate error
+            return Some(Err(e));
+        }
     };
     let unnest_plan = traversal.unnest;
     let column_definitions = traversal.column_definitions;
@@ -410,7 +429,10 @@ fn try_optimize(plan: &LogicalPlan) -> Option<Result<LogicalPlan>> {
         if let Expr::AggregateFunction(AggregateFunction { params, .. }) = expr {
             if let Some(arg) = params.args.first() {
                 // Resolve the argument through the column definitions
-                let resolved = resolve_expr(arg, &column_definitions);
+                let resolved = match resolve_expr(arg, &column_definitions) {
+                    Ok(r) => r,
+                    Err(e) => return Some(Err(e)),
+                };
                 trace!("Resolved array_agg argument: {arg:?} -> {resolved:?}");
                 transform_exprs.push(resolved);
             } else {
