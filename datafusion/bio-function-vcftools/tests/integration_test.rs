@@ -2042,3 +2042,142 @@ async fn test_parquet_round_trip_with_transform() {
     // Clean up
     disable_fused_array_transform();
 }
+
+/// Test that optimization is NOT applied when GROUP BY doesn't include a row-identity column.
+///
+/// The FusedArrayTransform optimization requires that GROUP BY uniquely identifies each input row.
+/// Without this, the optimization would produce incorrect results because it doesn't perform
+/// cross-row aggregation.
+///
+/// For example, if multiple rows share the same `metadata` value and we GROUP BY metadata
+/// (without a row_idx), the baseline array_agg should merge values across rows. But the
+/// optimized plan would return separate arrays per row, producing incorrect results.
+#[tokio::test]
+#[serial]
+async fn test_optimization_not_applied_without_row_identity() {
+    use datafusion::physical_plan::displayable;
+
+    let ctx = create_optimized_context().await;
+    let batch = create_test_data();
+    let schema = batch.schema();
+
+    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    ctx.register_table("test_data", Arc::new(table)).unwrap();
+
+    // Query that groups by metadata (non-unique) WITHOUT a row_idx column.
+    // This should NOT be optimized because metadata doesn't uniquely identify rows.
+    let sql = r#"
+        WITH unnested AS (
+            SELECT 
+                metadata,
+                unnest(values_a) as val_a
+            FROM test_data
+        )
+        SELECT
+            metadata,
+            array_agg(val_a) AS values_a_out
+        FROM unnested
+        GROUP BY metadata
+        ORDER BY metadata
+    "#;
+
+    let df = ctx.sql(sql).await.unwrap();
+
+    // Check the PHYSICAL plan does NOT include our optimization
+    let physical_plan = df.create_physical_plan().await.unwrap();
+    let plan_str = displayable(physical_plan.as_ref()).indent(true).to_string();
+    println!("\n=== Physical plan for GROUP BY without row-identity (should NOT be optimized) ===");
+    println!("{plan_str}");
+    println!("=== END ===\n");
+
+    // ASSERT: Optimization must NOT be applied when GROUP BY doesn't include row-identity column
+    let has_fused = plan_str.contains("FusedArrayTransform");
+    assert!(
+        !has_fused,
+        "FusedArrayTransform optimization was INCORRECTLY applied for GROUP BY without row-identity! \
+         Physical plan:\n{plan_str}"
+    );
+
+    // Verify query still executes correctly (using standard DataFusion aggregation)
+    let df2 = ctx.sql(sql).await.unwrap();
+    let results = df2.collect().await.unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 3,
+        "Expected 3 rows in result (one per unique metadata)"
+    );
+
+    println!("Row-identity validation test passed - optimization correctly NOT applied");
+
+    // Clean up
+    disable_fused_array_transform();
+}
+
+/// Test that optimization IS applied when GROUP BY includes a row-identity column (row_idx),
+/// even when other non-unique columns are also in the GROUP BY.
+#[tokio::test]
+#[serial]
+async fn test_optimization_applied_with_row_identity() {
+    use datafusion::physical_plan::displayable;
+
+    let ctx = create_optimized_context().await;
+    let batch = create_test_data();
+    let schema = batch.schema();
+
+    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    ctx.register_table("test_data", Arc::new(table)).unwrap();
+
+    // Query that groups by BOTH row_idx (unique) AND metadata (non-unique).
+    // This SHOULD be optimized because row_idx uniquely identifies rows.
+    let sql = r#"
+        WITH indexed AS (
+            SELECT 
+                ROW_NUMBER() OVER () as row_idx,
+                metadata,
+                values_a
+            FROM test_data
+        ),
+        unnested AS (
+            SELECT 
+                row_idx,
+                metadata,
+                unnest(values_a) as val_a
+            FROM indexed
+        )
+        SELECT
+            row_idx,
+            metadata,
+            array_agg(val_a) AS values_a_out
+        FROM unnested
+        GROUP BY row_idx, metadata
+        ORDER BY row_idx
+    "#;
+
+    let df = ctx.sql(sql).await.unwrap();
+
+    // Check the PHYSICAL plan DOES include our optimization
+    let physical_plan = df.create_physical_plan().await.unwrap();
+    let plan_str = displayable(physical_plan.as_ref()).indent(true).to_string();
+    println!("\n=== Physical plan for GROUP BY with row-identity (should be optimized) ===");
+    println!("{plan_str}");
+    println!("=== END ===\n");
+
+    // ASSERT: Optimization MUST be applied when GROUP BY includes row-identity column
+    let has_fused = plan_str.contains("FusedArrayTransform");
+    assert!(
+        has_fused,
+        "FusedArrayTransform optimization was NOT applied even though GROUP BY includes row_idx! \
+         Physical plan:\n{plan_str}"
+    );
+
+    // Verify query executes correctly
+    let df2 = ctx.sql(sql).await.unwrap();
+    let results = df2.collect().await.unwrap();
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "Expected 3 rows in result");
+
+    println!("Row-identity validation test passed - optimization correctly applied");
+
+    // Clean up
+    disable_fused_array_transform();
+}

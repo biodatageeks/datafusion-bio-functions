@@ -15,13 +15,13 @@
 //! Aggregate → SubqueryAlias → Projection → SubqueryAlias → Projection → Unnest
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use datafusion::common::Result;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::logical_expr::expr::AggregateFunction;
+use datafusion::logical_expr::expr::{AggregateFunction, WindowFunction};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan, SubqueryAlias};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use log::{debug, trace};
@@ -210,6 +210,9 @@ struct TraversalResult<'a> {
     /// Column mapping: output_name -> expression defining it
     /// This is built by traversing projections and composing expressions
     column_definitions: HashMap<String, Expr>,
+    /// Column names that uniquely identify each input row (e.g., from ROW_NUMBER() OVER ())
+    /// The optimization can only be applied if the GROUP BY includes at least one of these.
+    row_identity_columns: HashSet<String>,
 }
 
 /// Traverse from the Aggregate's input down to Unnest, collecting column definitions along the way.
@@ -272,9 +275,13 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Result<Option<TraversalResult<'_>>>
                 });
             }
 
+            // Scan the unnest input for row-identity columns (e.g., from ROW_NUMBER() OVER ())
+            let row_identity_columns = find_row_identity_columns(unnest.input.as_ref());
+
             Ok(Some(TraversalResult {
                 unnest,
                 column_definitions,
+                row_identity_columns,
             }))
         }
         LogicalPlan::Projection(projection) => {
@@ -285,6 +292,8 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Result<Option<TraversalResult<'_>>>
 
             // Build new column definitions by resolving projection expressions
             let mut new_definitions = HashMap::new();
+            // Track row-identity columns through this projection
+            let mut new_row_identity_columns = HashSet::new();
 
             for expr in &projection.expr {
                 let (alias, inner_expr) = match expr {
@@ -296,6 +305,14 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Result<Option<TraversalResult<'_>>>
                     other => (expr.schema_name().to_string(), other.clone()),
                 };
 
+                // Check if this column references a row-identity column
+                if let Expr::Column(col) = &inner_expr {
+                    if child_result.row_identity_columns.contains(col.name()) {
+                        trace!("Row-identity column aliased: {} -> {}", col.name(), alias);
+                        new_row_identity_columns.insert(alias.clone());
+                    }
+                }
+
                 // Resolve the expression against child definitions
                 let resolved = resolve_expr(&inner_expr, &child_result.column_definitions)?;
                 new_definitions.insert(alias, resolved);
@@ -304,6 +321,7 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Result<Option<TraversalResult<'_>>>
             Ok(Some(TraversalResult {
                 unnest: child_result.unnest,
                 column_definitions: new_definitions,
+                row_identity_columns: new_row_identity_columns,
             }))
         }
         _ => {
@@ -334,6 +352,103 @@ fn resolve_expr(expr: &Expr, definitions: &HashMap<String, Expr>) -> Result<Expr
             Ok(Transformed::no(e))
         })
         .map(|t| t.data)
+}
+
+/// Find columns that uniquely identify each row by scanning for ROW_NUMBER() OVER () patterns.
+///
+/// This traverses the plan tree looking for Window nodes that contain row_number()
+/// with an empty PARTITION BY clause (which produces unique values per row).
+/// It tracks these column names through projections/aliases.
+///
+/// # Arguments
+///
+/// * `plan` - The logical plan to scan (typically the input to Unnest)
+///
+/// # Returns
+///
+/// A set of column names that are guaranteed to uniquely identify each row.
+fn find_row_identity_columns(plan: &LogicalPlan) -> HashSet<String> {
+    let mut result = HashSet::new();
+
+    // Recursively scan the plan tree
+    fn scan_plan(plan: &LogicalPlan, identity_cols: &mut HashSet<String>) {
+        let plan = skip_wrappers(plan);
+
+        match plan {
+            LogicalPlan::Window(window) => {
+                // Check each window function expression
+                for expr in &window.window_expr {
+                    if let Some(col_name) = extract_row_identity_column(expr) {
+                        identity_cols.insert(col_name);
+                    }
+                }
+                // Continue scanning the input
+                scan_plan(window.input.as_ref(), identity_cols);
+            }
+            LogicalPlan::Projection(projection) => {
+                // Scan child first to collect identity columns
+                scan_plan(projection.input.as_ref(), identity_cols);
+
+                // Track aliases: if a projection aliases an identity column,
+                // the alias is also an identity column
+                let mut new_aliases = Vec::new();
+                for expr in &projection.expr {
+                    if let Expr::Alias(alias) = expr {
+                        if let Expr::Column(col) = alias.expr.as_ref() {
+                            if identity_cols.contains(col.name()) {
+                                new_aliases.push(alias.name.clone());
+                            }
+                        }
+                    }
+                }
+                for alias in new_aliases {
+                    identity_cols.insert(alias);
+                }
+            }
+            other => {
+                // For other node types, scan children
+                for child in other.inputs() {
+                    scan_plan(child, identity_cols);
+                }
+            }
+        }
+    }
+
+    scan_plan(plan, &mut result);
+    result
+}
+
+/// Check if an expression is a ROW_NUMBER() window function with empty PARTITION BY,
+/// and extract its output column name.
+///
+/// ROW_NUMBER() OVER () produces unique sequential values for each row, making it
+/// a valid row identity column. However, ROW_NUMBER() OVER (PARTITION BY x) does not
+/// produce globally unique values, so we only accept empty partition_by.
+fn extract_row_identity_column(expr: &Expr) -> Option<String> {
+    // Handle aliased expressions (e.g., ROW_NUMBER() OVER () as row_idx)
+    let (output_name, inner_expr) = match expr {
+        Expr::Alias(alias) => (alias.name.clone(), alias.expr.as_ref()),
+        other => (other.schema_name().to_string(), other),
+    };
+
+    // Check if it's a window function (WindowFunction is boxed in Expr::WindowFunction)
+    if let Expr::WindowFunction(window_func) = inner_expr {
+        let WindowFunction { fun, params } = window_func.as_ref();
+        // Check if it's row_number (case-insensitive)
+        let func_name = fun.name().to_lowercase();
+        if func_name == "row_number" {
+            // Only accept if partition_by is empty (ensures global uniqueness)
+            if params.partition_by.is_empty() {
+                trace!("Found row-identity column: {output_name} (from row_number())");
+                return Some(output_name);
+            } else {
+                trace!(
+                    "row_number() with PARTITION BY is not a row-identity column: {output_name}"
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Attempt to detect and optimize the pattern.
@@ -380,10 +495,12 @@ fn try_optimize(plan: &LogicalPlan) -> Option<Result<LogicalPlan>> {
     };
     let unnest_plan = traversal.unnest;
     let column_definitions = traversal.column_definitions;
+    let row_identity_columns = traversal.row_identity_columns;
 
     trace!(
-        "Found Unnest, column_definitions: {:?}",
-        column_definitions.keys().collect::<Vec<_>>()
+        "Found Unnest, column_definitions: {:?}, row_identity_columns: {:?}",
+        column_definitions.keys().collect::<Vec<_>>(),
+        row_identity_columns
     );
 
     // Get the input to unnest (this is what we'll use as our input)
@@ -415,6 +532,27 @@ fn try_optimize(plan: &LogicalPlan) -> Option<Result<LogicalPlan>> {
             }
         })
         .collect();
+
+    // CRITICAL: Verify that GROUP BY includes a row-identity column.
+    //
+    // FusedArrayTransformExec emits at most one output row per input row and never
+    // performs cross-row aggregation. If the GROUP BY doesn't uniquely identify each
+    // original input row, the optimization would produce incorrect results.
+    //
+    // For example, GROUP BY metadata (where multiple rows share the same metadata)
+    // should merge values across rows with array_agg, but the optimized plan would
+    // return separate arrays per row.
+    let has_row_identity = passthrough_columns
+        .iter()
+        .any(|col| row_identity_columns.contains(col));
+
+    if !has_row_identity {
+        debug!(
+            "GROUP BY columns {passthrough_columns:?} do not include any row-identity column \
+             (available: {row_identity_columns:?}). Cannot safely apply FusedArrayTransform optimization."
+        );
+        return None;
+    }
 
     // Extract output column names and transform expressions from aggregate expressions
     // For each array_agg(col), we resolve 'col' to get the actual transformation
