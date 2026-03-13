@@ -86,6 +86,9 @@ pub const AF_COL_NAMES: &[&str] = &[
     "gnomADg_SAS",
 ];
 
+type ExactCoordIndex = HashMap<String, HashMap<(i64, i64), Vec<u32>>>;
+type CoordBucket = HashMap<(i64, i64), Vec<u32>>;
+
 fn read_optional_i64(
     batch: &RecordBatch,
     row: usize,
@@ -126,6 +129,31 @@ fn push_unique_candidate(candidates: &mut Vec<usize>, seen: &mut HashSet<usize>,
     if seen.insert(candidate) {
         candidates.push(candidate);
     }
+}
+
+fn push_exact_candidates(
+    coord_map: Option<&CoordBucket>,
+    start: i64,
+    end: i64,
+    candidates: &mut Vec<usize>,
+) {
+    let Some(matches) = coord_map.and_then(|coord_map| coord_map.get(&(start, end))) else {
+        return;
+    };
+    candidates.extend(matches.iter().map(|&idx| idx as usize));
+}
+
+fn cache_allele_string_needs_overlap_probe(allele_string: &str) -> bool {
+    let mut alleles = allele_string.split('/');
+    let Some(ref_allele) = alleles.next() else {
+        return false;
+    };
+    for alt_allele in alleles {
+        if ref_allele == "-" || alt_allele == "-" || ref_allele.len() != alt_allele.len() {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy)]
@@ -301,23 +329,43 @@ where
 /// before `compare_existing()` decides whether the existing variant is
 /// allele-compatible.
 fn collect_overlapping_candidates(
-    build: &BuildSide,
-    chrom: &str,
+    compare_hash_bucket: Option<&CoordBucket>,
+    unshifted_hash_bucket: Option<&CoordBucket>,
+    compare_tree: Option<&COITree<u32, u32>>,
+    unshifted_tree: Option<&COITree<u32, u32>>,
     start: i64,
     end: i64,
+    allele_string: &str,
 ) -> Vec<usize> {
-    let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
     let probe_start = start.min(end);
     let probe_end = start.max(end);
+    let mut candidates = Vec::new();
 
-    if let Some(tree) = build.compare_trees.get(chrom) {
+    push_exact_candidates(compare_hash_bucket, probe_start, probe_end, &mut candidates);
+    push_exact_candidates(
+        unshifted_hash_bucket,
+        probe_start,
+        probe_end,
+        &mut candidates,
+    );
+    if candidates.len() > 1 {
+        candidates.sort_unstable();
+        candidates.dedup();
+    }
+
+    if !cache_allele_string_needs_overlap_probe(allele_string) {
+        return candidates;
+    }
+
+    let mut seen: HashSet<usize> = candidates.iter().copied().collect();
+
+    if let Some(tree) = compare_tree {
         tree.query(probe_start as i32, probe_end as i32, |interval| {
             push_unique_candidate(&mut candidates, &mut seen, *interval.metadata as usize);
         });
     }
 
-    if let Some(tree) = build.unshifted_trees.get(chrom) {
+    if let Some(tree) = unshifted_tree {
         tree.query(probe_start as i32, probe_end as i32, |interval| {
             push_unique_candidate(&mut candidates, &mut seen, *interval.metadata as usize);
         });
@@ -611,7 +659,13 @@ struct BuildSide {
     /// Primary: chrom → { (vep_norm_start, vep_norm_end) → [row_indices] }.
     /// Two-level to avoid per-row String allocation during probe — the outer
     /// lookup by `&str` is free.
-    hash_index: HashMap<String, HashMap<(i64, i64), Vec<u32>>>,
+    hash_index: ExactCoordIndex,
+    /// Exact active compare-space coordinates used by colocated probing before
+    /// falling back to overlap trees for shiftable indels.
+    compare_hash_index: ExactCoordIndex,
+    /// Exact unshifted coordinates used by colocated probing when upstream
+    /// shift state exists.
+    unshifted_hash_index: ExactCoordIndex,
     /// Fallback: per-chromosome interval trees for overlap queries.
     /// Intervals use raw 1-based coordinates (not VEP-normalized) so that
     /// shifted indels can be found via range overlap.
@@ -839,7 +893,9 @@ impl VariantLookupStream {
             .transpose()?;
 
         let mut rows = Vec::with_capacity(num_rows);
-        let mut hash_index: HashMap<String, HashMap<(i64, i64), Vec<u32>>> = HashMap::new();
+        let mut hash_index: ExactCoordIndex = HashMap::new();
+        let mut compare_hash_index: ExactCoordIndex = HashMap::new();
+        let mut unshifted_hash_index: ExactCoordIndex = HashMap::new();
         let mut intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
         let mut compare_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
         let mut unshifted_intervals_by_chrom: HashMap<String, Vec<Interval<u32>>> = HashMap::new();
@@ -922,6 +978,12 @@ impl VariantLookupStream {
 
             let compare_tree_start = active_compare_start.min(active_compare_end);
             let compare_tree_end = active_compare_start.max(active_compare_end);
+            compare_hash_index
+                .entry(norm_chrom.clone())
+                .or_default()
+                .entry((compare_tree_start, compare_tree_end))
+                .or_default()
+                .push(i as u32);
             compare_intervals_by_chrom
                 .entry(norm_chrom.clone())
                 .or_default()
@@ -973,6 +1035,19 @@ impl VariantLookupStream {
                     tree_end as i32,
                     row_idx as u32,
                 ));
+            unshifted_hash_index
+                .entry(if self.vcf_has_chr {
+                    chroms[row_idx]
+                        .strip_prefix("chr")
+                        .unwrap_or(&chroms[row_idx])
+                        .to_string()
+                } else {
+                    chroms[row_idx].clone()
+                })
+                .or_default()
+                .entry((tree_start, tree_end))
+                .or_default()
+                .push(row_idx as u32);
         }
 
         let mut trees = HashMap::new();
@@ -996,6 +1071,8 @@ impl VariantLookupStream {
             vcf_batch,
             rows,
             hash_index,
+            compare_hash_index,
+            unshifted_hash_index,
             trees,
             compare_trees,
             unshifted_trees,
@@ -1015,8 +1092,6 @@ impl VariantLookupStream {
         self.resolve_coloc_indices(&cache_schema);
         let ci = self.cache_indices.as_ref().unwrap();
 
-        let build = self.build.as_mut().unwrap();
-
         // Zero-copy accessors for the hot-loop columns.
         let cache_chroms = StringAccessor::new(cache_batch.column(ci.chrom), "chrom")?;
         let cache_starts = I64Accessor::new(cache_batch.column(ci.start), "start")?;
@@ -1034,91 +1109,92 @@ impl VariantLookupStream {
         let mut vcf_indices: Vec<u32> = Vec::new();
         let mut cache_indices_buf: Vec<u32> = Vec::new();
 
-        for cache_row in 0..num_cache_rows {
-            let cache_chrom = cache_chroms.value(cache_row);
+        {
+            let build = self.build.as_mut().unwrap();
+            let rows = &build.rows;
+            let hash_index = &build.hash_index;
+            let trees = &build.trees;
+            let matched = &mut build.matched;
+            let mut active_chrom = String::new();
+            let mut active_hash_bucket: Option<&CoordBucket> = None;
+            let mut active_tree: Option<&COITree<u32, u32>> = None;
 
-            let cache_start_raw = cache_starts.value(cache_row);
-            let cache_end_raw = cache_ends.value(cache_row);
-            let failed = cache_failed
-                .as_ref()
-                .map(|accessor| accessor.value(cache_row))
-                .unwrap_or(0);
-            // Traceability:
-            // - Ensembl VEP `filter_variation()`
-            //   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L224-L227
-            if failed > self.allowed_failed {
-                continue;
-            }
-            let cache_start_1based = if cache_zero_based {
-                cache_start_raw + 1
-            } else {
-                cache_start_raw
-            };
-            let cache_end_1based = cache_end_raw;
+            for cache_row in 0..num_cache_rows {
+                let cache_chrom = cache_chroms.value(cache_row);
+                if active_chrom != cache_chrom {
+                    active_chrom.clear();
+                    active_chrom.push_str(cache_chrom);
+                    active_hash_bucket = hash_index.get(cache_chrom);
+                    active_tree = trees.get(cache_chrom);
+                }
 
-            let allele_str = cache_alleles.value(cache_row);
+                let cache_start_raw = cache_starts.value(cache_row);
+                let cache_end_raw = cache_ends.value(cache_row);
+                let failed = cache_failed
+                    .as_ref()
+                    .map(|accessor| accessor.value(cache_row))
+                    .unwrap_or(0);
+                // Traceability:
+                // - Ensembl VEP `filter_variation()`
+                //   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L224-L227
+                if failed > self.allowed_failed {
+                    continue;
+                }
+                let cache_start_1based = if cache_zero_based {
+                    cache_start_raw + 1
+                } else {
+                    cache_start_raw
+                };
+                let cache_end_1based = cache_end_raw;
 
-            // --- Primary: O(1) hash lookup by exact (chrom, start, end) ---
-            // Outer lookup by &str avoids String allocation per row.
-            let mut found_via_hash = false;
-            if let Some(coord_map) = build.hash_index.get(cache_chrom) {
-                if let Some(candidates) = coord_map.get(&(cache_start_1based, cache_end_1based)) {
+                let allele_str = cache_alleles.value(cache_row);
+
+                // --- Primary: O(1) hash lookup by exact (chrom, start, end) ---
+                let mut found_via_hash = false;
+                if let Some(candidates) = active_hash_bucket
+                    .and_then(|coord_map| coord_map.get(&(cache_start_1based, cache_end_1based)))
+                {
                     for &vcf_idx in candidates {
-                        let row = &build.rows[vcf_idx as usize];
+                        let row = &rows[vcf_idx as usize];
                         if allele_matches(&row.vcf_ref, &row.vcf_alt, allele_str) {
                             vcf_indices.push(vcf_idx);
                             cache_indices_buf.push(cache_row as u32);
-                            build.matched[vcf_idx as usize] = true;
+                            matched[vcf_idx as usize] = true;
                             found_via_hash = true;
                         }
                     }
                 }
-            }
 
-            // --- Fallback: COITree overlap query for shifted indels ---
-            // Only used when extended_probes=true. The tree uses VEP-normalized
-            // coordinates, so after finding overlap candidates we verify that the
-            // cache row's coordinates are compatible with the VCF variant's
-            // VEP-normalized coordinates (either exact match or insertion-style
-            // reversal where cache start/end == VCF vep_start/vep_end).
-            if !found_via_hash && self.extended_probes {
-                if let Some(tree) = build.trees.get(cache_chrom) {
-                    let probe_start = cache_start_1based.min(cache_end_1based);
-                    let probe_end = cache_start_1based.max(cache_end_1based);
+                if !found_via_hash && self.extended_probes {
+                    if let Some(tree) = active_tree {
+                        let probe_start = cache_start_1based.min(cache_end_1based);
+                        let probe_end = cache_start_1based.max(cache_end_1based);
 
-                    tree.query(probe_start as i32, probe_end as i32, |interval| {
-                        let vcf_idx = *interval.metadata;
+                        tree.query(probe_start as i32, probe_end as i32, |interval| {
+                            let vcf_idx = *interval.metadata;
 
-                        // Skip VCF variants already matched via hash — tree
-                        // fallback is only for variants the hash missed entirely.
-                        // Without this guard, a cache row at a different position
-                        // can pollute co-located data for already-matched variants.
-                        if build.matched[vcf_idx as usize] {
-                            return;
-                        }
+                            if matched[vcf_idx as usize] {
+                                return;
+                            }
 
-                        let row = &build.rows[vcf_idx as usize];
+                            let row = &rows[vcf_idx as usize];
+                            let exact = cache_start_1based == row.vep_start
+                                && cache_end_1based == row.vep_end;
+                            let swapped = cache_start_1based == row.vep_end
+                                && cache_end_1based == row.vep_start;
+                            let contains = cache_start_1based <= row.vep_start
+                                && cache_end_1based >= row.vep_end;
+                            if !exact && !swapped && !contains {
+                                return;
+                            }
 
-                        // Coordinate compatibility check:
-                        // 1. Exact match (same as hash would find)
-                        // 2. Swapped (insertion-style: cache start/end flipped)
-                        // 3. Cache range contains VEP point (half-open vs closed)
-                        let exact =
-                            cache_start_1based == row.vep_start && cache_end_1based == row.vep_end;
-                        let swapped =
-                            cache_start_1based == row.vep_end && cache_end_1based == row.vep_start;
-                        let contains =
-                            cache_start_1based <= row.vep_start && cache_end_1based >= row.vep_end;
-                        if !exact && !swapped && !contains {
-                            return;
-                        }
-
-                        if allele_matches(&row.vcf_ref, &row.vcf_alt, allele_str) {
-                            vcf_indices.push(vcf_idx);
-                            cache_indices_buf.push(cache_row as u32);
-                            build.matched[vcf_idx as usize] = true;
-                        }
-                    });
+                            if allele_matches(&row.vcf_ref, &row.vcf_alt, allele_str) {
+                                vcf_indices.push(vcf_idx);
+                                cache_indices_buf.push(cache_row as u32);
+                                matched[vcf_idx as usize] = true;
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -1131,6 +1207,13 @@ impl VariantLookupStream {
             let var_names = StringAccessor::new(var_name_col, "variation_name")?;
 
             let mut local_buf: HashMap<ColocatedKey, Vec<ColocatedCacheEntry>> = HashMap::new();
+            let build = self.build.as_ref().unwrap();
+            let rows = &build.rows;
+            let mut active_chrom = String::new();
+            let mut active_compare_hash_bucket: Option<&CoordBucket> = None;
+            let mut active_unshifted_hash_bucket: Option<&CoordBucket> = None;
+            let mut active_compare_tree: Option<&COITree<u32, u32>> = None;
+            let mut active_unshifted_tree: Option<&COITree<u32, u32>> = None;
 
             for cache_row in 0..num_cache_rows {
                 if var_name_col.is_null(cache_row) {
@@ -1142,6 +1225,14 @@ impl VariantLookupStream {
                 }
 
                 let cache_chrom = cache_chroms.value(cache_row);
+                if active_chrom != cache_chrom {
+                    active_chrom.clear();
+                    active_chrom.push_str(cache_chrom);
+                    active_compare_hash_bucket = build.compare_hash_index.get(cache_chrom);
+                    active_unshifted_hash_bucket = build.unshifted_hash_index.get(cache_chrom);
+                    active_compare_tree = build.compare_trees.get(cache_chrom);
+                    active_unshifted_tree = build.unshifted_trees.get(cache_chrom);
+                }
                 let cache_start_raw = cache_starts.value(cache_row);
                 let cache_end_raw = cache_ends.value(cache_row);
                 let failed = cache_failed
@@ -1159,13 +1250,23 @@ impl VariantLookupStream {
                 let ce1 = cache_end_raw;
                 let allele_str = cache_alleles.value(cache_row);
 
-                if !build.compare_trees.contains_key(cache_chrom)
-                    && !build.unshifted_trees.contains_key(cache_chrom)
+                if active_compare_hash_bucket.is_none()
+                    && active_unshifted_hash_bucket.is_none()
+                    && active_compare_tree.is_none()
+                    && active_unshifted_tree.is_none()
                 {
                     continue;
                 }
-                for vcf_idx in collect_overlapping_candidates(build, cache_chrom, cs1, ce1) {
-                    let vcf_row = &build.rows[vcf_idx];
+                for vcf_idx in collect_overlapping_candidates(
+                    active_compare_hash_bucket,
+                    active_unshifted_hash_bucket,
+                    active_compare_tree,
+                    active_unshifted_tree,
+                    cs1,
+                    ce1,
+                    allele_str,
+                ) {
+                    let vcf_row = &rows[vcf_idx];
                     if !existing_start_is_visible_to_input_row(vcf_row, cs1) {
                         continue;
                     }
@@ -1246,6 +1347,7 @@ impl VariantLookupStream {
         let cache_take = UInt32Array::from(cache_indices_buf);
 
         let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
+        let build = self.build.as_ref().unwrap();
 
         // VCF columns from build side.
         for col_idx in 0..self.num_vcf_cols {
@@ -1803,6 +1905,8 @@ mod tests {
                 unshifted_end: None,
             }],
             hash_index: HashMap::new(),
+            compare_hash_index: HashMap::new(),
+            unshifted_hash_index: HashMap::new(),
             trees: HashMap::from([(
                 "1".to_string(),
                 COITree::new(&[Interval::new(62689177, 62689188, 0)]),
@@ -1816,8 +1920,103 @@ mod tests {
         };
 
         assert_eq!(
-            collect_overlapping_candidates(&build, "1", 62689177, 62689188),
+            collect_overlapping_candidates(
+                None,
+                None,
+                build.compare_trees.get("1"),
+                build.unshifted_trees.get("1"),
+                62689177,
+                62689188,
+                "ACATATATATATATATATATATAT/-"
+            ),
             vec![0]
+        );
+    }
+
+    #[test]
+    fn collect_overlapping_candidates_uses_exact_compare_hash_for_substitutions() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+        let empty_batch = RecordBatch::new_empty(schema);
+        let build = BuildSide {
+            vcf_batch: empty_batch,
+            rows: vec![BuildRow {
+                vcf_ref: "A".to_string(),
+                vcf_alt: "G".to_string(),
+                input_allele_string: "A/G".to_string(),
+                input_start: 101,
+                input_end: 101,
+                compare_allele_string: "A/G".to_string(),
+                compare_start: 101,
+                compare_end: 101,
+                unshifted_allele_string: None,
+                vep_start: 101,
+                vep_end: 101,
+                unshifted_start: None,
+                unshifted_end: None,
+            }],
+            hash_index: HashMap::new(),
+            compare_hash_index: HashMap::from([(
+                "1".to_string(),
+                HashMap::from([((101, 101), vec![0])]),
+            )]),
+            unshifted_hash_index: HashMap::new(),
+            trees: HashMap::new(),
+            compare_trees: HashMap::new(),
+            unshifted_trees: HashMap::new(),
+            matched: vec![false],
+        };
+
+        assert_eq!(
+            collect_overlapping_candidates(
+                build.compare_hash_index.get("1"),
+                build.unshifted_hash_index.get("1"),
+                build.compare_trees.get("1"),
+                build.unshifted_trees.get("1"),
+                101,
+                101,
+                "A/G"
+            ),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn cache_allele_string_probe_requirement_matches_variant_class() {
+        assert!(!cache_allele_string_needs_overlap_probe("A/G"));
+        assert!(!cache_allele_string_needs_overlap_probe("AA/GG"));
+        assert!(!cache_allele_string_needs_overlap_probe("A/G/T"));
+        assert!(cache_allele_string_needs_overlap_probe("-/AC"));
+        assert!(cache_allele_string_needs_overlap_probe("AC/-"));
+        assert!(cache_allele_string_needs_overlap_probe("AC/A"));
+    }
+
+    #[test]
+    fn collect_overlapping_candidates_skips_overlap_probe_for_substitutions_without_exact_hits() {
+        let tree = COITree::new(&[Interval::new(101, 101, 0)]);
+
+        assert!(
+            collect_overlapping_candidates(None, None, Some(&tree), None, 101, 101, "A/G")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn collect_overlapping_candidates_deduplicates_exact_and_tree_hits() {
+        let compare_hash_bucket: CoordBucket = HashMap::from([((10, 11), vec![2, 0])]);
+        let unshifted_hash_bucket: CoordBucket = HashMap::from([((10, 11), vec![1, 0])]);
+        let tree = COITree::new(&[Interval::new(10, 11, 0), Interval::new(10, 11, 3)]);
+
+        assert_eq!(
+            collect_overlapping_candidates(
+                Some(&compare_hash_bucket),
+                Some(&unshifted_hash_bucket),
+                Some(&tree),
+                None,
+                10,
+                11,
+                "CA/-"
+            ),
+            vec![0, 1, 2, 3]
         );
     }
 
@@ -1948,8 +2147,30 @@ mod tests {
         assert_eq!(row.unshifted_allele_string.as_deref(), Some("CA/-"));
         assert_eq!(row.unshifted_start, Some(2));
         assert_eq!(row.unshifted_end, Some(3));
-        assert_eq!(collect_overlapping_candidates(build, "1", 8, 9), vec![0]);
-        assert_eq!(collect_overlapping_candidates(build, "1", 2, 3), vec![0]);
+        assert_eq!(
+            collect_overlapping_candidates(
+                build.compare_hash_index.get("1"),
+                build.unshifted_hash_index.get("1"),
+                build.compare_trees.get("1"),
+                build.unshifted_trees.get("1"),
+                8,
+                9,
+                "CA/-"
+            ),
+            vec![0]
+        );
+        assert_eq!(
+            collect_overlapping_candidates(
+                build.compare_hash_index.get("1"),
+                build.unshifted_hash_index.get("1"),
+                build.compare_trees.get("1"),
+                build.unshifted_trees.get("1"),
+                2,
+                3,
+                "CA/-"
+            ),
+            vec![0]
+        );
     }
 
     #[test]
