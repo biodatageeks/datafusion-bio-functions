@@ -1191,6 +1191,7 @@ impl AnnotateProvider {
         raw_hgvsp: &str,
         remove_hgvsp_version: bool,
         no_escape: bool,
+        prediction_format: bool,
     ) -> String {
         let mut out = raw_hgvsp.to_string();
 
@@ -1202,6 +1203,12 @@ impl AnnotateProvider {
                     .map(|(base, _)| base)
                     .unwrap_or(ref_name);
                 out = format!("{stripped_ref}:p.{suffix}");
+            }
+        }
+
+        if prediction_format {
+            if let Some((ref_name, suffix)) = out.split_once(":p.") {
+                out = format!("{ref_name}:p.({suffix})");
             }
         }
 
@@ -2405,6 +2412,7 @@ impl AnnotateProvider {
                                     value,
                                     hgvs_flags.remove_hgvsp_version,
                                     hgvs_flags.no_escape,
+                                    hgvs_flags.hgvsp_use_prediction,
                                 )
                             })
                             .unwrap_or_default()
@@ -3508,7 +3516,7 @@ mod tests {
     #[test]
     fn test_format_hgvsp_output_strips_version_and_escapes_equals() {
         assert_eq!(
-            AnnotateProvider::format_hgvsp_output("ENSP000001.2:p.Val100=", true, false),
+            AnnotateProvider::format_hgvsp_output("ENSP000001.2:p.Val100=", true, false, false),
             "ENSP000001:p.Val100%3D"
         );
     }
@@ -3516,8 +3524,16 @@ mod tests {
     #[test]
     fn test_format_hgvsp_output_keeps_version_and_literal_equals_when_no_escape() {
         assert_eq!(
-            AnnotateProvider::format_hgvsp_output("ENSP000001.2:p.Val100=", false, true),
+            AnnotateProvider::format_hgvsp_output("ENSP000001.2:p.Val100=", false, true, false),
             "ENSP000001.2:p.Val100="
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_output_wraps_prediction_format() {
+        assert_eq!(
+            AnnotateProvider::format_hgvsp_output("ENSP000001.2:p.Val100Ala", false, true, true),
+            "ENSP000001.2:p.(Val100Ala)"
         );
     }
 

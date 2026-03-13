@@ -1956,6 +1956,34 @@ mod tests {
             .expect("transcript hgvs entry should exist");
         assert_eq!(hgvs_entry[10], "ENSTHGVS000001.1:c.4G>A");
         assert_eq!(hgvs_entry[11], "ENSPHGVS000001.1:p.Ala2Thr");
+
+        let hgvs_prediction_batches = ctx
+            .sql(&format!(
+                "SELECT csq FROM annotate_vep( \
+                   'vcf_hgvs', \
+                   'var_hgvs_cache', \
+                   'parquet', \
+                   '{{\"hgvsp\":true,\"hgvsp_use_prediction\":true,\"reference_fasta_path\":\"{}\"}}' \
+                 )",
+                fasta_path.replace('\'', "''")
+            ))
+            .await
+            .expect("hgvs prediction query should parse")
+            .collect()
+            .await
+            .expect("collect hgvs prediction annotate_vep");
+        let hgvs_prediction_csq = string_values(
+            hgvs_prediction_batches[0]
+                .column_by_name("csq")
+                .expect("hgvs prediction csq column exists"),
+        );
+        let hgvs_prediction_entry =
+            csq_entries(hgvs_prediction_csq[0].as_ref().expect("hgvs prediction csq present"))
+                .into_iter()
+                .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
+                .expect("transcript hgvs prediction entry should exist");
+        assert_eq!(hgvs_prediction_entry[10], "");
+        assert_eq!(hgvs_prediction_entry[11], "ENSPHGVS000001.1:p.(Ala2Thr)");
     }
 
     #[tokio::test(flavor = "multi_thread")]
