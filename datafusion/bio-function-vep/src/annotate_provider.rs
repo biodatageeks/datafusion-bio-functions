@@ -420,6 +420,15 @@ fn push_unique_value(values: &mut Vec<String>, value: impl Into<String>) {
 }
 
 impl ColocatedEntry {
+    /// Traceability:
+    /// - Ensembl VEP `add_colocated_variant_info()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035
+    /// - Ensembl VEP `add_colocated_frequency_data()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1150-L1157
+    ///
+    /// The colocated output path must resolve the matched existing-variant
+    /// allele against the live CSQ allele, with optional fallback to the
+    /// retained unshifted allele when VEP preserved original shift metadata.
     fn matching_allele<'a>(
         &'a self,
         output_allele: &str,
@@ -431,6 +440,13 @@ impl ColocatedEntry {
         })
     }
 
+    /// Traceability:
+    /// - Ensembl VEP `add_colocated_variant_info()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035
+    ///
+    /// Existing variants without `matched_alleles` remain visible, but once
+    /// a matched-allele map exists the output must be filtered by the active
+    /// CSQ allele exactly as OutputFactory does.
     fn matches_output_allele(
         &self,
         output_allele: &str,
@@ -483,6 +499,12 @@ impl ColocatedData {
             })
     }
 
+    /// Traceability:
+    /// - Ensembl VEP `add_colocated_variant_info()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1005-L1011
+    ///
+    /// OutputFactory sorts co-located variants by somatic status and then by
+    /// variation-name class before emitting IDs and metadata.
     fn sorted_entries(&self) -> Vec<&ColocatedEntry> {
         let mut entries: Vec<&ColocatedEntry> = self.entries.iter().collect();
         entries.sort_by(|a, b| {
@@ -3629,6 +3651,54 @@ mod tests {
 
         assert_eq!(data.compare_output_allele.as_deref(), Some("-"));
         assert_eq!(data.unshifted_output_allele.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn test_build_colocated_map_from_sink_merges_duplicate_variation_names_and_matches() {
+        let key = ("1".to_string(), 101, 102, "AA/-".to_string());
+        let sink = HashMap::from([(
+            key.clone(),
+            ColocatedSinkValue {
+                entries: vec![
+                    ColocatedCacheEntry {
+                        variation_name: "rs1".to_string(),
+                        allele_string: "AA/-".to_string(),
+                        matched_alleles: vec![make_match("A", "-")],
+                        somatic: 0,
+                        pheno: 0,
+                        clin_sig: Some("benign".to_string()),
+                        clin_sig_allele: None,
+                        pubmed: None,
+                        af_values: vec![String::new(); AF_COLUMNS.len()],
+                    },
+                    ColocatedCacheEntry {
+                        variation_name: "rs1".to_string(),
+                        allele_string: "AA/-".to_string(),
+                        matched_alleles: vec![MatchedVariantAllele {
+                            a_allele: "AA".to_string(),
+                            a_index: 1,
+                            b_allele: "-".to_string(),
+                            b_index: 0,
+                        }],
+                        somatic: 0,
+                        pheno: 0,
+                        clin_sig: Some("benign".to_string()),
+                        clin_sig_allele: None,
+                        pubmed: None,
+                        af_values: vec![String::new(); AF_COLUMNS.len()],
+                    },
+                ],
+                compare_output_allele: Some("-".to_string()),
+                unshifted_output_allele: Some("A".to_string()),
+            },
+        )]);
+
+        let map = build_colocated_map_from_sink(&sink);
+        let data = map.get(&key).expect("colocated data");
+
+        assert_eq!(data.entries.len(), 1);
+        assert_eq!(data.entries[0].variation_name, "rs1");
+        assert_eq!(data.entries[0].matched_alleles.len(), 2);
     }
 
     #[test]

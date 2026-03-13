@@ -143,6 +143,14 @@ fn push_exact_candidates(
     candidates.extend(matches.iter().map(|&idx| idx as usize));
 }
 
+/// Traceability:
+/// - Ensembl VEP `Parser::VCF::create_VariationFeatures()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Parser/VCF.pm#L321-L345
+/// - Ensembl VEP `OutputFactory::add_colocated_variant_info()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035
+///
+/// OutputFactory compares co-located rows against the ALT/output component of
+/// the parser/build-side allele string that `compare_existing()` retained.
 fn output_allele_from_allele_string(allele_string: &str) -> Option<&str> {
     allele_string.split_once('/').map(|(_, alt)| alt)
 }
@@ -153,6 +161,12 @@ enum ShiftableIndelKind {
     Deletion,
 }
 
+/// Traceability:
+/// - Ensembl Variation `create_shift_hash()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400
+///
+/// Genomic shift state is only defined for simple insertion/deletion allele
+/// strings. Substitutions and multi-ALT representations bypass this path.
 fn parse_shiftable_indel(allele_string: &str) -> Option<(&str, &str, ShiftableIndelKind)> {
     let (ref_allele, alt_allele) = allele_string.split_once('/')?;
     if ref_allele == "-" && !alt_allele.is_empty() && alt_allele != "-" {
@@ -164,6 +178,12 @@ fn parse_shiftable_indel(allele_string: &str) -> Option<(&str, &str, ShiftableIn
     None
 }
 
+/// Traceability:
+/// - Ensembl Variation `create_shift_hash()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400
+///
+/// Shift-state construction queries the indexed genomic reference by absolute
+/// chromosome coordinates before `_genomic_shift()` rotates repeat indels.
 fn build_reference_region(chrom: &str, start: i64, end: i64) -> Result<Region> {
     let start = usize::try_from(start).map_err(|_| {
         DataFusionError::Execution(format!(
@@ -188,6 +208,12 @@ fn build_reference_region(chrom: &str, start: i64, end: i64) -> Result<Region> {
     Ok(Region::new(chrom, start..=end))
 }
 
+/// Traceability:
+/// - Ensembl Variation `_genomic_shift()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L411-L466
+///
+/// The downstream flank used for VEP-style repeat shifting comes directly
+/// from the indexed reference FASTA, not from local allele heuristics.
 fn read_reference_sequence<R>(
     reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
     chrom: &str,
@@ -1082,10 +1108,16 @@ impl VariantLookupStream {
         Ok(())
     }
 
-    /// Process a single cache (probe) batch against the build-side indices.
+    /// Traceability:
+    /// - Ensembl VEP `AnnotationSource::Cache::VariationTabix::_annotate_pm()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationSource/Cache/VariationTabix.pm#L151-L189
+    /// - Ensembl VEP `compare_existing()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206
     ///
-    /// Strategy: try O(1) hash lookup first; on miss, fall back to COITree
-    /// overlap query for shifted-coordinate indels.
+    /// Probe-side cache processing follows the same VEP sequence: filter
+    /// unusable cache rows, match by exact hash or overlap window, and collect
+    /// colocated entries during the same scan with identical compare-existing
+    /// semantics.
     fn process_probe_batch(&mut self, cache_batch: &RecordBatch) -> Result<Option<RecordBatch>> {
         let cache_schema = cache_batch.schema();
         self.resolve_cache_indices(&cache_schema)?;
@@ -2010,6 +2042,27 @@ mod tests {
             collect_overlapping_candidates(None, None, Some(&tree), None, 101, 101),
             vec![0]
         );
+    }
+
+    #[test]
+    fn output_allele_from_allele_string_extracts_alt_component() {
+        assert_eq!(output_allele_from_allele_string("AA/-"), Some("-"));
+        assert_eq!(output_allele_from_allele_string("-/AC"), Some("AC"));
+        assert_eq!(output_allele_from_allele_string("AA"), None);
+    }
+
+    #[test]
+    fn parse_shiftable_indel_only_accepts_simple_insertions_and_deletions() {
+        assert!(matches!(
+            parse_shiftable_indel("-/AC"),
+            Some(("-", "AC", ShiftableIndelKind::Insertion))
+        ));
+        assert!(matches!(
+            parse_shiftable_indel("AC/-"),
+            Some(("AC", "-", ShiftableIndelKind::Deletion))
+        ));
+        assert!(parse_shiftable_indel("A/G").is_none());
+        assert!(parse_shiftable_indel("A/G/T").is_none());
     }
 
     #[test]

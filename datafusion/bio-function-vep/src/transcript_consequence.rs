@@ -1179,6 +1179,9 @@ impl TranscriptConsequenceEngine {
         }
     }
 
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_overlap_cds()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L511-L518
     fn overlaps_cds(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
         let Some(cds_start) = tx.cds_start else {
             return false;
@@ -1197,6 +1200,12 @@ impl TranscriptConsequenceEngine {
     /// where CDS consequences can't be determined — only
     /// `coding_sequence_variant`.  Frameshift introns (≤12bp) are treated
     /// as part of the coding context, so they don't trigger complex indel.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::within_cds()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L627-L648
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
     fn is_complex_indel(&self, variant: &VariantInput, tx_exons: &[&ExonFeature]) -> bool {
         // Insertions aren't complex
         if variant.ref_allele == "-" {
@@ -1222,6 +1231,10 @@ impl TranscriptConsequenceEngine {
 
     /// Returns true if the variant extends only into frameshift introns
     /// (≤12bp) from the given exon.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
     fn extends_into_frameshift_intron_only(
         &self,
         variant: &VariantInput,
@@ -1383,6 +1396,13 @@ impl TranscriptConsequenceEngine {
         None
     }
 
+    /// Traceability:
+    /// - Ensembl Variation `TranscriptVariationAllele::start_lost()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L83-L120
+    /// - Ensembl Variation `TranscriptVariationAllele::stop_lost()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L124-L158
+    /// - Ensembl Variation `TranscriptVariationAllele::stop_gained()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L161-L194
     fn add_start_stop_heuristic_terms(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -1459,6 +1479,12 @@ impl TranscriptConsequenceEngine {
     ///
     /// We check: is the insertion at an exon boundary, and is it on the
     /// UTR side of the CDS (in transcript orientation)?
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_after_coding()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L581-L606
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_before_coding()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L553-L578
     fn utr_boundary_insertion_term(
         &self,
         variant: &VariantInput,
@@ -1499,6 +1525,9 @@ impl TranscriptConsequenceEngine {
         None
     }
 
+    /// Traceability:
+    /// - Ensembl Variation `TranscriptVariationAllele::start_lost()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L83-L120
     fn overlaps_start_codon(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             return false;
@@ -1511,6 +1540,11 @@ impl TranscriptConsequenceEngine {
         overlaps(variant.start, variant.end, s, e)
     }
 
+    /// Traceability:
+    /// - Ensembl Variation `TranscriptVariationAllele::stop_lost()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L124-L158
+    /// - Ensembl Variation `TranscriptVariationAllele::stop_gained()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L161-L194
     fn overlaps_stop_codon(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             return false;
@@ -1523,6 +1557,11 @@ impl TranscriptConsequenceEngine {
         overlaps(variant.start, variant.end, s, e)
     }
 
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_before_coding()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L553-L578
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_after_coding()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L581-L606
     fn utr_term(&self, variant: &VariantInput, tx: &TranscriptFeature) -> Option<SoTerm> {
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             return None;
@@ -1563,6 +1602,11 @@ impl TranscriptConsequenceEngine {
         None
     }
 
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::upstream()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L652-L677
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::downstream()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L680-L705
     fn upstream_downstream_term(
         &self,
         variant: &VariantInput,
@@ -1641,6 +1685,10 @@ impl TranscriptConsequenceEngine {
 
     /// Returns true if the variant falls within a frameshift intron (≤13bp).
     /// VEP treats such variants as part of the surrounding coding context.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
     fn in_frameshift_intron(&self, variant: &VariantInput, tx_exons: &[&ExonFeature]) -> bool {
         if tx_exons.len() < 2 {
             return false;
@@ -1662,6 +1710,11 @@ impl TranscriptConsequenceEngine {
         false
     }
 
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_overlap()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L151-L259
     fn add_intron_splice_terms(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -1752,6 +1805,10 @@ impl TranscriptConsequenceEngine {
     /// region, VEP only checks splice_region (via `_intron_overlap` in the
     /// boundary loop).  Strand is irrelevant for _intron_overlap — it checks
     /// the same genomic coordinate ranges on both strands.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_overlap()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L151-L259
     fn add_splice_region_only(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -1808,6 +1865,11 @@ impl TranscriptConsequenceEngine {
         }
     }
 
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_overlap()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L151-L259
     fn add_splice_for_intron_positive(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -1962,6 +2024,12 @@ impl TranscriptConsequenceEngine {
     /// Splice checks for a single intron on the negative strand.
     /// On negative strand, the donor is at the intron END and acceptor at
     /// the intron START (genomic coordinates).
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_overlap()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L151-L259
     fn add_splice_for_intron_negative(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -2125,6 +2193,10 @@ fn overlaps(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
 /// semantics: for insertions (ref_allele == "-"), the insertion point must
 /// be strictly inside the feature (start > feature_start && start <= feature_end),
 /// not at the feature boundary.
+///
+/// Traceability:
+/// - Ensembl Variation `VariationEffect::within_feature()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L43-L53
 fn feature_overlaps(variant: &VariantInput, feat_start: i64, feat_end: i64) -> bool {
     if variant.ref_allele == "-" {
         variant.start > feat_start && variant.start <= feat_end
@@ -2133,6 +2205,9 @@ fn feature_overlaps(variant: &VariantInput, feat_start: i64, feat_end: i64) -> b
     }
 }
 
+/// Traceability:
+/// - Ensembl Variation `VariationEffect::overlap_perl()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L85
 fn add_if_overlaps(
     terms: &mut BTreeSet<SoTerm>,
     variant: &VariantInput,
@@ -2167,6 +2242,10 @@ fn is_non_coding_biotype(biotype: &str) -> bool {
 /// Returns true for transcript IDs that VEP annotates against.
 /// When `merged` is true (VEP `--merged` mode), both Ensembl and RefSeq
 /// transcripts are accepted.  Default (non-merged) accepts only ENST.
+///
+/// Traceability:
+/// - Ensembl VEP `AnnotationSourceAdaptor::get_all_TranscriptVariations()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSourceAdaptor.pm#L173-L220
 pub fn is_vep_transcript(id: &str, merged: bool) -> bool {
     if merged {
         id.starts_with("ENST")
@@ -2188,6 +2267,10 @@ pub fn is_vep_transcript(id: &str, merged: bool) -> bool {
 /// coding_sequence_variant because the codon change can't be computed).
 /// Per-transcript stripping in `strip_parent_terms` handles the case
 /// where both appear on the SAME transcript.
+///
+/// Traceability:
+/// - Ensembl Variation `BaseVariationFeatureOverlapAllele::_get_cons_term_rank()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749
 fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
@@ -2212,6 +2295,10 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 /// `protein_altering_variant` alongside `missense_variant`.
 /// Also strips `splice_polypyrimidine_tract_variant` when more specific
 /// splice-site terms subsume it.
+///
+/// Traceability:
+/// - Ensembl Variation `BaseVariationFeatureOverlapAllele::_get_cons_term_rank()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
@@ -2269,6 +2356,9 @@ fn allele_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
     (ref_len, alt_len)
 }
 
+/// Traceability:
+/// - Ensembl Variation `BaseTranscriptVariationAllele::incomplete_cds()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L520-L548
 fn cds_is_incomplete(tx: &TranscriptFeature, tx_translation: Option<&TranslationFeature>) -> bool {
     if let Some(translation) = tx_translation {
         if let Some(cds_len) = translation.cds_len {
@@ -2356,6 +2446,9 @@ fn apply_codon_classification(terms: &mut BTreeSet<SoTerm>, c: &CodingClassifica
     }
 }
 
+/// Traceability:
+/// - Ensembl Variation `BaseTranscriptVariationAllele::_get_peptide_alleles()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509
 fn classify_coding_change(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -2708,6 +2801,10 @@ fn classify_coding_change(
 /// For insertions, the variant position marks the insertion point (between
 /// two bases in the CDS). We map this to CDS coordinates, build the mutated
 /// CDS, and compute codons/amino acids/positions.
+///
+/// Traceability:
+/// - Ensembl Variation `BaseTranscriptVariationAllele::_get_peptide_alleles()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509
 fn classify_insertion(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -2912,6 +3009,10 @@ fn classify_insertion(
 /// Build the first 3 bases of the mutated CDS for an indel near the start
 /// codon. Used by the start_retained/start_lost heuristic when CDS sequence
 /// is available. Returns None if the variant position can't be mapped.
+///
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_ins_del_start_altered()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L197-L285
 fn mutated_cds_first3(
     cds_seq: &str,
     variant: &VariantInput,
@@ -3066,6 +3167,10 @@ fn mutated_cds_first3(
 
 /// Format codon bases with VEP case convention: changed positions uppercase,
 /// unchanged positions lowercase.
+///
+/// Traceability:
+/// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1631-L1677
 fn format_codon_display(
     bases: &[u8],
     changed_start: usize,
@@ -3088,6 +3193,12 @@ fn format_codon_display(
 
 /// Determine which exon (if any) the variant overlaps.
 /// Returns "N/total" string for the EXON CSQ field.
+///
+/// Traceability:
+/// - Ensembl VEP `OutputFactory.pm`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1414-L1445
+/// - Ensembl Variation `BaseTranscriptVariation::exon_number()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L698-L724
 fn which_exon_str(variant: &VariantInput, tx_exons: &[&ExonFeature]) -> Option<String> {
     if tx_exons.is_empty() {
         return None;
@@ -3193,6 +3304,12 @@ fn genomic_to_cdna_index(tx_exons: &[&ExonFeature], strand: i8, pos: i64) -> Opt
 }
 
 /// Compute the cDNA_position string for a variant overlapping an exon.
+///
+/// Traceability:
+/// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1631-L1677
+/// - Ensembl VEP `format_coords()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159
 fn compute_cdna_position(
     variant: &VariantInput,
     tx_exons: &[&ExonFeature],
@@ -3285,6 +3402,10 @@ fn compute_cdna_position(
 }
 
 /// Compute FLAGS field from transcript attributes.
+///
+/// Traceability:
+/// - Ensembl VEP `OutputFactory.pm`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1425-L1430
 fn compute_flags(tx: &TranscriptFeature) -> Option<String> {
     // Prefer pre-formatted flags string that preserves encounter order from cache.
     // Note: VEP's flag ordering is inconsistent between transcripts (some use
@@ -3346,6 +3467,11 @@ fn pep_allele_string_from_codon_allele_string(codon_allele_string: &str) -> Opti
     }
 }
 
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::pep_allele_string()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L618-L629
+/// - Ensembl Variation `TranscriptVariationAllele::peptide()`
+///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L692-L777
 fn peptide_from_codon_allele(codon: &str) -> Option<String> {
     if codon == "-" {
         return Some("-".to_string());
@@ -3435,6 +3561,9 @@ fn translate_codon_bytes(codon: [u8; 3]) -> Option<char> {
     }
 }
 
+/// Traceability:
+/// - Ensembl Variation `BaseTranscriptVariationAllele::_get_coding_region_start_end()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L321-L364
 fn genomic_to_cds_index(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
