@@ -3627,6 +3627,94 @@ async fn bench_scaling_subtract() -> Result<()> {
     Ok(())
 }
 
+const FBRAIN_BENCH_PATH: &str = "/tmp/polars-bio-bench/databio/fBrain-DS14718/";
+
+async fn bench_subtract_cross_with_partitions(
+    target_partitions: usize,
+    show_plan: bool,
+) -> Result<(usize, usize, usize, std::time::Duration)> {
+    let ctx = create_bio_session_with_target_partitions(target_partitions);
+    ctx.sql(&format!(
+        "CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'"
+    ))
+    .await?;
+    ctx.sql(&format!(
+        "CREATE EXTERNAL TABLE fbrain STORED AS PARQUET LOCATION '{FBRAIN_BENCH_PATH}'"
+    ))
+    .await?;
+
+    let left_count: usize = ctx
+        .sql("SELECT count(*) AS c FROM chain")
+        .await?
+        .collect()
+        .await?
+        .iter()
+        .map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0) as usize
+        })
+        .sum();
+
+    let right_count: usize = ctx
+        .sql("SELECT count(*) AS c FROM fbrain")
+        .await?
+        .collect()
+        .await?
+        .iter()
+        .map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0) as usize
+        })
+        .sum();
+
+    if show_plan {
+        let plan = ctx
+            .sql("EXPLAIN VERBOSE SELECT * FROM subtract('chain', 'fbrain')")
+            .await?
+            .collect()
+            .await?;
+        let formatted = pretty_format_batches(&plan)?.to_string();
+        eprintln!("\n  EXPLAIN VERBOSE (partitions={target_partitions}):\n{formatted}");
+    }
+
+    let start = std::time::Instant::now();
+    let result = ctx
+        .sql("SELECT * FROM subtract('chain', 'fbrain')")
+        .await?
+        .collect()
+        .await?;
+    let elapsed = start.elapsed();
+    let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    Ok((left_count, right_count, rows, elapsed))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scaling_subtract_cross() -> Result<()> {
+    eprintln!("\n=== SUBTRACT(chainXenTro3Link, fBrain-DS14718) ===");
+    let partition_counts = [1, 2, 4, 8];
+    for (i, partitions) in partition_counts.iter().enumerate() {
+        let show_plan = i == 0;
+        let (left, right, rows, elapsed) =
+            bench_subtract_cross_with_partitions(*partitions, show_plan).await?;
+        eprintln!(
+            "  partitions={:<2}  left={:<12}  right={:<12}  output={:<12}  time={:.3}s",
+            partitions,
+            left,
+            right,
+            rows,
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Scaling benchmarks for count_overlaps and coverage
 // ─────────────────────────────────────────────────────────────────────────────
