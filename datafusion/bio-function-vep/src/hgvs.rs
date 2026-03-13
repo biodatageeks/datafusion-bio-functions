@@ -4,6 +4,19 @@ use std::cmp::Ordering;
 
 use crate::transcript_consequence::{ExonFeature, TranscriptFeature, TranslationFeature};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProteinHgvsData {
+    pub start: usize,
+    pub end: usize,
+    pub ref_peptide: String,
+    pub alt_peptide: String,
+    pub ref_translation: String,
+    pub alt_translation: String,
+    pub frameshift: bool,
+    pub start_lost: bool,
+    pub stop_lost: bool,
+}
+
 /// Map a single-letter amino acid code to its 3-letter abbreviation.
 pub fn aa_one_to_three(c: char) -> &'static str {
     match c {
@@ -478,166 +491,538 @@ fn genomic_to_cdna_index_pub(tx_exons: &[&ExonFeature], strand: i8, pos: i64) ->
     None
 }
 
-/// Compute HGVSp notation from coding classification data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProteinHgvsNotation {
+    start: usize,
+    end: usize,
+    ref_allele: String,
+    alt_allele: String,
+    original_ref: String,
+    preseq: String,
+    kind: String,
+}
+
+impl ProteinHgvsNotation {
+    /// Traceability:
+    /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1749
+    fn from_context(data: &ProteinHgvsData) -> Self {
+        let ref_allele = normalize_peptide_allele(&data.ref_peptide);
+        let alt_allele = normalize_peptide_allele(&data.alt_peptide);
+        Self {
+            start: data.start,
+            end: data.end,
+            original_ref: ref_allele.clone(),
+            ref_allele,
+            alt_allele,
+            preseq: String::new(),
+            kind: String::new(),
+        }
+    }
+}
+
+/// Compute HGVSp notation from peptide-level coding classification data.
 ///
-/// Format: `ENSP00000368698.2:p.Arg348His`
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1593-L1758
+/// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_type()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1976-L2041
+/// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2043-L2114
+/// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1833-L1974
 pub fn format_hgvsp(
     translation: &TranslationFeature,
-    protein_position: Option<&str>,
-    amino_acids: Option<&str>,
-    terms: &[crate::so_terms::SoTerm],
+    protein: &ProteinHgvsData,
+    shift_hgvs: bool,
 ) -> Option<String> {
-    use crate::so_terms::SoTerm;
-
     let protein_id = versioned_id(translation.stable_id.as_deref()?, translation.version);
+    if protein.start_lost {
+        return Some(format!("{protein_id}:p.?"));
+    }
 
-    let aa = amino_acids?;
-    let pos_str = protein_position?;
+    let mut notation = ProteinHgvsNotation::from_context(protein);
+    if protein.frameshift {
+        resolve_frameshift_hgvs(&mut notation, protein)?;
+    } else {
+        if notation.ref_allele != notation.alt_allele {
+            clip_protein_alleles(&mut notation);
+        } else {
+            notation.kind = "=".to_string();
+        }
+        if notation.kind.is_empty() {
+            notation.kind = protein_event_type(&notation.ref_allele, &notation.alt_allele, false);
+        }
+        if shift_hgvs && matches!(notation.kind.as_str(), "ins" | "del") {
+            shift_peptides_post_var(&mut notation, &protein.ref_translation);
+        }
+        if notation.kind == "ins" && !check_for_peptide_duplication(&mut notation, &protein.ref_translation) {
+            notation.ref_allele = surrounding_peptides(
+                &protein.ref_translation,
+                notation.start.min(notation.end),
+                &notation.original_ref,
+                Some(2),
+            )?;
+        }
+    }
 
-    // Parse amino acids: "V/I" → (ref_aa, alt_aa)
-    let parts: Vec<&str> = aa.split('/').collect();
-    if parts.is_empty() {
+    format_hgvsp_notation(&protein_id, &notation, protein)
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2054-L2089
+fn normalize_peptide_allele(allele: &str) -> String {
+    if allele == "-" {
+        String::new()
+    } else {
+        allele.to_string()
+    }
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_clip_alleles()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2225
+fn clip_protein_alleles(notation: &mut ProteinHgvsNotation) {
+    let mut ref_allele = notation.ref_allele.clone();
+    let mut alt_allele = notation.alt_allele.clone();
+    let mut start = notation.start;
+    let mut end = notation.end;
+    let mut preseq = String::new();
+
+    while !ref_allele.is_empty()
+        && !alt_allele.is_empty()
+        && ref_allele.as_bytes()[0] == alt_allele.as_bytes()[0]
+    {
+        preseq.push(ref_allele.remove(0));
+        alt_allele.remove(0);
+        start = start.saturating_add(1);
+    }
+
+    while !ref_allele.is_empty()
+        && !alt_allele.is_empty()
+        && ref_allele.as_bytes()[ref_allele.len() - 1] == alt_allele.as_bytes()[alt_allele.len() - 1]
+    {
+        ref_allele.pop();
+        alt_allele.pop();
+        end = end.saturating_sub(1);
+    }
+
+    notation.start = start;
+    notation.end = end;
+    notation.ref_allele = ref_allele;
+    notation.alt_allele = alt_allele;
+    notation.preseq = preseq;
+
+    notation.kind = if notation.ref_allele == notation.alt_allele {
+        "=".to_string()
+    } else if notation.ref_allele.len() == 1 && notation.alt_allele.len() == 1 {
+        ">".to_string()
+    } else if notation.ref_allele.is_empty() && !notation.alt_allele.is_empty() {
+        "ins".to_string()
+    } else if !notation.ref_allele.is_empty() && notation.alt_allele.is_empty() {
+        "del".to_string()
+    } else {
+        "delins".to_string()
+    };
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_type()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1976-L2041
+fn protein_event_type(ref_allele: &str, alt_allele: &str, frameshift: bool) -> String {
+    if frameshift {
+        "fs".to_string()
+    } else if ref_allele == alt_allele {
+        "=".to_string()
+    } else if ref_allele.is_empty() {
+        "ins".to_string()
+    } else if alt_allele.is_empty() {
+        "del".to_string()
+    } else if ref_allele.len() == 1 && alt_allele.len() == 1 {
+        ">".to_string()
+    } else {
+        "delins".to_string()
+    }
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_fs_peptides()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2249-L2295
+fn resolve_frameshift_hgvs(
+    notation: &mut ProteinHgvsNotation,
+    protein: &ProteinHgvsData,
+) -> Option<()> {
+    notation.kind = "fs".to_string();
+    let ref_translation = append_terminal_stop(&protein.ref_translation);
+    let alt_translation = protein.alt_translation.as_str();
+    let mut start = notation.start;
+
+    if start > alt_translation.len() {
+        notation.kind = "del".to_string();
+        notation.end = start;
+        notation.ref_allele = peptide_char(&ref_translation, start)?.to_string();
+        notation.alt_allele.clear();
+        return Some(());
+    }
+
+    while start <= alt_translation.len() {
+        let ref_aa = peptide_char(&ref_translation, start)?;
+        let alt_aa = peptide_char(alt_translation, start)?;
+        if ref_aa == '*' && alt_aa == '*' {
+            notation.kind = "=".to_string();
+            notation.start = start;
+            notation.end = start;
+            notation.ref_allele = "*".to_string();
+            notation.alt_allele = "*".to_string();
+            return Some(());
+        }
+        if ref_aa != alt_aa {
+            notation.start = start;
+            notation.end = start;
+            notation.ref_allele = ref_aa.to_string();
+            notation.alt_allele = alt_aa.to_string();
+            return Some(());
+        }
+        start = start.saturating_add(1);
+    }
+
+    notation.kind = "del".to_string();
+    notation.start = start;
+    notation.end = start;
+    notation.ref_allele = peptide_char(&ref_translation, start)?.to_string();
+    notation.alt_allele.clear();
+    Some(())
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_fs_peptides()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2262-L2295
+fn append_terminal_stop(peptide: &str) -> String {
+    if peptide.contains('*') {
+        peptide.to_string()
+    } else {
+        format!("{peptide}*")
+    }
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_fs_peptides()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2278-L2291
+fn peptide_char(peptide: &str, pos: usize) -> Option<char> {
+    peptide.as_bytes().get(pos.checked_sub(1)?).map(|b| *b as char)
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_check_peptides_post_var()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2501-L2518
+/// - Ensembl Variation `TranscriptVariationAllele::_shift_3prime()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2525-L2573
+fn shift_peptides_post_var(notation: &mut ProteinHgvsNotation, ref_translation: &str) {
+    let post_seq = match surrounding_peptides(
+        ref_translation,
+        notation.end.saturating_add(1),
+        &notation.original_ref,
+        None,
+    ) {
+        Some(seq) => seq,
+        None => return,
+    };
+
+    let seq_to_check = if notation.kind == "ins" {
+        &mut notation.alt_allele
+    } else if notation.kind == "del" {
+        &mut notation.ref_allele
+    } else {
+        return;
+    };
+
+    let deleted_len = seq_to_check.len();
+    if deleted_len == 0 || post_seq.len() < deleted_len {
+        return;
+    }
+
+    for check_next_post in post_seq.chars() {
+        let Some(check_next_del) = seq_to_check.chars().next() else {
+            break;
+        };
+        if check_next_del != check_next_post {
+            break;
+        }
+        notation.start = notation.start.saturating_add(1);
+        notation.end = notation.end.saturating_add(1);
+        seq_to_check.remove(0);
+        seq_to_check.push(check_next_del);
+    }
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_check_for_peptide_duplication()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2404
+fn check_for_peptide_duplication(notation: &mut ProteinHgvsNotation, ref_translation: &str) -> bool {
+    if notation.alt_allele.is_empty() || notation.start == 0 {
+        return false;
+    }
+
+    let mut upstream = ref_translation
+        .get(..notation.start.saturating_sub(1))
+        .unwrap_or_default()
+        .to_string();
+    upstream.push_str(&notation.preseq);
+
+    let alt_len = notation.alt_allele.len();
+    let Some(test_new_start) = notation
+        .start
+        .checked_sub(alt_len)
+        .and_then(|s| s.checked_sub(1))
+    else {
+        return false;
+    };
+    let Some(test_seq) = upstream.get(test_new_start..test_new_start.saturating_add(alt_len)) else {
+        return false;
+    };
+
+    if test_seq == notation.alt_allele {
+        notation.kind = "dup".to_string();
+        notation.end = notation.start.saturating_sub(1);
+        notation.start = notation.start.saturating_sub(alt_len);
+        true
+    } else {
+        false
+    }
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_surrounding_peptides()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2297-L2320
+fn surrounding_peptides(
+    ref_translation: &str,
+    ref_pos: usize,
+    original_ref: &str,
+    length: Option<usize>,
+) -> Option<String> {
+    let mut ref_trans = ref_translation.to_string();
+    if original_ref.starts_with('*') {
+        ref_trans.push_str(original_ref);
+    }
+    if ref_trans.len() < ref_pos {
         return None;
     }
-    let ref_aa = parts[0];
-    let alt_aa = if parts.len() > 1 { parts[1] } else { ref_aa };
-
-    // Check for frameshift
-    let is_frameshift = terms.contains(&SoTerm::FrameshiftVariant);
-    if is_frameshift {
-        return format_hgvsp_frameshift(&protein_id, pos_str, ref_aa, alt_aa);
+    let start = ref_pos.checked_sub(1)?;
+    match length {
+        Some(len) => ref_trans.get(start..start.saturating_add(len)).map(str::to_string),
+        None => ref_trans.get(start..).map(str::to_string),
     }
-
-    // Check for stop gained
-    if terms.contains(&SoTerm::StopGained) {
-        return format_hgvsp_stop_gained(&protein_id, pos_str, ref_aa, alt_aa);
-    }
-
-    // Check for synonymous / stop retained / start retained
-    let is_synonymous = terms.contains(&SoTerm::SynonymousVariant)
-        || terms.contains(&SoTerm::StopRetainedVariant)
-        || terms.contains(&SoTerm::StartRetainedVariant);
-    if is_synonymous {
-        return format_hgvsp_synonymous(&protein_id, pos_str, ref_aa);
-    }
-
-    // Check for inframe deletion
-    if terms.contains(&SoTerm::InframeDeletion) {
-        return format_hgvsp_inframe_del(&protein_id, pos_str, ref_aa);
-    }
-
-    // Check for inframe insertion
-    if terms.contains(&SoTerm::InframeInsertion) {
-        return format_hgvsp_inframe_ins(&protein_id, pos_str, ref_aa, alt_aa);
-    }
-
-    // Missense (default for protein-altering)
-    if ref_aa.len() == 1 && alt_aa.len() == 1 {
-        let ref3 = aa_one_to_three(ref_aa.chars().next()?);
-        let alt3 = aa_one_to_three(alt_aa.chars().next()?);
-        // Parse position (may be "348" or "348-350")
-        let pos_num = pos_str.split('-').next()?;
-        return Some(format!("{protein_id}:p.{ref3}{pos_num}{alt3}"));
-    }
-
-    // Multi-AA missense / complex
-    if let Some(pos_num) = pos_str.split('-').next() {
-        let ref3: String = ref_aa.chars().map(aa_one_to_three).collect();
-        let alt3: String = alt_aa.chars().map(aa_one_to_three).collect();
-        return Some(format!("{protein_id}:p.{ref3}{pos_num}{alt3}"));
-    }
-
-    None
 }
 
-fn format_hgvsp_frameshift(
-    protein_id: &str,
-    pos_str: &str,
-    ref_aa: &str,
-    alt_aa: &str,
-) -> Option<String> {
-    let pos_num = pos_str.split('-').next()?;
-    let ref3 = aa_one_to_three(ref_aa.chars().next()?);
-    // VEP shows the alt AA for frameshifts, defaulting to Ter if it's a stop
-    let alt3 = if alt_aa == "*" || alt_aa.is_empty() {
-        "Ter"
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_stop_loss_extra_AA()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2406-L2455
+fn stop_loss_extra_aa(protein: &ProteinHgvsData, ref_var_pos: usize, frameshift: bool) -> Option<usize> {
+    let stop_idx = protein.alt_translation.find('*')?;
+    let extra = if frameshift {
+        stop_idx.saturating_add(1).checked_sub(ref_var_pos)?
     } else {
-        aa_one_to_three(alt_aa.chars().next()?)
+        let ref_len = protein
+            .ref_translation
+            .find('*')
+            .unwrap_or(protein.ref_translation.len());
+        stop_idx
+            .saturating_add(1)
+            .checked_sub(ref_len.saturating_add(1))?
     };
-    // VEP format: p.Arg348AlafsTer? (we use Ter? since we don't compute exact stop)
-    Some(format!("{protein_id}:p.{ref3}{pos_num}{alt3}fsTer?"))
+    (extra > 0).then_some(extra)
 }
 
-fn format_hgvsp_stop_gained(
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2083-L2112
+fn peptide_to_three_letter(peptide: &str) -> String {
+    peptide.chars().map(aa_one_to_three).collect()
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1877-L1880
+fn peptide_first_three(peptide: &str) -> Option<&'static str> {
+    Some(aa_one_to_three(peptide.chars().next()?))
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1877-L1880
+fn peptide_last_three(peptide: &str) -> Option<&'static str> {
+    Some(aa_one_to_three(peptide.chars().last()?))
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1833-L1974
+fn format_hgvsp_notation(
     protein_id: &str,
-    pos_str: &str,
-    ref_aa: &str,
-    _alt_aa: &str,
+    notation: &ProteinHgvsNotation,
+    protein: &ProteinHgvsData,
 ) -> Option<String> {
-    let pos_num = pos_str.split('-').next()?;
-    let ref3 = aa_one_to_three(ref_aa.chars().next()?);
-    Some(format!("{protein_id}:p.{ref3}{pos_num}Ter"))
-}
+    let mut out = format!("{protein_id}:p.");
 
-fn format_hgvsp_synonymous(protein_id: &str, pos_str: &str, ref_aa: &str) -> Option<String> {
-    let pos_num = pos_str.split('-').next()?;
-    let ref3 = aa_one_to_three(ref_aa.chars().next()?);
-    Some(format!("{protein_id}:p.{ref3}{pos_num}="))
-}
-
-fn format_hgvsp_inframe_del(protein_id: &str, pos_str: &str, ref_aa: &str) -> Option<String> {
-    let parts: Vec<&str> = pos_str.split('-').collect();
-    if parts.len() == 2 {
-        let start_pos = parts[0];
-        let end_pos = parts[1];
-        let first_ref3 = aa_one_to_three(ref_aa.chars().next()?);
-        let last_ref3 = aa_one_to_three(ref_aa.chars().last()?);
-        Some(format!(
-            "{protein_id}:p.{first_ref3}{start_pos}_{last_ref3}{end_pos}del"
-        ))
-    } else {
-        let ref3 = aa_one_to_three(ref_aa.chars().next()?);
-        Some(format!("{protein_id}:p.{ref3}{pos_str}del"))
+    if notation.ref_allele == notation.alt_allele && !matches!(notation.kind.as_str(), "fs" | "ins") {
+        out.push_str(&format!(
+            "{}{}=",
+            peptide_first_three(&notation.ref_allele)?,
+            notation.start
+        ));
+        return Some(out);
     }
-}
 
-fn format_hgvsp_inframe_ins(
-    protein_id: &str,
-    pos_str: &str,
-    ref_aa: &str,
-    alt_aa: &str,
-) -> Option<String> {
-    let parts: Vec<&str> = pos_str.split('-').collect();
-    // The inserted sequence is the extra AAs in alt beyond ref
-    let ins_seq: String = if alt_aa.len() > ref_aa.len() {
-        alt_aa[ref_aa.len()..]
-            .chars()
-            .map(aa_one_to_three)
-            .collect()
-    } else {
-        alt_aa.chars().map(aa_one_to_three).collect()
-    };
-    if parts.len() == 2 {
-        let start_pos = parts[0];
-        let end_pos = parts[1];
-        let first_ref3 = aa_one_to_three(ref_aa.chars().next()?);
-        let last_ref3 = if ref_aa.len() > 1 {
-            aa_one_to_three(ref_aa.chars().last()?)
+    if protein.stop_lost && matches!(notation.kind.as_str(), "del" | ">") {
+        let extra = stop_loss_extra_aa(protein, notation.start.saturating_sub(1), false)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let alt_head = peptide_first_three(&notation.alt_allele).unwrap_or("?");
+        if notation.ref_allele.len() > 1 && notation.kind == "del" {
+            out.push_str(&format!(
+                "{}{}_{}{}{}extTer{}",
+                peptide_first_three(&notation.ref_allele)?,
+                notation.start,
+                peptide_last_three(&notation.ref_allele)?,
+                notation.end,
+                alt_head,
+                extra
+            ));
         } else {
-            // For single-AA position, use the next position
-            first_ref3
-        };
-        Some(format!(
-            "{protein_id}:p.{first_ref3}{start_pos}_{last_ref3}{end_pos}ins{ins_seq}"
-        ))
-    } else {
-        let ref3 = aa_one_to_three(ref_aa.chars().next()?);
-        let pos_num: usize = pos_str.parse().ok()?;
-        let next_pos = pos_num + 1;
-        Some(format!(
-            "{protein_id}:p.{ref3}{pos_num}_{ref3}{next_pos}ins{ins_seq}"
-        ))
+            out.push_str(&format!(
+                "{}{}{}extTer{}",
+                peptide_to_three_letter(&notation.ref_allele),
+                notation.start,
+                alt_head,
+                extra
+            ));
+        }
+        return Some(out);
     }
+
+    match notation.kind.as_str() {
+        "dup" => {
+            if notation.start < notation.end {
+                out.push_str(&format!(
+                    "{}{}_{}{}dup",
+                    peptide_first_three(&notation.alt_allele)?,
+                    notation.start,
+                    peptide_last_three(&notation.alt_allele)?,
+                    notation.end
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{}{}dup",
+                    peptide_to_three_letter(&notation.alt_allele),
+                    notation.start
+                ));
+            }
+        }
+        ">" => {
+            out.push_str(&format!(
+                "{}{}{}",
+                peptide_to_three_letter(&notation.ref_allele),
+                notation.start,
+                peptide_to_three_letter(&notation.alt_allele)
+            ));
+        }
+        "delins" | "ins" => {
+            let mut alt_allele = notation.alt_allele.clone();
+            if let Some(stop_idx) = alt_allele.find('*') {
+                alt_allele.truncate(stop_idx.saturating_add(1));
+            }
+            let mut alt = peptide_to_three_letter(&alt_allele);
+            if notation.ref_allele.ends_with('*') {
+                if let Some(extra) =
+                    stop_loss_extra_aa(protein, notation.start.saturating_sub(1), false)
+                {
+                    alt.push_str(&format!("extTer{extra}"));
+                }
+            }
+            if notation.start == notation.end && notation.kind == "delins" {
+                out.push_str(&format!(
+                    "{}{}{}{}",
+                    peptide_first_three(&notation.ref_allele)?,
+                    notation.start,
+                    notation.kind,
+                    alt
+                ));
+            } else {
+                let (start, end) = if notation.start > notation.end {
+                    (notation.end, notation.start)
+                } else {
+                    (notation.start, notation.end)
+                };
+                out.push_str(&format!(
+                    "{}{}_{}{}{}{}",
+                    peptide_first_three(&notation.ref_allele)?,
+                    start,
+                    peptide_last_three(&notation.ref_allele)?,
+                    end,
+                    notation.kind,
+                    alt
+                ));
+            }
+        }
+        "fs" => {
+            if notation.alt_allele == "*" {
+                out.push_str(&format!(
+                    "{}{}Ter",
+                    peptide_to_three_letter(&notation.ref_allele),
+                    notation.start
+                ));
+            } else {
+                let extra = stop_loss_extra_aa(protein, notation.start.saturating_sub(1), true)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                out.push_str(&format!(
+                    "{}{}{}fsTer{}",
+                    peptide_to_three_letter(&notation.ref_allele),
+                    notation.start,
+                    peptide_to_three_letter(&notation.alt_allele),
+                    extra
+                ));
+            }
+        }
+        "del" => {
+            if notation.ref_allele.len() > 1 {
+                out.push_str(&format!(
+                    "{}{}_{}{}del",
+                    peptide_first_three(&notation.ref_allele)?,
+                    notation.start,
+                    peptide_last_three(&notation.ref_allele)?,
+                    notation.end
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{}{}del",
+                    peptide_to_three_letter(&notation.ref_allele),
+                    notation.start
+                ));
+            }
+        }
+        _ if notation.start != notation.end => {
+            out.push_str(&format!(
+                "{}{}_{}{}",
+                peptide_to_three_letter(&notation.ref_allele),
+                notation.start,
+                peptide_to_three_letter(&notation.alt_allele),
+                notation.end
+            ));
+        }
+        _ => {
+            out.push_str(&format!(
+                "{}{}{}",
+                peptide_to_three_letter(&notation.ref_allele),
+                notation.start,
+                peptide_to_three_letter(&notation.alt_allele)
+            ));
+        }
+    }
+
+    Some(out)
 }
 
 #[cfg(test)]
@@ -689,6 +1074,18 @@ mod tests {
             exon_number: 1,
             start: 90,
             end: 140,
+        }
+    }
+
+    fn make_translation() -> TranslationFeature {
+        TranslationFeature {
+            transcript_id: "ENSTHGVS000001".to_string(),
+            cds_len: Some(9),
+            protein_len: Some(3),
+            translation_seq: None,
+            cds_sequence: None,
+            stable_id: Some("ENSPHGVS000001".to_string()),
+            version: Some(1),
         }
     }
 
@@ -801,25 +1198,145 @@ mod tests {
 
     #[test]
     fn test_format_hgvsp_synonymous() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2,
+            end: 2,
+            ref_peptide: "A".to_string(),
+            alt_peptide: "A".to_string(),
+            ref_translation: "MA*".to_string(),
+            alt_translation: "MA*".to_string(),
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
         assert_eq!(
-            format_hgvsp_synonymous("ENSP00000368698.2", "100", "V"),
-            Some("ENSP00000368698.2:p.Val100=".to_string())
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ala2=".to_string())
         );
     }
 
     #[test]
-    fn test_format_hgvsp_stop_gained() {
+    fn test_format_hgvsp_start_lost_reports_unknown_protein() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 1,
+            end: 1,
+            ref_peptide: "M".to_string(),
+            alt_peptide: "L".to_string(),
+            ref_translation: "MA*".to_string(),
+            alt_translation: "LA*".to_string(),
+            frameshift: false,
+            start_lost: true,
+            stop_lost: false,
+        };
         assert_eq!(
-            format_hgvsp_stop_gained("ENSP00000368698.2", "100", "R", "*"),
-            Some("ENSP00000368698.2:p.Arg100Ter".to_string())
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.?".to_string())
         );
     }
 
     #[test]
-    fn test_format_hgvsp_frameshift() {
+    fn test_format_hgvsp_frameshift_uses_first_changed_residue_and_stop_distance() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 3,
+            end: 3,
+            ref_peptide: "K".to_string(),
+            alt_peptide: "Q".to_string(),
+            ref_translation: "MKKKK".to_string(),
+            alt_translation: "MKQW*".to_string(),
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
+        };
         assert_eq!(
-            format_hgvsp_frameshift("ENSP00000368698.2", "100", "R", "A"),
-            Some("ENSP00000368698.2:p.Arg100AlafsTer?".to_string())
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Lys3GlnfsTer3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_stop_lost_adds_extension_length() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 3,
+            end: 3,
+            ref_peptide: "*".to_string(),
+            alt_peptide: "Q".to_string(),
+            ref_translation: "MA*".to_string(),
+            alt_translation: "MAQ*".to_string(),
+            frameshift: false,
+            start_lost: false,
+            stop_lost: true,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter3GlnextTer1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_insertion_duplication_uses_dup_notation() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 3,
+            end: 3,
+            ref_peptide: "-".to_string(),
+            alt_peptide: "A".to_string(),
+            ref_translation: "MAA*".to_string(),
+            alt_translation: "MAAA*".to_string(),
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ala2dup".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_insertion_uses_flanking_residues() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2,
+            end: 3,
+            ref_peptide: "-".to_string(),
+            alt_peptide: "Q".to_string(),
+            ref_translation: "MAV*".to_string(),
+            alt_translation: "MAQV*".to_string(),
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ala2_Val3insGln".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_shift_hgvs_false_disables_three_prime_peptide_shift() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2,
+            end: 2,
+            ref_peptide: "A".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: "MAA*".to_string(),
+            alt_translation: "MA*".to_string(),
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, false),
+            Some("ENSPHGVS000001.1:p.Ala2del".to_string())
+        );
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ala3del".to_string())
         );
     }
 

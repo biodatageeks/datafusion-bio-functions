@@ -412,6 +412,7 @@ impl<'a> PreparedContext<'a> {
 pub struct TranscriptConsequenceEngine {
     upstream_distance: i64,
     downstream_distance: i64,
+    shift_hgvs: bool,
 }
 
 impl Default for TranscriptConsequenceEngine {
@@ -425,6 +426,24 @@ impl TranscriptConsequenceEngine {
         Self {
             upstream_distance,
             downstream_distance,
+            shift_hgvs: false,
+        }
+    }
+
+    /// Traceability:
+    /// - Ensembl VEP `Config.pm` `shift_hgvs`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L353-L381
+    /// - Ensembl VEP `Runner::post_setup_checks()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Runner.pm#L771-L773
+    pub fn new_with_hgvs_shift(
+        upstream_distance: i64,
+        downstream_distance: i64,
+        shift_hgvs: bool,
+    ) -> Self {
+        Self {
+            upstream_distance,
+            downstream_distance,
+            shift_hgvs,
         }
     }
 
@@ -522,7 +541,7 @@ impl TranscriptConsequenceEngine {
                         let exon_str = which_exon_str(variant, &tx_exons);
                         let intron_str = which_intron_str(variant, &tx_exons, tx.strand);
                         let cdna_position = compute_cdna_position(variant, &tx_exons, tx.strand);
-                        let (cds_position, protein_position, amino_acids, codons) =
+                        let (cds_position, protein_position, amino_acids, codons, protein_hgvs) =
                             if let Some(ref cc) = coding_class {
                                 let n_pad_len = tx_translation
                                     .and_then(|t| t.cds_sequence.as_deref())
@@ -560,9 +579,10 @@ impl TranscriptConsequenceEngine {
                                     .as_deref()
                                     .and_then(pep_allele_string_from_codon_allele_string)
                                     .or_else(|| cc.amino_acids.clone());
-                                (cds_pos, prot_pos, amino_acids, codons)
+                                let protein_hgvs = cc.protein_hgvs.clone();
+                                (cds_pos, prot_pos, amino_acids, codons, protein_hgvs)
                             } else {
-                                (None, None, None, None)
+                                (None, None, None, None, None)
                             };
                         let flags = compute_flags(tx);
                         // Compute HGVSc notation.
@@ -577,12 +597,9 @@ impl TranscriptConsequenceEngine {
                         );
                         // Compute HGVSp notation.
                         let hgvsp = tx_translation.and_then(|tl| {
-                            crate::hgvs::format_hgvsp(
-                                tl,
-                                protein_position.as_deref(),
-                                amino_acids.as_deref(),
-                                &terms,
-                            )
+                            protein_hgvs
+                                .as_ref()
+                                .and_then(|data| crate::hgvs::format_hgvsp(tl, data, self.shift_hgvs))
                         });
                         out.push(TranscriptConsequence {
                             transcript_id: Some(tx.transcript_id.clone()),
@@ -2441,6 +2458,8 @@ struct CodingClassification {
     protein_position_start: Option<usize>,
     /// 1-based protein end position.
     protein_position_end: Option<usize>,
+    /// Peptide-context HGVS input used to replay Ensembl's protein formatter.
+    protein_hgvs: Option<crate::hgvs::ProteinHgvsData>,
 }
 
 impl CodingClassification {
@@ -2453,6 +2472,37 @@ impl CodingClassification {
             || self.start_lost
             || self.start_retained
     }
+}
+
+/// Traceability:
+/// - Ensembl Variation `BaseTranscriptVariationAllele::_get_peptide_alleles()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509
+fn build_protein_hgvs_data(
+    class: &CodingClassification,
+    old_aas: &[char],
+    new_aas: &[char],
+    frameshift: bool,
+) -> Option<crate::hgvs::ProteinHgvsData> {
+    let start = class.protein_position_start?;
+    let end = class.protein_position_end.or(class.protein_position_start)?;
+    let (ref_peptide, alt_peptide) = match class.amino_acids.as_deref() {
+        Some(value) => match value.split_once('/') {
+            Some((left, right)) => (left.to_string(), right.to_string()),
+            None => (value.to_string(), value.to_string()),
+        },
+        None => (String::new(), String::new()),
+    };
+    Some(crate::hgvs::ProteinHgvsData {
+        start,
+        end,
+        ref_peptide,
+        alt_peptide,
+        ref_translation: old_aas.iter().collect(),
+        alt_translation: new_aas.iter().collect(),
+        frameshift,
+        start_lost: class.start_lost,
+        stop_lost: class.stop_lost,
+    })
 }
 
 fn apply_codon_classification(terms: &mut BTreeSet<SoTerm>, c: &CodingClassification) {
@@ -2827,6 +2877,7 @@ fn classify_coding_change(
         }
     }
 
+    class.protein_hgvs = build_protein_hgvs_data(&class, &old_aas, &new_aas, frameshift);
     Some(class)
 }
 
@@ -3037,6 +3088,7 @@ fn classify_insertion(
         }
     }
 
+    class.protein_hgvs = build_protein_hgvs_data(&class, &old_aas, &new_aas, frameshift);
     Some(class)
 }
 

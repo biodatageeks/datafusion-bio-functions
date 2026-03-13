@@ -366,12 +366,17 @@ impl VepFlags {
 /// Traceability:
 /// - Ensembl VEP `Config.pm` HGVS-related flags
 ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L195-L200
+/// - Ensembl VEP `Config.pm` `shift_hgvs`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L353-L381
+/// - Ensembl VEP `Runner::post_setup_checks()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Runner.pm#L771-L773
 /// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
 ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1698-L1715
 #[derive(Debug, Clone, Copy, Default)]
 struct HgvsFlags {
     hgvsc: bool,
     hgvsp: bool,
+    shift_hgvs: bool,
     no_escape: bool,
     remove_hgvsp_version: bool,
     hgvsp_use_prediction: bool,
@@ -385,9 +390,15 @@ impl HgvsFlags {
                 .unwrap_or(false)
         };
         let hgvs = parse("hgvs");
+        let hgvsc = hgvs || parse("hgvsc");
+        let hgvsp = hgvs || parse("hgvsp");
+        let shift_hgvs = options_json
+            .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, "shift_hgvs"))
+            .unwrap_or(hgvsc || hgvsp);
         Self {
-            hgvsc: hgvs || parse("hgvsc"),
-            hgvsp: hgvs || parse("hgvsp"),
+            hgvsc,
+            hgvsp,
+            shift_hgvs,
             no_escape: parse("no_escape"),
             remove_hgvsp_version: parse("remove_hgvsp_version"),
             hgvsp_use_prediction: parse("hgvsp_use_prediction"),
@@ -2112,7 +2123,11 @@ impl AnnotateProvider {
                 )
             };
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
-        let engine = TranscriptConsequenceEngine::new(upstream_distance, downstream_distance);
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
+            upstream_distance,
+            downstream_distance,
+            hgvs_flags.shift_hgvs,
+        );
         let ctx = PreparedContext::new(
             &transcripts,
             &exons,
@@ -3487,6 +3502,7 @@ mod tests {
         let flags = HgvsFlags::from_options_json(Some(r#"{"hgvs":true}"#));
         assert!(flags.hgvsc);
         assert!(flags.hgvsp);
+        assert!(flags.shift_hgvs);
         assert!(!flags.no_escape);
         assert!(!flags.remove_hgvsp_version);
         assert!(!flags.hgvsp_use_prediction);
@@ -3498,6 +3514,7 @@ mod tests {
         let flags = HgvsFlags::from_options_json(Some(r#"{"hgvsc":true}"#));
         assert!(flags.hgvsc);
         assert!(!flags.hgvsp);
+        assert!(flags.shift_hgvs);
         assert!(flags.any());
     }
 
@@ -3508,9 +3525,18 @@ mod tests {
         ));
         assert!(!flags.hgvsc);
         assert!(flags.hgvsp);
+        assert!(flags.shift_hgvs);
         assert!(flags.no_escape);
         assert!(flags.remove_hgvsp_version);
         assert!(flags.hgvsp_use_prediction);
+    }
+
+    #[test]
+    fn test_hgvs_flags_shift_hgvs_can_be_disabled_explicitly() {
+        let flags = HgvsFlags::from_options_json(Some(r#"{"hgvs":true,"shift_hgvs":false}"#));
+        assert!(flags.hgvsc);
+        assert!(flags.hgvsp);
+        assert!(!flags.shift_hgvs);
     }
 
     #[test]

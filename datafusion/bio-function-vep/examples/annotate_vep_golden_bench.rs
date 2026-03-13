@@ -46,8 +46,18 @@ struct Args {
     extended_probes: bool,
     /// Enable HGVSc/HGVSp generation in both Ensembl VEP and annotate_vep.
     hgvs: bool,
+    /// Mirrors VEP `--shift_hgvs [0|1]` when HGVS output is enabled.
+    shift_hgvs: Option<bool>,
     /// Reference FASTA required for offline HGVS generation.
     reference_fasta_path: Option<PathBuf>,
+}
+
+fn parse_cli_bool(raw: &str) -> Option<bool> {
+    match raw {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
 }
 
 impl Args {
@@ -69,6 +79,23 @@ impl Args {
             })
             .unwrap_or_else(|| vec!["ensembl".to_string(), "datafusion".to_string()]);
         let hgvs = args.iter().any(|a| a == "--hgvs");
+        let shift_hgvs = args
+            .iter()
+            .find_map(|a| {
+                a.strip_prefix("--shift-hgvs=")
+                    .or_else(|| a.strip_prefix("--shift_hgvs="))
+            })
+            .and_then(parse_cli_bool)
+            .or_else(|| {
+                args.iter()
+                    .any(|a| a == "--shift-hgvs" || a == "--shift_hgvs")
+                    .then_some(true)
+            })
+            .or_else(|| {
+                args.iter()
+                    .any(|a| a == "--no-shift-hgvs" || a == "--no-shift_hgvs")
+                    .then_some(false)
+            });
         let reference_fasta_path = args
             .iter()
             .find_map(|a| a.strip_prefix("--reference-fasta-path="))
@@ -118,6 +145,7 @@ impl Args {
             steps,
             extended_probes: args.iter().any(|a| a == "--extended-probes"),
             hgvs,
+            shift_hgvs,
             reference_fasta_path,
         }
     }
@@ -158,6 +186,12 @@ async fn main() -> Result<()> {
     println!("  steps: {:?}", args.steps);
     println!("  extended_probes: {}", args.extended_probes);
     println!("  hgvs: {}", args.hgvs);
+    println!(
+        "  shift_hgvs: {}",
+        args.shift_hgvs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "(default)".to_string())
+    );
     println!(
         "  reference_fasta_path: {}",
         args.reference_fasta_path
@@ -258,6 +292,7 @@ async fn main() -> Result<()> {
                 &args.vep_cache_dir,
                 args.merged,
                 args.hgvs,
+                args.shift_hgvs,
                 args.reference_fasta_path.as_deref(),
             )?;
             let elapsed = docker_start.elapsed().as_secs_f64();
@@ -414,6 +449,9 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
 
     if args.hgvs {
         entries.push("\"hgvs\":true".to_string());
+        if let Some(shift_hgvs) = args.shift_hgvs {
+            entries.push(format!("\"shift_hgvs\":{shift_hgvs}"));
+        }
         let fasta_path = args.reference_fasta_path.as_ref().ok_or_else(|| {
             DataFusionError::Execution(
                 "--hgvs requires --reference-fasta-path=/path/to/reference.fa[.gz]".to_string(),
@@ -526,6 +564,7 @@ fn run_vep_docker(
     vep_cache_dir: &Path,
     merged: bool,
     hgvs: bool,
+    shift_hgvs: Option<bool>,
     reference_fasta_path: Option<&Path>,
 ) -> Result<()> {
     let sampled_name = sampled_vcf
@@ -589,6 +628,10 @@ fn run_vep_docker(
             .arg("--hgvs")
             .arg("--fasta")
             .arg(format!("/fasta/{fasta_name}"));
+        if let Some(value) = shift_hgvs {
+            cmd.arg("--shift_hgvs")
+                .arg(if value { "1" } else { "0" });
+        }
     } else {
         cmd.arg("ensemblorg/ensembl-vep:release_115.2")
             .arg("vep")

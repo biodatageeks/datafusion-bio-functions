@@ -69,8 +69,122 @@ Remaining open work outside the README chr1 gate:
 
 - Phase 4 HGVS-specific parity benchmark with `--hgvs --fasta`
 - exact port of the Ensembl Variation HGVS algorithm used by VEP
-- indexed-FASTA validation and HGVS integration-harness hardening
+- full zero-mismatch closure for HGVS-enabled chr1 runs
 - refresh acceptance records as that second benchmark is added
+- release-115 flag-surface parity beyond the fixed README field set
+- VEP-style on/off gating for feature-expanding and output-gating flags
+- dynamic CSQ field/header parity for flags not covered by the current 74-column benchmark
+
+Important caveat:
+
+- the current `74/74` result proves parity for the README benchmark profile, not full release-115 CLI flag parity
+- the current Rust path still behaves like a fixed-schema benchmark serializer in several places where VEP conditionally adds or removes columns based on flags
+
+## Release 115 Flag-Parity Audit
+
+This section supersedes the earlier rough split between "flags with side effects" and "pure output flags". For Ensembl VEP release 115, the exact target is:
+
+- match which flags change processing or row generation
+- match which flags imply other flags
+- match which flags only gate output fields
+- match which CSQ columns exist at all for a given flag set
+
+### Corrections to the Initial Categorisation
+
+- `--pubmed` is not a pure output-only flag in release 115. `Config.pm` groups `pubmed` with `check_existing`, `af`, `af_1kg`, `af_gnomad`, `af_gnomade`, `af_gnomadg`, and `max_af`, all of which imply `--check_existing`.
+- `--protein` is primarily an output-gating flag in release 115. It controls `ENSP` emission in `OutputFactory`; it does not independently change transcript consequence classification.
+- `--canonical` only becomes selection-sensitive when VEP pick-order modes are active. In the current Rust parity scope, it should be treated as output gating unless and until `pick`, `pick_allele`, `per_gene`, or related modes are implemented.
+- `--mirna` is not just a generic annotation column switch. It enables miRNA structural output in `OutputFactory` and depends on transcript attributes and overlap state.
+- `--af_esp` should not be treated as part of the current release-115 target surface unless explicitly added. It still appears in some compatibility/incompatibility code paths, but it is not part of the active release-115 option set we are currently matching.
+
+### Flag Families That Must Match VEP Semantics
+
+#### Processing-side and row-set-changing flags
+
+- `--hgvs`, `--hgvsc`, `--hgvsp`, `--shift_hgvs`
+  - VEP effect:
+    - enables transcript/protein HGVS generation
+    - requires FASTA in offline mode
+    - changes shifted allele/coordinate behavior through HGVS-specific 3-prime shifting
+  - Current Rust status:
+    - partially supported
+    - wrapper-level flag parsing and `shift_hgvs` control exist
+    - exact Ensembl Variation HGVS algorithm is still incomplete
+- `--regulatory`
+  - VEP effect:
+    - expands the overlap set beyond transcripts
+    - adds regulatory-feature and motif-feature consequence rows
+    - can also be enabled indirectly when a plugin requests regulatory or motif features
+  - Current Rust status:
+    - regulatory, motif, and miRNA context engines exist
+    - benchmark path already exercises regulatory output
+    - explicit top-level VEP-style `regulatory` option gating is not yet fully modeled
+- `--check_existing`, `--af`, `--af_1kg`, `--af_gnomad`, `--af_gnomade`, `--af_gnomadg`, `--max_af`, `--pubmed`
+  - VEP effect:
+    - turns on co-located/existing-variant lookup
+    - enables AF/clinical/publication output from matched existing variants
+    - `af_*`, `max_af`, and `pubmed` all imply `check_existing`
+  - Current Rust status:
+    - exact co-located matching semantics are in place for the README benchmark profile
+    - implication handling exists for `af`, `af_1kg`, `af_gnomade`, `af_gnomadg`, `max_af`, and `pubmed`
+    - release-115 alias parity for `af_gnomad` still needs to be added
+
+#### Output-gating flags already represented in the current 74-field schema
+
+- `--symbol`, `--biotype`, `--numbers`, `--ccds`, `--canonical`, `--mane`, `--mane_select`, `--tsl`, `--protein`, `--uniprot`, `--variant_class`, `--gene_phenotype`
+  - VEP effect:
+    - add or remove specific CSQ fields from the header and output
+    - do not change consequence logic on their own
+  - Current Rust status:
+    - most corresponding columns already exist in the fixed 74-field schema
+    - current serializer still emits many of them unconditionally in benchmark mode instead of gating them by option
+    - this is benchmark parity, not yet CLI flag parity
+
+#### Output-gating flags whose columns are still missing from the current Rust CSQ schema
+
+- `--appris` -> `APPRIS`
+- `--domains` -> `DOMAINS`
+- `--sift b` -> `SIFT`
+- `--polyphen b` -> `PolyPhen`
+- `--mirna` -> `miRNA`
+
+Current Rust status:
+
+- these are not part of the current 74-column schema in `golden_benchmark.rs`
+- some of the underlying data or logic already exists
+  - miRNA overlap logic exists in the transcript engine
+  - protein-feature overlap support exists upstream but is not yet serialized as `DOMAINS`
+- output/header parity for these fields is still open
+
+### Source-of-Truth References for Flag Behavior
+
+- `Config.pm`
+  - `check_existing`, AF flags, `max_af`, `pubmed`: `modules/Bio/EnsEMBL/VEP/Config.pm#L124-L136`
+  - transcript/output flags: `modules/Bio/EnsEMBL/VEP/Config.pm#L177-L220`
+  - default "everything" profile enabling `hgvs`, `symbol`, `numbers`, `domains`, `regulatory`, `canonical`, `protein`, `biotype`, `uniprot`, `tsl`, `variant_class`, `sift`, `polyphen`, `ccds`, `gene_phenotype`, `mane`, `mirna`: `modules/Bio/EnsEMBL/VEP/Config.pm#L350-L381`
+  - flag implication rules: `modules/Bio/EnsEMBL/VEP/Config.pm#L439-L489`
+  - pick-order interaction for `canonical`, `appris`, `tsl`, `biotype`, `ccds`, `mane`: `modules/Bio/EnsEMBL/VEP/Config.pm#L305-L306`
+- `Runner.pm`
+  - offline HGVS gating and `shift_hgvs=0` semantics: `modules/Bio/EnsEMBL/VEP/Runner.pm#L726-L738`, `modules/Bio/EnsEMBL/VEP/Runner.pm#L771-L773`
+  - plugin-driven regulatory enablement: `modules/Bio/EnsEMBL/VEP/Runner.pm#L959-L962`
+- `BaseRunner.pm`
+  - process-wide `shift_hgvs` default wiring: `modules/Bio/EnsEMBL/VEP/BaseRunner.pm#L491-L496`
+- `OutputFactory.pm`
+  - numbers, domains, symbol, CCDS, ENSP, uniprot, canonical, biotype, gene phenotype, MANE, TSL, APPRIS, miRNA: `modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1434-L1610`
+  - HGVS, SIFT, PolyPhen output gating: `modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1693-L1794`
+
+### Current Rust Gaps Relative to That Surface
+
+- fixed 74-field CSQ schema is still hard-coded in `golden_benchmark.rs`
+- many benchmark-profile transcript fields are emitted even when the corresponding VEP flag would normally be off
+- there is no complete release-115 option parser for all output-gating flags listed above
+- there is no exact field-list/header parity layer yet for non-benchmark flag combinations
+- missing output columns still need serializer, tests, and benchmark coverage:
+  - `APPRIS`
+  - `DOMAINS`
+  - `SIFT`
+  - `PolyPhen`
+  - `miRNA`
 
 ## Upstream Source of Truth
 
@@ -835,6 +949,64 @@ Acceptance:
 - HGVS benchmark reaches zero mismatches when HGVS is enabled
 - no simplified HGVS-only heuristic formatter remains in the hot path
 
+## Phase 5: Release-115 Flag Surface and Output-Schema Parity
+
+Purpose: move from "README benchmark parity" to "VEP option-surface parity" for the supported release-115 flags.
+
+Tasks:
+
+1. Add a real release-115 option matrix to `options_json` parsing and benchmark harness wiring:
+   - `regulatory`
+   - `symbol`
+   - `biotype`
+   - `numbers`
+   - `ccds`
+   - `canonical`
+   - `protein`
+   - `uniprot`
+   - `mane`
+   - `mane_select`
+   - `tsl`
+   - `appris`
+   - `variant_class`
+   - `gene_phenotype`
+   - `mirna`
+   - `domains`
+   - `sift`
+   - `polyphen`
+   - release-115 alias `af_gnomad` -> `af_gnomade`
+2. Split processing-side flags from output-gating flags in the Rust implementation:
+   - processing-side behavior must change lookup/context loading exactly when VEP does
+   - output-only flags must not silently stay "always on" in serializer code
+3. Make CSQ field/header generation flag-sensitive like VEP rather than permanently fixed to the README 74-column contract:
+   - disabled fields must disappear from the emitted CSQ field order when VEP would omit them
+   - enabled fields must appear in VEP order
+   - comparison tooling must support multiple field profiles, not only the fixed 74-field profile
+4. Implement missing release-115 output columns:
+   - `APPRIS`
+   - `DOMAINS`
+   - `SIFT`
+   - `PolyPhen`
+   - `miRNA`
+5. Add exact integration benchmarks against Docker VEP for at least these profiles:
+   - default non-HGVS profile
+   - `--regulatory`
+   - `--check_existing --af --af_1kg --af_gnomade --af_gnomadg --max_af --pubmed`
+   - transcript-output profile:
+     - `--symbol --biotype --numbers --ccds --canonical --protein --uniprot --mane --tsl --variant_class --gene_phenotype`
+   - extra output profile:
+     - `--appris --domains --sift b --polyphen b --mirna`
+   - HGVS profile:
+     - `--hgvs --fasta`
+     - `--hgvs --shift_hgvs 0 --fasta`
+
+Acceptance:
+
+- for every supported profile, our CSQ header field list matches VEP exactly
+- enabling/disabling a flag changes row count, field set, and coordinates exactly when VEP does
+- no benchmark-only always-on serializer path remains for fields controlled by VEP flags
+- the missing release-115 columns above are emitted and tested
+
 ## Traceability Comment Format
 
 Required minimum format for parity-sensitive methods:
@@ -922,14 +1094,21 @@ The strict parity work is complete only when all of the following hold:
 4. Every parity-sensitive method has a review record and a method-level traceability comment with exact Ensembl VEP GitHub file and line references.
 5. `FLAGS` ordering is sourced from ordered upstream-equivalent data.
 6. A second HGVS-enabled benchmark path exists for validating real full-field parity.
+7. The release-115 flag implication matrix is matched for all supported flags in scope.
+8. Output-gating flags add or remove CSQ columns exactly as VEP does, rather than relying on a permanently fixed schema.
+9. Missing release-115 output fields in the audited scope (`APPRIS`, `DOMAINS`, `SIFT`, `PolyPhen`, `miRNA`) are implemented and benchmarked.
 
 Status on March 13, 2026:
 
 - Criteria `1` through `5` are satisfied on chr1.
 - Criterion `6` remains open.
-  - wrapper-level HGVS emission is in place
-  - exact Ensembl Variation HGVS generation is not yet ported
-  - the new HGVS integration test still fails until indexed FASTA setup is hardened
+  - wrapper-level HGVS emission and indexed-FASTA validation are in place
+  - exact Ensembl Variation HGVS generation is still incomplete
+  - the HGVS-enabled chr1 benchmark still has real mismatches
+- Criteria `7` through `9` are not yet satisfied.
+  - flag implication coverage is still partial
+  - fixed-schema benchmark output still masks missing output-gating parity
+  - several release-115 output columns are still absent from the Rust CSQ schema
 
 ## Recommended Execution Order
 
@@ -939,6 +1118,7 @@ Status on March 13, 2026:
 4. Phase 2: exact transcript consequence and transcript-count parity
 5. Phase 3: exact `FLAGS`
 6. Phase 4: HGVS parity beyond the current README procedure
+7. Phase 5: release-115 flag surface and dynamic output-schema parity
 
 ## Expected Outcome by Phase
 
@@ -950,6 +1130,8 @@ Status on March 13, 2026:
   - completed
 - After Phase 4:
   - parity is no longer limited by the current benchmark’s unexercised or simplified HGVS path
+- After Phase 5:
+  - the implementation can be compared against Ensembl VEP under multiple flag profiles rather than only the fixed README profile
 
 ## Non-Goals
 
