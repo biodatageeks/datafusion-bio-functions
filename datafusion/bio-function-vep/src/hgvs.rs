@@ -582,8 +582,7 @@ fn format_hgvsp_stop_gained(
 fn format_hgvsp_synonymous(protein_id: &str, pos_str: &str, ref_aa: &str) -> Option<String> {
     let pos_num = pos_str.split('-').next()?;
     let ref3 = aa_one_to_three(ref_aa.chars().next()?);
-    // VEP URL-encodes the "=" sign as %3D
-    Some(format!("{protein_id}:p.{ref3}{pos_num}%3D"))
+    Some(format!("{protein_id}:p.{ref3}{pos_num}="))
 }
 
 fn format_hgvsp_inframe_del(protein_id: &str, pos_str: &str, ref_aa: &str) -> Option<String> {
@@ -804,7 +803,7 @@ mod tests {
     fn test_format_hgvsp_synonymous() {
         assert_eq!(
             format_hgvsp_synonymous("ENSP00000368698.2", "100", "V"),
-            Some("ENSP00000368698.2:p.Val100%3D".to_string())
+            Some("ENSP00000368698.2:p.Val100=".to_string())
         );
     }
 

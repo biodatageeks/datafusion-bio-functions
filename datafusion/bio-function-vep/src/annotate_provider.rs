@@ -372,6 +372,9 @@ impl VepFlags {
 struct HgvsFlags {
     hgvsc: bool,
     hgvsp: bool,
+    no_escape: bool,
+    remove_hgvsp_version: bool,
+    hgvsp_use_prediction: bool,
 }
 
 impl HgvsFlags {
@@ -385,6 +388,9 @@ impl HgvsFlags {
         Self {
             hgvsc: hgvs || parse("hgvsc"),
             hgvsp: hgvs || parse("hgvsp"),
+            no_escape: parse("no_escape"),
+            remove_hgvsp_version: parse("remove_hgvsp_version"),
+            hgvsp_use_prediction: parse("hgvsp_use_prediction"),
         }
     }
 
@@ -1172,6 +1178,38 @@ impl AnnotateProvider {
             .as_deref()
             .and_then(Self::parse_json_distance_option)
             .unwrap_or((5000, 5000))
+    }
+
+    /// Traceability:
+    /// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1706-L1715
+    ///
+    /// Ensembl strips the translation version only at output time when
+    /// `remove_hgvsp_version` is enabled, and URI-escapes `=` only when
+    /// `no_escape` is false.
+    fn format_hgvsp_output(
+        raw_hgvsp: &str,
+        remove_hgvsp_version: bool,
+        no_escape: bool,
+    ) -> String {
+        let mut out = raw_hgvsp.to_string();
+
+        if remove_hgvsp_version {
+            if let Some((ref_name, suffix)) = out.split_once(":p.") {
+                let stripped_ref = ref_name
+                    .rsplit_once('.')
+                    .filter(|(_, version)| version.chars().all(|ch| ch.is_ascii_digit()))
+                    .map(|(base, _)| base)
+                    .unwrap_or(ref_name);
+                out = format!("{stripped_ref}:p.{suffix}");
+            }
+        }
+
+        if !no_escape {
+            out = out.replace('=', "%3D");
+        }
+
+        out
     }
 
     /// Traceability:
@@ -2360,9 +2398,18 @@ impl AnnotateProvider {
                         ""
                     };
                     let hgvsp = if hgvs_flags.hgvsp {
-                        tc.hgvsp.as_deref().unwrap_or("")
+                        tc.hgvsp
+                            .as_deref()
+                            .map(|value| {
+                                Self::format_hgvsp_output(
+                                    value,
+                                    hgvs_flags.remove_hgvsp_version,
+                                    hgvs_flags.no_escape,
+                                )
+                            })
+                            .unwrap_or_default()
                     } else {
-                        ""
+                        String::new()
                     };
                     let source_val = if merged { source } else { "" };
 
@@ -3432,6 +3479,9 @@ mod tests {
         let flags = HgvsFlags::from_options_json(Some(r#"{"hgvs":true}"#));
         assert!(flags.hgvsc);
         assert!(flags.hgvsp);
+        assert!(!flags.no_escape);
+        assert!(!flags.remove_hgvsp_version);
+        assert!(!flags.hgvsp_use_prediction);
         assert!(flags.any());
     }
 
@@ -3444,10 +3494,39 @@ mod tests {
     }
 
     #[test]
+    fn test_hgvs_flags_output_controls() {
+        let flags = HgvsFlags::from_options_json(Some(
+            r#"{"hgvsp":true,"no_escape":true,"remove_hgvsp_version":true,"hgvsp_use_prediction":true}"#,
+        ));
+        assert!(!flags.hgvsc);
+        assert!(flags.hgvsp);
+        assert!(flags.no_escape);
+        assert!(flags.remove_hgvsp_version);
+        assert!(flags.hgvsp_use_prediction);
+    }
+
+    #[test]
+    fn test_format_hgvsp_output_strips_version_and_escapes_equals() {
+        assert_eq!(
+            AnnotateProvider::format_hgvsp_output("ENSP000001.2:p.Val100=", true, false),
+            "ENSP000001:p.Val100%3D"
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_output_keeps_version_and_literal_equals_when_no_escape() {
+        assert_eq!(
+            AnnotateProvider::format_hgvsp_output("ENSP000001.2:p.Val100=", false, true),
+            "ENSP000001.2:p.Val100="
+        );
+    }
+
+    #[test]
     fn test_validate_hgvs_reference_fasta_requires_existing_path() {
         let flags = HgvsFlags {
             hgvsc: true,
             hgvsp: false,
+            ..Default::default()
         };
         let missing = AnnotateProvider::validate_hgvs_reference_fasta(flags, None)
             .expect_err("missing reference fasta should fail")
@@ -3491,6 +3570,7 @@ mod tests {
         let flags = HgvsFlags {
             hgvsc: true,
             hgvsp: false,
+            ..Default::default()
         };
         let dir = tempfile::tempdir().expect("create temp fasta dir");
         let fasta_path = dir.path().join("test.fa");
@@ -3510,6 +3590,7 @@ mod tests {
         let flags = HgvsFlags {
             hgvsc: true,
             hgvsp: false,
+            ..Default::default()
         };
         let (_dir, fasta_path) = write_test_indexed_fasta("1", "NNNNNNNNNN");
         AnnotateProvider::validate_hgvs_reference_fasta(flags, Some(&fasta_path))
