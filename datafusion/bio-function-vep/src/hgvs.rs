@@ -45,12 +45,13 @@ fn versioned_id(base_id: &str, version: Option<i32>) -> String {
 
 /// Compute HGVSc notation for a variant overlapping a transcript.
 ///
-/// For exonic variants, uses cDNA position. For intronic variants, computes
-/// offset from nearest exon boundary.
-///
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
 ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1301-L1491
+/// - Ensembl Variation `Utils::Sequence::hgvs_variant_notation()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L493-L619
+/// - Ensembl Variation `TranscriptVariationAllele::_clip_alleles()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2232
 /// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
 ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
 /// - Ensembl Variation `Utils::Sequence::format_hgvs_string()`
@@ -58,63 +59,212 @@ fn versioned_id(base_id: &str, version: Option<i32>) -> String {
 pub fn format_hgvsc(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
-    cdna_position: Option<&str>,
+    _cdna_position: Option<&str>,
     ref_allele: &str,
     alt_allele: &str,
     variant_start: i64,
     variant_end: i64,
 ) -> Option<String> {
     let tx_id = versioned_id(&tx.transcript_id, tx.version);
-    let is_ins = ref_allele == "-";
-    let is_del = alt_allele == "-";
     let numbering = if tx.cds_start.is_some() && tx.cds_end.is_some() {
         'c'
     } else {
         'n'
     };
-
-    // Try exonic first (we have a cDNA position).
-    if let Some(cdna_pos) = cdna_position {
-        let hgvs_pos = exonic_hgvsc_position(tx, tx_exons, cdna_pos)?;
-        let change = format_cdna_change(&hgvs_pos, ref_allele, alt_allele, is_ins, is_del);
-        return Some(format!("{tx_id}:{numbering}.{change}"));
+    let mut notation =
+        hgvs_variant_notation(ref_allele, alt_allele, variant_start, variant_end)?;
+    if notation.kind != "dup" {
+        clip_alleles(&mut notation);
     }
-
-    // Intronic: compute offset from nearest exon boundary.
-    if let Some(intronic) = compute_intronic_hgvsc(
-        tx,
-        tx_exons,
-        variant_start,
-        variant_end,
-        ref_allele,
-        alt_allele,
-    ) {
-        return Some(format!("{tx_id}:{numbering}.{intronic}"));
+    let (mut start, mut end) = notation_to_hgvsc_coords(tx, tx_exons, &notation)?;
+    if !end.starts_with('*')
+        && matches!(
+            compare_hgvs_positions(&start, &end),
+            Some(Ordering::Greater)
+        )
+    {
+        std::mem::swap(&mut start, &mut end);
     }
-
-    None
+    format_hgvs_string(&tx_id, numbering, &start, &end, &notation)
 }
 
-fn exonic_hgvsc_position(
-    tx: &TranscriptFeature,
-    tx_exons: &[&ExonFeature],
-    cdna_position: &str,
-) -> Option<String> {
-    if tx.cds_start.is_none() || tx.cds_end.is_none() {
-        return Some(cdna_position.replace('-', "_"));
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HgvsNotation {
+    start: i64,
+    end: i64,
+    ref_allele: String,
+    alt_allele: String,
+    kind: String,
+}
+
+/// Traceability:
+/// - Ensembl Variation `Utils::Sequence::hgvs_variant_notation()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L493-L619
+fn hgvs_variant_notation(
+    ref_allele: &str,
+    alt_allele: &str,
+    ref_start: i64,
+    ref_end: i64,
+) -> Option<HgvsNotation> {
+    let ref_allele = if ref_allele == "-" {
+        String::new()
+    } else {
+        ref_allele.to_string()
+    };
+    let alt_allele = if alt_allele == "-" {
+        String::new()
+    } else {
+        alt_allele.to_string()
+    };
+
+    if ref_allele == alt_allele {
+        return None;
     }
 
-    let (coding_start, coding_end) = coding_cdna_bounds(tx, tx_exons)?;
-    let mut converted = Vec::new();
-    for raw_part in cdna_position.split('-') {
-        let raw = raw_part.parse::<usize>().ok()?;
-        converted.push(convert_cdna_index_to_hgvsc(raw, coding_start, coding_end));
+    let ref_len = ref_allele.len();
+    let alt_len = alt_allele.len();
+    let kind = if alt_len == 0 {
+        "del".to_string()
+    } else if ref_len == alt_len {
+        if ref_len == 1 {
+            ">".to_string()
+        } else if reverse_complement(&ref_allele).as_deref() == Some(alt_allele.as_str()) {
+            "inv".to_string()
+        } else {
+            "delins".to_string()
+        }
+    } else if ref_len == 0 {
+        "ins".to_string()
+    } else if alt_len % ref_len == 0 && alt_allele == ref_allele.repeat(alt_len / ref_len) {
+        if alt_len / ref_len == 2 {
+            "dup".to_string()
+        } else {
+            format!("[{}]", alt_len / ref_len)
+        }
+    } else {
+        "delins".to_string()
+    };
+
+    Some(HgvsNotation {
+        start: ref_start,
+        end: ref_end,
+        ref_allele,
+        alt_allele,
+        kind,
+    })
+}
+
+fn reverse_complement(seq: &str) -> Option<String> {
+    let mut out = String::with_capacity(seq.len());
+    for ch in seq.chars().rev() {
+        out.push(match ch {
+            'A' => 'T',
+            'C' => 'G',
+            'G' => 'C',
+            'T' => 'A',
+            'N' => 'N',
+            _ => return None,
+        });
     }
-    match converted.as_slice() {
-        [single] => Some(single.clone()),
-        [start, end] => Some(format!("{start}_{end}")),
-        _ => None,
+    Some(out)
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_clip_alleles()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2232
+fn clip_alleles(notation: &mut HgvsNotation) {
+    let mut ref_allele = notation.ref_allele.clone();
+    let mut alt_allele = notation.alt_allele.clone();
+    let mut start = notation.start;
+    let mut end = notation.end;
+    let mut preseq = String::new();
+
+    while !ref_allele.is_empty()
+        && !alt_allele.is_empty()
+        && ref_allele.as_bytes()[0] == alt_allele.as_bytes()[0]
+    {
+        preseq.push(ref_allele.remove(0));
+        alt_allele.remove(0);
+        start += 1;
     }
+
+    while !ref_allele.is_empty()
+        && !alt_allele.is_empty()
+        && ref_allele.as_bytes()[ref_allele.len() - 1] == alt_allele.as_bytes()[alt_allele.len() - 1]
+    {
+        ref_allele.pop();
+        alt_allele.pop();
+        end -= 1;
+    }
+
+    notation.ref_allele = ref_allele;
+    notation.alt_allele = alt_allele;
+    notation.start = start;
+    notation.end = end;
+
+    if notation.ref_allele.len() == 1
+        && notation.alt_allele.len() == 1
+        && notation.ref_allele != notation.alt_allele
+    {
+        notation.kind = ">".to_string();
+    } else if notation.ref_allele.is_empty() && !notation.alt_allele.is_empty() {
+        if preseq.ends_with(&notation.alt_allele) {
+            notation.kind = "dup".to_string();
+            notation.start -= notation.alt_allele.len() as i64;
+        } else {
+            notation.kind = "ins".to_string();
+        }
+    } else if !notation.ref_allele.is_empty() && notation.alt_allele.is_empty() {
+        notation.kind = "del".to_string();
+    }
+}
+
+fn notation_to_hgvsc_coords(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    notation: &HgvsNotation,
+) -> Option<(String, String)> {
+    if notation.kind == "ins" {
+        let start = hgvs_cdna_position_from_genomic(tx, tx_exons, notation.start - 1)?;
+        let end = hgvs_cdna_position_from_genomic(tx, tx_exons, notation.start)?;
+        return Some((start, end));
+    }
+    Some((
+        hgvs_cdna_position_from_genomic(tx, tx_exons, notation.start)?,
+        hgvs_cdna_position_from_genomic(tx, tx_exons, notation.end)?,
+    ))
+}
+
+/// Traceability:
+/// - Ensembl Variation `Utils::Sequence::format_hgvs_string()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L635-L676
+fn format_hgvs_string(
+    ref_name: &str,
+    numbering: char,
+    start: &str,
+    end: &str,
+    notation: &HgvsNotation,
+) -> Option<String> {
+    let coordinates = if start == end {
+        start.to_string()
+    } else {
+        format!("{start}_{end}")
+    };
+    let suffix = if notation.kind == ">" || (notation.kind == "inv" && notation.ref_allele.len() == 1)
+    {
+        format!("{start}{}>{}", notation.ref_allele, notation.alt_allele)
+    } else if matches!(notation.kind.as_str(), "del" | "inv" | "dup") {
+        format!("{coordinates}{}", notation.kind)
+    } else if notation.kind == "delins" {
+        format!("{coordinates}delins{}", notation.alt_allele)
+    } else if notation.kind == "ins" {
+        format!("{coordinates}ins{}", notation.alt_allele)
+    } else if notation.kind.starts_with('[') && notation.kind.ends_with(']') {
+        format!("{coordinates}{}", notation.kind)
+    } else {
+        return None;
+    };
+    Some(format!("{ref_name}:{numbering}.{suffix}"))
 }
 
 fn coding_cdna_bounds(tx: &TranscriptFeature, tx_exons: &[&ExonFeature]) -> Option<(usize, usize)> {
@@ -126,16 +276,6 @@ fn coding_cdna_bounds(tx: &TranscriptFeature, tx_exons: &[&ExonFeature]) -> Opti
         genomic_to_cdna_index_pub(tx_exons, tx.strand, coding_start_anchor)?,
         genomic_to_cdna_index_pub(tx_exons, tx.strand, coding_end_anchor)?,
     ))
-}
-
-fn convert_cdna_index_to_hgvsc(raw: usize, coding_start: usize, coding_end: usize) -> String {
-    if raw > coding_end {
-        format!("*{}", raw - coding_end)
-    } else if raw >= coding_start {
-        (raw - coding_start + 1).to_string()
-    } else {
-        (raw as i64 - coding_start as i64).to_string()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,111 +453,6 @@ fn compare_hgvs_positions(left: &str, right: &str) -> Option<Ordering> {
         .ok()
         .unwrap_or(0);
     Some((left_coord, left_offset).cmp(&(right_coord, right_offset)))
-}
-
-/// Format the cDNA change part for exonic variants.
-fn format_cdna_change(
-    cdna_pos: &str,
-    ref_allele: &str,
-    alt_allele: &str,
-    is_ins: bool,
-    is_del: bool,
-) -> String {
-    if is_ins {
-        // Insertion: c.10_11insACG
-        format!("{cdna_pos}ins{alt_allele}")
-    } else if is_del && ref_allele.len() == 1 {
-        // Single-base deletion: c.10del
-        format!("{cdna_pos}del")
-    } else if is_del {
-        // Multi-base deletion: c.10_12del
-        format!("{cdna_pos}del")
-    } else if ref_allele.len() == 1 && alt_allele.len() == 1 {
-        // SNV: c.1043G>A
-        format!("{cdna_pos}{ref_allele}>{alt_allele}")
-    } else if ref_allele.len() > 1 && alt_allele.len() > 1 {
-        // Delins (MNV or complex): c.10_12delinsACG
-        format!("{cdna_pos}delins{alt_allele}")
-    } else if alt_allele.len() > ref_allele.len() {
-        // Insertion-like (after trimming this shouldn't happen, but handle it)
-        format!("{cdna_pos}delins{alt_allele}")
-    } else {
-        // Deletion-like with alt shorter than ref
-        format!("{cdna_pos}delins{alt_allele}")
-    }
-}
-
-/// Compute intronic HGVS notation: c.{cdna_boundary}{+/-}{offset}{ref}>{alt}
-///
-/// Finds the nearest exon boundary and computes the signed offset from it.
-fn compute_intronic_hgvsc(
-    tx: &TranscriptFeature,
-    tx_exons: &[&ExonFeature],
-    variant_start: i64,
-    variant_end: i64,
-    ref_allele: &str,
-    alt_allele: &str,
-) -> Option<String> {
-    if tx_exons.is_empty() {
-        return None;
-    }
-
-    let is_ins = ref_allele == "-";
-    let is_del = alt_allele == "-";
-
-    if is_ins {
-        let mut pos1 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start - 1)?;
-        let mut pos2 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
-        if !pos1.starts_with('*')
-            && !pos2.starts_with('*')
-            && matches!(
-                compare_hgvs_positions(&pos1, &pos2),
-                Some(Ordering::Greater)
-            )
-        {
-            std::mem::swap(&mut pos1, &mut pos2);
-        }
-        Some(format!("{pos1}_{pos2}ins{alt_allele}"))
-    } else if is_del {
-        if variant_start == variant_end {
-            let pos = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
-            Some(format!("{pos}del"))
-        } else {
-            let mut pos1 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
-            let mut pos2 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_end)?;
-            if !pos1.starts_with('*')
-                && !pos2.starts_with('*')
-                && matches!(
-                    compare_hgvs_positions(&pos1, &pos2),
-                    Some(Ordering::Greater)
-                )
-            {
-                std::mem::swap(&mut pos1, &mut pos2);
-            }
-            Some(format!("{pos1}_{pos2}del"))
-        }
-    } else if ref_allele.len() == 1 && alt_allele.len() == 1 {
-        let pos = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
-        Some(format!("{pos}{ref_allele}>{alt_allele}"))
-    } else {
-        if variant_start == variant_end {
-            let pos = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
-            Some(format!("{pos}delins{alt_allele}"))
-        } else {
-            let mut pos1 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
-            let mut pos2 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_end)?;
-            if !pos1.starts_with('*')
-                && !pos2.starts_with('*')
-                && matches!(
-                    compare_hgvs_positions(&pos1, &pos2),
-                    Some(Ordering::Greater)
-                )
-            {
-                std::mem::swap(&mut pos1, &mut pos2);
-            }
-            Some(format!("{pos1}_{pos2}delins{alt_allele}"))
-        }
-    }
 }
 
 /// Public wrapper for genomic_to_cdna_index (which is private in transcript_consequence).
@@ -676,35 +711,78 @@ mod tests {
     }
 
     #[test]
-    fn test_format_cdna_change_snv() {
-        assert_eq!(
-            format_cdna_change("1043", "G", "A", false, false),
-            "1043G>A"
-        );
+    fn test_hgvs_variant_notation_substitution() {
+        let notation = hgvs_variant_notation("G", "A", 103, 103).expect("notation");
+        assert_eq!(notation.kind, ">");
+        assert_eq!(notation.start, 103);
+        assert_eq!(notation.end, 103);
+        assert_eq!(notation.ref_allele, "G");
+        assert_eq!(notation.alt_allele, "A");
     }
 
     #[test]
-    fn test_format_cdna_change_insertion() {
-        assert_eq!(
-            format_cdna_change("10-11", "-", "ACG", true, false),
-            "10-11insACG"
-        );
+    fn test_clip_alleles_reclassifies_delins_to_substitution() {
+        let mut notation = HgvsNotation {
+            start: 100,
+            end: 101,
+            ref_allele: "AC".to_string(),
+            alt_allele: "AT".to_string(),
+            kind: "delins".to_string(),
+        };
+        clip_alleles(&mut notation);
+        assert_eq!(notation.kind, ">");
+        assert_eq!(notation.start, 101);
+        assert_eq!(notation.end, 101);
+        assert_eq!(notation.ref_allele, "C");
+        assert_eq!(notation.alt_allele, "T");
     }
 
     #[test]
-    fn test_format_cdna_change_deletion() {
-        assert_eq!(format_cdna_change("10", "A", "-", false, true), "10del");
-        assert_eq!(
-            format_cdna_change("10-12", "ACG", "-", false, true),
-            "10-12del"
-        );
+    fn test_clip_alleles_reclassifies_delins_to_insertion() {
+        let mut notation = HgvsNotation {
+            start: 100,
+            end: 100,
+            ref_allele: "A".to_string(),
+            alt_allele: "AT".to_string(),
+            kind: "delins".to_string(),
+        };
+        clip_alleles(&mut notation);
+        assert_eq!(notation.kind, "ins");
+        assert_eq!(notation.start, 101);
+        assert_eq!(notation.end, 100);
+        assert_eq!(notation.ref_allele, "");
+        assert_eq!(notation.alt_allele, "T");
     }
 
     #[test]
-    fn test_format_cdna_change_delins() {
+    fn test_clip_alleles_reclassifies_delins_to_duplication() {
+        let mut notation = HgvsNotation {
+            start: 100,
+            end: 100,
+            ref_allele: "A".to_string(),
+            alt_allele: "AA".to_string(),
+            kind: "delins".to_string(),
+        };
+        clip_alleles(&mut notation);
+        assert_eq!(notation.kind, "dup");
+        assert_eq!(notation.start, 100);
+        assert_eq!(notation.end, 100);
+        assert_eq!(notation.ref_allele, "");
+        assert_eq!(notation.alt_allele, "A");
+    }
+
+    #[test]
+    fn test_format_hgvs_string_delins() {
+        let notation = HgvsNotation {
+            start: 10,
+            end: 12,
+            ref_allele: "ACG".to_string(),
+            alt_allele: "TT".to_string(),
+            kind: "delins".to_string(),
+        };
         assert_eq!(
-            format_cdna_change("10-12", "ACG", "TT", false, false),
-            "10-12delinsTT"
+            format_hgvs_string("ENST000001.1", 'c', "10", "12", &notation),
+            Some("ENST000001.1:c.10_12delinsTT".to_string())
         );
     }
 
@@ -754,6 +832,28 @@ mod tests {
         assert_eq!(
             format_hgvsc(&tx, &exons, Some("14"), "G", "A", 103, 103),
             Some("ENSTHGVS000001.1:c.4G>A".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_formats_insertions_with_flanking_coordinates() {
+        let tx = make_transcript("protein_coding", 1, Some(100), Some(108));
+        let exon = make_exon();
+        let exons = [&exon];
+        assert_eq!(
+            format_hgvsc(&tx, &exons, None, "-", "T", 103, 103),
+            Some("ENSTHGVS000001.1:c.3_4insT".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_formats_deletions_from_genomic_span() {
+        let tx = make_transcript("protein_coding", 1, Some(100), Some(108));
+        let exon = make_exon();
+        let exons = [&exon];
+        assert_eq!(
+            format_hgvsc(&tx, &exons, None, "G", "-", 103, 103),
+            Some("ENSTHGVS000001.1:c.4del".to_string())
         );
     }
 
