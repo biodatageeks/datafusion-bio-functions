@@ -76,8 +76,9 @@ impl StreamCollector {
                             None => {
                                 let idx = self.groups.len();
                                 self.groups.push(Vec::with_capacity(1024));
-                                self.contig_names.push(contig.to_string());
-                                self.contig_to_idx.insert(contig.to_string(), idx);
+                                let owned = contig.to_string();
+                                self.contig_to_idx.insert(owned.clone(), idx);
+                                self.contig_names.push(owned);
                                 idx
                             }
                         };
@@ -192,8 +193,9 @@ impl FullBatchCollector {
                             None => {
                                 let idx = self.groups.len();
                                 self.groups.push(Vec::with_capacity(1024));
-                                self.contig_names.push(contig.to_string());
-                                self.contig_to_idx.insert(contig.to_string(), idx);
+                                let owned = contig.to_string();
+                                self.contig_to_idx.insert(owned.clone(), idx);
+                                self.contig_names.push(owned);
                                 idx
                             }
                         };

@@ -3626,3 +3626,912 @@ async fn bench_scaling_subtract() -> Result<()> {
     }
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scaling benchmarks for count_overlaps and coverage
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn bench_count_overlaps_with_partitions(
+    target_partitions: usize,
+    show_plan: bool,
+) -> Result<(usize, std::time::Duration)> {
+    let ctx = create_bio_session_with_target_partitions(target_partitions);
+    let create = format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
+    ctx.sql(&create).await?;
+    ctx.sql(
+        "CREATE EXTERNAL TABLE mask STORED AS PARQUET LOCATION '/tmp/polars-bio-bench/databio/chainXenTro3Link/part-00000-d999dd06-a0e2-4b31-80e5-2acf71fcebc7-c000.snappy.parquet'"
+    ).await?;
+
+    if show_plan {
+        let plan = ctx
+            .sql("EXPLAIN VERBOSE SELECT * FROM count_overlaps('mask', 'chain')")
+            .await?
+            .collect()
+            .await?;
+        let formatted = pretty_format_batches(&plan)?.to_string();
+        eprintln!("\n  EXPLAIN VERBOSE (partitions={target_partitions}):\n{formatted}");
+    }
+
+    let start = std::time::Instant::now();
+    let result = ctx
+        .sql("SELECT * FROM count_overlaps('mask', 'chain')")
+        .await?
+        .collect()
+        .await?;
+    let elapsed = start.elapsed();
+    let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    Ok((rows, elapsed))
+}
+
+async fn bench_coverage_with_partitions(
+    target_partitions: usize,
+    show_plan: bool,
+) -> Result<(usize, std::time::Duration)> {
+    let ctx = create_bio_session_with_target_partitions(target_partitions);
+    let create = format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
+    ctx.sql(&create).await?;
+    ctx.sql(
+        "CREATE EXTERNAL TABLE mask STORED AS PARQUET LOCATION '/tmp/polars-bio-bench/databio/chainXenTro3Link/part-00000-d999dd06-a0e2-4b31-80e5-2acf71fcebc7-c000.snappy.parquet'"
+    ).await?;
+
+    if show_plan {
+        let plan = ctx
+            .sql("EXPLAIN VERBOSE SELECT * FROM coverage('mask', 'chain')")
+            .await?
+            .collect()
+            .await?;
+        let formatted = pretty_format_batches(&plan)?.to_string();
+        eprintln!("\n  EXPLAIN VERBOSE (partitions={target_partitions}):\n{formatted}");
+    }
+
+    let start = std::time::Instant::now();
+    let result = ctx
+        .sql("SELECT * FROM coverage('mask', 'chain')")
+        .await?
+        .collect()
+        .await?;
+    let elapsed = start.elapsed();
+    let rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    Ok((rows, elapsed))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scaling_count_overlaps() -> Result<()> {
+    eprintln!("\n=== COUNT_OVERLAPS scaling (chainXenTro3Link, ~51M rows) ===");
+    let partition_counts = [1, 2, 4, 8];
+    for (i, partitions) in partition_counts.iter().enumerate() {
+        let show_plan = i == 0;
+        let (rows, elapsed) = bench_count_overlaps_with_partitions(*partitions, show_plan).await?;
+        eprintln!(
+            "  partitions={:<2}  rows={:<10}  time={:.3}s",
+            partitions,
+            rows,
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scaling_coverage() -> Result<()> {
+    eprintln!("\n=== COVERAGE scaling (chainXenTro3Link, ~51M rows) ===");
+    let partition_counts = [1, 2, 4, 8];
+    for (i, partitions) in partition_counts.iter().enumerate() {
+        let show_plan = i == 0;
+        let (rows, elapsed) = bench_coverage_with_partitions(*partitions, show_plan).await?;
+        eprintln!(
+            "  partitions={:<2}  rows={:<10}  time={:.3}s",
+            partitions,
+            rows,
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Additional unit tests for subtract
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_subtract_udtf_single_row_input() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE left_t (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE right_t (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 120, 150)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM subtract('left_t', 'right_t') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+",
+        "| contig | pos_start | pos_end |",
+        "+--------+-----------+---------+",
+        "| a      | 100       | 120     |",
+        "| a      | 150       | 200     |",
+        "+--------+-----------+---------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_subtract_udtf_fully_covered() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE left_t (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200),
+        ('a', 300, 400)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE right_t (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 50, 500)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM subtract('left_t', 'right_t')")
+        .await?
+        .collect()
+        .await?;
+
+    // All left intervals fully covered by right → no output
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_subtract_udtf_fragmented_right_merges() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE left_t (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 500)
+    "#,
+    )
+    .await?;
+
+    // Many small overlapping right intervals that merge into [200, 400]
+    ctx.sql(
+        r#"
+        CREATE TABLE right_t (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 200, 250),
+        ('a', 230, 300),
+        ('a', 280, 350),
+        ('a', 340, 400)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM subtract('left_t', 'right_t') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+",
+        "| contig | pos_start | pos_end |",
+        "+--------+-----------+---------+",
+        "| a      | 100       | 200     |",
+        "| a      | 400       | 500     |",
+        "+--------+-----------+---------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_subtract_udtf_multi_contig_different_patterns() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE left_t (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200),
+        ('b', 100, 200),
+        ('c', 100, 200)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE right_t (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 150, 180),
+        ('c', 50, 300)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM subtract('left_t', 'right_t') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+",
+        "| contig | pos_start | pos_end |",
+        "+--------+-----------+---------+",
+        "| a      | 100       | 150     |",
+        "| a      | 180       | 200     |",
+        "| b      | 100       | 200     |",
+        "+--------+-----------+---------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Additional unit tests for count_overlaps and coverage
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_no_overlaps() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 300, 400)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets')")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | count |",
+        "+--------+-----------+---------+-------+",
+        "| a      | 300       | 400     | 0     |",
+        "+--------+-----------+---------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_all_overlapping() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 300),
+        ('a', 150, 350),
+        ('a', 200, 400)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 180, 280)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets')")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | count |",
+        "+--------+-----------+---------+-------+",
+        "| a      | 180       | 280     | 3     |",
+        "+--------+-----------+---------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_empty_left() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads AS
+        SELECT
+            CAST('a' AS TEXT) AS contig,
+            CAST(1 AS INTEGER) AS pos_start,
+            CAST(2 AS INTEGER) AS pos_end
+        WHERE FALSE
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets')")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | count |",
+        "+--------+-----------+---------+-------+",
+        "| a      | 100       | 200     | 0     |",
+        "+--------+-----------+---------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_multi_contig() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200),
+        ('b', 100, 200)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 150, 250),
+        ('b', 300, 400)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets') ORDER BY contig")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | count |",
+        "+--------+-----------+---------+-------+",
+        "| a      | 150       | 250     | 1     |",
+        "| b      | 300       | 400     | 0     |",
+        "+--------+-----------+---------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_strict_mode() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+
+    // Target touches left at exactly pos_end=200
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 200, 300)
+    "#,
+    )
+    .await?;
+
+    // Weak mode: touching counts as overlap
+    let result_weak = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets', 'weak')")
+        .await?
+        .collect()
+        .await?;
+    let count_weak: i64 = result_weak[0]
+        .column_by_name("count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count_weak, 1);
+
+    // Strict mode: touching does NOT count as overlap
+    let result_strict = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets', 'strict')")
+        .await?
+        .collect()
+        .await?;
+    let count_strict: i64 = result_strict[0]
+        .column_by_name("count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count_strict, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_coverage_partial_overlap() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 150, 300)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM coverage('reads', 'targets')")
+        .await?
+        .collect()
+        .await?;
+
+    // Coverage: overlap of [100,200) with [150,300) is about 51 bp (coitree math)
+    let coverage: i64 = result[0]
+        .column_by_name("coverage")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert!(coverage > 0, "expected positive coverage, got {coverage}");
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Additional unit tests for complement
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_complement_udtf_no_view_implicit_bounds() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM complement('intervals') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    // Without a view table, implicit bounds are (0, i64::MAX)
+    // Should produce gaps [0, 100) and [200, i64::MAX)
+    let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_complement_udtf_trailing_gaps_view_only_contigs() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE chromsizes (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 0, 500),
+        ('b', 0, 1000)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM complement('intervals', 'chromsizes') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    // contig 'a': gaps [0,100), [200,500)
+    // contig 'b': no input intervals → entire view [0,1000) is a gap
+    let expected = [
+        "+--------+-----------+---------+",
+        "| contig | pos_start | pos_end |",
+        "+--------+-----------+---------+",
+        "| a      | 0         | 100     |",
+        "| a      | 200       | 500     |",
+        "| b      | 0         | 1000    |",
+        "+--------+-----------+---------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_complement_udtf_strict_mode() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200),
+        ('a', 200, 300)
+    "#,
+    )
+    .await?;
+
+    ctx.sql(
+        r#"
+        CREATE TABLE chromsizes (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 0, 500)
+    "#,
+    )
+    .await?;
+
+    // In strict mode, touching intervals (end==start) are NOT merged
+    let result = ctx
+        .sql("SELECT * FROM complement('intervals', 'chromsizes', 'strict') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    // Strict merge: [100,200) and [200,300) are NOT merged → gap [0,100) and [300,500)
+    // plus a zero-width gap at 200 if touching intervals don't merge.
+    let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    // At minimum we should see the leading and trailing gaps
+    assert!(
+        total_rows >= 2,
+        "expected at least 2 gap rows, got {total_rows}"
+    );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Additional unit tests for merge
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_merge_udtf_non_overlapping() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200),
+        ('a', 300, 400),
+        ('a', 500, 600)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM merge('intervals') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------------+",
+        "| contig | pos_start | pos_end | n_intervals |",
+        "+--------+-----------+---------+-------------+",
+        "| a      | 100       | 200     | 1           |",
+        "| a      | 300       | 400     | 1           |",
+        "| a      | 500       | 600     | 1           |",
+        "+--------+-----------+---------+-------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_merge_udtf_overlapping() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 300),
+        ('a', 200, 400),
+        ('a', 350, 500)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM merge('intervals') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------------+",
+        "| contig | pos_start | pos_end | n_intervals |",
+        "+--------+-----------+---------+-------------+",
+        "| a      | 100       | 500     | 3           |",
+        "+--------+-----------+---------+-------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_merge_udtf_single_interval_per_contig() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200),
+        ('b', 300, 400)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM merge('intervals') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------------+",
+        "| contig | pos_start | pos_end | n_intervals |",
+        "+--------+-----------+---------+-------------+",
+        "| a      | 100       | 200     | 1           |",
+        "| b      | 300       | 400     | 1           |",
+        "+--------+-----------+---------+-------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_merge_udtf_with_min_dist() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200),
+        ('a', 250, 350)
+    "#,
+    )
+    .await?;
+
+    // min_dist=100 should merge intervals 50 apart
+    let result = ctx
+        .sql("SELECT * FROM merge('intervals', 100) ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------------+",
+        "| contig | pos_start | pos_end | n_intervals |",
+        "+--------+-----------+---------+-------------+",
+        "| a      | 100       | 350     | 2           |",
+        "+--------+-----------+---------+-------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Additional unit tests for cluster
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cluster_udtf_non_overlapping_each_own_cluster() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200),
+        ('a', 400, 500),
+        ('a', 700, 800)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM cluster('intervals') ORDER BY pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| contig | pos_start | pos_end | cluster | cluster_start | cluster_end |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| a      | 100       | 200     | 0       | 100           | 200         |",
+        "| a      | 400       | 500     | 1       | 400           | 500         |",
+        "| a      | 700       | 800     | 2       | 700           | 800         |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cluster_udtf_overlapping_single_cluster() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 300),
+        ('a', 200, 400),
+        ('a', 350, 500)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM cluster('intervals') ORDER BY pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| contig | pos_start | pos_end | cluster | cluster_start | cluster_end |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| a      | 100       | 300     | 0       | 100           | 500         |",
+        "| a      | 200       | 400     | 0       | 100           | 500         |",
+        "| a      | 350       | 500     | 0       | 100           | 500         |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cluster_udtf_with_min_dist() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200),
+        ('a', 250, 350)
+    "#,
+    )
+    .await?;
+
+    // min_dist=100 should cluster intervals that are 50 apart into one cluster
+    let result = ctx
+        .sql("SELECT * FROM cluster('intervals', 100) ORDER BY pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| contig | pos_start | pos_end | cluster | cluster_start | cluster_end |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| a      | 100       | 200     | 0       | 100           | 350         |",
+        "| a      | 250       | 350     | 0       | 100           | 350         |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cluster_udtf_sequential_ids() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE intervals (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 100, 200),
+        ('a', 300, 400),
+        ('b', 100, 200),
+        ('b', 300, 400)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM cluster('intervals') ORDER BY contig, pos_start")
+        .await?
+        .collect()
+        .await?;
+
+    // Cluster IDs are 0-based and globally sequential across contigs
+    let expected = [
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| contig | pos_start | pos_end | cluster | cluster_start | cluster_end |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| a      | 100       | 200     | 0       | 100           | 200         |",
+        "| a      | 300       | 400     | 1       | 300           | 400         |",
+        "| b      | 100       | 200     | 2       | 100           | 200         |",
+        "| b      | 300       | 400     | 3       | 300           | 400         |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}

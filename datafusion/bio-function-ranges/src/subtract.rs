@@ -26,6 +26,26 @@ use futures::{Stream, ready};
 use crate::filter_op::FilterOp;
 use crate::grouped_stream::{FullBatchCollector, IndexedGroups, StreamCollector};
 
+/// Merge overlapping/touching intervals in a sorted `Vec<(i64, i64)>` in-place.
+/// After this, the intervals are non-overlapping and sorted, which dramatically
+/// shrinks the candidate set for subtraction.
+fn normalize_intervals(intervals: &mut Vec<(i64, i64)>) {
+    if intervals.len() <= 1 {
+        return;
+    }
+    // intervals are already sorted by (start, end) from StreamCollector
+    let mut write = 0;
+    for read in 1..intervals.len() {
+        if intervals[read].0 <= intervals[write].1 {
+            intervals[write].1 = intervals[write].1.max(intervals[read].1);
+        } else {
+            write += 1;
+            intervals[write] = intervals[read];
+        }
+    }
+    intervals.truncate(write + 1);
+}
+
 pub struct SubtractProvider {
     session: Arc<SessionContext>,
     left_table: String,
@@ -301,7 +321,6 @@ impl ExecutionPlan for SubtractExec {
                 end_col_idx: 0,
                 group_idx: 0,
                 interval_idx: 0,
-                right_cursor: 0,
                 output_row_indices: Vec::new(),
                 output_starts: Vec::new(),
                 output_ends: Vec::new(),
@@ -319,7 +338,6 @@ impl ExecutionPlan for SubtractExec {
                 left_groups: Vec::new(),
                 group_idx: 0,
                 interval_idx: 0,
-                right_cursor: 0,
                 contig_builder: StringBuilder::new(),
                 start_builder: Int64Builder::new(),
                 end_builder: Int64Builder::new(),
@@ -349,7 +367,6 @@ struct SubtractStream {
     left_groups: Vec<(String, Vec<(i64, i64)>)>,
     group_idx: usize,
     interval_idx: usize,
-    right_cursor: usize,
     contig_builder: StringBuilder,
     start_builder: Int64Builder,
     end_builder: Int64Builder,
@@ -392,6 +409,11 @@ impl Stream for SubtractStream {
                         }
                         this.right_groups =
                             this.right_collector.take().unwrap().take_groups_as_map();
+                        // Normalize (merge) right-side intervals per contig to
+                        // shrink the candidate set for subtraction.
+                        for intervals in this.right_groups.values_mut() {
+                            normalize_intervals(intervals);
+                        }
                     }
                     this.phase = SubtractPhase::CollectLeft;
                 }
@@ -419,24 +441,18 @@ impl Stream for SubtractStream {
                             let (ls, le) = left_intervals[this.interval_idx];
                             this.interval_idx += 1;
 
-                            while this.right_cursor < right_intervals.len() {
-                                let skip = if this.strict {
-                                    right_intervals[this.right_cursor].1 <= ls
-                                } else {
-                                    right_intervals[this.right_cursor].1 < ls
-                                };
-                                if skip {
-                                    this.right_cursor += 1;
-                                } else {
-                                    break;
-                                }
-                            }
+                            // Binary search for the first right interval whose
+                            // end extends past the left start.
+                            let strict = this.strict;
+                            let start = right_intervals.partition_point(|&(_, re)| {
+                                if strict { re <= ls } else { re < ls }
+                            });
 
                             let mut cursor = ls;
-                            let mut j = this.right_cursor;
+                            let mut j = start;
                             while j < right_intervals.len() {
                                 let (rs, re) = right_intervals[j];
-                                let no_overlap = if this.strict { rs >= le } else { rs > le };
+                                let no_overlap = if strict { rs >= le } else { rs > le };
                                 if no_overlap {
                                     break;
                                 }
@@ -467,7 +483,6 @@ impl Stream for SubtractStream {
 
                         this.group_idx += 1;
                         this.interval_idx = 0;
-                        this.right_cursor = 0;
 
                         if this.pending_rows >= this.batch_size {
                             return Poll::Ready(Some(this.flush_builders()));
@@ -511,7 +526,6 @@ struct SubtractStreamExtra {
     end_col_idx: usize,
     group_idx: usize,
     interval_idx: usize,
-    right_cursor: usize,
     output_row_indices: Vec<u32>,
     output_starts: Vec<i64>,
     output_ends: Vec<i64>,
@@ -567,6 +581,11 @@ impl Stream for SubtractStreamExtra {
                         }
                         this.right_groups =
                             this.right_collector.take().unwrap().take_groups_as_map();
+                        // Normalize (merge) right-side intervals per contig to
+                        // shrink the candidate set for subtraction.
+                        for intervals in this.right_groups.values_mut() {
+                            normalize_intervals(intervals);
+                        }
                     }
                     this.phase = SubtractPhase::CollectLeft;
                 }
@@ -604,24 +623,18 @@ impl Stream for SubtractStreamExtra {
                             let (ls, le, row_idx) = left_intervals[this.interval_idx];
                             this.interval_idx += 1;
 
-                            while this.right_cursor < right_intervals.len() {
-                                let skip = if this.strict {
-                                    right_intervals[this.right_cursor].1 <= ls
-                                } else {
-                                    right_intervals[this.right_cursor].1 < ls
-                                };
-                                if skip {
-                                    this.right_cursor += 1;
-                                } else {
-                                    break;
-                                }
-                            }
+                            // Binary search for the first right interval whose
+                            // end extends past the left start.
+                            let strict = this.strict;
+                            let start = right_intervals.partition_point(|&(_, re)| {
+                                if strict { re <= ls } else { re < ls }
+                            });
 
                             let mut cursor = ls;
-                            let mut j = this.right_cursor;
+                            let mut j = start;
                             while j < right_intervals.len() {
                                 let (rs, re) = right_intervals[j];
-                                let no_overlap = if this.strict { rs >= le } else { rs > le };
+                                let no_overlap = if strict { rs >= le } else { rs > le };
                                 if no_overlap {
                                     break;
                                 }
@@ -660,7 +673,6 @@ impl Stream for SubtractStreamExtra {
 
                         this.group_idx += 1;
                         this.interval_idx = 0;
-                        this.right_cursor = 0;
 
                         if this.pending_rows >= this.batch_size {
                             return Poll::Ready(Some(this.flush_builders()));
