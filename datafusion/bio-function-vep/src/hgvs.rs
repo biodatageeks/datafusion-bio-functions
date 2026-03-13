@@ -45,6 +45,14 @@ fn versioned_id(base_id: &str, version: Option<i32>) -> String {
 ///
 /// For exonic variants, uses cDNA position. For intronic variants, computes
 /// offset from nearest exon boundary.
+///
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1301-L1491
+/// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
+/// - Ensembl Variation `Utils::Sequence::format_hgvs_string()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L623-L676
 pub fn format_hgvsc(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -57,11 +65,17 @@ pub fn format_hgvsc(
     let tx_id = versioned_id(&tx.transcript_id, tx.version);
     let is_ins = ref_allele == "-";
     let is_del = alt_allele == "-";
+    let numbering = if tx.cds_start.is_some() && tx.cds_end.is_some() {
+        'c'
+    } else {
+        'n'
+    };
 
     // Try exonic first (we have a cDNA position).
     if let Some(cdna_pos) = cdna_position {
-        let change = format_cdna_change(cdna_pos, ref_allele, alt_allele, is_ins, is_del);
-        return Some(format!("{tx_id}:c.{change}"));
+        let hgvs_pos = exonic_hgvsc_position(tx, tx_exons, cdna_pos)?;
+        let change = format_cdna_change(&hgvs_pos, ref_allele, alt_allele, is_ins, is_del);
+        return Some(format!("{tx_id}:{numbering}.{change}"));
     }
 
     // Intronic: compute offset from nearest exon boundary.
@@ -73,10 +87,53 @@ pub fn format_hgvsc(
         ref_allele,
         alt_allele,
     ) {
-        return Some(format!("{tx_id}:c.{intronic}"));
+        return Some(format!("{tx_id}:{numbering}.{intronic}"));
     }
 
     None
+}
+
+fn exonic_hgvsc_position(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    cdna_position: &str,
+) -> Option<String> {
+    if tx.cds_start.is_none() || tx.cds_end.is_none() {
+        return Some(cdna_position.replace('-', "_"));
+    }
+
+    let (coding_start, coding_end) = coding_cdna_bounds(tx, tx_exons)?;
+    let mut converted = Vec::new();
+    for raw_part in cdna_position.split('-') {
+        let raw = raw_part.parse::<usize>().ok()?;
+        converted.push(convert_cdna_index_to_hgvsc(raw, coding_start, coding_end));
+    }
+    match converted.as_slice() {
+        [single] => Some(single.clone()),
+        [start, end] => Some(format!("{start}_{end}")),
+        _ => None,
+    }
+}
+
+fn coding_cdna_bounds(tx: &TranscriptFeature, tx_exons: &[&ExonFeature]) -> Option<(usize, usize)> {
+    let cds_start = tx.cds_start?;
+    let cds_end = tx.cds_end?;
+    let coding_start_anchor = if tx.strand >= 0 { cds_start } else { cds_end };
+    let coding_end_anchor = if tx.strand >= 0 { cds_end } else { cds_start };
+    Some((
+        genomic_to_cdna_index_pub(tx_exons, tx.strand, coding_start_anchor)?,
+        genomic_to_cdna_index_pub(tx_exons, tx.strand, coding_end_anchor)?,
+    ))
+}
+
+fn convert_cdna_index_to_hgvsc(raw: usize, coding_start: usize, coding_end: usize) -> String {
+    if raw > coding_end {
+        format!("*{}", raw - coding_end)
+    } else if raw >= coding_start {
+        (raw - coding_start + 1).to_string()
+    } else {
+        (raw as i64 - coding_start as i64).to_string()
+    }
 }
 
 /// Format the cDNA change part for exonic variants.
@@ -451,6 +508,54 @@ fn format_hgvsp_inframe_ins(
 mod tests {
     use super::*;
 
+    fn make_transcript(
+        biotype: &str,
+        strand: i8,
+        cds_start: Option<i64>,
+        cds_end: Option<i64>,
+    ) -> TranscriptFeature {
+        TranscriptFeature {
+            transcript_id: "ENSTHGVS000001".to_string(),
+            chrom: "1".to_string(),
+            start: 90,
+            end: 140,
+            strand,
+            biotype: biotype.to_string(),
+            cds_start,
+            cds_end,
+            mature_mirna_regions: Vec::new(),
+            gene_stable_id: None,
+            gene_symbol: None,
+            gene_symbol_source: None,
+            gene_hgnc_id: None,
+            source: None,
+            version: Some(1),
+            cds_start_nf: false,
+            cds_end_nf: false,
+            flags_str: None,
+            is_canonical: false,
+            tsl: None,
+            mane_select: None,
+            mane_plus_clinical: None,
+            translation_stable_id: None,
+            gene_phenotype: false,
+            ccds: None,
+            swissprot: None,
+            trembl: None,
+            uniparc: None,
+            uniprot_isoform: None,
+        }
+    }
+
+    fn make_exon() -> ExonFeature {
+        ExonFeature {
+            transcript_id: "ENSTHGVS000001".to_string(),
+            exon_number: 1,
+            start: 90,
+            end: 140,
+        }
+    }
+
     #[test]
     fn test_aa_one_to_three() {
         assert_eq!(aa_one_to_three('A'), "Ala");
@@ -528,6 +633,39 @@ mod tests {
         assert_eq!(
             format_hgvsp_frameshift("ENSP00000368698.2", "100", "R", "A"),
             Some("ENSP00000368698.2:p.Arg100AlafsTer?".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_uses_coding_relative_numbering() {
+        let tx = make_transcript("protein_coding", 1, Some(100), Some(108));
+        let exon = make_exon();
+        let exons = [&exon];
+        assert_eq!(
+            format_hgvsc(&tx, &exons, Some("14"), "G", "A", 103, 103),
+            Some("ENSTHGVS000001.1:c.4G>A".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_uses_negative_utr_coordinate() {
+        let tx = make_transcript("protein_coding", 1, Some(100), Some(108));
+        let exon = make_exon();
+        let exons = [&exon];
+        assert_eq!(
+            format_hgvsc(&tx, &exons, Some("10"), "A", "G", 99, 99),
+            Some("ENSTHGVS000001.1:c.-1A>G".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_uses_non_coding_numbering() {
+        let tx = make_transcript("lncRNA", 1, None, None);
+        let exon = make_exon();
+        let exons = [&exon];
+        assert_eq!(
+            format_hgvsc(&tx, &exons, Some("14"), "G", "A", 103, 103),
+            Some("ENSTHGVS000001.1:n.14G>A".to_string())
         );
     }
 }

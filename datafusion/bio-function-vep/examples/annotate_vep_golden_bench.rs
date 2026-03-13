@@ -44,6 +44,10 @@ struct Args {
     steps: Vec<String>,
     /// Use interval-overlap fallback for shifted indels (--extended-probes).
     extended_probes: bool,
+    /// Enable HGVSc/HGVSp generation in both Ensembl VEP and annotate_vep.
+    hgvs: bool,
+    /// Reference FASTA required for offline HGVS generation.
+    reference_fasta_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -64,6 +68,11 @@ impl Args {
                     .collect()
             })
             .unwrap_or_else(|| vec!["ensembl".to_string(), "datafusion".to_string()]);
+        let hgvs = args.iter().any(|a| a == "--hgvs");
+        let reference_fasta_path = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--reference-fasta-path="))
+            .map(PathBuf::from);
         // Filter out flags for positional parsing.
         let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
 
@@ -108,6 +117,8 @@ impl Args {
             merged,
             steps,
             extended_probes: args.iter().any(|a| a == "--extended-probes"),
+            hgvs,
+            reference_fasta_path,
         }
     }
 
@@ -146,6 +157,14 @@ async fn main() -> Result<()> {
     println!("  merged: {}", args.merged);
     println!("  steps: {:?}", args.steps);
     println!("  extended_probes: {}", args.extended_probes);
+    println!("  hgvs: {}", args.hgvs);
+    println!(
+        "  reference_fasta_path: {}",
+        args.reference_fasta_path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none)".to_string())
+    );
 
     fs::create_dir_all(&args.work_dir).map_err(io_err)?;
 
@@ -238,6 +257,8 @@ async fn main() -> Result<()> {
                 &args.work_dir,
                 &args.vep_cache_dir,
                 args.merged,
+                args.hgvs,
+                args.reference_fasta_path.as_deref(),
             )?;
             let elapsed = docker_start.elapsed().as_secs_f64();
             println!(
@@ -263,7 +284,7 @@ async fn main() -> Result<()> {
     let mut ours_annotations = None;
     let mut ours_elapsed = 0.0;
     if args.run_datafusion() {
-        let options_json = build_options_json(&args);
+        let options_json = build_options_json(&args)?;
         let effective_context_dir = args
             .context_dir
             .as_deref()
@@ -330,13 +351,17 @@ async fn main() -> Result<()> {
 ///
 /// Scans context_dir for files matching known patterns and builds the
 /// JSON string to pass as the 4th argument to `annotate_vep()`.
-fn build_options_json(args: &Args) -> Option<String> {
+fn build_options_json(args: &Args) -> Result<Option<String>> {
     // Use explicit context_dir, or derive from cache_source parent directory.
     let context_dir = args
         .context_dir
         .as_deref()
         .or_else(|| Path::new(&args.cache_source).parent())
-        .filter(|p| p.is_dir())?;
+        .filter(|p| p.is_dir());
+
+    let Some(context_dir) = context_dir else {
+        return Ok(None);
+    };
 
     // Derive base name from cache_source (e.g. "115_GRCh38_variation_22" -> "115_GRCh38")
     // by stripping "_variation*" or "_variants*" suffix.
@@ -387,6 +412,21 @@ fn build_options_json(args: &Args) -> Option<String> {
     // Extended probes: use interval-overlap fallback for shifted indels.
     entries.push(format!("\"extended_probes\":{}", args.extended_probes));
 
+    if args.hgvs {
+        entries.push("\"hgvs\":true".to_string());
+        let fasta_path = args.reference_fasta_path.as_ref().ok_or_else(|| {
+            DataFusionError::Execution(
+                "--hgvs requires --reference-fasta-path=/path/to/reference.fa[.gz]".to_string(),
+            )
+        })?;
+        entries.push(format!(
+            "\"reference_fasta_path\":\"{}\"",
+            sql_literal(fasta_path.to_str().ok_or_else(|| {
+                DataFusionError::Execution("reference_fasta_path must be valid UTF-8".to_string())
+            })?)
+        ));
+    }
+
     // Batch 3 flags — enable frequency and clinical CSQ fields.
     entries.push("\"check_existing\":true".to_string());
     entries.push("\"af\":true".to_string());
@@ -401,10 +441,10 @@ fn build_options_json(args: &Args) -> Option<String> {
     }
 
     if entries.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(format!("{{{}}}", entries.join(",")))
+    Ok(Some(format!("{{{}}}", entries.join(","))))
 }
 
 /// Register context parquet files from context_dir in the DataFusion session.
@@ -485,6 +525,8 @@ fn run_vep_docker(
     work_dir: &Path,
     vep_cache_dir: &Path,
     merged: bool,
+    hgvs: bool,
+    reference_fasta_path: Option<&Path>,
 ) -> Result<()> {
     let sampled_name = sampled_vcf
         .file_name()
@@ -504,22 +546,66 @@ fn run_vep_docker(
         .arg("-v")
         .arg(volume_cache)
         .arg("-v")
-        .arg(volume_work)
-        .arg("ensemblorg/ensembl-vep:release_115.2")
-        .arg("vep")
-        .arg("--dir")
-        .arg("/opt/vep/.vep")
-        .arg("--cache")
-        .arg("--offline")
-        .arg("--assembly")
-        .arg("GRCh38")
-        .arg("--input_file")
-        .arg(format!("/work/{sampled_name}"))
-        .arg("--output_file")
-        .arg(format!("/work/{golden_name}"))
-        .arg("--vcf")
-        .arg("--force_overwrite")
-        .arg("--no_stats");
+        .arg(volume_work);
+
+    if hgvs {
+        let fasta_path = reference_fasta_path.ok_or_else(|| {
+            DataFusionError::Execution(
+                "--hgvs requires --reference-fasta-path=/path/to/reference.fa[.gz]".to_string(),
+            )
+        })?;
+        let fasta_parent = fasta_path.parent().ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "reference FASTA has no parent directory: {}",
+                fasta_path.display()
+            ))
+        })?;
+        let fasta_name = fasta_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "invalid reference FASTA file name: {}",
+                    fasta_path.display()
+                ))
+            })?;
+        cmd.arg("-v")
+            .arg(format!("{}:/fasta:ro", fasta_parent.display()));
+        cmd.arg("ensemblorg/ensembl-vep:release_115.2")
+            .arg("vep")
+            .arg("--dir")
+            .arg("/opt/vep/.vep")
+            .arg("--cache")
+            .arg("--offline")
+            .arg("--assembly")
+            .arg("GRCh38")
+            .arg("--input_file")
+            .arg(format!("/work/{sampled_name}"))
+            .arg("--output_file")
+            .arg(format!("/work/{golden_name}"))
+            .arg("--vcf")
+            .arg("--force_overwrite")
+            .arg("--no_stats")
+            .arg("--hgvs")
+            .arg("--fasta")
+            .arg(format!("/fasta/{fasta_name}"));
+    } else {
+        cmd.arg("ensemblorg/ensembl-vep:release_115.2")
+            .arg("vep")
+            .arg("--dir")
+            .arg("/opt/vep/.vep")
+            .arg("--cache")
+            .arg("--offline")
+            .arg("--assembly")
+            .arg("GRCh38")
+            .arg("--input_file")
+            .arg(format!("/work/{sampled_name}"))
+            .arg("--output_file")
+            .arg(format!("/work/{golden_name}"))
+            .arg("--vcf")
+            .arg("--force_overwrite")
+            .arg("--no_stats");
+    }
 
     // Enable regulatory feature annotations (VEP skips them by default).
     cmd.arg("--regulatory");

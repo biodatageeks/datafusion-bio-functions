@@ -68,6 +68,8 @@ Observed result:
 Remaining open work outside the README chr1 gate:
 
 - Phase 4 HGVS-specific parity benchmark with `--hgvs --fasta`
+- exact port of the Ensembl Variation HGVS algorithm used by VEP
+- indexed-FASTA validation and HGVS integration-harness hardening
 - refresh acceptance records as that second benchmark is added
 
 ## Upstream Source of Truth
@@ -103,6 +105,40 @@ These files define the behavior that the Rust implementation must match.
   - coding consequence classification
   - peptide allele string generation
   - boundary shift handling
+
+### HGVS semantics used by VEP
+
+- `modules/Bio/EnsEMBL/VEP/Config.pm`
+  - `hgvs`
+  - `hgvsc`
+  - `hgvsp`
+  - `hgvsp_use_prediction`
+  - `remove_hgvsp_version`
+  - `shift_hgvs`
+- `modules/Bio/EnsEMBL/VEP/Runner.pm`
+  - offline HGVS + FASTA gating
+  - `shift_hgvs=0` forcing `shift_3prime=0`
+- `modules/Bio/EnsEMBL/VEP/BaseRunner.pm`
+  - offline/cache-backed HGVS shift defaults
+- `modules/Bio/EnsEMBL/VEP/OutputFactory.pm`
+  - HGVS emission
+  - URI escaping
+  - output-level version stripping / predicted-format toggles
+- external dependency:
+  - `Bio::EnsEMBL::Variation::TranscriptVariationAllele`
+    - `hgvs_transcript`
+    - `hgvs_protein`
+    - `_return_3prime`
+    - `_clip_alleles`
+    - `_get_cDNA_position`
+    - `_get_hgvs_protein_type`
+    - `_get_hgvs_peptides`
+    - `_get_fs_peptides`
+    - `_get_alternate_cds`
+    - `_stop_loss_extra_AA`
+  - `Bio::EnsEMBL::Variation::Utils::Sequence`
+    - `hgvs_variant_notation`
+    - `format_hgvs_string`
 
 ## Main Diagnosis
 
@@ -188,12 +224,26 @@ Relevant upstream file:
 
 ### 4. The current benchmark does not prove HGVS parity
 
-The benchmark requests `HGVSc` and `HGVSp` in the CSQ field list but does not enable `--hgvs`, and our serializer currently emits empty strings for those fields in transcript CSQ assembly.
+The README chr1 benchmark still does not prove HGVS parity because it does not enable `--hgvs --fasta`.
+
+Current worktree status:
+
+- wrapper-level HGVS flags and CSQ emission are now wired
+- benchmark CLI support for `--hgvs` and `--reference-fasta-path` is partially in place
+- however, the actual HGVS generation path still relies on the local simplified formatter rather than the exact Ensembl Variation algorithm
+- the new end-to-end HGVS integration test is currently blocked by indexed-FASTA fixture setup, because runtime opens an indexed FASTA reader rather than a plain FASTA path
+
+This means the remaining HGVS gap is no longer “blank serializer fields”; it is now “exact upstream algorithm + valid indexed FASTA harness”.
 
 Relevant files:
 
 - [annotate_vep_golden_bench.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/examples/annotate_vep_golden_bench.rs#L514)
-- [annotate_provider.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/annotate_provider.rs#L2028)
+- [annotate_provider.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/annotate_provider.rs#L1176)
+- [annotate_provider.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/annotate_provider.rs#L2338)
+- [annotate_table_function.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/annotate_table_function.rs#L1850)
+- [hgvs.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/hgvs.rs#L48)
+- [hgvs.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/hgvs.rs#L290)
+- [variant_lookup_exec.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/variant_lookup_exec.rs#L907)
 - [OutputFactory.pm](/Users/mwiewior/research/git/ensembl-vep/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1696)
 
 This does not block the README 74-field target, but it does block true end-to-end parity with VEP.
@@ -735,26 +785,55 @@ Purpose: reach real VEP parity beyond the current README benchmark.
 
 Tasks:
 
-1. Enable a second golden benchmark mode that runs VEP with:
-   - `--hgvs`
-   - `--fasta`
-2. Stop hardcoding blank `HGVSc` and `HGVSp` in transcript CSQ assembly.
-3. Use the already-computed transcript consequence HGVS fields when enabled.
-4. If the current HGVS implementation differs from VEP:
-   - port strand handling
-   - port transcript/protein accession formatting
-   - port offset handling
-   - port escaping behavior
+1. Finish the HGVS harness and setup validation first:
+   - enable the second golden benchmark mode that runs VEP with `--hgvs --fasta`
+   - require an indexed reference FASTA at setup time rather than failing later during execution
+   - make the HGVS integration test use a valid self-contained indexed FASTA fixture
+2. Keep wrapper semantics aligned with VEP:
+   - `hgvs` enables both `hgvsc` and `hgvsp`
+   - offline/cache-backed HGVS requires FASTA
+   - `shift_hgvs=0` disables HGVS-only 3-prime shifting by forcing `shift_3prime=0`
+   - `remove_hgvsp_version`, `hgvsp_use_prediction`, and output-layer escaping follow VEP behavior exactly
+3. Replace the simplified transcript HGVS formatter with a source-equivalent Ensembl Variation port:
+   - port `hgvs_variant_notation`
+   - port `format_hgvs_string`
+   - port `_clip_alleles`
+   - port `_get_cDNA_position`
+   - port transcript numbering (`c.` vs `n.`), intronic offsets, 5' UTR negatives, and 3' UTR `*` coordinates
+   - port shifted insertion/deletion handling via `_return_3prime` / `shift_hash`
+4. Replace the simplified protein HGVS formatter with a source-equivalent Ensembl Variation port:
+   - port `_get_hgvs_protein_type`
+   - port `_get_hgvs_peptides`
+   - port `_get_fs_peptides`
+   - port `_get_alternate_cds`
+   - port `_stop_loss_extra_AA`
+   - port peptide duplication / delins / frameshift / stop-loss / start-loss formatting
+5. Add upstream-style regression coverage before relying on full chr1:
+   - synonymous `=`
+   - intronic HGVS on both strands
+   - 5' UTR and 3' UTR transcript coordinates
+   - insertion vs duplication
+   - deletion vs delins
+   - frameshift with exact first changed AA
+   - stop-loss extension
+   - version stripping / predicted-format toggles / output escaping
 
 Relevant current files:
 
 - [annotate_vep_golden_bench.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/examples/annotate_vep_golden_bench.rs#L514)
-- [annotate_provider.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/annotate_provider.rs#L2028)
+- [annotate_provider.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/annotate_provider.rs#L1176)
+- [annotate_provider.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/annotate_provider.rs#L2338)
+- [annotate_table_function.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/annotate_table_function.rs#L1850)
+- [hgvs.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/hgvs.rs#L48)
+- [hgvs.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/hgvs.rs#L290)
+- [variant_lookup_exec.rs](/Users/mwiewior/research/git/datafusion-bio-functions/datafusion/bio-function-vep/src/variant_lookup_exec.rs#L907)
 - [OutputFactory.pm](/Users/mwiewior/research/git/ensembl-vep/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1678)
 
 Acceptance:
 
+- HGVS integration tests pass with a real indexed FASTA fixture
 - HGVS benchmark reaches zero mismatches when HGVS is enabled
+- no simplified HGVS-only heuristic formatter remains in the hot path
 
 ## Traceability Comment Format
 
@@ -848,6 +927,9 @@ Status on March 13, 2026:
 
 - Criteria `1` through `5` are satisfied on chr1.
 - Criterion `6` remains open.
+  - wrapper-level HGVS emission is in place
+  - exact Ensembl Variation HGVS generation is not yet ported
+  - the new HGVS integration test still fails until indexed FASTA setup is hardened
 
 ## Recommended Execution Order
 
@@ -867,7 +949,7 @@ Status on March 13, 2026:
 - After Phase 3:
   - completed
 - After Phase 4:
-  - parity is no longer limited by the current benchmark’s blank HGVS fields
+  - parity is no longer limited by the current benchmark’s unexercised or simplified HGVS path
 
 ## Non-Goals
 

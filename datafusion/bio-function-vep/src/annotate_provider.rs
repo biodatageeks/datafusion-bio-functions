@@ -26,6 +26,7 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext};
+use noodles_fasta as fasta;
 use serde_json::Value;
 
 use crate::allele::{MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele};
@@ -357,6 +358,38 @@ impl VepFlags {
             3 => self.af_gnomadg,
             _ => false,
         }
+    }
+}
+
+/// Parsed HGVS-related flags controlling HGVSc/HGVSp emission.
+///
+/// Traceability:
+/// - Ensembl VEP `Config.pm` HGVS-related flags
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L195-L200
+/// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1698-L1715
+#[derive(Debug, Clone, Copy, Default)]
+struct HgvsFlags {
+    hgvsc: bool,
+    hgvsp: bool,
+}
+
+impl HgvsFlags {
+    fn from_options_json(options_json: Option<&str>) -> Self {
+        let parse = |key| {
+            options_json
+                .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
+                .unwrap_or(false)
+        };
+        let hgvs = parse("hgvs");
+        Self {
+            hgvsc: hgvs || parse("hgvsc"),
+            hgvsp: hgvs || parse("hgvsp"),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.hgvsc || self.hgvsp
     }
 }
 
@@ -1141,6 +1174,42 @@ impl AnnotateProvider {
             .unwrap_or((5000, 5000))
     }
 
+    /// Traceability:
+    /// - Ensembl VEP `Runner::post_setup_checks()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Runner.pm#L726-L738
+    ///
+    /// VEP refuses offline HGVS output without an available FASTA. Our table
+    /// function is also offline/cache-backed, so require `reference_fasta_path`
+    /// whenever HGVS output is requested. Our runtime uses indexed FASTA
+    /// access, so validate that the indexed reader can actually be opened here
+    /// rather than failing later during execution.
+    fn validate_hgvs_reference_fasta(
+        hgvs_flags: HgvsFlags,
+        reference_fasta_path: Option<&str>,
+    ) -> Result<()> {
+        if !hgvs_flags.any() {
+            return Ok(());
+        }
+        let Some(path) = reference_fasta_path else {
+            return Err(DataFusionError::Execution(
+                "annotate_vep(): Cannot generate HGVS coordinates (--hgvs/--hgvsc/--hgvsp) without reference_fasta_path (VEP --fasta)".to_string(),
+            ));
+        };
+        if !std::path::Path::new(path).exists() {
+            return Err(DataFusionError::Execution(format!(
+                "annotate_vep(): reference_fasta_path does not exist: {path}"
+            )));
+        }
+        fasta::io::indexed_reader::Builder::default()
+            .build_from_path(path)
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): failed to open indexed reference FASTA '{path}': {e}"
+                ))
+            })?;
+        Ok(())
+    }
+
     async fn resolve_transcript_context_tables(
         &self,
         cache_table: &str,
@@ -1854,6 +1923,7 @@ impl AnnotateProvider {
         sv_table: Option<&str>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let flags = VepFlags::from_options_json(self.options_json.as_deref());
+        let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
 
         // Build the lookup plan directly (bypassing SQL) so we can attach
         // a co-located data sink that piggybacks on the same cache scan.
@@ -1883,6 +1953,7 @@ impl AnnotateProvider {
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_string_option(opts, "reference_fasta_path"));
+        Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let mut provider = LookupProvider::new(
             Arc::clone(&self.session),
             self.vcf_table.clone(),
@@ -2078,6 +2149,7 @@ impl AnnotateProvider {
             .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
             .unwrap_or(false);
         let flags = VepFlags::from_options_json(self.options_json.as_deref());
+        let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
 
         let mut csq_builder = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 40);
         let mut most_builder =
@@ -2282,8 +2354,16 @@ impl AnnotateProvider {
                     let codons_str = tc.codons.as_deref().unwrap_or("");
                     let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
                     let tc_flags = tc.flags.as_deref().unwrap_or("");
-                    let hgvsc = "";
-                    let hgvsp = "";
+                    let hgvsc = if hgvs_flags.hgvsc {
+                        tc.hgvsc.as_deref().unwrap_or("")
+                    } else {
+                        ""
+                    };
+                    let hgvsp = if hgvs_flags.hgvsp {
+                        tc.hgvsp.as_deref().unwrap_or("")
+                    } else {
+                        ""
+                    };
                     let source_val = if merged { source } else { "" };
 
                     // Batch 1 fields from transcript metadata.
@@ -3345,6 +3425,95 @@ mod tests {
         let flags = VepFlags::from_options_json(Some(r#"{"af_gnomade":true}"#));
         assert!(flags.af_gnomade);
         assert!(flags.check_existing);
+    }
+
+    #[test]
+    fn test_hgvs_flags_hgvs_enables_both_fields() {
+        let flags = HgvsFlags::from_options_json(Some(r#"{"hgvs":true}"#));
+        assert!(flags.hgvsc);
+        assert!(flags.hgvsp);
+        assert!(flags.any());
+    }
+
+    #[test]
+    fn test_hgvs_flags_single_field() {
+        let flags = HgvsFlags::from_options_json(Some(r#"{"hgvsc":true}"#));
+        assert!(flags.hgvsc);
+        assert!(!flags.hgvsp);
+        assert!(flags.any());
+    }
+
+    #[test]
+    fn test_validate_hgvs_reference_fasta_requires_existing_path() {
+        let flags = HgvsFlags {
+            hgvsc: true,
+            hgvsp: false,
+        };
+        let missing = AnnotateProvider::validate_hgvs_reference_fasta(flags, None)
+            .expect_err("missing reference fasta should fail")
+            .to_string();
+        assert!(missing.contains("Cannot generate HGVS coordinates"));
+
+        let bad_path = AnnotateProvider::validate_hgvs_reference_fasta(flags, Some("/no/such.fa"))
+            .expect_err("nonexistent reference fasta should fail")
+            .to_string();
+        assert!(bad_path.contains("reference_fasta_path does not exist"));
+    }
+
+    fn write_test_indexed_fasta(
+        sequence_name: &str,
+        sequence: &str,
+    ) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create temp fasta dir");
+        let fasta_path = dir.path().join("test.fa");
+        let fasta_contents = format!(">{sequence_name}\n{sequence}\n");
+        std::fs::write(&fasta_path, fasta_contents).expect("write temp fasta");
+        let fasta_index = format!(
+            "{sequence_name}\t{}\t{}\t{}\t{}\n",
+            sequence.len(),
+            sequence_name.len() + 2,
+            sequence.len(),
+            sequence.len() + 1
+        );
+        std::fs::write(fasta_path.with_extension("fa.fai"), fasta_index)
+            .expect("write temp fasta index");
+        (
+            dir,
+            fasta_path
+                .to_str()
+                .expect("temp fasta path should be UTF-8")
+                .to_string(),
+        )
+    }
+
+    #[test]
+    fn test_validate_hgvs_reference_fasta_requires_index() {
+        let flags = HgvsFlags {
+            hgvsc: true,
+            hgvsp: false,
+        };
+        let dir = tempfile::tempdir().expect("create temp fasta dir");
+        let fasta_path = dir.path().join("test.fa");
+        std::fs::write(&fasta_path, b">1\nNNNNNNNNNN\n").expect("write temp fasta");
+
+        let err = AnnotateProvider::validate_hgvs_reference_fasta(
+            flags,
+            Some(fasta_path.to_str().expect("utf8 fasta path")),
+        )
+        .expect_err("plain fasta without index should fail")
+        .to_string();
+        assert!(err.contains("failed to open indexed reference FASTA"));
+    }
+
+    #[test]
+    fn test_validate_hgvs_reference_fasta_accepts_indexed_path() {
+        let flags = HgvsFlags {
+            hgvsc: true,
+            hgvsp: false,
+        };
+        let (_dir, fasta_path) = write_test_indexed_fasta("1", "NNNNNNNNNN");
+        AnnotateProvider::validate_hgvs_reference_fasta(flags, Some(&fasta_path))
+            .expect("indexed fasta should validate");
     }
 
     // =======================================================================

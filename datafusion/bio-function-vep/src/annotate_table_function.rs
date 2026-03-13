@@ -1195,6 +1195,161 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid stop-loss translation memtable")
     }
 
+    fn hgvs_vcf_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![103])),
+                Arc::new(Int64Array::from(vec![103])),
+                Arc::new(StringArray::from(vec!["G"])),
+                Arc::new(StringArray::from(vec!["A"])),
+            ],
+        )
+        .expect("valid hgvs vcf batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid hgvs vcf memtable")
+    }
+
+    fn hgvs_cache_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("AF", DataType::Float64, true),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![103])),
+                Arc::new(Int64Array::from(vec![103])),
+                Arc::new(StringArray::from(vec!["rs_hgvs"])),
+                Arc::new(StringArray::from(vec!["G/A"])),
+                Arc::new(StringArray::from(vec!["pathogenic"])),
+                Arc::new(Float64Array::from(vec![0.02_f64])),
+                Arc::new(Int64Array::from(vec![0])),
+            ],
+        )
+        .expect("valid hgvs cache batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid hgvs cache memtable")
+    }
+
+    fn hgvs_transcripts_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("strand", DataType::Int64, false),
+            Field::new("biotype", DataType::Utf8, false),
+            Field::new("cds_start", DataType::Int64, true),
+            Field::new("cds_end", DataType::Int64, true),
+            Field::new("version", DataType::Int64, true),
+            Field::new("translation_stable_id", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["ENSTHGVS000001"])),
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![90])),
+                Arc::new(Int64Array::from(vec![140])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["protein_coding"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![108])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["ENSPHGVS000001"])),
+            ],
+        )
+        .expect("valid hgvs transcript batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid hgvs transcript memtable")
+    }
+
+    fn hgvs_exons_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("exon_number", DataType::Int64, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["ENSTHGVS000001"])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![90])),
+                Arc::new(Int64Array::from(vec![140])),
+            ],
+        )
+        .expect("valid hgvs exon batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid hgvs exon memtable")
+    }
+
+    fn hgvs_translations_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("cds_len", DataType::Int64, true),
+            Field::new("protein_len", DataType::Int64, true),
+            Field::new("translation_seq", DataType::Utf8, true),
+            Field::new("cds_sequence", DataType::Utf8, true),
+            Field::new("stable_id", DataType::Utf8, true),
+            Field::new("version", DataType::Int64, true),
+        ]));
+        // CDS from 100..108 => ATG GCT TAA, variant 103 G>A gives Ala2Thr.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["ENSTHGVS000001"])),
+                Arc::new(Int64Array::from(vec![9])),
+                Arc::new(Int64Array::from(vec![3])),
+                Arc::new(StringArray::from(vec!["MA*"])),
+                Arc::new(StringArray::from(vec!["ATGGCTTAA"])),
+                Arc::new(StringArray::from(vec!["ENSPHGVS000001"])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .expect("valid hgvs translation batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid hgvs translation memtable")
+    }
+
+    fn write_test_indexed_fasta(
+        sequence_name: &str,
+        sequence: &str,
+    ) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("create temp fasta dir");
+        let fasta_path = dir.path().join("test.fa");
+        let fasta_contents = format!(">{sequence_name}\n{sequence}\n");
+        std::fs::write(&fasta_path, fasta_contents).expect("write temp fasta");
+        let fasta_index = format!(
+            "{sequence_name}\t{}\t{}\t{}\t{}\n",
+            sequence.len(),
+            sequence_name.len() + 2,
+            sequence.len(),
+            sequence.len() + 1
+        );
+        std::fs::write(fasta_path.with_extension("fa.fai"), fasta_index)
+            .expect("write temp fasta index");
+        (
+            dir,
+            fasta_path
+                .to_str()
+                .expect("temp fasta path should be UTF-8")
+                .to_string(),
+        )
+    }
+
     fn distance_vcf_table() -> MemTable {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -1712,6 +1867,95 @@ mod tests {
         assert_eq!(upstream_entry[18], "7079");
         assert_eq!(downstream_entry[1], "downstream_gene_variant");
         assert_eq!(downstream_entry[18], "15000");
+    }
+
+    // Mirrors Ensembl VEP offline HGVS gating and output toggles:
+    // - https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Runner.pm#L726-L738
+    // - https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1698-L1715
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_hgvs_fields_require_flag_and_reference_fasta() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_hgvs", Arc::new(hgvs_vcf_table()))
+            .expect("register hgvs vcf");
+        ctx.register_table("var_hgvs_cache", Arc::new(hgvs_cache_table()))
+            .expect("register hgvs cache");
+        ctx.register_table(
+            "var_hgvs_cache_transcripts",
+            Arc::new(hgvs_transcripts_table()),
+        )
+        .expect("register hgvs transcripts");
+        ctx.register_table("var_hgvs_cache_exons", Arc::new(hgvs_exons_table()))
+            .expect("register hgvs exons");
+        ctx.register_table(
+            "var_hgvs_cache_translations",
+            Arc::new(hgvs_translations_table()),
+        )
+        .expect("register hgvs translations");
+
+        let default_batches = ctx
+            .sql("SELECT csq FROM annotate_vep('vcf_hgvs', 'var_hgvs_cache', 'parquet')")
+            .await
+            .expect("default hgvs query should parse")
+            .collect()
+            .await
+            .expect("collect default hgvs annotate_vep");
+        let default_csq = string_values(
+            default_batches[0]
+                .column_by_name("csq")
+                .expect("default csq column exists"),
+        );
+        let default_entry = csq_entries(default_csq[0].as_ref().expect("default csq present"))
+            .into_iter()
+            .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
+            .expect("transcript entry should exist");
+        assert_eq!(default_entry[10], "");
+        assert_eq!(default_entry[11], "");
+
+        let missing_fasta_err = ctx
+            .sql(
+                "SELECT csq FROM annotate_vep( \
+                   'vcf_hgvs', \
+                   'var_hgvs_cache', \
+                   'parquet', \
+                   '{\"hgvs\":true}' \
+                 )",
+            )
+            .await
+            .expect("hgvs query should parse")
+            .collect()
+            .await
+            .expect_err("hgvs without reference fasta should fail")
+            .to_string();
+        assert!(missing_fasta_err.contains("Cannot generate HGVS coordinates"));
+
+        let (_fasta_dir, fasta_path) = write_test_indexed_fasta("1", "NNNNNNNNNN");
+
+        let hgvs_batches = ctx
+            .sql(&format!(
+                "SELECT csq FROM annotate_vep( \
+                   'vcf_hgvs', \
+                   'var_hgvs_cache', \
+                   'parquet', \
+                   '{{\"hgvs\":true,\"reference_fasta_path\":\"{}\"}}' \
+                 )",
+                fasta_path.replace('\'', "''")
+            ))
+            .await
+            .expect("hgvs enabled query should parse")
+            .collect()
+            .await
+            .expect("collect hgvs enabled annotate_vep");
+        let hgvs_csq = string_values(
+            hgvs_batches[0]
+                .column_by_name("csq")
+                .expect("hgvs csq column exists"),
+        );
+        let hgvs_entry = csq_entries(hgvs_csq[0].as_ref().expect("hgvs csq present"))
+            .into_iter()
+            .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
+            .expect("transcript hgvs entry should exist");
+        assert_eq!(hgvs_entry[10], "ENSTHGVS000001.1:c.4G>A");
+        assert_eq!(hgvs_entry[11], "ENSPHGVS000001.1:p.Ala2Thr");
     }
 
     #[tokio::test(flavor = "multi_thread")]
