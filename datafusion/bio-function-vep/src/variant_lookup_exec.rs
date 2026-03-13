@@ -143,17 +143,8 @@ fn push_exact_candidates(
     candidates.extend(matches.iter().map(|&idx| idx as usize));
 }
 
-fn cache_allele_string_needs_overlap_probe(allele_string: &str) -> bool {
-    let mut alleles = allele_string.split('/');
-    let Some(ref_allele) = alleles.next() else {
-        return false;
-    };
-    for alt_allele in alleles {
-        if ref_allele == "-" || alt_allele == "-" || ref_allele.len() != alt_allele.len() {
-            return true;
-        }
-    }
-    false
+fn output_allele_from_allele_string(allele_string: &str) -> Option<&str> {
+    allele_string.split_once('/').map(|(_, alt)| alt)
 }
 
 #[derive(Clone, Copy)]
@@ -327,7 +318,9 @@ where
 /// This mirrors VEP's prefilter by considering overlaps against both shifted
 /// active coordinates and, when defined, unshifted minimized coordinates
 /// before `compare_existing()` decides whether the existing variant is
-/// allele-compatible.
+/// allele-compatible. VEP applies this start-window fetch to all existing
+/// allele classes, not just indels, so point substitutions that fall inside a
+/// larger MNV window must also survive to `compare_existing()`.
 fn collect_overlapping_candidates(
     compare_hash_bucket: Option<&CoordBucket>,
     unshifted_hash_bucket: Option<&CoordBucket>,
@@ -335,7 +328,6 @@ fn collect_overlapping_candidates(
     unshifted_tree: Option<&COITree<u32, u32>>,
     start: i64,
     end: i64,
-    allele_string: &str,
 ) -> Vec<usize> {
     let probe_start = start.min(end);
     let probe_end = start.max(end);
@@ -351,10 +343,6 @@ fn collect_overlapping_candidates(
     if candidates.len() > 1 {
         candidates.sort_unstable();
         candidates.dedup();
-    }
-
-    if !cache_allele_string_needs_overlap_probe(allele_string) {
-        return candidates;
     }
 
     let mut seen: HashSet<usize> = candidates.iter().copied().collect();
@@ -464,8 +452,20 @@ fn compare_existing_variant(
 /// cache entries attached to that specific parser/input allele.
 pub type ColocatedKey = (String, i64, i64, String);
 
+#[derive(Debug, Clone, Default)]
+pub struct ColocatedSinkValue {
+    pub entries: Vec<ColocatedCacheEntry>,
+    /// Active compare-space output allele component. This mirrors the allele
+    /// identity used by `compare_existing()` after any genomic shift is
+    /// applied.
+    pub compare_output_allele: Option<String>,
+    /// Original compare-space output allele component retained only when VEP
+    /// defines `unshifted_allele_string` / `alt_orig_allele_string`.
+    pub unshifted_output_allele: Option<String>,
+}
+
 /// Shared sink for co-located data collected during `VariantLookupExec` streaming.
-pub type ColocatedSink = Arc<Mutex<HashMap<ColocatedKey, Vec<ColocatedCacheEntry>>>>;
+pub type ColocatedSink = Arc<Mutex<HashMap<ColocatedKey, ColocatedSinkValue>>>;
 
 /// Physical execution plan for self-contained left interval join.
 ///
@@ -1206,7 +1206,7 @@ impl VariantLookupStream {
             let var_name_col = cache_batch.column(coloc_idx.variation_name);
             let var_names = StringAccessor::new(var_name_col, "variation_name")?;
 
-            let mut local_buf: HashMap<ColocatedKey, Vec<ColocatedCacheEntry>> = HashMap::new();
+            let mut local_buf: HashMap<ColocatedKey, ColocatedSinkValue> = HashMap::new();
             let build = self.build.as_ref().unwrap();
             let rows = &build.rows;
             let mut active_chrom = String::new();
@@ -1264,7 +1264,6 @@ impl VariantLookupStream {
                     active_unshifted_tree,
                     cs1,
                     ce1,
-                    allele_str,
                 ) {
                     let vcf_row = &rows[vcf_idx];
                     if !existing_start_is_visible_to_input_row(vcf_row, cs1) {
@@ -1282,7 +1281,19 @@ impl VariantLookupStream {
                         vcf_row.input_end,
                         vcf_row.input_allele_string.clone(),
                     );
-                    local_buf.entry(key).or_default().push(ColocatedCacheEntry {
+                    let sink_value = local_buf.entry(key).or_insert_with(|| ColocatedSinkValue {
+                        entries: Vec::new(),
+                        compare_output_allele: output_allele_from_allele_string(
+                            &vcf_row.compare_allele_string,
+                        )
+                        .map(str::to_string),
+                        unshifted_output_allele: vcf_row
+                            .unshifted_allele_string
+                            .as_deref()
+                            .and_then(output_allele_from_allele_string)
+                            .map(str::to_string),
+                    });
+                    sink_value.entries.push(ColocatedCacheEntry {
                         variation_name: var_name.to_string(),
                         allele_string: allele_str.to_string(),
                         matched_alleles,
@@ -1332,8 +1343,21 @@ impl VariantLookupStream {
 
             if !local_buf.is_empty() {
                 let mut guard = sink.lock().unwrap();
-                for (key, entries) in local_buf {
-                    guard.entry(key).or_default().extend(entries);
+                for (key, mut value) in local_buf {
+                    guard
+                        .entry(key)
+                        .and_modify(|existing| {
+                            if existing.compare_output_allele.is_none() {
+                                existing.compare_output_allele =
+                                    value.compare_output_allele.clone();
+                            }
+                            if existing.unshifted_output_allele.is_none() {
+                                existing.unshifted_output_allele =
+                                    value.unshifted_output_allele.clone();
+                            }
+                            existing.entries.append(&mut value.entries);
+                        })
+                        .or_insert(value);
                 }
             }
         }
@@ -1927,7 +1951,6 @@ mod tests {
                 build.unshifted_trees.get("1"),
                 62689177,
                 62689188,
-                "ACATATATATATATATATATATAT/-"
             ),
             vec![0]
         );
@@ -1974,29 +1997,28 @@ mod tests {
                 build.unshifted_trees.get("1"),
                 101,
                 101,
-                "A/G"
             ),
             vec![0]
         );
     }
 
     #[test]
-    fn cache_allele_string_probe_requirement_matches_variant_class() {
-        assert!(!cache_allele_string_needs_overlap_probe("A/G"));
-        assert!(!cache_allele_string_needs_overlap_probe("AA/GG"));
-        assert!(!cache_allele_string_needs_overlap_probe("A/G/T"));
-        assert!(cache_allele_string_needs_overlap_probe("-/AC"));
-        assert!(cache_allele_string_needs_overlap_probe("AC/-"));
-        assert!(cache_allele_string_needs_overlap_probe("AC/A"));
+    fn collect_overlapping_candidates_uses_overlap_probe_for_substitutions_without_exact_hits() {
+        let tree = COITree::new(&[Interval::new(101, 101, 0)]);
+
+        assert_eq!(
+            collect_overlapping_candidates(None, None, Some(&tree), None, 101, 101),
+            vec![0]
+        );
     }
 
     #[test]
-    fn collect_overlapping_candidates_skips_overlap_probe_for_substitutions_without_exact_hits() {
-        let tree = COITree::new(&[Interval::new(101, 101, 0)]);
+    fn collect_overlapping_candidates_keeps_point_existing_variants_inside_mnv_window() {
+        let tree = COITree::new(&[Interval::new(59546535, 59546538, 0)]);
 
-        assert!(
-            collect_overlapping_candidates(None, None, Some(&tree), None, 101, 101, "A/G")
-                .is_empty()
+        assert_eq!(
+            collect_overlapping_candidates(None, None, Some(&tree), None, 59546535, 59546535),
+            vec![0]
         );
     }
 
@@ -2014,9 +2036,39 @@ mod tests {
                 None,
                 10,
                 11,
-                "CA/-"
             ),
             vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn compare_existing_variant_matches_point_existing_variant_within_mnv() {
+        let row = BuildRow {
+            vcf_ref: "GATT".to_string(),
+            vcf_alt: "TATT".to_string(),
+            input_allele_string: "GATT/TATT".to_string(),
+            input_start: 59546535,
+            input_end: 59546538,
+            compare_allele_string: "GATT/TATT".to_string(),
+            compare_start: 59546535,
+            compare_end: 59546538,
+            unshifted_allele_string: None,
+            vep_start: 59546535,
+            vep_end: 59546538,
+            unshifted_start: None,
+            unshifted_end: None,
+        };
+
+        let matched = compare_existing_variant(&row, "G/T", 59546535, 59546535).unwrap();
+
+        assert_eq!(
+            matched,
+            vec![MatchedVariantAllele {
+                a_allele: "TATT".to_string(),
+                a_index: 0,
+                b_allele: "T".to_string(),
+                b_index: 0,
+            }]
         );
     }
 
@@ -2155,7 +2207,6 @@ mod tests {
                 build.unshifted_trees.get("1"),
                 8,
                 9,
-                "CA/-"
             ),
             vec![0]
         );
@@ -2167,7 +2218,6 @@ mod tests {
                 build.unshifted_trees.get("1"),
                 2,
                 3,
-                "CA/-"
             ),
             vec![0]
         );

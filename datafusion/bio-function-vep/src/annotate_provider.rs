@@ -39,7 +39,9 @@ use crate::transcript_consequence::{
     SvEventKind, SvFeatureKind, TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature,
     VariantInput, is_vep_transcript,
 };
-use crate::variant_lookup_exec::{ColocatedCacheEntry, ColocatedKey, ColocatedSink};
+use crate::variant_lookup_exec::{
+    ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
+};
 
 /// Known variation cache annotation columns exposed as top-level output fields.
 /// All are nullable Utf8. Columns not present in the actual cache emit NULLs.
@@ -376,6 +378,8 @@ struct ColocatedEntry {
 #[derive(Debug, Default, Clone)]
 struct ColocatedData {
     entries: Vec<ColocatedEntry>,
+    compare_output_allele: Option<String>,
+    unshifted_output_allele: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -440,6 +444,45 @@ impl ColocatedEntry {
 }
 
 impl ColocatedData {
+    /// Traceability:
+    /// - Ensembl VEP `add_colocated_variant_info()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035
+    ///
+    /// Rust stores the active compare-space allele and any retained original
+    /// compare-space allele separately on the colocated sink. For the live CSQ
+    /// path, `Existing_variation` must prefer the active compare-space allele
+    /// and only fall back to the retained original allele when the output
+    /// allele already equals the active representation.
+    fn variant_match_output_allele<'a>(&'a self, output_allele: &str) -> Option<&'a str> {
+        self.compare_output_allele
+            .as_deref()
+            .filter(|allele| *allele != output_allele)
+            .or_else(|| {
+                self.unshifted_output_allele
+                    .as_deref()
+                    .filter(|allele| *allele != output_allele)
+            })
+    }
+
+    /// Traceability:
+    /// - Ensembl VEP `add_colocated_frequency_data()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1150-L1157
+    ///
+    /// Frequency output matches the current CSQ allele first, then
+    /// `alt_orig_allele_string` when VEP retained original shift metadata.
+    /// Because Rust stores both active and retained compare-space alleles on
+    /// the sink, the live path must prefer the retained original allele here.
+    fn frequency_match_output_allele<'a>(&'a self, output_allele: &str) -> Option<&'a str> {
+        self.unshifted_output_allele
+            .as_deref()
+            .filter(|allele| *allele != output_allele)
+            .or_else(|| {
+                self.compare_output_allele
+                    .as_deref()
+                    .filter(|allele| *allele != output_allele)
+            })
+    }
+
     fn sorted_entries(&self) -> Vec<&ColocatedEntry> {
         let mut entries: Vec<&ColocatedEntry> = self.entries.iter().collect();
         entries.sort_by(|a, b| {
@@ -708,12 +751,16 @@ impl ColocatedData {
 ///
 /// Each existing variant must retain the `matched_alleles` attached during
 /// `compare_existing()`, merged across duplicate probe hits but without
-/// re-synthesizing allele matches from local heuristics.
+/// re-synthesizing allele matches from local heuristics. The active compare
+/// allele plus any retained original compare allele must also survive this
+/// merge so the live CSQ path can reproduce OutputFactory's shifted-vs-original
+/// allele filtering.
 fn build_colocated_map_from_sink(
-    sink: &HashMap<ColocatedKey, Vec<ColocatedCacheEntry>>,
+    sink: &HashMap<ColocatedKey, ColocatedSinkValue>,
 ) -> HashMap<ColocatedKey, ColocatedData> {
     let mut map = HashMap::with_capacity(sink.len());
-    for (key, cache_entries) in sink {
+    for (key, sink_value) in sink {
+        let cache_entries = &sink_value.entries;
         let mut entries: Vec<ColocatedEntry> = Vec::new();
         let mut seen: HashMap<String, usize> = HashMap::new();
         for ce in cache_entries {
@@ -747,7 +794,14 @@ fn build_colocated_map_from_sink(
             });
         }
 
-        map.insert(key.clone(), ColocatedData { entries });
+        map.insert(
+            key.clone(),
+            ColocatedData {
+                entries,
+                compare_output_allele: sink_value.compare_output_allele.clone(),
+                unshifted_output_allele: sink_value.unshifted_output_allele.clone(),
+            },
+        );
     }
     map
 }
@@ -2029,27 +2083,39 @@ impl AnnotateProvider {
                 end_val,
                 input_allele_string,
             ));
-            let variant_fields = if flags.check_existing {
-                coloc
-                    .map(|data| data.variant_fields(&vep_allele, None, flags.pubmed))
-                    .unwrap_or_default()
+            let (variant_fields, frequency_fields) = if flags.check_existing {
+                if let Some(data) = coloc {
+                    (
+                        data.variant_fields(
+                            &vep_allele,
+                            data.variant_match_output_allele(&vep_allele),
+                            flags.pubmed,
+                        ),
+                        data.frequency_fields(
+                            &vep_allele,
+                            data.frequency_match_output_allele(&vep_allele),
+                            &flags,
+                        ),
+                    )
+                } else {
+                    (
+                        ColocatedVariantFields::default(),
+                        ColocatedFrequencyFields {
+                            af_values: vec![String::new(); AF_COLUMNS.len()],
+                            max_af: String::new(),
+                            max_af_pops: String::new(),
+                        },
+                    )
+                }
             } else {
-                ColocatedVariantFields::default()
-            };
-            let frequency_fields = if flags.check_existing {
-                coloc
-                    .map(|data| data.frequency_fields(&vep_allele, None, &flags))
-                    .unwrap_or_else(|| ColocatedFrequencyFields {
+                (
+                    ColocatedVariantFields::default(),
+                    ColocatedFrequencyFields {
                         af_values: vec![String::new(); AF_COLUMNS.len()],
                         max_af: String::new(),
                         max_af_pops: String::new(),
-                    })
-            } else {
-                ColocatedFrequencyFields {
-                    af_values: vec![String::new(); AF_COLUMNS.len()],
-                    max_af: String::new(),
-                    max_af_pops: String::new(),
-                }
+                    },
+                )
             };
             let existing_var = variant_fields.existing_variation.as_str();
 
@@ -3412,7 +3478,23 @@ mod tests {
     }
 
     fn make_coloc_data(entries: Vec<ColocatedEntry>) -> ColocatedData {
-        ColocatedData { entries }
+        ColocatedData {
+            entries,
+            compare_output_allele: None,
+            unshifted_output_allele: None,
+        }
+    }
+
+    fn make_coloc_data_with_output_alleles(
+        entries: Vec<ColocatedEntry>,
+        compare_output_allele: Option<&str>,
+        unshifted_output_allele: Option<&str>,
+    ) -> ColocatedData {
+        ColocatedData {
+            entries,
+            compare_output_allele: compare_output_allele.map(str::to_string),
+            unshifted_output_allele: unshifted_output_allele.map(str::to_string),
+        }
     }
 
     #[test]
@@ -3497,6 +3579,56 @@ mod tests {
         assert_eq!(fields.existing_variation, "rs1");
         assert_eq!(fields.clin_sig, "benign");
         assert_eq!(fields.pubmed, "123");
+    }
+
+    #[test]
+    fn test_variant_match_output_allele_prefers_shifted_compare_allele() {
+        let data = make_coloc_data_with_output_alleles(vec![], Some("-"), Some("A"));
+
+        assert_eq!(data.variant_match_output_allele("A"), Some("-"));
+    }
+
+    #[test]
+    fn test_variant_match_output_allele_falls_back_to_unshifted_when_compare_matches_output() {
+        let data = make_coloc_data_with_output_alleles(vec![], Some("-"), Some("A"));
+
+        assert_eq!(data.variant_match_output_allele("-"), Some("A"));
+    }
+
+    #[test]
+    fn test_frequency_match_output_allele_prefers_unshifted_alt_orig_allele() {
+        let data = make_coloc_data_with_output_alleles(vec![], Some("-"), Some("A"));
+
+        assert_eq!(data.frequency_match_output_allele("-"), Some("A"));
+    }
+
+    #[test]
+    fn test_build_colocated_map_from_sink_preserves_output_allele_metadata() {
+        let key = ("1".to_string(), 101, 102, "AA/-".to_string());
+        let sink = HashMap::from([(
+            key.clone(),
+            ColocatedSinkValue {
+                entries: vec![ColocatedCacheEntry {
+                    variation_name: "rs1".to_string(),
+                    allele_string: "AA/-".to_string(),
+                    matched_alleles: vec![make_match("A", "-")],
+                    somatic: 0,
+                    pheno: 0,
+                    clin_sig: None,
+                    clin_sig_allele: None,
+                    pubmed: None,
+                    af_values: vec![String::new(); AF_COLUMNS.len()],
+                }],
+                compare_output_allele: Some("-".to_string()),
+                unshifted_output_allele: Some("A".to_string()),
+            },
+        )]);
+
+        let map = build_colocated_map_from_sink(&sink);
+        let data = map.get(&key).expect("colocated data");
+
+        assert_eq!(data.compare_output_allele.as_deref(), Some("-"));
+        assert_eq!(data.unshifted_output_allele.as_deref(), Some("A"));
     }
 
     #[test]

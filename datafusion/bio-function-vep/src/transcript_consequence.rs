@@ -1260,10 +1260,18 @@ impl TranscriptConsequenceEngine {
         let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
         terms.insert(SoTerm::CodingSequenceVariant);
 
-        // VEP: complex indel — deletion spans exon→intron boundary.
-        // VEP can't compute protein change; only coding_sequence_variant.
+        // Traceability:
+        // - Ensembl VEP `TranscriptVariationAllele_to_output_hash()`
+        //   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1661-L1665
+        // - Ensembl VEP `format_coords()`
+        //   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159
+        //
+        // VEP still emits partial CDS/protein coordinate bounds for complex
+        // exon↔intron or CDS↔UTR indels even when codon/amino-acid strings
+        // cannot be computed. Preserve those bounds here instead of dropping
+        // the coding position fields entirely.
         if self.is_complex_indel(variant, tx_exons) {
-            return None;
+            return partial_coding_overlap_classification(tx, tx_exons, variant);
         }
 
         if cds_is_incomplete(tx, tx_translation) && self.overlaps_stop_codon(variant, tx) {
@@ -1326,6 +1334,10 @@ impl TranscriptConsequenceEngine {
             } else {
                 let cds = tx_translation.and_then(|t| t.cds_sequence.as_deref());
                 self.add_start_stop_heuristic_terms(terms, variant, tx, cds);
+                terms.insert(SoTerm::ProteinAlteringVariant);
+                if extends_into_utr {
+                    return partial_coding_overlap_classification(tx, tx_exons, variant);
+                }
             }
             terms.insert(SoTerm::ProteinAlteringVariant);
             return None;
@@ -1602,46 +1614,25 @@ impl TranscriptConsequenceEngine {
     /// that reach into exons.  This naturally handles both fully-intronic
     /// variants AND exon-spanning deletions.
     /// Returns true if the variant overlaps any intron body (gap between
-    /// adjacent exons).  VEP's `intronic` flag effectively excludes splice
-    /// site positions (the first and last 2 bases of each intron), so we
-    /// use `intron_start + 2 .. intron_end - 2`.  This prevents false
-    /// `intron_variant` at splice donor/acceptor sites without needing
-    /// post-hoc stripping.  Frameshift introns (≤12bp span) are also
-    /// skipped, matching VEP behaviour.
+    /// adjacent exons). VEP's `intronic` predicate is not "whole intron
+    /// overlap": it excludes frameshift introns and uses the splice-trimmed
+    /// body from `_intron_effects()`.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+    /// - Ensembl Variation `overlap_perl()` / `_intron_overlap()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L109
     fn variant_overlaps_intron(&self, variant: &VariantInput, tx_exons: &[&ExonFeature]) -> bool {
         if tx_exons.len() < 2 {
             return false;
         }
-        let is_ins = variant.ref_allele == "-";
         let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
         sorted.sort_by_key(|e| e.start);
         for pair in sorted.windows(2) {
             let intron_start = pair[0].end + 1;
             let intron_end = pair[1].start - 1;
-            if intron_start > intron_end {
-                continue;
-            }
-            // Skip frameshift introns (≤12bp)
-            if (intron_end - intron_start).abs() <= 12 {
-                continue;
-            }
-            // Narrower range excluding splice site positions
-            let inner_start = intron_start + 2;
-            let inner_end = intron_end - 2;
-            if inner_start > inner_end {
-                continue;
-            }
-            let hit = if is_ins {
-                // For insertions, VEP requires both flanking positions
-                // (start-1 and start) within the intron body — but using
-                // the full intron range, not the narrower splice-excluded
-                // range.  This means an insertion at intron_start (first
-                // intron base) is NOT intronic (left flank is the exon).
-                variant.start > intron_start && variant.start <= intron_end
-            } else {
-                overlaps(variant.start, variant.end, inner_start, inner_end)
-            };
-            if hit {
+            if variant_hits_intron_body(variant, intron_start, intron_end) {
                 return true;
             }
         }
@@ -1953,14 +1944,18 @@ impl TranscriptConsequenceEngine {
                 intron_end,
                 SoTerm::SpliceAcceptorVariant,
             );
-            // Polypyrimidine: intron_end-16..intron_end-2
-            add_if_overlaps(
-                terms,
-                variant,
-                intron_end - 16,
-                intron_end - 2,
-                SoTerm::SplicePolypyrimidineTractVariant,
-            );
+            // PPT is intronic-only in VEP's boundary logic. Exon-spanning
+            // deletions that clip the acceptor still get splice_acceptor, but
+            // they do not keep the PPT term.
+            if variant.start >= intron_start && variant.end <= intron_end {
+                add_if_overlaps(
+                    terms,
+                    variant,
+                    intron_end - 16,
+                    intron_end - 2,
+                    SoTerm::SplicePolypyrimidineTractVariant,
+                );
+            }
         }
     }
 
@@ -2079,14 +2074,18 @@ impl TranscriptConsequenceEngine {
                 intron_start - 1,
                 SoTerm::SpliceRegionVariant,
             );
-            // Polypyrimidine (negative strand): intron_start+2..intron_start+16
-            add_if_overlaps(
-                terms,
-                variant,
-                intron_start + 2,
-                intron_start + 16,
-                SoTerm::SplicePolypyrimidineTractVariant,
-            );
+            // PPT is intronic-only in VEP's boundary logic. Exon-spanning
+            // deletions that clip the acceptor still get splice_acceptor, but
+            // they do not keep the PPT term.
+            if variant.start >= intron_start && variant.end <= intron_end {
+                add_if_overlaps(
+                    terms,
+                    variant,
+                    intron_start + 2,
+                    intron_start + 16,
+                    SoTerm::SplicePolypyrimidineTractVariant,
+                );
+            }
         }
     }
 }
@@ -2211,8 +2210,8 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 /// VEP never emits `coding_sequence_variant` alongside a specific
 /// coding consequence (missense, synonymous, etc.), and never emits
 /// `protein_altering_variant` alongside `missense_variant`.
-/// Also strips `splice_polypyrimidine_tract_variant` and `intron_variant`
-/// when `splice_acceptor/donor_variant` is present.
+/// Also strips `splice_polypyrimidine_tract_variant` when more specific
+/// splice-site terms subsume it.
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
@@ -2247,18 +2246,6 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         || terms.contains(&SoTerm::SpliceDonor5thBaseVariant)
     {
         terms.remove(&SoTerm::SpliceRegionVariant);
-    }
-
-    // VEP Perl uses a tier system (all splice terms are tier 3) — it does
-    // NOT strip splice_polypyrimidine_tract_variant when splice_acceptor is
-    // present. However, VEP's intron_variant detection range (intron_start+2
-    // ..intron_end-2) excludes splice sites, so in practice intron_variant
-    // rarely co-occurs with splice_donor/acceptor. Strip intron_variant
-    // here as a safety net for edge cases where our overlap detection is
-    // slightly wider than VEP's.
-    if terms.contains(&SoTerm::SpliceDonorVariant) || terms.contains(&SoTerm::SpliceAcceptorVariant)
-    {
-        terms.remove(&SoTerm::IntronVariant);
     }
 
     // VEP doesn't emit incomplete_terminal_codon_variant when a more specific
@@ -3137,11 +3124,26 @@ fn which_intron_str(
     for (i, pair) in sorted.windows(2).enumerate() {
         let intron_start = pair[0].end + 1;
         let intron_end = pair[1].start - 1;
-        if intron_start > intron_end {
-            continue;
-        }
+        // Traceability:
+        // - Ensembl VEP only serializes `INTRON` when `_pre_consequence_predicates->{intron}`
+        //   is true in `OutputFactory.pm`, and that predicate is driven by
+        //   `_overlapped_introns`, not `_intron_effects->{intronic}`.
+        //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1414-L1445
+        // - Ensembl Variation `_bvfo_preds()` sets `pre->{intron}` from full
+        //   intron overlap.
+        //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L454-L507
+        // - Ensembl Variation `BaseTranscriptVariation::intron_number()` then maps the
+        //   overlapped intron to `N/total` using the raw VF start/end.
+        //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L727-L755
+        // - Ensembl Variation `overlap_perl()` shows the insertion overlap
+        //   semantics for `(P, P-1)` coordinates.
+        //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L85
+        //
+        // This is intentionally broader than `variant_overlaps_intron()`: VEP
+        // can emit an `INTRON` number for splice-boundary variants even when
+        // the consequence set does not include `intron_variant`.
         let hit = if variant.ref_allele == "-" {
-            variant.start >= intron_start && variant.start <= intron_end
+            variant.start > intron_start && variant.start <= intron_end
         } else {
             overlaps(variant.start, variant.end, intron_start, intron_end)
         };
@@ -3453,6 +3455,115 @@ fn genomic_to_cds_index(
         offset = offset.saturating_add(seg_len);
     }
     None
+}
+
+/// Traceability:
+/// - Ensembl VEP `TranscriptVariationAllele_to_output_hash()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1661-L1665
+/// - Ensembl VEP `format_coords()`
+///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159
+///
+/// When a variant spans from non-coding sequence into CDS (or vice versa),
+/// VEP keeps the known coding-side bound and emits `?` for the unknown side.
+/// This applies even when the event is a complex indel and codon/peptide
+/// strings cannot be derived.
+fn partial_coding_overlap_classification(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+) -> Option<CodingClassification> {
+    let segments = coding_segments(tx, tx_exons)?;
+    let variant_start = variant.start.min(variant.end);
+    let variant_end = variant.start.max(variant.end);
+
+    let mut first_idx = None;
+    let mut last_idx = None;
+    let mut first_overlap_genomic = None;
+    let mut last_overlap_genomic = None;
+    let mut offset = 0usize;
+    for (seg_start, seg_end) in segments {
+        let overlap_start = variant_start.max(seg_start);
+        let overlap_end = variant_end.min(seg_end);
+        if overlap_start <= overlap_end {
+            first_overlap_genomic = Some(
+                first_overlap_genomic.map_or(overlap_start, |curr: i64| curr.min(overlap_start)),
+            );
+            last_overlap_genomic =
+                Some(last_overlap_genomic.map_or(overlap_end, |curr: i64| curr.max(overlap_end)));
+            let seg_first = if tx.strand >= 0 {
+                usize::try_from(overlap_start.saturating_sub(seg_start)).ok()?
+            } else {
+                usize::try_from(seg_end.saturating_sub(overlap_end)).ok()?
+            };
+            let seg_last = if tx.strand >= 0 {
+                usize::try_from(overlap_end.saturating_sub(seg_start)).ok()?
+            } else {
+                usize::try_from(seg_end.saturating_sub(overlap_start)).ok()?
+            };
+            first_idx = Some(first_idx.map_or(offset + seg_first, |curr: usize| {
+                curr.min(offset + seg_first)
+            }));
+            last_idx =
+                Some(last_idx.map_or(offset + seg_last, |curr: usize| curr.max(offset + seg_last)));
+        }
+
+        let seg_len = usize::try_from(seg_end.saturating_sub(seg_start).saturating_add(1)).ok()?;
+        offset = offset.saturating_add(seg_len);
+    }
+
+    let first_idx = first_idx?;
+    let last_idx = last_idx?;
+    let first_overlap_genomic = first_overlap_genomic?;
+    let last_overlap_genomic = last_overlap_genomic?;
+    let extends_before_coding = if tx.strand >= 0 {
+        variant_start < first_overlap_genomic
+    } else {
+        variant_end > last_overlap_genomic
+    };
+    let extends_after_coding = if tx.strand >= 0 {
+        variant_end > last_overlap_genomic
+    } else {
+        variant_start < first_overlap_genomic
+    };
+
+    let mut class = CodingClassification::default();
+    class.cds_position_start = (!extends_before_coding).then_some(first_idx + 1);
+    class.cds_position_end = (!extends_after_coding).then_some(last_idx + 1);
+    class.protein_position_start = (!extends_before_coding).then_some((first_idx / 3) + 1);
+    class.protein_position_end = (!extends_after_coding).then_some((last_idx / 3) + 1);
+    Some(class)
+}
+
+/// Traceability:
+/// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+/// - Ensembl Variation `overlap_perl()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L85
+///
+/// VEP's `intronic` predicate excludes frameshift introns and does not use a
+/// simple full-intron overlap. Insertions are evaluated with `(P, P-1)`
+/// coordinates plus the explicit boundary cases at `intron_start+2` and
+/// `intron_end-2`, which reduces to `P in [intron_start+2, intron_end-1]`.
+fn variant_hits_intron_body(variant: &VariantInput, intron_start: i64, intron_end: i64) -> bool {
+    if intron_start > intron_end {
+        return false;
+    }
+    if (intron_end - intron_start).abs() <= 12 {
+        return false;
+    }
+
+    let inner_start = intron_start + 2;
+    let inner_end = intron_end - 2;
+    if inner_start > inner_end {
+        return false;
+    }
+
+    if variant.ref_allele == "-" {
+        let p = variant.start;
+        p >= inner_start && p <= inner_end + 1
+    } else {
+        overlaps(variant.start, variant.end, inner_start, inner_end)
+    }
 }
 
 fn normalize_allele_seq(allele: &str) -> String {
@@ -5073,17 +5184,14 @@ mod tests {
             &[],
         );
         let terms = &assignments[0].terms;
-        // We strip intron_variant when splice_donor_variant is present as a
-        // safety net for edge cases where our overlap detection is wider than
-        // VEP's intron range (intron_start+2..intron_end-2).
         assert!(
             terms.contains(&SoTerm::SpliceDonorVariant),
             "Large exon-spanning deletion should get splice_donor_variant: {:?}",
             terms
         );
         assert!(
-            !terms.contains(&SoTerm::IntronVariant),
-            "intron_variant should be stripped when splice_donor_variant present: {:?}",
+            terms.contains(&SoTerm::IntronVariant),
+            "Large exon-spanning deletion should keep intron_variant: {:?}",
             terms
         );
     }
@@ -6040,6 +6148,273 @@ mod tests {
         );
     }
 
+    #[test]
+    fn complex_indel_spanning_acceptor_and_exon_does_not_emit_ppt() {
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            1300,
+            1,
+            "protein_coding",
+            Some(1050),
+            Some(1300),
+        );
+        let exons = vec![exon("T1", 1, 1000, 1099), exon("T1", 2, 1200, 1300)];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 1185, 1202, "NNNNNNNNNNNNNNNNNN", "-"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(terms.contains(&SoTerm::SpliceAcceptorVariant));
+        assert!(terms.contains(&SoTerm::IntronVariant));
+        assert!(
+            !terms.contains(&SoTerm::SplicePolypyrimidineTractVariant),
+            "Boundary-spanning deletion should not emit PPT: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn complex_indel_spanning_intron_into_cds_keeps_partial_unknown_bounds() {
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            1300,
+            1,
+            "protein_coding",
+            Some(1050),
+            Some(1300),
+        );
+        let exons = vec![exon("T1", 1, 1000, 1099), exon("T1", 2, 1200, 1300)];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 1185, 1202, "NNNNNNNNNNNNNNNNNN", "-"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let entry = assignments
+            .iter()
+            .find(|entry| entry.terms.contains(&SoTerm::CodingSequenceVariant))
+            .expect("coding assignment");
+
+        assert_eq!(entry.cds_position.as_deref(), Some("?-53"));
+        assert_eq!(entry.protein_position.as_deref(), Some("?-18"));
+    }
+
+    #[test]
+    fn positive_acceptor_insertion_keeps_intron_number_without_intron_variant() {
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "ENST00000756326",
+            "1",
+            116466214,
+            116570264,
+            1,
+            "lncRNA",
+            None,
+            None,
+        );
+        let exons = vec![
+            exon("ENST00000756326", 1, 116466214, 116466291),
+            exon("ENST00000756326", 2, 116530389, 116530527),
+            exon("ENST00000756326", 3, 116569628, 116569702),
+            exon("ENST00000756326", 4, 116569787, 116569881),
+            exon("ENST00000756326", 5, 116569987, 116570264),
+        ];
+        let v = VariantInput::from_vcf("1".into(), 116569626, 116569626, "A".into(), "AG".into());
+
+        let assignments =
+            engine.evaluate_variant_with_context(&v, &[t], &exons, &[], &[], &[], &[], &[]);
+        let entry = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENST00000756326"))
+            .expect("transcript assignment");
+
+        assert!(entry.terms.contains(&SoTerm::SpliceAcceptorVariant));
+        assert!(entry.terms.contains(&SoTerm::NonCodingTranscriptVariant));
+        assert!(!entry.terms.contains(&SoTerm::IntronVariant));
+        assert_eq!(entry.intron_str.as_deref(), Some("2/4"));
+    }
+
+    #[test]
+    fn negative_acceptor_insertion_keeps_intron_number_without_intron_variant() {
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "ENST00000703693",
+            "1",
+            1785312,
+            1890493,
+            -1,
+            "protein_coding",
+            Some(1787331),
+            Some(1825453),
+        );
+        let exons = vec![
+            exon("ENST00000703693", 1, 1890364, 1890493),
+            exon("ENST00000703693", 2, 1853152, 1853297),
+            exon("ENST00000703693", 3, 1852570, 1852680),
+            exon("ENST00000703693", 4, 1848461, 1848529),
+            exon("ENST00000703693", 5, 1847878, 1848036),
+            exon("ENST00000703693", 6, 1839190, 1839238),
+            exon("ENST00000703693", 7, 1825397, 1825499),
+            exon("ENST00000703693", 8, 1817837, 1817875),
+            exon("ENST00000703693", 9, 1815756, 1815862),
+            exon("ENST00000703693", 10, 1806475, 1806538),
+            exon("ENST00000703693", 11, 1804419, 1804581),
+            exon("ENST00000703693", 12, 1793245, 1793311),
+            exon("ENST00000703693", 13, 1790395, 1790596),
+            exon("ENST00000703693", 14, 1789053, 1789269),
+            exon("ENST00000703693", 15, 1787322, 1787437),
+            exon("ENST00000703693", 16, 1785312, 1787053),
+        ];
+        let v = VariantInput::from_vcf("1".into(), 1848037, 1848037, "C".into(), "CTA".into());
+
+        let assignments =
+            engine.evaluate_variant_with_context(&v, &[t], &exons, &[], &[], &[], &[], &[]);
+        let entry = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENST00000703693"))
+            .expect("transcript assignment");
+
+        assert!(entry.terms.contains(&SoTerm::SpliceAcceptorVariant));
+        assert!(!entry.terms.contains(&SoTerm::IntronVariant));
+        assert_eq!(entry.intron_str.as_deref(), Some("4/15"));
+    }
+
+    #[test]
+    fn exon_boundary_insertion_does_not_emit_intron_number() {
+        let v = VariantInput::from_vcf("1".into(), 56249200, 56249200, "T".into(), "TC".into());
+        let exons = vec![
+            exon("ENST00000569425", 2, 56253653, 56253893),
+            exon("ENST00000569425", 3, 56248294, 56249200),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+
+        assert_eq!(which_intron_str(&v, &exons_ref, -1), None);
+    }
+
+    #[test]
+    fn intron_body_insertion_boundaries_follow_vep_overlap_perl_semantics() {
+        assert!(!variant_hits_intron_body(
+            &var("22", 100, 100, "-", "C"),
+            100,
+            120
+        ));
+        assert!(!variant_hits_intron_body(
+            &var("22", 101, 101, "-", "C"),
+            100,
+            120
+        ));
+        assert!(variant_hits_intron_body(
+            &var("22", 102, 102, "-", "C"),
+            100,
+            120
+        ));
+        assert!(variant_hits_intron_body(
+            &var("22", 119, 119, "-", "C"),
+            100,
+            120
+        ));
+        assert!(!variant_hits_intron_body(
+            &var("22", 120, 120, "-", "C"),
+            100,
+            120
+        ));
+    }
+
+    #[test]
+    fn splice_acceptor_snv_keeps_intron_number_without_intron_variant() {
+        let v = var("1", 161599629, 161599629, "C", "G");
+        let exons = vec![
+            exon("ENST00000466542", 1, 161581340, 161581549),
+            exon("ENST00000466542", 2, 161588422, 161588442),
+            exon("ENST00000466542", 3, 161589562, 161589819),
+            exon("ENST00000466542", 4, 161591144, 161591398),
+            exon("ENST00000466542", 5, 161592129, 161592242),
+            exon("ENST00000466542", 6, 161595553, 161595590),
+            exon("ENST00000466542", 7, 161599630, 161599803),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+
+        assert_eq!(which_intron_str(&v, &exons_ref, 1).as_deref(), Some("6/6"));
+    }
+
+    #[test]
+    fn cds_to_utr_deletion_keeps_partial_unknown_bounds_on_negative_strand() {
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "ENST00000696609",
+            "1",
+            225524599,
+            225524689,
+            -1,
+            "protein_coding",
+            Some(225524599),
+            Some(225524666),
+        );
+        let exons = vec![exon("ENST00000696609", 1, 225524599, 225524689)];
+        let v = VariantInput::from_vcf(
+            "1".into(),
+            225524663,
+            225524674,
+            "TCATTGTTCCAA".into(),
+            "T".into(),
+        );
+
+        let assignments =
+            engine.evaluate_variant_with_context(&v, &[t], &exons, &[], &[], &[], &[], &[]);
+        let entry = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENST00000696609"))
+            .expect("transcript assignment");
+
+        assert_eq!(entry.cds_position.as_deref(), Some("?-3"));
+        assert_eq!(entry.protein_position.as_deref(), Some("?-1"));
+    }
+
+    #[test]
+    fn cds_to_utr_deletion_keeps_partial_unknown_bounds_on_positive_strand() {
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "ENST000POS1",
+            "1",
+            1000,
+            1100,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1050),
+        );
+        let exons = vec![exon("ENST000POS1", 1, 1000, 1100)];
+        let v = var("1", 1048, 1060, "ACCCCCCCCCCCC", "-");
+
+        let assignments =
+            engine.evaluate_variant_with_context(&v, &[t], &exons, &[], &[], &[], &[], &[]);
+        let entry = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENST000POS1"))
+            .expect("transcript assignment");
+
+        assert_eq!(entry.cds_position.as_deref(), Some("49-?"));
+        assert_eq!(entry.protein_position.as_deref(), Some("17-?"));
+    }
+
     // ---- frameshift insertion at codon boundary: protein_position range ----
 
     #[test]
@@ -6261,9 +6636,9 @@ mod tests {
     }
 
     #[test]
-    fn splice_ppt_kept_intron_stripped_with_acceptor() {
-        // PPT is kept (VEP doesn't strip it), but intron_variant is
-        // stripped as a safety net for overlap detection differences.
+    fn splice_ppt_kept_intron_kept_with_acceptor() {
+        // VEP keeps intron_variant when the variant genuinely overlaps the
+        // intron body as well as the splice acceptor.
         let mut terms = BTreeSet::new();
         terms.insert(SoTerm::SpliceAcceptorVariant);
         terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
@@ -6271,7 +6646,7 @@ mod tests {
         strip_parent_terms(&mut terms);
         assert!(terms.contains(&SoTerm::SpliceAcceptorVariant));
         assert!(terms.contains(&SoTerm::SplicePolypyrimidineTractVariant));
-        assert!(!terms.contains(&SoTerm::IntronVariant));
+        assert!(terms.contains(&SoTerm::IntronVariant));
     }
 
     // ---- incomplete_terminal_codon stripped when stop_lost present ----
@@ -6402,8 +6777,8 @@ mod tests {
     }
 
     #[test]
-    fn ppt_kept_intron_stripped_with_splice_acceptor() {
-        // PPT kept, intron_variant stripped alongside splice_acceptor.
+    fn ppt_kept_intron_kept_with_splice_acceptor() {
+        // PPT kept, intron_variant also kept when it was genuinely assigned.
         let mut terms = BTreeSet::new();
         terms.insert(SoTerm::SpliceAcceptorVariant);
         terms.insert(SoTerm::SplicePolypyrimidineTractVariant);
@@ -6411,19 +6786,20 @@ mod tests {
         terms.insert(SoTerm::NonCodingTranscriptVariant);
         strip_parent_terms(&mut terms);
         assert!(terms.contains(&SoTerm::SplicePolypyrimidineTractVariant));
-        assert!(!terms.contains(&SoTerm::IntronVariant));
+        assert!(terms.contains(&SoTerm::IntronVariant));
         assert!(terms.contains(&SoTerm::SpliceAcceptorVariant));
         assert!(terms.contains(&SoTerm::NonCodingTranscriptVariant));
     }
 
     #[test]
-    fn intron_variant_stripped_with_splice_donor() {
-        // Strip intron_variant alongside splice_donor as safety net.
+    fn intron_variant_kept_with_splice_donor() {
+        // VEP keeps intron_variant when the variant also overlaps the intron
+        // body beyond the donor site.
         let mut terms = BTreeSet::new();
         terms.insert(SoTerm::SpliceDonorVariant);
         terms.insert(SoTerm::IntronVariant);
         strip_parent_terms(&mut terms);
-        assert!(!terms.contains(&SoTerm::IntronVariant));
+        assert!(terms.contains(&SoTerm::IntronVariant));
         assert!(terms.contains(&SoTerm::SpliceDonorVariant));
     }
 
