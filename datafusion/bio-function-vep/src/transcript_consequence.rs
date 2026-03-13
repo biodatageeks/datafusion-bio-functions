@@ -801,6 +801,17 @@ impl TranscriptConsequenceEngine {
         (terms_vec, coding_class)
     }
 
+    /// Traceability:
+    /// - Ensembl VEP `OutputFactory::RegulatoryFeatureVariationAllele_to_output_hash()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1802-L1829
+    /// - Ensembl Variation `VariationEffect::within_feature()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L126-L143
+    ///
+    /// VEP emits one regulatory CSQ entry per overlapping
+    /// `RegulatoryFeatureVariationAllele`, serialized by stable_id as
+    /// `Feature`. Our cache can contain duplicate regulatory rows for the same
+    /// stable_id, so this path deduplicates by feature id to preserve the
+    /// upstream one-entry-per-feature behavior.
     fn append_regulatory_terms(
         &self,
         out: &mut Vec<TranscriptConsequence>,
@@ -870,6 +881,15 @@ impl TranscriptConsequenceEngine {
         }
     }
 
+    /// Traceability:
+    /// - Ensembl VEP `OutputFactory::RegulatoryFeatureVariationAllele_to_output_hash()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1802-L1829
+    /// - Ensembl Variation `VariationEffect::within_feature()`
+    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L126-L143
+    ///
+    /// Prepared-context regulatory output must preserve the same one-entry-per-
+    /// feature semantics as the non-prepared path, even when the context cache
+    /// contains duplicate rows for a single regulatory stable_id.
     fn append_regulatory_terms_prepared(
         &self,
         out: &mut Vec<TranscriptConsequence>,
