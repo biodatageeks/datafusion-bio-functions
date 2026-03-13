@@ -1461,6 +1461,112 @@ async fn test_conditional_transform() {
     disable_fused_array_transform();
 }
 
+#[tokio::test]
+#[serial]
+async fn test_multiple_transforms() {
+    use datafusion::physical_plan::displayable;
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+
+    let ctx = create_optimized_context().await; // Use optimized context
+    let batch = create_test_data();
+    let schema = batch.schema();
+
+    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    ctx.register_table("test_data", Arc::new(table)).unwrap();
+
+    // Query with CASE expression
+    let sql = r#"
+        WITH indexed AS (
+            SELECT 
+                ROW_NUMBER() OVER () as row_idx,
+                metadata,
+                values_a,
+                values_b
+            FROM test_data
+        ),
+        unnested AS (
+            SELECT 
+                row_idx,
+                metadata,
+                unnest(values_a) as val_a,
+                unnest(values_b) as val_b
+            FROM indexed
+        ),
+        transformed_1 AS (
+            SELECT
+                row_idx,
+                metadata,
+                val_a,
+                val_b,
+                val_a + val_b AS val_sum,
+                val_a * val_b AS val_product
+            FROM unnested
+        ),
+        transformed_2 AS (
+            SELECT
+                row_idx,
+                metadata,
+                val_a,
+                val_b,
+                val_product,
+                CASE WHEN val_sum > 30.0 THEN val_a * val_a ELSE val_a + 700.0 END AS val_conditional
+            FROM transformed_1
+        )
+        SELECT
+            row_idx,
+            metadata,
+            array_agg(val_b) AS values_b,
+            array_agg(val_product) AS values_product,
+            array_agg(val_conditional) AS values_conditional
+        FROM transformed_2
+        GROUP BY row_idx, metadata
+        ORDER BY row_idx
+    "#;
+
+    let df = ctx.sql(sql).await.unwrap();
+
+    // Check the PHYSICAL plan includes our optimization
+    let physical_plan = df.create_physical_plan().await.unwrap();
+    let plan_str = displayable(physical_plan.as_ref()).indent(true).to_string();
+    println!("\n=== Physical plan for conditional transform ===");
+    println!("{plan_str}");
+    println!("=== END ===\n");
+
+    // ASSERT: Optimization must be applied for conditional transform
+    let has_fused = plan_str.contains("FusedArrayTransform");
+    println!("Optimization applied: {has_fused}");
+    assert!(
+        has_fused,
+        "FusedArrayTransform optimization was NOT applied for conditional transform! Physical plan:\n{plan_str}"
+    );
+
+    let df2 = ctx.sql(sql).await.unwrap();
+    let results = df2.collect().await.unwrap();
+
+    // Verify we got 3 rows back
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3, "Expected 3 rows in result");
+
+    // serialize results to string and then compare with expected string
+    let results_str = pretty_format_batches(&results).unwrap().to_string();
+    let expected_str =
+"+---------+----------+--------------------+--------------------+---------------------+
+| row_idx | metadata | values_b           | values_product     | values_conditional  |
++---------+----------+--------------------+--------------------+---------------------+
+| 1       | meta1    | [10.0, 20.0, 30.0] | [10.0, 40.0, 90.0] | [701.0, 702.0, 9.0] |
+| 2       | meta2    | [40.0, 50.0]       | [160.0, 250.0]     | [16.0, 25.0]        |
+| 3       | meta3    | [60.0]             | [360.0]            | [36.0]              |
++---------+----------+--------------------+--------------------+---------------------+".to_string();
+    assert_eq!(
+        results_str, expected_str,
+        "Results do not match expected output for multiple transforms case"
+    );
+
+    // Clean up
+    disable_fused_array_transform();
+}
+
+
 // =============================================================================
 // False Positive Tests (optimization should NOT be applied)
 // =============================================================================
