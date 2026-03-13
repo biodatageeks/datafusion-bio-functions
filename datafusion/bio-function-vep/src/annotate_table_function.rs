@@ -108,8 +108,12 @@ mod tests {
     use datafusion::arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
+    use datafusion::prelude::ParquetReadOptions;
+    use parquet::arrow::ArrowWriter;
     use std::collections::BTreeSet;
+    use std::fs::File;
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     fn vcf_table() -> MemTable {
         let schema = Arc::new(Schema::new(vec![
@@ -1191,6 +1195,104 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid stop-loss translation memtable")
     }
 
+    fn distance_vcf_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![30_000])),
+                Arc::new(Int64Array::from(vec![30_000])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .expect("valid distance vcf batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid distance vcf memtable")
+    }
+
+    fn distance_cache_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("AF", DataType::Float64, true),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![30_000])),
+                Arc::new(Int64Array::from(vec![30_000])),
+                Arc::new(StringArray::from(vec!["rs_distance"])),
+                Arc::new(StringArray::from(vec!["A/G"])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(Float64Array::from(vec![None::<f64>])),
+                Arc::new(Int64Array::from(vec![0])),
+            ],
+        )
+        .expect("valid distance cache batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid distance cache memtable")
+    }
+
+    fn distance_transcripts_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("strand", DataType::Int64, false),
+            Field::new("biotype", DataType::Utf8, false),
+            Field::new("cds_start", DataType::Int64, true),
+            Field::new("cds_end", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["ENSTDISTUP", "ENSTDISTDOWN"])),
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![37_079, 14_000])),
+                Arc::new(Int64Array::from(vec![37_200, 15_000])),
+                Arc::new(Int64Array::from(vec![1, 1])),
+                Arc::new(StringArray::from(vec!["protein_coding", "protein_coding"])),
+                Arc::new(Int64Array::from(vec![None::<i64>, None])),
+                Arc::new(Int64Array::from(vec![None::<i64>, None])),
+            ],
+        )
+        .expect("valid distance transcript batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid distance transcript memtable")
+    }
+
+    fn distance_exons_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("exon_number", DataType::Int64, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["ENSTDISTUP", "ENSTDISTDOWN"])),
+                Arc::new(Int64Array::from(vec![1, 1])),
+                Arc::new(Int64Array::from(vec![37_079, 14_000])),
+                Arc::new(Int64Array::from(vec![37_200, 15_000])),
+            ],
+        )
+        .expect("valid distance exon batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid distance exon memtable")
+    }
+
     fn string_values(col: &Arc<dyn datafusion::arrow::array::Array>) -> Vec<Option<String>> {
         if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
             (0..arr.len())
@@ -1218,6 +1320,72 @@ mod tests {
         } else {
             panic!("expected string or string view");
         }
+    }
+
+    fn csq_entries(csq: &str) -> Vec<Vec<&str>> {
+        csq.split(',')
+            .map(|entry| entry.split('|').collect())
+            .collect()
+    }
+
+    fn find_csq_entry<'a>(csq: &'a str, feature_type: &str, feature: &str) -> Vec<&'a str> {
+        csq_entries(csq)
+            .into_iter()
+            .find(|fields| fields.len() == 74 && fields[5] == feature_type && fields[6] == feature)
+            .expect("expected CSQ entry to exist")
+    }
+
+    fn regulatory_feature_batch(rows: &[(&str, &str, i64, i64, Option<&str>)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("stable_id", DataType::Utf8, false),
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("feature_type", DataType::Utf8, true),
+        ]));
+        let stable_ids: Vec<&str> = rows.iter().map(|row| row.0).collect();
+        let chroms: Vec<&str> = rows.iter().map(|row| row.1).collect();
+        let starts: Vec<i64> = rows.iter().map(|row| row.2).collect();
+        let ends: Vec<i64> = rows.iter().map(|row| row.3).collect();
+        let feature_types: Vec<Option<&str>> = rows.iter().map(|row| row.4).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(stable_ids)),
+                Arc::new(StringArray::from(chroms)),
+                Arc::new(Int64Array::from(starts)),
+                Arc::new(Int64Array::from(ends)),
+                Arc::new(StringArray::from(feature_types)),
+            ],
+        )
+        .expect("valid regulatory feature batch")
+    }
+
+    fn regulatory_table_with_rows(rows: &[(&str, &str, i64, i64, Option<&str>)]) -> MemTable {
+        let batch = regulatory_feature_batch(rows);
+        MemTable::try_new(batch.schema(), vec![vec![batch]]).expect("valid regulatory memtable")
+    }
+
+    async fn register_single_batch_parquet(
+        ctx: &datafusion::prelude::SessionContext,
+        table_name: &str,
+        batch: &RecordBatch,
+    ) -> TempDir {
+        let dir = tempfile::tempdir().expect("create temp parquet dir");
+        let path = dir.path().join(format!("{table_name}.parquet"));
+        let file = File::create(&path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, batch.schema(), None).expect("create parquet writer");
+        writer.write(batch).expect("write parquet batch");
+        writer.close().expect("close parquet writer");
+        ctx.register_parquet(
+            table_name,
+            path.to_str().expect("utf8 parquet path"),
+            ParquetReadOptions::default(),
+        )
+        .await
+        .expect("register parquet table");
+        dir
     }
 
     fn extract_terms(csq: &str) -> Vec<String> {
@@ -1451,6 +1619,101 @@ mod tests {
         assert!(most.iter().all(|v| v.is_some()));
     }
 
+    // Mirrors Ensembl VEP Runner distance coverage:
+    // - https://github.com/Ensembl/ensembl-vep/blob/release/115/t/Runner.t#L535-L571
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_respects_options_json_distance_for_upstream_and_downstream() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_distance", Arc::new(distance_vcf_table()))
+            .expect("register distance vcf");
+        ctx.register_table("var_distance_cache", Arc::new(distance_cache_table()))
+            .expect("register distance cache");
+        ctx.register_table(
+            "var_distance_cache_transcripts",
+            Arc::new(distance_transcripts_table()),
+        )
+        .expect("register distance transcripts");
+        ctx.register_table("var_distance_cache_exons", Arc::new(distance_exons_table()))
+            .expect("register distance exons");
+
+        let default_batches = ctx
+            .sql("SELECT csq FROM annotate_vep('vcf_distance', 'var_distance_cache', 'parquet')")
+            .await
+            .expect("default distance query should parse")
+            .collect()
+            .await
+            .expect("collect default distance annotate_vep");
+        let default_csq = string_values(
+            default_batches[0]
+                .column_by_name("csq")
+                .expect("default csq column exists"),
+        );
+        let default_csq0 = default_csq[0]
+            .as_ref()
+            .expect("default csq should be present");
+        assert!(default_csq0.contains("intergenic_variant"));
+        assert!(!default_csq0.contains("ENSTDISTUP"));
+        assert!(!default_csq0.contains("ENSTDISTDOWN"));
+
+        let numeric_batches = ctx
+            .sql(
+                "SELECT csq FROM annotate_vep( \
+                   'vcf_distance', \
+                   'var_distance_cache', \
+                   'parquet', \
+                   '{\"distance\":10000}' \
+                 )",
+            )
+            .await
+            .expect("numeric distance query should parse")
+            .collect()
+            .await
+            .expect("collect numeric distance annotate_vep");
+        let numeric_csq = string_values(
+            numeric_batches[0]
+                .column_by_name("csq")
+                .expect("numeric csq column exists"),
+        );
+        let numeric_csq0 = numeric_csq[0]
+            .as_ref()
+            .expect("numeric csq should be present");
+        let numeric_entries = csq_entries(numeric_csq0);
+        assert_eq!(numeric_entries.len(), 1);
+        let upstream_entry = find_csq_entry(numeric_csq0, "Transcript", "ENSTDISTUP");
+        assert_eq!(upstream_entry[1], "upstream_gene_variant");
+        assert_eq!(upstream_entry[18], "7079");
+        assert!(!numeric_csq0.contains("ENSTDISTDOWN"));
+
+        let pair_batches = ctx
+            .sql(
+                "SELECT csq FROM annotate_vep( \
+                   'vcf_distance', \
+                   'var_distance_cache', \
+                   'parquet', \
+                   '{\"distance\":\"10000,20000\"}' \
+                 )",
+            )
+            .await
+            .expect("pair distance query should parse")
+            .collect()
+            .await
+            .expect("collect pair distance annotate_vep");
+        let pair_csq = string_values(
+            pair_batches[0]
+                .column_by_name("csq")
+                .expect("pair csq column exists"),
+        );
+        let pair_csq0 = pair_csq[0].as_ref().expect("pair csq should be present");
+        let pair_entries = csq_entries(pair_csq0);
+        assert_eq!(pair_entries.len(), 2);
+        let upstream_entry = find_csq_entry(pair_csq0, "Transcript", "ENSTDISTUP");
+        let downstream_entry = find_csq_entry(pair_csq0, "Transcript", "ENSTDISTDOWN");
+        assert_eq!(upstream_entry[1], "upstream_gene_variant");
+        assert_eq!(upstream_entry[18], "7079");
+        assert_eq!(downstream_entry[1], "downstream_gene_variant");
+        assert_eq!(downstream_entry[18], "15000");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_uses_translation_context_for_synonymous_classification() {
         let ctx = create_vep_session();
@@ -1610,6 +1873,122 @@ mod tests {
         assert!(parquet_csq0.contains("TF_binding_site_variant"));
         assert!(parquet_csq0.contains("mature_miRNA_variant"));
         assert_eq!(parquet_most0, "transcript_ablation");
+    }
+
+    // Mirrors the cache-backed regulatory source coverage from:
+    // - https://github.com/Ensembl/ensembl-vep/blob/release/115/t/AnnotationSource_Cache_RegFeat.t#L166-L205
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_deduplicates_duplicate_regulatory_rows_from_parquet_context_table() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_reg_dup", Arc::new(context_vcf_table()))
+            .expect("register duplicate regulatory vcf");
+        ctx.register_table("var_reg_dup_cache", Arc::new(context_cache_table()))
+            .expect("register duplicate regulatory cache");
+
+        let duplicate_batch = regulatory_feature_batch(&[
+            ("ENSR_DUP", "1", 150, 160, Some("promoter")),
+            ("ENSR_DUP", "1", 150, 160, Some("promoter")),
+        ]);
+        let _parquet_dir =
+            register_single_batch_parquet(&ctx, "reg_dup_table", &duplicate_batch).await;
+
+        let batches = ctx
+            .sql(
+                "SELECT csq, most_severe_consequence \
+                 FROM annotate_vep( \
+                   'vcf_reg_dup', \
+                   'var_reg_dup_cache', \
+                   'parquet', \
+                   '{\"regulatory_table\":\"reg_dup_table\"}' \
+                 )",
+            )
+            .await
+            .expect("duplicate regulatory query should parse")
+            .collect()
+            .await
+            .expect("collect duplicate regulatory annotate_vep");
+
+        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+        let most = string_values(
+            batches[0]
+                .column_by_name("most_severe_consequence")
+                .expect("most severe column exists"),
+        );
+        let csq0 = csq[0].as_ref().expect("csq should be present");
+        let entries = csq_entries(csq0);
+        let regulatory_entries: Vec<&Vec<&str>> = entries
+            .iter()
+            .filter(|fields| fields.len() == 74 && fields[5] == "RegulatoryFeature")
+            .collect();
+        assert_eq!(regulatory_entries.len(), 1);
+        assert_eq!(regulatory_entries[0][6], "ENSR_DUP");
+        assert_eq!(regulatory_entries[0][7], "promoter");
+        assert_eq!(most[0], Some("regulatory_region_variant".to_string()));
+    }
+
+    // Mirrors Ensembl VEP regulatory output serialization coverage:
+    // - https://github.com/Ensembl/ensembl-vep/blob/release/115/t/OutputFactory.t#L1207-L1236
+    // - https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1802-L1829
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_regulatory_csq_serializer_matches_vep_output_factory_shape() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_reg_ser", Arc::new(context_vcf_table()))
+            .expect("register regulatory serializer vcf");
+        ctx.register_table("var_reg_ser_cache", Arc::new(context_cache_table()))
+            .expect("register regulatory serializer cache");
+        ctx.register_table(
+            "var_reg_ser_cache_regulatory_features",
+            Arc::new(regulatory_table_with_rows(&[(
+                "ENSR00000140763",
+                "1",
+                150,
+                160,
+                Some("promoter"),
+            )])),
+        )
+        .expect("register regulatory serializer table");
+
+        let batches = ctx
+            .sql(
+                "SELECT csq, most_severe_consequence \
+                 FROM annotate_vep('vcf_reg_ser', 'var_reg_ser_cache', 'parquet')",
+            )
+            .await
+            .expect("regulatory serializer query should parse")
+            .collect()
+            .await
+            .expect("collect regulatory serializer annotate_vep");
+
+        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+        let most = string_values(
+            batches[0]
+                .column_by_name("most_severe_consequence")
+                .expect("most severe column exists"),
+        );
+        let csq0 = csq[0].as_ref().expect("csq should be present");
+        let entries = csq_entries(csq0);
+        assert_eq!(entries.len(), 2);
+
+        let entry = find_csq_entry(csq0, "RegulatoryFeature", "ENSR00000140763");
+        assert_eq!(entry.len(), 74);
+        assert_eq!(entry[0], "G");
+        assert_eq!(entry[1], "regulatory_region_variant");
+        assert_eq!(entry[2], "MODIFIER");
+        assert_eq!(entry[3], "");
+        assert_eq!(entry[4], "");
+        assert_eq!(entry[5], "RegulatoryFeature");
+        assert_eq!(entry[6], "ENSR00000140763");
+        assert_eq!(entry[7], "promoter");
+        assert_eq!(entry[8], "");
+        assert_eq!(entry[9], "");
+        assert_eq!(entry[18], "");
+        assert!(
+            entries
+                .iter()
+                .any(|fields| fields.len() == 74 && fields[1] == "intergenic_variant"),
+            "regulatory-only output should retain the orthogonal intergenic entry"
+        );
+        assert_eq!(most[0], Some("regulatory_region_variant".to_string()));
     }
 
     #[tokio::test(flavor = "multi_thread")]

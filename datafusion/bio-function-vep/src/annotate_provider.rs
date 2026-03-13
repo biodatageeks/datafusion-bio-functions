@@ -1108,6 +1108,39 @@ impl AnnotateProvider {
         after_colon[..digits_len].parse().ok()
     }
 
+    /// Traceability:
+    /// - Ensembl VEP `Config.pm` `distance` option
+    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L145-L155
+    /// - Ensembl VEP `BaseRunner::_set_package_variables()`
+    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/BaseRunner.pm#L499-L511
+    ///
+    /// Ensembl accepts `--distance N` and `--distance U,D`, applying the
+    /// first value to upstream and the second to downstream when provided.
+    fn parse_json_distance_option(json: &str) -> Option<(i64, i64)> {
+        if let Some(distance) = Self::parse_json_i64_option(json, "distance") {
+            if distance >= 0 {
+                return Some((distance, distance));
+            }
+        }
+
+        let raw = Self::parse_json_string_option(json, "distance")?;
+        let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+        let parse_part = |value: &str| value.parse::<i64>().ok().filter(|parsed| *parsed >= 0);
+
+        match parts.as_slice() {
+            [single] => parse_part(single).map(|distance| (distance, distance)),
+            [upstream, downstream] => Some((parse_part(upstream)?, parse_part(downstream)?)),
+            _ => None,
+        }
+    }
+
+    fn transcript_distance_config(&self) -> (i64, i64) {
+        self.options_json
+            .as_deref()
+            .and_then(Self::parse_json_distance_option)
+            .unwrap_or((5000, 5000))
+    }
+
     async fn resolve_transcript_context_tables(
         &self,
         cache_table: &str,
@@ -1962,7 +1995,8 @@ impl AnnotateProvider {
                     Vec::new(),
                 )
             };
-        let engine = TranscriptConsequenceEngine::default();
+        let (upstream_distance, downstream_distance) = self.transcript_distance_config();
+        let engine = TranscriptConsequenceEngine::new(upstream_distance, downstream_distance);
         let ctx = PreparedContext::new(
             &transcripts,
             &exons,
@@ -3368,6 +3402,34 @@ mod tests {
         assert_eq!(
             AnnotateProvider::parse_json_string_option(json, "b"),
             Some("second".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_json_distance_option_single_numeric() {
+        assert_eq!(
+            AnnotateProvider::parse_json_distance_option(r#"{"distance":10000}"#),
+            Some((10000, 10000))
+        );
+    }
+
+    #[test]
+    fn test_parse_json_distance_option_pair_string() {
+        assert_eq!(
+            AnnotateProvider::parse_json_distance_option(r#"{"distance":"10000,20000"}"#),
+            Some((10000, 20000))
+        );
+    }
+
+    #[test]
+    fn test_parse_json_distance_option_invalid_value() {
+        assert_eq!(
+            AnnotateProvider::parse_json_distance_option(r#"{"distance":"10000,nope"}"#),
+            None
+        );
+        assert_eq!(
+            AnnotateProvider::parse_json_distance_option(r#"{"distance":-1}"#),
+            None
         );
     }
 
