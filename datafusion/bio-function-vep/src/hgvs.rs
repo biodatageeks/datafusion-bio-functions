@@ -1,5 +1,7 @@
 //! HGVS notation formatting for VEP CSQ fields (HGVSc and HGVSp).
 
+use std::cmp::Ordering;
+
 use crate::transcript_consequence::{ExonFeature, TranscriptFeature, TranslationFeature};
 
 /// Map a single-letter amino acid code to its 3-letter abbreviation.
@@ -136,6 +138,183 @@ fn convert_cdna_index_to_hgvsc(raw: usize, coding_start: usize, coding_end: usiz
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExonCdnaCoord {
+    start: i64,
+    end: i64,
+    cdna_start: usize,
+    cdna_end: usize,
+}
+
+fn exon_cdna_coords(tx_exons: &[&ExonFeature], strand: i8) -> Option<Vec<ExonCdnaCoord>> {
+    let mut exons: Vec<&ExonFeature> = tx_exons.to_vec();
+    exons.sort_by_key(|exon| exon.start);
+    if exons.is_empty() {
+        return None;
+    }
+
+    let exon_lens: Vec<usize> = exons
+        .iter()
+        .map(|exon| usize::try_from(exon.end.saturating_sub(exon.start).saturating_add(1)).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let total_len = exon_lens.iter().copied().sum::<usize>();
+
+    let mut coords = Vec::with_capacity(exons.len());
+    if strand >= 0 {
+        let mut offset = 0usize;
+        for (exon, exon_len) in exons.into_iter().zip(exon_lens) {
+            let cdna_start = offset + 1;
+            let cdna_end = offset + exon_len;
+            coords.push(ExonCdnaCoord {
+                start: exon.start,
+                end: exon.end,
+                cdna_start,
+                cdna_end,
+            });
+            offset = cdna_end;
+        }
+    } else {
+        let mut consumed = 0usize;
+        for (exon, exon_len) in exons.into_iter().zip(exon_lens) {
+            let cdna_end = total_len.saturating_sub(consumed);
+            let cdna_start = cdna_end.saturating_sub(exon_len).saturating_add(1);
+            coords.push(ExonCdnaCoord {
+                start: exon.start,
+                end: exon.end,
+                cdna_start,
+                cdna_end,
+            });
+            consumed = consumed.saturating_add(exon_len);
+        }
+    }
+
+    Some(coords)
+}
+
+fn hgvs_cdna_position_from_genomic(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    genomic_pos: i64,
+) -> Option<String> {
+    let exons = exon_cdna_coords(tx_exons, tx.strand)?;
+    let mut cdna_position = None;
+
+    for (i, exon) in exons.iter().enumerate() {
+        if genomic_pos > exon.end {
+            continue;
+        }
+
+        if genomic_pos >= exon.start {
+            let coord = if tx.strand >= 0 {
+                exon.cdna_start as i64 + (genomic_pos - exon.start)
+            } else {
+                exon.cdna_start as i64 + (exon.end - genomic_pos)
+            };
+            cdna_position = Some(coord.to_string());
+            break;
+        }
+
+        let prev_exon = exons.get(i.checked_sub(1)?)?;
+        let updist = (genomic_pos - prev_exon.end).abs();
+        let downdist = (exon.start - genomic_pos).abs();
+        cdna_position = Some(
+            if updist < downdist || (updist == downdist && tx.strand >= 0) {
+                if tx.strand >= 0 {
+                    format!("{}+{}", prev_exon.cdna_end, updist)
+                } else {
+                    format!("{}-{}", prev_exon.cdna_start, updist)
+                }
+            } else if tx.strand >= 0 {
+                format!("{}-{}", exon.cdna_start, downdist)
+            } else {
+                format!("{}+{}", exon.cdna_end, downdist)
+            },
+        );
+        break;
+    }
+
+    shift_to_hgvs_coding_coordinates(tx, tx_exons, &cdna_position?)
+}
+
+fn shift_to_hgvs_coding_coordinates(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    raw_cdna_position: &str,
+) -> Option<String> {
+    let (raw_coord, intron_offset) = split_hgvs_coord(raw_cdna_position)?;
+    let Some((start_codon, stop_codon)) = coding_cdna_bounds(tx, tx_exons) else {
+        return Some(raw_cdna_position.to_string());
+    };
+
+    let mut coord = raw_coord;
+    let mut prefix = "";
+    let mut coord_text = None;
+
+    if coord > stop_codon as i64 {
+        coord -= stop_codon as i64;
+        prefix = "*";
+    } else if coord == stop_codon as i64 && intron_offset.is_some() {
+        prefix = "*";
+        coord_text = Some(String::new());
+    }
+
+    if prefix.is_empty() {
+        if coord >= start_codon as i64 {
+            coord += 1;
+        }
+        coord -= start_codon as i64;
+        coord_text = Some(coord.to_string());
+    } else if coord_text.is_none() {
+        coord_text = Some(coord.to_string());
+    }
+
+    Some(format!(
+        "{prefix}{}{}",
+        coord_text?,
+        intron_offset.unwrap_or_default()
+    ))
+}
+
+fn split_hgvs_coord(value: &str) -> Option<(i64, Option<String>)> {
+    let body = value.strip_prefix('*').unwrap_or(value);
+    let split_idx = body
+        .char_indices()
+        .skip(1)
+        .find_map(|(idx, ch)| matches!(ch, '+' | '-').then_some(idx));
+    let (coord_part, offset_part) = if let Some(idx) = split_idx {
+        (&body[..idx], Some(body[idx..].to_string()))
+    } else {
+        (body, None)
+    };
+    Some((coord_part.parse::<i64>().ok()?, offset_part))
+}
+
+fn compare_hgvs_positions(left: &str, right: &str) -> Option<Ordering> {
+    let left_star = left.starts_with('*');
+    let right_star = right.starts_with('*');
+    match (left_star, right_star) {
+        (false, true) => return Some(Ordering::Less),
+        (true, false) => return Some(Ordering::Greater),
+        _ => {}
+    }
+
+    let (left_coord, left_offset) = split_hgvs_coord(left)?;
+    let (right_coord, right_offset) = split_hgvs_coord(right)?;
+    let left_offset = left_offset
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<i64>()
+        .ok()
+        .unwrap_or(0);
+    let right_offset = right_offset
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<i64>()
+        .ok()
+        .unwrap_or(0);
+    Some((left_coord, left_offset).cmp(&(right_coord, right_offset)))
+}
+
 /// Format the cDNA change part for exonic variants.
 fn format_cdna_change(
     cdna_pos: &str,
@@ -186,136 +365,59 @@ fn compute_intronic_hgvsc(
     let is_ins = ref_allele == "-";
     let is_del = alt_allele == "-";
 
-    // Get sorted exon boundaries.
-    let mut exon_boundaries: Vec<(i64, i64)> = tx_exons.iter().map(|e| (e.start, e.end)).collect();
-    exon_boundaries.sort_by_key(|(s, _)| *s);
-
-    // Find the nearest exon boundary and compute the offset.
-    let (cdna_boundary, offset) =
-        nearest_exon_boundary(tx, tx_exons, &exon_boundaries, variant_start, variant_end)?;
-
     if is_ins {
-        // Intronic insertion
-        let (cdna_boundary2, offset2) = nearest_exon_boundary(
-            tx,
-            tx_exons,
-            &exon_boundaries,
-            variant_start - 1,
-            variant_start - 1,
-        )?;
-        let pos1 = format_intronic_pos(cdna_boundary2, offset2);
-        let pos2 = format_intronic_pos(cdna_boundary, offset);
-        // Order positions correctly
+        let mut pos1 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start - 1)?;
+        let mut pos2 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
+        if !pos1.starts_with('*')
+            && !pos2.starts_with('*')
+            && matches!(
+                compare_hgvs_positions(&pos1, &pos2),
+                Some(Ordering::Greater)
+            )
+        {
+            std::mem::swap(&mut pos1, &mut pos2);
+        }
         Some(format!("{pos1}_{pos2}ins{alt_allele}"))
     } else if is_del {
         if variant_start == variant_end {
-            let pos = format_intronic_pos(cdna_boundary, offset);
+            let pos = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
             Some(format!("{pos}del"))
         } else {
-            let (cdna_boundary2, offset2) =
-                nearest_exon_boundary(tx, tx_exons, &exon_boundaries, variant_end, variant_end)?;
-            let pos1 = format_intronic_pos(cdna_boundary, offset);
-            let pos2 = format_intronic_pos(cdna_boundary2, offset2);
+            let mut pos1 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
+            let mut pos2 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_end)?;
+            if !pos1.starts_with('*')
+                && !pos2.starts_with('*')
+                && matches!(
+                    compare_hgvs_positions(&pos1, &pos2),
+                    Some(Ordering::Greater)
+                )
+            {
+                std::mem::swap(&mut pos1, &mut pos2);
+            }
             Some(format!("{pos1}_{pos2}del"))
         }
     } else if ref_allele.len() == 1 && alt_allele.len() == 1 {
-        // SNV in intron
-        let pos = format_intronic_pos(cdna_boundary, offset);
+        let pos = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
         Some(format!("{pos}{ref_allele}>{alt_allele}"))
     } else {
-        // Complex intronic change
-        let pos = format_intronic_pos(cdna_boundary, offset);
         if variant_start == variant_end {
+            let pos = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
             Some(format!("{pos}delins{alt_allele}"))
         } else {
-            let (cdna_boundary2, offset2) =
-                nearest_exon_boundary(tx, tx_exons, &exon_boundaries, variant_end, variant_end)?;
-            let pos2 = format_intronic_pos(cdna_boundary2, offset2);
-            Some(format!("{pos}_{pos2}delins{alt_allele}"))
-        }
-    }
-}
-
-/// Format an intronic position as "123+45" or "123-45".
-fn format_intronic_pos(cdna_boundary: usize, offset: i64) -> String {
-    if offset > 0 {
-        format!("{cdna_boundary}+{offset}")
-    } else if offset < 0 {
-        format!("{cdna_boundary}{offset}")
-    } else {
-        // Offset of 0 means right at the boundary (shouldn't happen for intronic).
-        format!("{cdna_boundary}")
-    }
-}
-
-/// Find the nearest exon boundary to a genomic position and return
-/// (cdna_position_at_boundary, signed_offset_from_boundary).
-///
-/// Positive offset = downstream of the exon end (donor side, +).
-/// Negative offset = upstream of the exon start (acceptor side, -).
-fn nearest_exon_boundary(
-    tx: &TranscriptFeature,
-    tx_exons: &[&ExonFeature],
-    sorted_exon_bounds: &[(i64, i64)],
-    variant_start: i64,
-    _variant_end: i64,
-) -> Option<(usize, i64)> {
-    let pos = variant_start;
-    let strand = tx.strand;
-
-    // Build ordered exon list in transcript direction.
-    let mut segments: Vec<(i64, i64)> = sorted_exon_bounds.to_vec();
-    if strand < 0 {
-        segments.reverse();
-    }
-
-    // For each intron gap between consecutive exons, check if position falls in it.
-    for i in 0..segments.len().saturating_sub(1) {
-        let (prev_start, prev_end) = segments[i];
-        let (next_start, next_end) = segments[i + 1];
-
-        let (intron_start, intron_end) = if strand >= 0 {
-            (prev_end + 1, next_start - 1)
-        } else {
-            (next_end + 1, prev_start - 1)
-        };
-
-        if pos >= intron_start && pos <= intron_end {
-            // Position is in this intron gap.
-            if strand >= 0 {
-                // Distance from donor (prev exon end) and acceptor (next exon start).
-                let dist_to_donor = pos - prev_end;
-                let dist_to_acceptor = next_start - pos;
-
-                if dist_to_donor <= dist_to_acceptor {
-                    // Closer to donor (upstream exon end).
-                    let cdna = genomic_to_cdna_index_pub(tx_exons, strand, prev_end)?;
-                    return Some((cdna, dist_to_donor));
-                } else {
-                    // Closer to acceptor (downstream exon start).
-                    let cdna = genomic_to_cdna_index_pub(tx_exons, strand, next_start)?;
-                    return Some((cdna, -dist_to_acceptor));
-                }
-            } else {
-                // Negative strand: donor is at next_end, acceptor is at prev_start.
-                let dist_to_donor = next_end - pos;
-                let dist_to_acceptor = pos - prev_start;
-
-                if dist_to_donor.abs() <= dist_to_acceptor.abs() {
-                    // Closer to donor.
-                    let cdna = genomic_to_cdna_index_pub(tx_exons, strand, next_end)?;
-                    return Some((cdna, dist_to_donor.abs()));
-                } else {
-                    // Closer to acceptor.
-                    let cdna = genomic_to_cdna_index_pub(tx_exons, strand, prev_start)?;
-                    return Some((cdna, -(dist_to_acceptor.abs())));
-                }
+            let mut pos1 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
+            let mut pos2 = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_end)?;
+            if !pos1.starts_with('*')
+                && !pos2.starts_with('*')
+                && matches!(
+                    compare_hgvs_positions(&pos1, &pos2),
+                    Some(Ordering::Greater)
+                )
+            {
+                std::mem::swap(&mut pos1, &mut pos2);
             }
+            Some(format!("{pos1}_{pos2}delins{alt_allele}"))
         }
     }
-
-    // Position may be beyond all exons (UTR-intronic or upstream/downstream).
-    None
 }
 
 /// Public wrapper for genomic_to_cdna_index (which is private in transcript_consequence).
@@ -607,9 +709,17 @@ mod tests {
     }
 
     #[test]
-    fn test_format_intronic_pos() {
-        assert_eq!(format_intronic_pos(100, 5), "100+5");
-        assert_eq!(format_intronic_pos(100, -3), "100-3");
+    fn test_split_hgvs_coord() {
+        assert_eq!(
+            split_hgvs_coord("100+5"),
+            Some((100, Some("+5".to_string())))
+        );
+        assert_eq!(
+            split_hgvs_coord("100-3"),
+            Some((100, Some("-3".to_string())))
+        );
+        assert_eq!(split_hgvs_coord("-1"), Some((-1, None)));
+        assert_eq!(split_hgvs_coord("*2"), Some((2, None)));
     }
 
     #[test]
@@ -666,6 +776,61 @@ mod tests {
         assert_eq!(
             format_hgvsc(&tx, &exons, Some("14"), "G", "A", 103, 103),
             Some("ENSTHGVS000001.1:n.14G>A".to_string())
+        );
+    }
+
+    #[test]
+    fn test_hgvs_cdna_position_intronic_plus_strand() {
+        let tx = make_transcript("protein_coding", 1, Some(90), Some(119));
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 90,
+            end: 99,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 110,
+            end: 119,
+        };
+        let exons = [&exon1, &exon2];
+        assert_eq!(
+            hgvs_cdna_position_from_genomic(&tx, &exons, 104),
+            Some("10+5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_hgvs_cdna_position_intronic_minus_strand() {
+        let tx = make_transcript("protein_coding", -1, Some(90), Some(119));
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 90,
+            end: 99,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 110,
+            end: 119,
+        };
+        let exons = [&exon1, &exon2];
+        assert_eq!(
+            hgvs_cdna_position_from_genomic(&tx, &exons, 104),
+            Some("11-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_uses_star_coordinate_in_three_prime_utr() {
+        let tx = make_transcript("protein_coding", 1, Some(100), Some(108));
+        let exon = make_exon();
+        let exons = [&exon];
+        assert_eq!(
+            format_hgvsc(&tx, &exons, Some("21"), "A", "G", 110, 110),
+            Some("ENSTHGVS000001.1:c.*2A>G".to_string())
         );
     }
 }
