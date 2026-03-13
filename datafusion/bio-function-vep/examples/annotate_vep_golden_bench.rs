@@ -13,11 +13,12 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::golden_benchmark::{
-    ComparisonReport, CsqFieldReport, CsqUnmatchedReport, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ,
-    DEFAULT_EXTERNAL_VEP_CACHE_DIR, DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, TermComparisonReport,
-    VariantAnnotation, VariantDiscrepancy, VariantKey, collect_discrepancies,
-    compare_annotation_terms, compare_annotations, compare_csq_fields, diagnose_unmatched_csq,
-    ensure_local_copy, normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
+    ComparisonReport, CsqFieldReport, CsqMultiplicityReport, CsqUnmatchedReport,
+    DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ, DEFAULT_EXTERNAL_VEP_CACHE_DIR,
+    DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, TermComparisonReport, VariantAnnotation, VariantDiscrepancy,
+    VariantKey, collect_discrepancies, compare_annotation_terms, compare_annotations,
+    compare_csq_fields, diagnose_csq_multiplicity, diagnose_unmatched_csq, ensure_local_copy,
+    normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
 };
 use datafusion_bio_function_vep::register_vep_functions;
 
@@ -292,10 +293,12 @@ async fn main() -> Result<()> {
         let csq_field_report = compare_csq_fields(golden, ours);
         let discrepancies = collect_discrepancies(golden, ours);
         let unmatched_report = diagnose_unmatched_csq(golden, ours);
+        let multiplicity_report = diagnose_csq_multiplicity(golden, ours);
 
         print_report(&report, &term_report);
         print_csq_field_report(&csq_field_report);
         print_unmatched_report(&unmatched_report);
+        print_multiplicity_report(&multiplicity_report);
         print_discrepancy_summary(&discrepancies, &report);
 
         write_report(
@@ -841,6 +844,39 @@ fn print_unmatched_report(report: &CsqUnmatchedReport) {
         println!("  ours_only samples (allele|feature|feature_type):");
         for (a, f, ft) in &report.ours_only_sample {
             println!("    {}|{}|{}", a, f, ft);
+        }
+    }
+}
+
+fn print_multiplicity_report(report: &CsqMultiplicityReport) {
+    if report.golden_extra_total == 0 && report.ours_extra_total == 0 {
+        return;
+    }
+
+    println!("\ncsq multiplicity diagnostic:");
+    println!("  golden_extra_duplicates: {}", report.golden_extra_total);
+    println!("  ours_extra_duplicates: {}", report.ours_extra_total);
+    if !report.samples.is_empty() {
+        println!(
+            "  samples (chrom:pos ref/alt allele|feature|feature_type golden_count->ours_count):"
+        );
+        for sample in &report.samples {
+            println!(
+                "    {}:{} {}/{} {}|{}|{} {}->{}",
+                sample.variant_key.chrom,
+                sample.variant_key.pos,
+                sample.variant_key.ref_allele,
+                sample.variant_key.alt_alleles,
+                sample.allele,
+                sample.feature,
+                if sample.feature_type.is_empty() {
+                    "(empty)"
+                } else {
+                    sample.feature_type.as_str()
+                },
+                sample.golden_count,
+                sample.ours_count,
+            );
         }
     }
 }

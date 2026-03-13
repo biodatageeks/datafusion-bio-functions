@@ -2,7 +2,7 @@
 
 Goal: get `datafusion/bio-function-vep` to zero mismatches on the README chr1 golden benchmark for all 74 CSQ columns, with zero extra CSQ entries, by implementing Ensembl VEP semantics exactly rather than tuning heuristics.
 
-Date: March 12, 2026
+Date: March 13, 2026
 
 ## Hard Constraints
 
@@ -36,7 +36,7 @@ Secondary target:
 
 - Close the hidden parity gap for HGVS behavior that the current 74-field benchmark does not exercise because the harness does not pass `--hgvs --fasta`.
 
-## Current Baseline
+## Current Verified Status
 
 Validated on this checkout with:
 
@@ -48,43 +48,27 @@ cargo run -p datafusion-bio-function-vep --example annotate_vep_golden_bench --r
   0 \
   /tmp/vep_golden \
   vep-benchmark/data/HG002_chr1.vcf.gz \
-  /tmp/annotate_vep_golden_bench_curr \
+  /tmp/annotate_vep_golden_bench_release_entry_diag_fix2 \
   /Users/mwiewior/research/data/vep \
   --steps=ensembl,datafusion \
   --extended-probes
 ```
 
-Observed baseline:
+Observed result:
 
 - `323,430` variants compared
 - `2,997,504` CSQ entries compared
-- `53/74` fields perfect
-- `21/74` fields imperfect
-- `15` extra CSQ entries on our side
+- `74/74` fields perfect
+- `0` extra CSQ entries on our side
+- `0` missing CSQ entries
+- `100%` most-severe parity
+- `100%` term-set parity
+- release annotate time `49.783s`
 
-Imperfect fields:
+Remaining open work outside the README chr1 gate:
 
-- `Consequence`
-- `INTRON`
-- `CDS_position`
-- `Protein_position`
-- `Amino_acids`
-- `Existing_variation`
-- `FLAGS`
-- `AF`
-- `AFR_AF`
-- `AMR_AF`
-- `EAS_AF`
-- `EUR_AF`
-- `SAS_AF`
-- `gnomADe_AF`
-- `gnomADg_AF`
-- `MAX_AF`
-- `MAX_AF_POPS`
-- `CLIN_SIG`
-- `SOMATIC`
-- `PHENO`
-- `PUBMED`
+- Phase 4 HGVS-specific parity benchmark with `--hgvs --fasta`
+- refresh acceptance records as that second benchmark is added
 
 ## Upstream Source of Truth
 
@@ -860,6 +844,11 @@ The strict parity work is complete only when all of the following hold:
 5. `FLAGS` ordering is sourced from ordered upstream-equivalent data.
 6. A second HGVS-enabled benchmark path exists for validating real full-field parity.
 
+Status on March 13, 2026:
+
+- Criteria `1` through `5` are satisfied on chr1.
+- Criterion `6` remains open.
+
 ## Recommended Execution Order
 
 1. Phase -1: existing code review and traceability inventory
@@ -872,12 +861,11 @@ The strict parity work is complete only when all of the following hold:
 ## Expected Outcome by Phase
 
 - After Phase 1:
-  - 15 large co-located field mismatch groups should collapse
+  - completed
 - After Phase 2:
-  - the 5 consequence/position/amino-acid fields should collapse
-  - the 15 extra entries should disappear
+  - completed
 - After Phase 3:
-  - `FLAGS` should collapse
+  - completed
 - After Phase 4:
   - parity is no longer limited by the current benchmark’s blank HGVS fields
 

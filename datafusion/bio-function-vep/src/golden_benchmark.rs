@@ -583,6 +583,25 @@ pub struct CsqUnmatchedReport {
     pub ours_only_sample: Vec<(String, String, String)>,
 }
 
+/// Diagnostic sample for `(Allele, Feature)` multiplicity drift within one variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsqMultiplicitySample {
+    pub variant_key: VariantKey,
+    pub allele: String,
+    pub feature: String,
+    pub feature_type: String,
+    pub golden_count: usize,
+    pub ours_count: usize,
+}
+
+/// Report of CSQ entry multiplicity drift after `(Allele, Feature)` matching.
+#[derive(Debug, Clone, Default)]
+pub struct CsqMultiplicityReport {
+    pub golden_extra_total: usize,
+    pub ours_extra_total: usize,
+    pub samples: Vec<CsqMultiplicitySample>,
+}
+
 /// Diagnose why CSQ entries are unmatched between golden and ours.
 pub fn diagnose_unmatched_csq(
     golden: &[VariantAnnotation],
@@ -683,6 +702,80 @@ pub fn diagnose_unmatched_csq(
         golden_only_sample,
         ours_only_sample,
     }
+}
+
+/// Diagnose multiplicity drift for entries that share the same
+/// `(Allele, Feature)` key within a single variant.
+pub fn diagnose_csq_multiplicity(
+    golden: &[VariantAnnotation],
+    ours: &[VariantAnnotation],
+) -> CsqMultiplicityReport {
+    let golden_map: HashMap<VariantKey, &VariantAnnotation> =
+        golden.iter().map(|r| (r.key.clone(), r)).collect();
+    let ours_map: HashMap<VariantKey, &VariantAnnotation> =
+        ours.iter().map(|r| (r.key.clone(), r)).collect();
+
+    let mut report = CsqMultiplicityReport::default();
+
+    for (key, golden_row) in &golden_map {
+        let Some(ours_row) = ours_map.get(key) else {
+            continue;
+        };
+
+        let golden_entries = parse_csq_entries(golden_row.csq.as_deref().unwrap_or(""));
+        let ours_entries = parse_csq_entries(ours_row.csq.as_deref().unwrap_or(""));
+
+        let mut golden_counts: HashMap<(String, String), usize> = HashMap::new();
+        let mut ours_counts: HashMap<(String, String), usize> = HashMap::new();
+        let mut feature_types: HashMap<(String, String), String> = HashMap::new();
+
+        for entry in &golden_entries {
+            let key = (entry.allele().to_string(), entry.feature().to_string());
+            *golden_counts.entry(key.clone()).or_default() += 1;
+            feature_types
+                .entry(key)
+                .or_insert_with(|| entry.fields.get(5).cloned().unwrap_or_default());
+        }
+
+        for entry in &ours_entries {
+            let key = (entry.allele().to_string(), entry.feature().to_string());
+            *ours_counts.entry(key.clone()).or_default() += 1;
+            feature_types
+                .entry(key)
+                .or_insert_with(|| entry.fields.get(5).cloned().unwrap_or_default());
+        }
+
+        let mut all_keys: BTreeSet<(String, String)> = BTreeSet::new();
+        all_keys.extend(golden_counts.keys().cloned());
+        all_keys.extend(ours_counts.keys().cloned());
+
+        for pair in all_keys {
+            let golden_count = *golden_counts.get(&pair).unwrap_or(&0);
+            let ours_count = *ours_counts.get(&pair).unwrap_or(&0);
+            if golden_count == ours_count {
+                continue;
+            }
+
+            if ours_count > golden_count {
+                report.ours_extra_total += ours_count - golden_count;
+            } else {
+                report.golden_extra_total += golden_count - ours_count;
+            }
+
+            if report.samples.len() < 30 {
+                report.samples.push(CsqMultiplicitySample {
+                    variant_key: (*key).clone(),
+                    allele: pair.0.clone(),
+                    feature: pair.1.clone(),
+                    feature_type: feature_types.get(&pair).cloned().unwrap_or_default(),
+                    golden_count,
+                    ours_count,
+                });
+            }
+        }
+    }
+
+    report
 }
 
 /// Parsed CSQ entry (one pipe-delimited annotation from one transcript).
@@ -1204,5 +1297,40 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         assert_eq!(report.matched, 1);
         assert!(report.golden_only_by_ft.is_empty());
         assert!(report.ours_only_by_ft.is_empty());
+    }
+
+    #[test]
+    fn diagnose_multiplicity_reports_duplicate_ours_entries() {
+        let key = VariantKey {
+            chrom: "22".into(),
+            pos: 100,
+            ref_allele: "A".into(),
+            alt_alleles: "G".into(),
+        };
+        let golden = vec![VariantAnnotation {
+            key: key.clone(),
+            csq: Some("G|miss|MOD|S|G1|Transcript|TX1|pc||||||||||||||||||||||||".into()),
+            most_severe_consequence: Some("missense_variant".into()),
+        }];
+        let ours = vec![VariantAnnotation {
+            key: key.clone(),
+            csq: Some(
+                "G|miss|MOD|S|G1|Transcript|TX1|pc||||||||||||||||||||||||,\
+                 G|miss|MOD|S|G1|Transcript|TX1|pc||||||||||||||||||||||||"
+                    .into(),
+            ),
+            most_severe_consequence: Some("missense_variant".into()),
+        }];
+
+        let report = diagnose_csq_multiplicity(&golden, &ours);
+        assert_eq!(report.golden_extra_total, 0);
+        assert_eq!(report.ours_extra_total, 1);
+        assert_eq!(report.samples.len(), 1);
+        assert_eq!(report.samples[0].variant_key, key);
+        assert_eq!(report.samples[0].allele, "G");
+        assert_eq!(report.samples[0].feature, "TX1");
+        assert_eq!(report.samples[0].feature_type, "Transcript");
+        assert_eq!(report.samples[0].golden_count, 1);
+        assert_eq!(report.samples[0].ours_count, 2);
     }
 }

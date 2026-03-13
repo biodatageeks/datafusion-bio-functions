@@ -1,6 +1,6 @@
 //! Transcript/exon-driven consequence evaluation (phase 2).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use coitrees::{COITree, Interval, IntervalTree};
 
@@ -833,8 +833,12 @@ impl TranscriptConsequenceEngine {
         }
 
         // Emit one CSQ entry per overlapping regulatory feature (matching VEP behavior).
+        let mut seen_feature_ids: HashSet<&str> = HashSet::new();
         for r in regulatory {
             if normalize_chrom(&r.chrom) != chrom || !feature_overlaps(variant, r.start, r.end) {
+                continue;
+            }
+            if !seen_feature_ids.insert(r.feature_id.as_str()) {
                 continue;
             }
             let mut terms: BTreeSet<SoTerm> = sv_terms.clone();
@@ -899,9 +903,13 @@ impl TranscriptConsequenceEngine {
             &mut regulatory_hits,
         );
         let mut matched_regulatory = false;
+        let mut seen_feature_ids: HashSet<&str> = HashSet::new();
         for idx in regulatory_hits {
             let r = ctx.regulatory_index.features[idx];
             if !feature_overlaps(variant, r.start, r.end) {
+                continue;
+            }
+            if !seen_feature_ids.insert(r.feature_id.as_str()) {
                 continue;
             }
             matched_regulatory = true;
@@ -1612,40 +1620,46 @@ impl TranscriptConsequenceEngine {
         variant: &VariantInput,
         tx: &TranscriptFeature,
     ) -> Option<(SoTerm, i64)> {
-        // For insertions, use the left flanking position (start - 1) so
-        // that an insertion at the transcript boundary is detected as
-        // upstream/downstream.  The insertion is between start-1 and start;
-        // if start-1 is in the upstream window, the insertion is upstream.
-        let check_start = if variant.ref_allele == "-" {
+        let is_insertion = variant.ref_allele == "-";
+        // VEP's upstream/downstream predicates do not use generic interval
+        // overlap for insertions. They evaluate `_before_start()` against the
+        // insertion's left coordinate (`end = start - 1`) and `_after_end()`
+        // against the right coordinate (`start`), which keeps insertions at
+        // exactly transcript_start-5001 outside the 5kb window.
+        let check_start = if is_insertion {
             variant.start.saturating_sub(1)
         } else {
             variant.start
         };
-        let check_end = variant.end;
+        let before_start_end = if is_insertion {
+            variant.start.saturating_sub(1)
+        } else {
+            variant.end
+        };
         if tx.strand >= 0 {
-            let up_start = tx.start.saturating_sub(self.upstream_distance);
-            let up_end = tx.start.saturating_sub(1);
-            if overlaps(check_start, check_end, up_start, up_end) {
-                let dist = tx.start.saturating_sub(check_end).max(0);
+            if before_start_end >= tx.start.saturating_sub(self.upstream_distance)
+                && before_start_end < tx.start
+            {
+                let dist = tx.start.saturating_sub(variant.end).max(0);
                 return Some((SoTerm::UpstreamGeneVariant, dist));
             }
             let down_start = tx.end.saturating_add(1);
             let down_end = tx.end.saturating_add(self.downstream_distance);
-            if overlaps(check_start, check_end, down_start, down_end) {
+            if overlaps(check_start, variant.end, down_start, down_end) {
                 let dist = check_start.saturating_sub(tx.end).max(0);
                 return Some((SoTerm::DownstreamGeneVariant, dist));
             }
         } else {
             let up_start = tx.end.saturating_add(1);
             let up_end = tx.end.saturating_add(self.upstream_distance);
-            if overlaps(check_start, check_end, up_start, up_end) {
+            if overlaps(check_start, variant.end, up_start, up_end) {
                 let dist = check_start.saturating_sub(tx.end).max(0);
                 return Some((SoTerm::UpstreamGeneVariant, dist));
             }
-            let down_start = tx.start.saturating_sub(self.downstream_distance);
-            let down_end = tx.start.saturating_sub(1);
-            if overlaps(check_start, check_end, down_start, down_end) {
-                let dist = tx.start.saturating_sub(check_end).max(0);
+            if before_start_end >= tx.start.saturating_sub(self.downstream_distance)
+                && before_start_end < tx.start
+            {
+                let dist = tx.start.saturating_sub(variant.end).max(0);
                 return Some((SoTerm::DownstreamGeneVariant, dist));
             }
         }
@@ -4008,6 +4022,86 @@ mod tests {
     }
 
     #[test]
+    fn insertion_5000bp_before_positive_transcript_start_is_upstream() {
+        let engine = TranscriptConsequenceEngine::new(5000, 5000);
+        let positive = tx(
+            "txp",
+            "22",
+            10_000,
+            11_000,
+            1,
+            "protein_coding",
+            Some(10_100),
+            Some(10_900),
+        );
+        let variant = VariantInput::from_vcf("22".into(), 5_000, 5_000, "A".into(), "AT".into());
+
+        let out = engine.evaluate_variant(&variant, std::slice::from_ref(&positive), &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].terms, vec![SoTerm::UpstreamGeneVariant]);
+    }
+
+    #[test]
+    fn insertion_5001bp_before_positive_transcript_start_is_not_upstream() {
+        let engine = TranscriptConsequenceEngine::new(5000, 5000);
+        let positive = tx(
+            "txp",
+            "22",
+            10_000,
+            11_000,
+            1,
+            "protein_coding",
+            Some(10_100),
+            Some(10_900),
+        );
+        let variant = VariantInput::from_vcf("22".into(), 4_998, 4_998, "A".into(), "AT".into());
+
+        let out = engine.evaluate_variant(&variant, std::slice::from_ref(&positive), &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].terms, vec![SoTerm::IntergenicVariant]);
+    }
+
+    #[test]
+    fn insertion_5000bp_before_negative_transcript_start_is_downstream() {
+        let engine = TranscriptConsequenceEngine::new(5000, 5000);
+        let negative = tx(
+            "txn",
+            "22",
+            20_000,
+            21_000,
+            -1,
+            "protein_coding",
+            Some(20_100),
+            Some(20_900),
+        );
+        let variant = VariantInput::from_vcf("22".into(), 15_000, 15_000, "A".into(), "AG".into());
+
+        let out = engine.evaluate_variant(&variant, std::slice::from_ref(&negative), &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].terms, vec![SoTerm::DownstreamGeneVariant]);
+    }
+
+    #[test]
+    fn insertion_5001bp_before_negative_transcript_start_is_not_downstream() {
+        let engine = TranscriptConsequenceEngine::new(5000, 5000);
+        let negative = tx(
+            "txn",
+            "22",
+            20_000,
+            21_000,
+            -1,
+            "protein_coding",
+            Some(20_100),
+            Some(20_900),
+        );
+        let variant = VariantInput::from_vcf("22".into(), 14_998, 14_998, "A".into(), "AG".into());
+
+        let out = engine.evaluate_variant(&variant, std::slice::from_ref(&negative), &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].terms, vec![SoTerm::IntergenicVariant]);
+    }
+
+    #[test]
     fn non_coding_exon_and_intron_terms() {
         let engine = TranscriptConsequenceEngine::default();
         let tx = tx("lnc", "22", 100, 300, 1, "lincRNA", None, None);
@@ -4646,6 +4740,38 @@ mod tests {
             .collect();
 
         assert_eq!(ids, vec!["ENSR22_B", "ENSR22_A"]);
+    }
+
+    #[test]
+    fn regulatory_duplicate_stable_ids_emit_single_entry() {
+        let engine = TranscriptConsequenceEngine::default();
+        let reg = regulatory("ENSR22_A", "22", 100, 200);
+        let variant = var("22", 150, 150, "A", "G");
+        let mut out = Vec::new();
+
+        engine.append_regulatory_terms(&mut out, &variant, &[reg.clone(), reg], &[]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].transcript_id.as_deref(), Some("ENSR22_A"));
+        assert_eq!(out[0].feature_type, FeatureType::RegulatoryFeature);
+    }
+
+    #[test]
+    fn prepared_context_deduplicates_duplicate_regulatory_stable_ids() {
+        let engine = TranscriptConsequenceEngine::default();
+        let reg = regulatory("ENSR22_A", "chr22", 100, 200);
+        let regulatory_features = vec![reg.clone(), reg];
+        let variant = var("22", 150, 150, "A", "G");
+        let prepared = PreparedContext::new(&[], &[], &[], &regulatory_features, &[], &[], &[]);
+
+        let out = engine.evaluate_variant_prepared(&variant, &prepared);
+        let regulatory_ids: Vec<_> = out
+            .iter()
+            .filter(|tc| tc.feature_type == FeatureType::RegulatoryFeature)
+            .map(|tc| tc.transcript_id.as_deref().unwrap_or(""))
+            .collect();
+
+        assert_eq!(regulatory_ids, vec!["ENSR22_A"]);
     }
 
     #[test]
