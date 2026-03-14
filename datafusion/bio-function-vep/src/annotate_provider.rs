@@ -3083,7 +3083,11 @@ where
             continue;
         }
         // Only need UTR for coding transcripts.
-        if tx.cdna_coding_end.is_none() {
+        let Some(coding_end) = tx.cdna_coding_end else {
+            continue;
+        };
+        // Skip LoF biotype (VEP doesn't provide UTR for these).
+        if tx.biotype.contains("LoF") {
             continue;
         }
         let chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
@@ -3097,16 +3101,55 @@ where
         let Some(tx_exons) = exons_by_tx.get(tx.transcript_id.as_str()) else {
             continue;
         };
+        // Only hydrate if exons extend past CDS (i.e., there IS a 3' UTR).
+        // If total exonic length <= coding_end, there's no UTR to hydrate.
+        let total_exonic: usize = tx_exons.iter().map(|e| {
+            usize::try_from(e.end.saturating_sub(e.start).saturating_add(1)).unwrap_or(0)
+        }).sum();
+        if total_exonic <= coding_end {
+            continue;
+        }
+        // Read the entire transcript span in ONE FASTA query and extract
+        // exon subsequences from it. This reduces ~8.7 FASTA reads per
+        // transcript to just 1, cutting hydration I/O by ~8x.
+        // For very large transcripts (>500KB), fall back to per-exon reads
+        // to avoid excessive memory allocation.
+        let tx_span_size = tx.end - tx.start + 1;
+        if tx_span_size > 500_000 {
+            // Per-exon fallback for large transcripts
+            let mut genomic_cdna = String::new();
+            let mut ok = true;
+            for exon in tx_exons {
+                let segment = read_reference_sequence(reader, chrom, exon.start, exon.end)?;
+                let expected = usize::try_from(exon.end - exon.start + 1).unwrap_or_default();
+                if segment.len() != expected { ok = false; break; }
+                genomic_cdna.push_str(&segment);
+            }
+            if !ok || genomic_cdna.is_empty() { continue; }
+            let cdna = if tx.strand >= 0 {
+                genomic_cdna.to_ascii_uppercase()
+            } else {
+                let Some(rc) = reverse_complement_dna(&genomic_cdna) else { continue; };
+                rc
+            };
+            tx.cdna_seq = Some(cdna);
+            continue;
+        }
+        let tx_span = read_reference_sequence(reader, chrom, tx.start, tx.end)?;
+        let tx_span_len = usize::try_from(tx_span_size).unwrap_or_default();
+        if tx_span.len() != tx_span_len {
+            continue;
+        }
         let mut genomic_cdna = String::new();
         let mut ok = true;
         for exon in tx_exons {
-            let segment = read_reference_sequence(reader, chrom, exon.start, exon.end)?;
-            let expected = usize::try_from(exon.end - exon.start + 1).unwrap_or_default();
-            if segment.len() != expected {
+            let local_start = usize::try_from(exon.start - tx.start).unwrap_or(0);
+            let local_end = usize::try_from(exon.end - tx.start + 1).unwrap_or(0);
+            let Some(segment) = tx_span.get(local_start..local_end) else {
                 ok = false;
                 break;
-            }
-            genomic_cdna.push_str(&segment);
+            };
+            genomic_cdna.push_str(segment);
         }
         if !ok || genomic_cdna.is_empty() {
             continue;
