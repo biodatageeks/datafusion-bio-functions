@@ -2931,7 +2931,22 @@ fn classify_coding_change(
         }
     }
 
-    class.protein_hgvs = build_protein_hgvs_data(&class, &old_aas, &new_aas, frameshift);
+    // For HGVS stop-loss / frameshift extension distance, translate the
+    // mutated CDS + 3' UTR so that the new stop codon can be found even
+    // when it falls in the UTR region.
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::_stop_loss_extra_AA()`
+    //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2406-L2455
+    let hgvs_new_aas = if class.stop_lost || frameshift {
+        let mut extended = mutated.clone();
+        if let Some(utr) = three_prime_utr_seq(tx) {
+            extended.extend_from_slice(utr.as_bytes());
+        }
+        translate_protein_from_cds(&extended).unwrap_or_else(|| new_aas.clone())
+    } else {
+        new_aas.clone()
+    };
+    class.protein_hgvs = build_protein_hgvs_data(&class, &old_aas, &hgvs_new_aas, frameshift);
     Some(class)
 }
 
@@ -3142,7 +3157,17 @@ fn classify_insertion(
         }
     }
 
-    class.protein_hgvs = build_protein_hgvs_data(&class, &old_aas, &new_aas, frameshift);
+    // Extend with 3' UTR for HGVS stop-loss/frameshift extension distance.
+    let hgvs_new_aas = if class.stop_lost || frameshift {
+        let mut extended = mutated.clone();
+        if let Some(utr) = three_prime_utr_seq(tx) {
+            extended.extend_from_slice(utr.as_bytes());
+        }
+        translate_protein_from_cds(&extended).unwrap_or_else(|| new_aas.clone())
+    } else {
+        new_aas.clone()
+    };
+    class.protein_hgvs = build_protein_hgvs_data(&class, &old_aas, &hgvs_new_aas, frameshift);
     Some(class)
 }
 
@@ -4104,6 +4129,29 @@ fn reverse_complement(seq: &str) -> Option<String> {
         out.push(c);
     }
     Some(out)
+}
+
+/// Extract the 3' UTR nucleotide sequence from the transcript's spliced
+/// sequence. Returns `None` when the transcript has no spliced sequence or
+/// no coding-end annotation.
+///
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_stop_loss_extra_AA()`
+///   calls `$self->transcript_variation->_three_prime_utr()` and appends
+///   it to the alternate CDS before translating
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2412-L2418
+fn three_prime_utr_seq(tx: &TranscriptFeature) -> Option<String> {
+    let spliced = tx.spliced_seq.as_deref()?;
+    let coding_end = tx.cdna_coding_end?;
+    if coding_end >= spliced.len() {
+        return None;
+    }
+    let utr = &spliced[coding_end..];
+    if utr.is_empty() {
+        None
+    } else {
+        Some(utr.to_ascii_uppercase())
+    }
 }
 
 fn translate_protein_from_cds(cds: &[u8]) -> Option<Vec<char>> {
