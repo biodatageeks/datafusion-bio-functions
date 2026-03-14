@@ -1464,8 +1464,8 @@ async fn test_conditional_transform() {
 #[tokio::test]
 #[serial]
 async fn test_multiple_transforms() {
-    use datafusion::physical_plan::displayable;
     use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::physical_plan::displayable;
 
     let ctx = create_optimized_context().await; // Use optimized context
     let batch = create_test_data();
@@ -1550,13 +1550,14 @@ async fn test_multiple_transforms() {
     // serialize results to string and then compare with expected string
     let results_str = pretty_format_batches(&results).unwrap().to_string();
     let expected_str =
-"+---------+----------+--------------------+--------------------+---------------------+
+        "+---------+----------+--------------------+--------------------+---------------------+
 | row_idx | metadata | values_b           | values_product     | values_conditional  |
 +---------+----------+--------------------+--------------------+---------------------+
 | 1       | meta1    | [10.0, 20.0, 30.0] | [10.0, 40.0, 90.0] | [701.0, 702.0, 9.0] |
 | 2       | meta2    | [40.0, 50.0]       | [160.0, 250.0]     | [16.0, 25.0]        |
 | 3       | meta3    | [60.0]             | [360.0]            | [36.0]              |
-+---------+----------+--------------------+--------------------+---------------------+".to_string();
++---------+----------+--------------------+--------------------+---------------------+"
+            .to_string();
     assert_eq!(
         results_str, expected_str,
         "Results do not match expected output for multiple transforms case"
@@ -1565,7 +1566,6 @@ async fn test_multiple_transforms() {
     // Clean up
     disable_fused_array_transform();
 }
-
 
 // =============================================================================
 // False Positive Tests (optimization should NOT be applied)
