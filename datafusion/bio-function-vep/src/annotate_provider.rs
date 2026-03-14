@@ -1417,6 +1417,13 @@ impl AnnotateProvider {
             let cds_end_nf_idx = schema.index_of("cds_end_nf").ok();
             let mirna_regions_idx = schema.index_of("mature_mirna_regions").ok();
             let cdna_seq_idx = schema.index_of("cdna_seq").ok();
+            // Promoted columns (previously extracted from raw_object_json).
+            let bam_edit_status_idx = schema.index_of("bam_edit_status").ok();
+            let has_non_polya_rna_edit_idx = schema.index_of("has_non_polya_rna_edit").ok();
+            let spliced_seq_idx = schema.index_of("spliced_seq").ok();
+            let translateable_seq_idx = schema.index_of("translateable_seq").ok();
+            let flags_str_idx = schema.index_of("flags_str").ok();
+            let cdna_mapper_segments_idx = schema.index_of("cdna_mapper_segments").ok();
             // Batch 1 columns.
             let is_canonical_idx = schema.index_of("is_canonical").ok();
             let tsl_idx = schema.index_of("tsl").ok();
@@ -1483,20 +1490,31 @@ impl AnnotateProvider {
                 let cds_end_nf = cds_end_nf_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                     .unwrap_or(false);
+                // Prefer promoted top-level columns; fall back to JSON parsing
+                // for backward compatibility with older caches.
                 let raw_object_json = raw_json_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                if let Some(translateable_seq) =
-                    translateable_seq_from_raw_object_json(raw_object_json.as_deref())
+                let has_promoted_columns = translateable_seq_idx.is_some();
+                if let Some(translateable_seq) = translateable_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or_else(|| translateable_seq_from_raw_object_json(raw_object_json.as_deref()))
                 {
                     translateable_seq_by_tx.insert(transcript_id.clone(), translateable_seq);
                 }
-                let cdna_mapper_segments =
-                    cdna_mapper_segments_from_raw_object_json(raw_object_json.as_deref());
-                let flags_str = resolve_flags_str(
-                    raw_object_json.as_deref(),
-                    cds_start_nf,
-                    cds_end_nf,
-                );
+                let cdna_mapper_segments = if let Some(idx) = cdna_mapper_segments_idx {
+                    cdna_mapper_segments_from_list_column(batch.column(idx).as_ref(), row)
+                } else {
+                    cdna_mapper_segments_from_raw_object_json(raw_object_json.as_deref())
+                };
+                let flags_str = flags_str_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or_else(|| {
+                        resolve_flags_str(
+                            raw_object_json.as_deref(),
+                            cds_start_nf,
+                            cds_end_nf,
+                        )
+                    });
 
                 let gene_stable_id =
                     gene_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
@@ -1508,18 +1526,28 @@ impl AnnotateProvider {
                     gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let refseq_id =
                     refseq_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let source = normalize_source_cache(
-                    raw_object_json.as_deref(),
-                    &transcript_id,
-                    source_idx
-                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                        .as_deref(),
-                );
-                let bam_edit_status =
-                    bam_edit_status_from_raw_object_json(raw_object_json.as_deref());
-                let has_non_polya_rna_edit =
-                    has_non_polya_rna_edit_from_raw_object_json(raw_object_json.as_deref());
-                let spliced_seq = spliced_seq_from_raw_object_json(raw_object_json.as_deref());
+                let source = if has_promoted_columns {
+                    source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                } else {
+                    normalize_source_cache(
+                        raw_object_json.as_deref(),
+                        &transcript_id,
+                        source_idx
+                            .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                            .as_deref(),
+                    )
+                };
+                let bam_edit_status = bam_edit_status_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or_else(|| bam_edit_status_from_raw_object_json(raw_object_json.as_deref()));
+                let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or_else(|| {
+                        has_non_polya_rna_edit_from_raw_object_json(raw_object_json.as_deref())
+                    });
+                let spliced_seq = spliced_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or_else(|| spliced_seq_from_raw_object_json(raw_object_json.as_deref()));
                 let cdna_seq =
                     cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let version = version_idx
@@ -3509,6 +3537,51 @@ fn spliced_seq_from_raw_object_json(raw_json: Option<&str>) -> Option<String> {
 /// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
 ///   resolves transcript positions through TranscriptMapper `genomic2cdna`
 ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
+/// Read cdna_mapper_segments from a promoted List<Struct> parquet column.
+fn cdna_mapper_segments_from_list_column(
+    col: &dyn Array,
+    row: usize,
+) -> Vec<TranscriptCdnaMapperSegment> {
+    use datafusion::arrow::array::{AsArray, Int64Array, Int8Array, ListArray, StructArray};
+
+    let list_array = col.as_any().downcast_ref::<ListArray>();
+    let Some(list_array) = list_array else {
+        return Vec::new();
+    };
+    if list_array.is_null(row) {
+        return Vec::new();
+    }
+    let start = list_array.value_offsets()[row] as usize;
+    let end = list_array.value_offsets()[row + 1] as usize;
+    if start == end {
+        return Vec::new();
+    }
+    let values = list_array.values();
+    let struct_array = values.as_any().downcast_ref::<StructArray>();
+    let Some(struct_array) = struct_array else {
+        return Vec::new();
+    };
+    let gs = struct_array.column_by_name("genomic_start").and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let ge = struct_array.column_by_name("genomic_end").and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let cs = struct_array.column_by_name("cdna_start").and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let ce = struct_array.column_by_name("cdna_end").and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let ori = struct_array.column_by_name("ori").and_then(|c| c.as_any().downcast_ref::<Int8Array>());
+    let (Some(gs), Some(ge), Some(cs), Some(ce), Some(ori)) = (gs, ge, cs, ce, ori) else {
+        return Vec::new();
+    };
+    let mut segments = Vec::with_capacity(end - start);
+    for i in start..end {
+        segments.push(TranscriptCdnaMapperSegment {
+            genomic_start: gs.value(i),
+            genomic_end: ge.value(i),
+            cdna_start: cs.value(i) as usize,
+            cdna_end: ce.value(i) as usize,
+            ori: ori.value(i),
+        });
+    }
+    segments
+}
+
 fn cdna_mapper_segments_from_raw_object_json(
     raw_json: Option<&str>,
 ) -> Vec<TranscriptCdnaMapperSegment> {
