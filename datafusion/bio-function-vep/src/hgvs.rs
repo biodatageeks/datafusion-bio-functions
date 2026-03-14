@@ -2555,4 +2555,455 @@ mod tests {
             Some(Ordering::Greater)
         );
     }
+
+    // ---------------------------------------------------------------
+    // stop_loss_extra_aa — exact VEP _stop_loss_extra_AA semantics
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_stop_loss_extra_aa_non_frameshift_uses_ref_len_without_terminal_stop() {
+        // VEP: ref_len = length(_peptide()) where cached peptide has no terminal *.
+        // ref_translation = "MKKR*" → trim_end_matches('*').len() = 4.
+        // alt_translation = "MKKRQW*" → find('*') = 6.
+        // extra = (6 + 1) - (4 + 1) = 2.
+        let protein = ProteinHgvsData {
+            start: 5, end: 5,
+            ref_peptide: "*".into(), alt_peptide: "Q".into(),
+            ref_translation: "MKKR*".into(),
+            alt_translation: "MKKRQW*".into(),
+            frameshift: false, start_lost: false, stop_lost: true,
+        };
+        assert_eq!(stop_loss_extra_aa(&protein, 4, false), Some(2));
+    }
+
+    #[test]
+    fn test_stop_loss_extra_aa_non_frameshift_with_internal_stops_uses_full_len() {
+        // LoF transcript: ref = "M*KR*" (internal stop at 1, terminal at 4).
+        // trim_end_matches('*').len() = 4 (strips only trailing *).
+        // If stop at position 1 is mutated, alt has stop later.
+        // alt = "MQKRW*" → find('*') = 5.
+        // extra = (5+1) - (4+1) = 1.
+        let protein = ProteinHgvsData {
+            start: 2, end: 2,
+            ref_peptide: "*".into(), alt_peptide: "Q".into(),
+            ref_translation: "M*KR*".into(),
+            alt_translation: "MQKRW*".into(),
+            frameshift: false, start_lost: false, stop_lost: true,
+        };
+        assert_eq!(stop_loss_extra_aa(&protein, 1, false), Some(1));
+    }
+
+    #[test]
+    fn test_stop_loss_extra_aa_non_frameshift_no_new_stop_returns_none() {
+        // Alt translation has no stop codon → returns None → extTer?
+        let protein = ProteinHgvsData {
+            start: 3, end: 3,
+            ref_peptide: "*".into(), alt_peptide: "Q".into(),
+            ref_translation: "MA*".into(),
+            alt_translation: "MAQ".into(), // no *
+            frameshift: false, start_lost: false, stop_lost: true,
+        };
+        assert_eq!(stop_loss_extra_aa(&protein, 2, false), None);
+    }
+
+    #[test]
+    fn test_stop_loss_extra_aa_non_frameshift_same_length_returns_none() {
+        // VEP: extra = 0 → returns undef. Our: 0 > 0 is false → None.
+        // ref = "MA*" (trim len = 2). alt = "MAQ*" (find = 3).
+        // extra = (3+1) - (2+1) = 1. Actually that's 1, not 0.
+        // For true zero: ref = "MAK*" (trim=3), alt = "MAQK*" (find=4).
+        // extra = (4+1) - (3+1) = 1. Hmm, hard to get 0.
+        // ref = "MAK*" (trim=3), alt = "MAQ*" (find=3).
+        // extra = (3+1) - (3+1) = 0 → None.
+        let protein = ProteinHgvsData {
+            start: 3, end: 3,
+            ref_peptide: "*".into(), alt_peptide: "Q".into(),
+            ref_translation: "MAK*".into(),
+            alt_translation: "MAQ*".into(),
+            frameshift: false, start_lost: false, stop_lost: true,
+        };
+        assert_eq!(stop_loss_extra_aa(&protein, 2, false), None);
+    }
+
+    #[test]
+    fn test_stop_loss_extra_aa_frameshift_counts_from_variant_position() {
+        // Frameshift: extra = stop_idx + 1 - ref_var_pos.
+        // alt = "MKQW*" → find('*') = 4.
+        // ref_var_pos = 3 (1-based position of first affected AA).
+        // extra = (4 + 1) - 3 = 2.
+        let protein = ProteinHgvsData {
+            start: 3, end: 3,
+            ref_peptide: "K".into(), alt_peptide: "Q".into(),
+            ref_translation: "MKKK*".into(),
+            alt_translation: "MKQW*".into(),
+            frameshift: true, start_lost: false, stop_lost: false,
+        };
+        assert_eq!(stop_loss_extra_aa(&protein, 3, true), Some(2));
+    }
+
+    // ---------------------------------------------------------------
+    // perform_shift_ensembl — hgvs_reverse flag combinations
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_perform_shift_ensembl_forward_no_reverse_rotates_both_left() {
+        // seq_strand=1, reverse=false, hgvs_reverse=false.
+        // Both seq_to_check and hgvs_output rotate left.
+        let (shift, seq, hgvs, start, end) = perform_shift_ensembl(
+            b"AT", b"AT", "ATGC", "", 100, 99, false, 1,
+        );
+        assert_eq!(shift, 2); // AT matches AT in post_seq
+        assert_eq!(seq, b"AT"); // full rotation back to original
+        assert_eq!(hgvs, b"AT");
+        assert_eq!(start, 102);
+        assert_eq!(end, 101);
+    }
+
+    #[test]
+    fn test_perform_shift_ensembl_reverse_with_hgvs_reverse() {
+        // seq_strand=-1, reverse=true, hgvs_reverse = (1 != -1) = true.
+        // seq_to_check rotates right, hgvs_output rotates left.
+        let (shift, _seq, hgvs, _start, _end) = perform_shift_ensembl(
+            b"AG", b"AG", "", "CCAG", 100, 101, true, -1,
+        );
+        assert!(shift > 0);
+        // hgvs_output should be different rotation than seq_to_check
+        assert_eq!(hgvs.len(), 2);
+    }
+
+    #[test]
+    fn test_perform_shift_ensembl_no_match_returns_zero_shift() {
+        let (shift, seq, hgvs, start, end) = perform_shift_ensembl(
+            b"AT", b"AT", "GC", "", 100, 99, false, 1,
+        );
+        assert_eq!(shift, 0);
+        assert_eq!(seq, b"AT");
+        assert_eq!(hgvs, b"AT");
+        assert_eq!(start, 100);
+        assert_eq!(end, 99);
+    }
+
+    #[test]
+    fn test_perform_shift_ensembl_genomic_shift_always_uses_seq_strand_1() {
+        // Genomic shift: seq_strand=1 regardless of transcript strand.
+        // This means hgvs_reverse = (1 != 1) = false.
+        // Both rotate left for forward shift.
+        let (shift, _seq, hgvs, _, _) = perform_shift_ensembl(
+            b"TC", b"TC", "TCAA", "", 100, 99, false, 1,
+        );
+        assert_eq!(shift, 2);
+        assert_eq!(hgvs, b"TC"); // full rotation
+    }
+
+    // ---------------------------------------------------------------
+    // clip_alleles — strand-aware multi-base clipping
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_clip_alleles_negative_strand_prefix_decrements_end() {
+        let mut notation = HgvsNotation {
+            start: 100, end: 102,
+            ref_allele: "ACG".into(), alt_allele: "ACT".into(),
+            kind: "delins".into(),
+        };
+        clip_alleles(&mut notation, -1);
+        // Negative strand: prefix clip decrements end.
+        assert_eq!(notation.ref_allele, "G");
+        assert_eq!(notation.alt_allele, "T");
+        assert_eq!(notation.kind, ">");
+        assert_eq!(notation.end, 100); // decremented by 2
+    }
+
+    #[test]
+    fn test_clip_alleles_negative_strand_suffix_increments_start() {
+        let mut notation = HgvsNotation {
+            start: 100, end: 102,
+            ref_allele: "GCA".into(), alt_allele: "TCA".into(),
+            kind: "delins".into(),
+        };
+        clip_alleles(&mut notation, -1);
+        assert_eq!(notation.ref_allele, "G");
+        assert_eq!(notation.alt_allele, "T");
+        assert_eq!(notation.kind, ">");
+        assert_eq!(notation.start, 102); // incremented by 2 (suffix "CA")
+    }
+
+    // ---------------------------------------------------------------
+    // check_for_peptide_duplication — fallback positions
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_check_for_peptide_duplication_at_current_position() {
+        let mut notation = ProteinHgvsNotation {
+            start: 4, end: 5, // boundary insertion
+            ref_allele: String::new(),
+            alt_allele: "K".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "ins".into(),
+        };
+        // ref_translation[2] = 'K' (0-based idx 2 = position 3).
+        // check at start=4: test_new_start = 4-1-1 = 2. upstream = ref[..3] = "MAK".
+        // upstream[2] = 'K'. Match!
+        let result = check_for_peptide_duplication(&mut notation, "MAKL*");
+        assert!(result);
+        assert_eq!(notation.kind, "dup");
+        assert_eq!(notation.start, 3); // 4 - 1
+        assert_eq!(notation.end, 3);   // 4 - 1
+    }
+
+    #[test]
+    fn test_check_for_peptide_duplication_fallback_at_offset_2() {
+        let mut notation = ProteinHgvsNotation {
+            start: 3, end: 4,
+            ref_allele: String::new(),
+            alt_allele: "K".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "ins".into(),
+        };
+        // At start=3: test_new_start = 3-1-1 = 1. upstream = ref[..2] = "MA".
+        // upstream[1] = 'A'. Not 'K'. Fail.
+        // At start+1=4: test_new_start = 4-1-1 = 2. upstream = ref[..3] = "MAK".
+        // upstream[2] = 'K'. Match!
+        // At start+2=5: test_new_start = 5-1-1 = 3. upstream = ref[..4] = "MAKL".
+        // upstream[3] = 'L'. Not 'K'. Fail.
+        // Fallback tries offset 2 first (reversed), then 1. Offset 2 (start=5) fails.
+        // Offset 1 (start=4) succeeds.
+        let result = check_for_peptide_duplication(&mut notation, "MAKL*");
+        assert!(result);
+        assert_eq!(notation.kind, "dup");
+        assert_eq!(notation.start, 3); // 4 - 1
+    }
+
+    #[test]
+    fn test_check_for_peptide_duplication_no_match_returns_false() {
+        let mut notation = ProteinHgvsNotation {
+            start: 3, end: 3,
+            ref_allele: String::new(),
+            alt_allele: "W".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "ins".into(),
+        };
+        // No 'W' in the upstream of "MAKL*"
+        let result = check_for_peptide_duplication(&mut notation, "MAKL*");
+        assert!(!result);
+        assert_eq!(notation.kind, "ins"); // unchanged
+    }
+
+    #[test]
+    fn test_check_for_peptide_duplication_multi_residue() {
+        let mut notation = ProteinHgvsNotation {
+            start: 5, end: 6,
+            ref_allele: String::new(),
+            alt_allele: "KL".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "ins".into(),
+        };
+        // ref = "MAKLKL*". At start=5: test_new_start = 5-2-1 = 2.
+        // upstream = ref[..4] = "MAKL". upstream[2..4] = "KL". Match!
+        let result = check_for_peptide_duplication(&mut notation, "MAKLKL*");
+        assert!(result);
+        assert_eq!(notation.kind, "dup");
+        assert_eq!(notation.start, 3); // 5 - 2
+        assert_eq!(notation.end, 4);   // 5 - 1
+    }
+
+    // ---------------------------------------------------------------
+    // Protein HGVS helpers
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_frameshift_finds_first_changed_residue() {
+        let mut notation = ProteinHgvsNotation {
+            start: 2, end: 2,
+            ref_allele: String::new(), alt_allele: String::new(),
+            original_ref: String::new(), preseq: String::new(),
+            kind: String::new(),
+        };
+        let protein = ProteinHgvsData {
+            start: 2, end: 2,
+            ref_peptide: "A".into(), alt_peptide: "Q".into(),
+            ref_translation: "MAK*".into(),
+            alt_translation: "MQW*".into(),
+            frameshift: true, start_lost: false, stop_lost: false,
+        };
+        resolve_frameshift_hgvs(&mut notation, &protein);
+        assert_eq!(notation.kind, "fs");
+        assert_eq!(notation.start, 2); // first differing AA
+        assert_eq!(notation.ref_allele, "A");
+        assert_eq!(notation.alt_allele, "Q");
+    }
+
+    #[test]
+    fn test_resolve_frameshift_synonymous_when_both_reach_stop() {
+        let mut notation = ProteinHgvsNotation {
+            start: 2, end: 2,
+            ref_allele: String::new(), alt_allele: String::new(),
+            original_ref: String::new(), preseq: String::new(),
+            kind: String::new(),
+        };
+        let protein = ProteinHgvsData {
+            start: 2, end: 2,
+            ref_peptide: "A".into(), alt_peptide: "A".into(),
+            ref_translation: "MA*".into(),
+            alt_translation: "MA*".into(),
+            frameshift: true, start_lost: false, stop_lost: false,
+        };
+        resolve_frameshift_hgvs(&mut notation, &protein);
+        assert_eq!(notation.kind, "=");
+    }
+
+    #[test]
+    fn test_surrounding_peptides_returns_flanking_residues() {
+        assert_eq!(
+            surrounding_peptides("MAKL*", 2, "", Some(2)),
+            Some("AK".into())
+        );
+        assert_eq!(
+            surrounding_peptides("MAKL*", 1, "", Some(2)),
+            Some("MA".into())
+        );
+    }
+
+    #[test]
+    fn test_surrounding_peptides_extends_with_stop_original_ref() {
+        // When original_ref starts with *, append it to ref_translation
+        assert_eq!(
+            surrounding_peptides("MAK", 3, "*Q", Some(2)),
+            Some("K*".into())
+        );
+    }
+
+    #[test]
+    fn test_normalize_peptide_allele_converts_dash() {
+        assert_eq!(normalize_peptide_allele("-"), "");
+        assert_eq!(normalize_peptide_allele("K"), "K");
+    }
+
+    #[test]
+    fn test_append_terminal_stop_adds_star_when_missing() {
+        assert_eq!(append_terminal_stop("MAK"), "MAK*");
+        assert_eq!(append_terminal_stop("MAK*"), "MAK*");
+        assert_eq!(append_terminal_stop("M*K"), "M*K"); // internal stop, no append
+    }
+
+    #[test]
+    fn test_reverse_complement_basic() {
+        assert_eq!(reverse_complement("ACGT"), Some("ACGT".into()));
+        assert_eq!(reverse_complement("AAAA"), Some("TTTT".into()));
+        assert_eq!(reverse_complement("N"), Some("N".into()));
+        assert_eq!(reverse_complement(""), Some("".into()));
+        assert_eq!(reverse_complement("X"), None); // invalid base
+    }
+
+    #[test]
+    fn test_split_hgvs_coord_parses_intronic_offsets() {
+        assert_eq!(split_hgvs_coord("100"), Some((100, None)));
+        assert_eq!(split_hgvs_coord("100+5"), Some((100, Some("+5".into()))));
+        assert_eq!(split_hgvs_coord("100-3"), Some((100, Some("-3".into()))));
+        assert_eq!(split_hgvs_coord("-5"), Some((-5, None)));
+        assert_eq!(split_hgvs_coord("-5+10"), Some((-5, Some("+10".into()))));
+        assert_eq!(split_hgvs_coord("*100+5"), Some((100, Some("+5".into()))));
+    }
+
+    #[test]
+    fn test_protein_event_type_classification() {
+        assert_eq!(protein_event_type("", "K", false), "ins");
+        assert_eq!(protein_event_type("K", "", false), "del");
+        assert_eq!(protein_event_type("K", "L", false), ">");
+        assert_eq!(protein_event_type("KL", "QW", false), "delins");
+        assert_eq!(protein_event_type("K", "L", true), "fs");
+        assert_eq!(protein_event_type("K", "K", false), "=");
+    }
+
+    #[test]
+    fn test_peptide_char_1based_indexing() {
+        assert_eq!(peptide_char("MAKL", 1), Some('M'));
+        assert_eq!(peptide_char("MAKL", 4), Some('L'));
+        assert_eq!(peptide_char("MAKL", 5), None); // out of bounds
+        assert_eq!(peptide_char("MAKL", 0), None); // invalid 1-based
+    }
+
+    #[test]
+    fn test_format_hgvsp_deletion_single_residue() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2, end: 2,
+            ref_peptide: "A".into(), alt_peptide: "-".into(),
+            ref_translation: "MA*".into(),
+            alt_translation: "M*".into(),
+            frameshift: false, start_lost: false, stop_lost: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ala2del".into())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_deletion_multi_residue() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2, end: 3,
+            ref_peptide: "AK".into(), alt_peptide: "-".into(),
+            ref_translation: "MAK*".into(),
+            alt_translation: "M*".into(),
+            frameshift: false, start_lost: false, stop_lost: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ala2_Lys3del".into())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_missense() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2, end: 2,
+            ref_peptide: "A".into(), alt_peptide: "V".into(),
+            ref_translation: "MA*".into(),
+            alt_translation: "MV*".into(),
+            frameshift: false, start_lost: false, stop_lost: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ala2Val".into())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_delins() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2, end: 2,
+            ref_peptide: "A".into(), alt_peptide: "VW".into(),
+            ref_translation: "MAK*".into(),
+            alt_translation: "MVWK*".into(),
+            frameshift: false, start_lost: false, stop_lost: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ala2delinsValTrp".into())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_frameshift_immediate_stop() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 2, end: 2,
+            ref_peptide: "A".into(), alt_peptide: "*".into(),
+            ref_translation: "MAK*".into(),
+            alt_translation: "M*".into(),
+            frameshift: true, start_lost: false, stop_lost: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ala2Ter".into())
+        );
+    }
 }

@@ -7896,4 +7896,161 @@ mod tests {
             // preserve ATG via base sliding).
         }
     }
+
+    // ---------------------------------------------------------------
+    // three_prime_utr_seq — LoF biotype suppression and fallback
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn three_prime_utr_seq_returns_none_for_lof_biotype() {
+        let t = tx("ENST0001", "1", 100, 200, 1, "protein_coding_LoF", Some(110), Some(180));
+        let mut t = t;
+        t.cdna_coding_end = Some(80);
+        t.spliced_seq = Some("ATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGTAATGA".into());
+        assert!(three_prime_utr_seq(&t).is_none());
+    }
+
+    #[test]
+    fn three_prime_utr_seq_returns_utr_from_spliced_seq() {
+        let mut t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(180));
+        t.cdna_coding_end = Some(9);
+        t.spliced_seq = Some("ATGATGATGCCCGGG".into()); // 15 bases, coding ends at 9
+        let utr = three_prime_utr_seq(&t);
+        assert_eq!(utr, Some("CCCGGG".into()));
+    }
+
+    #[test]
+    fn three_prime_utr_seq_falls_back_to_cdna_seq() {
+        let mut t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(180));
+        t.cdna_coding_end = Some(9);
+        t.spliced_seq = None;
+        t.cdna_seq = Some("ATGATGATGTTTTTT".into());
+        let utr = three_prime_utr_seq(&t);
+        assert_eq!(utr, Some("TTTTTT".into()));
+    }
+
+    #[test]
+    fn three_prime_utr_seq_returns_none_when_coding_end_at_seq_end() {
+        let mut t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(180));
+        t.cdna_coding_end = Some(9);
+        t.spliced_seq = Some("ATGATGATG".into()); // 9 bases, coding_end == len
+        assert!(three_prime_utr_seq(&t).is_none());
+    }
+
+    #[test]
+    fn three_prime_utr_seq_returns_none_when_no_coding_end() {
+        let mut t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(180));
+        t.cdna_coding_end = None;
+        t.spliced_seq = Some("ATGATGATGCCC".into());
+        assert!(three_prime_utr_seq(&t).is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // genomic_to_cds_index — strand-aware CDS mapping
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn genomic_to_cds_index_positive_strand() {
+        let t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(150));
+        let exon = ExonFeature {
+            transcript_id: "ENST0001".into(),
+            exon_number: 1,
+            start: 100,
+            end: 200,
+        };
+        let exons = vec![&exon];
+        // CDS: 110-150. Position 120 → offset from CDS start = 120-110 = 10.
+        assert_eq!(genomic_to_cds_index(&t, &exons, 120), Some(10));
+        assert_eq!(genomic_to_cds_index(&t, &exons, 110), Some(0)); // first CDS base
+        assert_eq!(genomic_to_cds_index(&t, &exons, 150), Some(40)); // last CDS base
+    }
+
+    #[test]
+    fn genomic_to_cds_index_negative_strand() {
+        let t = tx("ENST0001", "1", 100, 200, -1, "protein_coding", Some(110), Some(150));
+        let exon = ExonFeature {
+            transcript_id: "ENST0001".into(),
+            exon_number: 1,
+            start: 100,
+            end: 200,
+        };
+        let exons = vec![&exon];
+        // Negative strand: CDS 110-150, higher genomic = lower CDS index.
+        // Position 150 → offset = 150-150 = 0.
+        assert_eq!(genomic_to_cds_index(&t, &exons, 150), Some(0));
+        // Position 110 → offset = 150-110 = 40.
+        assert_eq!(genomic_to_cds_index(&t, &exons, 110), Some(40));
+    }
+
+    #[test]
+    fn genomic_to_cds_index_outside_cds_returns_none() {
+        let t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(150));
+        let exon = ExonFeature {
+            transcript_id: "ENST0001".into(),
+            exon_number: 1,
+            start: 100,
+            end: 200,
+        };
+        let exons = vec![&exon];
+        assert_eq!(genomic_to_cds_index(&t, &exons, 105), None); // before CDS
+        assert_eq!(genomic_to_cds_index(&t, &exons, 160), None); // after CDS
+    }
+
+    // ---------------------------------------------------------------
+    // coding_segments — strand-aware segment ordering
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn coding_segments_positive_strand_sorted_ascending() {
+        let t = tx("ENST0001", "1", 100, 300, 1, "protein_coding", Some(120), Some(280));
+        let e1 = ExonFeature { transcript_id: "ENST0001".into(), exon_number: 1, start: 100, end: 150 };
+        let e2 = ExonFeature { transcript_id: "ENST0001".into(), exon_number: 2, start: 200, end: 300 };
+        let exons = vec![&e1, &e2];
+        let segs = coding_segments(&t, &exons).unwrap();
+        assert_eq!(segs, vec![(120, 150), (200, 280)]);
+    }
+
+    #[test]
+    fn coding_segments_negative_strand_reversed() {
+        let t = tx("ENST0001", "1", 100, 300, -1, "protein_coding", Some(120), Some(280));
+        let e1 = ExonFeature { transcript_id: "ENST0001".into(), exon_number: 1, start: 100, end: 150 };
+        let e2 = ExonFeature { transcript_id: "ENST0001".into(), exon_number: 2, start: 200, end: 300 };
+        let exons = vec![&e1, &e2];
+        let segs = coding_segments(&t, &exons).unwrap();
+        // Negative strand: reversed order
+        assert_eq!(segs, vec![(200, 280), (120, 150)]);
+    }
+
+    #[test]
+    fn coding_segments_returns_none_without_cds() {
+        let t = tx("ENST0001", "1", 100, 300, 1, "lncRNA", None, None);
+        let e1 = ExonFeature { transcript_id: "ENST0001".into(), exon_number: 1, start: 100, end: 300 };
+        let exons = vec![&e1];
+        assert!(coding_segments(&t, &exons).is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // translate_protein_from_cds
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn translate_protein_includes_stop() {
+        let cds = b"ATGTTTAAATGA"; // MFK*
+        let pep = translate_protein_from_cds(cds).unwrap();
+        assert_eq!(pep, vec!['M', 'F', 'K', '*']);
+    }
+
+    #[test]
+    fn translate_protein_handles_incomplete_codon() {
+        let cds = b"ATGTTTAA"; // 8 bases → 2 complete codons
+        let pep = translate_protein_from_cds(cds).unwrap();
+        assert_eq!(pep, vec!['M', 'F']); // ignores trailing 2 bases
+    }
+
+    #[test]
+    fn translate_protein_handles_n_bases() {
+        let cds = b"ATGNNN"; // ATG = M, NNN = X
+        let pep = translate_protein_from_cds(cds).unwrap();
+        assert_eq!(pep, vec!['M', 'X']);
+    }
 }
