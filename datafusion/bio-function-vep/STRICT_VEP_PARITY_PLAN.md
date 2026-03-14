@@ -1250,8 +1250,20 @@ Status on March 13, 2026:
 
 ## Phase 4 HGVS Parity Status (updated March 14, 2026)
 
+### Non-merged (Ensembl-only) benchmark — near-zero
+
+Benchmark: chr1 non-merged, 2,997,504 CSQ entries, `--hgvs --fasta`, Docker VEP 115.2.
+**72/74 fields at zero mismatches. HGVSc: 2, HGVSp: 4. Total: 6 mismatches (99.9998%).**
+
+Remaining 6 mismatches:
+- 2 HGVSc: spurious HGVSc where VEP emits empty (ENST00000948304, ENST00000673836)
+- 3 HGVSp: `extTerN` where VEP says `extTer?` (VEP `_trim_incomplete_codon` trims the alt CDS before UTR append)
+- 1 HGVSp: insertion flanking off-by-2 at chr1:248638949 (protein position mapper difference)
+
+### Merged (Ensembl+RefSeq) benchmark
+
 Benchmark: chr1 merged, 4,737,090 CSQ entries, `--hgvs --shift_hgvs 1 --fasta`.
-72/74 fields at zero mismatches. Only HGVSc (106) and HGVSp (125) remain.
+72/74 fields at zero mismatches. Only HGVSc (106) and HGVSp (5) remain.
 
 ### Progression
 
