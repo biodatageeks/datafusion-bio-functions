@@ -2488,7 +2488,10 @@ impl AnnotateProvider {
                     ref_allele,
                     alt_allele.clone(),
                 );
+                // Only compute genomic shift for indels (ref != alt length).
+                // SNVs/MNVs don't shift and skipping avoids allele normalization overhead.
                 if let Some(reader) = hgvs_reference_reader.as_mut() {
+                    if ref_al.len() != alt_allele.len() {
                     let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
                     let (vep_ref_norm, vep_alt_norm) = vcf_to_vep_allele(&ref_al, &alt_allele);
                     let vep_start = vep_norm_start(start, &ref_al, &alt_allele);
@@ -2511,6 +2514,7 @@ impl AnnotateProvider {
                         vep_end,
                         -1,
                     )?;
+                    }
                 }
                 let assignments = engine.evaluate_variant_prepared(&variant, ctx);
 
