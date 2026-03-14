@@ -1114,16 +1114,24 @@ pub fn format_hgvsp(
         if notation.kind.is_empty() {
             notation.kind = protein_event_type(&notation.ref_allele, &notation.alt_allele, false);
         }
-        if shift_hgvs && matches!(notation.kind.as_str(), "ins" | "del") {
-            shift_peptides_post_var(&mut notation, &protein.ref_translation);
-        }
-        if notation.kind == "ins" && !check_for_peptide_duplication(&mut notation, &protein.ref_translation) {
-            notation.ref_allele = surrounding_peptides(
-                &protein.ref_translation,
-                notation.start.min(notation.end),
-                &notation.original_ref,
-                Some(2),
-            )?;
+        // Traceability:
+        // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
+        //   checks for peptide duplication BEFORE 3' shifting
+        //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1758
+        if notation.kind == "ins" && check_for_peptide_duplication(&mut notation, &protein.ref_translation) {
+            // Dup detected — skip shift and flanking.
+        } else {
+            if shift_hgvs && matches!(notation.kind.as_str(), "ins" | "del") {
+                shift_peptides_post_var(&mut notation, &protein.ref_translation);
+            }
+            if notation.kind == "ins" {
+                notation.ref_allele = surrounding_peptides(
+                    &protein.ref_translation,
+                    notation.start.min(notation.end),
+                    &notation.original_ref,
+                    Some(2),
+                )?;
+            }
         }
     }
 
