@@ -1416,6 +1416,7 @@ impl AnnotateProvider {
             let cds_start_nf_idx = schema.index_of("cds_start_nf").ok();
             let cds_end_nf_idx = schema.index_of("cds_end_nf").ok();
             let mirna_regions_idx = schema.index_of("mature_mirna_regions").ok();
+            let cdna_seq_idx = schema.index_of("cdna_seq").ok();
             // Batch 1 columns.
             let is_canonical_idx = schema.index_of("is_canonical").ok();
             let tsl_idx = schema.index_of("tsl").ok();
@@ -1519,6 +1520,8 @@ impl AnnotateProvider {
                 let has_non_polya_rna_edit =
                     has_non_polya_rna_edit_from_raw_object_json(raw_object_json.as_deref());
                 let spliced_seq = spliced_seq_from_raw_object_json(raw_object_json.as_deref());
+                let cdna_seq =
+                    cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let version = version_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .and_then(|v| i32::try_from(v).ok());
@@ -1569,6 +1572,7 @@ impl AnnotateProvider {
                     bam_edit_status,
                     has_non_polya_rna_edit,
                     spliced_seq,
+                    cdna_seq,
                     version,
                     cds_start_nf,
                     cds_end_nf,
@@ -3789,6 +3793,7 @@ mod tests {
             bam_edit_status: None,
             has_non_polya_rna_edit: false,
             spliced_seq: None,
+            cdna_seq: None,
             version: None,
             cds_start_nf: false,
             cds_end_nf: false,

@@ -147,6 +147,9 @@ pub struct TranscriptFeature {
     pub has_non_polya_rna_edit: bool,
     /// Edited transcript sequence cached on `_variation_effect_feature_cache`.
     pub spliced_seq: Option<String>,
+    /// Full transcript cDNA sequence from the `cdna_seq` parquet column.
+    /// Used as fallback for 3' UTR extraction when `spliced_seq` is absent.
+    pub cdna_seq: Option<String>,
     /// Transcript version number (e.g. 6 for ENST00000379410.6).
     pub version: Option<i32>,
     /// CDS start not found (incomplete 5' end).
@@ -4157,12 +4160,16 @@ fn reverse_complement(seq: &str) -> Option<String> {
 ///   it to the alternate CDS before translating
 ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2412-L2418
 fn three_prime_utr_seq(tx: &TranscriptFeature) -> Option<String> {
-    let spliced = tx.spliced_seq.as_deref()?;
     let coding_end = tx.cdna_coding_end?;
-    if coding_end >= spliced.len() {
+    // Try spliced_seq first (for edited RefSeq transcripts), then cdna_seq.
+    let full_seq = tx
+        .spliced_seq
+        .as_deref()
+        .or(tx.cdna_seq.as_deref())?;
+    if coding_end >= full_seq.len() {
         return None;
     }
-    let utr = &spliced[coding_end..];
+    let utr = &full_seq[coding_end..];
     if utr.is_empty() {
         None
     } else {
@@ -4244,6 +4251,7 @@ mod tests {
             bam_edit_status: None,
             has_non_polya_rna_edit: false,
             spliced_seq: None,
+            cdna_seq: None,
             version: None,
             cds_start_nf: false,
             cds_end_nf: false,
