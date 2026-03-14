@@ -1442,8 +1442,12 @@ fn stop_loss_extra_aa(protein: &ProteinHgvsData, ref_var_pos: usize, frameshift:
     let extra = if frameshift {
         stop_idx.saturating_add(1).checked_sub(ref_var_pos)?
     } else {
-        // VEP: $ref_len = length($ref_temp) — full translation length.
-        let ref_len = protein.ref_translation.len();
+        // VEP: $ref_len = length(_peptide()). The VEP cache stores the
+        // peptide WITHOUT the terminal *, so length = number of amino
+        // acids excluding the stop. Our ref_translation includes *, so
+        // we strip trailing * to match VEP's cached peptide length.
+        // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1282-L1291
+        let ref_len = protein.ref_translation.trim_end_matches('*').len();
         stop_idx
             .saturating_add(1)
             .checked_sub(ref_len.saturating_add(1))?
@@ -1902,8 +1906,8 @@ mod tests {
     #[test]
     fn test_format_hgvsp_stop_lost_adds_extension_length() {
         let translation = make_translation();
-        // VEP: $ref_len = length("MA*") = 3. $+[0] for "MAQW*" = 5.
-        // $extra_aa = 5 - 1 - 3 = 1 > 0 → extTer1.
+        // VEP cached peptide for "MA*" is "MA" (no *), length=2.
+        // Alt "MAQW*": $+[0] = 5. extra = 5 - 1 - 2 = 2 → extTer2.
         let protein = ProteinHgvsData {
             start: 3,
             end: 3,
@@ -1917,14 +1921,14 @@ mod tests {
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
-            Some("ENSPHGVS000001.1:p.Ter3GlnextTer1".to_string())
+            Some("ENSPHGVS000001.1:p.Ter3GlnextTer2".to_string())
         );
     }
 
     #[test]
-    fn test_format_hgvsp_stop_lost_with_adjacent_stop_returns_unknown() {
-        // VEP: $ref_len = length("MA*") = 3. $+[0] for "MAQ*" = 4.
-        // $extra_aa = 4 - 1 - 3 = 0 ≤ 0 → undef → extTer?
+    fn test_format_hgvsp_stop_lost_with_adjacent_stop_gives_ext_1() {
+        // VEP cached peptide for "MA*" is "MA" (no *), length=2.
+        // Alt "MAQ*": $+[0] = 4. extra = 4 - 1 - 2 = 1 → extTer1.
         let translation = make_translation();
         let protein = ProteinHgvsData {
             start: 3,
@@ -1939,7 +1943,7 @@ mod tests {
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
-            Some("ENSPHGVS000001.1:p.Ter3GlnextTer?".to_string())
+            Some("ENSPHGVS000001.1:p.Ter3GlnextTer1".to_string())
         );
     }
 
