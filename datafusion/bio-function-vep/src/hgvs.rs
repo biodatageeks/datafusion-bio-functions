@@ -264,6 +264,13 @@ where
     let mut shifted_end = end;
     let shift_length;
 
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::_genomic_shift()`
+    //   always passes `seq_strand = 1` to `perform_shift()` because the
+    //   genomic shift operates on forward-strand coordinates; the HGVS
+    //   output allele stays in VF orientation
+    //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L431
+    let genomic_seq_strand = 1i8;
     if strand >= 0 {
         let flank_start = end + 1;
         if flank_start <= 0 {
@@ -280,7 +287,7 @@ where
                 shifted_start,
                 shifted_end,
                 false,
-                strand,
+                genomic_seq_strand,
             );
         shift_length = computed_shift_length;
         seq_to_check = shifted_seq;
@@ -304,7 +311,7 @@ where
                 shifted_start,
                 shifted_end,
                 true,
-                strand,
+                genomic_seq_strand,
             );
         shift_length = computed_shift_length;
         seq_to_check = shifted_seq;
@@ -468,6 +475,11 @@ fn edited_transcript_shifted_output_allele(
 }
 
 /// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_return_3prime()`
+///   calls `perform_shift()` for edited RefSeq transcripts with the
+///   transcript strand as `seq_strand` and the reverse flag derived
+///   from the strand direction
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L237-L243
 /// - Ensembl Variation `TranscriptVariationAllele::perform_shift()`
 ///   rotates the transcript-side allele and HGVS output allele separately
 ///   depending on transcript strand and variation-feature strand
@@ -484,34 +496,24 @@ fn shift_output_allele_across_transcript(
     } else {
         reverse_complement(&vf_allele)?
     };
-    let mut seq_to_check = feature_allele.into_bytes();
-    let mut hgvs_output = vf_allele.into_bytes();
+    let seq_to_check = feature_allele.into_bytes();
+    let hgvs_output = vf_allele.into_bytes();
 
-    if transcript_strand >= 0 {
-        for next_base in post_seq.bytes() {
-            let Some(check_next) = seq_to_check.first().copied() else {
-                break;
-            };
-            if check_next != next_base {
-                break;
-            }
-            seq_to_check.rotate_left(1);
-            hgvs_output.rotate_left(1);
-        }
-    } else {
-        for next_base in pre_seq.bytes().rev() {
-            let Some(check_next) = seq_to_check.last().copied() else {
-                break;
-            };
-            if check_next != next_base {
-                break;
-            }
-            seq_to_check.rotate_right(1);
-            hgvs_output.rotate_left(1);
-        }
-    }
+    // VEP: $reverse = (-1 * ($strand - 1)) / 2
+    let reverse = transcript_strand < 0;
+    // VEP: perform_shift(..., $strand) — transcript strand as seq_strand
+    let (_, _, shifted_output, _, _) = perform_shift_ensembl(
+        &seq_to_check,
+        &hgvs_output,
+        post_seq,
+        pre_seq,
+        0, // var_start/end not used for output allele
+        0,
+        reverse,
+        transcript_strand,
+    );
 
-    String::from_utf8(hgvs_output).ok()
+    String::from_utf8(shifted_output).ok()
 }
 
 fn build_reference_region(chrom: &str, start: i64, end: i64) -> Result<Region> {
