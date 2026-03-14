@@ -153,6 +153,19 @@ pub fn format_hgvsc(
     variant_end: i64,
     genomic_shift: Option<&HgvsGenomicShift>,
 ) -> Option<String> {
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
+    //   returns undef when `_get_cDNA_position()` can't map a position
+    //   outside the transcript region. For deletions that extend beyond
+    //   the transcript boundaries, VEP's `_slice_start` / coordinate
+    //   mapping fails for the out-of-bounds end, producing empty HGVSc.
+    //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1416
+    if ref_allele != "-" && alt_allele == "-" {
+        // Deletion: check if either end extends beyond transcript boundaries.
+        if variant_start < tx.start || variant_end > tx.end {
+            return None;
+        }
+    }
     let tx_id = versioned_id(&tx.transcript_id, tx.version);
     let numbering = if tx.cds_start.is_some() && tx.cds_end.is_some() {
         'c'

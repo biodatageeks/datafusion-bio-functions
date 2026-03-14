@@ -4159,7 +4159,18 @@ fn reverse_complement(seq: &str) -> Option<String> {
 ///   calls `$self->transcript_variation->_three_prime_utr()` and appends
 ///   it to the alternate CDS before translating
 ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2412-L2418
+/// Traceability:
+/// - Ensembl Variation `BaseTranscriptVariation::_three_prime_utr()`
+///   delegates to `$tran->three_prime_utr()` which returns the annotated
+///   UTR from the transcript object. For `protein_coding_LoF` biotype
+///   transcripts, the Ensembl API returns undef because these transcripts
+///   lack functional UTR annotations.
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1106-L1116
 fn three_prime_utr_seq(tx: &TranscriptFeature) -> Option<String> {
+    // LoF transcripts don't have annotated UTR in VEP's transcript objects.
+    if tx.biotype.contains("LoF") {
+        return None;
+    }
     let coding_end = tx.cdna_coding_end?;
     // Try spliced_seq first (for edited RefSeq transcripts), then cdna_seq.
     let full_seq = tx
