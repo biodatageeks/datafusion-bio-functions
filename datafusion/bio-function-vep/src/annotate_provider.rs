@@ -2115,7 +2115,7 @@ impl AnnotateProvider {
         });
 
         let (
-            transcripts,
+            mut transcripts,
             translateable_seq_by_tx,
             exons,
             mut translations,
@@ -2217,6 +2217,17 @@ impl AnnotateProvider {
             &translateable_seq_by_tx,
             &hydrated_transcript_ids,
         );
+        // Hydrate full spliced cDNA on transcripts that lack spliced_seq so
+        // that three_prime_utr_seq() can find the UTR for stop-loss/frameshift
+        // extension distance computation.
+        if let Some(reader) = hgvs_reference_reader.as_mut() {
+            hydrate_transcript_cdna_from_reference(
+                reader,
+                &mut transcripts,
+                &exons,
+                &input_variant_intervals,
+            )?;
+        }
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
         let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
             upstream_distance,
@@ -3033,6 +3044,84 @@ where
     }
 
     Ok(hydrated_transcript_ids)
+}
+
+/// Hydrate `TranscriptFeature.cdna_seq` with the full spliced transcript cDNA
+/// (all exon bases concatenated, strand-oriented) so that `three_prime_utr_seq()`
+/// can extract the 3' UTR for stop-loss / frameshift extension distance.
+///
+/// Only populates coding transcripts that already have `cdna_coding_end` but lack
+/// `spliced_seq` (which is the preferred source for UTR extraction).
+///
+/// Traceability:
+/// - VEP `_three_prime_utr()` derives UTR from `$self->transcript->seq()` which
+///   is the full spliced cDNA assembled from exons
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2412-L2418
+fn hydrate_transcript_cdna_from_reference<R>(
+    reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
+    transcripts: &mut [TranscriptFeature],
+    exons: &[ExonFeature],
+    input_variant_intervals: &HashMap<String, Vec<(i64, i64)>>,
+) -> Result<()>
+where
+    R: BufRead + Seek,
+{
+    let mut exons_by_tx: HashMap<&str, Vec<&ExonFeature>> = HashMap::new();
+    for exon in exons {
+        exons_by_tx
+            .entry(exon.transcript_id.as_str())
+            .or_default()
+            .push(exon);
+    }
+    for tx_exons in exons_by_tx.values_mut() {
+        tx_exons.sort_by_key(|exon| (exon.start, exon.end, exon.exon_number));
+    }
+
+    for tx in transcripts.iter_mut() {
+        // Skip if we already have spliced_seq or cdna_seq.
+        if tx.spliced_seq.is_some() {
+            continue;
+        }
+        // Only need UTR for coding transcripts.
+        if tx.cdna_coding_end.is_none() {
+            continue;
+        }
+        let chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
+        let overlaps_input = input_variant_intervals
+            .get(chrom)
+            .map(|intervals| interval_overlaps_any(intervals, tx.start, tx.end))
+            .unwrap_or(false);
+        if !overlaps_input {
+            continue;
+        }
+        let Some(tx_exons) = exons_by_tx.get(tx.transcript_id.as_str()) else {
+            continue;
+        };
+        let mut genomic_cdna = String::new();
+        let mut ok = true;
+        for exon in tx_exons {
+            let segment = read_reference_sequence(reader, chrom, exon.start, exon.end)?;
+            let expected = usize::try_from(exon.end - exon.start + 1).unwrap_or_default();
+            if segment.len() != expected {
+                ok = false;
+                break;
+            }
+            genomic_cdna.push_str(&segment);
+        }
+        if !ok || genomic_cdna.is_empty() {
+            continue;
+        }
+        let cdna = if tx.strand >= 0 {
+            genomic_cdna.to_ascii_uppercase()
+        } else {
+            let Some(rc) = reverse_complement_dna(&genomic_cdna) else {
+                continue;
+            };
+            rc
+        };
+        tx.cdna_seq = Some(cdna);
+    }
+    Ok(())
 }
 
 fn apply_translateable_seq_overrides(
