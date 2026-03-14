@@ -2095,6 +2095,7 @@ impl AnnotateProvider {
         let task_ctx = self.session.task_ctx();
         let base_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
         let input_variant_intervals = collect_input_variant_intervals(&base_batches)?;
+        let indel_variant_intervals = collect_indel_variant_intervals(&base_batches)?;
 
         // Build co-located variant aggregation from the piggybacked sink.
         let colocated_map = if flags.check_existing {
@@ -2225,6 +2226,7 @@ impl AnnotateProvider {
                 reader,
                 &mut transcripts,
                 &exons,
+                &indel_variant_intervals,
                 &input_variant_intervals,
             )?;
         }
@@ -3061,7 +3063,8 @@ fn hydrate_transcript_cdna_from_reference<R>(
     reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
     transcripts: &mut [TranscriptFeature],
     exons: &[ExonFeature],
-    input_variant_intervals: &HashMap<String, Vec<(i64, i64)>>,
+    indel_intervals: &HashMap<String, Vec<(i64, i64)>>,
+    all_intervals: &HashMap<String, Vec<(i64, i64)>>,
 ) -> Result<()>
 where
     R: BufRead + Seek,
@@ -3091,11 +3094,25 @@ where
             continue;
         }
         let chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
-        let overlaps_input = input_variant_intervals
+        let (Some(cds_start_g), Some(cds_end_g)) = (tx.cds_start, tx.cds_end) else {
+            continue;
+        };
+        // Hydrate if: (a) any indel overlaps the CDS (potential frameshift), OR
+        // (b) any variant (incl. SNV) overlaps the stop codon (potential stop_lost).
+        let indel_overlaps_cds = indel_intervals
             .get(chrom)
-            .map(|intervals| interval_overlaps_any(intervals, tx.start, tx.end))
+            .map(|iv| interval_overlaps_any(iv, cds_start_g, cds_end_g))
             .unwrap_or(false);
-        if !overlaps_input {
+        let (stop_start, stop_end) = if tx.strand >= 0 {
+            (cds_end_g.saturating_sub(2), cds_end_g)
+        } else {
+            (cds_start_g, cds_start_g.saturating_add(2))
+        };
+        let any_overlaps_stop = all_intervals
+            .get(chrom)
+            .map(|iv| interval_overlaps_any(iv, stop_start, stop_end))
+            .unwrap_or(false);
+        if !indel_overlaps_cds && !any_overlaps_stop {
             continue;
         }
         let Some(tx_exons) = exons_by_tx.get(tx.transcript_id.as_str()) else {
@@ -3259,6 +3276,83 @@ fn collect_input_variant_intervals(
             )
         })?;
         for row in 0..batch.num_rows() {
+            let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                continue;
+            };
+            intervals_by_chrom
+                .entry(chrom.strip_prefix("chr").unwrap_or(&chrom).to_string())
+                .or_default()
+                .push((start, end));
+        }
+    }
+
+    for intervals in intervals_by_chrom.values_mut() {
+        intervals.sort_unstable_by_key(|interval| interval.0);
+        let mut merged = Vec::with_capacity(intervals.len());
+        for (start, end) in intervals.drain(..) {
+            if let Some((_, last_end)) = merged.last_mut() {
+                if start <= *last_end {
+                    *last_end = (*last_end).max(end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
+        *intervals = merged;
+    }
+
+    Ok(intervals_by_chrom)
+}
+
+/// Collect intervals for indel-only variants (ref_len != alt_len).
+/// Used to restrict cDNA hydration to transcripts that might have
+/// frameshift or stop-loss consequences requiring UTR extension.
+fn collect_indel_variant_intervals(
+    batches: &[RecordBatch],
+) -> Result<HashMap<String, Vec<(i64, i64)>>> {
+    let mut intervals_by_chrom: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+    for batch in batches {
+        let schema = batch.schema();
+        let chrom_idx = schema.index_of("chrom").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required chrom column".to_string(),
+            )
+        })?;
+        let start_idx = schema.index_of("start").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required start column".to_string(),
+            )
+        })?;
+        let end_idx = schema.index_of("end").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required end column".to_string(),
+            )
+        })?;
+        let ref_idx = schema.index_of("reference").ok();
+        let alt_idx = schema.index_of("alternate").ok();
+        for row in 0..batch.num_rows() {
+            // Only include indels (different ref/alt lengths).
+            let is_indel = match (ref_idx, alt_idx) {
+                (Some(ri), Some(ai)) => {
+                    let ref_len = string_at(batch.column(ri).as_ref(), row)
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                    let alt_len = string_at(batch.column(ai).as_ref(), row)
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                    ref_len != alt_len
+                }
+                _ => true, // If we can't determine, include conservatively.
+            };
+            if !is_indel {
+                continue;
+            }
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
                 continue;
             };
