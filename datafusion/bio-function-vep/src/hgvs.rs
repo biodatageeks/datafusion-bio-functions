@@ -145,7 +145,7 @@ fn has_numeric_version_suffix(value: &str) -> bool {
 pub fn format_hgvsc(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
-    _cdna_position: Option<&str>,
+    cdna_position: Option<&str>,
     cds_position: Option<&str>,
     ref_allele: &str,
     alt_allele: &str,
