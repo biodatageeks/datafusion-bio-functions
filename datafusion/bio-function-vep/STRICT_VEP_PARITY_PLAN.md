@@ -65,19 +65,22 @@ Observed result:
 - `100%` term-set parity
 - release annotate time `49.783s`
 
-Remaining open work outside the README chr1 gate:
+**Phase 4 HGVS parity: ACHIEVED** (March 14, 2026)
 
-- Phase 4 HGVS-specific parity benchmark with `--hgvs --fasta`
-- exact port of the Ensembl Variation HGVS algorithm used by VEP
-- full zero-mismatch closure for HGVS-enabled chr1 runs
-- refresh acceptance records as that second benchmark is added
+- Non-merged (Ensembl-only) chr1 benchmark: **74/74 fields at zero mismatches** with `--hgvs --fasta`
+- Merged (Ensembl+RefSeq) chr1 benchmark: 72/74 fields, ~105 remaining mismatches (all RefSeq-specific)
+- Performance: 51s without HGVS, 79s with HGVS (matches pre-HGVS baseline)
+
+Remaining open work:
+
+- merged (RefSeq) HGVS parity — edited transcript shifting, cdna_mapper_segments
 - release-115 flag-surface parity beyond the fixed README field set
 - VEP-style on/off gating for feature-expanding and output-gating flags
 - dynamic CSQ field/header parity for flags not covered by the current 74-column benchmark
 
 Important caveat:
 
-- the current `74/74` result proves parity for the README benchmark profile, not full release-115 CLI flag parity
+- the current `74/74` result proves parity for the non-merged benchmark profile, not full release-115 CLI flag parity
 - the current Rust path still behaves like a fixed-schema benchmark serializer in several places where VEP conditionally adds or removes columns based on flags
 
 ## Reproducible Benchmark Commands
@@ -451,18 +454,11 @@ Relevant upstream file:
 
 - [OutputFactory.pm](/Users/mwiewior/research/git/ensembl-vep/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1425)
 
-### 4. The current benchmark does not prove HGVS parity
+### 4. ~~The current benchmark does not prove HGVS parity~~ RESOLVED
 
-The README chr1 benchmark still does not prove HGVS parity because it does not enable `--hgvs --fasta`.
+**HGVS parity achieved on non-merged benchmark** (March 14, 2026).
 
-Current worktree status:
-
-- wrapper-level HGVS flags and CSQ emission are now wired
-- benchmark CLI support for `--hgvs` and `--reference-fasta-path` is partially in place
-- however, the actual HGVS generation path still relies on the local simplified formatter rather than the exact Ensembl Variation algorithm
-- the new end-to-end HGVS integration test is currently blocked by indexed-FASTA fixture setup, because runtime opens an indexed FASTA reader rather than a plain FASTA path
-
-This means the remaining HGVS gap is no longer “blank serializer fields”; it is now “exact upstream algorithm + valid indexed FASTA harness”.
+The non-merged chr1 benchmark with `--hgvs --fasta` now shows **74/74 fields at zero mismatches** across 2,997,504 CSQ entries. The HGVS generation path ports exact Ensembl Variation algorithms including `hgvs_transcript()`, `hgvs_protein()`, `perform_shift()`, `_stop_loss_extra_AA()`, `_check_for_peptide_duplication()`, `_get_alternate_cds()`, and `genomic2pep()` with full traceability to VEP release/115 source.
 
 Relevant files:
 
@@ -1288,24 +1284,76 @@ Benchmark: chr1 merged, 4,737,090 CSQ entries, `--hgvs --shift_hgvs 1 --fasta`.
    - [TranscriptVariationAllele.pm#L237-L243](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L237-L243)
    - [TranscriptVariationAllele.pm#L291-L351](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351)
 
-### Remaining HGVSc root causes (106 mismatches)
+### ACHIEVED: 74/74 zero mismatches on non-merged (Ensembl-only) benchmark
 
-| Class | ~Count | Root Cause | VEP Reference |
-|-------|--------|------------|---------------|
-| Insertion allele rotation (edited RefSeq) | ~60 | `edited_transcript_shifted_output_allele` produces different rotation than VEP `_return_3prime()` for the transcript-level shift — the pre/post sequence extraction from `spliced_seq` uses `(min, max)` bounds while VEP uses `(cdna_end_unshifted, cdna_start_unshifted)` with swapped semantics for insertions | [TranscriptVariationAllele.pm#L228-L237](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L228-L237) |
-| Intronic dup vs ins | ~20 | `apply_shifted_insertion_duplication()` context comparison fails — 5'/3' flanking sequence from genomic shift doesn't match the feature-strand allele for some intronic repeats | [TranscriptVariationAllele.pm#L1395-L1407](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1395-L1407) |
-| Intronic cDNA off-by-1 (NM_001134939, NM_001301371, NM_016178) | ~20 | `cdna_mapper_segments` for these 3 RefSeq transcripts map to a cDNA position 1 lower than VEP's `TranscriptMapper`. Likely a segment boundary or phase-offset difference | [BaseTranscriptVariation.pm#L467-L499](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499) |
-| Spurious HGVSc (chr1:228006919) | ~5 | We emit `c.-199_-190del` where VEP emits empty — missing gating condition that suppresses HGVS for variants outside the mapped transcript region | — |
+**Date: March 14, 2026**
 
-### Remaining HGVSp root causes (125 mismatches)
+Non-merged (Ensembl-only) chr1 benchmark with Docker VEP 115.2:
+- **74/74 CSQ fields at zero mismatches**
+- **2,997,504 CSQ entries compared**
+- **100.000% accuracy across all fields**
+- **0 missing entries, 0 extra entries**
 
-| Class | ~Count | Root Cause | VEP Reference |
-|-------|--------|------------|---------------|
-| Protein dup not detected | ~100 | For codon-boundary insertions (`amino_acids = "-/X"`), VEP's `hgvs_protein()` uses `translation_start()` which returns a position 1 higher than our `protein_position_start = codon_at + 1`. This off-by-1 causes `_check_for_peptide_duplication()` to look at the wrong upstream char. VEP uses `genomic2pep()` mapper; we use `cds_idx / 3` | [TranscriptVariationAllele.pm#L1680-L1682](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1680-L1682), [BaseTranscriptVariation.pm#L467-L499](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499), [TranscriptVariationAllele.pm#L2371-L2410](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2410) |
-| Protein dup off-by-1 | ~5 | Same root cause as above — dup IS detected but the resulting position is 1 lower than VEP | [TranscriptVariationAllele.pm#L2371-L2410](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2410) |
-| fsTer? (XM_ transcripts at chr1:15112994) | ~7 | These predicted RefSeq transcripts lack `spliced_seq` in our cache, so `three_prime_utr_seq()` returns `None` and the alt translation can't find the new stop. VEP's `_three_prime_utr()` derives UTR from the transcript object's exon sequences, which is always available | [TranscriptVariationAllele.pm#L2412-L2418](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2412-L2418) |
-| extTer spurious (chr1:161589597, chr1:247756207) | ~3 | We compute `extTer267`/`extTer76` where VEP returns `extTer?` — our UTR-extended translation finds a spurious in-frame stop that VEP doesn't see, likely because VEP's `_three_prime_utr()` returns a different (shorter) UTR or the `_get_alternate_cds` trims incomplete codons differently | [TranscriptVariationAllele.pm#L2335-L2372](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2335-L2372) |
-| Insertion flanking off-by-1 (chr1:248638949) | ~5 | `surrounding_peptides()` returns the wrong flanking pair — `Tyr104_Leu105` instead of VEP's `Phe103_Tyr104`. Same codon-boundary insertion protein position off-by-1 as the dup issue | [TranscriptVariationAllele.pm#L2297-L2320](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2297-L2320) |
+Performance (chr1, 323K variants, VEP-only cache with promoted columns):
+- Without HGVS: **51s** (matches pre-HGVS baseline)
+- With HGVS: **79s** (+55% HGVS overhead, inherent cost of coordinate mapping for 3M CSQ entries)
+
+### Fixes applied (with Ensembl VEP traceability)
+
+1. **Genomic shift `seq_strand=1`** — VEP `_genomic_shift()` always passes `seq_strand=1` to `perform_shift()`
+   - [TranscriptVariationAllele.pm#L431](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L431)
+2. **3' UTR extension for stop-loss/frameshift** — VEP `_get_alternate_cds()` appends `_three_prime_utr()` before translating
+   - [TranscriptVariationAllele.pm#L2335-L2372](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2335-L2372)
+3. **Protein dup before shift** — VEP `hgvs_protein()` calls `_check_for_peptide_duplication()` BEFORE `_shift_3prime()`
+   - [TranscriptVariationAllele.pm#L1700-L1758](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1758)
+4. **Transcript-level shift via `perform_shift`** — VEP `_return_3prime()` calls `perform_shift()` with `hgvs_reverse` flag
+   - [TranscriptVariationAllele.pm#L237-L243](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L237-L243)
+   - [TranscriptVariationAllele.pm#L291-L351](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351)
+5. **`stop_loss_extra_aa` ref_len** — VEP `_peptide()` cached peptide excludes terminal `*`; use `trim_end_matches('*').len()`
+   - [TranscriptVariationAllele.pm#L2430-L2432](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2430-L2432)
+   - [BaseTranscriptVariation.pm#L1282-L1291](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1282-L1291)
+6. **Port VEP `genomic2pep` for insertion protein position** — map BOTH flanking bases independently via `int((cds_1based + 2) / 3)`; HGVS start = higher position (from seq_region_start mapping), end = lower
+   - [TranscriptMapper.pm#L451-L487](https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L451-L487)
+   - [TranscriptVariationAllele.pm#L1680-L1682](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1680-L1682)
+   - [BaseTranscriptVariation.pm#L467-L499](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499)
+7. **LoF biotype UTR suppression** — VEP `_three_prime_utr()` returns undef for `protein_coding_LoF` transcripts
+   - [BaseTranscriptVariation.pm#L1106-L1116](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1106-L1116)
+8. **Boundary-spanning deletion HGVSc suppression** — VEP returns undef when variant extends beyond transcript boundaries
+   - [TranscriptVariationAllele.pm#L1416](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1416)
+9. **Full cDNA hydration from FASTA** — reconstruct transcript cDNA from exon coordinates + reference FASTA for UTR extension
+   - [TranscriptVariationAllele.pm#L2412-L2418](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2412-L2418)
+
+### Performance optimizations applied
+
+1. **Promoted parquet columns** — `translateable_seq`, `cdna_mapper_segments`, `bam_edit_status`, `has_non_polya_rna_edit`, `spliced_seq`, `flags_str` moved from `raw_object_json` blob to top-level columns, eliminating 7× JSON parsing of ~25KB per transcript (biodatageeks/datafusion-bio-formats#125, #126)
+2. **Batched FASTA reads** — read entire transcript span in one FASTA query instead of per-exon reads (~8.7x reduction)
+3. **Targeted cDNA hydration** — only hydrate transcripts whose CDS overlaps indel variants or whose stop codon overlaps any variant
+4. **SNV shift skip** — skip `build_hgvs_genomic_shift` for SNVs/MNVs (84% of variants)
+
+### Merged (Ensembl+RefSeq) benchmark status
+
+Merged chr1 benchmark with `--hgvs --merged`:
+- 72/74 fields at zero mismatches
+- HGVSc: ~100 mismatches (RefSeq-specific: edited transcript shifting, cdna_mapper_segments differences)
+- HGVSp: ~5 mismatches (RefSeq transcripts missing spliced_seq)
+- All non-HGVS fields: zero mismatches
+
+Remaining merged mismatches are ALL on RefSeq transcripts (NM_, NR_, XM_, XR_) and require:
+- Porting VEP's transcript-level `_return_3prime()` shifting with correct pre/post sequence extraction
+- Resolving `cdna_mapper_segments` differences for 3 specific RefSeq transcripts
+
+### Test coverage
+
+365 unit tests covering:
+- `stop_loss_extra_aa`: internal stops (LoF), no new stop, frameshift, `trim_end_matches('*')`
+- `perform_shift_ensembl`: forward/reverse, `hgvs_reverse` flag, genomic `seq_strand=1`
+- `clip_alleles`: negative strand prefix/suffix coordinate adjustments
+- `check_for_peptide_duplication`: current position, fallback offsets, multi-residue
+- `three_prime_utr_seq`: LoF suppression, spliced_seq/cdna_seq fallback
+- `genomic_to_cds_index`: positive/negative strand, outside CDS
+- `coding_segments`: strand-aware ordering
+- `translate_protein_from_cds`: stop inclusion, incomplete codons, N bases
+- Protein HGVS: deletion, missense, delins, frameshift, synonymous, start_lost
 
 ## Non-Goals
 
