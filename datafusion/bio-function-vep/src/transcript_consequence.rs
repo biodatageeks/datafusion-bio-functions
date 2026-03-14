@@ -2482,20 +2482,36 @@ impl CodingClassification {
 /// Traceability:
 /// - Ensembl Variation `BaseTranscriptVariationAllele::_get_peptide_alleles()`
 ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
+///   sets `start` from `$tv->translation_start()` which uses the
+///   `genomic2pep()` mapper. For codon-boundary insertions (ref = "-"),
+///   the mapper returns the codon AFTER the boundary, which is
+///   `protein_position_end` in our classification. Using `end` as
+///   the HGVS start aligns the dup detection index with VEP.
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1680-L1682
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499
 fn build_protein_hgvs_data(
     class: &CodingClassification,
     old_aas: &[char],
     new_aas: &[char],
     frameshift: bool,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
-    let start = class.protein_position_start?;
-    let end = class.protein_position_end.or(class.protein_position_start)?;
+    let raw_start = class.protein_position_start?;
+    let raw_end = class.protein_position_end.or(class.protein_position_start)?;
     let (ref_peptide, alt_peptide) = match class.amino_acids.as_deref() {
         Some(value) => match value.split_once('/') {
             Some((left, right)) => (left.to_string(), right.to_string()),
             None => (value.to_string(), value.to_string()),
         },
         None => (String::new(), String::new()),
+    };
+    // For codon-boundary insertions (ref = "-"), VEP's translation_start()
+    // returns the codon after the boundary. Use `end` as HGVS start to match.
+    let (start, end) = if ref_peptide == "-" && raw_start != raw_end {
+        (raw_end, raw_end)
+    } else {
+        (raw_start, raw_end)
     };
     Some(crate::hgvs::ProteinHgvsData {
         start,
