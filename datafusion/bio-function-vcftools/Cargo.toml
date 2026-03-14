@@ -1,0 +1,22 @@
+[package]
+name = "datafusion-bio-function-vcftools"
+version = "0.1.0"
+description = "Fused array transform optimization for Apache DataFusion"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+
+[dependencies]
+datafusion = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+parquet = { workspace = true }
