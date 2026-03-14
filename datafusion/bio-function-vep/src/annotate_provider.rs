@@ -1492,9 +1492,13 @@ impl AnnotateProvider {
                     .unwrap_or(false);
                 // Prefer promoted top-level columns; fall back to JSON parsing
                 // for backward compatibility with older caches.
-                let raw_object_json = raw_json_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let has_promoted_columns = translateable_seq_idx.is_some();
+                // Only read raw_object_json when promoted columns are missing.
+                let raw_object_json = if has_promoted_columns {
+                    None
+                } else {
+                    raw_json_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                };
                 if let Some(translateable_seq) = translateable_seq_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                     .or_else(|| translateable_seq_from_raw_object_json(raw_object_json.as_deref()))
