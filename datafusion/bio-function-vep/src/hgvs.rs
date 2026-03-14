@@ -1329,21 +1329,46 @@ fn shift_peptides_post_var(notation: &mut ProteinHgvsNotation, ref_translation: 
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_check_for_peptide_duplication()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2404
+///   builds upstream from `substr($reference_trans, 0, $start - 1)` + preseq, then
+///   tests whether the alt peptide matches the upstream at `start - alt_len - 1`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2410
+/// - VEP's `$hgvs_notation->{start}` comes from `translation_start()` via the
+///   `genomic2pep()` mapper, which for codon-boundary insertions can return a
+///   position 1 higher than our `protein_position_start`. We compensate by also
+///   trying with `start + 1` when the insertion has no clipped prefix (boundary).
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499
 fn check_for_peptide_duplication(notation: &mut ProteinHgvsNotation, ref_translation: &str) -> bool {
     if notation.alt_allele.is_empty() || notation.start == 0 {
         return false;
     }
 
+    // Try dup check at the current position first.
+    if try_peptide_dup_at(notation, ref_translation, notation.start) {
+        return true;
+    }
+    // For codon-boundary insertions (empty preseq = no clipped prefix),
+    // also try one position forward to match VEP's genomic2pep mapper.
+    if notation.preseq.is_empty() {
+        if try_peptide_dup_at(notation, ref_translation, notation.start.saturating_add(1)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn try_peptide_dup_at(
+    notation: &mut ProteinHgvsNotation,
+    ref_translation: &str,
+    check_start: usize,
+) -> bool {
     let mut upstream = ref_translation
-        .get(..notation.start.saturating_sub(1))
+        .get(..check_start.saturating_sub(1))
         .unwrap_or_default()
         .to_string();
     upstream.push_str(&notation.preseq);
 
     let alt_len = notation.alt_allele.len();
-    let Some(test_new_start) = notation
-        .start
+    let Some(test_new_start) = check_start
         .checked_sub(alt_len)
         .and_then(|s| s.checked_sub(1))
     else {
@@ -1355,8 +1380,8 @@ fn check_for_peptide_duplication(notation: &mut ProteinHgvsNotation, ref_transla
 
     if test_seq == notation.alt_allele {
         notation.kind = "dup".to_string();
-        notation.end = notation.start.saturating_sub(1);
-        notation.start = notation.start.saturating_sub(alt_len);
+        notation.end = check_start.saturating_sub(1);
+        notation.start = check_start.saturating_sub(alt_len);
         true
     } else {
         false
