@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use coitrees::{COITree, Interval, IntervalTree};
 
+use crate::hgvs::HgvsGenomicShift;
 use crate::so_terms::{ALL_SO_TERMS, SoTerm};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +14,8 @@ pub struct VariantInput {
     pub end: i64,
     pub ref_allele: String,
     pub alt_allele: String,
+    pub hgvs_shift_forward: Option<HgvsGenomicShift>,
+    pub hgvs_shift_reverse: Option<HgvsGenomicShift>,
 }
 
 impl VariantInput {
@@ -45,6 +48,8 @@ impl VariantInput {
                 end,
                 ref_allele,
                 alt_allele,
+                hgvs_shift_forward: None,
+                hgvs_shift_reverse: None,
             };
         }
 
@@ -89,8 +94,27 @@ impl VariantInput {
             } else {
                 String::from_utf8_lossy(final_alt).to_string()
             },
+            hgvs_shift_forward: None,
+            hgvs_shift_reverse: None,
         }
     }
+
+    pub fn hgvs_shift_for_strand(&self, strand: i8) -> Option<&HgvsGenomicShift> {
+        if strand >= 0 {
+            self.hgvs_shift_forward.as_ref()
+        } else {
+            self.hgvs_shift_reverse.as_ref()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptCdnaMapperSegment {
+    pub genomic_start: i64,
+    pub genomic_end: i64,
+    pub cdna_start: usize,
+    pub cdna_end: usize,
+    pub ori: i8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +127,10 @@ pub struct TranscriptFeature {
     pub biotype: String,
     pub cds_start: Option<i64>,
     pub cds_end: Option<i64>,
+    pub cdna_coding_start: Option<usize>,
+    pub cdna_coding_end: Option<usize>,
+    /// TranscriptMapper exon-to-cDNA segments in genomic order.
+    pub cdna_mapper_segments: Vec<TranscriptCdnaMapperSegment>,
     /// Mature miRNA genomic regions (mapped from cDNA attributes in raw_object_json).
     pub mature_mirna_regions: Vec<(i64, i64)>,
     // Gene metadata for per-transcript CSQ serialization.
@@ -540,7 +568,7 @@ impl TranscriptConsequenceEngine {
                     if !terms.is_empty() {
                         let exon_str = which_exon_str(variant, &tx_exons);
                         let intron_str = which_intron_str(variant, &tx_exons, tx.strand);
-                        let cdna_position = compute_cdna_position(variant, &tx_exons, tx.strand);
+                        let cdna_position = compute_cdna_position(variant, tx, &tx_exons);
                         let (cds_position, protein_position, amino_acids, codons, protein_hgvs) =
                             if let Some(ref cc) = coding_class {
                                 let n_pad_len = tx_translation
@@ -594,12 +622,23 @@ impl TranscriptConsequenceEngine {
                             &variant.alt_allele,
                             variant.start,
                             variant.end,
+                            if self.shift_hgvs {
+                                variant.hgvs_shift_for_strand(tx.strand)
+                            } else {
+                                None
+                            },
                         );
                         // Compute HGVSp notation.
                         let hgvsp = tx_translation.and_then(|tl| {
-                            protein_hgvs
-                                .as_ref()
-                                .and_then(|data| crate::hgvs::format_hgvsp(tl, data, self.shift_hgvs))
+                            let effective_translation =
+                                translation_for_hgvsp(tx, tl);
+                            protein_hgvs.as_ref().and_then(|data| {
+                                crate::hgvs::format_hgvsp(
+                                    &effective_translation,
+                                    data,
+                                    self.shift_hgvs,
+                                )
+                            })
                         });
                         out.push(TranscriptConsequence {
                             transcript_id: Some(tx.transcript_id.clone()),
@@ -1828,91 +1867,14 @@ impl TranscriptConsequenceEngine {
                 continue;
             }
 
-            // For frameshift introns where the variant is in the exonic
-            // boundary region (not overlapping the intron body), VEP only
-            // checks splice_region via _intron_overlap — the first loop
-            // (which checks donor/acceptor/PPT/etc.) requires overlap with
-            // the full intron span tree, which small introns don't trigger.
-            if is_frameshift_intron {
-                // Only splice_region checks (exonic boundary of intron)
-                self.add_splice_region_only(terms, sv, is_ins, intron_start, intron_end);
-            } else if tx.strand >= 0 {
+            // Ensembl skips frameshift introns only when the allele overlaps
+            // the intron body itself. Boundary variants still run through the
+            // normal donor/acceptor/PPT logic on the boundary interval tree.
+            if tx.strand >= 0 {
                 self.add_splice_for_intron_positive(terms, sv, is_ins, intron_start, intron_end);
             } else {
                 self.add_splice_for_intron_negative(terms, sv, is_ins, intron_start, intron_end);
             }
-        }
-    }
-
-    /// Splice checks for a single intron on the positive strand.
-    /// Intron coordinates are 1-based inclusive [intron_start, intron_end].
-    ///
-    /// VEP Perl offsets (from `_intron_effects`):
-    ///   donor (start):  +0/+1 = splice_donor, +4 = 5th_base, +2..+5 = donor_region
-    ///   acceptor (end): -0/-1 = splice_acceptor
-    ///   splice_region:  _intron_overlap checks +2..+7, -7..-2, start-3..start-1, end+1..end+3
-    ///   polypyrimidine: -16..-2 (from intron_end)
-    /// For frameshift introns where the variant is in the exonic boundary
-    /// region, VEP only checks splice_region (via `_intron_overlap` in the
-    /// boundary loop).  Strand is irrelevant for _intron_overlap — it checks
-    /// the same genomic coordinate ranges on both strands.
-    ///
-    /// Traceability:
-    /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_overlap()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L151-L259
-    fn add_splice_region_only(
-        &self,
-        terms: &mut BTreeSet<SoTerm>,
-        variant: &VariantInput,
-        is_ins: bool,
-        intron_start: i64,
-        intron_end: i64,
-    ) {
-        if is_ins {
-            let p = variant.start;
-            // _intron_overlap insertion checks for splice_region
-            if (intron_start + 3..=intron_start + 7).contains(&p)
-                || (intron_end - 6..=intron_end - 2).contains(&p)
-                || (intron_start - 2..=intron_start - 1).contains(&p)
-                || (intron_end + 2..=intron_end + 3).contains(&p)
-                || p == intron_start
-                || p == intron_end + 1
-                || p == intron_start + 2
-                || p == intron_end - 1
-            {
-                terms.insert(SoTerm::SpliceRegionVariant);
-            }
-        } else {
-            // splice_region (intronic): intron_start+2..intron_start+7, intron_end-7..intron_end-2
-            add_if_overlaps(
-                terms,
-                variant,
-                intron_start + 2,
-                intron_start + 7,
-                SoTerm::SpliceRegionVariant,
-            );
-            add_if_overlaps(
-                terms,
-                variant,
-                intron_end - 7,
-                intron_end - 2,
-                SoTerm::SpliceRegionVariant,
-            );
-            // splice_region (exonic): intron_start-3..intron_start-1, intron_end+1..intron_end+3
-            add_if_overlaps(
-                terms,
-                variant,
-                intron_start - 3,
-                intron_start - 1,
-                SoTerm::SpliceRegionVariant,
-            );
-            add_if_overlaps(
-                terms,
-                variant,
-                intron_end + 1,
-                intron_end + 3,
-                SoTerm::SpliceRegionVariant,
-            );
         }
     }
 
@@ -2378,6 +2340,10 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 
     // VEP's splice_region function suppresses splice_region_variant when
     // any of the more specific splice site terms are present.
+    //
+    // Traceability:
+    // - Ensembl Variation `VariationEffect::splice_region()`
+    //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L616-L627
     if terms.contains(&SoTerm::SpliceDonorVariant)
         || terms.contains(&SoTerm::SpliceAcceptorVariant)
         || terms.contains(&SoTerm::SpliceDonorRegionVariant)
@@ -2424,6 +2390,29 @@ fn cds_is_incomplete(tx: &TranscriptFeature, tx_translation: Option<&Translation
     }
     let cds_len = cds_end - cds_start + 1;
     cds_len % 3 != 0
+}
+
+/// Traceability:
+/// - Ensembl VEP `OutputFactory::output_hash_to_vcf_info_chunk()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1698-L1715
+/// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1584-L1880
+///
+/// VEP emits HGVSp with the translation stable ID that hangs off the
+/// TranscriptVariationAllele object. Our parquet caches can miss that ID on the
+/// translation row while the transcript row still carries it, so preserve the
+/// translation row as-is but backfill the missing stable ID from the transcript
+/// metadata for HGVS emission.
+fn translation_for_hgvsp(
+    tx: &TranscriptFeature,
+    translation: &TranslationFeature,
+) -> TranslationFeature {
+    if translation.stable_id.is_some() || tx.translation_stable_id.is_none() {
+        return translation.clone();
+    }
+    let mut out = translation.clone();
+    out.stable_id = tx.translation_stable_id.clone();
+    out
 }
 
 fn is_start_codon(allele: &str) -> bool {
@@ -2539,6 +2528,18 @@ fn classify_coding_change(
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
 ) -> Option<CodingClassification> {
+    let xm_debug = variant.start == 151002632
+        && variant.end == 151002632
+        && matches!(
+            tx.transcript_id.as_str(),
+            "XM_017001777.2"
+                | "XM_047425125.1"
+                | "XM_047425126.1"
+                | "XM_047425128.1"
+                | "XM_047425133.1"
+                | "XM_047425134.1"
+                | "XM_047425135.1"
+        );
     let translation = tx_translation?;
     let cds_seq = translation.cds_sequence.as_deref()?.to_ascii_uppercase();
     let ref_genomic = normalize_allele_seq(&variant.ref_allele);
@@ -2573,11 +2574,27 @@ fn classify_coding_change(
         .windows(2)
         .any(|w| w[1] != w[0].saturating_add(1))
     {
+        if xm_debug {
+            eprintln!(
+                "DEBUG_XM_151002632 skip=noncontiguous tx={} cds_indices={:?}",
+                tx.transcript_id,
+                cds_indices
+            );
+        }
         return None;
     }
     let start_idx = *cds_indices.first()?;
     let end_idx = *cds_indices.last()?;
     if end_idx >= cds_seq.len() {
+        if xm_debug {
+            eprintln!(
+                "DEBUG_XM_151002632 skip=out_of_bounds tx={} start_idx={} end_idx={} cds_len={}",
+                tx.transcript_id,
+                start_idx,
+                end_idx,
+                cds_seq.len()
+            );
+        }
         return None;
     }
 
@@ -2593,7 +2610,34 @@ fn classify_coding_change(
     };
 
     let ref_seq_slice = &cds_seq[start_idx..=end_idx];
+    if tx.transcript_id == "NM_004442.7" && variant.start == 22893000 && variant.end == 22893000 {
+        eprintln!(
+            "DEBUG_NM_004442_7 start_idx={} end_idx={} ref_seq_slice={} ref_tx={} cds_pos={} window={}",
+            start_idx,
+            end_idx,
+            ref_seq_slice,
+            ref_tx,
+            start_idx + 1,
+            &cds_seq[start_idx.saturating_sub(3)..=(end_idx + 3).min(cds_seq.len().saturating_sub(1))]
+        );
+    }
+    if xm_debug {
+        eprintln!(
+            "DEBUG_XM_151002632 compare tx={} start_idx={} end_idx={} ref_seq_slice={} ref_tx={} alt_tx={} cds_pos={} window={}",
+            tx.transcript_id,
+            start_idx,
+            end_idx,
+            ref_seq_slice,
+            ref_tx,
+            alt_tx,
+            start_idx + 1,
+            &cds_seq[start_idx.saturating_sub(3)..=(end_idx + 3).min(cds_seq.len().saturating_sub(1))]
+        );
+    }
     if ref_seq_slice != ref_tx {
+        if xm_debug {
+            eprintln!("DEBUG_XM_151002632 skip=ref_mismatch tx={}", tx.transcript_id);
+        }
         return None;
     }
 
@@ -2701,6 +2745,21 @@ fn classify_coding_change(
         } else if !aa_changed && !class.stop_retained && !class.start_retained {
             class.synonymous = true;
         }
+    }
+
+    if xm_debug {
+        eprintln!(
+            "DEBUG_XM_151002632 class tx={} synonymous={} missense={} stop_gained={} stop_lost={} start_lost={} start_retained={} aa={:?} codons={:?}",
+            tx.transcript_id,
+            class.synonymous,
+            class.missense,
+            class.stop_gained,
+            class.stop_lost,
+            class.start_lost,
+            class.start_retained,
+            class.amino_acids,
+            class.codons
+        );
     }
 
     // Populate CSQ metadata fields from the computed data.
@@ -3389,6 +3448,162 @@ fn genomic_to_cdna_index(tx_exons: &[&ExonFeature], strand: i8, pos: i64) -> Opt
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TranscriptCdnaCoord {
+    pub start: i64,
+    pub end: i64,
+    pub cdna_start: usize,
+    pub cdna_end: usize,
+}
+
+fn mapper_segment_cdna_index(segment: &TranscriptCdnaMapperSegment, pos: i64) -> Option<usize> {
+    if pos < segment.genomic_start || pos > segment.genomic_end {
+        return None;
+    }
+    let local = if segment.ori >= 0 {
+        usize::try_from(pos.saturating_sub(segment.genomic_start)).ok()?
+    } else {
+        usize::try_from(segment.genomic_end.saturating_sub(pos)).ok()?
+    };
+    Some(segment.cdna_start.saturating_add(local))
+}
+
+/// Map genomic coordinates to transcript cDNA indices using the same cached
+/// TranscriptMapper segments Ensembl VEP carries on transcript objects.
+///
+/// Traceability:
+/// - Ensembl VEP `AnnotationSource::Database::Transcript::prefetch_transcript_data()`
+///   caches `mapper` on `_variation_effect_feature_cache`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L333-L352
+/// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
+///   resolves transcript coordinates through `genomic2cdna`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
+pub(crate) fn genomic_to_cdna_index_for_transcript(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    pos: i64,
+) -> Option<usize> {
+    if !tx.cdna_mapper_segments.is_empty() {
+        return tx
+            .cdna_mapper_segments
+            .iter()
+            .find_map(|segment| mapper_segment_cdna_index(segment, pos));
+    }
+    genomic_to_cdna_index(tx_exons, tx.strand, pos)
+}
+
+fn transcript_cdna_coords(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+) -> Option<Vec<TranscriptCdnaCoord>> {
+    if !tx.cdna_mapper_segments.is_empty() {
+        return Some(
+            tx.cdna_mapper_segments
+                .iter()
+                .map(|segment| TranscriptCdnaCoord {
+                    start: segment.genomic_start,
+                    end: segment.genomic_end,
+                    cdna_start: segment.cdna_start,
+                    cdna_end: segment.cdna_end,
+                })
+                .collect(),
+        );
+    }
+
+    let mut exons: Vec<&ExonFeature> = tx_exons.to_vec();
+    exons.sort_by_key(|exon| exon.start);
+    if exons.is_empty() {
+        return None;
+    }
+
+    let exon_lens: Vec<usize> = exons
+        .iter()
+        .map(|exon| usize::try_from(exon.end.saturating_sub(exon.start).saturating_add(1)).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let total_len = exon_lens.iter().copied().sum::<usize>();
+
+    let mut coords = Vec::with_capacity(exons.len());
+    if tx.strand >= 0 {
+        let mut offset = 0usize;
+        for (exon, exon_len) in exons.into_iter().zip(exon_lens) {
+            let cdna_start = offset + 1;
+            let cdna_end = offset + exon_len;
+            coords.push(TranscriptCdnaCoord {
+                start: exon.start,
+                end: exon.end,
+                cdna_start,
+                cdna_end,
+            });
+            offset = cdna_end;
+        }
+    } else {
+        let mut consumed = 0usize;
+        for (exon, exon_len) in exons.into_iter().zip(exon_lens) {
+            let cdna_end = total_len.saturating_sub(consumed);
+            let cdna_start = cdna_end.saturating_sub(exon_len).saturating_add(1);
+            coords.push(TranscriptCdnaCoord {
+                start: exon.start,
+                end: exon.end,
+                cdna_start,
+                cdna_end,
+            });
+            consumed = consumed.saturating_add(exon_len);
+        }
+    }
+    Some(coords)
+}
+
+/// Resolve a genomic position to raw transcript cDNA numbering, including
+/// intronic offsets, using TranscriptMapper segments when present.
+///
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
+pub(crate) fn raw_cdna_position_from_genomic(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    genomic_pos: i64,
+) -> Option<String> {
+    let coords = transcript_cdna_coords(tx, tx_exons)?;
+    let mut cdna_position = None;
+
+    for (i, segment) in coords.iter().enumerate() {
+        if genomic_pos > segment.end {
+            continue;
+        }
+
+        if genomic_pos >= segment.start {
+            let coord = if tx.strand >= 0 {
+                segment.cdna_start as i64 + (genomic_pos - segment.start)
+            } else {
+                segment.cdna_start as i64 + (segment.end - genomic_pos)
+            };
+            cdna_position = Some(coord.to_string());
+            break;
+        }
+
+        let prev_segment = coords.get(i.checked_sub(1)?)?;
+        let updist = (genomic_pos - prev_segment.end).abs();
+        let downdist = (segment.start - genomic_pos).abs();
+        cdna_position = Some(
+            if updist < downdist || (updist == downdist && tx.strand >= 0) {
+                if tx.strand >= 0 {
+                    format!("{}+{}", prev_segment.cdna_end, updist)
+                } else {
+                    format!("{}-{}", prev_segment.cdna_start, updist)
+                }
+            } else if tx.strand >= 0 {
+                format!("{}-{}", segment.cdna_start, downdist)
+            } else {
+                format!("{}+{}", segment.cdna_end, downdist)
+            },
+        );
+        break;
+    }
+
+    cdna_position
+}
+
 /// Compute the cDNA_position string for a variant overlapping an exon.
 ///
 /// Traceability:
@@ -3398,8 +3613,8 @@ fn genomic_to_cdna_index(tx_exons: &[&ExonFeature], strand: i8, pos: i64) -> Opt
 ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159
 fn compute_cdna_position(
     variant: &VariantInput,
+    tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
-    strand: i8,
 ) -> Option<String> {
     if tx_exons.is_empty() {
         return None;
@@ -3421,8 +3636,8 @@ fn compute_cdna_position(
         return None;
     }
     if is_ins {
-        let a = genomic_to_cdna_index(tx_exons, strand, variant.start.saturating_sub(1));
-        let b = genomic_to_cdna_index(tx_exons, strand, variant.start);
+        let a = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start.saturating_sub(1));
+        let b = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start);
         match (a, b) {
             (Some(a), Some(b)) => {
                 let lo = a.min(b);
@@ -3433,7 +3648,7 @@ fn compute_cdna_position(
             // The two cDNA positions are always adjacent, so infer the missing
             // one from the known one, accounting for strand direction.
             (None, Some(b)) => {
-                let other = if strand >= 0 {
+                let other = if tx.strand >= 0 {
                     b.saturating_sub(1)
                 } else {
                     b + 1
@@ -3443,7 +3658,7 @@ fn compute_cdna_position(
                 Some(format!("{lo}-{hi}"))
             }
             (Some(a), None) => {
-                let other = if strand >= 0 {
+                let other = if tx.strand >= 0 {
                     a + 1
                 } else {
                     a.saturating_sub(1)
@@ -3455,8 +3670,8 @@ fn compute_cdna_position(
             (None, None) => None,
         }
     } else {
-        let start_cdna = genomic_to_cdna_index(tx_exons, strand, variant.start);
-        let end_cdna = genomic_to_cdna_index(tx_exons, strand, variant.end);
+        let start_cdna = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start);
+        let end_cdna = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.end);
         match (start_cdna, end_cdna) {
             (Some(s), Some(e)) if s == e => Some(s.to_string()),
             (Some(s), Some(e)) => {
@@ -3469,14 +3684,14 @@ fn compute_cdna_position(
             // On negative strand, genomic start maps to higher cDNA pos and
             // genomic end maps to lower, so we must orient correctly.
             (Some(s), None) => {
-                if strand < 0 {
+                if tx.strand < 0 {
                     Some(format!("?-{s}"))
                 } else {
                     Some(format!("{s}-?"))
                 }
             }
             (None, Some(e)) => {
-                if strand < 0 {
+                if tx.strand < 0 {
                     Some(format!("{e}-?"))
                 } else {
                     Some(format!("?-{e}"))
@@ -3896,6 +4111,9 @@ mod tests {
             biotype: biotype.to_string(),
             cds_start,
             cds_end,
+            cdna_coding_start: None,
+            cdna_coding_end: None,
+            cdna_mapper_segments: Vec::new(),
             mature_mirna_regions: Vec::new(),
             gene_stable_id: None,
             gene_symbol: None,
@@ -3936,6 +4154,8 @@ mod tests {
             end,
             ref_allele: r.to_string(),
             alt_allele: a.to_string(),
+            hgvs_shift_forward: None,
+            hgvs_shift_reverse: None,
         }
     }
 
@@ -4017,6 +4237,17 @@ mod tests {
             stable_id: None,
             version: None,
         }
+    }
+
+    #[test]
+    fn translation_for_hgvsp_falls_back_to_transcript_stable_id() {
+        let mut transcript = tx("ENSTTEST0001", "1", 1, 10, 1, "protein_coding", Some(1), Some(9));
+        transcript.translation_stable_id = Some("ENSPTEST0001".to_string());
+        let translation = translation("ENSTTEST0001", None, None, None, None);
+
+        let effective = translation_for_hgvsp(&transcript, &translation);
+
+        assert_eq!(effective.stable_id.as_deref(), Some("ENSPTEST0001"));
     }
 
     #[test]
@@ -5212,6 +5443,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn insertion_near_frameshift_intron_boundary_on_negative_strand_keeps_donor_region() {
+        // Tiny 1bp intron on the negative strand: donor is at intron end.
+        // Ensembl still evaluates donor-region predicates for exonic boundary
+        // variants; only alleles overlapping the intron body itself skip the
+        // frameshift intron boundary logic.
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            100,
+            240,
+            -1,
+            "protein_coding",
+            Some(100),
+            Some(240),
+        );
+        let exons = vec![exon("T1", 1, 100, 169), exon("T1", 2, 171, 240)];
+
+        // Intron is 170..170, donor region on negative strand is
+        // intron_end-5..intron_end-2 => 165..168. Insertion coordinate
+        // semantics narrow that to 166..168; 166 should therefore emit
+        // splice_donor_region_variant.
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 166, 166, "-", "TCCTCC"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::SpliceDonorRegionVariant),
+            "Negative-strand boundary insertion near a frameshift intron should keep splice_donor_region: {:?}",
+            terms
+        );
+        assert!(
+            !terms.contains(&SoTerm::SpliceRegionVariant),
+            "splice_region should be suppressed when splice_donor_region is present: {:?}",
+            terms
+        );
+    }
+
     // ── Approach B tests: exon-spanning indel splice detection ──
 
     #[test]
@@ -5642,10 +5919,11 @@ mod tests {
 
     #[test]
     fn compute_cdna_position_snv() {
+        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 150, 150, "A", "G");
-        assert_eq!(compute_cdna_position(&v, &refs, 1), Some("51".to_string()));
+        assert_eq!(compute_cdna_position(&v, &t, &refs), Some("51".to_string()));
     }
 
     #[test]
@@ -6118,10 +6396,11 @@ mod tests {
     #[test]
     fn compute_cdna_position_insertion_within_exon() {
         // Insertion within a single exon → range "a-b"
+        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 150, 150, "-", "ACG");
-        let pos = compute_cdna_position(&v, &refs, 1);
+        let pos = compute_cdna_position(&v, &t, &refs);
         assert!(pos.is_some());
         let s = pos.unwrap();
         assert!(s.contains('-'), "Insertion cDNA should be a range: {s}");
@@ -6131,10 +6410,11 @@ mod tests {
     fn compute_cdna_position_insertion_at_exon_left_boundary() {
         // Insertion at start of exon: left flanking position is intronic
         // Exon: 200..300. Insertion at pos 200: left=199 (intronic), right=200 (exonic)
+        let t = tx("tx1", "22", 200, 300, 1, "protein_coding", Some(200), Some(300));
         let exons = vec![exon("tx1", 1, 200, 300)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 200, 200, "-", "ACG");
-        let pos = compute_cdna_position(&v, &refs, 1);
+        let pos = compute_cdna_position(&v, &t, &refs);
         assert!(
             pos.is_some(),
             "Insertion at exon left boundary should produce cDNA position"
@@ -6149,10 +6429,11 @@ mod tests {
     fn compute_cdna_position_insertion_at_exon_right_boundary() {
         // Insertion at end of exon: right flanking position is intronic
         // Exon: 100..200. Insertion at pos 201: left=200 (exonic), right=201 (intronic)
+        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 201, 201, "-", "ACG");
-        let pos = compute_cdna_position(&v, &refs, 1);
+        let pos = compute_cdna_position(&v, &t, &refs);
         assert!(
             pos.is_some(),
             "Insertion at exon right boundary should produce cDNA position"
@@ -6168,11 +6449,12 @@ mod tests {
     #[test]
     fn compute_cdna_position_insertion_at_exon_boundary_minus_strand() {
         // Minus strand: insertion at exon boundary with intronic flanking
+        let t = tx("tx1", "22", 200, 300, -1, "protein_coding", Some(200), Some(300));
         let exons = vec![exon("tx1", 1, 200, 300)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         // Insertion at pos 200: left=199 (intronic), right=200 (exonic)
         let v = var("22", 200, 200, "-", "ACG");
-        let pos = compute_cdna_position(&v, &refs, -1);
+        let pos = compute_cdna_position(&v, &t, &refs);
         assert!(
             pos.is_some(),
             "Insertion at exon boundary on minus strand should produce cDNA position"
@@ -6182,11 +6464,12 @@ mod tests {
     #[test]
     fn compute_cdna_position_deletion_spanning_boundary() {
         // Deletion that starts before exon, ends within exon → "?-N"
+        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         // Deletion from 90 to 110: start is outside exon, end is inside
         let v = var("22", 90, 110, &"N".repeat(21), "-");
-        let pos = compute_cdna_position(&v, &refs, 1);
+        let pos = compute_cdna_position(&v, &t, &refs);
         assert!(pos.is_some());
         let s = pos.unwrap();
         assert!(
@@ -6198,11 +6481,12 @@ mod tests {
     #[test]
     fn compute_cdna_position_deletion_spanning_boundary_minus_strand() {
         // On minus strand: deletion extending past exon end
+        let t = tx("tx1", "22", 100, 200, -1, "protein_coding", Some(100), Some(200));
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         // Deletion from 190 to 210: start inside, end outside
         let v = var("22", 190, 210, &"N".repeat(21), "-");
-        let pos = compute_cdna_position(&v, &refs, -1);
+        let pos = compute_cdna_position(&v, &t, &refs);
         assert!(pos.is_some());
         let s = pos.unwrap();
         assert!(
@@ -6214,11 +6498,64 @@ mod tests {
     #[test]
     fn compute_cdna_position_deletion_range() {
         // Multi-base deletion fully within exon → "start-end"
+        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 110, 115, "NNNNNN", "-");
-        let pos = compute_cdna_position(&v, &refs, 1);
+        let pos = compute_cdna_position(&v, &t, &refs);
         assert_eq!(pos, Some("11-16".to_string()));
+    }
+
+    #[test]
+    fn compute_cdna_position_uses_transcript_mapper_segments() {
+        let mut t = tx(
+            "NM_001291281.3",
+            "1",
+            41361434,
+            41383590,
+            1,
+            "protein_coding",
+            Some(41361931),
+            Some(41383295),
+        );
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 41361434,
+                genomic_end: 41362344,
+                cdna_start: 1,
+                cdna_end: 911,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 41381616,
+                genomic_end: 41382208,
+                cdna_start: 912,
+                cdna_end: 1504,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 41382210,
+                genomic_end: 41382210,
+                cdna_start: 1505,
+                cdna_end: 1505,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 41382211,
+                genomic_end: 41383590,
+                cdna_start: 1707,
+                cdna_end: 3086,
+                ori: 1,
+            },
+        ];
+        let exons = vec![
+            exon("NM_001291281.3", 1, 41361434, 41362344),
+            exon("NM_001291281.3", 2, 41381616, 41382208),
+            exon("NM_001291281.3", 3, 41382210, 41383590),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("1", 41383346, 41383346, "C", "T");
+        assert_eq!(compute_cdna_position(&v, &t, &refs), Some("2842".to_string()));
     }
 
     // ---- FLAGS field from transcript attributes ----
@@ -7138,6 +7475,16 @@ mod tests {
         terms.insert(SoTerm::SpliceRegionVariant);
         strip_parent_terms(&mut terms);
         assert!(terms.contains(&SoTerm::IntronVariant));
+    }
+
+    #[test]
+    fn splice_donor_region_strips_splice_region() {
+        let mut terms = BTreeSet::new();
+        terms.insert(SoTerm::SpliceDonorRegionVariant);
+        terms.insert(SoTerm::SpliceRegionVariant);
+        strip_parent_terms(&mut terms);
+        assert!(terms.contains(&SoTerm::SpliceDonorRegionVariant));
+        assert!(!terms.contains(&SoTerm::SpliceRegionVariant));
     }
 
     // ---- UTR boundary insertion detection ----

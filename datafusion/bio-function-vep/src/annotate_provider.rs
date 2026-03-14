@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, Seek};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -26,10 +27,14 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext};
+use noodles_core::{Position, Region};
 use noodles_fasta as fasta;
 use serde_json::Value;
 
-use crate::allele::{MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele};
+use crate::allele::{
+    MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end,
+    vep_norm_start,
+};
 use crate::annotation_store::{AnnotationBackend, build_store};
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
@@ -37,8 +42,8 @@ use crate::lookup_provider::LookupProvider;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     ExonFeature, MirnaFeature, MotifFeature, PreparedContext, RegulatoryFeature, StructuralFeature,
-    SvEventKind, SvFeatureKind, TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature,
-    VariantInput, is_vep_transcript,
+    SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequenceEngine,
+    TranscriptFeature, TranslationFeature, VariantInput, is_vep_transcript,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -1353,11 +1358,13 @@ impl AnnotateProvider {
         &self,
         table: &str,
         chroms: &HashSet<String>,
-    ) -> Result<Vec<TranscriptFeature>> {
+    ) -> Result<(Vec<TranscriptFeature>, HashMap<String, String>)> {
         let filter = Self::chrom_filter_clause(chroms);
         let query = format!("SELECT * FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
+        let mut translateable_seq_by_tx = HashMap::new();
+        let mut refseq_ids: Vec<Option<String>> = Vec::new();
 
         for batch in &batches {
             let schema = batch.schema();
@@ -1396,10 +1403,13 @@ impl AnnotateProvider {
             })?;
             let cds_start_idx = schema.index_of("cds_start").ok();
             let cds_end_idx = schema.index_of("cds_end").ok();
+            let cdna_coding_start_idx = schema.index_of("cdna_coding_start").ok();
+            let cdna_coding_end_idx = schema.index_of("cdna_coding_end").ok();
             let gene_stable_id_idx = schema.index_of("gene_stable_id").ok();
             let gene_symbol_idx = schema.index_of("gene_symbol").ok();
             let gene_symbol_source_idx = schema.index_of("gene_symbol_source").ok();
             let gene_hgnc_id_idx = schema.index_of("gene_hgnc_id").ok();
+            let refseq_id_idx = schema.index_of("refseq_id").ok();
             let source_idx = schema.index_of("source").ok();
             let version_idx = schema.index_of("version").ok();
             let raw_json_idx = schema.index_of("raw_object_json").ok();
@@ -1446,6 +1456,14 @@ impl AnnotateProvider {
                 let cds_end = cds_end_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .filter(|v| *v > 0);
+                let cdna_coding_start = cdna_coding_start_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .filter(|v| *v > 0)
+                    .and_then(|v| usize::try_from(v).ok());
+                let cdna_coding_end = cdna_coding_end_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .filter(|v| *v > 0)
+                    .and_then(|v| usize::try_from(v).ok());
 
                 // Mature miRNA regions from promoted List<Struct<start,end>>
                 // column (already genomic coordinates).
@@ -1464,10 +1482,17 @@ impl AnnotateProvider {
                 let cds_end_nf = cds_end_nf_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                     .unwrap_or(false);
+                let raw_object_json = raw_json_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                if let Some(translateable_seq) =
+                    translateable_seq_from_raw_object_json(raw_object_json.as_deref())
+                {
+                    translateable_seq_by_tx.insert(transcript_id.clone(), translateable_seq);
+                }
+                let cdna_mapper_segments =
+                    cdna_mapper_segments_from_raw_object_json(raw_object_json.as_deref());
                 let flags_str = resolve_flags_str(
-                    raw_json_idx
-                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                        .as_deref(),
+                    raw_object_json.as_deref(),
                     cds_start_nf,
                     cds_end_nf,
                 );
@@ -1480,7 +1505,15 @@ impl AnnotateProvider {
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_hgnc_id =
                     gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let source = source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let refseq_id =
+                    refseq_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let source = normalize_source_cache(
+                    raw_object_json.as_deref(),
+                    &transcript_id,
+                    source_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .as_deref(),
+                );
                 let version = version_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .and_then(|v| i32::try_from(v).ok());
@@ -1519,6 +1552,9 @@ impl AnnotateProvider {
                     biotype,
                     cds_start,
                     cds_end,
+                    cdna_coding_start,
+                    cdna_coding_end,
+                    cdna_mapper_segments,
                     mature_mirna_regions,
                     gene_stable_id,
                     gene_symbol,
@@ -1541,10 +1577,12 @@ impl AnnotateProvider {
                     uniparc,
                     uniprot_isoform,
                 });
+                refseq_ids.push(refseq_id);
             }
         }
 
-        Ok(out)
+        backfill_missing_hgnc_ids(&mut out, &refseq_ids);
+        Ok((out, translateable_seq_by_tx))
     }
 
     async fn load_exons(&self, table: &str, chroms: &HashSet<String>) -> Result<Vec<ExonFeature>> {
@@ -2009,7 +2047,29 @@ impl AnnotateProvider {
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_string_option(opts, "reference_fasta_path"));
+        eprintln!(
+            "DEBUG_HGVS_FLAGS any={} shift_hgvs={} reference_fasta_path={:?}",
+            hgvs_flags.any(),
+            hgvs_flags.shift_hgvs,
+            reference_fasta_path
+        );
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
+        let mut hgvs_reference_reader = if hgvs_flags.any() && hgvs_flags.shift_hgvs {
+            reference_fasta_path
+                .as_deref()
+                .map(|path| {
+                    fasta::io::indexed_reader::Builder::default()
+                        .build_from_path(path)
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "failed to open indexed reference FASTA '{path}': {e}"
+                            ))
+                        })
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let mut provider = LookupProvider::new(
             Arc::clone(&self.session),
             self.vcf_table.clone(),
@@ -2019,7 +2079,7 @@ impl AnnotateProvider {
             cache_columns,
             extended_probes,
             allowed_failed,
-            reference_fasta_path,
+            None,
         )?;
         if flags.check_existing {
             provider.set_colocated_sink(Arc::clone(&coloc_sink));
@@ -2028,6 +2088,7 @@ impl AnnotateProvider {
         let plan = provider.scan(state, None, &[], None).await?;
         let task_ctx = self.session.task_ctx();
         let base_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
+        let input_variant_intervals = collect_input_variant_intervals(&base_batches)?;
 
         // Build co-located variant aggregation from the piggybacked sink.
         let colocated_map = if flags.check_existing {
@@ -2047,7 +2108,16 @@ impl AnnotateProvider {
             (0..batch.num_rows()).any(|row| string_at(col.as_ref(), row).is_none())
         });
 
-        let (transcripts, exons, translations, regulatory, motifs, mirnas, structural) =
+        let (
+            transcripts,
+            translateable_seq_by_tx,
+            exons,
+            mut translations,
+            regulatory,
+            motifs,
+            mirnas,
+            structural,
+        ) =
             if has_cache_misses {
                 // Extract distinct chrom values from VCF batches for predicate pushdown
                 let vcf_chroms: HashSet<String> = {
@@ -2071,14 +2141,16 @@ impl AnnotateProvider {
                     .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
                     .unwrap_or(false);
 
-                let tx = if let Some(table) = transcripts_table {
-                    self.load_transcripts(table, &vcf_chroms)
-                        .await?
-                        .into_iter()
-                        .filter(|t| is_vep_transcript(&t.transcript_id, merged))
-                        .collect::<Vec<_>>()
+                let (tx, translateable_seq_by_tx) = if let Some(table) = transcripts_table {
+                    let (tx, translateable_seq_by_tx) = self.load_transcripts(table, &vcf_chroms).await?;
+                    (
+                        tx.into_iter()
+                            .filter(|t| is_vep_transcript(&t.transcript_id, merged))
+                            .collect::<Vec<_>>(),
+                        translateable_seq_by_tx,
+                    )
                 } else {
-                    Vec::new()
+                    (Vec::new(), HashMap::new())
                 };
                 let ex = if let Some(table) = exons_table {
                     self.load_exons(table, &vcf_chroms).await?
@@ -2090,6 +2162,15 @@ impl AnnotateProvider {
                 } else {
                     Vec::new()
                 };
+                eprintln!(
+                    "DEBUG_CONTEXT_COUNTS transcripts={} exons={} translations={} translations_table={} has_tx_nm004442={} has_tl_nm004442={}",
+                    tx.len(),
+                    ex.len(),
+                    tl.len(),
+                    translations_table.unwrap_or("(none)"),
+                    tx.iter().any(|t| t.transcript_id == "NM_004442.7"),
+                    tl.iter().any(|t| t.transcript_id == "NM_004442.7")
+                );
                 let rg = if let Some(table) = regulatory_table {
                     self.load_regulatory_features(table, &vcf_chroms).await?
                 } else {
@@ -2110,10 +2191,11 @@ impl AnnotateProvider {
                 } else {
                     Vec::new()
                 };
-                (tx, ex, tl, rg, mt, mi, st)
+                (tx, translateable_seq_by_tx, ex, tl, rg, mt, mi, st)
             } else {
                 (
                     Vec::new(),
+                    HashMap::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -2122,6 +2204,28 @@ impl AnnotateProvider {
                     Vec::new(),
                 )
             };
+        eprintln!(
+            "DEBUG_HYDRATE_CALL reader_some={} transcripts={} translations={}",
+            hgvs_reference_reader.is_some(),
+            transcripts.len(),
+            translations.len()
+        );
+        let hydrated_transcript_ids = if let Some(reader) = hgvs_reference_reader.as_mut() {
+            hydrate_refseq_translation_cds_from_reference(
+                reader,
+                &transcripts,
+                &exons,
+                &mut translations,
+                &input_variant_intervals,
+            )?
+        } else {
+            HashSet::new()
+        };
+        apply_translateable_seq_overrides(
+            &mut translations,
+            &translateable_seq_by_tx,
+            &hydrated_transcript_ids,
+        );
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
         let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
             upstream_distance,
@@ -2210,6 +2314,23 @@ impl AnnotateProvider {
             .unwrap_or(false);
         let flags = VepFlags::from_options_json(self.options_json.as_deref());
         let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
+        let mut hgvs_reference_reader = if hgvs_flags.any() && hgvs_flags.shift_hgvs {
+            self.options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_string_option(opts, "reference_fasta_path"))
+                .map(|path| {
+                    fasta::io::indexed_reader::Builder::default()
+                        .build_from_path(&path)
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "failed to open indexed reference FASTA '{path}': {e}"
+                            ))
+                        })
+                })
+                .transpose()?
+        } else {
+            None
+        };
 
         let mut csq_builder = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 40);
         let mut most_builder =
@@ -2356,13 +2477,37 @@ impl AnnotateProvider {
                     continue;
                 }
 
-                let variant = VariantInput::from_vcf(
+                let mut variant = VariantInput::from_vcf(
                     chrom.clone(),
                     start,
                     end,
                     ref_allele,
                     alt_allele.clone(),
                 );
+                if let Some(reader) = hgvs_reference_reader.as_mut() {
+                    let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
+                    let (vep_ref_norm, vep_alt_norm) = vcf_to_vep_allele(&ref_al, &alt_allele);
+                    let vep_start = vep_norm_start(start, &ref_al, &alt_allele);
+                    let vep_end = vep_norm_end(start, &ref_al, &alt_allele);
+                    variant.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+                        reader,
+                        chrom_norm,
+                        &vep_ref_norm,
+                        &vep_alt_norm,
+                        vep_start,
+                        vep_end,
+                        1,
+                    )?;
+                    variant.hgvs_shift_reverse = crate::hgvs::build_hgvs_genomic_shift(
+                        reader,
+                        chrom_norm,
+                        &vep_ref_norm,
+                        &vep_alt_norm,
+                        vep_start,
+                        vep_end,
+                        -1,
+                    )?;
+                }
                 let assignments = engine.evaluate_variant_prepared(&variant, ctx);
 
                 // Derive most_severe from all assignments.
@@ -2579,13 +2724,9 @@ fn resolve_flags_str(
     cds_start_nf: bool,
     cds_end_nf: bool,
 ) -> Option<String> {
-    if cds_start_nf || cds_end_nf {
-        raw_object_json
-            .and_then(flags_str_from_raw_object_json)
-            .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf))
-    } else {
-        None
-    }
+    raw_object_json
+        .and_then(flags_str_from_raw_object_json)
+        .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf))
 }
 
 /// Parse ordered transcript `FLAGS` from the serialized Ensembl transcript
@@ -2635,6 +2776,130 @@ fn flags_str_from_bools(cds_start_nf: bool, cds_end_nf: bool) -> Option<String> 
     }
 }
 
+/// Normalize the merged-mode transcript `SOURCE` field to the Ensembl-facing
+/// values VEP emits (`Ensembl` / `RefSeq`).
+///
+/// Traceability:
+/// - Ensembl VEP `OutputFactory::BaseTranscriptVariationAllele_to_output_hash()`
+///   emits `$tr->{_source_cache}` directly for merged annotations
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1530-L1531
+/// - Ensembl VEP merged-source tests
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/t/OutputFactory.t#L1051-L1060
+fn normalize_source_cache(
+    raw_object_json: Option<&str>,
+    transcript_id: &str,
+    raw_source: Option<&str>,
+) -> Option<String> {
+    source_cache_from_raw_object_json(raw_object_json)
+        .or_else(|| normalized_source_from_transcript_id(transcript_id))
+        .or_else(|| raw_source.and_then(normalize_source_label))
+}
+
+fn source_cache_from_raw_object_json(raw_json: Option<&str>) -> Option<String> {
+    let value: Value = serde_json::from_str(raw_json?).ok()?;
+    value
+        .get("__value")
+        .and_then(|inner| inner.get("_source_cache"))
+        .and_then(Value::as_str)
+        .and_then(normalize_source_label)
+}
+
+fn normalized_source_from_transcript_id(transcript_id: &str) -> Option<String> {
+    match transcript_id {
+        id if id.starts_with("ENST") => Some("Ensembl".to_string()),
+        id if id.starts_with("NM_")
+            || id.starts_with("NR_")
+            || id.starts_with("XM_")
+            || id.starts_with("XR_") =>
+        {
+            Some("RefSeq".to_string())
+        }
+        _ => None,
+    }
+}
+
+fn normalize_source_label(source: &str) -> Option<String> {
+    match source {
+        "" | "-" => None,
+        "Ensembl" | "RefSeq" => Some(source.to_string()),
+        value if matches!(
+            value,
+            "ensembl" | "ensembl_havana" | "havana" | "VEGA" | "vega"
+        ) =>
+        {
+            Some("Ensembl".to_string())
+        }
+        value if matches!(value, "BestRefSeq" | "RefSeq" | "Gnomon") => {
+            Some("RefSeq".to_string())
+        }
+        other => Some(other.to_string()),
+    }
+}
+
+/// Fill missing merged-mode `HGNC_ID` values for RefSeq rows using the paired
+/// Ensembl transcript mapping in the merged cache, with a unique-gene-symbol
+/// fallback when no explicit `refseq_id -> HGNC_ID` link exists.
+///
+/// Traceability:
+/// - Ensembl VEP `OutputFactory::BaseTranscriptVariationAllele_to_output_hash()`
+///   emits transcript `_gene_hgnc_id` directly
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1474-L1484
+///
+/// Our parquet cache materializes Ensembl and RefSeq transcript rows
+/// separately. RefSeq rows often lack promoted `gene_hgnc_id`, while the paired
+/// Ensembl row carries both `refseq_id` and `gene_hgnc_id`. This reconstructs
+/// the VEP-visible merged transcript state without heuristics.
+fn backfill_missing_hgnc_ids(transcripts: &mut [TranscriptFeature], refseq_ids: &[Option<String>]) {
+    let mut refseq_gene_hgnc_by_id: HashMap<String, (Option<String>, String)> = HashMap::new();
+    let mut symbol_to_hgnc_ids: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for (tx, refseq_id) in transcripts.iter().zip(refseq_ids.iter()) {
+        let Some(hgnc_id) = tx.gene_hgnc_id.as_deref() else {
+            continue;
+        };
+        if let Some(refseq_id) = refseq_id.as_deref() {
+            refseq_gene_hgnc_by_id
+                .entry(refseq_id.to_string())
+                .or_insert_with(|| (tx.gene_symbol.clone(), hgnc_id.to_string()));
+        }
+        if let Some(symbol) = tx.gene_symbol.as_deref() {
+            symbol_to_hgnc_ids
+                .entry(symbol.to_string())
+                .or_default()
+                .insert(hgnc_id.to_string());
+        }
+    }
+
+    let unique_hgnc_by_symbol: HashMap<String, String> = symbol_to_hgnc_ids
+        .into_iter()
+        .filter_map(|(symbol, ids)| {
+            if ids.len() == 1 {
+                ids.into_iter().next().map(|id| (symbol, id))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for tx in transcripts.iter_mut() {
+        if tx.gene_hgnc_id.is_some() {
+            continue;
+        }
+        if let Some((mapped_symbol, hgnc_id)) = refseq_gene_hgnc_by_id.get(tx.transcript_id.as_str())
+        {
+            if mapped_symbol.as_deref() == tx.gene_symbol.as_deref() || tx.gene_symbol.is_none() {
+                tx.gene_hgnc_id = Some(hgnc_id.clone());
+                continue;
+            }
+        }
+        if let Some(symbol) = tx.gene_symbol.as_deref() {
+            if let Some(hgnc_id) = unique_hgnc_by_symbol.get(symbol) {
+                tx.gene_hgnc_id = Some(hgnc_id.clone());
+            }
+        }
+    }
+}
+
 /// Parse mature miRNA genomic regions from the `raw_object_json` transcript
 /// attribute.  VEP stores miRNA cDNA coordinates in the transcript's attribute
 /// array as `{code: "miRNA", value: "42-59"}`.  We map those cDNA coords to
@@ -2671,6 +2936,437 @@ fn read_mirna_regions(batch: &RecordBatch, col_idx: usize, row: usize) -> Option
         regions.push((s, e));
     }
     Some(regions)
+}
+
+/// Rebuild RefSeq/XM/XR CDS strings from the indexed genomic reference so the
+/// transcript engine sees the same spliced reference sequence Ensembl Variation
+/// uses through transcript objects during HGVS/coding consequence evaluation.
+///
+/// Traceability:
+/// - Ensembl Variation `BaseTranscriptVariationAllele::_get_peptide_alleles()`
+///   consumes transcript-derived CDS/peptide sequence rather than a VCF-local
+///   allele string
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509
+///
+/// In our merged parquet cache, a small subset of RefSeq transcript CDS strings
+/// diverge from the genomic reference sequence that VEP's transcript objects
+/// expose. Reconstructing the spliced CDS from the indexed FASTA restores the
+/// same sequence basis without changing transcript/exon coordinates.
+fn hydrate_refseq_translation_cds_from_reference<R>(
+    reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
+    transcripts: &[TranscriptFeature],
+    exons: &[ExonFeature],
+    translations: &mut [TranslationFeature],
+    input_variant_intervals: &HashMap<String, Vec<(i64, i64)>>,
+) -> Result<HashSet<String>>
+where
+    R: BufRead + Seek,
+{
+    let mut exons_by_tx: HashMap<&str, Vec<&ExonFeature>> = HashMap::new();
+    for exon in exons {
+        exons_by_tx
+            .entry(exon.transcript_id.as_str())
+            .or_default()
+            .push(exon);
+    }
+    for tx_exons in exons_by_tx.values_mut() {
+        tx_exons.sort_by_key(|exon| (exon.start, exon.end, exon.exon_number));
+    }
+    let translation_ids: HashSet<&str> = translations
+        .iter()
+        .map(|translation| translation.transcript_id.as_str())
+        .collect();
+
+    let mut hydrated_by_tx: HashMap<String, String> = HashMap::new();
+    for tx in transcripts {
+        if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
+            eprintln!(
+                "DEBUG_HYDRATE_TX precheck tx={} source={:?} chrom={} cds_start={:?} cds_end={:?}",
+                tx.transcript_id,
+                tx.source,
+                tx.chrom,
+                tx.cds_start,
+                tx.cds_end
+            );
+        }
+        if !translation_ids.contains(tx.transcript_id.as_str()) {
+            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
+                eprintln!("DEBUG_HYDRATE_TX skip=missing_translation tx={}", tx.transcript_id);
+            }
+            continue;
+        }
+        if !is_refseq_transcript_for_hydration(tx) {
+            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
+                eprintln!("DEBUG_HYDRATE_TX skip=not_refseq tx={}", tx.transcript_id);
+            }
+            continue;
+        }
+        let chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
+        let overlaps_input = input_variant_intervals
+            .get(chrom)
+            .map(|intervals| interval_overlaps_any(intervals, tx.start, tx.end))
+            .unwrap_or(false);
+        if !overlaps_input {
+            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
+                eprintln!("DEBUG_HYDRATE_TX skip=no_input_overlap tx={}", tx.transcript_id);
+            }
+            continue;
+        }
+        let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
+            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
+                eprintln!("DEBUG_HYDRATE_TX skip=missing_cds tx={}", tx.transcript_id);
+            }
+            continue;
+        };
+        let Some(tx_exons) = exons_by_tx.get(tx.transcript_id.as_str()) else {
+            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
+                eprintln!("DEBUG_HYDRATE_TX skip=missing_exons tx={}", tx.transcript_id);
+            }
+            continue;
+        };
+        if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
+            eprintln!(
+                "DEBUG_HYDRATE_TX exons tx={} count={}",
+                tx.transcript_id,
+                tx_exons.len(),
+            );
+        }
+        let mut genomic_cds = String::new();
+        for exon in tx_exons {
+            let seg_start = exon.start.max(cds_start);
+            let seg_end = exon.end.min(cds_end);
+            if seg_start > seg_end {
+                continue;
+            }
+            let segment = read_reference_sequence(reader, chrom, seg_start, seg_end)?;
+            if segment.len() != usize::try_from(seg_end - seg_start + 1).unwrap_or_default() {
+                if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
+                    eprintln!(
+                        "DEBUG_HYDRATE_TX skip=invalid_segment tx={} exon={} seg_start={} seg_end={} segment_len={}",
+                        tx.transcript_id,
+                        exon.exon_number,
+                        seg_start,
+                        seg_end,
+                        segment.len()
+                    );
+                }
+                genomic_cds.clear();
+                break;
+            }
+            genomic_cds.push_str(&segment);
+        }
+        if genomic_cds.is_empty() {
+            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
+                eprintln!("DEBUG_HYDRATE_TX skip=empty_genomic_cds tx={}", tx.transcript_id);
+            }
+            continue;
+        }
+        let cds_sequence = if tx.strand >= 0 {
+            genomic_cds
+        } else {
+            reverse_complement_dna(&genomic_cds).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): failed to reverse-complement CDS for transcript {}",
+                    tx.transcript_id
+                ))
+            })?
+        };
+        if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
+            let base_idx = if tx.transcript_id == "NM_004442.7" { 1544 } else { 129 };
+            let base = cds_sequence
+                .as_bytes()
+                .get(base_idx)
+                .copied()
+                .map(char::from)
+                .unwrap_or('?');
+            eprintln!(
+                "DEBUG_HYDRATE_TX computed tx={} base_idx={} base={} len={}",
+                tx.transcript_id,
+                base_idx + 1,
+                base,
+                cds_sequence.len()
+            );
+        }
+        hydrated_by_tx.insert(tx.transcript_id.clone(), cds_sequence);
+    }
+
+    let mut hydrated_transcript_ids = HashSet::new();
+    for translation in translations.iter_mut() {
+        let Some(cds_sequence) = hydrated_by_tx.get(&translation.transcript_id) else {
+            continue;
+        };
+        translation.cds_sequence = Some(apply_cds_phase_padding(
+            translation.cds_sequence.as_deref(),
+            cds_sequence.clone(),
+        ));
+        hydrated_transcript_ids.insert(translation.transcript_id.clone());
+        if translation.transcript_id == "NM_004442.7" || translation.transcript_id == "XM_017001777.2" {
+            let seq = translation.cds_sequence.as_deref().unwrap_or("");
+            let base_idx = if translation.transcript_id == "NM_004442.7" { 1544 } else { 129 };
+            let base = seq
+                .as_bytes()
+                .get(base_idx)
+                .copied()
+                .map(char::from)
+                .unwrap_or('?');
+            eprintln!(
+                "DEBUG_HYDRATE_TX applied tx={} base_idx={} base={} len={}",
+                translation.transcript_id,
+                base_idx + 1,
+                base,
+                seq.len()
+            );
+        }
+    }
+
+    Ok(hydrated_transcript_ids)
+}
+
+fn apply_translateable_seq_overrides(
+    translations: &mut [TranslationFeature],
+    translateable_seq_by_tx: &HashMap<String, String>,
+    hydrated_transcript_ids: &HashSet<String>,
+) {
+    for translation in translations {
+        if hydrated_transcript_ids.contains(&translation.transcript_id) {
+            continue;
+        }
+        if let Some(seq) = translateable_seq_by_tx.get(&translation.transcript_id) {
+            if translation.transcript_id == "NM_004442.7" {
+                let base = seq.as_bytes().get(1544).copied().map(char::from).unwrap_or('?');
+                eprintln!(
+                    "DEBUG_OVERRIDE_NM_004442_7 base1545={} len={}",
+                    base,
+                    seq.len()
+                );
+            }
+            translation.cds_sequence = Some(seq.clone());
+        }
+    }
+}
+
+fn is_refseq_transcript_for_hydration(tx: &TranscriptFeature) -> bool {
+    tx.source
+        .as_deref()
+        .and_then(normalize_source_label)
+        .as_deref()
+        == Some("RefSeq")
+        || matches!(
+            tx.transcript_id.as_bytes().get(..2),
+            Some(b"NM") | Some(b"NR") | Some(b"XM") | Some(b"XR")
+        )
+}
+
+fn read_reference_sequence<R>(
+    reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
+    chrom: &str,
+    start: i64,
+    end: i64,
+) -> Result<String>
+where
+    R: BufRead + Seek,
+{
+    let region = Region::new(
+        chrom,
+        Position::try_from(usize::try_from(start).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "annotate_vep(): invalid FASTA start {start} for {chrom}:{start}-{end}: {e}"
+            ))
+        })?)
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "annotate_vep(): invalid FASTA start {start} for {chrom}:{start}-{end}: {e}"
+            ))
+        })?..=Position::try_from(usize::try_from(end).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "annotate_vep(): invalid FASTA end {end} for {chrom}:{start}-{end}: {e}"
+            ))
+        })?)
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "annotate_vep(): invalid FASTA end {end} for {chrom}:{start}-{end}: {e}"
+            ))
+        })?,
+    );
+    let record = reader.query(&region).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "annotate_vep(): failed querying FASTA for {chrom}:{start}-{end}: {e}"
+        ))
+    })?;
+    String::from_utf8(record.sequence().as_ref().to_vec()).map_err(|e| {
+        DataFusionError::Execution(format!(
+            "annotate_vep(): FASTA sequence for {chrom}:{start}-{end} is not valid UTF-8: {e}"
+        ))
+    })
+}
+
+fn collect_input_variant_intervals(
+    batches: &[RecordBatch],
+) -> Result<HashMap<String, Vec<(i64, i64)>>> {
+    let mut intervals_by_chrom: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+    for batch in batches {
+        let schema = batch.schema();
+        let chrom_idx = schema.index_of("chrom").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required chrom column".to_string(),
+            )
+        })?;
+        let start_idx = schema.index_of("start").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required start column".to_string(),
+            )
+        })?;
+        let end_idx = schema.index_of("end").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required end column".to_string(),
+            )
+        })?;
+        for row in 0..batch.num_rows() {
+            let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                continue;
+            };
+            intervals_by_chrom
+                .entry(chrom.strip_prefix("chr").unwrap_or(&chrom).to_string())
+                .or_default()
+                .push((start, end));
+        }
+    }
+
+    for intervals in intervals_by_chrom.values_mut() {
+        intervals.sort_unstable_by_key(|interval| interval.0);
+        let mut merged = Vec::with_capacity(intervals.len());
+        for (start, end) in intervals.drain(..) {
+            if let Some((_, last_end)) = merged.last_mut() {
+                if start <= *last_end {
+                    *last_end = (*last_end).max(end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
+        *intervals = merged;
+    }
+
+    Ok(intervals_by_chrom)
+}
+
+fn interval_overlaps_any(intervals: &[(i64, i64)], start: i64, end: i64) -> bool {
+    let idx = intervals.partition_point(|interval| interval.1 < start);
+    idx < intervals.len() && intervals[idx].0 <= end
+}
+
+fn translateable_seq_from_raw_object_json(raw_json: Option<&str>) -> Option<String> {
+    let raw_json = raw_json?;
+    let value: serde_json::Value = serde_json::from_str(raw_json).ok()?;
+    value
+        .get("__value")
+        .and_then(|v| v.get("translateable_seq"))
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Parse cached TranscriptMapper exon-to-cDNA pairs from serialized transcript
+/// `raw_object_json`.
+///
+/// Traceability:
+/// - Ensembl VEP `AnnotationSource::Database::Transcript::prefetch_transcript_data()`
+///   caches `mapper` on `_variation_effect_feature_cache`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L333-L352
+/// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
+///   resolves transcript positions through TranscriptMapper `genomic2cdna`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
+fn cdna_mapper_segments_from_raw_object_json(
+    raw_json: Option<&str>,
+) -> Vec<TranscriptCdnaMapperSegment> {
+    let raw_json = match raw_json {
+        Some(raw_json) => raw_json,
+        None => return Vec::new(),
+    };
+    let value: Value = match serde_json::from_str(raw_json) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let Some(pairs) = value
+        .get("__value")
+        .and_then(|inner| inner.get("_variation_effect_feature_cache"))
+        .and_then(|inner| inner.get("mapper"))
+        .map(mapper_inner_value)
+        .and_then(|inner| inner.get("exon_coord_mapper"))
+        .map(mapper_inner_value)
+        .and_then(|inner| inner.get("_pair_cdna"))
+        .and_then(|inner| inner.get("CDNA"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut segments = pairs
+        .iter()
+        .filter_map(cdna_mapper_segment_from_json)
+        .collect::<Vec<_>>();
+    segments.sort_unstable_by_key(|segment| {
+        (segment.genomic_start, segment.genomic_end, segment.cdna_start)
+    });
+    segments
+}
+
+fn mapper_inner_value(value: &Value) -> &Value {
+    value.get("__value").unwrap_or(value)
+}
+
+fn cdna_mapper_segment_from_json(pair: &Value) -> Option<TranscriptCdnaMapperSegment> {
+    let pair = mapper_inner_value(pair);
+    let from = pair.get("from").map(mapper_inner_value)?;
+    let to = pair.get("to").map(mapper_inner_value)?;
+    let genomic_start = to.get("start")?.as_i64()?;
+    let genomic_end = to.get("end")?.as_i64()?;
+    let cdna_start = usize::try_from(from.get("start")?.as_u64()?).ok()?;
+    let cdna_end = usize::try_from(from.get("end")?.as_u64()?).ok()?;
+    let ori = i8::try_from(pair.get("ori")?.as_i64()?).ok()?;
+    Some(TranscriptCdnaMapperSegment {
+        genomic_start,
+        genomic_end,
+        cdna_start,
+        cdna_end,
+        ori,
+    })
+}
+
+fn apply_cds_phase_padding(existing_cds: Option<&str>, mut hydrated_cds: String) -> String {
+    let leading_phase_padding = existing_cds
+        .map(|seq| seq.bytes().take_while(|&b| b == b'N' || b == b'n').count())
+        .unwrap_or(0);
+    if leading_phase_padding == 0 {
+        return hydrated_cds;
+    }
+    let mut padded = String::with_capacity(leading_phase_padding + hydrated_cds.len());
+    padded.extend(std::iter::repeat_n('N', leading_phase_padding));
+    padded.push_str(&hydrated_cds);
+    hydrated_cds.clear();
+    padded
+}
+
+fn reverse_complement_dna(seq: &str) -> Option<String> {
+    let mut out = String::with_capacity(seq.len());
+    for base in seq.as_bytes().iter().rev() {
+        let comp = match base.to_ascii_uppercase() {
+            b'A' => 'T',
+            b'C' => 'G',
+            b'G' => 'C',
+            b'T' => 'A',
+            b'N' => 'N',
+            _ => return None,
+        };
+        out.push(comp);
+    }
+    Some(out)
 }
 
 fn bool_at(array: &dyn Array, row: usize) -> Option<bool> {
@@ -3002,7 +3698,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_flags_str_returns_none_without_promoted_flags() {
+    fn test_resolve_flags_str_uses_raw_json_even_without_promoted_flags() {
         let raw = r#"{
             "__value": {
                 "attributes": [
@@ -3012,7 +3708,10 @@ mod tests {
             }
         }"#;
 
-        assert_eq!(resolve_flags_str(Some(raw), false, false), None);
+        assert_eq!(
+            resolve_flags_str(Some(raw), false, false),
+            Some("cds_end_NF&cds_start_NF".to_string())
+        );
     }
 
     #[test]
@@ -3069,6 +3768,229 @@ mod tests {
             flags_str_from_bools(false, true),
             Some("cds_end_NF".to_string())
         );
+    }
+
+    fn metadata_test_transcript(
+        transcript_id: &str,
+        gene_symbol: Option<&str>,
+        gene_hgnc_id: Option<&str>,
+    ) -> TranscriptFeature {
+        TranscriptFeature {
+            transcript_id: transcript_id.to_string(),
+            chrom: "1".to_string(),
+            start: 1,
+            end: 10,
+            strand: 1,
+            biotype: "protein_coding".to_string(),
+            cds_start: Some(1),
+            cds_end: Some(10),
+            cdna_coding_start: Some(1),
+            cdna_coding_end: Some(10),
+            cdna_mapper_segments: Vec::new(),
+            mature_mirna_regions: Vec::new(),
+            gene_stable_id: Some("ENSGTEST000001".to_string()),
+            gene_symbol: gene_symbol.map(ToString::to_string),
+            gene_symbol_source: Some("HGNC".to_string()),
+            gene_hgnc_id: gene_hgnc_id.map(ToString::to_string),
+            source: None,
+            version: None,
+            cds_start_nf: false,
+            cds_end_nf: false,
+            flags_str: None,
+            is_canonical: false,
+            tsl: None,
+            mane_select: None,
+            mane_plus_clinical: None,
+            translation_stable_id: None,
+            gene_phenotype: false,
+            ccds: None,
+            swissprot: None,
+            trembl: None,
+            uniparc: None,
+            uniprot_isoform: None,
+        }
+    }
+
+    #[test]
+    fn test_normalize_source_cache_prefers_upstream_source_cache() {
+        let raw = r#"{
+            "__value": {
+                "_source_cache": "RefSeq"
+            }
+        }"#;
+
+        assert_eq!(
+            normalize_source_cache(Some(raw), "ENST00000366540", Some("ensembl_havana")),
+            Some("RefSeq".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_source_cache_falls_back_to_transcript_prefix() {
+        assert_eq!(
+            normalize_source_cache(None, "NM_001206729.2", Some("BestRefSeq")),
+            Some("RefSeq".to_string())
+        );
+        assert_eq!(
+            normalize_source_cache(None, "ENST00000366540", Some("havana")),
+            Some("Ensembl".to_string())
+        );
+    }
+
+    #[test]
+    fn test_backfill_missing_hgnc_ids_prefers_exact_refseq_mapping() {
+        let mut transcripts = vec![
+            metadata_test_transcript("ENST00000366540", Some("AKT3"), Some("HGNC:393")),
+            metadata_test_transcript("NM_001206729.2", Some("AKT3"), None),
+        ];
+        let refseq_ids = vec![Some("NM_001206729.2".to_string()), None];
+
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids);
+
+        assert_eq!(transcripts[1].gene_hgnc_id.as_deref(), Some("HGNC:393"));
+    }
+
+    #[test]
+    fn test_backfill_missing_hgnc_ids_skips_refseq_mapping_when_symbols_differ() {
+        let mut transcripts = vec![
+            metadata_test_transcript("ENST00000377004", Some("CIROZ"), Some("HGNC:26730")),
+            metadata_test_transcript("NM_001170754.2", Some("C1orf127"), None),
+        ];
+        let refseq_ids = vec![Some("NM_001170754.2".to_string()), None];
+
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids);
+
+        assert_eq!(transcripts[1].gene_hgnc_id, None);
+    }
+
+    #[test]
+    fn test_backfill_missing_hgnc_ids_falls_back_to_unique_symbol() {
+        let mut transcripts = vec![
+            metadata_test_transcript("ENST00000372990", Some("RHBDL2"), Some("HGNC:16083")),
+            metadata_test_transcript("NM_017821.5", Some("RHBDL2"), None),
+        ];
+        let refseq_ids = vec![None, None];
+
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids);
+
+        assert_eq!(transcripts[1].gene_hgnc_id.as_deref(), Some("HGNC:16083"));
+    }
+
+    #[test]
+    fn test_backfill_missing_hgnc_ids_uses_symbol_fallback_when_refseq_link_is_cross_gene() {
+        let mut transcripts = vec![
+            metadata_test_transcript("ENST00000638160", Some("CHML"), Some("HGNC:1941")),
+            metadata_test_transcript("ENST00000399674", Some("OPN3"), Some("HGNC:14007")),
+            metadata_test_transcript("NM_001381855.1", Some("OPN3"), None),
+        ];
+        let refseq_ids = vec![Some("NM_001381855.1".to_string()), None, None];
+
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids);
+
+        assert_eq!(transcripts[2].gene_hgnc_id.as_deref(), Some("HGNC:14007"));
+    }
+
+    #[test]
+    fn test_is_refseq_transcript_for_hydration_accepts_best_refseq_and_refseq_ids() {
+        let mut by_source = metadata_test_transcript("ENST00000366540", Some("AKT3"), None);
+        by_source.source = Some("BestRefSeq".to_string());
+        assert!(is_refseq_transcript_for_hydration(&by_source));
+
+        let by_id = metadata_test_transcript("NM_001206729.2", Some("AKT3"), None);
+        assert!(is_refseq_transcript_for_hydration(&by_id));
+
+        let mut ensembl = metadata_test_transcript("ENST00000366540", Some("AKT3"), None);
+        ensembl.source = Some("havana".to_string());
+        assert!(!is_refseq_transcript_for_hydration(&ensembl));
+    }
+
+    #[test]
+    fn test_translateable_seq_from_raw_object_json_extracts_upstream_cds() {
+        let raw = r#"{
+            "__value": {
+                "translateable_seq": "ATGGCC"
+            }
+        }"#;
+
+        assert_eq!(
+            translateable_seq_from_raw_object_json(Some(raw)).as_deref(),
+            Some("ATGGCC")
+        );
+        assert_eq!(translateable_seq_from_raw_object_json(None), None);
+    }
+
+    #[test]
+    fn test_cdna_mapper_segments_from_raw_object_json_extracts_and_sorts_segments() {
+        let raw = r#"{
+            "__value": {
+                "_variation_effect_feature_cache": {
+                    "mapper": {
+                        "__value": {
+                            "exon_coord_mapper": {
+                                "__value": {
+                                    "_pair_cdna": {
+                                        "CDNA": [
+                                            {
+                                                "__value": {
+                                                    "ori": -1,
+                                                    "from": {"__value": {"start": 56, "end": 367}},
+                                                    "to": {"__value": {"start": 12895561, "end": 12895872}}
+                                                }
+                                            },
+                                            {
+                                                "__value": {
+                                                    "ori": -1,
+                                                    "from": {"__value": {"start": 1, "end": 55}},
+                                                    "to": {"__value": {"start": 12898216, "end": 12898270}}
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            cdna_mapper_segments_from_raw_object_json(Some(raw)),
+            vec![
+                TranscriptCdnaMapperSegment {
+                    genomic_start: 12895561,
+                    genomic_end: 12895872,
+                    cdna_start: 56,
+                    cdna_end: 367,
+                    ori: -1,
+                },
+                TranscriptCdnaMapperSegment {
+                    genomic_start: 12898216,
+                    genomic_end: 12898270,
+                    cdna_start: 1,
+                    cdna_end: 55,
+                    ori: -1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_apply_translateable_seq_overrides_replaces_translation_cds_sequence() {
+        let mut translations = vec![TranslationFeature {
+            transcript_id: "NM_TEST.1".to_string(),
+            cds_len: None,
+            protein_len: None,
+            translation_seq: None,
+            cds_sequence: Some("OLD".to_string()),
+            stable_id: None,
+            version: None,
+        }];
+        let overrides = HashMap::from([("NM_TEST.1".to_string(), "ATGGCC".to_string())]);
+
+        apply_translateable_seq_overrides(&mut translations, &overrides, &HashSet::new());
+
+        assert_eq!(translations[0].cds_sequence.as_deref(), Some("ATGGCC"));
     }
 
     #[test]
@@ -3637,6 +4559,18 @@ mod tests {
         let (_dir, fasta_path) = write_test_indexed_fasta("1", "NNNNNNNNNN");
         AnnotateProvider::validate_hgvs_reference_fasta(flags, Some(&fasta_path))
             .expect("indexed fasta should validate");
+    }
+
+    #[test]
+    fn test_apply_cds_phase_padding_preserves_existing_leading_ns() {
+        assert_eq!(
+            apply_cds_phase_padding(Some("NNATG"), "AAATTT".to_string()),
+            "NNAAATTT"
+        );
+        assert_eq!(
+            apply_cds_phase_padding(Some("atg"), "AAATTT".to_string()),
+            "AAATTT"
+        );
     }
 
     // =======================================================================
