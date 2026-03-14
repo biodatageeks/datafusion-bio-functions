@@ -80,6 +80,121 @@ Important caveat:
 - the current `74/74` result proves parity for the README benchmark profile, not full release-115 CLI flag parity
 - the current Rust path still behaves like a fixed-schema benchmark serializer in several places where VEP conditionally adds or removes columns based on flags
 
+## Reproducible Benchmark Commands
+
+Important harness behavior:
+
+- `annotate_vep_golden_bench` only skips Docker VEP when the expected golden VCF already exists inside the chosen `work_dir`.
+- For full `chr1` runs with `sample_limit=0`, the expected filename is:
+  - `HG002_chr1_0_vep115_golden.vcf`
+- So the reusable workflow is:
+  - create a dedicated `work_dir`
+  - copy the correct golden VCF into that directory with that exact filename
+  - run the benchmark with `--steps=datafusion`
+
+### 1. README chr1 benchmark against the saved default golden
+
+```bash
+mkdir -p /tmp/annotate_vep_default_compare_repo_golden
+cp \
+  /Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data/output/default/HG002_chr1_0_vep115_golden.vcf \
+  /tmp/annotate_vep_default_compare_repo_golden/HG002_chr1_0_vep115_golden.vcf
+
+cargo run --release -p datafusion-bio-function-vep --example annotate_vep_golden_bench -- \
+  /Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data/HG002_chr1.vcf.gz \
+  /Users/mwiewior/research/data/vep/115_GRCh38_variation_1.parquet \
+  parquet \
+  0 \
+  /Users/mwiewior/research/data/vep/homo_sapiens/115_GRCh38 \
+  /Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data/HG002_chr1.vcf.gz \
+  /tmp/annotate_vep_default_compare_repo_golden \
+  /Users/mwiewior/research/data/vep \
+  --steps=datafusion \
+  --extended-probes
+```
+
+Expected artifact paths:
+
+- `/tmp/annotate_vep_default_compare_repo_golden/HG002_chr1_0_comparison_report.txt`
+- `/tmp/annotate_vep_default_compare_repo_golden/HG002_chr1_0_discrepancies.txt`
+
+### 2. HGVS non-merged chr1 benchmark against the saved golden
+
+```bash
+mkdir -p /tmp/annotate_vep_hgvs_nonmerge_compare
+cp \
+  /Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data/output/hgvsc_nonmerge/HG002_chr1_0_vep115_golden.vcf \
+  /tmp/annotate_vep_hgvs_nonmerge_compare/HG002_chr1_0_vep115_golden.vcf
+
+cargo run --release -p datafusion-bio-function-vep --example annotate_vep_golden_bench -- \
+  --hgvs \
+  --extended-probes \
+  --reference-fasta-path=/tmp/ensembl_release115_official_fasta/Homo_sapiens.GRCh38.dna.toplevel.fa.gz \
+  /Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data/HG002_chr1.vcf.gz \
+  /Users/mwiewior/research/data/vep/115_GRCh38_variation_1.parquet \
+  parquet \
+  0 \
+  /Users/mwiewior/research/data/vep/homo_sapiens/115_GRCh38 \
+  /Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data/HG002_chr1.vcf.gz \
+  /tmp/annotate_vep_hgvs_nonmerge_compare \
+  /Users/mwiewior/research/data/vep \
+  --steps=datafusion
+```
+
+### 3. HGVS merged chr1 benchmark against the saved golden
+
+```bash
+mkdir -p /tmp/annotate_vep_hgvs_merged_compare
+cp \
+  /Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data/output/hgvsc_merged/HG002_chr1_0_vep115_golden.vcf \
+  /tmp/annotate_vep_hgvs_merged_compare/HG002_chr1_0_vep115_golden.vcf
+
+cargo run --release -p datafusion-bio-function-vep --example annotate_vep_golden_bench -- \
+  --merged \
+  --hgvs \
+  --extended-probes \
+  --reference-fasta-path=/tmp/ensembl_release115_official_fasta/Homo_sapiens.GRCh38.dna.toplevel.fa.gz \
+  /Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data/HG002_chr1.vcf.gz \
+  /Users/mwiewior/research/data/vep/115_GRCh38_variation_1.parquet \
+  parquet \
+  0 \
+  /Users/mwiewior/research/data/vep/homo_sapiens_merged/115_GRCh38 \
+  /Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data/HG002_chr1.vcf.gz \
+  /tmp/annotate_vep_hgvs_merged_compare \
+  /Users/mwiewior/research/data/vep \
+  --steps=datafusion
+```
+
+### 4. Fresh Docker VEP golden generation for a new work directory
+
+Only use this when intentionally regenerating the golden VCF.
+
+```bash
+cargo run --release -p datafusion-bio-function-vep --example annotate_vep_golden_bench -- \
+  --merged \
+  --hgvs \
+  --extended-probes \
+  --reference-fasta-path=/tmp/ensembl_release115_official_fasta/Homo_sapiens.GRCh38.dna.toplevel.fa.gz \
+  /Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data/HG002_chr1.vcf.gz \
+  /Users/mwiewior/research/data/vep/115_GRCh38_variation_1.parquet \
+  parquet \
+  0 \
+  /Users/mwiewior/research/data/vep/homo_sapiens_merged/115_GRCh38 \
+  /Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data/HG002_chr1.vcf.gz \
+  /tmp/annotate_vep_hgvs_merged_fresh \
+  /Users/mwiewior/research/data/vep \
+  --steps=ensembl,datafusion
+```
+
+### 5. Unit test commands used while iterating on HGVS parity
+
+```bash
+cargo test -p datafusion-bio-function-vep --lib format_hgvsc_
+cargo test -p datafusion-bio-function-vep --lib test_format_hgvsp_
+cargo test -p datafusion-bio-function-vep --lib
+cargo test --workspace --lib
+```
+
 ## Release 115 Flag-Parity Audit
 
 This section supersedes the earlier rough split between "flags with side effects" and "pure output flags". For Ensembl VEP release 115, the exact target is:

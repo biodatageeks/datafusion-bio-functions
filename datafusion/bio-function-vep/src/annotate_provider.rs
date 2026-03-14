@@ -1514,6 +1514,11 @@ impl AnnotateProvider {
                         .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                         .as_deref(),
                 );
+                let bam_edit_status =
+                    bam_edit_status_from_raw_object_json(raw_object_json.as_deref());
+                let has_non_polya_rna_edit =
+                    has_non_polya_rna_edit_from_raw_object_json(raw_object_json.as_deref());
+                let spliced_seq = spliced_seq_from_raw_object_json(raw_object_json.as_deref());
                 let version = version_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .and_then(|v| i32::try_from(v).ok());
@@ -1561,6 +1566,9 @@ impl AnnotateProvider {
                     gene_symbol_source,
                     gene_hgnc_id,
                     source,
+                    bam_edit_status,
+                    has_non_polya_rna_edit,
+                    spliced_seq,
                     version,
                     cds_start_nf,
                     cds_end_nf,
@@ -2047,12 +2055,6 @@ impl AnnotateProvider {
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_string_option(opts, "reference_fasta_path"));
-        eprintln!(
-            "DEBUG_HGVS_FLAGS any={} shift_hgvs={} reference_fasta_path={:?}",
-            hgvs_flags.any(),
-            hgvs_flags.shift_hgvs,
-            reference_fasta_path
-        );
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let mut hgvs_reference_reader = if hgvs_flags.any() && hgvs_flags.shift_hgvs {
             reference_fasta_path
@@ -2162,15 +2164,6 @@ impl AnnotateProvider {
                 } else {
                     Vec::new()
                 };
-                eprintln!(
-                    "DEBUG_CONTEXT_COUNTS transcripts={} exons={} translations={} translations_table={} has_tx_nm004442={} has_tl_nm004442={}",
-                    tx.len(),
-                    ex.len(),
-                    tl.len(),
-                    translations_table.unwrap_or("(none)"),
-                    tx.iter().any(|t| t.transcript_id == "NM_004442.7"),
-                    tl.iter().any(|t| t.transcript_id == "NM_004442.7")
-                );
                 let rg = if let Some(table) = regulatory_table {
                     self.load_regulatory_features(table, &vcf_chroms).await?
                 } else {
@@ -2204,12 +2197,6 @@ impl AnnotateProvider {
                     Vec::new(),
                 )
             };
-        eprintln!(
-            "DEBUG_HYDRATE_CALL reader_some={} transcripts={} translations={}",
-            hgvs_reference_reader.is_some(),
-            transcripts.len(),
-            translations.len()
-        );
         let hydrated_transcript_ids = if let Some(reader) = hgvs_reference_reader.as_mut() {
             hydrate_refseq_translation_cds_from_reference(
                 reader,
@@ -2979,26 +2966,10 @@ where
 
     let mut hydrated_by_tx: HashMap<String, String> = HashMap::new();
     for tx in transcripts {
-        if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
-            eprintln!(
-                "DEBUG_HYDRATE_TX precheck tx={} source={:?} chrom={} cds_start={:?} cds_end={:?}",
-                tx.transcript_id,
-                tx.source,
-                tx.chrom,
-                tx.cds_start,
-                tx.cds_end
-            );
-        }
         if !translation_ids.contains(tx.transcript_id.as_str()) {
-            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
-                eprintln!("DEBUG_HYDRATE_TX skip=missing_translation tx={}", tx.transcript_id);
-            }
             continue;
         }
         if !is_refseq_transcript_for_hydration(tx) {
-            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
-                eprintln!("DEBUG_HYDRATE_TX skip=not_refseq tx={}", tx.transcript_id);
-            }
             continue;
         }
         let chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
@@ -3007,30 +2978,14 @@ where
             .map(|intervals| interval_overlaps_any(intervals, tx.start, tx.end))
             .unwrap_or(false);
         if !overlaps_input {
-            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
-                eprintln!("DEBUG_HYDRATE_TX skip=no_input_overlap tx={}", tx.transcript_id);
-            }
             continue;
         }
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
-            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
-                eprintln!("DEBUG_HYDRATE_TX skip=missing_cds tx={}", tx.transcript_id);
-            }
             continue;
         };
         let Some(tx_exons) = exons_by_tx.get(tx.transcript_id.as_str()) else {
-            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
-                eprintln!("DEBUG_HYDRATE_TX skip=missing_exons tx={}", tx.transcript_id);
-            }
             continue;
         };
-        if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
-            eprintln!(
-                "DEBUG_HYDRATE_TX exons tx={} count={}",
-                tx.transcript_id,
-                tx_exons.len(),
-            );
-        }
         let mut genomic_cds = String::new();
         for exon in tx_exons {
             let seg_start = exon.start.max(cds_start);
@@ -3040,25 +2995,12 @@ where
             }
             let segment = read_reference_sequence(reader, chrom, seg_start, seg_end)?;
             if segment.len() != usize::try_from(seg_end - seg_start + 1).unwrap_or_default() {
-                if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
-                    eprintln!(
-                        "DEBUG_HYDRATE_TX skip=invalid_segment tx={} exon={} seg_start={} seg_end={} segment_len={}",
-                        tx.transcript_id,
-                        exon.exon_number,
-                        seg_start,
-                        seg_end,
-                        segment.len()
-                    );
-                }
                 genomic_cds.clear();
                 break;
             }
             genomic_cds.push_str(&segment);
         }
         if genomic_cds.is_empty() {
-            if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
-                eprintln!("DEBUG_HYDRATE_TX skip=empty_genomic_cds tx={}", tx.transcript_id);
-            }
             continue;
         }
         let cds_sequence = if tx.strand >= 0 {
@@ -3071,22 +3013,6 @@ where
                 ))
             })?
         };
-        if tx.transcript_id == "NM_004442.7" || tx.transcript_id == "XM_017001777.2" {
-            let base_idx = if tx.transcript_id == "NM_004442.7" { 1544 } else { 129 };
-            let base = cds_sequence
-                .as_bytes()
-                .get(base_idx)
-                .copied()
-                .map(char::from)
-                .unwrap_or('?');
-            eprintln!(
-                "DEBUG_HYDRATE_TX computed tx={} base_idx={} base={} len={}",
-                tx.transcript_id,
-                base_idx + 1,
-                base,
-                cds_sequence.len()
-            );
-        }
         hydrated_by_tx.insert(tx.transcript_id.clone(), cds_sequence);
     }
 
@@ -3100,23 +3026,6 @@ where
             cds_sequence.clone(),
         ));
         hydrated_transcript_ids.insert(translation.transcript_id.clone());
-        if translation.transcript_id == "NM_004442.7" || translation.transcript_id == "XM_017001777.2" {
-            let seq = translation.cds_sequence.as_deref().unwrap_or("");
-            let base_idx = if translation.transcript_id == "NM_004442.7" { 1544 } else { 129 };
-            let base = seq
-                .as_bytes()
-                .get(base_idx)
-                .copied()
-                .map(char::from)
-                .unwrap_or('?');
-            eprintln!(
-                "DEBUG_HYDRATE_TX applied tx={} base_idx={} base={} len={}",
-                translation.transcript_id,
-                base_idx + 1,
-                base,
-                seq.len()
-            );
-        }
     }
 
     Ok(hydrated_transcript_ids)
@@ -3132,14 +3041,6 @@ fn apply_translateable_seq_overrides(
             continue;
         }
         if let Some(seq) = translateable_seq_by_tx.get(&translation.transcript_id) {
-            if translation.transcript_id == "NM_004442.7" {
-                let base = seq.as_bytes().get(1544).copied().map(char::from).unwrap_or('?');
-                eprintln!(
-                    "DEBUG_OVERRIDE_NM_004442_7 base1545={} len={}",
-                    base,
-                    seq.len()
-                );
-            }
             translation.cds_sequence = Some(seq.clone());
         }
     }
@@ -3269,6 +3170,98 @@ fn translateable_seq_from_raw_object_json(raw_json: Option<&str>) -> Option<Stri
         .and_then(|v| v.get("translateable_seq"))
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Traceability:
+/// - Ensembl VEP `AnnotationType::Transcript::edit_transcript()` records
+///   transcript edit status on `_bam_edit_status`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L581-L601
+fn bam_edit_status_from_raw_object_json(raw_json: Option<&str>) -> Option<String> {
+    let raw_json = raw_json?;
+    let value: Value = serde_json::from_str(raw_json).ok()?;
+    value
+        .get("__value")
+        .and_then(|inner| inner.get("_bam_edit_status"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_return_3prime()` only
+///   enables transcript-side RefSeq HGVS shifting when non-polyA `_rna_edit*`
+///   attributes exist on the transcript
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L149-L182
+/// - Ensembl Variation `TranscriptVariationAllele::is_polyA()` excludes tail
+///   artifacts from that HGVS-shift gate
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1492-L1504
+fn has_non_polya_rna_edit_from_raw_object_json(raw_json: Option<&str>) -> bool {
+    let Some(raw_json) = raw_json else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(raw_json) else {
+        return false;
+    };
+    let Some(inner) = value.get("__value").and_then(Value::as_object) else {
+        return false;
+    };
+    let transcript_len = inner
+        .get("_variation_effect_feature_cache")
+        .map(mapper_inner_value)
+        .and_then(|cache| cache.get("spliced_seq"))
+        .and_then(Value::as_str)
+        .map(str::len);
+
+    inner
+        .get("attributes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|attr| attr.get("__value").and_then(Value::as_object))
+        .filter(|attr| {
+            attr.get("code")
+                .and_then(Value::as_str)
+                .is_some_and(|code| code.starts_with("_rna_edit"))
+        })
+        .any(|attr| !rna_edit_attribute_is_polya(attr, transcript_len))
+}
+
+fn rna_edit_attribute_is_polya(
+    attr: &serde_json::Map<String, serde_json::Value>,
+    transcript_len: Option<usize>,
+) -> bool {
+    let Some(transcript_len) = transcript_len else {
+        return false;
+    };
+    let Some(value) = attr.get("value").and_then(Value::as_str) else {
+        return false;
+    };
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let Some(start) = parts[0].parse::<usize>().ok() else {
+        return false;
+    };
+    transcript_len <= 1usize.saturating_add(parts[2].len()).saturating_add(start)
+}
+
+/// Traceability:
+/// - Ensembl VEP `AnnotationType::Transcript::edit_transcript()` caches the
+///   edited transcript sequence on `_variation_effect_feature_cache.spliced_seq`
+///   for downstream HGVS generation
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L596-L597
+fn spliced_seq_from_raw_object_json(raw_json: Option<&str>) -> Option<String> {
+    let raw_json = raw_json?;
+    let value: Value = serde_json::from_str(raw_json).ok()?;
+    value
+        .get("__value")
+        .and_then(|inner| inner.get("_variation_effect_feature_cache"))
+        .map(mapper_inner_value)
+        .and_then(|inner| inner.get("spliced_seq"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
         .map(ToString::to_string)
 }
 
@@ -3793,6 +3786,9 @@ mod tests {
             gene_symbol_source: Some("HGNC".to_string()),
             gene_hgnc_id: gene_hgnc_id.map(ToString::to_string),
             source: None,
+            bam_edit_status: None,
+            has_non_polya_rna_edit: false,
+            spliced_seq: None,
             version: None,
             cds_start_nf: false,
             cds_end_nf: false,
@@ -3917,6 +3913,66 @@ mod tests {
             Some("ATGGCC")
         );
         assert_eq!(translateable_seq_from_raw_object_json(None), None);
+    }
+
+    #[test]
+    fn test_bam_edit_status_from_raw_object_json_extracts_status() {
+        let raw = r#"{
+            "__value": {
+                "_bam_edit_status": "ok"
+            }
+        }"#;
+        assert_eq!(
+            bam_edit_status_from_raw_object_json(Some(raw)).as_deref(),
+            Some("ok")
+        );
+        assert_eq!(bam_edit_status_from_raw_object_json(None), None);
+    }
+
+    #[test]
+    fn test_has_non_polya_rna_edit_from_raw_object_json_skips_poly_a_tail() {
+        let raw = r#"{
+            "__value": {
+                "attributes": [
+                    {"__value": {"code": "_rna_edit", "value": "2364 2363 AAAAAAAA"}}
+                ],
+                "_variation_effect_feature_cache": {
+                    "spliced_seq": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                }
+            }
+        }"#;
+        assert!(!has_non_polya_rna_edit_from_raw_object_json(Some(raw)));
+    }
+
+    #[test]
+    fn test_has_non_polya_rna_edit_from_raw_object_json_detects_real_edit() {
+        let raw = r#"{
+            "__value": {
+                "attributes": [
+                    {"__value": {"code": "_rna_edit", "value": "12 13 CG"}}
+                ],
+                "_variation_effect_feature_cache": {
+                    "spliced_seq": "ACGTACGTACGTACGTACGT"
+                }
+            }
+        }"#;
+        assert!(has_non_polya_rna_edit_from_raw_object_json(Some(raw)));
+    }
+
+    #[test]
+    fn test_spliced_seq_from_raw_object_json_extracts_edited_transcript_sequence() {
+        let raw = r#"{
+            "__value": {
+                "_variation_effect_feature_cache": {
+                    "spliced_seq": "ACGTACGT"
+                }
+            }
+        }"#;
+        assert_eq!(
+            spliced_seq_from_raw_object_json(Some(raw)).as_deref(),
+            Some("ACGTACGT")
+        );
+        assert_eq!(spliced_seq_from_raw_object_json(None), None);
     }
 
     #[test]

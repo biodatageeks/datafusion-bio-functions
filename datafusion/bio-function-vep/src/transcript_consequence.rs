@@ -139,6 +139,14 @@ pub struct TranscriptFeature {
     pub gene_symbol_source: Option<String>,
     pub gene_hgnc_id: Option<String>,
     pub source: Option<String>,
+    /// RefSeq transcript edit status used by Ensembl when deciding whether
+    /// transcript-level HGVS shifting must use edited transcript sequence.
+    pub bam_edit_status: Option<String>,
+    /// True when Ensembl would treat transcript attributes as real RNA-edit
+    /// annotations for HGVS shifting after excluding poly-A tail artifacts.
+    pub has_non_polya_rna_edit: bool,
+    /// Edited transcript sequence cached on `_variation_effect_feature_cache`.
+    pub spliced_seq: Option<String>,
     /// Transcript version number (e.g. 6 for ENST00000379410.6).
     pub version: Option<i32>,
     /// CDS start not found (incomplete 5' end).
@@ -607,7 +615,14 @@ impl TranscriptConsequenceEngine {
                                     .as_deref()
                                     .and_then(pep_allele_string_from_codon_allele_string)
                                     .or_else(|| cc.amino_acids.clone());
-                                let protein_hgvs = cc.protein_hgvs.clone();
+                                let protein_hgvs = protein_hgvs_for_output(
+                                    tx,
+                                    &tx_exons,
+                                    tx_translation,
+                                    variant,
+                                    cc.protein_hgvs.as_ref(),
+                                    self.shift_hgvs,
+                                );
                                 (cds_pos, prot_pos, amino_acids, codons, protein_hgvs)
                             } else {
                                 (None, None, None, None, None)
@@ -618,6 +633,7 @@ impl TranscriptConsequenceEngine {
                             tx,
                             &tx_exons,
                             cdna_position.as_deref(),
+                            cds_position.as_deref(),
                             &variant.ref_allele,
                             &variant.alt_allele,
                             variant.start,
@@ -2494,6 +2510,55 @@ fn build_protein_hgvs_data(
     })
 }
 
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
+///   applies `_return_3prime()` before checking coding coordinates, so protein
+///   HGVS is derived from the HGVS-shifted indel state rather than the
+///   original unshifted consequence state
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1626-L1749
+fn protein_hgvs_for_output(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+    fallback: Option<&crate::hgvs::ProteinHgvsData>,
+    shift_hgvs: bool,
+) -> Option<crate::hgvs::ProteinHgvsData> {
+    if !shift_hgvs {
+        return fallback.cloned();
+    }
+
+    let Some(shift) = variant.hgvs_shift_for_strand(tx.strand) else {
+        return fallback.cloned();
+    };
+    let is_insertion = variant.ref_allele == "-" && variant.alt_allele != "-";
+    let is_deletion = variant.alt_allele == "-" && variant.ref_allele != "-";
+    if !(is_insertion || is_deletion) {
+        return fallback.cloned();
+    }
+
+    let shifted_variant = VariantInput {
+        chrom: variant.chrom.clone(),
+        start: shift.display_start(),
+        end: shift.display_end(),
+        ref_allele: if is_insertion {
+            "-".to_string()
+        } else {
+            shift.shifted_allele_string.clone()
+        },
+        alt_allele: if is_insertion {
+            shift.shifted_output_allele.clone()
+        } else {
+            "-".to_string()
+        },
+        hgvs_shift_forward: None,
+        hgvs_shift_reverse: None,
+    };
+
+    classify_coding_change(tx, tx_exons, tx_translation, &shifted_variant)
+        .and_then(|class| class.protein_hgvs)
+}
+
 fn apply_codon_classification(terms: &mut BTreeSet<SoTerm>, c: &CodingClassification) {
     if c.start_lost {
         terms.insert(SoTerm::StartLost);
@@ -2528,18 +2593,6 @@ fn classify_coding_change(
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
 ) -> Option<CodingClassification> {
-    let xm_debug = variant.start == 151002632
-        && variant.end == 151002632
-        && matches!(
-            tx.transcript_id.as_str(),
-            "XM_017001777.2"
-                | "XM_047425125.1"
-                | "XM_047425126.1"
-                | "XM_047425128.1"
-                | "XM_047425133.1"
-                | "XM_047425134.1"
-                | "XM_047425135.1"
-        );
     let translation = tx_translation?;
     let cds_seq = translation.cds_sequence.as_deref()?.to_ascii_uppercase();
     let ref_genomic = normalize_allele_seq(&variant.ref_allele);
@@ -2574,27 +2627,11 @@ fn classify_coding_change(
         .windows(2)
         .any(|w| w[1] != w[0].saturating_add(1))
     {
-        if xm_debug {
-            eprintln!(
-                "DEBUG_XM_151002632 skip=noncontiguous tx={} cds_indices={:?}",
-                tx.transcript_id,
-                cds_indices
-            );
-        }
         return None;
     }
     let start_idx = *cds_indices.first()?;
     let end_idx = *cds_indices.last()?;
     if end_idx >= cds_seq.len() {
-        if xm_debug {
-            eprintln!(
-                "DEBUG_XM_151002632 skip=out_of_bounds tx={} start_idx={} end_idx={} cds_len={}",
-                tx.transcript_id,
-                start_idx,
-                end_idx,
-                cds_seq.len()
-            );
-        }
         return None;
     }
 
@@ -2610,34 +2647,7 @@ fn classify_coding_change(
     };
 
     let ref_seq_slice = &cds_seq[start_idx..=end_idx];
-    if tx.transcript_id == "NM_004442.7" && variant.start == 22893000 && variant.end == 22893000 {
-        eprintln!(
-            "DEBUG_NM_004442_7 start_idx={} end_idx={} ref_seq_slice={} ref_tx={} cds_pos={} window={}",
-            start_idx,
-            end_idx,
-            ref_seq_slice,
-            ref_tx,
-            start_idx + 1,
-            &cds_seq[start_idx.saturating_sub(3)..=(end_idx + 3).min(cds_seq.len().saturating_sub(1))]
-        );
-    }
-    if xm_debug {
-        eprintln!(
-            "DEBUG_XM_151002632 compare tx={} start_idx={} end_idx={} ref_seq_slice={} ref_tx={} alt_tx={} cds_pos={} window={}",
-            tx.transcript_id,
-            start_idx,
-            end_idx,
-            ref_seq_slice,
-            ref_tx,
-            alt_tx,
-            start_idx + 1,
-            &cds_seq[start_idx.saturating_sub(3)..=(end_idx + 3).min(cds_seq.len().saturating_sub(1))]
-        );
-    }
     if ref_seq_slice != ref_tx {
-        if xm_debug {
-            eprintln!("DEBUG_XM_151002632 skip=ref_mismatch tx={}", tx.transcript_id);
-        }
         return None;
     }
 
@@ -2745,21 +2755,6 @@ fn classify_coding_change(
         } else if !aa_changed && !class.stop_retained && !class.start_retained {
             class.synonymous = true;
         }
-    }
-
-    if xm_debug {
-        eprintln!(
-            "DEBUG_XM_151002632 class tx={} synonymous={} missense={} stop_gained={} stop_lost={} start_lost={} start_retained={} aa={:?} codons={:?}",
-            tx.transcript_id,
-            class.synonymous,
-            class.missense,
-            class.stop_gained,
-            class.stop_lost,
-            class.start_lost,
-            class.start_retained,
-            class.amino_acids,
-            class.codons
-        );
     }
 
     // Populate CSQ metadata fields from the computed data.
@@ -3604,6 +3599,68 @@ pub(crate) fn raw_cdna_position_from_genomic(
     cdna_position
 }
 
+/// Resolve the unshifted transcript-sequence cDNA bounds Ensembl uses when
+/// generating HGVS 3' shifts for transcript alleles.
+///
+/// Traceability:
+/// - Ensembl Variation `BaseTranscriptVariation::cdna_coords()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L478-L492
+/// - Ensembl Variation `BaseTranscriptVariation::cdna_start_unshifted()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L194-L208
+/// - Ensembl Variation `BaseTranscriptVariation::cdna_end_unshifted()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L225-L233
+pub(crate) fn unshifted_cdna_bounds_for_hgvs_shift(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant_start: i64,
+    variant_end: i64,
+    ref_allele: &str,
+    alt_allele: &str,
+) -> Option<(usize, usize)> {
+    let coords = transcript_cdna_coords(tx, tx_exons)?;
+
+    if ref_allele == "-" && alt_allele != "-" {
+        let left = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant_start.saturating_sub(1));
+        let right = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant_start);
+        return match (left, right) {
+            (Some(left), Some(right)) => Some((left.min(right), left.max(right))),
+            (None, Some(right)) => {
+                let other = if tx.strand >= 0 {
+                    right.saturating_sub(1)
+                } else {
+                    right.saturating_add(1)
+                };
+                Some((other.min(right), other.max(right)))
+            }
+            (Some(left), None) => {
+                let other = if tx.strand >= 0 {
+                    left.saturating_add(1)
+                } else {
+                    left.saturating_sub(1)
+                };
+                Some((left.min(other), left.max(other)))
+            }
+            (None, None) => {
+                let prev_segment = coords.iter().take_while(|segment| segment.end < variant_start).last()?;
+                let next_segment = coords.iter().find(|segment| segment.start > variant_start)?;
+                if tx.strand >= 0 {
+                    Some((prev_segment.cdna_end, next_segment.cdna_start))
+                } else {
+                    Some((next_segment.cdna_end, prev_segment.cdna_start))
+                }
+            }
+        };
+    }
+
+    if ref_allele != "-" && alt_allele == "-" {
+        let start = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant_start)?;
+        let end = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant_end)?;
+        return Some((start.min(end), start.max(end)));
+    }
+
+    None
+}
+
 /// Compute the cDNA_position string for a variant overlapping an exon.
 ///
 /// Traceability:
@@ -4120,6 +4177,9 @@ mod tests {
             gene_symbol_source: None,
             gene_hgnc_id: None,
             source: None,
+            bam_edit_status: None,
+            has_non_polya_rna_edit: false,
+            spliced_seq: None,
             version: None,
             cds_start_nf: false,
             cds_end_nf: false,
@@ -6556,6 +6616,49 @@ mod tests {
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("1", 41383346, 41383346, "C", "T");
         assert_eq!(compute_cdna_position(&v, &t, &refs), Some("2842".to_string()));
+    }
+
+    #[test]
+    fn unshifted_cdna_bounds_for_hgvs_shift_handles_intronic_insertions() {
+        let t = tx(
+            "NM_TEST.1",
+            "1",
+            90,
+            119,
+            1,
+            "protein_coding",
+            Some(95),
+            Some(118),
+        );
+        let exons = vec![exon("NM_TEST.1", 1, 90, 99), exon("NM_TEST.1", 2, 110, 119)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        assert_eq!(
+            unshifted_cdna_bounds_for_hgvs_shift(&t, &refs, 104, 104, "-", "GAA"),
+            Some((10, 11))
+        );
+    }
+
+    #[test]
+    fn unshifted_cdna_bounds_for_hgvs_shift_handles_intronic_insertions_on_negative_strand() {
+        let t = tx(
+            "NM_TEST_NEG.1",
+            "1",
+            90,
+            119,
+            -1,
+            "protein_coding",
+            Some(95),
+            Some(118),
+        );
+        let exons = vec![
+            exon("NM_TEST_NEG.1", 1, 90, 99),
+            exon("NM_TEST_NEG.1", 2, 110, 119),
+        ];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        assert_eq!(
+            unshifted_cdna_bounds_for_hgvs_shift(&t, &refs, 104, 104, "-", "GAA"),
+            Some((10, 11))
+        );
     }
 
     // ---- FLAGS field from transcript attributes ----
