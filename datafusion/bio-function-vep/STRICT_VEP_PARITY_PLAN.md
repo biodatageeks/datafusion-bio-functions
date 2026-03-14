@@ -1248,6 +1248,53 @@ Status on March 13, 2026:
 - After Phase 5:
   - the implementation can be compared against Ensembl VEP under multiple flag profiles rather than only the fixed README profile
 
+## Phase 4 HGVS Parity Status (updated March 14, 2026)
+
+Benchmark: chr1 merged, 4,737,090 CSQ entries, `--hgvs --shift_hgvs 1 --fasta`.
+72/74 fields at zero mismatches. Only HGVSc (106) and HGVSp (125) remain.
+
+### Progression
+
+| Run | HGVSc mismatches | HGVSp mismatches | Total |
+|-----|-----------------|-----------------|-------|
+| mapper_fix (earliest) | 16,215 | 114 | 16,329 |
+| resample | 5,636 | 114 | 5,750 |
+| resume1 | 584 | 114 | 698 |
+| resume2 | 860 | 114 | 974 |
+| **Current** | **106** | **125** | **231** |
+
+### Fixes applied
+
+1. **Genomic shift `seq_strand=1`** — VEP `_genomic_shift()` always passes `seq_strand=1` to `perform_shift()`. We were passing the transcript strand, causing `hgvs_reverse=true` for reverse-strand transcripts and wrong allele rotation.
+   - [TranscriptVariationAllele.pm#L431](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L431)
+2. **3' UTR extension for stop-loss/frameshift** — VEP `_get_alternate_cds()` appends `_three_prime_utr()` before translating so `_stop_loss_extra_AA()` can find the new stop codon in the UTR.
+   - [TranscriptVariationAllele.pm#L2335-L2372](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2335-L2372)
+   - [TranscriptVariationAllele.pm#L2406-L2461](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2406-L2461)
+3. **Protein dup before shift** — VEP `hgvs_protein()` calls `_check_for_peptide_duplication()` BEFORE `_shift_3prime()`. We had the order reversed.
+   - [TranscriptVariationAllele.pm#L1700-L1758](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1758)
+4. **Transcript-level shift via `perform_shift`** — VEP `_return_3prime()` calls `perform_shift()` with `hgvs_reverse` flag for edited RefSeq transcripts. We were using simple `rotate_left`/`rotate_right`.
+   - [TranscriptVariationAllele.pm#L237-L243](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L237-L243)
+   - [TranscriptVariationAllele.pm#L291-L351](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351)
+
+### Remaining HGVSc root causes (106 mismatches)
+
+| Class | ~Count | Root Cause | VEP Reference |
+|-------|--------|------------|---------------|
+| Insertion allele rotation (edited RefSeq) | ~60 | `edited_transcript_shifted_output_allele` produces different rotation than VEP `_return_3prime()` for the transcript-level shift — the pre/post sequence extraction from `spliced_seq` uses `(min, max)` bounds while VEP uses `(cdna_end_unshifted, cdna_start_unshifted)` with swapped semantics for insertions | [TranscriptVariationAllele.pm#L228-L237](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L228-L237) |
+| Intronic dup vs ins | ~20 | `apply_shifted_insertion_duplication()` context comparison fails — 5'/3' flanking sequence from genomic shift doesn't match the feature-strand allele for some intronic repeats | [TranscriptVariationAllele.pm#L1395-L1407](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1395-L1407) |
+| Intronic cDNA off-by-1 (NM_001134939, NM_001301371, NM_016178) | ~20 | `cdna_mapper_segments` for these 3 RefSeq transcripts map to a cDNA position 1 lower than VEP's `TranscriptMapper`. Likely a segment boundary or phase-offset difference | [BaseTranscriptVariation.pm#L467-L499](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499) |
+| Spurious HGVSc (chr1:228006919) | ~5 | We emit `c.-199_-190del` where VEP emits empty — missing gating condition that suppresses HGVS for variants outside the mapped transcript region | — |
+
+### Remaining HGVSp root causes (125 mismatches)
+
+| Class | ~Count | Root Cause | VEP Reference |
+|-------|--------|------------|---------------|
+| Protein dup not detected | ~100 | For codon-boundary insertions (`amino_acids = "-/X"`), VEP's `hgvs_protein()` uses `translation_start()` which returns a position 1 higher than our `protein_position_start = codon_at + 1`. This off-by-1 causes `_check_for_peptide_duplication()` to look at the wrong upstream char. VEP uses `genomic2pep()` mapper; we use `cds_idx / 3` | [TranscriptVariationAllele.pm#L1680-L1682](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1680-L1682), [BaseTranscriptVariation.pm#L467-L499](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499), [TranscriptVariationAllele.pm#L2371-L2410](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2410) |
+| Protein dup off-by-1 | ~5 | Same root cause as above — dup IS detected but the resulting position is 1 lower than VEP | [TranscriptVariationAllele.pm#L2371-L2410](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2410) |
+| fsTer? (XM_ transcripts at chr1:15112994) | ~7 | These predicted RefSeq transcripts lack `spliced_seq` in our cache, so `three_prime_utr_seq()` returns `None` and the alt translation can't find the new stop. VEP's `_three_prime_utr()` derives UTR from the transcript object's exon sequences, which is always available | [TranscriptVariationAllele.pm#L2412-L2418](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2412-L2418) |
+| extTer spurious (chr1:161589597, chr1:247756207) | ~3 | We compute `extTer267`/`extTer76` where VEP returns `extTer?` — our UTR-extended translation finds a spurious in-frame stop that VEP doesn't see, likely because VEP's `_three_prime_utr()` returns a different (shorter) UTR or the `_get_alternate_cds` trims incomplete codons differently | [TranscriptVariationAllele.pm#L2335-L2372](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2335-L2372) |
+| Insertion flanking off-by-1 (chr1:248638949) | ~5 | `surrounding_peptides()` returns the wrong flanking pair — `Tyr104_Leu105` instead of VEP's `Phe103_Tyr104`. Same codon-boundary insertion protein position off-by-1 as the dup issue | [TranscriptVariationAllele.pm#L2297-L2320](https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2297-L2320) |
+
 ## Non-Goals
 
 - optimizing runtime before semantic parity is reached
