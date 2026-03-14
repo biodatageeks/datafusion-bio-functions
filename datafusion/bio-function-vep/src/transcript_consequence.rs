@@ -2509,10 +2509,15 @@ fn build_protein_hgvs_data(
         },
         None => (String::new(), String::new()),
     };
-    // For codon-boundary insertions (ref = "-"), VEP's translation_start()
-    // returns the codon after the boundary. Use `end` as HGVS start to match.
+    // Traceability:
+    // - VEP's hgvs_protein() uses translation_start() which returns the
+    //   FIRST coordinate from genomic2pep. For insertions, genomic2pep
+    //   maps seq_region_start (POS+1) first, giving the HIGHER protein
+    //   position. _get_hgvs_peptides uses min(start,end) for flanking.
+    //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1680-L1682
     let (start, end) = if ref_peptide == "-" && raw_start != raw_end {
-        (raw_end, raw_end)
+        // Boundary insertion: HGVS start = higher position (from POS+1 mapping).
+        (raw_end, raw_start)
     } else {
         (raw_start, raw_end)
     };
@@ -3027,18 +3032,27 @@ fn classify_insertion(
     class.cds_position_start = Some(cds_idx + 1);
     class.cds_position_end = Some(cds_idx + 2);
 
-    // Protein position: VEP uses the codon containing the insertion point.
-    // For inframe insertions at codon boundaries, VEP shows a range spanning
-    // the codons on either side of the boundary.
+    // Protein position: VEP maps BOTH flanking bases of the insertion via
+    // genomic2pep, which converts each CDS position independently through
+    // int((cds_1based + 2) / 3). When the two sides map to different protein
+    // positions, the insertion is at a codon boundary.
+    // https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L477-L478
     let codon_at = cds_idx / 3;
-    let ins_at_boundary = ins_point % 3 == 0;
+    let hgvs_cds_a = genomic_to_cds_index(tx, tx_exons, variant.start)
+        .map(|i| i + leading_n_offset + 1); // 1-based
+    let hgvs_cds_b = genomic_to_cds_index(tx, tx_exons, variant.start.saturating_sub(1))
+        .map(|i| i + leading_n_offset + 1); // 1-based
+    let (pep_a, pep_b) = match (hgvs_cds_a, hgvs_cds_b) {
+        (Some(a), Some(b)) => ((a + 2) / 3, (b + 2) / 3),
+        _ => (codon_at + 1, codon_at + 1),
+    };
+    let ins_at_boundary = pep_a != pep_b;
     if ins_at_boundary {
-        // Insertion at codon boundary: VEP shows the flanking codons.
-        class.protein_position_start = Some(codon_at + 1);
-        class.protein_position_end = Some(codon_at + 2);
+        class.protein_position_start = Some(pep_a.min(pep_b));
+        class.protein_position_end = Some(pep_a.max(pep_b));
     } else {
-        class.protein_position_start = Some(codon_at + 1);
-        class.protein_position_end = Some(codon_at + 1);
+        class.protein_position_start = Some(pep_a);
+        class.protein_position_end = Some(pep_a);
     }
 
     // Start codon check
