@@ -239,32 +239,32 @@ impl TableFunctionImpl for NearestTableFunction {
         let mut k = 1usize;
         let mut include_overlaps = true;
 
-        if let Some(arg) = args.get(arg_idx) {
-            if matches!(
+        if let Some(arg) = args.get(arg_idx)
+            && matches!(
                 arg,
                 Expr::Literal(ScalarValue::Int64(Some(_)), _)
                     | Expr::Literal(ScalarValue::Int32(Some(_)), _)
                     | Expr::Literal(ScalarValue::UInt64(Some(_)), _)
                     | Expr::Literal(ScalarValue::UInt32(Some(_)), _)
-            ) {
-                k = extract_usize_arg(arg, "k", self.name)?;
-                arg_idx += 1;
-            }
+            )
+        {
+            k = extract_usize_arg(arg, "k", self.name)?;
+            arg_idx += 1;
         }
 
-        if let Some(arg) = args.get(arg_idx) {
-            if matches!(arg, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) {
-                include_overlaps = extract_bool_arg(arg, "overlap", self.name)?;
-                arg_idx += 1;
-            }
+        if let Some(arg) = args.get(arg_idx)
+            && matches!(arg, Expr::Literal(ScalarValue::Boolean(Some(_)), _))
+        {
+            include_overlaps = extract_bool_arg(arg, "overlap", self.name)?;
+            arg_idx += 1;
         }
 
         let mut compute_distance = true;
-        if let Some(arg) = args.get(arg_idx) {
-            if matches!(arg, Expr::Literal(ScalarValue::Boolean(Some(_)), _)) {
-                compute_distance = extract_bool_arg(arg, "compute_distance", self.name)?;
-                arg_idx += 1;
-            }
+        if let Some(arg) = args.get(arg_idx)
+            && matches!(arg, Expr::Literal(ScalarValue::Boolean(Some(_)), _))
+        {
+            compute_distance = extract_bool_arg(arg, "compute_distance", self.name)?;
+            arg_idx += 1;
         }
 
         let (cols_left, cols_right, filter_op) = parse_col_args_extra(&args[arg_idx..], self.name)?;

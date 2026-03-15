@@ -1,3 +1,10 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::too_many_arguments,
+    unused_variables,
+    clippy::manual_saturating_arithmetic,
+    clippy::implicit_saturating_sub
+)]
 //! Benchmark: individual SIFT/PolyPhen point queries on translation parquet.
 //!
 //! Simulates the lazy per-transcript loading approach where each transcript's

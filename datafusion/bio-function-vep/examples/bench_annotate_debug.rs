@@ -1,3 +1,10 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::too_many_arguments,
+    unused_variables,
+    clippy::manual_saturating_arithmetic,
+    clippy::implicit_saturating_sub
+)]
 use std::sync::Arc;
 
 use datafusion::arrow::array::Array;

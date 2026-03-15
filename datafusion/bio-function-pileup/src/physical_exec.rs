@@ -291,11 +291,9 @@ async fn accumulate_partition(
                 DenseMode::Disable => false,
             };
 
-            if use_dense {
-                if let Some(lengths) = events::extract_contig_lengths(&batch.schema()) {
-                    contig_lengths = lengths;
-                    is_dense = true;
-                }
+            if use_dense && let Some(lengths) = events::extract_contig_lengths(&batch.schema()) {
+                contig_lengths = lengths;
+                is_dense = true;
             }
 
             if config.per_base && !is_dense {
@@ -417,12 +415,11 @@ fn merge_dense_results(
     } else {
         let mut pending_batches = VecDeque::new();
         for contig in &contigs {
-            if let Some(depth) = merged_depths.get(contig) {
-                if let Ok(batches) =
+            if let Some(depth) = merged_depths.get(contig)
+                && let Ok(batches) =
                     coverage::dense_depth_to_record_batches(contig, depth, schema, batch_size)
-                {
-                    pending_batches.extend(batches);
-                }
+            {
+                pending_batches.extend(batches);
             }
         }
         StreamPhase::Emitting {

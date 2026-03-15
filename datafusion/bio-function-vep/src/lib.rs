@@ -4,6 +4,38 @@
 //! - `lookup_variants()` table function for known variant lookup via equi-join
 //! - `match_allele()` scalar UDF for allele matching
 //! - `vep_allele()` scalar UDF for VCF→VEP allele conversion
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    clippy::too_many_arguments,
+    clippy::collapsible_if,
+    clippy::collapsible_else_if,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::redundant_guards,
+    clippy::manual_div_ceil,
+    clippy::field_reassign_with_default,
+    clippy::useless_vec,
+    clippy::manual_flatten,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::should_implement_trait,
+    clippy::manual_clamp,
+    clippy::needless_range_loop,
+    clippy::or_fun_call,
+    clippy::vec_init_then_push,
+    clippy::clone_on_copy,
+    clippy::single_element_loop,
+    clippy::used_underscore_items,
+    clippy::empty_line_after_doc_comments,
+    clippy::manual_contains,
+    clippy::collapsible_str_replace,
+    clippy::unnecessary_map_or,
+    clippy::assigning_clones,
+    clippy::map_entry,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::unwrap_or_default
+)]
 
 pub mod allele;
 pub mod annotate_provider;

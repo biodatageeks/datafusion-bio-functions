@@ -862,10 +862,10 @@ impl IntervalJoinAlgorithm {
                 }
             }
             IntervalJoinAlgorithm::CoitreesNearest(hashmap) => {
-                if let Some(index) = hashmap.get(&k) {
-                    if let Some(position) = index.nearest_one(start, end, true) {
-                        f(position);
-                    }
+                if let Some(index) = hashmap.get(&k)
+                    && let Some(position) = index.nearest_one(start, end, true)
+                {
+                    f(position);
                 }
             }
             IntervalJoinAlgorithm::IntervalTree(hashmap) => {
@@ -1577,7 +1577,7 @@ mod tests {
         ])
     }
 
-    fn csv_options(schema: &Schema) -> CsvReadOptions {
+    fn csv_options(schema: &Schema) -> CsvReadOptions<'_> {
         CsvReadOptions::new()
             .has_header(true)
             .schema(schema)

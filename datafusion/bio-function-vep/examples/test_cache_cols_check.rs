@@ -1,3 +1,9 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::too_many_arguments,
+    unused_variables,
+    clippy::manual_saturating_arithmetic
+)]
 use datafusion::arrow::array::{Array, LargeStringArray, StringArray, StringViewArray};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;

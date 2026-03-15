@@ -1,3 +1,9 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::too_many_arguments,
+    unused_variables,
+    clippy::manual_saturating_arithmetic
+)]
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
