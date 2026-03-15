@@ -1738,6 +1738,7 @@ mod tests {
             version: Some(1),
             sift_predictions: Vec::new(),
             polyphen_predictions: Vec::new(),
+            protein_features: Vec::new(),
         }
     }
 

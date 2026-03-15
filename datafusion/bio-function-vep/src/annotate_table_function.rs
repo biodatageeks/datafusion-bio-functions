@@ -1977,11 +1977,14 @@ mod tests {
                 .column_by_name("csq")
                 .expect("hgvs prediction csq column exists"),
         );
-        let hgvs_prediction_entry =
-            csq_entries(hgvs_prediction_csq[0].as_ref().expect("hgvs prediction csq present"))
-                .into_iter()
-                .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
-                .expect("transcript hgvs prediction entry should exist");
+        let hgvs_prediction_entry = csq_entries(
+            hgvs_prediction_csq[0]
+                .as_ref()
+                .expect("hgvs prediction csq present"),
+        )
+        .into_iter()
+        .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
+        .expect("transcript hgvs prediction entry should exist");
         assert_eq!(hgvs_prediction_entry[10], "");
         assert_eq!(hgvs_prediction_entry[11], "ENSPHGVS000001.1:p.(Ala2Thr)");
     }

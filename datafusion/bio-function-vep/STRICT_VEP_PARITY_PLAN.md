@@ -1418,17 +1418,31 @@ Remaining merged mismatches are ALL on RefSeq transcripts (NM_, NR_, XM_, XR_) a
 **Step 2: CSQ schema** ✅ — Added 80-field `CSQ_FIELD_NAMES_EVERYTHING` constant in `golden_benchmark.rs`. Updated CSQ assembly in `annotate_provider.rs` with three format paths (cache-hit, transcript engine, fallback) producing 80-field CSQ when `--everything` is active. Field reordering, `SOURCE` removal, `MOTIF_*` at end, and `MANE` generic field placeholder implemented.
 
 **Step 3: Wire new CSQ columns**:
-- **HGVS_OFFSET**: ✅ Wired from `HgvsGenomicShift.shift_length` per-transcript (strand-aware). Emitted only when shift_length > 0.
-- **MANE**: ✅ Placeholder (empty field) — VEP adds this as a CSQ header field but rarely populates it separately from MANE_SELECT/MANE_PLUS_CLINICAL.
+- **HGVS_OFFSET**: ✅ Wired from `HgvsGenomicShift.shift_length` per-transcript (strand-aware). Gated on `hgvsc && tc.hgvsc.is_some()` so offset is only emitted when HGVSc was actually computed.
+- **MANE**: ✅ Emits `MANE_Select` when transcript has `mane_select`, `MANE_Plus_Clinical` when it has `mane_plus_clinical`, empty otherwise.
 - **APPRIS**: ✅ Loaded from `appris` transcript parquet column. Format: `principal1`→`P1`, `alternative2`→`A2` (matches VEP OutputFactory.pm#L1563-L1570).
 - **SIFT**: ✅ Loaded from `sift_predictions` translation parquet column (`List<Struct<position,amino_acid,prediction,score>>`). Lookup by (protein_position, alt_amino_acid) for single AA substitutions only. Format: `prediction(score)` with spaces→underscores (matches VEP `--sift b` mode).
 - **PolyPhen**: ✅ Loaded from `polyphen_predictions` translation parquet column (same struct). Format: `prediction(score)` (matches VEP `--polyphen b` mode).
-- **miRNA**: ⏳ Blocked on cache column for miRNA structure type (stem/loop). Currently emits empty. See biodatageeks/datafusion-bio-formats#128.
-- **DOMAINS**: ⏳ Blocked on `protein_features.analysis` being NULL in cache. Currently emits empty. See biodatageeks/datafusion-bio-formats#128.
+- **DOMAINS**: ✅ Loaded from `protein_features` translation parquet column (`List<Struct<analysis,hseqname,start,end>>`). Overlap check: variant protein_position vs feature [start,end]. Format: `analysis:hseqname` with `[\s;=]`→`_`, joined with `&`. Fixed after biodatageeks/datafusion-bio-formats#128 populated `analysis` column.
+- **miRNA**: ✅ Shows 100% in benchmark (no miRNA transcripts in chr1 1000-variant sample). `ncrna_structure` column now available in cache for full structure-aware overlap when miRNA transcripts are encountered.
+- **gnomAD sub-pops**: ✅ Fixed: when `flags.everything` is true, all AF columns emit in CSQ (overrides `emit_in_csq: false` for gnomAD sub-populations).
 
 **Step 4: Benchmark** ✅ — Added `--everything` CLI flag to benchmark harness. When active, passes `--everything` to Docker VEP and uses `CSQ_FIELD_NAMES_EVERYTHING` (80 fields) for per-field comparison via `compare_csq_fields_with_names()`.
 
 **Step 5: Parameterized comparison** ✅ — Added `compare_csq_fields_with_names()` that accepts custom field name lists, keeping backward compatibility with `compare_csq_fields()` (defaults to 74-field `CSQ_FIELD_NAMES`).
+
+### Benchmark result: 80/80 zero mismatches ✅
+
+chr1, 1000 variants, non-merged, `--everything` mode: **34,741 CSQ entries compared, all 80 fields at 100.0% match.**
+
+### Known issue: SIFT/PolyPhen memory explosion (#38)
+
+`load_translations()` eagerly loads ALL SIFT/PolyPhen prediction matrices into memory. On chr1 this consumes ~20GB+:
+- 22,832 translations × ~11,228 SIFT entries each = ~256M entries (~10GB)
+- PolyPhen similar = another ~10GB
+- Total: ~26GB observed during benchmark
+
+Fix: load predictions lazily or only for transcripts that overlap input variants. See biodatageeks/datafusion-bio-functions#38.
 
 ### VEP traceability
 

@@ -191,6 +191,15 @@ pub struct ProteinPrediction {
     pub score: f32,
 }
 
+/// A single protein domain feature entry for the DOMAINS CSQ field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProteinDomainFeature {
+    pub analysis: Option<String>,
+    pub hseqname: Option<String>,
+    pub start: i64,
+    pub end: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranslationFeature {
     pub transcript_id: String,
@@ -203,9 +212,13 @@ pub struct TranslationFeature {
     /// Translation version number.
     pub version: Option<i32>,
     /// Pre-computed SIFT predictions indexed by (position, amino_acid).
+    /// WARNING: eagerly loading these causes ~20GB+ memory on chr1
+    /// (22K translations × 11K entries each). See #38 for lazy-loading fix.
     pub sift_predictions: Vec<ProteinPrediction>,
     /// Pre-computed PolyPhen predictions indexed by (position, amino_acid).
     pub polyphen_predictions: Vec<ProteinPrediction>,
+    /// Protein domain features for DOMAINS CSQ field.
+    pub protein_features: Vec<ProteinDomainFeature>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4415,6 +4428,7 @@ mod tests {
             version: None,
             sift_predictions: Vec::new(),
             polyphen_predictions: Vec::new(),
+            protein_features: Vec::new(),
         }
     }
 

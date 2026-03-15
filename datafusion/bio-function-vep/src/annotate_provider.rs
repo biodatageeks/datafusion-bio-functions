@@ -40,10 +40,10 @@ use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
-    ExonFeature, MirnaFeature, MotifFeature, PreparedContext, ProteinPrediction, RegulatoryFeature,
-    StructuralFeature, SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment,
-    TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature, VariantInput,
-    is_vep_transcript,
+    ExonFeature, MirnaFeature, MotifFeature, PreparedContext, ProteinDomainFeature,
+    ProteinPrediction, RegulatoryFeature, StructuralFeature, SvEventKind, SvFeatureKind,
+    TranscriptCdnaMapperSegment, TranscriptConsequenceEngine, TranscriptFeature,
+    TranslationFeature, VariantInput, is_vep_transcript,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -809,7 +809,7 @@ impl ColocatedData {
             .iter()
             .enumerate()
             .map(|(idx, column)| {
-                if column.emit_in_csq {
+                if column.emit_in_csq || flags.everything {
                     per_column[idx].join("&")
                 } else {
                     String::new()
@@ -1823,6 +1823,7 @@ impl AnnotateProvider {
             let tl_version_idx = schema.index_of("version").ok();
             let sift_idx = schema.index_of("sift_predictions").ok();
             let polyphen_idx = schema.index_of("polyphen_predictions").ok();
+            let pf_idx = schema.index_of("protein_features").ok();
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
                     continue;
@@ -1848,6 +1849,9 @@ impl AnnotateProvider {
                 let polyphen_predictions = polyphen_idx
                     .map(|idx| read_protein_predictions(batch.column(idx).as_ref(), row))
                     .unwrap_or_default();
+                let protein_features = pf_idx
+                    .map(|idx| read_protein_features(batch.column(idx).as_ref(), row))
+                    .unwrap_or_default();
 
                 out.push(TranslationFeature {
                     transcript_id,
@@ -1859,6 +1863,7 @@ impl AnnotateProvider {
                     version: tl_version,
                     sift_predictions,
                     polyphen_predictions,
+                    protein_features,
                 });
             }
         }
@@ -2738,15 +2743,34 @@ impl AnnotateProvider {
 
                     if flags.everything {
                         // HGVS_OFFSET: shift_length for the transcript's strand.
-                        let tx_strand = tx_opt.map(|tx| tx.strand).unwrap_or(1);
-                        let hgvs_offset = variant
-                            .hgvs_shift_for_strand(tx_strand)
-                            .filter(|s| s.shift_length > 0)
-                            .map(|s| s.shift_length.to_string())
-                            .unwrap_or_default();
-                        // MANE generic: empty for now (--everything enables --mane,
-                        // but the generic MANE field is a VEP placeholder).
-                        let mane = "";
+                        // VEP only emits HGVS_OFFSET when HGVSc was actually computed
+                        // for this transcript variant allele. Non-transcript features
+                        // (regulatory, intergenic) never get HGVS_OFFSET.
+                        let hgvs_offset = if hgvs_flags.hgvsc && tc.hgvsc.is_some() {
+                            let tx_strand = tx_opt.map(|tx| tx.strand).unwrap_or(1);
+                            variant
+                                .hgvs_shift_for_strand(tx_strand)
+                                .filter(|s| s.shift_length > 0)
+                                .map(|s| s.shift_length.to_string())
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        // MANE generic: VEP emits "MANE_Select" or "MANE_Plus_Clinical"
+                        // depending on the transcript's MANE annotation.
+                        // Traceability:
+                        // - VEP OutputFactory.pm MANE output
+                        //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1548-L1560
+                        let mane = if tx_opt.and_then(|tx| tx.mane_select.as_deref()).is_some() {
+                            "MANE_Select"
+                        } else if tx_opt
+                            .and_then(|tx| tx.mane_plus_clinical.as_deref())
+                            .is_some()
+                        {
+                            "MANE_Plus_Clinical"
+                        } else {
+                            ""
+                        };
                         // APPRIS: abbreviate principal1→P1, alternative2→A2.
                         // Traceability:
                         // - VEP OutputFactory.pm APPRIS output
@@ -2765,6 +2789,12 @@ impl AnnotateProvider {
                             tc.amino_acids.as_deref(),
                             ctx,
                         );
+                        // DOMAINS: overlapping protein domain features.
+                        let domains = lookup_domains(
+                            tc.transcript_id.as_deref(),
+                            tc.protein_position.as_deref(),
+                            ctx,
+                        );
                         // 80-field CSQ: 22 base + 20 Batch 1 + 33 Batch 3 + 5 motif.
                         // Traceability:
                         // - VEP Constants.pm CSQ field order for --everything
@@ -2777,7 +2807,7 @@ impl AnnotateProvider {
                              {variant_class}|{symbol_source}|{hgnc_id}|\
                              {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
                              {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{gene_pheno}|\
-                             {sift_str}|{polyphen_str}|||\
+                             {sift_str}|{polyphen_str}|{domains}||\
                              {hgvs_offset}|\
                              {batch3_suffix}|||||"
                         ));
@@ -3116,6 +3146,164 @@ fn read_protein_predictions(col: &dyn Array, row: usize) -> Vec<ProteinPredictio
         }
     }
     out
+}
+
+/// Read protein domain features from a `List<Struct<analysis, hseqname, start, end>>` column.
+///
+/// Traceability:
+/// - VEP OutputFactory.pm DOMAINS output
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1448-L1466
+fn read_protein_features(col: &dyn Array, row: usize) -> Vec<ProteinDomainFeature> {
+    if col.is_null(row) {
+        return Vec::new();
+    }
+    let Some(list_arr) = col.as_any().downcast_ref::<ListArray>() else {
+        return Vec::new();
+    };
+    let offsets = list_arr.offsets();
+    let start_off = offsets[row] as usize;
+    let end_off = offsets[row + 1] as usize;
+    if start_off == end_off {
+        return Vec::new();
+    }
+    let values = list_arr.values();
+    let struct_arr = values.as_struct();
+    let analysis_col = struct_arr.column_by_name("analysis");
+    let hseqname_col = struct_arr.column_by_name("hseqname");
+    let Some(start_col) = struct_arr.column_by_name("start") else {
+        return Vec::new();
+    };
+    let Some(end_col) = struct_arr.column_by_name("end") else {
+        return Vec::new();
+    };
+
+    let start_arr = start_col.as_any().downcast_ref::<Int64Array>();
+    let end_arr = end_col.as_any().downcast_ref::<Int64Array>();
+
+    let mut out = Vec::with_capacity(end_off - start_off);
+    for i in start_off..end_off {
+        let s = start_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
+        let e = end_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
+        let (Some(s), Some(e)) = (s, e) else {
+            continue;
+        };
+
+        let analysis = analysis_col.and_then(|c| {
+            c.as_any()
+                .downcast_ref::<StringArray>()
+                .and_then(|a| {
+                    if a.is_null(i) {
+                        None
+                    } else {
+                        Some(a.value(i).to_string())
+                    }
+                })
+                .or_else(|| {
+                    c.as_any().downcast_ref::<StringViewArray>().and_then(|a| {
+                        if a.is_null(i) {
+                            None
+                        } else {
+                            Some(a.value(i).to_string())
+                        }
+                    })
+                })
+        });
+        let hseqname = hseqname_col.and_then(|c| {
+            c.as_any()
+                .downcast_ref::<StringArray>()
+                .and_then(|a| {
+                    if a.is_null(i) {
+                        None
+                    } else {
+                        Some(a.value(i).to_string())
+                    }
+                })
+                .or_else(|| {
+                    c.as_any().downcast_ref::<StringViewArray>().and_then(|a| {
+                        if a.is_null(i) {
+                            None
+                        } else {
+                            Some(a.value(i).to_string())
+                        }
+                    })
+                })
+        });
+
+        out.push(ProteinDomainFeature {
+            analysis,
+            hseqname,
+            start: s,
+            end: e,
+        });
+    }
+    out
+}
+
+/// Look up overlapping protein domains for a given transcript and protein position.
+///
+/// Formats matching domains as `analysis:hseqname` joined with `&`, with
+/// spaces, semicolons, and equals signs replaced by underscores (matching VEP).
+///
+/// Traceability:
+/// - VEP OutputFactory.pm DOMAINS output
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1448-L1466
+fn lookup_domains(
+    transcript_id: Option<&str>,
+    protein_position: Option<&str>,
+    ctx: &PreparedContext<'_>,
+) -> String {
+    let Some(tx_id) = transcript_id else {
+        return String::new();
+    };
+    let Some(pos_str) = protein_position else {
+        return String::new();
+    };
+    if pos_str.is_empty() {
+        return String::new();
+    }
+
+    // Parse protein position: single int or range "start-end".
+    // VEP uses positions like "42" or "42-43".
+    let (prot_start, prot_end) = if let Some((a, b)) = pos_str.split_once('-') {
+        let Ok(s) = a.parse::<i64>() else {
+            return String::new();
+        };
+        let Ok(e) = b.parse::<i64>() else {
+            return String::new();
+        };
+        (s, e)
+    } else if pos_str.contains('?') {
+        // Unknown position (e.g. "?") — no domain lookup.
+        return String::new();
+    } else {
+        let Ok(p) = pos_str.parse::<i64>() else {
+            return String::new();
+        };
+        (p, p)
+    };
+
+    let Some(tl) = ctx.translation_by_tx.get(tx_id) else {
+        return String::new();
+    };
+
+    let mut labels: Vec<String> = Vec::new();
+    for pf in &tl.protein_features {
+        // Check overlap: variant protein range [prot_start, prot_end] vs feature [pf.start, pf.end]
+        if prot_start <= pf.end && prot_end >= pf.start {
+            let parts: Vec<&str> = [pf.analysis.as_deref(), pf.hseqname.as_deref()]
+                .iter()
+                .filter_map(|p| *p)
+                .collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let mut label = parts.join(":");
+            // Replace spaces, semicolons, and equals signs with underscores.
+            label = label.replace(' ', "_").replace(';', "_").replace('=', "_");
+            labels.push(label);
+        }
+    }
+    labels.join("&")
 }
 
 /// Rebuild RefSeq/XM/XR CDS strings from the indexed genomic reference so the
