@@ -38,23 +38,34 @@ Secondary target:
 
 ## Current Verified Status
 
-Validated on this checkout with:
+### Phase 5: `--everything` mode (80-field CSQ) — ACHIEVED (March 15, 2026)
 
-```bash
-cargo run -p datafusion-bio-function-vep --example annotate_vep_golden_bench --release -- \
-  vep-benchmark/data/HG002_chr1.vcf.gz \
-  /Users/mwiewior/research/data/vep/115_GRCh38_variation_1.parquet \
-  parquet \
-  0 \
-  /tmp/vep_golden \
-  vep-benchmark/data/HG002_chr1.vcf.gz \
-  /tmp/annotate_vep_golden_bench_release_entry_diag_fix2 \
-  /Users/mwiewior/research/data/vep \
-  --steps=ensembl,datafusion \
-  --extended-probes
-```
+Validated on 5,000-variant chr22 benchmark with `--everything` flag:
 
-Observed result:
+- `5,021` variants (after multi-allelic decomposition)
+- `93,993` CSQ entries compared
+- `80/80` fields at zero mismatches
+- `0` extra CSQ entries
+- `0` missing CSQ entries
+- `100%` most-severe parity
+- `100%` term-set parity
+- Ensembl VEP: `31.4s`, DataFusion: `79.7s`
+
+New fields wired in Phase 5:
+- `APPRIS` — abbreviated format (`principal1` -> `P1`, `alternative2` -> `A2`)
+- `SIFT` — `prediction(score)` format with spaces replaced by underscores
+- `PolyPhen` — same format as SIFT
+- `DOMAINS` — `analysis:hseqname` with `&`-separated multiple overlapping domains
+- `miRNA` — placeholder (no miRNA features in current benchmark)
+- `HGVS_OFFSET` — emitted only when HGVSc is computed; negative for reverse-strand transcripts
+- `MANE` — `MANE_Select` / `MANE_Plus_Clinical` labels
+- gnomAD sub-population AFs — gated by `emit_in_csq || flags.everything`
+
+Key fix: HGVS_OFFSET sign was corrected to emit negative values for reverse-strand transcripts, matching VEP's convention.
+
+### Phase 4: HGVS parity — ACHIEVED (March 14, 2026)
+
+Validated on full chr1 benchmark (74-field mode):
 
 - `323,430` variants compared
 - `2,997,504` CSQ entries compared
@@ -65,8 +76,6 @@ Observed result:
 - `100%` term-set parity
 - release annotate time `49.783s`
 
-**Phase 4 HGVS parity: ACHIEVED** (March 14, 2026)
-
 - Non-merged (Ensembl-only) chr1 benchmark: **74/74 fields at zero mismatches** with `--hgvs --fasta`
 - Merged (Ensembl+RefSeq) chr1 benchmark: 72/74 fields, ~105 remaining mismatches (all RefSeq-specific)
 - Performance: 51s without HGVS, 79s with HGVS (matches pre-HGVS baseline)
@@ -74,14 +83,12 @@ Observed result:
 Remaining open work:
 
 - merged (RefSeq) HGVS parity — edited transcript shifting, cdna_mapper_segments
-- release-115 flag-surface parity beyond the fixed README field set
-- VEP-style on/off gating for feature-expanding and output-gating flags
-- dynamic CSQ field/header parity for flags not covered by the current 74-column benchmark
+- dynamic CSQ field/header parity for flags not covered by the current 80-column benchmark
 
 Important caveat:
 
-- the current `74/74` result proves parity for the non-merged benchmark profile, not full release-115 CLI flag parity
-- the current Rust path still behaves like a fixed-schema benchmark serializer in several places where VEP conditionally adds or removes columns based on flags
+- the current `80/80` result proves parity for the `--everything` benchmark profile on chr22
+- the full chr1 `74/74` result proves parity for the non-merged default profile
 
 ## Reproducible Benchmark Commands
 

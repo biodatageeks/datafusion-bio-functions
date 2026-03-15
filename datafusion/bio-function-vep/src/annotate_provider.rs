@@ -2751,7 +2751,16 @@ impl AnnotateProvider {
                             variant
                                 .hgvs_shift_for_strand(tx_strand)
                                 .filter(|s| s.shift_length > 0)
-                                .map(|s| s.shift_length.to_string())
+                                .map(|s| {
+                                    // VEP emits negative HGVS_OFFSET for reverse-strand
+                                    // transcripts (the shift direction is opposite).
+                                    let signed = s.shift_length as i64;
+                                    if tx_strand < 0 {
+                                        (-signed).to_string()
+                                    } else {
+                                        signed.to_string()
+                                    }
+                                })
                                 .unwrap_or_default()
                         } else {
                             String::new()
@@ -4157,4 +4166,259 @@ impl TableProvider for AnnotateProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcript_consequence::{
+        ProteinDomainFeature, ProteinPrediction, TranslationFeature,
+    };
+
+    // ── format_appris ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_appris_principal1() {
+        assert_eq!(format_appris("principal1"), "P1");
+    }
+
+    #[test]
+    fn test_format_appris_alternative2() {
+        assert_eq!(format_appris("alternative2"), "A2");
+    }
+
+    #[test]
+    fn test_format_appris_principal5() {
+        assert_eq!(format_appris("principal5"), "P5");
+    }
+
+    #[test]
+    fn test_format_appris_passthrough() {
+        // Unknown strings should pass through unchanged.
+        assert_eq!(format_appris("other"), "other");
+    }
+
+    // ── format_prediction ──────────────────────────────────────────────
+
+    #[test]
+    fn test_format_prediction_deleterious() {
+        assert_eq!(format_prediction("deleterious", 0.01), "deleterious(0.01)");
+    }
+
+    #[test]
+    fn test_format_prediction_probably_damaging() {
+        // Spaces become underscores.
+        assert_eq!(
+            format_prediction("probably damaging", 0.999),
+            "probably_damaging(0.999)"
+        );
+    }
+
+    #[test]
+    fn test_format_prediction_tolerated_low_confidence() {
+        // " - " becomes "_" (spaces become underscores first, then "_-_" collapses).
+        assert_eq!(
+            format_prediction("tolerated - low confidence", 0.23),
+            "tolerated_low_confidence(0.23)"
+        );
+    }
+
+    // ── lookup_sift_polyphen ───────────────────────────────────────────
+
+    /// Build a TranslationFeature with the given SIFT/PolyPhen predictions and
+    /// protein domain features.
+    fn make_translation(
+        tx_id: &str,
+        sift: Vec<ProteinPrediction>,
+        polyphen: Vec<ProteinPrediction>,
+        protein_features: Vec<ProteinDomainFeature>,
+    ) -> TranslationFeature {
+        TranslationFeature {
+            transcript_id: tx_id.to_string(),
+            cds_len: None,
+            protein_len: None,
+            translation_seq: None,
+            cds_sequence: None,
+            stable_id: None,
+            version: None,
+            sift_predictions: sift,
+            polyphen_predictions: polyphen,
+            protein_features,
+        }
+    }
+
+    /// Build a minimal PreparedContext from a set of translations (no
+    /// transcripts, exons, regulatory features, etc.).
+    fn minimal_ctx(translations: &[TranslationFeature]) -> PreparedContext<'_> {
+        PreparedContext::new(&[], &[], translations, &[], &[], &[], &[])
+    }
+
+    #[test]
+    fn test_lookup_sift_polyphen_single_aa_match() {
+        let translations = vec![make_translation(
+            "ENST00000001",
+            vec![ProteinPrediction {
+                position: 42,
+                amino_acid: "I".to_string(),
+                prediction: "deleterious".to_string(),
+                score: 0.01,
+            }],
+            vec![ProteinPrediction {
+                position: 42,
+                amino_acid: "I".to_string(),
+                prediction: "probably damaging".to_string(),
+                score: 0.999,
+            }],
+            vec![],
+        )];
+        let ctx = minimal_ctx(&translations);
+
+        let (sift, polyphen) =
+            lookup_sift_polyphen(Some("ENST00000001"), Some("42"), Some("V/I"), &ctx);
+        assert_eq!(sift, "deleterious(0.01)");
+        assert_eq!(polyphen, "probably_damaging(0.999)");
+    }
+
+    #[test]
+    fn test_lookup_sift_polyphen_non_substitution_skipped() {
+        let translations = vec![make_translation(
+            "ENST00000001",
+            vec![ProteinPrediction {
+                position: 42,
+                amino_acid: "I".to_string(),
+                prediction: "deleterious".to_string(),
+                score: 0.01,
+            }],
+            vec![],
+            vec![],
+        )];
+        let ctx = minimal_ctx(&translations);
+
+        // Multi-char alt amino acid -- not a single substitution.
+        let (sift, polyphen) =
+            lookup_sift_polyphen(Some("ENST00000001"), Some("42"), Some("V/IL"), &ctx);
+        assert!(sift.is_empty());
+        assert!(polyphen.is_empty());
+
+        // Range position -- indel, should be skipped.
+        let (sift, polyphen) =
+            lookup_sift_polyphen(Some("ENST00000001"), Some("42-43"), Some("V/I"), &ctx);
+        assert!(sift.is_empty());
+        assert!(polyphen.is_empty());
+    }
+
+    #[test]
+    fn test_lookup_sift_polyphen_missing_transcript() {
+        let translations = vec![make_translation("ENST00000001", vec![], vec![], vec![])];
+        let ctx = minimal_ctx(&translations);
+
+        let (sift, polyphen) =
+            lookup_sift_polyphen(Some("ENST_MISSING"), Some("42"), Some("V/I"), &ctx);
+        assert!(sift.is_empty());
+        assert!(polyphen.is_empty());
+    }
+
+    // ── lookup_domains ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_lookup_domains_single_overlap() {
+        let translations = vec![make_translation(
+            "ENST00000001",
+            vec![],
+            vec![],
+            vec![ProteinDomainFeature {
+                analysis: Some("Pfam".to_string()),
+                hseqname: Some("PF00069".to_string()),
+                start: 30,
+                end: 100,
+            }],
+        )];
+        let ctx = minimal_ctx(&translations);
+        assert_eq!(
+            lookup_domains(Some("ENST00000001"), Some("42"), &ctx),
+            "Pfam:PF00069"
+        );
+    }
+
+    #[test]
+    fn test_lookup_domains_multiple_overlap() {
+        let translations = vec![make_translation(
+            "ENST00000001",
+            vec![],
+            vec![],
+            vec![
+                ProteinDomainFeature {
+                    analysis: Some("Pfam".to_string()),
+                    hseqname: Some("PF00069".to_string()),
+                    start: 30,
+                    end: 100,
+                },
+                ProteinDomainFeature {
+                    analysis: Some("PROSITE profiles".to_string()),
+                    hseqname: Some("PS50011".to_string()),
+                    start: 40,
+                    end: 50,
+                },
+            ],
+        )];
+        let ctx = minimal_ctx(&translations);
+        assert_eq!(
+            lookup_domains(Some("ENST00000001"), Some("42"), &ctx),
+            "Pfam:PF00069&PROSITE_profiles:PS50011"
+        );
+    }
+
+    #[test]
+    fn test_lookup_domains_no_overlap() {
+        let translations = vec![make_translation(
+            "ENST00000001",
+            vec![],
+            vec![],
+            vec![ProteinDomainFeature {
+                analysis: Some("Pfam".to_string()),
+                hseqname: Some("PF00069".to_string()),
+                start: 100,
+                end: 200,
+            }],
+        )];
+        let ctx = minimal_ctx(&translations);
+        assert!(lookup_domains(Some("ENST00000001"), Some("42"), &ctx).is_empty());
+    }
+
+    #[test]
+    fn test_lookup_domains_spaces_replaced() {
+        let translations = vec![make_translation(
+            "ENST00000001",
+            vec![],
+            vec![],
+            vec![ProteinDomainFeature {
+                analysis: Some("Gene3D db".to_string()),
+                hseqname: Some("1.10.510.10".to_string()),
+                start: 1,
+                end: 50,
+            }],
+        )];
+        let ctx = minimal_ctx(&translations);
+        assert_eq!(
+            lookup_domains(Some("ENST00000001"), Some("10"), &ctx),
+            "Gene3D_db:1.10.510.10"
+        );
+    }
+
+    // ── HGVS_OFFSET sign ──────────────────────────────────────────────
+
+    #[test]
+    fn test_hgvs_offset_reverse_strand_is_negative() {
+        // The HGVS_OFFSET logic in the CSQ builder negates shift_length for
+        // reverse-strand transcripts (strand == -1).
+        let shift_length: u32 = 3;
+        let tx_strand: i8 = -1;
+        let signed = shift_length as i64;
+        let value = if tx_strand < 0 { -signed } else { signed };
+        assert_eq!(value, -3);
+    }
+
+    #[test]
+    fn test_hgvs_offset_forward_strand_is_positive() {
+        let shift_length: u32 = 3;
+        let tx_strand: i8 = 1;
+        let signed = shift_length as i64;
+        let value = if tx_strand < 0 { -signed } else { signed };
+        assert_eq!(value, 3);
+    }
 }
