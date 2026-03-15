@@ -375,13 +375,21 @@ fn collect_overlapping_candidates(
 
     if let Some(tree) = compare_tree {
         tree.query(probe_start as i32, probe_end as i32, |interval| {
-            push_unique_candidate(&mut candidates, &mut seen, *GenericInterval::<u32>::metadata(interval) as usize);
+            push_unique_candidate(
+                &mut candidates,
+                &mut seen,
+                *GenericInterval::<u32>::metadata(interval) as usize,
+            );
         });
     }
 
     if let Some(tree) = unshifted_tree {
         tree.query(probe_start as i32, probe_end as i32, |interval| {
-            push_unique_candidate(&mut candidates, &mut seen, *GenericInterval::<u32>::metadata(interval) as usize);
+            push_unique_candidate(
+                &mut candidates,
+                &mut seen,
+                *GenericInterval::<u32>::metadata(interval) as usize,
+            );
         });
     }
 
