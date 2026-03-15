@@ -2020,95 +2020,85 @@ impl AnnotateProvider {
     /// Window size for sliding-window SIFT/PolyPhen loading (5MB).
     const SIFT_WINDOW_SIZE: i64 = 5_000_000;
 
-    /// Load SIFT/PolyPhen predictions using a sliding genomic window.
+    /// Load SIFT/PolyPhen predictions for a single genomic window into the cache.
     ///
-    /// For each chromosome, slides a window across the variant bounding box
-    /// and queries translations whose CDS overlaps each window:
+    /// Queries translations whose CDS overlaps the window `[win_start, win_end)`:
     /// ```sql
-    /// SELECT transcript_id, sift_predictions, polyphen_predictions
+    /// SELECT transcript_id, "end", sift_predictions, polyphen_predictions
     /// FROM translations
     /// WHERE chrom = '1' AND start <= win_end AND "end" >= win_start
     /// ```
     ///
     /// Each window typically returns ~20-50 translations (~500K prediction
-    /// entries ≈ ~20MB). The LRU cache evicts entries from old windows,
-    /// bounding peak memory regardless of chromosome size.
+    /// entries ~20MB).
     ///
     /// With sorted parquet + small row groups (bio-formats#129), DataFusion
     /// uses row-group min/max statistics to skip non-matching row groups,
     /// reading only 1-2 row groups per window query instead of all.
     ///
     /// See biodatageeks/datafusion-bio-functions#38.
-    async fn load_sift_polyphen_by_window(
+    async fn load_sift_window(
         &self,
         table: &str,
-        chrom_bounds: &HashMap<String, (i64, i64)>,
-    ) -> Result<SiftPolyphenCache> {
-        // Capacity: ~2000 transcripts ≈ ~800MB max. Enough for any single
-        // chromosome's worth of overlapping translations without eviction
-        // pressure for typical variant sets.
-        let mut cache = SiftPolyphenCache::new(2000);
+        chrom: &str,
+        win_start: i64,
+        win_end: i64,
+        cache: &mut SiftPolyphenCache,
+    ) -> Result<()> {
+        let escaped_chrom = Self::escaped_sql_literal(chrom);
+        let query = format!(
+            "SELECT transcript_id, \"end\", sift_predictions, polyphen_predictions \
+             FROM `{table}` \
+             WHERE chrom = '{escaped_chrom}' \
+               AND start <= {win_end} AND \"end\" >= {win_start}"
+        );
+        let batches = self.session.sql(&query).await?.collect().await?;
 
-        for (chrom, &(min_start, max_end)) in chrom_bounds {
-            let escaped_chrom = Self::escaped_sql_literal(chrom);
-            let mut win_start = min_start;
+        for batch in &batches {
+            let schema = batch.schema();
+            let tx_idx = schema
+                .index_of("transcript_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .ok();
+            let end_col_idx = schema.index_of("end").ok();
+            let sift_col_idx = schema.index_of("sift_predictions").ok();
+            let pp_col_idx = schema.index_of("polyphen_predictions").ok();
 
-            while win_start <= max_end {
-                let win_end = (win_start + Self::SIFT_WINDOW_SIZE).min(max_end);
+            let Some(tx_idx) = tx_idx else { continue };
 
-                let query = format!(
-                    "SELECT transcript_id, sift_predictions, polyphen_predictions \
-                     FROM `{table}` \
-                     WHERE chrom = '{escaped_chrom}' \
-                       AND start <= {win_end} AND \"end\" >= {win_start}"
-                );
-                let batches = self.session.sql(&query).await?.collect().await?;
-
-                for batch in &batches {
-                    let schema = batch.schema();
-                    let tx_idx = schema
-                        .index_of("transcript_id")
-                        .or_else(|_| schema.index_of("stable_id"))
-                        .ok();
-                    let sift_col_idx = schema.index_of("sift_predictions").ok();
-                    let pp_col_idx = schema.index_of("polyphen_predictions").ok();
-
-                    let Some(tx_idx) = tx_idx else { continue };
-
-                    for row in 0..batch.num_rows() {
-                        let Some(tx_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
-                            continue;
-                        };
-                        // Skip if already cached (window overlap with previous window).
-                        if cache.get(&tx_id).is_some() {
-                            continue;
-                        }
-                        let mut preds = CachedPredictions::default();
-                        if let Some(idx) = sift_col_idx {
-                            for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
-                                preds.sift.insert(
-                                    (pred.position, pred.amino_acid),
-                                    (pred.prediction, pred.score),
-                                );
-                            }
-                        }
-                        if let Some(idx) = pp_col_idx {
-                            for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
-                                preds.polyphen.insert(
-                                    (pred.position, pred.amino_acid),
-                                    (pred.prediction, pred.score),
-                                );
-                            }
-                        }
-                        cache.insert(tx_id, preds);
+            for row in 0..batch.num_rows() {
+                let Some(tx_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                    continue;
+                };
+                // Skip if already cached (window overlap with previous window).
+                if cache.get(&tx_id).is_some() {
+                    continue;
+                }
+                let genomic_end = end_col_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(i64::MAX);
+                let mut preds = CachedPredictions::default();
+                if let Some(idx) = sift_col_idx {
+                    for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
+                        preds.sift.insert(
+                            (pred.position, pred.amino_acid),
+                            (pred.prediction, pred.score),
+                        );
                     }
                 }
-
-                win_start += Self::SIFT_WINDOW_SIZE;
+                if let Some(idx) = pp_col_idx {
+                    for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
+                        preds.polyphen.insert(
+                            (pred.position, pred.amino_acid),
+                            (pred.prediction, pred.score),
+                        );
+                    }
+                }
+                cache.insert(tx_id, preds, genomic_end);
             }
         }
 
-        Ok(cache)
+        Ok(())
     }
 
     async fn load_regulatory_features(
@@ -2698,77 +2688,85 @@ impl AnnotateProvider {
             format!("{} tx_trees chroms", ctx.tx_trees.len())
         );
 
-        // Build SIFT/PolyPhen prediction cache using a sliding genomic window.
+        // Build SIFT/PolyPhen prediction cache using lazy sliding windows.
         //
-        // Instead of loading all ~22K translations' prediction matrices eagerly
-        // (~20GB on chr1), we:
-        // 1. Extract the genomic bounding box of input variants per chromosome
-        // 2. Slide a window (default 5MB) across that range
-        // 3. For each window, query only translations whose CDS overlaps it:
-        //      SELECT transcript_id, sift_predictions, polyphen_predictions
-        //      FROM translations
-        //      WHERE chrom = '1' AND start <= win_end AND "end" >= win_start
-        // 4. Each window returns ~20-50 translations → ~500K prediction entries
-        //
-        // Memory stays bounded: the LRU cache evicts entries from old windows.
-        // With sorted parquet + small row groups (bio-formats#129), each window
-        // query reads only 1-2 row groups via min/max statistics pushdown.
+        // Instead of loading all translations upfront, windows are loaded
+        // lazily as the annotation batch loop advances through genomic
+        // positions. SQL queries only fire when a batch crosses a 5MB window
+        // boundary. Entries whose genomic end falls behind the current batch
+        // are evicted (safe because VCF is position-sorted).
         //
         // See biodatageeks/datafusion-bio-functions#38.
         let t_sift = profile_start!();
-        let sift_cache = if flags.everything {
-            if let Some(table) = translations_table {
-                // Compute variant bounding box per chromosome, expanded by
-                // upstream/downstream transcript distance to catch translations
-                // whose CDS is near but not directly overlapping the variants.
-                let mut chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
-                for batch in &base_batches {
-                    let schema = batch.schema();
-                    if let (Ok(ci), Ok(si), Ok(ei)) = (
-                        schema.index_of("chrom"),
-                        schema.index_of("start"),
-                        schema.index_of("end"),
-                    ) {
-                        for row in 0..batch.num_rows() {
-                            if let (Some(c), Some(s), Some(e)) = (
-                                string_at(batch.column(ci).as_ref(), row),
-                                int64_at(batch.column(si).as_ref(), row),
-                                int64_at(batch.column(ei).as_ref(), row),
-                            ) {
-                                // Strip chr prefix to match translation table chrom format.
-                                let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
-                                let entry =
-                                    chrom_bounds.entry(c_norm).or_insert((i64::MAX, i64::MIN));
-                                entry.0 = entry.0.min(s);
-                                entry.1 = entry.1.max(e);
-                            }
-                        }
-                    }
-                }
-                // Expand by a generous margin to catch translations whose CDS
-                // extends beyond the variant region. Genes can span >1MB, so
-                // we add 2x the window size as padding.
-                for bounds in chrom_bounds.values_mut() {
-                    bounds.0 = (bounds.0 - Self::SIFT_WINDOW_SIZE).max(1);
-                    bounds.1 += Self::SIFT_WINDOW_SIZE;
-                }
-                self.load_sift_polyphen_by_window(table, &chrom_bounds)
-                    .await?
-            } else {
-                SiftPolyphenCache::new(0)
-            }
-        } else {
-            SiftPolyphenCache::new(0)
-        };
-        profile_end!(
-            "7. sift_polyphen_cache",
-            t_sift,
-            format!("{} transcripts cached", sift_cache.len())
-        );
+        let mut sift_cache = SiftPolyphenCache::new();
+        let sift_enabled = flags.everything && translations_table.is_some();
+        let mut loaded_windows: HashSet<(String, i64)> = HashSet::new();
+        profile_end!("7. sift_polyphen_cache_init", t_sift);
 
         let t_annotate = profile_start!();
         let mut annotated_batches = Vec::with_capacity(base_batches.len());
         for batch in &base_batches {
+            // Lazily load SIFT/PolyPhen windows as the batch loop advances.
+            if sift_enabled {
+                let table = translations_table.unwrap();
+                let schema = batch.schema();
+                if let (Ok(ci), Ok(si), Ok(ei)) = (
+                    schema.index_of("chrom"),
+                    schema.index_of("start"),
+                    schema.index_of("end"),
+                ) {
+                    // Collect per-chrom min/max positions in this batch.
+                    let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
+                    for row in 0..batch.num_rows() {
+                        if let (Some(c), Some(s), Some(e)) = (
+                            string_at(batch.column(ci).as_ref(), row),
+                            int64_at(batch.column(si).as_ref(), row),
+                            int64_at(batch.column(ei).as_ref(), row),
+                        ) {
+                            let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
+                            let entry = batch_chrom_bounds
+                                .entry(c_norm)
+                                .or_insert((i64::MAX, i64::MIN));
+                            entry.0 = entry.0.min(s);
+                            entry.1 = entry.1.max(e);
+                        }
+                    }
+
+                    for (chrom, (batch_min, batch_max)) in &batch_chrom_bounds {
+                        let window_start =
+                            (batch_max / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
+
+                        // Also load the window containing the minimum position
+                        // (may differ from the max window).
+                        let min_window_start =
+                            (batch_min / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
+
+                        // Load all windows from the min to the max + next window.
+                        let mut ws = min_window_start;
+                        while ws <= window_start + Self::SIFT_WINDOW_SIZE {
+                            let key = (chrom.clone(), ws);
+                            if !loaded_windows.contains(&key) {
+                                self.load_sift_window(
+                                    table,
+                                    chrom,
+                                    ws,
+                                    ws + Self::SIFT_WINDOW_SIZE,
+                                    &mut sift_cache,
+                                )
+                                .await?;
+                                loaded_windows.insert(key);
+                            }
+                            ws += Self::SIFT_WINDOW_SIZE;
+                        }
+
+                        // Evict entries whose genomic end is behind the batch
+                        // minimum (position-sorted VCF guarantees no future
+                        // batch will need them).
+                        sift_cache.evict_before(*batch_min);
+                    }
+                }
+            }
+
             annotated_batches.push(self.annotate_batch_with_transcript_engine(
                 batch,
                 &engine,
@@ -2778,15 +2776,16 @@ impl AnnotateProvider {
             )?);
         }
         profile_end!(
-            "8. annotate_batches (hits+misses)",
+            "7+8. sift_lazy_load + annotate_batches",
             t_annotate,
             format!(
-                "{} batches, {} total rows",
+                "{} batches, {} total rows, {} sift windows loaded",
                 annotated_batches.len(),
                 annotated_batches
                     .iter()
                     .map(|b| b.num_rows())
-                    .sum::<usize>()
+                    .sum::<usize>(),
+                loaded_windows.len()
             )
         );
 
@@ -4681,7 +4680,7 @@ mod tests {
     // ── lookup_sift_polyphen ───────────────────────────────────────────
 
     fn make_sift_cache(entries: Vec<(&str, i32, &str, &str, f32, &str, f32)>) -> SiftPolyphenCache {
-        let mut cache = SiftPolyphenCache::new(100);
+        let mut cache = SiftPolyphenCache::new();
         // Group entries by transcript_id.
         let mut by_tx: HashMap<String, CachedPredictions> = HashMap::new();
         for (tx_id, pos, aa, sift_pred, sift_score, pp_pred, pp_score) in entries {
@@ -4694,7 +4693,7 @@ mod tests {
                 .insert((pos, aa.to_string()), (pp_pred.to_string(), pp_score));
         }
         for (tx_id, preds) in by_tx {
-            cache.insert(tx_id, preds);
+            cache.insert(tx_id, preds, i64::MAX);
         }
         cache
     }
@@ -4742,7 +4741,7 @@ mod tests {
 
     #[test]
     fn test_lookup_sift_polyphen_missing_transcript() {
-        let cache = SiftPolyphenCache::new(10);
+        let cache = SiftPolyphenCache::new();
         let (sift, polyphen) =
             lookup_sift_polyphen(Some("ENST_MISSING"), Some("42"), Some("V/I"), &cache);
         assert!(sift.is_empty());

@@ -234,24 +234,23 @@ pub struct CachedPredictions {
 ///
 /// With sorted parquet + small row groups (see datafusion-bio-formats#129),
 /// DataFusion uses row-group min/max statistics to skip non-matching row
-/// groups, reading ~1K rows instead of 22K. The cache holds predictions for
-/// up to `capacity` transcripts; when full, the oldest entry is evicted.
+/// groups, reading ~1K rows instead of 22K. Windows are loaded lazily as
+/// the annotation batch loop advances through genomic positions, and entries
+/// whose genomic end falls behind the current batch are evicted.
 ///
 /// Typical memory: ~500 transcripts × ~400KB each ≈ 200MB (vs 20GB eager).
 #[derive(Debug)]
 pub struct SiftPolyphenCache {
     entries: HashMap<String, CachedPredictions>,
-    /// Insertion order for LRU eviction (oldest first).
-    order: Vec<String>,
-    capacity: usize,
+    /// Genomic end position for each cached transcript, used for eviction.
+    genomic_ends: HashMap<String, i64>,
 }
 
 impl SiftPolyphenCache {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            entries: HashMap::with_capacity(capacity),
-            order: Vec::with_capacity(capacity),
-            capacity,
+            entries: HashMap::new(),
+            genomic_ends: HashMap::new(),
         }
     }
 
@@ -260,19 +259,32 @@ impl SiftPolyphenCache {
         self.entries.get(transcript_id)
     }
 
-    /// Insert predictions for a transcript, evicting the oldest entry if at capacity.
-    pub fn insert(&mut self, transcript_id: String, predictions: CachedPredictions) {
-        if self.entries.len() >= self.capacity && !self.entries.contains_key(&transcript_id) {
-            // Evict oldest entry.
-            if let Some(oldest) = self.order.first().cloned() {
-                self.entries.remove(&oldest);
-                self.order.remove(0);
-            }
-        }
+    /// Insert predictions for a transcript with its genomic end position.
+    pub fn insert(
+        &mut self,
+        transcript_id: String,
+        predictions: CachedPredictions,
+        genomic_end: i64,
+    ) {
         if !self.entries.contains_key(&transcript_id) {
-            self.order.push(transcript_id.clone());
+            self.genomic_ends.insert(transcript_id.clone(), genomic_end);
         }
         self.entries.insert(transcript_id, predictions);
+    }
+
+    /// Evict all entries whose genomic end is strictly less than `position`.
+    /// Safe because VCF is position-sorted — no future batch will need them.
+    pub fn evict_before(&mut self, position: i64) {
+        let to_remove: Vec<String> = self
+            .genomic_ends
+            .iter()
+            .filter(|(_, end)| **end < position)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &to_remove {
+            self.entries.remove(key);
+            self.genomic_ends.remove(key);
+        }
     }
 
     pub fn len(&self) -> usize {
