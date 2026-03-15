@@ -1355,6 +1355,98 @@ Remaining merged mismatches are ALL on RefSeq transcripts (NM_, NR_, XM_, XR_) a
 - `translate_protein_from_cds`: stop inclusion, incomplete codons, N bases
 - Protein HGVS: deletion, missense, delins, frameshift, synonymous, start_lost
 
+## Phase 5: `--everything` Flag Parity
+
+**Status: blocked on cache columns (biodatageeks/datafusion-bio-formats#127)**
+
+**Goal**: support `--everything` flag producing 80/80 zero mismatches on chr1 non-merged benchmark.
+
+### VEP `--everything` CSQ field order (80 fields, confirmed via Docker VEP 115.2)
+
+```
+ 1 Allele                 21 FLAGS                  41 miRNA
+ 2 Consequence            22 VARIANT_CLASS          42 HGVS_OFFSET
+ 3 IMPACT                 23 SYMBOL_SOURCE          43 AF
+ 4 SYMBOL                 24 HGNC_ID                44 AFR_AF
+ 5 Gene                   25 CANONICAL              45 AMR_AF
+ 6 Feature_type           26 MANE                   46 EAS_AF
+ 7 Feature                27 MANE_SELECT            47 EUR_AF
+ 8 BIOTYPE                28 MANE_PLUS_CLINICAL     48 SAS_AF
+ 9 EXON                   29 TSL                    49-58 gnomADe_*_AF
+10 INTRON                 30 APPRIS                 59-69 gnomADg_*_AF
+11 HGVSc                  31 CCDS                   70 MAX_AF
+12 HGVSp                  32 ENSP                   71 MAX_AF_POPS
+13 cDNA_position          33 SWISSPROT              72 CLIN_SIG
+14 CDS_position           34 TREMBL                 73 SOMATIC
+15 Protein_position       35 UNIPARC                74 PHENO
+16 Amino_acids            36 UNIPROT_ISOFORM        75 PUBMED
+17 Codons                 37 GENE_PHENO             76 MOTIF_NAME
+18 Existing_variation     38 SIFT                   77 MOTIF_POS
+19 DISTANCE               39 PolyPhen               78 HIGH_INF_POS
+20 STRAND                 40 DOMAINS                79 MOTIF_SCORE_CHANGE
+                                                    80 TRANSCRIPTION_FACTORS
+```
+
+### Differences from current 74-field schema
+
+| Change | Details |
+|--------|---------|
+| **New fields (6)** | `APPRIS` (30), `SIFT` (38), `PolyPhen` (39), `DOMAINS` (40), `miRNA` (41), `HGVS_OFFSET` (42) |
+| **New field** | `MANE` (26) — generic MANE flag, separate from MANE_SELECT/MANE_PLUS_CLINICAL |
+| **Removed** | `SOURCE` — not present in --everything output |
+| **Reordered** | `VARIANT_CLASS` moved from after batch1 to position 22 (after FLAGS) |
+| **Reordered** | `MOTIF_*` fields moved from positions 24-28 to end (76-80) |
+| **Renamed** | gnomAD sub-population fields gained `_AF` suffix (e.g., `gnomADe_AFR` → `gnomADe_AFR_AF`) |
+
+### VEP `--everything` enables (Config.pm L346-374)
+
+`sift=b`, `polyphen=b`, `ccds`, `hgvs`, `symbol`, `numbers`, `domains`, `regulatory`, `canonical`, `protein`, `biotype`, `af`, `af_1kg`, `af_gnomade`, `af_gnomadg`, `max_af`, `pubmed`, `uniprot`, `mane`, `tsl`, `appris`, `variant_class`, `gene_phenotype`, `mirna`
+
+### New cache columns needed (biodatageeks/datafusion-bio-formats#127)
+
+| Column | Table | Type | Source |
+|--------|-------|------|--------|
+| `appris` | transcript | `Utf8` | Transcript attribute code `appris` |
+| `protein_features` | translation | `List<Struct<analysis,hseqname,start,end>>` | `_variation_effect_feature_cache.protein_features` |
+| `sift_predictions` | translation | `Map<Utf8, Utf8>` or equivalent | Decoded from binary `ProteinFunctionPredictionMatrix` |
+| `polyphen_predictions` | translation | `Map<Utf8, Utf8>` or equivalent | Decoded from binary `ProteinFunctionPredictionMatrix` |
+
+### Implementation steps
+
+**Step 1: Flag parsing** ✅ — Added `everything: bool` to `VepFlags` and `HgvsFlags`. When true, all sub-flags are enabled per Config.pm.
+
+**Step 2: CSQ schema** ✅ — Added 80-field `CSQ_FIELD_NAMES_EVERYTHING` constant in `golden_benchmark.rs`. Updated CSQ assembly in `annotate_provider.rs` with three format paths (cache-hit, transcript engine, fallback) producing 80-field CSQ when `--everything` is active. Field reordering, `SOURCE` removal, `MOTIF_*` at end, and `MANE` generic field placeholder implemented.
+
+**Step 3: Wire new CSQ columns**:
+- **HGVS_OFFSET**: ✅ Wired from `HgvsGenomicShift.shift_length` per-transcript (strand-aware). Emitted only when shift_length > 0.
+- **MANE**: ✅ Placeholder (empty field) — VEP adds this as a CSQ header field but rarely populates it separately from MANE_SELECT/MANE_PLUS_CLINICAL.
+- **APPRIS**: ✅ Loaded from `appris` transcript parquet column. Format: `principal1`→`P1`, `alternative2`→`A2` (matches VEP OutputFactory.pm#L1563-L1570).
+- **SIFT**: ✅ Loaded from `sift_predictions` translation parquet column (`List<Struct<position,amino_acid,prediction,score>>`). Lookup by (protein_position, alt_amino_acid) for single AA substitutions only. Format: `prediction(score)` with spaces→underscores (matches VEP `--sift b` mode).
+- **PolyPhen**: ✅ Loaded from `polyphen_predictions` translation parquet column (same struct). Format: `prediction(score)` (matches VEP `--polyphen b` mode).
+- **miRNA**: ⏳ Blocked on cache column for miRNA structure type (stem/loop). Currently emits empty. See biodatageeks/datafusion-bio-formats#128.
+- **DOMAINS**: ⏳ Blocked on `protein_features.analysis` being NULL in cache. Currently emits empty. See biodatageeks/datafusion-bio-formats#128.
+
+**Step 4: Benchmark** ✅ — Added `--everything` CLI flag to benchmark harness. When active, passes `--everything` to Docker VEP and uses `CSQ_FIELD_NAMES_EVERYTHING` (80 fields) for per-field comparison via `compare_csq_fields_with_names()`.
+
+**Step 5: Parameterized comparison** ✅ — Added `compare_csq_fields_with_names()` that accepts custom field name lists, keeping backward compatibility with `compare_csq_fields()` (defaults to 74-field `CSQ_FIELD_NAMES`).
+
+### VEP traceability
+
+- `--everything` definition: [Config.pm#L346-L374](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L346-L374)
+- Flag implications: [Config.pm#L436-L441](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L436-L441)
+- APPRIS output: [OutputFactory.pm#L1563-L1570](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1563-L1570)
+- DOMAINS output: [OutputFactory.pm#L1448-L1466](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1448-L1466)
+- SIFT/PolyPhen output: [OutputFactory.pm#L1746-L1799](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799)
+- miRNA output: [OutputFactory.pm#L1572-L1612](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1572-L1612)
+- CSQ field order: [Constants.pm#L66-L138](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138)
+
+### Critical files
+
+- `annotate_provider.rs` — flag parsing, CSQ assembly, column loading
+- `transcript_consequence.rs` — TranscriptConsequence/Feature structs, miRNA logic
+- `golden_benchmark.rs` — CSQ_FIELD_NAMES
+- `annotate_vep_golden_bench.rs` — benchmark harness
+
 ## Non-Goals
 
 - optimizing runtime before semantic parity is reached

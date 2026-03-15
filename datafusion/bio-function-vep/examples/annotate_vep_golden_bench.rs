@@ -13,12 +13,13 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::golden_benchmark::{
-    ComparisonReport, CsqFieldReport, CsqMultiplicityReport, CsqUnmatchedReport,
-    DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ, DEFAULT_EXTERNAL_VEP_CACHE_DIR,
+    CSQ_FIELD_NAMES_EVERYTHING, ComparisonReport, CsqFieldReport, CsqMultiplicityReport,
+    CsqUnmatchedReport, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ, DEFAULT_EXTERNAL_VEP_CACHE_DIR,
     DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, TermComparisonReport, VariantAnnotation, VariantDiscrepancy,
     VariantKey, collect_discrepancies, compare_annotation_terms, compare_annotations,
-    compare_csq_fields, diagnose_csq_multiplicity, diagnose_unmatched_csq, ensure_local_copy,
-    normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
+    compare_csq_fields, compare_csq_fields_with_names, diagnose_csq_multiplicity,
+    diagnose_unmatched_csq, ensure_local_copy, normalize_chrom, parse_vep_vcf_annotations,
+    sample_gz_vcf_first_n,
 };
 use datafusion_bio_function_vep::register_vep_functions;
 
@@ -50,6 +51,8 @@ struct Args {
     shift_hgvs: Option<bool>,
     /// Reference FASTA required for offline HGVS generation.
     reference_fasta_path: Option<PathBuf>,
+    /// Use VEP --everything flag (enables all features, 80-field CSQ schema).
+    everything: bool,
 }
 
 fn parse_cli_bool(raw: &str) -> Option<bool> {
@@ -147,6 +150,7 @@ impl Args {
             hgvs,
             shift_hgvs,
             reference_fasta_path,
+            everything: args.iter().any(|a| a == "--everything"),
         }
     }
 
@@ -199,6 +203,7 @@ async fn main() -> Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(none)".to_string())
     );
+    println!("  everything: {}", args.everything);
 
     fs::create_dir_all(&args.work_dir).map_err(io_err)?;
 
@@ -294,6 +299,7 @@ async fn main() -> Result<()> {
                 args.hgvs,
                 args.shift_hgvs,
                 args.reference_fasta_path.as_deref(),
+                args.everything,
             )?;
             let elapsed = docker_start.elapsed().as_secs_f64();
             println!(
@@ -346,7 +352,11 @@ async fn main() -> Result<()> {
     if let (Some(golden), Some(ours)) = (&golden_annotations, &ours_annotations) {
         let report = compare_annotations(golden, ours);
         let term_report = compare_annotation_terms(golden, ours);
-        let csq_field_report = compare_csq_fields(golden, ours);
+        let csq_field_report = if args.everything {
+            compare_csq_fields_with_names(golden, ours, CSQ_FIELD_NAMES_EVERYTHING)
+        } else {
+            compare_csq_fields(golden, ours)
+        };
         let discrepancies = collect_discrepancies(golden, ours);
         let unmatched_report = diagnose_unmatched_csq(golden, ours);
         let multiplicity_report = diagnose_csq_multiplicity(golden, ours);
@@ -447,14 +457,14 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
     // Extended probes: use interval-overlap fallback for shifted indels.
     entries.push(format!("\"extended_probes\":{}", args.extended_probes));
 
-    if args.hgvs {
-        entries.push("\"hgvs\":true".to_string());
-        if let Some(shift_hgvs) = args.shift_hgvs {
-            entries.push(format!("\"shift_hgvs\":{shift_hgvs}"));
-        }
+    if args.everything {
+        // --everything implies --hgvs and all other flags.
+        entries.push("\"everything\":true".to_string());
+        // --everything implies HGVS, so we need the reference FASTA.
         let fasta_path = args.reference_fasta_path.as_ref().ok_or_else(|| {
             DataFusionError::Execution(
-                "--hgvs requires --reference-fasta-path=/path/to/reference.fa[.gz]".to_string(),
+                "--everything requires --reference-fasta-path=/path/to/reference.fa[.gz]"
+                    .to_string(),
             )
         })?;
         entries.push(format!(
@@ -463,16 +473,36 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
                 DataFusionError::Execution("reference_fasta_path must be valid UTF-8".to_string())
             })?)
         ));
-    }
+    } else {
+        if args.hgvs {
+            entries.push("\"hgvs\":true".to_string());
+            if let Some(shift_hgvs) = args.shift_hgvs {
+                entries.push(format!("\"shift_hgvs\":{shift_hgvs}"));
+            }
+            let fasta_path = args.reference_fasta_path.as_ref().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "--hgvs requires --reference-fasta-path=/path/to/reference.fa[.gz]".to_string(),
+                )
+            })?;
+            entries.push(format!(
+                "\"reference_fasta_path\":\"{}\"",
+                sql_literal(fasta_path.to_str().ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "reference_fasta_path must be valid UTF-8".to_string(),
+                    )
+                })?)
+            ));
+        }
 
-    // Batch 3 flags — enable frequency and clinical CSQ fields.
-    entries.push("\"check_existing\":true".to_string());
-    entries.push("\"af\":true".to_string());
-    entries.push("\"af_1kg\":true".to_string());
-    entries.push("\"af_gnomade\":true".to_string());
-    entries.push("\"af_gnomadg\":true".to_string());
-    entries.push("\"max_af\":true".to_string());
-    entries.push("\"pubmed\":true".to_string());
+        // Batch 3 flags — enable frequency and clinical CSQ fields.
+        entries.push("\"check_existing\":true".to_string());
+        entries.push("\"af\":true".to_string());
+        entries.push("\"af_1kg\":true".to_string());
+        entries.push("\"af_gnomade\":true".to_string());
+        entries.push("\"af_gnomadg\":true".to_string());
+        entries.push("\"max_af\":true".to_string());
+        entries.push("\"pubmed\":true".to_string());
+    }
 
     if args.merged {
         entries.push("\"merged\":true".to_string());
@@ -566,6 +596,7 @@ fn run_vep_docker(
     hgvs: bool,
     shift_hgvs: Option<bool>,
     reference_fasta_path: Option<&Path>,
+    everything: bool,
 ) -> Result<()> {
     let sampled_name = sampled_vcf
         .file_name()
@@ -629,8 +660,7 @@ fn run_vep_docker(
             .arg("--fasta")
             .arg(format!("/fasta/{fasta_name}"));
         if let Some(value) = shift_hgvs {
-            cmd.arg("--shift_hgvs")
-                .arg(if value { "1" } else { "0" });
+            cmd.arg("--shift_hgvs").arg(if value { "1" } else { "0" });
         }
     } else {
         cmd.arg("ensemblorg/ensembl-vep:release_115.2")
@@ -650,43 +680,48 @@ fn run_vep_docker(
             .arg("--no_stats");
     }
 
-    // Enable regulatory feature annotations (VEP skips them by default).
-    cmd.arg("--regulatory");
+    if everything {
+        // --everything enables all VEP features; VEP determines its own 80-field order.
+        cmd.arg("--everything");
+    } else {
+        // Enable regulatory feature annotations (VEP skips them by default).
+        cmd.arg("--regulatory");
 
-    // Batch 1 VEP flags — enable additional CSQ fields for comparison.
-    cmd.arg("--variant_class");
-    cmd.arg("--canonical");
-    cmd.arg("--tsl");
-    cmd.arg("--mane");
-    cmd.arg("--protein");
-    cmd.arg("--gene_phenotype");
-    cmd.arg("--ccds");
-    cmd.arg("--uniprot");
+        // Batch 1 VEP flags — enable additional CSQ fields for comparison.
+        cmd.arg("--variant_class");
+        cmd.arg("--canonical");
+        cmd.arg("--tsl");
+        cmd.arg("--mane");
+        cmd.arg("--protein");
+        cmd.arg("--gene_phenotype");
+        cmd.arg("--ccds");
+        cmd.arg("--uniprot");
 
-    // Batch 3 VEP flags — enable frequency and clinical CSQ fields.
-    cmd.arg("--check_existing");
-    cmd.arg("--af");
-    cmd.arg("--af_1kg");
-    cmd.arg("--af_gnomade");
-    cmd.arg("--af_gnomadg");
-    cmd.arg("--max_af");
-    cmd.arg("--pubmed");
+        // Batch 3 VEP flags — enable frequency and clinical CSQ fields.
+        cmd.arg("--check_existing");
+        cmd.arg("--af");
+        cmd.arg("--af_1kg");
+        cmd.arg("--af_gnomade");
+        cmd.arg("--af_gnomadg");
+        cmd.arg("--max_af");
+        cmd.arg("--pubmed");
 
-    // Explicit field order matching CSQ_FIELD_NAMES (74 fields).
-    cmd.arg("--fields").arg(
-        "Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,EXON,INTRON,\
-              HGVSc,HGVSp,cDNA_position,CDS_position,Protein_position,Amino_acids,Codons,\
-              Existing_variation,DISTANCE,STRAND,FLAGS,SYMBOL_SOURCE,HGNC_ID,\
-              MOTIF_NAME,MOTIF_POS,HIGH_INF_POS,MOTIF_SCORE_CHANGE,TRANSCRIPTION_FACTORS,SOURCE,\
-              VARIANT_CLASS,CANONICAL,TSL,MANE_SELECT,MANE_PLUS_CLINICAL,ENSP,GENE_PHENO,CCDS,\
-              SWISSPROT,TREMBL,UNIPARC,UNIPROT_ISOFORM,\
-              AF,AFR_AF,AMR_AF,EAS_AF,EUR_AF,SAS_AF,\
-              gnomADe_AF,gnomADe_AFR,gnomADe_AMR,gnomADe_ASJ,gnomADe_EAS,gnomADe_FIN,\
-              gnomADe_MID,gnomADe_NFE,gnomADe_REMAINING,gnomADe_SAS,\
-              gnomADg_AF,gnomADg_AFR,gnomADg_AMI,gnomADg_AMR,gnomADg_ASJ,gnomADg_EAS,\
-              gnomADg_FIN,gnomADg_MID,gnomADg_NFE,gnomADg_REMAINING,gnomADg_SAS,\
-              MAX_AF,MAX_AF_POPS,CLIN_SIG,SOMATIC,PHENO,PUBMED",
-    );
+        // Explicit field order matching CSQ_FIELD_NAMES (74 fields).
+        cmd.arg("--fields").arg(
+            "Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,EXON,INTRON,\
+                  HGVSc,HGVSp,cDNA_position,CDS_position,Protein_position,Amino_acids,Codons,\
+                  Existing_variation,DISTANCE,STRAND,FLAGS,SYMBOL_SOURCE,HGNC_ID,\
+                  MOTIF_NAME,MOTIF_POS,HIGH_INF_POS,MOTIF_SCORE_CHANGE,TRANSCRIPTION_FACTORS,SOURCE,\
+                  VARIANT_CLASS,CANONICAL,TSL,MANE_SELECT,MANE_PLUS_CLINICAL,ENSP,GENE_PHENO,CCDS,\
+                  SWISSPROT,TREMBL,UNIPARC,UNIPROT_ISOFORM,\
+                  AF,AFR_AF,AMR_AF,EAS_AF,EUR_AF,SAS_AF,\
+                  gnomADe_AF,gnomADe_AFR,gnomADe_AMR,gnomADe_ASJ,gnomADe_EAS,gnomADe_FIN,\
+                  gnomADe_MID,gnomADe_NFE,gnomADe_REMAINING,gnomADe_SAS,\
+                  gnomADg_AF,gnomADg_AFR,gnomADg_AMI,gnomADg_AMR,gnomADg_ASJ,gnomADg_EAS,\
+                  gnomADg_FIN,gnomADg_MID,gnomADg_NFE,gnomADg_REMAINING,gnomADg_SAS,\
+                  MAX_AF,MAX_AF_POPS,CLIN_SIG,SOMATIC,PHENO,PUBMED",
+        );
+    }
 
     if merged {
         cmd.arg("--merged");

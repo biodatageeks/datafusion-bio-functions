@@ -170,6 +170,8 @@ pub struct TranscriptFeature {
     pub trembl: Option<String>,
     pub uniparc: Option<String>,
     pub uniprot_isoform: Option<String>,
+    /// APPRIS annotation code (e.g. "principal1", "alternative2").
+    pub appris: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,7 +182,16 @@ pub struct ExonFeature {
     pub end: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A single SIFT or PolyPhen prediction entry keyed by (position, amino_acid).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProteinPrediction {
+    pub position: i32,
+    pub amino_acid: String,
+    pub prediction: String,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranslationFeature {
     pub transcript_id: String,
     pub cds_len: Option<usize>,
@@ -191,6 +202,10 @@ pub struct TranslationFeature {
     pub stable_id: Option<String>,
     /// Translation version number.
     pub version: Option<i32>,
+    /// Pre-computed SIFT predictions indexed by (position, amino_acid).
+    pub sift_predictions: Vec<ProteinPrediction>,
+    /// Pre-computed PolyPhen predictions indexed by (position, amino_acid).
+    pub polyphen_predictions: Vec<ProteinPrediction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -649,8 +664,7 @@ impl TranscriptConsequenceEngine {
                         );
                         // Compute HGVSp notation.
                         let hgvsp = tx_translation.and_then(|tl| {
-                            let effective_translation =
-                                translation_for_hgvsp(tx, tl);
+                            let effective_translation = translation_for_hgvsp(tx, tl);
                             protein_hgvs.as_ref().and_then(|data| {
                                 crate::hgvs::format_hgvsp(
                                     &effective_translation,
@@ -2501,7 +2515,9 @@ fn build_protein_hgvs_data(
     frameshift: bool,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
     let raw_start = class.protein_position_start?;
-    let raw_end = class.protein_position_end.or(class.protein_position_start)?;
+    let raw_end = class
+        .protein_position_end
+        .or(class.protein_position_start)?;
     let (ref_peptide, alt_peptide) = match class.amino_acids.as_deref() {
         Some(value) => match value.split_once('/') {
             Some((left, right)) => (left.to_string(), right.to_string()),
@@ -3038,8 +3054,8 @@ fn classify_insertion(
     // positions, the insertion is at a codon boundary.
     // https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L477-L478
     let codon_at = cds_idx / 3;
-    let hgvs_cds_a = genomic_to_cds_index(tx, tx_exons, variant.start)
-        .map(|i| i + leading_n_offset + 1); // 1-based
+    let hgvs_cds_a =
+        genomic_to_cds_index(tx, tx_exons, variant.start).map(|i| i + leading_n_offset + 1); // 1-based
     let hgvs_cds_b = genomic_to_cds_index(tx, tx_exons, variant.start.saturating_sub(1))
         .map(|i| i + leading_n_offset + 1); // 1-based
     let (pep_a, pep_b) = match (hgvs_cds_a, hgvs_cds_b) {
@@ -3678,7 +3694,8 @@ pub(crate) fn unshifted_cdna_bounds_for_hgvs_shift(
     let coords = transcript_cdna_coords(tx, tx_exons)?;
 
     if ref_allele == "-" && alt_allele != "-" {
-        let left = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant_start.saturating_sub(1));
+        let left =
+            genomic_to_cdna_index_for_transcript(tx, tx_exons, variant_start.saturating_sub(1));
         let right = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant_start);
         return match (left, right) {
             (Some(left), Some(right)) => Some((left.min(right), left.max(right))),
@@ -3699,8 +3716,13 @@ pub(crate) fn unshifted_cdna_bounds_for_hgvs_shift(
                 Some((left.min(other), left.max(other)))
             }
             (None, None) => {
-                let prev_segment = coords.iter().take_while(|segment| segment.end < variant_start).last()?;
-                let next_segment = coords.iter().find(|segment| segment.start > variant_start)?;
+                let prev_segment = coords
+                    .iter()
+                    .take_while(|segment| segment.end < variant_start)
+                    .last()?;
+                let next_segment = coords
+                    .iter()
+                    .find(|segment| segment.start > variant_start)?;
                 if tx.strand >= 0 {
                     Some((prev_segment.cdna_end, next_segment.cdna_start))
                 } else {
@@ -4187,10 +4209,7 @@ fn three_prime_utr_seq(tx: &TranscriptFeature) -> Option<String> {
     }
     let coding_end = tx.cdna_coding_end?;
     // Try spliced_seq first (for edited RefSeq transcripts), then cdna_seq.
-    let full_seq = tx
-        .spliced_seq
-        .as_deref()
-        .or(tx.cdna_seq.as_deref())?;
+    let full_seq = tx.spliced_seq.as_deref().or(tx.cdna_seq.as_deref())?;
     if coding_end >= full_seq.len() {
         return None;
     }
@@ -4292,6 +4311,7 @@ mod tests {
             trembl: None,
             uniparc: None,
             uniprot_isoform: None,
+            appris: None,
         }
     }
 
@@ -4393,12 +4413,23 @@ mod tests {
             cds_sequence: cds_sequence.map(|v| v.to_string()),
             stable_id: None,
             version: None,
+            sift_predictions: Vec::new(),
+            polyphen_predictions: Vec::new(),
         }
     }
 
     #[test]
     fn translation_for_hgvsp_falls_back_to_transcript_stable_id() {
-        let mut transcript = tx("ENSTTEST0001", "1", 1, 10, 1, "protein_coding", Some(1), Some(9));
+        let mut transcript = tx(
+            "ENSTTEST0001",
+            "1",
+            1,
+            10,
+            1,
+            "protein_coding",
+            Some(1),
+            Some(9),
+        );
         transcript.translation_stable_id = Some("ENSPTEST0001".to_string());
         let translation = translation("ENSTTEST0001", None, None, None, None);
 
@@ -6076,7 +6107,16 @@ mod tests {
 
     #[test]
     fn compute_cdna_position_snv() {
-        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 150, 150, "A", "G");
@@ -6553,7 +6593,16 @@ mod tests {
     #[test]
     fn compute_cdna_position_insertion_within_exon() {
         // Insertion within a single exon → range "a-b"
-        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 150, 150, "-", "ACG");
@@ -6567,7 +6616,16 @@ mod tests {
     fn compute_cdna_position_insertion_at_exon_left_boundary() {
         // Insertion at start of exon: left flanking position is intronic
         // Exon: 200..300. Insertion at pos 200: left=199 (intronic), right=200 (exonic)
-        let t = tx("tx1", "22", 200, 300, 1, "protein_coding", Some(200), Some(300));
+        let t = tx(
+            "tx1",
+            "22",
+            200,
+            300,
+            1,
+            "protein_coding",
+            Some(200),
+            Some(300),
+        );
         let exons = vec![exon("tx1", 1, 200, 300)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 200, 200, "-", "ACG");
@@ -6586,7 +6644,16 @@ mod tests {
     fn compute_cdna_position_insertion_at_exon_right_boundary() {
         // Insertion at end of exon: right flanking position is intronic
         // Exon: 100..200. Insertion at pos 201: left=200 (exonic), right=201 (intronic)
-        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 201, 201, "-", "ACG");
@@ -6606,7 +6673,16 @@ mod tests {
     #[test]
     fn compute_cdna_position_insertion_at_exon_boundary_minus_strand() {
         // Minus strand: insertion at exon boundary with intronic flanking
-        let t = tx("tx1", "22", 200, 300, -1, "protein_coding", Some(200), Some(300));
+        let t = tx(
+            "tx1",
+            "22",
+            200,
+            300,
+            -1,
+            "protein_coding",
+            Some(200),
+            Some(300),
+        );
         let exons = vec![exon("tx1", 1, 200, 300)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         // Insertion at pos 200: left=199 (intronic), right=200 (exonic)
@@ -6621,7 +6697,16 @@ mod tests {
     #[test]
     fn compute_cdna_position_deletion_spanning_boundary() {
         // Deletion that starts before exon, ends within exon → "?-N"
-        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         // Deletion from 90 to 110: start is outside exon, end is inside
@@ -6638,7 +6723,16 @@ mod tests {
     #[test]
     fn compute_cdna_position_deletion_spanning_boundary_minus_strand() {
         // On minus strand: deletion extending past exon end
-        let t = tx("tx1", "22", 100, 200, -1, "protein_coding", Some(100), Some(200));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            200,
+            -1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         // Deletion from 190 to 210: start inside, end outside
@@ -6655,7 +6749,16 @@ mod tests {
     #[test]
     fn compute_cdna_position_deletion_range() {
         // Multi-base deletion fully within exon → "start-end"
-        let t = tx("tx1", "22", 100, 200, 1, "protein_coding", Some(100), Some(200));
+        let t = tx(
+            "tx1",
+            "22",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(200),
+        );
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 110, 115, "NNNNNN", "-");
@@ -6712,7 +6815,10 @@ mod tests {
         ];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("1", 41383346, 41383346, "C", "T");
-        assert_eq!(compute_cdna_position(&v, &t, &refs), Some("2842".to_string()));
+        assert_eq!(
+            compute_cdna_position(&v, &t, &refs),
+            Some("2842".to_string())
+        );
     }
 
     #[test]
@@ -7903,7 +8009,16 @@ mod tests {
 
     #[test]
     fn three_prime_utr_seq_returns_none_for_lof_biotype() {
-        let t = tx("ENST0001", "1", 100, 200, 1, "protein_coding_LoF", Some(110), Some(180));
+        let t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding_LoF",
+            Some(110),
+            Some(180),
+        );
         let mut t = t;
         t.cdna_coding_end = Some(80);
         t.spliced_seq = Some("ATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGATGTAATGA".into());
@@ -7912,7 +8027,16 @@ mod tests {
 
     #[test]
     fn three_prime_utr_seq_returns_utr_from_spliced_seq() {
-        let mut t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(180));
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(180),
+        );
         t.cdna_coding_end = Some(9);
         t.spliced_seq = Some("ATGATGATGCCCGGG".into()); // 15 bases, coding ends at 9
         let utr = three_prime_utr_seq(&t);
@@ -7921,7 +8045,16 @@ mod tests {
 
     #[test]
     fn three_prime_utr_seq_falls_back_to_cdna_seq() {
-        let mut t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(180));
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(180),
+        );
         t.cdna_coding_end = Some(9);
         t.spliced_seq = None;
         t.cdna_seq = Some("ATGATGATGTTTTTT".into());
@@ -7931,7 +8064,16 @@ mod tests {
 
     #[test]
     fn three_prime_utr_seq_returns_none_when_coding_end_at_seq_end() {
-        let mut t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(180));
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(180),
+        );
         t.cdna_coding_end = Some(9);
         t.spliced_seq = Some("ATGATGATG".into()); // 9 bases, coding_end == len
         assert!(three_prime_utr_seq(&t).is_none());
@@ -7939,7 +8081,16 @@ mod tests {
 
     #[test]
     fn three_prime_utr_seq_returns_none_when_no_coding_end() {
-        let mut t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(180));
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(180),
+        );
         t.cdna_coding_end = None;
         t.spliced_seq = Some("ATGATGATGCCC".into());
         assert!(three_prime_utr_seq(&t).is_none());
@@ -7951,7 +8102,16 @@ mod tests {
 
     #[test]
     fn genomic_to_cds_index_positive_strand() {
-        let t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(150));
+        let t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(150),
+        );
         let exon = ExonFeature {
             transcript_id: "ENST0001".into(),
             exon_number: 1,
@@ -7967,7 +8127,16 @@ mod tests {
 
     #[test]
     fn genomic_to_cds_index_negative_strand() {
-        let t = tx("ENST0001", "1", 100, 200, -1, "protein_coding", Some(110), Some(150));
+        let t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            -1,
+            "protein_coding",
+            Some(110),
+            Some(150),
+        );
         let exon = ExonFeature {
             transcript_id: "ENST0001".into(),
             exon_number: 1,
@@ -7984,7 +8153,16 @@ mod tests {
 
     #[test]
     fn genomic_to_cds_index_outside_cds_returns_none() {
-        let t = tx("ENST0001", "1", 100, 200, 1, "protein_coding", Some(110), Some(150));
+        let t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(150),
+        );
         let exon = ExonFeature {
             transcript_id: "ENST0001".into(),
             exon_number: 1,
@@ -8002,9 +8180,28 @@ mod tests {
 
     #[test]
     fn coding_segments_positive_strand_sorted_ascending() {
-        let t = tx("ENST0001", "1", 100, 300, 1, "protein_coding", Some(120), Some(280));
-        let e1 = ExonFeature { transcript_id: "ENST0001".into(), exon_number: 1, start: 100, end: 150 };
-        let e2 = ExonFeature { transcript_id: "ENST0001".into(), exon_number: 2, start: 200, end: 300 };
+        let t = tx(
+            "ENST0001",
+            "1",
+            100,
+            300,
+            1,
+            "protein_coding",
+            Some(120),
+            Some(280),
+        );
+        let e1 = ExonFeature {
+            transcript_id: "ENST0001".into(),
+            exon_number: 1,
+            start: 100,
+            end: 150,
+        };
+        let e2 = ExonFeature {
+            transcript_id: "ENST0001".into(),
+            exon_number: 2,
+            start: 200,
+            end: 300,
+        };
         let exons = vec![&e1, &e2];
         let segs = coding_segments(&t, &exons).unwrap();
         assert_eq!(segs, vec![(120, 150), (200, 280)]);
@@ -8012,9 +8209,28 @@ mod tests {
 
     #[test]
     fn coding_segments_negative_strand_reversed() {
-        let t = tx("ENST0001", "1", 100, 300, -1, "protein_coding", Some(120), Some(280));
-        let e1 = ExonFeature { transcript_id: "ENST0001".into(), exon_number: 1, start: 100, end: 150 };
-        let e2 = ExonFeature { transcript_id: "ENST0001".into(), exon_number: 2, start: 200, end: 300 };
+        let t = tx(
+            "ENST0001",
+            "1",
+            100,
+            300,
+            -1,
+            "protein_coding",
+            Some(120),
+            Some(280),
+        );
+        let e1 = ExonFeature {
+            transcript_id: "ENST0001".into(),
+            exon_number: 1,
+            start: 100,
+            end: 150,
+        };
+        let e2 = ExonFeature {
+            transcript_id: "ENST0001".into(),
+            exon_number: 2,
+            start: 200,
+            end: 300,
+        };
         let exons = vec![&e1, &e2];
         let segs = coding_segments(&t, &exons).unwrap();
         // Negative strand: reversed order
@@ -8024,7 +8240,12 @@ mod tests {
     #[test]
     fn coding_segments_returns_none_without_cds() {
         let t = tx("ENST0001", "1", 100, 300, 1, "lncRNA", None, None);
-        let e1 = ExonFeature { transcript_id: "ENST0001".into(), exon_number: 1, start: 100, end: 300 };
+        let e1 = ExonFeature {
+            transcript_id: "ENST0001".into(),
+            exon_number: 1,
+            start: 100,
+            end: 300,
+        };
         let exons = vec![&e1];
         assert!(coding_segments(&t, &exons).is_none());
     }

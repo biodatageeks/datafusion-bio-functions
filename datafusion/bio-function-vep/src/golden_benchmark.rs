@@ -464,7 +464,7 @@ pub fn collect_discrepancies(
     out
 }
 
-/// CSQ field names matching VEP `--fields` output order (41 fields).
+/// CSQ field names matching VEP `--fields` output order (74 fields).
 pub const CSQ_FIELD_NAMES: &[&str] = &[
     "Allele",
     "Consequence",
@@ -542,6 +542,104 @@ pub const CSQ_FIELD_NAMES: &[&str] = &[
     "SOMATIC",
     "PHENO",
     "PUBMED",
+];
+
+/// CSQ field names for `--everything` mode (80 fields).
+///
+/// Traceability:
+/// - VEP Constants.pm CSQ field order
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
+///
+/// Key differences from 74-field layout:
+/// - `SOURCE` removed (only present in `--merged` mode)
+/// - `VARIANT_CLASS` moved from after SOURCE to after FLAGS
+/// - `MANE` generic field added (separate from MANE_SELECT/MANE_PLUS_CLINICAL)
+/// - `APPRIS`, `SIFT`, `PolyPhen`, `DOMAINS`, `miRNA`, `HGVS_OFFSET` added
+/// - gnomAD sub-population fields have `_AF` suffix
+/// - `MOTIF_*` fields moved to end (positions 75-79)
+pub const CSQ_FIELD_NAMES_EVERYTHING: &[&str] = &[
+    "Allele",
+    "Consequence",
+    "IMPACT",
+    "SYMBOL",
+    "Gene",
+    "Feature_type",
+    "Feature",
+    "BIOTYPE",
+    "EXON",
+    "INTRON",
+    "HGVSc",
+    "HGVSp",
+    "cDNA_position",
+    "CDS_position",
+    "Protein_position",
+    "Amino_acids",
+    "Codons",
+    "Existing_variation",
+    "DISTANCE",
+    "STRAND",
+    "FLAGS",
+    "VARIANT_CLASS",
+    "SYMBOL_SOURCE",
+    "HGNC_ID",
+    "CANONICAL",
+    "MANE",
+    "MANE_SELECT",
+    "MANE_PLUS_CLINICAL",
+    "TSL",
+    "APPRIS",
+    "CCDS",
+    "ENSP",
+    "SWISSPROT",
+    "TREMBL",
+    "UNIPARC",
+    "UNIPROT_ISOFORM",
+    "GENE_PHENO",
+    "SIFT",
+    "PolyPhen",
+    "DOMAINS",
+    "miRNA",
+    "HGVS_OFFSET",
+    // Batch 3 fields (gnomAD sub-pops have _AF suffix in --everything).
+    "AF",
+    "AFR_AF",
+    "AMR_AF",
+    "EAS_AF",
+    "EUR_AF",
+    "SAS_AF",
+    "gnomADe_AF",
+    "gnomADe_AFR_AF",
+    "gnomADe_AMR_AF",
+    "gnomADe_ASJ_AF",
+    "gnomADe_EAS_AF",
+    "gnomADe_FIN_AF",
+    "gnomADe_MID_AF",
+    "gnomADe_NFE_AF",
+    "gnomADe_REMAINING_AF",
+    "gnomADe_SAS_AF",
+    "gnomADg_AF",
+    "gnomADg_AFR_AF",
+    "gnomADg_AMI_AF",
+    "gnomADg_AMR_AF",
+    "gnomADg_ASJ_AF",
+    "gnomADg_EAS_AF",
+    "gnomADg_FIN_AF",
+    "gnomADg_MID_AF",
+    "gnomADg_NFE_AF",
+    "gnomADg_REMAINING_AF",
+    "gnomADg_SAS_AF",
+    "MAX_AF",
+    "MAX_AF_POPS",
+    "CLIN_SIG",
+    "SOMATIC",
+    "PHENO",
+    "PUBMED",
+    // Motif fields moved to end in --everything.
+    "MOTIF_NAME",
+    "MOTIF_POS",
+    "HIGH_INF_POS",
+    "MOTIF_SCORE_CHANGE",
+    "TRANSCRIPTION_FACTORS",
 ];
 
 /// Sample of a field-level mismatch for debugging.
@@ -804,12 +902,23 @@ fn parse_csq_entries(csq: &str) -> Vec<CsqEntry> {
 /// Compare per-field CSQ accuracy between golden VEP output and ours.
 ///
 /// Matches entries by (Allele, Feature) key within each variant, then
-/// compares each of the 13 CSQ fields.
+/// compares each CSQ field. Uses the provided `field_names` to determine
+/// the number of fields (pass `CSQ_FIELD_NAMES` for 74-field mode or
+/// `CSQ_FIELD_NAMES_EVERYTHING` for 80-field `--everything` mode).
 pub fn compare_csq_fields(
     golden: &[VariantAnnotation],
     ours: &[VariantAnnotation],
 ) -> CsqFieldReport {
-    let field_count = CSQ_FIELD_NAMES.len();
+    compare_csq_fields_with_names(golden, ours, CSQ_FIELD_NAMES)
+}
+
+/// Compare per-field CSQ accuracy using a custom field name list.
+pub fn compare_csq_fields_with_names(
+    golden: &[VariantAnnotation],
+    ours: &[VariantAnnotation],
+    field_names: &[&str],
+) -> CsqFieldReport {
+    let field_count = field_names.len();
     let mut field_match_counts = vec![0usize; field_count];
     let mut field_mismatch_samples: HashMap<usize, Vec<FieldMismatchSample>> = HashMap::new();
     let mut total_entries = 0usize;
@@ -877,7 +986,7 @@ pub fn compare_csq_fields(
     }
 
     CsqFieldReport {
-        field_names: CSQ_FIELD_NAMES.iter().map(|s| s.to_string()).collect(),
+        field_names: field_names.iter().map(|s| s.to_string()).collect(),
         field_match_counts,
         total_entries_compared: total_entries,
         field_mismatch_samples,
@@ -1098,6 +1207,34 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         assert_eq!(CSQ_FIELD_NAMES[57], "gnomADg_AF");
         assert_eq!(CSQ_FIELD_NAMES[68], "MAX_AF");
         assert_eq!(CSQ_FIELD_NAMES[73], "PUBMED");
+    }
+
+    #[test]
+    fn csq_field_names_everything_has_80_entries() {
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING.len(), 80);
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[0], "Allele");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[1], "Consequence");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[6], "Feature");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[17], "Existing_variation");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[19], "STRAND");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[20], "FLAGS");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[21], "VARIANT_CLASS");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[24], "CANONICAL");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[25], "MANE");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[29], "APPRIS");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[35], "UNIPROT_ISOFORM");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[37], "SIFT");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[38], "PolyPhen");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[39], "DOMAINS");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[40], "miRNA");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[41], "HGVS_OFFSET");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[42], "AF");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[49], "gnomADe_AFR_AF");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[58], "gnomADg_AF");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[69], "MAX_AF");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[74], "PUBMED");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[75], "MOTIF_NAME");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[79], "TRANSCRIPTION_FACTORS");
     }
 
     #[test]

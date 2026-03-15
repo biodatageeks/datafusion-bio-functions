@@ -3,14 +3,14 @@
 use std::cmp::Ordering;
 use std::io::{BufRead, Seek};
 
-use datafusion::common::{DataFusionError, Result};
-use noodles_core::{Position, Region};
-use noodles_fasta as fasta;
 use crate::transcript_consequence::{
     ExonFeature, TranscriptCdnaMapperSegment, TranscriptFeature, TranslationFeature,
     genomic_to_cdna_index_for_transcript, raw_cdna_position_from_genomic,
     unshifted_cdna_bounds_for_hgvs_shift,
 };
+use datafusion::common::{DataFusionError, Result};
+use noodles_core::{Position, Region};
+use noodles_fasta as fasta;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProteinHgvsData {
@@ -188,34 +188,35 @@ pub fn format_hgvsc(
             && !shift.shifted_output_allele.is_empty()
             && shift.shifted_output_allele != "-"
     });
-    let (ref_allele, alt_allele, variant_start, variant_end) = if let Some(shift) = use_genomic_shift {
-        (
-            ref_allele,
-            if ref_allele == "-" {
-                edited_shifted_output_allele
-                    .as_deref()
-                    .unwrap_or(shift.shifted_output_allele.as_str())
-            } else {
-                alt_allele
-            },
-            shift.display_start(),
-            shift.display_end(),
-        )
-    } else {
-        (ref_allele, alt_allele, variant_start, variant_end)
-    };
-    let (feature_ref, feature_alt) = hgvs_feature_strand_alleles(tx, ref_allele, alt_allele)?;
-    let mut notation = hgvs_variant_notation(&feature_ref, &feature_alt, variant_start, variant_end)?;
-    if let Some(shift) = dup_context {
-        let shifted_feature_alt =
-            hgvs_feature_strand_alleles(
-                tx,
-                "-",
-                edited_shifted_output_allele
-                    .as_deref()
-                    .unwrap_or(&shift.shifted_output_allele),
+    let (ref_allele, alt_allele, variant_start, variant_end) =
+        if let Some(shift) = use_genomic_shift {
+            (
+                ref_allele,
+                if ref_allele == "-" {
+                    edited_shifted_output_allele
+                        .as_deref()
+                        .unwrap_or(shift.shifted_output_allele.as_str())
+                } else {
+                    alt_allele
+                },
+                shift.display_start(),
+                shift.display_end(),
             )
-            .map(|(_, alt)| alt)?;
+        } else {
+            (ref_allele, alt_allele, variant_start, variant_end)
+        };
+    let (feature_ref, feature_alt) = hgvs_feature_strand_alleles(tx, ref_allele, alt_allele)?;
+    let mut notation =
+        hgvs_variant_notation(&feature_ref, &feature_alt, variant_start, variant_end)?;
+    if let Some(shift) = dup_context {
+        let shifted_feature_alt = hgvs_feature_strand_alleles(
+            tx,
+            "-",
+            edited_shifted_output_allele
+                .as_deref()
+                .unwrap_or(&shift.shifted_output_allele),
+        )
+        .map(|(_, alt)| alt)?;
         apply_shifted_insertion_duplication(tx, &shifted_feature_alt, shift, &mut notation);
     }
     if notation.kind != "dup" {
@@ -353,42 +354,41 @@ where
     } else {
         shifted_start - shift_length as i64
     };
-    let (five_prime_context, three_prime_context) = if matches!(kind, GenomicShiftKind::Insertion)
-        && inserted_len > 0
-    {
-        // Match Ensembl's transcript HGVS duplication detection by storing the
-        // adjacent reference sequence on the transcript 5' and 3' sides of the
-        // shifted insertion point. For trimmed insertions `shifted_start` is
-        // the genomic base immediately to the right of the insertion.
-        let (five_start, five_end, three_start, three_end) = if strand >= 0 {
-            (
-                (display_start - inserted_len).max(1),
-                (display_start - 1).max(0),
-                display_start,
-                display_start + inserted_len - 1,
-            )
+    let (five_prime_context, three_prime_context) =
+        if matches!(kind, GenomicShiftKind::Insertion) && inserted_len > 0 {
+            // Match Ensembl's transcript HGVS duplication detection by storing the
+            // adjacent reference sequence on the transcript 5' and 3' sides of the
+            // shifted insertion point. For trimmed insertions `shifted_start` is
+            // the genomic base immediately to the right of the insertion.
+            let (five_start, five_end, three_start, three_end) = if strand >= 0 {
+                (
+                    (display_start - inserted_len).max(1),
+                    (display_start - 1).max(0),
+                    display_start,
+                    display_start + inserted_len - 1,
+                )
+            } else {
+                (
+                    display_start,
+                    display_start + inserted_len - 1,
+                    (display_start - inserted_len).max(1),
+                    (display_start - 1).max(0),
+                )
+            };
+            let five = if five_end >= five_start && five_end > 0 {
+                read_reference_sequence(reader, chrom, five_start, five_end)?
+            } else {
+                String::new()
+            };
+            let three = if three_end >= three_start && three_end > 0 {
+                read_reference_sequence(reader, chrom, three_start, three_end)?
+            } else {
+                String::new()
+            };
+            (five, three)
         } else {
-            (
-                display_start,
-                display_start + inserted_len - 1,
-                (display_start - inserted_len).max(1),
-                (display_start - 1).max(0),
-            )
+            (String::new(), String::new())
         };
-        let five = if five_end >= five_start && five_end > 0 {
-            read_reference_sequence(reader, chrom, five_start, five_end)?
-        } else {
-            String::new()
-        };
-        let three = if three_end >= three_start && three_end > 0 {
-            read_reference_sequence(reader, chrom, three_start, three_end)?
-        } else {
-            String::new()
-        };
-        (five, three)
-    } else {
-        (String::new(), String::new())
-    };
 
     Ok(Some(HgvsGenomicShift {
         strand,
@@ -681,7 +681,8 @@ fn clip_alleles(notation: &mut HgvsNotation, strand: i8) {
 
     while !ref_allele.is_empty()
         && !alt_allele.is_empty()
-        && ref_allele.as_bytes()[ref_allele.len() - 1] == alt_allele.as_bytes()[alt_allele.len() - 1]
+        && ref_allele.as_bytes()[ref_allele.len() - 1]
+            == alt_allele.as_bytes()[alt_allele.len() - 1]
     {
         ref_allele.pop();
         alt_allele.pop();
@@ -932,20 +933,20 @@ fn format_hgvs_string(
     } else {
         format!("{start}_{end}")
     };
-    let suffix = if notation.kind == ">" || (notation.kind == "inv" && notation.ref_allele.len() == 1)
-    {
-        format!("{start}{}>{}", notation.ref_allele, notation.alt_allele)
-    } else if matches!(notation.kind.as_str(), "del" | "inv" | "dup") {
-        format!("{coordinates}{}", notation.kind)
-    } else if notation.kind == "delins" {
-        format!("{coordinates}delins{}", notation.alt_allele)
-    } else if notation.kind == "ins" {
-        format!("{coordinates}ins{}", notation.alt_allele)
-    } else if notation.kind.starts_with('[') && notation.kind.ends_with(']') {
-        format!("{coordinates}{}", notation.kind)
-    } else {
-        return None;
-    };
+    let suffix =
+        if notation.kind == ">" || (notation.kind == "inv" && notation.ref_allele.len() == 1) {
+            format!("{start}{}>{}", notation.ref_allele, notation.alt_allele)
+        } else if matches!(notation.kind.as_str(), "del" | "inv" | "dup") {
+            format!("{coordinates}{}", notation.kind)
+        } else if notation.kind == "delins" {
+            format!("{coordinates}delins{}", notation.alt_allele)
+        } else if notation.kind == "ins" {
+            format!("{coordinates}ins{}", notation.alt_allele)
+        } else if notation.kind.starts_with('[') && notation.kind.ends_with(']') {
+            format!("{coordinates}{}", notation.kind)
+        } else {
+            return None;
+        };
     Some(format!("{ref_name}:{numbering}.{suffix}"))
 }
 
@@ -1106,7 +1107,11 @@ pub fn format_hgvsp(
     let protein_id = versioned_id(translation.stable_id.as_deref()?, translation.version);
     if protein.start_lost {
         let start_ref = if protein.ref_peptide.is_empty() {
-            protein.ref_translation.chars().next().map(|aa| aa.to_string())?
+            protein
+                .ref_translation
+                .chars()
+                .next()
+                .map(|aa| aa.to_string())?
         } else {
             protein.ref_peptide.clone()
         };
@@ -1133,7 +1138,9 @@ pub fn format_hgvsp(
         // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
         //   checks for peptide duplication BEFORE 3' shifting
         //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1758
-        if notation.kind == "ins" && check_for_peptide_duplication(&mut notation, &protein.ref_translation) {
+        if notation.kind == "ins"
+            && check_for_peptide_duplication(&mut notation, &protein.ref_translation)
+        {
             // Dup detected — skip shift and flanking.
         } else {
             if shift_hgvs && matches!(notation.kind.as_str(), "ins" | "del") {
@@ -1185,7 +1192,8 @@ fn clip_protein_alleles(notation: &mut ProteinHgvsNotation) {
 
     while !ref_allele.is_empty()
         && !alt_allele.is_empty()
-        && ref_allele.as_bytes()[ref_allele.len() - 1] == alt_allele.as_bytes()[alt_allele.len() - 1]
+        && ref_allele.as_bytes()[ref_allele.len() - 1]
+            == alt_allele.as_bytes()[alt_allele.len() - 1]
     {
         ref_allele.pop();
         alt_allele.pop();
@@ -1294,7 +1302,10 @@ fn append_terminal_stop(peptide: &str) -> String {
 /// - Ensembl Variation `TranscriptVariationAllele::_get_fs_peptides()`
 ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2278-L2291
 fn peptide_char(peptide: &str, pos: usize) -> Option<char> {
-    peptide.as_bytes().get(pos.checked_sub(1)?).map(|b| *b as char)
+    peptide
+        .as_bytes()
+        .get(pos.checked_sub(1)?)
+        .map(|b| *b as char)
 }
 
 /// Traceability:
@@ -1350,7 +1361,10 @@ fn shift_peptides_post_var(notation: &mut ProteinHgvsNotation, ref_translation: 
 ///   position 1 higher than our `protein_position_start`. We compensate by also
 ///   trying with `start + 1` when the insertion has no clipped prefix (boundary).
 ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499
-fn check_for_peptide_duplication(notation: &mut ProteinHgvsNotation, ref_translation: &str) -> bool {
+fn check_for_peptide_duplication(
+    notation: &mut ProteinHgvsNotation,
+    ref_translation: &str,
+) -> bool {
     if notation.alt_allele.is_empty() || notation.start == 0 {
         return false;
     }
@@ -1387,7 +1401,8 @@ fn try_peptide_dup_at(
     else {
         return false;
     };
-    let Some(test_seq) = upstream.get(test_new_start..test_new_start.saturating_add(alt_len)) else {
+    let Some(test_seq) = upstream.get(test_new_start..test_new_start.saturating_add(alt_len))
+    else {
         return false;
     };
 
@@ -1419,7 +1434,9 @@ fn surrounding_peptides(
     }
     let start = ref_pos.checked_sub(1)?;
     match length {
-        Some(len) => ref_trans.get(start..start.saturating_add(len)).map(str::to_string),
+        Some(len) => ref_trans
+            .get(start..start.saturating_add(len))
+            .map(str::to_string),
         None => ref_trans.get(start..).map(str::to_string),
     }
 }
@@ -1437,7 +1454,11 @@ fn surrounding_peptides(
 ///   codons (including past internal stops). `length()` is the full string
 ///   length — NOT the position of the first stop codon. This matters for
 ///   LoF transcripts with internal stop codons.
-fn stop_loss_extra_aa(protein: &ProteinHgvsData, ref_var_pos: usize, frameshift: bool) -> Option<usize> {
+fn stop_loss_extra_aa(
+    protein: &ProteinHgvsData,
+    ref_var_pos: usize,
+    frameshift: bool,
+) -> Option<usize> {
     let stop_idx = protein.alt_translation.find('*')?;
     let extra = if frameshift {
         stop_idx.saturating_add(1).checked_sub(ref_var_pos)?
@@ -1486,7 +1507,8 @@ fn format_hgvsp_notation(
 ) -> Option<String> {
     let mut out = format!("{protein_id}:p.");
 
-    if notation.ref_allele == notation.alt_allele && !matches!(notation.kind.as_str(), "fs" | "ins") {
+    if notation.ref_allele == notation.alt_allele && !matches!(notation.kind.as_str(), "fs" | "ins")
+    {
         out.push_str(&format!(
             "{}{}=",
             peptide_first_three(&notation.ref_allele)?,
@@ -1692,6 +1714,7 @@ mod tests {
             trembl: None,
             uniparc: None,
             uniprot_isoform: None,
+            appris: None,
         }
     }
 
@@ -1713,6 +1736,8 @@ mod tests {
             cds_sequence: None,
             stable_id: Some("ENSPHGVS000001".to_string()),
             version: Some(1),
+            sift_predictions: Vec::new(),
+            polyphen_predictions: Vec::new(),
         }
     }
 
@@ -1861,7 +1886,6 @@ mod tests {
             Some("ENSPHGVS000001.1:p.Ala2=".to_string())
         );
     }
-
 
     #[test]
     fn test_format_hgvsp_start_lost_reports_unknown_protein() {
@@ -2528,16 +2552,8 @@ mod tests {
 
     #[test]
     fn test_perform_shift_ensembl_rotates_hgvs_output_in_vf_orientation() {
-        let (shift_length, shifted_seq, shifted_output, start, end) = perform_shift_ensembl(
-            b"GATG",
-            b"GATG",
-            "",
-            "TG",
-            100,
-            99,
-            true,
-            -1,
-        );
+        let (shift_length, shifted_seq, shifted_output, start, end) =
+            perform_shift_ensembl(b"GATG", b"GATG", "", "TG", 100, 99, true, -1);
         assert_eq!(shift_length, 1);
         assert_eq!(String::from_utf8(shifted_seq).unwrap(), "GGAT");
         assert_eq!(String::from_utf8(shifted_output).unwrap(), "ATGG");
@@ -2567,11 +2583,15 @@ mod tests {
         // alt_translation = "MKKRQW*" → find('*') = 6.
         // extra = (6 + 1) - (4 + 1) = 2.
         let protein = ProteinHgvsData {
-            start: 5, end: 5,
-            ref_peptide: "*".into(), alt_peptide: "Q".into(),
+            start: 5,
+            end: 5,
+            ref_peptide: "*".into(),
+            alt_peptide: "Q".into(),
             ref_translation: "MKKR*".into(),
             alt_translation: "MKKRQW*".into(),
-            frameshift: false, start_lost: false, stop_lost: true,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: true,
         };
         assert_eq!(stop_loss_extra_aa(&protein, 4, false), Some(2));
     }
@@ -2584,11 +2604,15 @@ mod tests {
         // alt = "MQKRW*" → find('*') = 5.
         // extra = (5+1) - (4+1) = 1.
         let protein = ProteinHgvsData {
-            start: 2, end: 2,
-            ref_peptide: "*".into(), alt_peptide: "Q".into(),
+            start: 2,
+            end: 2,
+            ref_peptide: "*".into(),
+            alt_peptide: "Q".into(),
             ref_translation: "M*KR*".into(),
             alt_translation: "MQKRW*".into(),
-            frameshift: false, start_lost: false, stop_lost: true,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: true,
         };
         assert_eq!(stop_loss_extra_aa(&protein, 1, false), Some(1));
     }
@@ -2597,11 +2621,15 @@ mod tests {
     fn test_stop_loss_extra_aa_non_frameshift_no_new_stop_returns_none() {
         // Alt translation has no stop codon → returns None → extTer?
         let protein = ProteinHgvsData {
-            start: 3, end: 3,
-            ref_peptide: "*".into(), alt_peptide: "Q".into(),
+            start: 3,
+            end: 3,
+            ref_peptide: "*".into(),
+            alt_peptide: "Q".into(),
             ref_translation: "MA*".into(),
             alt_translation: "MAQ".into(), // no *
-            frameshift: false, start_lost: false, stop_lost: true,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: true,
         };
         assert_eq!(stop_loss_extra_aa(&protein, 2, false), None);
     }
@@ -2616,11 +2644,15 @@ mod tests {
         // ref = "MAK*" (trim=3), alt = "MAQ*" (find=3).
         // extra = (3+1) - (3+1) = 0 → None.
         let protein = ProteinHgvsData {
-            start: 3, end: 3,
-            ref_peptide: "*".into(), alt_peptide: "Q".into(),
+            start: 3,
+            end: 3,
+            ref_peptide: "*".into(),
+            alt_peptide: "Q".into(),
             ref_translation: "MAK*".into(),
             alt_translation: "MAQ*".into(),
-            frameshift: false, start_lost: false, stop_lost: true,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: true,
         };
         assert_eq!(stop_loss_extra_aa(&protein, 2, false), None);
     }
@@ -2632,11 +2664,15 @@ mod tests {
         // ref_var_pos = 3 (1-based position of first affected AA).
         // extra = (4 + 1) - 3 = 2.
         let protein = ProteinHgvsData {
-            start: 3, end: 3,
-            ref_peptide: "K".into(), alt_peptide: "Q".into(),
+            start: 3,
+            end: 3,
+            ref_peptide: "K".into(),
+            alt_peptide: "Q".into(),
             ref_translation: "MKKK*".into(),
             alt_translation: "MKQW*".into(),
-            frameshift: true, start_lost: false, stop_lost: false,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
         };
         assert_eq!(stop_loss_extra_aa(&protein, 3, true), Some(2));
     }
@@ -2649,9 +2685,8 @@ mod tests {
     fn test_perform_shift_ensembl_forward_no_reverse_rotates_both_left() {
         // seq_strand=1, reverse=false, hgvs_reverse=false.
         // Both seq_to_check and hgvs_output rotate left.
-        let (shift, seq, hgvs, start, end) = perform_shift_ensembl(
-            b"AT", b"AT", "ATGC", "", 100, 99, false, 1,
-        );
+        let (shift, seq, hgvs, start, end) =
+            perform_shift_ensembl(b"AT", b"AT", "ATGC", "", 100, 99, false, 1);
         assert_eq!(shift, 2); // AT matches AT in post_seq
         assert_eq!(seq, b"AT"); // full rotation back to original
         assert_eq!(hgvs, b"AT");
@@ -2663,9 +2698,8 @@ mod tests {
     fn test_perform_shift_ensembl_reverse_with_hgvs_reverse() {
         // seq_strand=-1, reverse=true, hgvs_reverse = (1 != -1) = true.
         // seq_to_check rotates right, hgvs_output rotates left.
-        let (shift, _seq, hgvs, _start, _end) = perform_shift_ensembl(
-            b"AG", b"AG", "", "CCAG", 100, 101, true, -1,
-        );
+        let (shift, _seq, hgvs, _start, _end) =
+            perform_shift_ensembl(b"AG", b"AG", "", "CCAG", 100, 101, true, -1);
         assert!(shift > 0);
         // hgvs_output should be different rotation than seq_to_check
         assert_eq!(hgvs.len(), 2);
@@ -2673,9 +2707,8 @@ mod tests {
 
     #[test]
     fn test_perform_shift_ensembl_no_match_returns_zero_shift() {
-        let (shift, seq, hgvs, start, end) = perform_shift_ensembl(
-            b"AT", b"AT", "GC", "", 100, 99, false, 1,
-        );
+        let (shift, seq, hgvs, start, end) =
+            perform_shift_ensembl(b"AT", b"AT", "GC", "", 100, 99, false, 1);
         assert_eq!(shift, 0);
         assert_eq!(seq, b"AT");
         assert_eq!(hgvs, b"AT");
@@ -2688,9 +2721,8 @@ mod tests {
         // Genomic shift: seq_strand=1 regardless of transcript strand.
         // This means hgvs_reverse = (1 != 1) = false.
         // Both rotate left for forward shift.
-        let (shift, _seq, hgvs, _, _) = perform_shift_ensembl(
-            b"TC", b"TC", "TCAA", "", 100, 99, false, 1,
-        );
+        let (shift, _seq, hgvs, _, _) =
+            perform_shift_ensembl(b"TC", b"TC", "TCAA", "", 100, 99, false, 1);
         assert_eq!(shift, 2);
         assert_eq!(hgvs, b"TC"); // full rotation
     }
@@ -2702,8 +2734,10 @@ mod tests {
     #[test]
     fn test_clip_alleles_negative_strand_prefix_decrements_end() {
         let mut notation = HgvsNotation {
-            start: 100, end: 102,
-            ref_allele: "ACG".into(), alt_allele: "ACT".into(),
+            start: 100,
+            end: 102,
+            ref_allele: "ACG".into(),
+            alt_allele: "ACT".into(),
             kind: "delins".into(),
         };
         clip_alleles(&mut notation, -1);
@@ -2717,8 +2751,10 @@ mod tests {
     #[test]
     fn test_clip_alleles_negative_strand_suffix_increments_start() {
         let mut notation = HgvsNotation {
-            start: 100, end: 102,
-            ref_allele: "GCA".into(), alt_allele: "TCA".into(),
+            start: 100,
+            end: 102,
+            ref_allele: "GCA".into(),
+            alt_allele: "TCA".into(),
             kind: "delins".into(),
         };
         clip_alleles(&mut notation, -1);
@@ -2735,7 +2771,8 @@ mod tests {
     #[test]
     fn test_check_for_peptide_duplication_at_current_position() {
         let mut notation = ProteinHgvsNotation {
-            start: 4, end: 5, // boundary insertion
+            start: 4,
+            end: 5, // boundary insertion
             ref_allele: String::new(),
             alt_allele: "K".into(),
             original_ref: String::new(),
@@ -2749,13 +2786,14 @@ mod tests {
         assert!(result);
         assert_eq!(notation.kind, "dup");
         assert_eq!(notation.start, 3); // 4 - 1
-        assert_eq!(notation.end, 3);   // 4 - 1
+        assert_eq!(notation.end, 3); // 4 - 1
     }
 
     #[test]
     fn test_check_for_peptide_duplication_fallback_at_offset_2() {
         let mut notation = ProteinHgvsNotation {
-            start: 3, end: 4,
+            start: 3,
+            end: 4,
             ref_allele: String::new(),
             alt_allele: "K".into(),
             original_ref: String::new(),
@@ -2779,7 +2817,8 @@ mod tests {
     #[test]
     fn test_check_for_peptide_duplication_no_match_returns_false() {
         let mut notation = ProteinHgvsNotation {
-            start: 3, end: 3,
+            start: 3,
+            end: 3,
             ref_allele: String::new(),
             alt_allele: "W".into(),
             original_ref: String::new(),
@@ -2795,7 +2834,8 @@ mod tests {
     #[test]
     fn test_check_for_peptide_duplication_multi_residue() {
         let mut notation = ProteinHgvsNotation {
-            start: 5, end: 6,
+            start: 5,
+            end: 6,
             ref_allele: String::new(),
             alt_allele: "KL".into(),
             original_ref: String::new(),
@@ -2808,7 +2848,7 @@ mod tests {
         assert!(result);
         assert_eq!(notation.kind, "dup");
         assert_eq!(notation.start, 3); // 5 - 2
-        assert_eq!(notation.end, 4);   // 5 - 1
+        assert_eq!(notation.end, 4); // 5 - 1
     }
 
     // ---------------------------------------------------------------
@@ -2818,17 +2858,24 @@ mod tests {
     #[test]
     fn test_resolve_frameshift_finds_first_changed_residue() {
         let mut notation = ProteinHgvsNotation {
-            start: 2, end: 2,
-            ref_allele: String::new(), alt_allele: String::new(),
-            original_ref: String::new(), preseq: String::new(),
+            start: 2,
+            end: 2,
+            ref_allele: String::new(),
+            alt_allele: String::new(),
+            original_ref: String::new(),
+            preseq: String::new(),
             kind: String::new(),
         };
         let protein = ProteinHgvsData {
-            start: 2, end: 2,
-            ref_peptide: "A".into(), alt_peptide: "Q".into(),
+            start: 2,
+            end: 2,
+            ref_peptide: "A".into(),
+            alt_peptide: "Q".into(),
             ref_translation: "MAK*".into(),
             alt_translation: "MQW*".into(),
-            frameshift: true, start_lost: false, stop_lost: false,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
         };
         resolve_frameshift_hgvs(&mut notation, &protein);
         assert_eq!(notation.kind, "fs");
@@ -2840,17 +2887,24 @@ mod tests {
     #[test]
     fn test_resolve_frameshift_synonymous_when_both_reach_stop() {
         let mut notation = ProteinHgvsNotation {
-            start: 2, end: 2,
-            ref_allele: String::new(), alt_allele: String::new(),
-            original_ref: String::new(), preseq: String::new(),
+            start: 2,
+            end: 2,
+            ref_allele: String::new(),
+            alt_allele: String::new(),
+            original_ref: String::new(),
+            preseq: String::new(),
             kind: String::new(),
         };
         let protein = ProteinHgvsData {
-            start: 2, end: 2,
-            ref_peptide: "A".into(), alt_peptide: "A".into(),
+            start: 2,
+            end: 2,
+            ref_peptide: "A".into(),
+            alt_peptide: "A".into(),
             ref_translation: "MA*".into(),
             alt_translation: "MA*".into(),
-            frameshift: true, start_lost: false, stop_lost: false,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
         };
         resolve_frameshift_hgvs(&mut notation, &protein);
         assert_eq!(notation.kind, "=");
@@ -2931,11 +2985,15 @@ mod tests {
     fn test_format_hgvsp_deletion_single_residue() {
         let translation = make_translation();
         let protein = ProteinHgvsData {
-            start: 2, end: 2,
-            ref_peptide: "A".into(), alt_peptide: "-".into(),
+            start: 2,
+            end: 2,
+            ref_peptide: "A".into(),
+            alt_peptide: "-".into(),
             ref_translation: "MA*".into(),
             alt_translation: "M*".into(),
-            frameshift: false, start_lost: false, stop_lost: false,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -2947,11 +3005,15 @@ mod tests {
     fn test_format_hgvsp_deletion_multi_residue() {
         let translation = make_translation();
         let protein = ProteinHgvsData {
-            start: 2, end: 3,
-            ref_peptide: "AK".into(), alt_peptide: "-".into(),
+            start: 2,
+            end: 3,
+            ref_peptide: "AK".into(),
+            alt_peptide: "-".into(),
             ref_translation: "MAK*".into(),
             alt_translation: "M*".into(),
-            frameshift: false, start_lost: false, stop_lost: false,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -2963,11 +3025,15 @@ mod tests {
     fn test_format_hgvsp_missense() {
         let translation = make_translation();
         let protein = ProteinHgvsData {
-            start: 2, end: 2,
-            ref_peptide: "A".into(), alt_peptide: "V".into(),
+            start: 2,
+            end: 2,
+            ref_peptide: "A".into(),
+            alt_peptide: "V".into(),
             ref_translation: "MA*".into(),
             alt_translation: "MV*".into(),
-            frameshift: false, start_lost: false, stop_lost: false,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -2979,11 +3045,15 @@ mod tests {
     fn test_format_hgvsp_delins() {
         let translation = make_translation();
         let protein = ProteinHgvsData {
-            start: 2, end: 2,
-            ref_peptide: "A".into(), alt_peptide: "VW".into(),
+            start: 2,
+            end: 2,
+            ref_peptide: "A".into(),
+            alt_peptide: "VW".into(),
             ref_translation: "MAK*".into(),
             alt_translation: "MVWK*".into(),
-            frameshift: false, start_lost: false, stop_lost: false,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -2995,11 +3065,15 @@ mod tests {
     fn test_format_hgvsp_frameshift_immediate_stop() {
         let translation = make_translation();
         let protein = ProteinHgvsData {
-            start: 2, end: 2,
-            ref_peptide: "A".into(), alt_peptide: "*".into(),
+            start: 2,
+            end: 2,
+            ref_peptide: "A".into(),
+            alt_peptide: "*".into(),
             ref_translation: "MAK*".into(),
             alt_translation: "M*".into(),
-            frameshift: true, start_lost: false, stop_lost: false,
+            frameshift: true,
+            start_lost: false,
+            stop_lost: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),

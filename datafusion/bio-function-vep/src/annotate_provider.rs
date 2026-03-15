@@ -32,8 +32,7 @@ use noodles_fasta as fasta;
 use serde_json::Value;
 
 use crate::allele::{
-    MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end,
-    vep_norm_start,
+    MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::annotation_store::{AnnotationBackend, build_store};
 #[cfg(feature = "kv-cache")]
@@ -41,9 +40,10 @@ use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
-    ExonFeature, MirnaFeature, MotifFeature, PreparedContext, RegulatoryFeature, StructuralFeature,
-    SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequenceEngine,
-    TranscriptFeature, TranslationFeature, VariantInput, is_vep_transcript,
+    ExonFeature, MirnaFeature, MotifFeature, PreparedContext, ProteinPrediction, RegulatoryFeature,
+    StructuralFeature, SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment,
+    TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature, VariantInput,
+    is_vep_transcript,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -314,8 +314,13 @@ const AF_COLUMNS: &[AfColumn] = &[
 ];
 
 /// Parsed VEP option flags controlling which Batch 3 CSQ fields are emitted.
+///
 /// Flag names match Ensembl VEP CLI: `--check_existing`, `--af`, `--af_1kg`,
-/// `--af_gnomade`, `--af_gnomadg`, `--max_af`, `--pubmed`.
+/// `--af_gnomade`, `--af_gnomadg`, `--max_af`, `--pubmed`, `--everything`.
+///
+/// Traceability:
+/// - Ensembl VEP `Config.pm` `--everything` expansion
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L346-L374
 #[derive(Debug, Clone)]
 struct VepFlags {
     check_existing: bool,
@@ -325,6 +330,8 @@ struct VepFlags {
     af_gnomadg: bool,
     max_af: bool,
     pubmed: bool,
+    /// When true, all VEP features are enabled and 80-field CSQ schema is used.
+    everything: bool,
 }
 
 impl VepFlags {
@@ -334,12 +341,14 @@ impl VepFlags {
                 .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
                 .unwrap_or(false)
         };
-        let af = parse("af");
-        let af_1kg = parse("af_1kg");
-        let af_gnomade = parse("af_gnomade");
-        let af_gnomadg = parse("af_gnomadg");
-        let max_af = parse("max_af");
-        let pubmed = parse("pubmed");
+        let everything = parse("everything");
+        // --everything implies all sub-flags per Config.pm#L346-L374.
+        let af = everything || parse("af");
+        let af_1kg = everything || parse("af_1kg");
+        let af_gnomade = everything || parse("af_gnomade");
+        let af_gnomadg = everything || parse("af_gnomadg");
+        let max_af = everything || parse("max_af");
+        let pubmed = everything || parse("pubmed");
         // VEP behavior: AF flags imply --check_existing.
         let check_existing =
             parse("check_existing") || af || af_1kg || af_gnomade || af_gnomadg || max_af || pubmed;
@@ -351,6 +360,7 @@ impl VepFlags {
             af_gnomadg,
             max_af,
             pubmed,
+            everything,
         }
     }
 
@@ -394,7 +404,9 @@ impl HgvsFlags {
                 .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
                 .unwrap_or(false)
         };
-        let hgvs = parse("hgvs");
+        let everything = parse("everything");
+        // --everything implies --hgvs per Config.pm#L346-L374.
+        let hgvs = everything || parse("hgvs");
         let hgvsc = hgvs || parse("hgvsc");
         let hgvsp = hgvs || parse("hgvsp");
         let shift_hgvs = options_json
@@ -923,6 +935,86 @@ fn csq_escape(val: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Format APPRIS annotation code for CSQ output.
+///
+/// Traceability:
+/// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1563-L1570
+///
+/// VEP abbreviates: `principal1` → `P1`, `alternative2` → `A2`.
+fn format_appris(raw: &str) -> String {
+    raw.replace("principal", "P").replace("alternative", "A")
+}
+
+/// Look up SIFT and PolyPhen predictions for a variant from the translation cache.
+///
+/// Traceability:
+/// - Ensembl VEP `OutputFactory::add_sift_polyphen()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799
+/// - Ensembl Variation `TranscriptVariationAllele::_protein_function_prediction()`
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm
+///
+/// VEP requires a single amino acid substitution (`A/B` pattern in `pep_allele_string`).
+/// Lookup is by (protein_position, alt_amino_acid). Output uses `--sift b` / `--polyphen b`
+/// format: `prediction(score)` with spaces replaced by underscores.
+fn lookup_sift_polyphen(
+    transcript_id: Option<&str>,
+    protein_position: Option<&str>,
+    amino_acids: Option<&str>,
+    ctx: &PreparedContext<'_>,
+) -> (String, String) {
+    let empty = || (String::new(), String::new());
+
+    // VEP only produces SIFT/PolyPhen for single amino acid substitutions.
+    let Some(aa) = amino_acids else {
+        return empty();
+    };
+    let parts: Vec<&str> = aa.split('/').collect();
+    if parts.len() != 2 || parts[0].len() != 1 || parts[1].len() != 1 {
+        return empty();
+    }
+    let alt_aa = parts[1];
+
+    // Parse protein position (may be a range like "42-43" for indels — skip those).
+    let Some(pos_str) = protein_position else {
+        return empty();
+    };
+    let Ok(pos) = pos_str.parse::<i32>() else {
+        return empty();
+    };
+
+    let Some(tx_id) = transcript_id else {
+        return empty();
+    };
+    let Some(tl) = ctx.translation_by_tx.get(tx_id) else {
+        return empty();
+    };
+
+    let sift = tl
+        .sift_predictions
+        .iter()
+        .find(|p| p.position == pos && p.amino_acid == alt_aa)
+        .map(|p| format_prediction(&p.prediction, p.score))
+        .unwrap_or_default();
+
+    let polyphen = tl
+        .polyphen_predictions
+        .iter()
+        .find(|p| p.position == pos && p.amino_acid == alt_aa)
+        .map(|p| format_prediction(&p.prediction, p.score))
+        .unwrap_or_default();
+
+    (sift, polyphen)
+}
+
+/// Format a SIFT/PolyPhen prediction as `prediction(score)` with spaces→underscores.
+///
+/// VEP uses `--sift b` / `--polyphen b` format (both prediction and score).
+fn format_prediction(prediction: &str, score: f32) -> String {
+    let pred = prediction.replace(' ', "_").replace("_-_", "_");
+    format!("{pred}({score})")
+}
+
 /// Format an AF value with Perl's `sprintf("%.4f", $freq)` — 4 decimal places.
 /// VEP applies this only to the global `AF` field for backward compatibility.
 fn format_af_4f(raw: &str) -> String {
@@ -1436,6 +1528,7 @@ impl AnnotateProvider {
             let trembl_idx = schema.index_of("trembl").ok();
             let uniparc_idx = schema.index_of("uniparc").ok();
             let uniprot_isoform_idx = schema.index_of("uniprot_isoform").ok();
+            let appris_idx = schema.index_of("appris").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -1492,13 +1585,15 @@ impl AnnotateProvider {
                     .unwrap_or(false);
                 // Read from promoted top-level parquet columns
                 // (biodatageeks/datafusion-bio-formats#125, #126).
-                if let Some(translateable_seq) = translateable_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                if let Some(translateable_seq) =
+                    translateable_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 {
                     translateable_seq_by_tx.insert(transcript_id.clone(), translateable_seq);
                 }
                 let cdna_mapper_segments = cdna_mapper_segments_idx
-                    .map(|idx| cdna_mapper_segments_from_list_column(batch.column(idx).as_ref(), row))
+                    .map(|idx| {
+                        cdna_mapper_segments_from_list_column(batch.column(idx).as_ref(), row)
+                    })
                     .unwrap_or_default();
                 let flags_str = flags_str_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
@@ -1514,8 +1609,7 @@ impl AnnotateProvider {
                     gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let refseq_id =
                     refseq_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let source =
-                    source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let source = source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let bam_edit_status =
                     bam_edit_status_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
@@ -1553,6 +1647,7 @@ impl AnnotateProvider {
                     uniparc_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let uniprot_isoform =
                     uniprot_isoform_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let appris = appris_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
 
                 out.push(TranscriptFeature {
                     transcript_id,
@@ -1591,6 +1686,7 @@ impl AnnotateProvider {
                     trembl,
                     uniparc,
                     uniprot_isoform,
+                    appris,
                 });
                 refseq_ids.push(refseq_id);
             }
@@ -1725,6 +1821,8 @@ impl AnnotateProvider {
                 .ok();
             let tl_stable_id_idx = schema.index_of("stable_id").ok();
             let tl_version_idx = schema.index_of("version").ok();
+            let sift_idx = schema.index_of("sift_predictions").ok();
+            let polyphen_idx = schema.index_of("polyphen_predictions").ok();
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
                     continue;
@@ -1744,6 +1842,12 @@ impl AnnotateProvider {
                 let tl_version = tl_version_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .and_then(|v| i32::try_from(v).ok());
+                let sift_predictions = sift_idx
+                    .map(|idx| read_protein_predictions(batch.column(idx).as_ref(), row))
+                    .unwrap_or_default();
+                let polyphen_predictions = polyphen_idx
+                    .map(|idx| read_protein_predictions(batch.column(idx).as_ref(), row))
+                    .unwrap_or_default();
 
                 out.push(TranslationFeature {
                     transcript_id,
@@ -1753,6 +1857,8 @@ impl AnnotateProvider {
                     cds_sequence,
                     stable_id: tl_stable_id,
                     version: tl_version,
+                    sift_predictions,
+                    polyphen_predictions,
                 });
             }
         }
@@ -2127,84 +2233,84 @@ impl AnnotateProvider {
             motifs,
             mirnas,
             structural,
-        ) =
-            if has_cache_misses {
-                // Extract distinct chrom values from VCF batches for predicate pushdown
-                let vcf_chroms: HashSet<String> = {
-                    let mut set = HashSet::new();
-                    for batch in &base_batches {
-                        if let Ok(idx) = batch.schema().index_of("chrom") {
-                            let col = batch.column(idx);
-                            for row in 0..batch.num_rows() {
-                                if let Some(v) = string_at(col.as_ref(), row) {
-                                    set.insert(v);
-                                }
+        ) = if has_cache_misses {
+            // Extract distinct chrom values from VCF batches for predicate pushdown
+            let vcf_chroms: HashSet<String> = {
+                let mut set = HashSet::new();
+                for batch in &base_batches {
+                    if let Ok(idx) = batch.schema().index_of("chrom") {
+                        let col = batch.column(idx);
+                        for row in 0..batch.num_rows() {
+                            if let Some(v) = string_at(col.as_ref(), row) {
+                                set.insert(v);
                             }
                         }
                     }
-                    set
-                };
-
-                let merged = self
-                    .options_json
-                    .as_deref()
-                    .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
-                    .unwrap_or(false);
-
-                let (tx, translateable_seq_by_tx) = if let Some(table) = transcripts_table {
-                    let (tx, translateable_seq_by_tx) = self.load_transcripts(table, &vcf_chroms).await?;
-                    (
-                        tx.into_iter()
-                            .filter(|t| is_vep_transcript(&t.transcript_id, merged))
-                            .collect::<Vec<_>>(),
-                        translateable_seq_by_tx,
-                    )
-                } else {
-                    (Vec::new(), HashMap::new())
-                };
-                let ex = if let Some(table) = exons_table {
-                    self.load_exons(table, &vcf_chroms).await?
-                } else {
-                    Vec::new()
-                };
-                let tl = if let Some(table) = translations_table {
-                    self.load_translations(table, &vcf_chroms).await?
-                } else {
-                    Vec::new()
-                };
-                let rg = if let Some(table) = regulatory_table {
-                    self.load_regulatory_features(table, &vcf_chroms).await?
-                } else {
-                    Vec::new()
-                };
-                let mt = if let Some(table) = motif_table {
-                    self.load_motif_features(table, &vcf_chroms).await?
-                } else {
-                    Vec::new()
-                };
-                let mi = if let Some(table) = mirna_table {
-                    self.load_mirna_features(table, &vcf_chroms).await?
-                } else {
-                    Vec::new()
-                };
-                let st = if let Some(table) = sv_table {
-                    self.load_structural_features(table, &vcf_chroms).await?
-                } else {
-                    Vec::new()
-                };
-                (tx, translateable_seq_by_tx, ex, tl, rg, mt, mi, st)
-            } else {
-                (
-                    Vec::new(),
-                    HashMap::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )
+                }
+                set
             };
+
+            let merged = self
+                .options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
+                .unwrap_or(false);
+
+            let (tx, translateable_seq_by_tx) = if let Some(table) = transcripts_table {
+                let (tx, translateable_seq_by_tx) =
+                    self.load_transcripts(table, &vcf_chroms).await?;
+                (
+                    tx.into_iter()
+                        .filter(|t| is_vep_transcript(&t.transcript_id, merged))
+                        .collect::<Vec<_>>(),
+                    translateable_seq_by_tx,
+                )
+            } else {
+                (Vec::new(), HashMap::new())
+            };
+            let ex = if let Some(table) = exons_table {
+                self.load_exons(table, &vcf_chroms).await?
+            } else {
+                Vec::new()
+            };
+            let tl = if let Some(table) = translations_table {
+                self.load_translations(table, &vcf_chroms).await?
+            } else {
+                Vec::new()
+            };
+            let rg = if let Some(table) = regulatory_table {
+                self.load_regulatory_features(table, &vcf_chroms).await?
+            } else {
+                Vec::new()
+            };
+            let mt = if let Some(table) = motif_table {
+                self.load_motif_features(table, &vcf_chroms).await?
+            } else {
+                Vec::new()
+            };
+            let mi = if let Some(table) = mirna_table {
+                self.load_mirna_features(table, &vcf_chroms).await?
+            } else {
+                Vec::new()
+            };
+            let st = if let Some(table) = sv_table {
+                self.load_structural_features(table, &vcf_chroms).await?
+            } else {
+                Vec::new()
+            };
+            (tx, translateable_seq_by_tx, ex, tl, rg, mt, mi, st)
+        } else {
+            (
+                Vec::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
         let hydrated_transcript_ids = if let Some(reader) = hgvs_reference_reader.as_mut() {
             hydrate_refseq_translation_cds_from_reference(
                 reader,
@@ -2453,11 +2559,20 @@ impl AnnotateProvider {
                 let impact = SoTerm::from_str(most_val)
                     .map(|t| impact_label(t.impact()))
                     .unwrap_or_else(|| impact_label(SoImpact::Modifier));
-                // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
-                let csq_entry = format!(
-                    "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
-                     {variant_class}||||||||||||{batch3_suffix}"
-                );
+                let csq_entry = if flags.everything {
+                    // 80-field CSQ: 22 base + 20 Batch 1 + 33 Batch 3 + 5 motif.
+                    format!(
+                        "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
+                         {variant_class}|||||||||||||||||||||\
+                         {batch3_suffix}|||||"
+                    )
+                } else {
+                    // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
+                    format!(
+                        "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
+                         {variant_class}||||||||||||{batch3_suffix}"
+                    )
+                };
                 (csq_entry, most_val.clone())
             } else {
                 // Cache miss — compute via transcript engine and produce per-transcript CSQ.
@@ -2495,28 +2610,28 @@ impl AnnotateProvider {
                 // SNVs/MNVs don't shift and skipping avoids allele normalization overhead.
                 if let Some(reader) = hgvs_reference_reader.as_mut() {
                     if ref_al.len() != alt_allele.len() {
-                    let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
-                    let (vep_ref_norm, vep_alt_norm) = vcf_to_vep_allele(&ref_al, &alt_allele);
-                    let vep_start = vep_norm_start(start, &ref_al, &alt_allele);
-                    let vep_end = vep_norm_end(start, &ref_al, &alt_allele);
-                    variant.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
-                        reader,
-                        chrom_norm,
-                        &vep_ref_norm,
-                        &vep_alt_norm,
-                        vep_start,
-                        vep_end,
-                        1,
-                    )?;
-                    variant.hgvs_shift_reverse = crate::hgvs::build_hgvs_genomic_shift(
-                        reader,
-                        chrom_norm,
-                        &vep_ref_norm,
-                        &vep_alt_norm,
-                        vep_start,
-                        vep_end,
-                        -1,
-                    )?;
+                        let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
+                        let (vep_ref_norm, vep_alt_norm) = vcf_to_vep_allele(&ref_al, &alt_allele);
+                        let vep_start = vep_norm_start(start, &ref_al, &alt_allele);
+                        let vep_end = vep_norm_end(start, &ref_al, &alt_allele);
+                        variant.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+                            reader,
+                            chrom_norm,
+                            &vep_ref_norm,
+                            &vep_alt_norm,
+                            vep_start,
+                            vep_end,
+                            1,
+                        )?;
+                        variant.hgvs_shift_reverse = crate::hgvs::build_hgvs_genomic_shift(
+                            reader,
+                            chrom_norm,
+                            &vep_ref_norm,
+                            &vep_alt_norm,
+                            vep_start,
+                            vep_end,
+                            -1,
+                        )?;
                     }
                 }
                 let assignments = engine.evaluate_variant_prepared(&variant, ctx);
@@ -2621,24 +2736,79 @@ impl AnnotateProvider {
                         .and_then(|tx| tx.uniprot_isoform.as_deref())
                         .unwrap_or("");
 
-                    // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
-                    csq_entries.push(format!(
-                        "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
-                         {exon}|{intron}|{hgvsc}|{hgvsp}|\
-                         {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                         {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
-                         |||||{source_val}|\
-                         {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
-                         {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
-                         {batch3_suffix}"
-                    ));
+                    if flags.everything {
+                        // HGVS_OFFSET: shift_length for the transcript's strand.
+                        let tx_strand = tx_opt.map(|tx| tx.strand).unwrap_or(1);
+                        let hgvs_offset = variant
+                            .hgvs_shift_for_strand(tx_strand)
+                            .filter(|s| s.shift_length > 0)
+                            .map(|s| s.shift_length.to_string())
+                            .unwrap_or_default();
+                        // MANE generic: empty for now (--everything enables --mane,
+                        // but the generic MANE field is a VEP placeholder).
+                        let mane = "";
+                        // APPRIS: abbreviate principal1→P1, alternative2→A2.
+                        // Traceability:
+                        // - VEP OutputFactory.pm APPRIS output
+                        //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1563-L1570
+                        let appris_str = tx_opt
+                            .and_then(|tx| tx.appris.as_deref())
+                            .map(format_appris)
+                            .unwrap_or_default();
+                        // SIFT/PolyPhen: lookup by (protein_position, alt_amino_acid).
+                        // Traceability:
+                        // - VEP OutputFactory.pm SIFT/PolyPhen output
+                        //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799
+                        let (sift_str, polyphen_str) = lookup_sift_polyphen(
+                            tc.transcript_id.as_deref(),
+                            tc.protein_position.as_deref(),
+                            tc.amino_acids.as_deref(),
+                            ctx,
+                        );
+                        // 80-field CSQ: 22 base + 20 Batch 1 + 33 Batch 3 + 5 motif.
+                        // Traceability:
+                        // - VEP Constants.pm CSQ field order for --everything
+                        //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
+                        csq_entries.push(format!(
+                            "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                             {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                             {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                             {existing_var}|{distance}|{strand_str}|{tc_flags}|\
+                             {variant_class}|{symbol_source}|{hgnc_id}|\
+                             {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
+                             {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{gene_pheno}|\
+                             {sift_str}|{polyphen_str}|||\
+                             {hgvs_offset}|\
+                             {batch3_suffix}|||||"
+                        ));
+                    } else {
+                        // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
+                        csq_entries.push(format!(
+                            "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                             {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                             {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                             {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
+                             |||||{source_val}|\
+                             {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
+                             {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
+                             {batch3_suffix}"
+                        ));
+                    }
                 }
                 if csq_entries.is_empty() {
                     let impact = impact_label(SoImpact::Modifier);
-                    csq_entries.push(format!(
-                        "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
-                         {variant_class}||||||||||||{batch3_suffix}"
-                    ));
+                    if flags.everything {
+                        csq_entries.push(format!(
+                            "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
+                             {variant_class}|||||||||||||||||||||\
+                             {batch3_suffix}|||||"
+                        ));
+                    } else {
+                        csq_entries.push(format!(
+                            "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
+                             {variant_class}||||||||||||{batch3_suffix}"
+                        ));
+                    }
                 }
                 (csq_entries.join(","), most_str)
             };
@@ -2738,16 +2908,15 @@ fn normalize_source_label(source: &str) -> Option<String> {
     match source {
         "" | "-" => None,
         "Ensembl" | "RefSeq" => Some(source.to_string()),
-        value if matches!(
-            value,
-            "ensembl" | "ensembl_havana" | "havana" | "VEGA" | "vega"
-        ) =>
+        value
+            if matches!(
+                value,
+                "ensembl" | "ensembl_havana" | "havana" | "VEGA" | "vega"
+            ) =>
         {
             Some("Ensembl".to_string())
         }
-        value if matches!(value, "BestRefSeq" | "RefSeq" | "Gnomon") => {
-            Some("RefSeq".to_string())
-        }
+        value if matches!(value, "BestRefSeq" | "RefSeq" | "Gnomon") => Some("RefSeq".to_string()),
         other => Some(other.to_string()),
     }
 }
@@ -2801,7 +2970,8 @@ fn backfill_missing_hgnc_ids(transcripts: &mut [TranscriptFeature], refseq_ids: 
         if tx.gene_hgnc_id.is_some() {
             continue;
         }
-        if let Some((mapped_symbol, hgnc_id)) = refseq_gene_hgnc_by_id.get(tx.transcript_id.as_str())
+        if let Some((mapped_symbol, hgnc_id)) =
+            refseq_gene_hgnc_by_id.get(tx.transcript_id.as_str())
         {
             if mapped_symbol.as_deref() == tx.gene_symbol.as_deref() || tx.gene_symbol.is_none() {
                 tx.gene_hgnc_id = Some(hgnc_id.clone());
@@ -2852,6 +3022,100 @@ fn read_mirna_regions(batch: &RecordBatch, col_idx: usize, row: usize) -> Option
         regions.push((s, e));
     }
     Some(regions)
+}
+
+/// Read SIFT or PolyPhen predictions from a
+/// `List<Struct<position: Int32, amino_acid: Utf8, prediction: Utf8, score: Float32>>` column.
+fn read_protein_predictions(col: &dyn Array, row: usize) -> Vec<ProteinPrediction> {
+    if col.is_null(row) {
+        return Vec::new();
+    }
+    let Some(list_arr) = col.as_any().downcast_ref::<ListArray>() else {
+        return Vec::new();
+    };
+    let offsets = list_arr.offsets();
+    let start_off = offsets[row] as usize;
+    let end_off = offsets[row + 1] as usize;
+    if start_off == end_off {
+        return Vec::new();
+    }
+    let values = list_arr.values();
+    let struct_arr = values.as_struct();
+    let Some(positions) = struct_arr.column_by_name("position") else {
+        return Vec::new();
+    };
+    let Some(amino_acids) = struct_arr.column_by_name("amino_acid") else {
+        return Vec::new();
+    };
+    let Some(predictions) = struct_arr.column_by_name("prediction") else {
+        return Vec::new();
+    };
+    let Some(scores) = struct_arr.column_by_name("score") else {
+        return Vec::new();
+    };
+    let pos_arr = positions.as_any().downcast_ref::<Int32Array>();
+    let aa_arr = amino_acids
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .or_else(|| None);
+    let aa_view = amino_acids.as_any().downcast_ref::<StringViewArray>();
+    let pred_arr = predictions
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .or_else(|| None);
+    let pred_view = predictions.as_any().downcast_ref::<StringViewArray>();
+    let score_arr = scores.as_any().downcast_ref::<Float32Array>();
+
+    let mut out = Vec::with_capacity(end_off - start_off);
+    for i in start_off..end_off {
+        let position = pos_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
+        let amino_acid = aa_arr
+            .and_then(|a| {
+                if a.is_null(i) {
+                    None
+                } else {
+                    Some(a.value(i).to_string())
+                }
+            })
+            .or_else(|| {
+                aa_view.and_then(|a| {
+                    if a.is_null(i) {
+                        None
+                    } else {
+                        Some(a.value(i).to_string())
+                    }
+                })
+            });
+        let prediction = pred_arr
+            .and_then(|a| {
+                if a.is_null(i) {
+                    None
+                } else {
+                    Some(a.value(i).to_string())
+                }
+            })
+            .or_else(|| {
+                pred_view.and_then(|a| {
+                    if a.is_null(i) {
+                        None
+                    } else {
+                        Some(a.value(i).to_string())
+                    }
+                })
+            });
+        let score = score_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
+        if let (Some(pos), Some(aa), Some(pred), Some(sc)) =
+            (position, amino_acid, prediction, score)
+        {
+            out.push(ProteinPrediction {
+                position: pos,
+                amino_acid: aa,
+                prediction: pred,
+                score: sc,
+            });
+        }
+    }
+    out
 }
 
 /// Rebuild RefSeq/XM/XR CDS strings from the indexed genomic reference so the
@@ -3032,9 +3296,10 @@ where
         };
         // Only hydrate if exons extend past CDS (i.e., there IS a 3' UTR).
         // If total exonic length <= coding_end, there's no UTR to hydrate.
-        let total_exonic: usize = tx_exons.iter().map(|e| {
-            usize::try_from(e.end.saturating_sub(e.start).saturating_add(1)).unwrap_or(0)
-        }).sum();
+        let total_exonic: usize = tx_exons
+            .iter()
+            .map(|e| usize::try_from(e.end.saturating_sub(e.start).saturating_add(1)).unwrap_or(0))
+            .sum();
         if total_exonic <= coding_end {
             continue;
         }
@@ -3051,14 +3316,21 @@ where
             for exon in tx_exons {
                 let segment = read_reference_sequence(reader, chrom, exon.start, exon.end)?;
                 let expected = usize::try_from(exon.end - exon.start + 1).unwrap_or_default();
-                if segment.len() != expected { ok = false; break; }
+                if segment.len() != expected {
+                    ok = false;
+                    break;
+                }
                 genomic_cdna.push_str(&segment);
             }
-            if !ok || genomic_cdna.is_empty() { continue; }
+            if !ok || genomic_cdna.is_empty() {
+                continue;
+            }
             let cdna = if tx.strand >= 0 {
                 genomic_cdna.to_ascii_uppercase()
             } else {
-                let Some(rc) = reverse_complement_dna(&genomic_cdna) else { continue; };
+                let Some(rc) = reverse_complement_dna(&genomic_cdna) else {
+                    continue;
+                };
                 rc
             };
             tx.cdna_seq = Some(cdna);
@@ -3319,7 +3591,7 @@ fn cdna_mapper_segments_from_list_column(
     col: &dyn Array,
     row: usize,
 ) -> Vec<TranscriptCdnaMapperSegment> {
-    use datafusion::arrow::array::{AsArray, Int64Array, Int8Array, ListArray, StructArray};
+    use datafusion::arrow::array::{AsArray, Int8Array, Int64Array, ListArray, StructArray};
 
     let list_array = col.as_any().downcast_ref::<ListArray>();
     let Some(list_array) = list_array else {
@@ -3338,11 +3610,21 @@ fn cdna_mapper_segments_from_list_column(
     let Some(struct_array) = struct_array else {
         return Vec::new();
     };
-    let gs = struct_array.column_by_name("genomic_start").and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-    let ge = struct_array.column_by_name("genomic_end").and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-    let cs = struct_array.column_by_name("cdna_start").and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-    let ce = struct_array.column_by_name("cdna_end").and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-    let ori = struct_array.column_by_name("ori").and_then(|c| c.as_any().downcast_ref::<Int8Array>());
+    let gs = struct_array
+        .column_by_name("genomic_start")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let ge = struct_array
+        .column_by_name("genomic_end")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let cs = struct_array
+        .column_by_name("cdna_start")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let ce = struct_array
+        .column_by_name("cdna_end")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let ori = struct_array
+        .column_by_name("ori")
+        .and_then(|c| c.as_any().downcast_ref::<Int8Array>());
     let (Some(gs), Some(ge), Some(cs), Some(ce), Some(ori)) = (gs, ge, cs, ce, ori) else {
         return Vec::new();
     };
