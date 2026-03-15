@@ -3230,11 +3230,24 @@ impl AnnotateProvider {
                             sift_cache,
                         );
                         // DOMAINS: overlapping protein domain features.
-                        let domains = lookup_domains(
-                            tc.transcript_id.as_deref(),
-                            tc.protein_position.as_deref(),
-                            ctx,
-                        );
+                        // VEP gates DOMAINS on $pre->{coding} which requires
+                        // a valid CDS coordinate mapping. Our cds_position is
+                        // only set when the variant falls within the CDS region.
+                        // Traceability:
+                        // - VEP OutputFactory.pm line 1434: if($self->{domains} && $pre->{coding})
+                        // - VEP BaseVariationFeatureOverlapAllele.pm _bvfo_preds lines 449-471
+                        //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm
+                        let is_coding = tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
+                        let domains = if is_coding {
+                            lookup_domains(
+                                tc.transcript_id.as_deref(),
+                                tc.protein_position.as_deref(),
+                                tc.amino_acids.as_deref(),
+                                ctx,
+                            )
+                        } else {
+                            String::new()
+                        };
                         // miRNA: ncRNA secondary structure overlap.
                         let mirna_str = {
                             let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
@@ -3718,9 +3731,14 @@ fn read_protein_features(col: &dyn Array, row: usize) -> Vec<ProteinDomainFeatur
 /// Traceability:
 /// - VEP OutputFactory.pm DOMAINS output
 ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1448-L1466
+/// - VEP BaseTranscriptVariation.pm get_overlapping_ProteinFeatures
+///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm
+/// - VEP Mapper.pm map_insert: for insertions, translation_start > translation_end
+///   https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm
 fn lookup_domains(
     transcript_id: Option<&str>,
     protein_position: Option<&str>,
+    amino_acids: Option<&str>,
     ctx: &PreparedContext<'_>,
 ) -> String {
     let Some(tx_id) = transcript_id else {
@@ -3734,7 +3752,6 @@ fn lookup_domains(
     }
 
     // Parse protein position: single int or range "start-end".
-    // VEP uses positions like "42" or "42-43".
     let (prot_start, prot_end) = if let Some((a, b)) = pos_str.split_once('-') {
         let Ok(s) = a.parse::<i64>() else {
             return String::new();
@@ -3742,9 +3759,18 @@ fn lookup_domains(
         let Ok(e) = b.parse::<i64>() else {
             return String::new();
         };
-        (s, e)
+        // For insertions (amino_acids = "-/X"), VEP's Mapper.map_insert swaps
+        // translation_start and translation_end so that start > end. This makes
+        // the overlap check exclude features that touch only at the exact
+        // insertion boundary. E.g., insertion at protein 408-409 becomes
+        // tl_start=409, tl_end=408: overlap with [389-408] is 409<=408 → false.
+        let is_insertion = amino_acids.is_some_and(|aa| aa.starts_with("-/"));
+        if is_insertion {
+            (e, s) // swap: start=409, end=408
+        } else {
+            (s, e)
+        }
     } else if pos_str.contains('?') {
-        // Unknown position (e.g. "?") — no domain lookup.
         return String::new();
     } else {
         let Ok(p) = pos_str.parse::<i64>() else {
@@ -4783,7 +4809,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("42"), &ctx),
+            lookup_domains(Some("ENST00000001"), Some("42"), None, &ctx),
             "Pfam:PF00069"
         );
     }
@@ -4809,7 +4835,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("42"), &ctx),
+            lookup_domains(Some("ENST00000001"), Some("42"), None, &ctx),
             "Pfam:PF00069&PROSITE_profiles:PS50011"
         );
     }
@@ -4826,7 +4852,7 @@ mod tests {
             }],
         )];
         let ctx = minimal_ctx(&translations);
-        assert!(lookup_domains(Some("ENST00000001"), Some("42"), &ctx).is_empty());
+        assert!(lookup_domains(Some("ENST00000001"), Some("42"), None, &ctx).is_empty());
     }
 
     #[test]
@@ -4842,7 +4868,7 @@ mod tests {
         )];
         let ctx = minimal_ctx(&translations);
         assert_eq!(
-            lookup_domains(Some("ENST00000001"), Some("10"), &ctx),
+            lookup_domains(Some("ENST00000001"), Some("10"), None, &ctx),
             "Gene3D_db:1.10.510.10"
         );
     }

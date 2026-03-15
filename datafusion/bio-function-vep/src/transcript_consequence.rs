@@ -239,7 +239,7 @@ pub struct CachedPredictions {
 /// whose genomic end falls behind the current batch are evicted.
 ///
 /// Typical memory: ~500 transcripts × ~400KB each ≈ 200MB (vs 20GB eager).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SiftPolyphenCache {
     entries: HashMap<String, CachedPredictions>,
     /// Genomic end position for each cached transcript, used for eviction.
@@ -248,10 +248,11 @@ pub struct SiftPolyphenCache {
 
 impl SiftPolyphenCache {
     pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            genomic_ends: HashMap::new(),
-        }
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Look up cached predictions for a transcript. Returns `None` on cache miss.
