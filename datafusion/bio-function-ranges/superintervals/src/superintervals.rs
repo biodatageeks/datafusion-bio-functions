@@ -1014,7 +1014,7 @@ impl<'a, T: Clone> Iterator for ValueIterator<'a, T> {
 // Updated iterator creation methods for IntervalMap
 impl<T: Clone> IntervalMap<T> {
     /// Returns an iterator over indices of intervals that intersect [start, end]
-    pub fn search_idxs_iter(&self, start: i32, end: i32) -> IndexIterator<T> {
+    pub fn search_idxs_iter(&self, start: i32, end: i32) -> IndexIterator<'_, T> {
         let current_idx = if self.starts.is_empty() {
             usize::MAX
         } else {
@@ -1028,7 +1028,7 @@ impl<T: Clone> IntervalMap<T> {
     }
 
     /// Returns an iterator over items (intervals with data) that intersect [start, end]
-    pub fn search_items_iter(&self, start: i32, end: i32) -> ItemIterator<T> {
+    pub fn search_items_iter(&self, start: i32, end: i32) -> ItemIterator<'_, T> {
         let current_idx = if self.starts.is_empty() {
             usize::MAX
         } else {
@@ -1042,7 +1042,7 @@ impl<T: Clone> IntervalMap<T> {
     }
 
     /// Returns an iterator over keys (interval start/end pairs) that intersect [start, end]
-    pub fn search_keys_iter(&self, start: i32, end: i32) -> KeyIterator<T> {
+    pub fn search_keys_iter(&self, start: i32, end: i32) -> KeyIterator<'_, T> {
         let current_idx = if self.starts.is_empty() {
             usize::MAX
         } else {
@@ -1056,7 +1056,7 @@ impl<T: Clone> IntervalMap<T> {
     }
 
     /// Returns an iterator over values (data) of intervals that intersect [start, end]
-    pub fn search_values_iter(&self, start: i32, end: i32) -> ValueIterator<T> {
+    pub fn search_values_iter(&self, start: i32, end: i32) -> ValueIterator<'_, T> {
         let current_idx = if self.starts.is_empty() {
             usize::MAX
         } else {
