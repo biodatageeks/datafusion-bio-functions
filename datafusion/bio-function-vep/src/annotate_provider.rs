@@ -14,6 +14,42 @@ use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Seek};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// Returns true when VEP_PROFILE env var is set (any value).
+fn profiling_enabled() -> bool {
+    std::env::var("VEP_PROFILE").is_ok()
+}
+
+macro_rules! profile_start {
+    () => {
+        Instant::now()
+    };
+}
+
+macro_rules! profile_end {
+    ($label:expr, $start:expr) => {
+        if profiling_enabled() {
+            let elapsed = $start.elapsed();
+            eprintln!(
+                "[VEP_PROFILE] {:.<50} {:>8.1}ms",
+                $label,
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+    };
+    ($label:expr, $start:expr, $extra:expr) => {
+        if profiling_enabled() {
+            let elapsed = $start.elapsed();
+            eprintln!(
+                "[VEP_PROFILE] {:.<50} {:>8.1}ms  {}",
+                $label,
+                elapsed.as_secs_f64() * 1000.0,
+                $extra
+            );
+        }
+    };
+}
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
@@ -40,9 +76,9 @@ use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
-    ExonFeature, MirnaFeature, MotifFeature, PreparedContext, ProteinDomainFeature,
-    ProteinPrediction, RegulatoryFeature, StructuralFeature, SvEventKind, SvFeatureKind,
-    TranscriptCdnaMapperSegment, TranscriptConsequenceEngine, TranscriptFeature,
+    CachedPredictions, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
+    ProteinDomainFeature, RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind,
+    SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequenceEngine, TranscriptFeature,
     TranslationFeature, VariantInput, is_vep_transcript,
 };
 use crate::variant_lookup_exec::{
@@ -946,7 +982,118 @@ fn format_appris(raw: &str) -> String {
     raw.replace("principal", "P").replace("alternative", "A")
 }
 
-/// Look up SIFT and PolyPhen predictions for a variant from the translation cache.
+/// Compute miRNA CSQ field from ncRNA secondary structure and variant cDNA position.
+///
+/// Traceability:
+/// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
+///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1572-L1612
+///
+/// The ncRNA attribute value has format `"start:end structure_string"` where:
+/// - `start`/`end` are 1-based cDNA positions of the structure
+/// - structure string uses dot-bracket notation with optional RLE counts:
+///   `(19` = 19 open-parens (stem), `.6` = 6 dots (loop), bare char = count 1
+///
+/// VEP maps variant cDNA positions into the expanded structure array:
+///   `struct_index = cdna_pos - ncrna_start`
+/// Characters `(` and `)` → `miRNA_stem`, `.` → `miRNA_loop`.
+/// Output is sorted, `&`-joined unique SO terms.
+fn mirna_structure_field(
+    ncrna_structure: Option<&str>,
+    biotype: &str,
+    cdna_start: Option<usize>,
+    cdna_end: Option<usize>,
+) -> String {
+    if biotype != "miRNA" {
+        return String::new();
+    }
+    let Some(raw) = ncrna_structure else {
+        return String::new();
+    };
+    let Some(cdna_s) = cdna_start else {
+        return String::new();
+    };
+    let Some(cdna_e) = cdna_end else {
+        return String::new();
+    };
+
+    // Parse ncRNA structure. Two formats supported:
+    // 1. Full attribute: "start:end structure_string" (e.g. "1:81 (19.(6...")
+    // 2. Structure only: "(19.(6..." (from parquet ncrna_structure column)
+    //
+    // When start:end prefix is missing, assume structure starts at cDNA position 1.
+    let parts: Vec<&str> = raw
+        .splitn(3, |c: char| c.is_whitespace() || c == ':')
+        .collect();
+    let (struct_start, struct_str) = if parts.len() >= 3 {
+        if let (Ok(s), Ok(_e)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+            (s, parts[2])
+        } else {
+            (1usize, raw)
+        }
+    } else {
+        (1usize, raw)
+    };
+
+    let (cs, ce) = if cdna_s <= cdna_e {
+        (cdna_s, cdna_e)
+    } else {
+        (cdna_e, cdna_s)
+    };
+
+    // Expand RLE structure: "(19" → 19 '(' chars, ".6" → 6 '.' chars, bare char → 1.
+    let mut expanded: Vec<u8> = Vec::new();
+    let bytes = struct_str.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'(' || ch == b')' || ch == b'.' {
+            // Read optional count after the character.
+            let mut count = 0usize;
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                count = count * 10 + (bytes[j] - b'0') as usize;
+                j += 1;
+            }
+            if count == 0 {
+                count = 1;
+            }
+            for _ in 0..count {
+                expanded.push(ch);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Map variant cDNA positions to structure indices and collect SO terms.
+    let mut has_stem = false;
+    let mut has_loop = false;
+    for pos in cs..=ce {
+        if pos < struct_start {
+            continue;
+        }
+        let idx = pos - struct_start;
+        if idx >= expanded.len() {
+            continue;
+        }
+        match expanded[idx] {
+            b'(' | b')' => has_stem = true,
+            b'.' => has_loop = true,
+            _ => {}
+        }
+    }
+
+    // Sorted output: miRNA_loop < miRNA_stem (alphabetical).
+    match (has_loop, has_stem) {
+        (true, true) => "miRNA_loop&miRNA_stem".to_string(),
+        (true, false) => "miRNA_loop".to_string(),
+        (false, true) => "miRNA_stem".to_string(),
+        (false, false) => String::new(),
+    }
+}
+
+/// Look up SIFT and PolyPhen predictions from the per-transcript LRU cache.
 ///
 /// Traceability:
 /// - Ensembl VEP `OutputFactory::add_sift_polyphen()`
@@ -957,11 +1104,15 @@ fn format_appris(raw: &str) -> String {
 /// VEP requires a single amino acid substitution (`A/B` pattern in `pep_allele_string`).
 /// Lookup is by (protein_position, alt_amino_acid). Output uses `--sift b` / `--polyphen b`
 /// format: `prediction(score)` with spaces replaced by underscores.
+///
+/// The cache is populated by `load_sift_polyphen_cache()` with one SQL point
+/// query per transcript. Each transcript's predictions are stored in a
+/// HashMap for O(1) lookup. See biodatageeks/datafusion-bio-functions#38.
 fn lookup_sift_polyphen(
     transcript_id: Option<&str>,
     protein_position: Option<&str>,
     amino_acids: Option<&str>,
-    ctx: &PreparedContext<'_>,
+    cache: &SiftPolyphenCache,
 ) -> (String, String) {
     let empty = || (String::new(), String::new());
 
@@ -986,22 +1137,20 @@ fn lookup_sift_polyphen(
     let Some(tx_id) = transcript_id else {
         return empty();
     };
-    let Some(tl) = ctx.translation_by_tx.get(tx_id) else {
+    let Some(preds) = cache.get(tx_id) else {
         return empty();
     };
 
-    let sift = tl
-        .sift_predictions
-        .iter()
-        .find(|p| p.position == pos && p.amino_acid == alt_aa)
-        .map(|p| format_prediction(&p.prediction, p.score))
+    let key = (pos, alt_aa.to_string());
+    let sift = preds
+        .sift
+        .get(&key)
+        .map(|(pred, score)| format_prediction(pred, *score))
         .unwrap_or_default();
-
-    let polyphen = tl
-        .polyphen_predictions
-        .iter()
-        .find(|p| p.position == pos && p.amino_acid == alt_aa)
-        .map(|p| format_prediction(&p.prediction, p.score))
+    let polyphen = preds
+        .polyphen
+        .get(&key)
+        .map(|(pred, score)| format_prediction(pred, *score))
         .unwrap_or_default();
 
     (sift, polyphen)
@@ -1529,6 +1678,7 @@ impl AnnotateProvider {
             let uniparc_idx = schema.index_of("uniparc").ok();
             let uniprot_isoform_idx = schema.index_of("uniprot_isoform").ok();
             let appris_idx = schema.index_of("appris").ok();
+            let ncrna_structure_idx = schema.index_of("ncrna_structure").ok();
 
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -1648,6 +1798,8 @@ impl AnnotateProvider {
                 let uniprot_isoform =
                     uniprot_isoform_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let appris = appris_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let ncrna_structure =
+                    ncrna_structure_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
 
                 out.push(TranscriptFeature {
                     transcript_id,
@@ -1687,6 +1839,7 @@ impl AnnotateProvider {
                     uniparc,
                     uniprot_isoform,
                     appris,
+                    ncrna_structure,
                 });
                 refseq_ids.push(refseq_id);
             }
@@ -1821,8 +1974,9 @@ impl AnnotateProvider {
                 .ok();
             let tl_stable_id_idx = schema.index_of("stable_id").ok();
             let tl_version_idx = schema.index_of("version").ok();
-            let sift_idx = schema.index_of("sift_predictions").ok();
-            let polyphen_idx = schema.index_of("polyphen_predictions").ok();
+            // SIFT/PolyPhen predictions are NOT loaded here — they are loaded
+            // lazily per-transcript via SiftPolyphenCache to avoid ~20GB memory.
+            // See biodatageeks/datafusion-bio-functions#38.
             let pf_idx = schema.index_of("protein_features").ok();
             for row in 0..batch.num_rows() {
                 let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
@@ -1843,12 +1997,6 @@ impl AnnotateProvider {
                 let tl_version = tl_version_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .and_then(|v| i32::try_from(v).ok());
-                let sift_predictions = sift_idx
-                    .map(|idx| read_protein_predictions(batch.column(idx).as_ref(), row))
-                    .unwrap_or_default();
-                let polyphen_predictions = polyphen_idx
-                    .map(|idx| read_protein_predictions(batch.column(idx).as_ref(), row))
-                    .unwrap_or_default();
                 let protein_features = pf_idx
                     .map(|idx| read_protein_features(batch.column(idx).as_ref(), row))
                     .unwrap_or_default();
@@ -1861,14 +2009,106 @@ impl AnnotateProvider {
                     cds_sequence,
                     stable_id: tl_stable_id,
                     version: tl_version,
-                    sift_predictions,
-                    polyphen_predictions,
                     protein_features,
                 });
             }
         }
 
         Ok(out)
+    }
+
+    /// Window size for sliding-window SIFT/PolyPhen loading (5MB).
+    const SIFT_WINDOW_SIZE: i64 = 5_000_000;
+
+    /// Load SIFT/PolyPhen predictions using a sliding genomic window.
+    ///
+    /// For each chromosome, slides a window across the variant bounding box
+    /// and queries translations whose CDS overlaps each window:
+    /// ```sql
+    /// SELECT transcript_id, sift_predictions, polyphen_predictions
+    /// FROM translations
+    /// WHERE chrom = '1' AND start <= win_end AND "end" >= win_start
+    /// ```
+    ///
+    /// Each window typically returns ~20-50 translations (~500K prediction
+    /// entries ≈ ~20MB). The LRU cache evicts entries from old windows,
+    /// bounding peak memory regardless of chromosome size.
+    ///
+    /// With sorted parquet + small row groups (bio-formats#129), DataFusion
+    /// uses row-group min/max statistics to skip non-matching row groups,
+    /// reading only 1-2 row groups per window query instead of all.
+    ///
+    /// See biodatageeks/datafusion-bio-functions#38.
+    async fn load_sift_polyphen_by_window(
+        &self,
+        table: &str,
+        chrom_bounds: &HashMap<String, (i64, i64)>,
+    ) -> Result<SiftPolyphenCache> {
+        // Capacity: ~2000 transcripts ≈ ~800MB max. Enough for any single
+        // chromosome's worth of overlapping translations without eviction
+        // pressure for typical variant sets.
+        let mut cache = SiftPolyphenCache::new(2000);
+
+        for (chrom, &(min_start, max_end)) in chrom_bounds {
+            let escaped_chrom = Self::escaped_sql_literal(chrom);
+            let mut win_start = min_start;
+
+            while win_start <= max_end {
+                let win_end = (win_start + Self::SIFT_WINDOW_SIZE).min(max_end);
+
+                let query = format!(
+                    "SELECT transcript_id, sift_predictions, polyphen_predictions \
+                     FROM `{table}` \
+                     WHERE chrom = '{escaped_chrom}' \
+                       AND start <= {win_end} AND \"end\" >= {win_start}"
+                );
+                let batches = self.session.sql(&query).await?.collect().await?;
+
+                for batch in &batches {
+                    let schema = batch.schema();
+                    let tx_idx = schema
+                        .index_of("transcript_id")
+                        .or_else(|_| schema.index_of("stable_id"))
+                        .ok();
+                    let sift_col_idx = schema.index_of("sift_predictions").ok();
+                    let pp_col_idx = schema.index_of("polyphen_predictions").ok();
+
+                    let Some(tx_idx) = tx_idx else { continue };
+
+                    for row in 0..batch.num_rows() {
+                        let Some(tx_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                            continue;
+                        };
+                        // Skip if already cached (window overlap with previous window).
+                        if cache.get(&tx_id).is_some() {
+                            continue;
+                        }
+                        let mut preds = CachedPredictions::default();
+                        if let Some(idx) = sift_col_idx {
+                            for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
+                                preds.sift.insert(
+                                    (pred.position, pred.amino_acid),
+                                    (pred.prediction, pred.score),
+                                );
+                            }
+                        }
+                        if let Some(idx) = pp_col_idx {
+                            for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
+                                preds.polyphen.insert(
+                                    (pred.position, pred.amino_acid),
+                                    (pred.prediction, pred.score),
+                                );
+                            }
+                        }
+                        cache.insert(tx_id, preds);
+                    }
+                }
+
+                win_start += Self::SIFT_WINDOW_SIZE;
+            }
+        }
+
+        Ok(cache)
     }
 
     async fn load_regulatory_features(
@@ -2142,6 +2382,10 @@ impl AnnotateProvider {
         mirna_table: Option<&str>,
         sv_table: Option<&str>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let t_total = profile_start!();
+        if profiling_enabled() {
+            eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine START ======");
+        }
         let flags = VepFlags::from_options_json(self.options_json.as_deref());
         let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
 
@@ -2205,30 +2449,74 @@ impl AnnotateProvider {
             provider.set_colocated_sink(Arc::clone(&coloc_sink));
         }
 
+        let t_var = profile_start!();
         let plan = provider.scan(state, None, &[], None).await?;
         let task_ctx = self.session.task_ctx();
         let base_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
+        let total_vcf_rows: usize = base_batches.iter().map(|b| b.num_rows()).sum();
+        profile_end!(
+            "1. variation_lookup (scan+collect)",
+            t_var,
+            format!(
+                "{} VCF rows, {} batches",
+                total_vcf_rows,
+                base_batches.len()
+            )
+        );
+
+        let t_intervals = profile_start!();
         let input_variant_intervals = collect_input_variant_intervals(&base_batches)?;
         let indel_variant_intervals = collect_indel_variant_intervals(&base_batches)?;
+        profile_end!("2. collect_variant_intervals", t_intervals);
 
         // Build co-located variant aggregation from the piggybacked sink.
+        let t_coloc = profile_start!();
         let colocated_map = if flags.check_existing {
             let guard = coloc_sink.lock().unwrap();
             build_colocated_map_from_sink(&guard)
         } else {
             HashMap::new()
         };
+        profile_end!(
+            "3. colocated_map_build",
+            t_coloc,
+            format!("{} entries", colocated_map.len())
+        );
 
         // Check if there are any cache misses (rows without cached most_severe).
         // Only load context tables if we actually need the transcript engine.
+        let mut cache_hit_count = 0usize;
+        let mut cache_miss_count = 0usize;
         let has_cache_misses = base_batches.iter().any(|batch| {
             let Ok(idx) = batch.schema().index_of("cache_most_severe_consequence") else {
+                cache_miss_count += batch.num_rows();
                 return true; // Column missing — all rows are misses.
             };
             let col = batch.column(idx);
-            (0..batch.num_rows()).any(|row| string_at(col.as_ref(), row).is_none())
+            let mut found_miss = false;
+            for row in 0..batch.num_rows() {
+                if string_at(col.as_ref(), row).is_none() {
+                    cache_miss_count += 1;
+                    found_miss = true;
+                } else {
+                    cache_hit_count += 1;
+                }
+            }
+            found_miss
         });
+        if profiling_enabled() {
+            let hit_rate = if total_vcf_rows > 0 {
+                cache_hit_count as f64 / total_vcf_rows as f64 * 100.0
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[VEP_PROFILE] cache hits: {}, misses: {}, hit rate: {:.1}%",
+                cache_hit_count, cache_miss_count, hit_rate
+            );
+        }
 
+        let t_ctx_load = profile_start!();
         let (
             mut transcripts,
             translateable_seq_by_tx,
@@ -2261,6 +2549,7 @@ impl AnnotateProvider {
                 .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
                 .unwrap_or(false);
 
+            let t_tx = profile_start!();
             let (tx, translateable_seq_by_tx) = if let Some(table) = transcripts_table {
                 let (tx, translateable_seq_by_tx) =
                     self.load_transcripts(table, &vcf_chroms).await?;
@@ -2273,36 +2562,67 @@ impl AnnotateProvider {
             } else {
                 (Vec::new(), HashMap::new())
             };
+            profile_end!(
+                "4a. load_transcripts",
+                t_tx,
+                format!("{} transcripts", tx.len())
+            );
+
+            let t_ex = profile_start!();
             let ex = if let Some(table) = exons_table {
                 self.load_exons(table, &vcf_chroms).await?
             } else {
                 Vec::new()
             };
+            profile_end!("4b. load_exons", t_ex, format!("{} exons", ex.len()));
+
+            let t_tl = profile_start!();
             let tl = if let Some(table) = translations_table {
                 self.load_translations(table, &vcf_chroms).await?
             } else {
                 Vec::new()
             };
+            profile_end!(
+                "4c. load_translations",
+                t_tl,
+                format!("{} translations", tl.len())
+            );
+
+            let t_rg = profile_start!();
             let rg = if let Some(table) = regulatory_table {
                 self.load_regulatory_features(table, &vcf_chroms).await?
             } else {
                 Vec::new()
             };
+            profile_end!(
+                "4d. load_regulatory",
+                t_rg,
+                format!("{} features", rg.len())
+            );
+
+            let t_mt = profile_start!();
             let mt = if let Some(table) = motif_table {
                 self.load_motif_features(table, &vcf_chroms).await?
             } else {
                 Vec::new()
             };
+            profile_end!("4e. load_motif", t_mt);
+
+            let t_mi = profile_start!();
             let mi = if let Some(table) = mirna_table {
                 self.load_mirna_features(table, &vcf_chroms).await?
             } else {
                 Vec::new()
             };
+            profile_end!("4f. load_mirna", t_mi);
+
+            let t_st = profile_start!();
             let st = if let Some(table) = sv_table {
                 self.load_structural_features(table, &vcf_chroms).await?
             } else {
                 Vec::new()
             };
+            profile_end!("4g. load_structural", t_st);
             (tx, translateable_seq_by_tx, ex, tl, rg, mt, mi, st)
         } else {
             (
@@ -2316,6 +2636,9 @@ impl AnnotateProvider {
                 Vec::new(),
             )
         };
+        profile_end!("4. context_tables_total", t_ctx_load);
+
+        let t_hydrate = profile_start!();
         let hydrated_transcript_ids = if let Some(reader) = hgvs_reference_reader.as_mut() {
             hydrate_refseq_translation_cds_from_reference(
                 reader,
@@ -2332,6 +2655,13 @@ impl AnnotateProvider {
             &translateable_seq_by_tx,
             &hydrated_transcript_ids,
         );
+        profile_end!(
+            "5a. hydrate_refseq_cds",
+            t_hydrate,
+            format!("{} hydrated", hydrated_transcript_ids.len())
+        );
+
+        let t_cdna = profile_start!();
         // Hydrate full spliced cDNA on transcripts that lack spliced_seq so
         // that three_prime_utr_seq() can find the UTR for stop-loss/frameshift
         // extension distance computation.
@@ -2344,6 +2674,9 @@ impl AnnotateProvider {
                 &input_variant_intervals,
             )?;
         }
+        profile_end!("5b. hydrate_transcript_cdna", t_cdna);
+
+        let t_prep = profile_start!();
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
         let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
             upstream_distance,
@@ -2359,7 +2692,81 @@ impl AnnotateProvider {
             &mirnas,
             &structural,
         );
+        profile_end!(
+            "6. prepared_context_build",
+            t_prep,
+            format!("{} tx_trees chroms", ctx.tx_trees.len())
+        );
 
+        // Build SIFT/PolyPhen prediction cache using a sliding genomic window.
+        //
+        // Instead of loading all ~22K translations' prediction matrices eagerly
+        // (~20GB on chr1), we:
+        // 1. Extract the genomic bounding box of input variants per chromosome
+        // 2. Slide a window (default 5MB) across that range
+        // 3. For each window, query only translations whose CDS overlaps it:
+        //      SELECT transcript_id, sift_predictions, polyphen_predictions
+        //      FROM translations
+        //      WHERE chrom = '1' AND start <= win_end AND "end" >= win_start
+        // 4. Each window returns ~20-50 translations → ~500K prediction entries
+        //
+        // Memory stays bounded: the LRU cache evicts entries from old windows.
+        // With sorted parquet + small row groups (bio-formats#129), each window
+        // query reads only 1-2 row groups via min/max statistics pushdown.
+        //
+        // See biodatageeks/datafusion-bio-functions#38.
+        let t_sift = profile_start!();
+        let sift_cache = if flags.everything {
+            if let Some(table) = translations_table {
+                // Compute variant bounding box per chromosome, expanded by
+                // upstream/downstream transcript distance to catch translations
+                // whose CDS is near but not directly overlapping the variants.
+                let mut chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
+                for batch in &base_batches {
+                    let schema = batch.schema();
+                    if let (Ok(ci), Ok(si), Ok(ei)) = (
+                        schema.index_of("chrom"),
+                        schema.index_of("start"),
+                        schema.index_of("end"),
+                    ) {
+                        for row in 0..batch.num_rows() {
+                            if let (Some(c), Some(s), Some(e)) = (
+                                string_at(batch.column(ci).as_ref(), row),
+                                int64_at(batch.column(si).as_ref(), row),
+                                int64_at(batch.column(ei).as_ref(), row),
+                            ) {
+                                // Strip chr prefix to match translation table chrom format.
+                                let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
+                                let entry =
+                                    chrom_bounds.entry(c_norm).or_insert((i64::MAX, i64::MIN));
+                                entry.0 = entry.0.min(s);
+                                entry.1 = entry.1.max(e);
+                            }
+                        }
+                    }
+                }
+                // Expand by a generous margin to catch translations whose CDS
+                // extends beyond the variant region. Genes can span >1MB, so
+                // we add 2x the window size as padding.
+                for bounds in chrom_bounds.values_mut() {
+                    bounds.0 = (bounds.0 - Self::SIFT_WINDOW_SIZE).max(1);
+                    bounds.1 += Self::SIFT_WINDOW_SIZE;
+                }
+                self.load_sift_polyphen_by_window(table, &chrom_bounds)
+                    .await?
+            } else {
+                SiftPolyphenCache::new(0)
+            }
+        } else {
+            SiftPolyphenCache::new(0)
+        };
+        profile_end!(
+            "7. sift_polyphen_cache",
+            t_sift,
+            format!("{} transcripts cached", sift_cache.len())
+        );
+
+        let t_annotate = profile_start!();
         let mut annotated_batches = Vec::with_capacity(base_batches.len());
         for batch in &base_batches {
             annotated_batches.push(self.annotate_batch_with_transcript_engine(
@@ -2367,9 +2774,23 @@ impl AnnotateProvider {
                 &engine,
                 &ctx,
                 &colocated_map,
+                &sift_cache,
             )?);
         }
+        profile_end!(
+            "8. annotate_batches (hits+misses)",
+            t_annotate,
+            format!(
+                "{} batches, {} total rows",
+                annotated_batches.len(),
+                annotated_batches
+                    .iter()
+                    .map(|b| b.num_rows())
+                    .sum::<usize>()
+            )
+        );
 
+        let t_project = profile_start!();
         let projected_batches = if let Some(indices) = projection {
             let mut out = Vec::with_capacity(annotated_batches.len());
             for batch in annotated_batches {
@@ -2386,7 +2807,17 @@ impl AnnotateProvider {
         };
 
         let mem = MemTable::try_new(projected_schema, vec![projected_batches])?;
-        mem.scan(state, None, &[], None).await
+        let result = mem.scan(state, None, &[], None).await;
+        profile_end!("9. projection + memtable", t_project);
+        profile_end!(
+            "TOTAL scan_with_transcript_engine",
+            t_total,
+            format!("{} VCF rows", total_vcf_rows)
+        );
+        if profiling_enabled() {
+            eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine END ======");
+        }
+        result
     }
 
     fn annotate_batch_with_transcript_engine(
@@ -2395,6 +2826,7 @@ impl AnnotateProvider {
         engine: &TranscriptConsequenceEngine,
         ctx: &PreparedContext<'_>,
         colocated_map: &HashMap<ColocatedKey, ColocatedData>,
+        sift_cache: &SiftPolyphenCache,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
@@ -2796,7 +3228,7 @@ impl AnnotateProvider {
                             tc.transcript_id.as_deref(),
                             tc.protein_position.as_deref(),
                             tc.amino_acids.as_deref(),
-                            ctx,
+                            sift_cache,
                         );
                         // DOMAINS: overlapping protein domain features.
                         let domains = lookup_domains(
@@ -2804,6 +3236,28 @@ impl AnnotateProvider {
                             tc.protein_position.as_deref(),
                             ctx,
                         );
+                        // miRNA: ncRNA secondary structure overlap.
+                        let mirna_str = {
+                            let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
+                            // Parse cDNA position range from the "N" or "N-M" string.
+                            let (cs, ce) = tc
+                                .cdna_position
+                                .as_deref()
+                                .and_then(|p| {
+                                    if let Some((a, b)) = p.split_once('-') {
+                                        Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                                    } else {
+                                        let v = p.parse::<usize>().ok()?;
+                                        Some((v, v))
+                                    }
+                                })
+                                .unwrap_or((0, 0));
+                            if cs > 0 {
+                                mirna_structure_field(ncrna, biotype, Some(cs), Some(ce))
+                            } else {
+                                String::new()
+                            }
+                        };
                         // 80-field CSQ: 22 base + 20 Batch 1 + 33 Batch 3 + 5 motif.
                         // Traceability:
                         // - VEP Constants.pm CSQ field order for --everything
@@ -2816,7 +3270,7 @@ impl AnnotateProvider {
                              {variant_class}|{symbol_source}|{hgnc_id}|\
                              {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
                              {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{gene_pheno}|\
-                             {sift_str}|{polyphen_str}|{domains}||\
+                             {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
                              {batch3_suffix}|||||"
                         ));
@@ -3061,6 +3515,15 @@ fn read_mirna_regions(batch: &RecordBatch, col_idx: usize, row: usize) -> Option
         regions.push((s, e));
     }
     Some(regions)
+}
+
+/// Transient prediction entry used only during parquet loading.
+/// Predictions are indexed into `SiftPolyphenCache` HashMap for O(1) lookup.
+struct ProteinPrediction {
+    position: i32,
+    amino_acid: String,
+    prediction: String,
+    score: f32,
 }
 
 /// Read SIFT or PolyPhen predictions from a
@@ -4167,7 +4630,7 @@ impl TableProvider for AnnotateProvider {
 mod tests {
     use super::*;
     use crate::transcript_consequence::{
-        ProteinDomainFeature, ProteinPrediction, TranslationFeature,
+        CachedPredictions, ProteinDomainFeature, SiftPolyphenCache, TranslationFeature,
     };
 
     // ── format_appris ──────────────────────────────────────────────────
@@ -4189,7 +4652,6 @@ mod tests {
 
     #[test]
     fn test_format_appris_passthrough() {
-        // Unknown strings should pass through unchanged.
         assert_eq!(format_appris("other"), "other");
     }
 
@@ -4202,7 +4664,6 @@ mod tests {
 
     #[test]
     fn test_format_prediction_probably_damaging() {
-        // Spaces become underscores.
         assert_eq!(
             format_prediction("probably damaging", 0.999),
             "probably_damaging(0.999)"
@@ -4211,7 +4672,6 @@ mod tests {
 
     #[test]
     fn test_format_prediction_tolerated_low_confidence() {
-        // " - " becomes "_" (spaces become underscores first, then "_-_" collapses).
         assert_eq!(
             format_prediction("tolerated - low confidence", 0.23),
             "tolerated_low_confidence(0.23)"
@@ -4220,12 +4680,79 @@ mod tests {
 
     // ── lookup_sift_polyphen ───────────────────────────────────────────
 
-    /// Build a TranslationFeature with the given SIFT/PolyPhen predictions and
-    /// protein domain features.
+    fn make_sift_cache(entries: Vec<(&str, i32, &str, &str, f32, &str, f32)>) -> SiftPolyphenCache {
+        let mut cache = SiftPolyphenCache::new(100);
+        // Group entries by transcript_id.
+        let mut by_tx: HashMap<String, CachedPredictions> = HashMap::new();
+        for (tx_id, pos, aa, sift_pred, sift_score, pp_pred, pp_score) in entries {
+            let preds = by_tx.entry(tx_id.to_string()).or_default();
+            preds
+                .sift
+                .insert((pos, aa.to_string()), (sift_pred.to_string(), sift_score));
+            preds
+                .polyphen
+                .insert((pos, aa.to_string()), (pp_pred.to_string(), pp_score));
+        }
+        for (tx_id, preds) in by_tx {
+            cache.insert(tx_id, preds);
+        }
+        cache
+    }
+
+    #[test]
+    fn test_lookup_sift_polyphen_single_aa_match() {
+        let cache = make_sift_cache(vec![(
+            "ENST00000001",
+            42,
+            "I",
+            "deleterious",
+            0.01,
+            "probably damaging",
+            0.999,
+        )]);
+        let (sift, polyphen) =
+            lookup_sift_polyphen(Some("ENST00000001"), Some("42"), Some("V/I"), &cache);
+        assert_eq!(sift, "deleterious(0.01)");
+        assert_eq!(polyphen, "probably_damaging(0.999)");
+    }
+
+    #[test]
+    fn test_lookup_sift_polyphen_non_substitution_skipped() {
+        let cache = make_sift_cache(vec![(
+            "ENST00000001",
+            42,
+            "I",
+            "deleterious",
+            0.01,
+            "benign",
+            0.0,
+        )]);
+        // Multi-char alt amino acid — not a single substitution.
+        let (sift, polyphen) =
+            lookup_sift_polyphen(Some("ENST00000001"), Some("42"), Some("V/IL"), &cache);
+        assert!(sift.is_empty());
+        assert!(polyphen.is_empty());
+
+        // Range position — indel, should be skipped.
+        let (sift, polyphen) =
+            lookup_sift_polyphen(Some("ENST00000001"), Some("42-43"), Some("V/I"), &cache);
+        assert!(sift.is_empty());
+        assert!(polyphen.is_empty());
+    }
+
+    #[test]
+    fn test_lookup_sift_polyphen_missing_transcript() {
+        let cache = SiftPolyphenCache::new(10);
+        let (sift, polyphen) =
+            lookup_sift_polyphen(Some("ENST_MISSING"), Some("42"), Some("V/I"), &cache);
+        assert!(sift.is_empty());
+        assert!(polyphen.is_empty());
+    }
+
+    // ── lookup_domains ─────────────────────────────────────────────────
+
     fn make_translation(
         tx_id: &str,
-        sift: Vec<ProteinPrediction>,
-        polyphen: Vec<ProteinPrediction>,
         protein_features: Vec<ProteinDomainFeature>,
     ) -> TranslationFeature {
         TranslationFeature {
@@ -4236,91 +4763,18 @@ mod tests {
             cds_sequence: None,
             stable_id: None,
             version: None,
-            sift_predictions: sift,
-            polyphen_predictions: polyphen,
             protein_features,
         }
     }
 
-    /// Build a minimal PreparedContext from a set of translations (no
-    /// transcripts, exons, regulatory features, etc.).
     fn minimal_ctx(translations: &[TranslationFeature]) -> PreparedContext<'_> {
         PreparedContext::new(&[], &[], translations, &[], &[], &[], &[])
     }
 
     #[test]
-    fn test_lookup_sift_polyphen_single_aa_match() {
-        let translations = vec![make_translation(
-            "ENST00000001",
-            vec![ProteinPrediction {
-                position: 42,
-                amino_acid: "I".to_string(),
-                prediction: "deleterious".to_string(),
-                score: 0.01,
-            }],
-            vec![ProteinPrediction {
-                position: 42,
-                amino_acid: "I".to_string(),
-                prediction: "probably damaging".to_string(),
-                score: 0.999,
-            }],
-            vec![],
-        )];
-        let ctx = minimal_ctx(&translations);
-
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST00000001"), Some("42"), Some("V/I"), &ctx);
-        assert_eq!(sift, "deleterious(0.01)");
-        assert_eq!(polyphen, "probably_damaging(0.999)");
-    }
-
-    #[test]
-    fn test_lookup_sift_polyphen_non_substitution_skipped() {
-        let translations = vec![make_translation(
-            "ENST00000001",
-            vec![ProteinPrediction {
-                position: 42,
-                amino_acid: "I".to_string(),
-                prediction: "deleterious".to_string(),
-                score: 0.01,
-            }],
-            vec![],
-            vec![],
-        )];
-        let ctx = minimal_ctx(&translations);
-
-        // Multi-char alt amino acid -- not a single substitution.
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST00000001"), Some("42"), Some("V/IL"), &ctx);
-        assert!(sift.is_empty());
-        assert!(polyphen.is_empty());
-
-        // Range position -- indel, should be skipped.
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST00000001"), Some("42-43"), Some("V/I"), &ctx);
-        assert!(sift.is_empty());
-        assert!(polyphen.is_empty());
-    }
-
-    #[test]
-    fn test_lookup_sift_polyphen_missing_transcript() {
-        let translations = vec![make_translation("ENST00000001", vec![], vec![], vec![])];
-        let ctx = minimal_ctx(&translations);
-
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST_MISSING"), Some("42"), Some("V/I"), &ctx);
-        assert!(sift.is_empty());
-        assert!(polyphen.is_empty());
-    }
-
-    // ── lookup_domains ─────────────────────────────────────────────────
-
-    #[test]
     fn test_lookup_domains_single_overlap() {
         let translations = vec![make_translation(
             "ENST00000001",
-            vec![],
-            vec![],
             vec![ProteinDomainFeature {
                 analysis: Some("Pfam".to_string()),
                 hseqname: Some("PF00069".to_string()),
@@ -4339,8 +4793,6 @@ mod tests {
     fn test_lookup_domains_multiple_overlap() {
         let translations = vec![make_translation(
             "ENST00000001",
-            vec![],
-            vec![],
             vec![
                 ProteinDomainFeature {
                     analysis: Some("Pfam".to_string()),
@@ -4367,8 +4819,6 @@ mod tests {
     fn test_lookup_domains_no_overlap() {
         let translations = vec![make_translation(
             "ENST00000001",
-            vec![],
-            vec![],
             vec![ProteinDomainFeature {
                 analysis: Some("Pfam".to_string()),
                 hseqname: Some("PF00069".to_string()),
@@ -4384,8 +4834,6 @@ mod tests {
     fn test_lookup_domains_spaces_replaced() {
         let translations = vec![make_translation(
             "ENST00000001",
-            vec![],
-            vec![],
             vec![ProteinDomainFeature {
                 analysis: Some("Gene3D db".to_string()),
                 hseqname: Some("1.10.510.10".to_string()),

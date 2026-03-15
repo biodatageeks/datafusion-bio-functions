@@ -172,6 +172,10 @@ pub struct TranscriptFeature {
     pub uniprot_isoform: Option<String>,
     /// APPRIS annotation code (e.g. "principal1", "alternative2").
     pub appris: Option<String>,
+    /// ncRNA secondary structure string for miRNA CSQ field.
+    /// Format: `"start:end structure_string"` e.g. `"1:81 (19.(6.(2.(4.14)12.)10.)9"`.
+    /// Parsed at CSQ output time to determine miRNA_stem/miRNA_loop overlap.
+    pub ncrna_structure: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,17 +186,8 @@ pub struct ExonFeature {
     pub end: i64,
 }
 
-/// A single SIFT or PolyPhen prediction entry keyed by (position, amino_acid).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProteinPrediction {
-    pub position: i32,
-    pub amino_acid: String,
-    pub prediction: String,
-    pub score: f32,
-}
-
 /// A single protein domain feature entry for the DOMAINS CSQ field.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProteinDomainFeature {
     pub analysis: Option<String>,
     pub hseqname: Option<String>,
@@ -200,7 +195,7 @@ pub struct ProteinDomainFeature {
     pub end: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslationFeature {
     pub transcript_id: String,
     pub cds_len: Option<usize>,
@@ -211,14 +206,78 @@ pub struct TranslationFeature {
     pub stable_id: Option<String>,
     /// Translation version number.
     pub version: Option<i32>,
-    /// Pre-computed SIFT predictions indexed by (position, amino_acid).
-    /// WARNING: eagerly loading these causes ~20GB+ memory on chr1
-    /// (22K translations × 11K entries each). See #38 for lazy-loading fix.
-    pub sift_predictions: Vec<ProteinPrediction>,
-    /// Pre-computed PolyPhen predictions indexed by (position, amino_acid).
-    pub polyphen_predictions: Vec<ProteinPrediction>,
     /// Protein domain features for DOMAINS CSQ field.
     pub protein_features: Vec<ProteinDomainFeature>,
+}
+
+/// Cached SIFT/PolyPhen predictions for a single transcript.
+///
+/// Keyed by `(position, amino_acid)` for O(1) lookup. Loaded lazily
+/// one transcript at a time to avoid the ~20GB memory explosion from
+/// eagerly loading all prediction matrices. See #38.
+#[derive(Debug, Clone, Default)]
+pub struct CachedPredictions {
+    /// SIFT predictions: `(position, amino_acid)` → `(prediction, score)`.
+    pub sift: HashMap<(i32, String), (String, f32)>,
+    /// PolyPhen predictions: `(position, amino_acid)` → `(prediction, score)`.
+    pub polyphen: HashMap<(i32, String), (String, f32)>,
+}
+
+/// LRU-style cache for SIFT/PolyPhen predictions, loaded per-transcript.
+///
+/// Each transcript's predictions are loaded on first access via a point
+/// query against the translation parquet:
+/// ```sql
+/// SELECT sift_predictions, polyphen_predictions
+/// FROM translations WHERE transcript_id = '...'
+/// ```
+///
+/// With sorted parquet + small row groups (see datafusion-bio-formats#129),
+/// DataFusion uses row-group min/max statistics to skip non-matching row
+/// groups, reading ~1K rows instead of 22K. The cache holds predictions for
+/// up to `capacity` transcripts; when full, the oldest entry is evicted.
+///
+/// Typical memory: ~500 transcripts × ~400KB each ≈ 200MB (vs 20GB eager).
+#[derive(Debug)]
+pub struct SiftPolyphenCache {
+    entries: HashMap<String, CachedPredictions>,
+    /// Insertion order for LRU eviction (oldest first).
+    order: Vec<String>,
+    capacity: usize,
+}
+
+impl SiftPolyphenCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(capacity),
+            order: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Look up cached predictions for a transcript. Returns `None` on cache miss.
+    pub fn get(&self, transcript_id: &str) -> Option<&CachedPredictions> {
+        self.entries.get(transcript_id)
+    }
+
+    /// Insert predictions for a transcript, evicting the oldest entry if at capacity.
+    pub fn insert(&mut self, transcript_id: String, predictions: CachedPredictions) {
+        if self.entries.len() >= self.capacity && !self.entries.contains_key(&transcript_id) {
+            // Evict oldest entry.
+            if let Some(oldest) = self.order.first().cloned() {
+                self.entries.remove(&oldest);
+                self.order.remove(0);
+            }
+        }
+        if !self.entries.contains_key(&transcript_id) {
+            self.order.push(transcript_id.clone());
+        }
+        self.entries.insert(transcript_id, predictions);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4325,6 +4384,7 @@ mod tests {
             uniparc: None,
             uniprot_isoform: None,
             appris: None,
+            ncrna_structure: None,
         }
     }
 
@@ -4426,8 +4486,6 @@ mod tests {
             cds_sequence: cds_sequence.map(|v| v.to_string()),
             stable_id: None,
             version: None,
-            sift_predictions: Vec::new(),
-            polyphen_predictions: Vec::new(),
             protein_features: Vec::new(),
         }
     }

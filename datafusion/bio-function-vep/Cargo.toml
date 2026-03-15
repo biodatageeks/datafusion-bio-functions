@@ -65,6 +65,10 @@ required-features = ["kv-cache"]
 name = "annotate_vep_golden_bench"
 required-features = []
 
+[[example]]
+name = "profile_annotation"
+required-features = []
+
 [features]
 default = ["kv-cache"]
 kv-cache = ["dep:fjall", "dep:arrow-ipc", "dep:lz4_flex", "dep:zstd", "dep:ahash"]
