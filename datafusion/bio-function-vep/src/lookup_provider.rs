@@ -257,7 +257,16 @@ impl TableProvider for LookupProvider {
         // Project cache to only the columns needed: join keys + requested output columns.
         // This avoids reading all 78 parquet columns when only ~10 are needed.
         let cache_df = self.session.table(&self.cache_table).await?;
-        let mut required_cols: Vec<&str> = vec!["chrom", "start", "end", "allele_string", "failed"];
+        let mut required_cols: Vec<&str> = vec!["chrom", "start", "end", "allele_string"];
+        // Only request "failed" if the cache schema actually contains it.
+        if cache_df
+            .schema()
+            .as_arrow()
+            .field_with_name("failed")
+            .is_ok()
+        {
+            required_cols.push("failed");
+        }
         for col in &self.cache_columns {
             if !required_cols.contains(&col.as_str()) {
                 required_cols.push(col.as_str());

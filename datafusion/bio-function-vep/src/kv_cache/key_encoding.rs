@@ -28,9 +28,8 @@ const CHROM_NAMES: &[&str] = &[
     "18", "19", "20", "21", "22",
 ];
 
-/// Non-canonical chromosome code: used for contigs like "GL000220.1".
-/// These are sorted lexicographically after canonical chromosomes.
-const NON_CANONICAL_PREFIX: u16 = 0x8000;
+/// First code assigned to non-canonical contigs (canonical use 1..=25).
+const NON_CANONICAL_START: u16 = 25;
 
 /// Map a chromosome name (with or without "chr" prefix) to its 2-byte code.
 ///
@@ -89,13 +88,19 @@ pub fn encode_position_key_buf(chrom_code: u16, start: i64, end: i64, buf: &mut 
 }
 
 /// Deterministic code for non-canonical chromosomes.
-/// Uses a hash-based approach to assign stable codes >= 0x8000.
+/// Uses a hash-based approach to assign stable codes in the range
+/// `NON_CANONICAL_START..=u16::MAX` (65511 possible values), which is
+/// much wider than the previous 15-bit (32768) space and reduces
+/// collision probability for non-canonical contig names.
 fn non_canonical_code(chrom: &str) -> u16 {
-    let mut hash: u16 = 0;
+    // FNV-1a 32-bit hash for better distribution.
+    let mut hash: u32 = 0x811c_9dc5;
     for b in chrom.bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(b as u16);
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
     }
-    NON_CANONICAL_PREFIX | (hash & 0x7FFF)
+    let range = (u16::MAX as u32) - (NON_CANONICAL_START as u32) + 1; // 65511
+    NON_CANONICAL_START + (hash % range) as u16
 }
 
 #[cfg(test)]

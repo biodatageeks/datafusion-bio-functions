@@ -4632,9 +4632,13 @@ impl TableProvider for AnnotateProvider {
                 projected_exprs.push(format!("{most_severe_expr} AS `most_severe_consequence`"));
             } else if idx >= cache_col_start {
                 let col_name = CACHE_OUTPUT_COLUMNS[idx - cache_col_start];
-                projected_exprs.push(format!(
-                    "CAST(l.`cache_{col_name}` AS VARCHAR) AS `{col_name}`"
-                ));
+                if has_col(col_name) {
+                    projected_exprs.push(format!(
+                        "CAST(l.`cache_{col_name}` AS VARCHAR) AS `{col_name}`"
+                    ));
+                } else {
+                    projected_exprs.push(format!("CAST(NULL AS VARCHAR) AS `{col_name}`"));
+                }
             }
         }
 
