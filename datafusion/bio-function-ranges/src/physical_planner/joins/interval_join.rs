@@ -361,7 +361,19 @@ impl DisplayAs for IntervalJoinExec {
                     self.algorithm
                 )
             }
-            DisplayFormatType::TreeRender => todo!(),
+            DisplayFormatType::TreeRender => {
+                let on = self
+                    .on
+                    .iter()
+                    .map(|(c1, c2)| format!("({c1}, {c2})"))
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "IntervalJoinExec: mode={:?}, join_type={:?}, on=[{}], alg={}",
+                    self.mode, self.join_type, on, self.algorithm
+                )
+            }
         }
     }
 }
@@ -850,10 +862,10 @@ impl IntervalJoinAlgorithm {
                 }
             }
             IntervalJoinAlgorithm::CoitreesNearest(hashmap) => {
-                if let Some(index) = hashmap.get(&k) {
-                    if let Some(position) = index.nearest_one(start, end, true) {
-                        f(position);
-                    }
+                if let Some(index) = hashmap.get(&k)
+                    && let Some(position) = index.nearest_one(start, end, true)
+                {
+                    f(position);
                 }
             }
             IntervalJoinAlgorithm::IntervalTree(hashmap) => {
@@ -902,7 +914,7 @@ fn update_hashmap(
         .map(|c| c.evaluate(batch)?.into_array(batch.num_rows()))
         .collect::<Result<Vec<_>>>()?;
 
-    let hash_values: &mut Vec<u64> = create_hashes(&keys_values, random_state, hashes_buffer)?;
+    let hash_values = create_hashes(&keys_values, random_state, hashes_buffer)?;
 
     let start = evaluate_as_i32(left_interval.start(), batch)?;
     let end = evaluate_as_i32(left_interval.end(), batch)?;
@@ -1343,6 +1355,7 @@ impl IntervalJoinStream {
                         total_output_rows += matches_for_this_row;
                     }
                 }
+
                 pos_vect.clear();
                 processed_input_rows += 1;
             }
@@ -1474,6 +1487,7 @@ impl IntervalJoinStream {
                         builder_left.append_slice(&pos_vect);
                     }
                 }
+
                 pos_vect.clear();
             }
 
@@ -1501,6 +1515,7 @@ impl IntervalJoinStream {
             }
 
             let result = RecordBatch::try_new(self.schema.clone(), columns)?;
+
             self.join_metrics.output_batches.add(1);
             self.join_metrics.output_rows.add(result.num_rows());
             timer.done();
@@ -1562,7 +1577,7 @@ mod tests {
         ])
     }
 
-    fn csv_options(schema: &Schema) -> CsvReadOptions {
+    fn csv_options(schema: &Schema) -> CsvReadOptions<'_> {
         CsvReadOptions::new()
             .has_header(true)
             .schema(schema)
