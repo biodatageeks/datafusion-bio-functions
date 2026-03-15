@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use coitrees::{COITree, Interval, IntervalTree};
+use coitrees::{COITree, GenericInterval, Interval, IntervalTree};
 
 use crate::hgvs::HgvsGenomicShift;
 use crate::so_terms::{ALL_SO_TERMS, SoTerm};
@@ -478,7 +478,7 @@ impl<'a, T> PreparedFeatureIndex<'a, T> {
             (query_end, query_start)
         };
         tree.query(first as i32, last as i32, |node| {
-            out.push(*node.metadata);
+            out.push(*GenericInterval::<usize>::metadata(node));
         });
         // Preserve the original cache/source encounter order.
         out.sort_unstable();
@@ -654,7 +654,7 @@ impl TranscriptConsequenceEngine {
             let query_first = (variant.start - max_dist) as i32;
             let query_last = (variant.end + max_dist) as i32;
             tree.query(query_first, query_last, |node| {
-                let tx_idx = *node.metadata;
+                let tx_idx = *GenericInterval::<usize>::metadata(node);
                 let tx = ctx.transcripts[tx_idx];
                 let tx_exons = ctx
                     .exons_by_tx

@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use coitrees::{COITree, Interval, IntervalTree};
+use coitrees::{COITree, GenericInterval, Interval, IntervalTree};
 use datafusion::arrow::array::{
     Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch,
     StringArray, StringViewArray, UInt32Array, UInt64Array,
@@ -375,13 +375,13 @@ fn collect_overlapping_candidates(
 
     if let Some(tree) = compare_tree {
         tree.query(probe_start as i32, probe_end as i32, |interval| {
-            push_unique_candidate(&mut candidates, &mut seen, *interval.metadata as usize);
+            push_unique_candidate(&mut candidates, &mut seen, *GenericInterval::<u32>::metadata(interval) as usize);
         });
     }
 
     if let Some(tree) = unshifted_tree {
         tree.query(probe_start as i32, probe_end as i32, |interval| {
-            push_unique_candidate(&mut candidates, &mut seen, *interval.metadata as usize);
+            push_unique_candidate(&mut candidates, &mut seen, *GenericInterval::<u32>::metadata(interval) as usize);
         });
     }
 
@@ -1203,7 +1203,7 @@ impl VariantLookupStream {
                         let probe_end = cache_start_1based.max(cache_end_1based);
 
                         tree.query(probe_start as i32, probe_end as i32, |interval| {
-                            let vcf_idx = *interval.metadata;
+                            let vcf_idx = *GenericInterval::<u32>::metadata(interval);
 
                             if matched[vcf_idx as usize] {
                                 return;
