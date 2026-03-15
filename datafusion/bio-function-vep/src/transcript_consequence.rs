@@ -571,9 +571,9 @@ impl TranscriptConsequenceEngine {
 
     /// Traceability:
     /// - Ensembl VEP `Config.pm` `shift_hgvs`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L353-L381
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L353-L381>
     /// - Ensembl VEP `Runner::post_setup_checks()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Runner.pm#L771-L773
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Runner.pm#L771-L773>
     pub fn new_with_hgvs_shift(
         upstream_distance: i64,
         downstream_distance: i64,
@@ -977,9 +977,9 @@ impl TranscriptConsequenceEngine {
 
     /// Traceability:
     /// - Ensembl VEP `OutputFactory::RegulatoryFeatureVariationAllele_to_output_hash()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1802-L1829
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1802-L1829>
     /// - Ensembl Variation `VariationEffect::within_feature()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L126-L143
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L126-L143>
     ///
     /// VEP emits one regulatory CSQ entry per overlapping
     /// `RegulatoryFeatureVariationAllele`, serialized by stable_id as
@@ -1057,9 +1057,9 @@ impl TranscriptConsequenceEngine {
 
     /// Traceability:
     /// - Ensembl VEP `OutputFactory::RegulatoryFeatureVariationAllele_to_output_hash()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1802-L1829
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1802-L1829>
     /// - Ensembl Variation `VariationEffect::within_feature()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L126-L143
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L126-L143>
     ///
     /// Prepared-context regulatory output must preserve the same one-entry-per-
     /// feature semantics as the non-prepared path, even when the context cache
@@ -1383,7 +1383,7 @@ impl TranscriptConsequenceEngine {
 
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_overlap_cds()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L511-L518
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L511-L518>
     fn overlaps_cds(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
         let Some(cds_start) = tx.cds_start else {
             return false;
@@ -1405,9 +1405,9 @@ impl TranscriptConsequenceEngine {
     ///
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::within_cds()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L627-L648
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L627-L648>
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149>
     fn is_complex_indel(&self, variant: &VariantInput, tx_exons: &[&ExonFeature]) -> bool {
         // Insertions aren't complex
         if variant.ref_allele == "-" {
@@ -1436,7 +1436,7 @@ impl TranscriptConsequenceEngine {
     ///
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149>
     fn extends_into_frameshift_intron_only(
         &self,
         variant: &VariantInput,
@@ -1600,11 +1600,11 @@ impl TranscriptConsequenceEngine {
 
     /// Traceability:
     /// - Ensembl Variation `TranscriptVariationAllele::start_lost()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L83-L120
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L83-L120>
     /// - Ensembl Variation `TranscriptVariationAllele::stop_lost()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L124-L158
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L124-L158>
     /// - Ensembl Variation `TranscriptVariationAllele::stop_gained()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L161-L194
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L161-L194>
     fn add_start_stop_heuristic_terms(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -1684,9 +1684,9 @@ impl TranscriptConsequenceEngine {
     ///
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_after_coding()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L581-L606
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L581-L606>
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_before_coding()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L553-L578
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L553-L578>
     fn utr_boundary_insertion_term(
         &self,
         variant: &VariantInput,
@@ -1729,7 +1729,7 @@ impl TranscriptConsequenceEngine {
 
     /// Traceability:
     /// - Ensembl Variation `TranscriptVariationAllele::start_lost()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L83-L120
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L83-L120>
     fn overlaps_start_codon(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             return false;
@@ -1744,9 +1744,9 @@ impl TranscriptConsequenceEngine {
 
     /// Traceability:
     /// - Ensembl Variation `TranscriptVariationAllele::stop_lost()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L124-L158
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L124-L158>
     /// - Ensembl Variation `TranscriptVariationAllele::stop_gained()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L161-L194
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L161-L194>
     fn overlaps_stop_codon(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             return false;
@@ -1761,9 +1761,9 @@ impl TranscriptConsequenceEngine {
 
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_before_coding()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L553-L578
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L553-L578>
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_after_coding()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L581-L606
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L581-L606>
     fn utr_term(&self, variant: &VariantInput, tx: &TranscriptFeature) -> Option<SoTerm> {
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             return None;
@@ -1806,9 +1806,9 @@ impl TranscriptConsequenceEngine {
 
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::upstream()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L652-L677
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L652-L677>
     /// - Ensembl Variation `BaseTranscriptVariationAllele::downstream()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L680-L705
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L680-L705>
     fn upstream_downstream_term(
         &self,
         variant: &VariantInput,
@@ -1872,9 +1872,9 @@ impl TranscriptConsequenceEngine {
     ///
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149>
     /// - Ensembl Variation `overlap_perl()` / `_intron_overlap()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L109
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L109>
     fn variant_overlaps_intron(&self, variant: &VariantInput, tx_exons: &[&ExonFeature]) -> bool {
         if tx_exons.len() < 2 {
             return false;
@@ -1896,7 +1896,7 @@ impl TranscriptConsequenceEngine {
     ///
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149>
     fn in_frameshift_intron(&self, variant: &VariantInput, tx_exons: &[&ExonFeature]) -> bool {
         if tx_exons.len() < 2 {
             return false;
@@ -1920,9 +1920,9 @@ impl TranscriptConsequenceEngine {
 
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149>
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_overlap()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L151-L259
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L151-L259>
     fn add_intron_splice_terms(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -1998,9 +1998,9 @@ impl TranscriptConsequenceEngine {
 
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149>
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_overlap()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L151-L259
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L151-L259>
     fn add_splice_for_intron_positive(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -2158,9 +2158,9 @@ impl TranscriptConsequenceEngine {
     ///
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149>
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_overlap()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L151-L259
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L151-L259>
     fn add_splice_for_intron_negative(
         &self,
         terms: &mut BTreeSet<SoTerm>,
@@ -2327,7 +2327,7 @@ fn overlaps(a_start: i64, a_end: i64, b_start: i64, b_end: i64) -> bool {
 ///
 /// Traceability:
 /// - Ensembl Variation `VariationEffect::within_feature()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L43-L53
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L43-L53>
 fn feature_overlaps(variant: &VariantInput, feat_start: i64, feat_end: i64) -> bool {
     if variant.ref_allele == "-" {
         variant.start > feat_start && variant.start <= feat_end
@@ -2338,7 +2338,7 @@ fn feature_overlaps(variant: &VariantInput, feat_start: i64, feat_end: i64) -> b
 
 /// Traceability:
 /// - Ensembl Variation `VariationEffect::overlap_perl()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L85
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L85>
 fn add_if_overlaps(
     terms: &mut BTreeSet<SoTerm>,
     variant: &VariantInput,
@@ -2376,7 +2376,7 @@ fn is_non_coding_biotype(biotype: &str) -> bool {
 ///
 /// Traceability:
 /// - Ensembl VEP `AnnotationSourceAdaptor::get_all_TranscriptVariations()`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSourceAdaptor.pm#L173-L220
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSourceAdaptor.pm#L173-L220>
 pub fn is_vep_transcript(id: &str, merged: bool) -> bool {
     if merged {
         id.starts_with("ENST")
@@ -2401,7 +2401,7 @@ pub fn is_vep_transcript(id: &str, merged: bool) -> bool {
 ///
 /// Traceability:
 /// - Ensembl Variation `BaseVariationFeatureOverlapAllele::_get_cons_term_rank()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749>
 fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
@@ -2429,7 +2429,7 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 ///
 /// Traceability:
 /// - Ensembl Variation `BaseVariationFeatureOverlapAllele::_get_cons_term_rank()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749>
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
@@ -2493,7 +2493,7 @@ fn allele_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
 
 /// Traceability:
 /// - Ensembl Variation `BaseTranscriptVariationAllele::incomplete_cds()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L520-L548
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L520-L548>
 fn cds_is_incomplete(tx: &TranscriptFeature, tx_translation: Option<&TranslationFeature>) -> bool {
     if let Some(translation) = tx_translation {
         if let Some(cds_len) = translation.cds_len {
@@ -2512,9 +2512,9 @@ fn cds_is_incomplete(tx: &TranscriptFeature, tx_translation: Option<&Translation
 
 /// Traceability:
 /// - Ensembl VEP `OutputFactory::output_hash_to_vcf_info_chunk()`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1698-L1715
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1698-L1715>
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1584-L1880
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1584-L1880>
 ///
 /// VEP emits HGVSp with the translation stable ID that hangs off the
 /// TranscriptVariationAllele object. Our parquet caches can miss that ID on the
@@ -2583,7 +2583,7 @@ impl CodingClassification {
 
 /// Traceability:
 /// - Ensembl Variation `BaseTranscriptVariationAllele::_get_peptide_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509>
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
 ///   sets `start` from `$tv->translation_start()` which uses the
@@ -2591,8 +2591,8 @@ impl CodingClassification {
 ///   the mapper returns the codon AFTER the boundary, which is
 ///   `protein_position_end` in our classification. Using `end` as
 ///   the HGVS start aligns the dup detection index with VEP.
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1680-L1682
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1680-L1682>
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499>
 fn build_protein_hgvs_data(
     class: &CodingClassification,
     old_aas: &[char],
@@ -2640,7 +2640,7 @@ fn build_protein_hgvs_data(
 ///   applies `_return_3prime()` before checking coding coordinates, so protein
 ///   HGVS is derived from the HGVS-shifted indel state rather than the
 ///   original unshifted consequence state
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1626-L1749
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1626-L1749>
 fn protein_hgvs_for_output(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -2711,7 +2711,7 @@ fn apply_codon_classification(terms: &mut BTreeSet<SoTerm>, c: &CodingClassifica
 
 /// Traceability:
 /// - Ensembl Variation `BaseTranscriptVariationAllele::_get_peptide_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509>
 fn classify_coding_change(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -3083,7 +3083,7 @@ fn classify_coding_change(
 ///
 /// Traceability:
 /// - Ensembl Variation `BaseTranscriptVariationAllele::_get_peptide_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509>
 fn classify_insertion(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -3311,7 +3311,7 @@ fn classify_insertion(
 ///
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_ins_del_start_altered()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L197-L285
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L197-L285>
 fn mutated_cds_first3(
     cds_seq: &str,
     variant: &VariantInput,
@@ -3469,7 +3469,7 @@ fn mutated_cds_first3(
 ///
 /// Traceability:
 /// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1631-L1677
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1631-L1677>
 fn format_codon_display(
     bases: &[u8],
     changed_start: usize,
@@ -3495,9 +3495,9 @@ fn format_codon_display(
 ///
 /// Traceability:
 /// - Ensembl VEP `OutputFactory.pm`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1414-L1445
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1414-L1445>
 /// - Ensembl Variation `BaseTranscriptVariation::exon_number()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L698-L724
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L698-L724>
 fn which_exon_str(variant: &VariantInput, tx_exons: &[&ExonFeature]) -> Option<String> {
     if tx_exons.is_empty() {
         return None;
@@ -3628,10 +3628,10 @@ fn mapper_segment_cdna_index(segment: &TranscriptCdnaMapperSegment, pos: i64) ->
 /// Traceability:
 /// - Ensembl VEP `AnnotationSource::Database::Transcript::prefetch_transcript_data()`
 ///   caches `mapper` on `_variation_effect_feature_cache`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L333-L352
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L333-L352>
 /// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
 ///   resolves transcript coordinates through `genomic2cdna`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765>
 pub(crate) fn genomic_to_cdna_index_for_transcript(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -3712,7 +3712,7 @@ fn transcript_cdna_coords(
 ///
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765>
 pub(crate) fn raw_cdna_position_from_genomic(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -3763,11 +3763,11 @@ pub(crate) fn raw_cdna_position_from_genomic(
 ///
 /// Traceability:
 /// - Ensembl Variation `BaseTranscriptVariation::cdna_coords()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L478-L492
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L478-L492>
 /// - Ensembl Variation `BaseTranscriptVariation::cdna_start_unshifted()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L194-L208
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L194-L208>
 /// - Ensembl Variation `BaseTranscriptVariation::cdna_end_unshifted()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L225-L233
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L225-L233>
 pub(crate) fn unshifted_cdna_bounds_for_hgvs_shift(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -3830,9 +3830,9 @@ pub(crate) fn unshifted_cdna_bounds_for_hgvs_shift(
 ///
 /// Traceability:
 /// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1631-L1677
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1631-L1677>
 /// - Ensembl VEP `format_coords()`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159>
 fn compute_cdna_position(
     variant: &VariantInput,
     tx: &TranscriptFeature,
@@ -3928,7 +3928,7 @@ fn compute_cdna_position(
 ///
 /// Traceability:
 /// - Ensembl VEP `OutputFactory.pm`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1425-L1430
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1425-L1430>
 fn compute_flags(tx: &TranscriptFeature) -> Option<String> {
     // Prefer pre-formatted flags string that preserves encounter order from cache.
     // Note: VEP's flag ordering is inconsistent between transcripts (some use
@@ -3962,7 +3962,7 @@ fn genomic_range(start: i64, end: i64) -> Option<Vec<i64>> {
 
 /// Traceability:
 /// - Ensembl VEP `format_coords()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159>
 fn format_coords_ensembl(start: Option<usize>, end: Option<usize>) -> Option<String> {
     match (start, end) {
         (Some(s), Some(e)) if s > e => Some(format!("{e}-{s}")),
@@ -3976,9 +3976,9 @@ fn format_coords_ensembl(start: Option<usize>, end: Option<usize>) -> Option<Str
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::pep_allele_string()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L618-L629
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L618-L629>
 /// - Ensembl Variation `TranscriptVariationAllele::peptide()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L692-L777
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L692-L777>
 fn pep_allele_string_from_codon_allele_string(codon_allele_string: &str) -> Option<String> {
     let (ref_codon, alt_codon) = codon_allele_string.split_once('/')?;
     let ref_pep = peptide_from_codon_allele(ref_codon)?;
@@ -3992,9 +3992,9 @@ fn pep_allele_string_from_codon_allele_string(codon_allele_string: &str) -> Opti
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::pep_allele_string()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L618-L629
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L618-L629>
 /// - Ensembl Variation `TranscriptVariationAllele::peptide()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L692-L777
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L692-L777>
 fn peptide_from_codon_allele(codon: &str) -> Option<String> {
     if codon == "-" {
         return Some("-".to_string());
@@ -4086,7 +4086,7 @@ fn translate_codon_bytes(codon: [u8; 3]) -> Option<char> {
 
 /// Traceability:
 /// - Ensembl Variation `BaseTranscriptVariationAllele::_get_coding_region_start_end()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L321-L364
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L321-L364>
 fn genomic_to_cds_index(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -4111,9 +4111,9 @@ fn genomic_to_cds_index(
 
 /// Traceability:
 /// - Ensembl VEP `TranscriptVariationAllele_to_output_hash()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1661-L1665
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1661-L1665>
 /// - Ensembl VEP `format_coords()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159>
 ///
 /// When a variant spans from non-coding sequence into CDS (or vice versa),
 /// VEP keeps the known coding-side bound and emits `?` for the unknown side.
@@ -4188,9 +4188,9 @@ fn partial_coding_overlap_classification(
 
 /// Traceability:
 /// - Ensembl Variation `BaseTranscriptVariationAllele::_intron_effects()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L99-L149>
 /// - Ensembl Variation `overlap_perl()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L85
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L81-L85>
 ///
 /// VEP's `intronic` predicate excludes frameshift introns and does not use a
 /// simple full-intron overlap. Insertions are evaluated with `(P, P-1)`
@@ -4279,14 +4279,14 @@ fn reverse_complement(seq: &str) -> Option<String> {
 /// - Ensembl Variation `TranscriptVariationAllele::_stop_loss_extra_AA()`
 ///   calls `$self->transcript_variation->_three_prime_utr()` and appends
 ///   it to the alternate CDS before translating
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2412-L2418
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2412-L2418>
 /// Traceability:
 /// - Ensembl Variation `BaseTranscriptVariation::_three_prime_utr()`
 ///   delegates to `$tran->three_prime_utr()` which returns the annotated
 ///   UTR from the transcript object. For `protein_coding_LoF` biotype
 ///   transcripts, the Ensembl API returns undef because these transcripts
 ///   lack functional UTR annotations.
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1106-L1116
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1106-L1116>
 fn three_prime_utr_seq(tx: &TranscriptFeature) -> Option<String> {
     // LoF transcripts don't have annotated UTR in VEP's transcript objects.
     if tx.biotype.contains("LoF") {

@@ -44,11 +44,11 @@ impl HgvsGenomicShift {
     /// - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
     ///   applies `_hgvs_offset` to `_slice_start/_slice_end` instead of
     ///   mutating the stored reverse-strand genomic start/end in `shift_hash`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1360-L1406
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1360-L1406>
     /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
     ///   applies the same strand-aware `shifting_offset` to translation
     ///   coordinates when HGVS shifting is active
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1636-L1669
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1636-L1669>
     ///
     /// For forward-strand genomic shifting Ensembl updates the genomic
     /// start/end directly during `perform_shift()`. For reverse-strand HGVS,
@@ -111,7 +111,7 @@ pub fn aa_one_to_three(c: char) -> &'static str {
 /// - Ensembl VEP `OutputFactory::BaseTranscriptVariationAllele_to_output_hash()`
 ///   appends transcript version only when the stable ID does not already end in
 ///   `.digits`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1417-L1421
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1417-L1421>
 fn versioned_id(base_id: &str, version: Option<i32>) -> String {
     if has_numeric_version_suffix(base_id) {
         return base_id.to_string();
@@ -133,15 +133,15 @@ fn has_numeric_version_suffix(value: &str) -> bool {
 ///
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1301-L1491
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1301-L1491>
 /// - Ensembl Variation `Utils::Sequence::hgvs_variant_notation()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L493-L619
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L493-L619>
 /// - Ensembl Variation `TranscriptVariationAllele::_clip_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2232
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2232>
 /// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765>
 /// - Ensembl Variation `Utils::Sequence::format_hgvs_string()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L623-L676
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L623-L676>
 pub fn format_hgvsc(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -248,11 +248,11 @@ enum GenomicShiftKind {
 
 /// Traceability:
 /// - Ensembl Variation `_genomic_shift()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L411-L466
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L411-L466>
 /// - Ensembl Variation `perform_shift()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351>
 /// - Ensembl Variation `create_shift_hash()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400>
 ///
 /// This materializes the simple-indel genomic shift hash VEP uses when
 /// transcript HGVS needs a precomputed genomic 3' shift outside transcript
@@ -406,7 +406,7 @@ where
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1360-L1364
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1360-L1364>
 ///
 /// VEP builds transcript HGVS from feature-strand alleles. For transcripts on
 /// the reverse strand, the variant allele sequence is reverse-complemented
@@ -448,10 +448,10 @@ fn parse_shiftable_indel<'a>(
 /// - Ensembl Variation `TranscriptVariationAllele::_return_3prime()`
 ///   uses edited transcript `spliced_seq` for RefSeq HGVS shifting when RNA
 ///   edit attributes are present
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L149-L235
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L149-L235>
 /// - Ensembl VEP `AnnotationType::Transcript::edit_transcript()` stores the
 ///   edited sequence on `_variation_effect_feature_cache.spliced_seq`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L596-L597
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L596-L597>
 fn edited_transcript_shifted_output_allele(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -492,11 +492,11 @@ fn edited_transcript_shifted_output_allele(
 ///   calls `perform_shift()` for edited RefSeq transcripts with the
 ///   transcript strand as `seq_strand` and the reverse flag derived
 ///   from the strand direction
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L237-L243
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L237-L243>
 /// - Ensembl Variation `TranscriptVariationAllele::perform_shift()`
 ///   rotates the transcript-side allele and HGVS output allele separately
 ///   depending on transcript strand and variation-feature strand
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351>
 fn shift_output_allele_across_transcript(
     alt_allele: &str,
     pre_seq: &str,
@@ -586,7 +586,7 @@ struct HgvsNotation {
 
 /// Traceability:
 /// - Ensembl Variation `Utils::Sequence::hgvs_variant_notation()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L493-L619
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L493-L619>
 fn hgvs_variant_notation(
     ref_allele: &str,
     alt_allele: &str,
@@ -658,7 +658,7 @@ fn reverse_complement(seq: &str) -> Option<String> {
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_clip_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2232
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2232>
 fn clip_alleles(notation: &mut HgvsNotation, strand: i8) {
     let mut ref_allele = notation.ref_allele.clone();
     let mut alt_allele = notation.alt_allele.clone();
@@ -800,7 +800,7 @@ fn variant_lies_within_transcript_sequence(
 
 /// Traceability:
 /// - Ensembl Variation `perform_shift()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351>
 ///
 /// VCF alleles are always reported on the forward genomic strand. When HGVS is
 /// generated for a reverse-strand transcript, Ensembl shifts the genomic
@@ -920,7 +920,7 @@ fn overlap_len(left_start: i64, left_end: i64, right_start: i64, right_end: i64)
 
 /// Traceability:
 /// - Ensembl Variation `Utils::Sequence::format_hgvs_string()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L635-L676
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L635-L676>
 fn format_hgvs_string(
     ref_name: &str,
     numbering: char,
@@ -954,7 +954,7 @@ fn format_hgvs_string(
 /// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
 ///   uses transcript coding cDNA anchors from the transcript/mapper state when
 ///   converting raw cDNA positions into HGVS `c.` coordinates
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765>
 fn coding_cdna_bounds(tx: &TranscriptFeature, tx_exons: &[&ExonFeature]) -> Option<(usize, usize)> {
     if let (Some(start_codon), Some(stop_codon)) = (tx.cdna_coding_start, tx.cdna_coding_end) {
         return Some((start_codon, stop_codon));
@@ -1072,7 +1072,7 @@ struct ProteinHgvsNotation {
 impl ProteinHgvsNotation {
     /// Traceability:
     /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
-    ///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1749
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1749>
     fn from_context(data: &ProteinHgvsData) -> Self {
         let ref_allele = normalize_peptide_allele(&data.ref_peptide);
         let alt_allele = normalize_peptide_allele(&data.alt_peptide);
@@ -1092,13 +1092,13 @@ impl ProteinHgvsNotation {
 ///
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1593-L1758
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1593-L1758>
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_type()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1976-L2041
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1976-L2041>
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2043-L2114
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2043-L2114>
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1833-L1974
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1833-L1974>
 pub fn format_hgvsp(
     translation: &TranslationFeature,
     protein: &ProteinHgvsData,
@@ -1162,7 +1162,7 @@ pub fn format_hgvsp(
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2054-L2089
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2054-L2089>
 fn normalize_peptide_allele(allele: &str) -> String {
     if allele == "-" {
         String::new()
@@ -1173,7 +1173,7 @@ fn normalize_peptide_allele(allele: &str) -> String {
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_clip_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2225
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2225>
 fn clip_protein_alleles(notation: &mut ProteinHgvsNotation) {
     let mut ref_allele = notation.ref_allele.clone();
     let mut alt_allele = notation.alt_allele.clone();
@@ -1221,7 +1221,7 @@ fn clip_protein_alleles(notation: &mut ProteinHgvsNotation) {
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_type()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1976-L2041
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1976-L2041>
 fn protein_event_type(ref_allele: &str, alt_allele: &str, frameshift: bool) -> String {
     if frameshift {
         "fs".to_string()
@@ -1240,7 +1240,7 @@ fn protein_event_type(ref_allele: &str, alt_allele: &str, frameshift: bool) -> S
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_fs_peptides()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2249-L2295
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2249-L2295>
 fn resolve_frameshift_hgvs(
     notation: &mut ProteinHgvsNotation,
     protein: &ProteinHgvsData,
@@ -1289,7 +1289,7 @@ fn resolve_frameshift_hgvs(
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_fs_peptides()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2262-L2295
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2262-L2295>
 fn append_terminal_stop(peptide: &str) -> String {
     if peptide.contains('*') {
         peptide.to_string()
@@ -1300,7 +1300,7 @@ fn append_terminal_stop(peptide: &str) -> String {
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_fs_peptides()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2278-L2291
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2278-L2291>
 fn peptide_char(peptide: &str, pos: usize) -> Option<char> {
     peptide
         .as_bytes()
@@ -1310,9 +1310,9 @@ fn peptide_char(peptide: &str, pos: usize) -> Option<char> {
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_check_peptides_post_var()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2501-L2518
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2501-L2518>
 /// - Ensembl Variation `TranscriptVariationAllele::_shift_3prime()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2525-L2573
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2525-L2573>
 fn shift_peptides_post_var(notation: &mut ProteinHgvsNotation, ref_translation: &str) {
     let post_seq = match surrounding_peptides(
         ref_translation,
@@ -1355,12 +1355,12 @@ fn shift_peptides_post_var(notation: &mut ProteinHgvsNotation, ref_translation: 
 /// - Ensembl Variation `TranscriptVariationAllele::_check_for_peptide_duplication()`
 ///   builds upstream from `substr($reference_trans, 0, $start - 1)` + preseq, then
 ///   tests whether the alt peptide matches the upstream at `start - alt_len - 1`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2410
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2410>
 /// - VEP's `$hgvs_notation->{start}` comes from `translation_start()` via the
 ///   `genomic2pep()` mapper, which for codon-boundary insertions can return a
 ///   position 1 higher than our `protein_position_start`. We compensate by also
 ///   trying with `start + 1` when the insertion has no clipped prefix (boundary).
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499>
 fn check_for_peptide_duplication(
     notation: &mut ProteinHgvsNotation,
     ref_translation: &str,
@@ -1418,7 +1418,7 @@ fn try_peptide_dup_at(
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_surrounding_peptides()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2297-L2320
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2297-L2320>
 fn surrounding_peptides(
     ref_translation: &str,
     ref_pos: usize,
@@ -1443,7 +1443,7 @@ fn surrounding_peptides(
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_stop_loss_extra_AA()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2406-L2461
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2406-L2461>
 ///
 ///   VEP Perl (non-frameshift path):
 ///     my $ref_temp = $self->transcript_variation->_peptide();
@@ -1478,28 +1478,28 @@ fn stop_loss_extra_aa(
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2083-L2112
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2083-L2112>
 fn peptide_to_three_letter(peptide: &str) -> String {
     peptide.chars().map(aa_one_to_three).collect()
 }
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1877-L1880
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1877-L1880>
 fn peptide_first_three(peptide: &str) -> Option<&'static str> {
     Some(aa_one_to_three(peptide.chars().next()?))
 }
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1877-L1880
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1877-L1880>
 fn peptide_last_three(peptide: &str) -> Option<&'static str> {
     Some(aa_one_to_three(peptide.chars().last()?))
 }
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1833-L1974
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1833-L1974>
 fn format_hgvsp_notation(
     protein_id: &str,
     notation: &ProteinHgvsNotation,

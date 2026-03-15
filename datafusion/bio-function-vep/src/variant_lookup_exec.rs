@@ -145,9 +145,9 @@ fn push_exact_candidates(
 
 /// Traceability:
 /// - Ensembl VEP `Parser::VCF::create_VariationFeatures()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Parser/VCF.pm#L321-L345
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Parser/VCF.pm#L321-L345>
 /// - Ensembl VEP `OutputFactory::add_colocated_variant_info()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035>
 ///
 /// OutputFactory compares co-located rows against the ALT/output component of
 /// the parser/build-side allele string that `compare_existing()` retained.
@@ -163,7 +163,7 @@ enum ShiftableIndelKind {
 
 /// Traceability:
 /// - Ensembl Variation `create_shift_hash()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400>
 ///
 /// Genomic shift state is only defined for simple insertion/deletion allele
 /// strings. Substitutions and multi-ALT representations bypass this path.
@@ -180,7 +180,7 @@ fn parse_shiftable_indel(allele_string: &str) -> Option<(&str, &str, ShiftableIn
 
 /// Traceability:
 /// - Ensembl Variation `create_shift_hash()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400>
 ///
 /// Shift-state construction queries the indexed genomic reference by absolute
 /// chromosome coordinates before `_genomic_shift()` rotates repeat indels.
@@ -210,7 +210,7 @@ fn build_reference_region(chrom: &str, start: i64, end: i64) -> Result<Region> {
 
 /// Traceability:
 /// - Ensembl Variation `_genomic_shift()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L411-L466
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L411-L466>
 ///
 /// The downstream flank used for VEP-style repeat shifting comes directly
 /// from the indexed reference FASTA, not from local allele heuristics.
@@ -238,7 +238,7 @@ where
 
 /// Traceability:
 /// - Ensembl Variation `perform_shift()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351>
 ///
 /// This is the source-equivalent positive-strand genomic branch of VEP's
 /// indel shifting loop. It rotates the shifted sequence through the 3' flank
@@ -289,9 +289,9 @@ fn perform_forward_genomic_shift(
 
 /// Traceability:
 /// - Ensembl Variation `create_shift_hash()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400>
 /// - Ensembl Variation `_genomic_shift()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L411-L466
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L411-L466>
 ///
 /// This materializes the VF-level genomic shift state VEP uses for colocated
 /// matching: active compare space becomes the shifted indel representation,
@@ -339,7 +339,7 @@ where
 
 /// Traceability:
 /// - Ensembl VEP `InputBuffer::get_overlapping_vfs()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/InputBuffer.pm#L311-L329
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/InputBuffer.pm#L311-L329>
 ///
 /// This mirrors VEP's prefilter by considering overlaps against both shifted
 /// active coordinates and, when defined, unshifted minimized coordinates
@@ -398,7 +398,7 @@ fn collect_overlapping_candidates(
 
 /// Traceability:
 /// - Ensembl VEP `AnnotationSource::Cache::VariationTabix::_annotate_pm()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationSource/Cache/VariationTabix.pm#L151-L189
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationSource/Cache/VariationTabix.pm#L151-L189>
 ///
 /// The variation cache fetch path does not consider every overlapping existing
 /// variant on the chromosome. Tabix is queried only for records whose START
@@ -415,9 +415,9 @@ fn existing_start_is_visible_to_input_row(input_row: &BuildRow, existing_start: 
 
 /// Traceability:
 /// - Ensembl VEP `compare_existing()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206>
 /// - Ensembl Variation `get_matched_variant_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258>
 ///
 /// This ports VEP's existing-variant decision exactly for the offline cache
 /// path: unknown-allele records match only on exact shifted coordinates, while
@@ -873,9 +873,9 @@ impl VariantLookupStream {
 
     /// Traceability:
     /// - Ensembl VEP `InputBuffer::get_overlapping_vfs()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/InputBuffer.pm#L311-L329
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/InputBuffer.pm#L311-L329>
     /// - Ensembl VEP `compare_existing()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L168-L196
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L168-L196>
     ///
     /// The build side must retain both the shifted lookup coordinates and the
     /// upstream input state required for later shifted/unshifted matching.
@@ -1118,9 +1118,9 @@ impl VariantLookupStream {
 
     /// Traceability:
     /// - Ensembl VEP `AnnotationSource::Cache::VariationTabix::_annotate_pm()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationSource/Cache/VariationTabix.pm#L151-L189
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationSource/Cache/VariationTabix.pm#L151-L189>
     /// - Ensembl VEP `compare_existing()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206>
     ///
     /// Probe-side cache processing follows the same VEP sequence: filter
     /// unusable cache rows, match by exact hash or overlap window, and collect

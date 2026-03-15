@@ -356,7 +356,7 @@ const AF_COLUMNS: &[AfColumn] = &[
 ///
 /// Traceability:
 /// - Ensembl VEP `Config.pm` `--everything` expansion
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L346-L374
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L346-L374>
 #[derive(Debug, Clone)]
 struct VepFlags {
     check_existing: bool,
@@ -416,13 +416,13 @@ impl VepFlags {
 ///
 /// Traceability:
 /// - Ensembl VEP `Config.pm` HGVS-related flags
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L195-L200
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L195-L200>
 /// - Ensembl VEP `Config.pm` `shift_hgvs`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L353-L381
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L353-L381>
 /// - Ensembl VEP `Runner::post_setup_checks()`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Runner.pm#L771-L773
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Runner.pm#L771-L773>
 /// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1698-L1715
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1698-L1715>
 #[derive(Debug, Clone, Copy, Default)]
 struct HgvsFlags {
     hgvsc: bool,
@@ -525,9 +525,9 @@ fn push_unique_value(values: &mut Vec<String>, value: impl Into<String>) {
 impl ColocatedEntry {
     /// Traceability:
     /// - Ensembl VEP `add_colocated_variant_info()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035>
     /// - Ensembl VEP `add_colocated_frequency_data()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1150-L1157
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1150-L1157>
     ///
     /// The colocated output path must resolve the matched existing-variant
     /// allele against the live CSQ allele, with optional fallback to the
@@ -545,7 +545,7 @@ impl ColocatedEntry {
 
     /// Traceability:
     /// - Ensembl VEP `add_colocated_variant_info()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035>
     ///
     /// Existing variants without `matched_alleles` remain visible, but once
     /// a matched-allele map exists the output must be filtered by the active
@@ -565,7 +565,7 @@ impl ColocatedEntry {
 impl ColocatedData {
     /// Traceability:
     /// - Ensembl VEP `add_colocated_variant_info()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035>
     ///
     /// Rust stores the active compare-space allele and any retained original
     /// compare-space allele separately on the colocated sink. For the live CSQ
@@ -585,7 +585,7 @@ impl ColocatedData {
 
     /// Traceability:
     /// - Ensembl VEP `add_colocated_frequency_data()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1150-L1157
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1150-L1157>
     ///
     /// Frequency output matches the current CSQ allele first, then
     /// `alt_orig_allele_string` when VEP retained original shift metadata.
@@ -604,7 +604,7 @@ impl ColocatedData {
 
     /// Traceability:
     /// - Ensembl VEP `add_colocated_variant_info()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1005-L1011
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1005-L1011>
     ///
     /// OutputFactory sorts co-located variants by somatic status and then by
     /// variation-name class before emitting IDs and metadata.
@@ -620,7 +620,7 @@ impl ColocatedData {
 
     /// Traceability:
     /// - Ensembl VEP `add_colocated_variant_info()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1005-L1120
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1005-L1120>
     ///
     /// This mirrors OutputFactory's co-located ID and clinical-field assembly:
     /// sort existing variants the same way, filter by `matched_alleles` using
@@ -715,9 +715,9 @@ impl ColocatedData {
 
     /// Traceability:
     /// - Ensembl VEP `add_colocated_frequency_data()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1139-L1232
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1139-L1232>
     /// - Ensembl VEP `get_frequency_data()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationSource/Cache/BaseCacheVariation.pm#L179-L255
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationSource/Cache/BaseCacheVariation.pm#L179-L255>
     ///
     /// This mirrors VEP's per-existing-variant frequency projection: build
     /// allele-to-frequency maps from the matched existing variant, select the
@@ -870,9 +870,9 @@ impl ColocatedData {
 ///
 /// Traceability:
 /// - Ensembl VEP `compare_existing()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L199-L206
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L199-L206>
 /// - Ensembl VEP `add_colocated_variant_info()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1032-L1049
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1032-L1049>
 ///
 /// Each existing variant must retain the `matched_alleles` attached during
 /// `compare_existing()`, merged across duplicate probe hits but without
@@ -933,7 +933,7 @@ fn build_colocated_map_from_sink(
 
 /// Traceability:
 /// - Ensembl VEP `output_hash_to_vcf_info_chunk()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory/VCF.pm#L379-L405
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory/VCF.pm#L379-L405>
 ///
 /// This applies the same CSQ field escaping VEP uses for VCF output:
 /// array separators become `&`, semicolons are percent-encoded, spaces become
@@ -975,7 +975,7 @@ fn csq_escape(val: &str) -> std::borrow::Cow<'_, str> {
 ///
 /// Traceability:
 /// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1563-L1570
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1563-L1570>
 ///
 /// VEP abbreviates: `principal1` → `P1`, `alternative2` → `A2`.
 fn format_appris(raw: &str) -> String {
@@ -986,7 +986,7 @@ fn format_appris(raw: &str) -> String {
 ///
 /// Traceability:
 /// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1572-L1612
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1572-L1612>
 ///
 /// The ncRNA attribute value has format `"start:end structure_string"` where:
 /// - `start`/`end` are 1-based cDNA positions of the structure
@@ -1097,9 +1097,9 @@ fn mirna_structure_field(
 ///
 /// Traceability:
 /// - Ensembl VEP `OutputFactory::add_sift_polyphen()`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799>
 /// - Ensembl Variation `TranscriptVariationAllele::_protein_function_prediction()`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm>
 ///
 /// VEP requires a single amino acid substitution (`A/B` pattern in `pep_allele_string`).
 /// Lookup is by (protein_position, alt_amino_acid). Output uses `--sift b` / `--polyphen b`
@@ -1406,9 +1406,9 @@ impl AnnotateProvider {
 
     /// Traceability:
     /// - Ensembl VEP `Config.pm` `distance` option
-    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L145-L155
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L145-L155>
     /// - Ensembl VEP `BaseRunner::_set_package_variables()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/BaseRunner.pm#L499-L511
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/BaseRunner.pm#L499-L511>
     ///
     /// Ensembl accepts `--distance N` and `--distance U,D`, applying the
     /// first value to upstream and the second to downstream when provided.
@@ -1439,7 +1439,7 @@ impl AnnotateProvider {
 
     /// Traceability:
     /// - Ensembl VEP `OutputFactory::TranscriptVariationAllele_to_output_hash()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1706-L1715
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1706-L1715>
     ///
     /// Ensembl strips the translation version only at output time when
     /// `remove_hgvsp_version` is enabled, and URI-escapes `=` only when
@@ -1478,7 +1478,7 @@ impl AnnotateProvider {
 
     /// Traceability:
     /// - Ensembl VEP `Runner::post_setup_checks()`
-    ///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Runner.pm#L726-L738
+    ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Runner.pm#L726-L738>
     ///
     /// VEP refuses offline HGVS output without an available FASTA. Our table
     /// function is also offline/cache-backed, so require `reference_fasta_path`
@@ -3433,7 +3433,7 @@ fn normalize_source_label(source: &str) -> Option<String> {
 /// Traceability:
 /// - Ensembl VEP `OutputFactory::BaseTranscriptVariationAllele_to_output_hash()`
 ///   emits transcript `_gene_hgnc_id` directly
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1474-L1484
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1474-L1484>
 ///
 /// Our parquet cache materializes Ensembl and RefSeq transcript rows
 /// separately. RefSeq rows often lack promoted `gene_hgnc_id`, while the paired
@@ -3636,7 +3636,7 @@ fn read_protein_predictions(col: &dyn Array, row: usize) -> Vec<ProteinPredictio
 ///
 /// Traceability:
 /// - VEP OutputFactory.pm DOMAINS output
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1448-L1466
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1448-L1466>
 fn read_protein_features(col: &dyn Array, row: usize) -> Vec<ProteinDomainFeature> {
     if col.is_null(row) {
         return Vec::new();
@@ -3730,11 +3730,11 @@ fn read_protein_features(col: &dyn Array, row: usize) -> Vec<ProteinDomainFeatur
 ///
 /// Traceability:
 /// - VEP OutputFactory.pm DOMAINS output
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1448-L1466
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1448-L1466>
 /// - VEP BaseTranscriptVariation.pm get_overlapping_ProteinFeatures
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm>
 /// - VEP Mapper.pm map_insert: for insertions, translation_start > translation_end
-///   https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm
+///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm>
 fn lookup_domains(
     transcript_id: Option<&str>,
     protein_position: Option<&str>,
@@ -3811,7 +3811,7 @@ fn lookup_domains(
 /// - Ensembl Variation `BaseTranscriptVariationAllele::_get_peptide_alleles()`
 ///   consumes transcript-derived CDS/peptide sequence rather than a VCF-local
 ///   allele string
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509>
 ///
 /// In our merged parquet cache, a small subset of RefSeq transcript CDS strings
 /// diverge from the genomic reference sequence that VEP's transcript objects
@@ -3919,7 +3919,7 @@ where
 /// Traceability:
 /// - VEP `_three_prime_utr()` derives UTR from `$self->transcript->seq()` which
 ///   is the full spliced cDNA assembled from exons
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2412-L2418
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2412-L2418>
 fn hydrate_transcript_cdna_from_reference<R>(
     reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
     transcripts: &mut [TranscriptFeature],
@@ -4267,10 +4267,10 @@ fn interval_overlaps_any(intervals: &[(i64, i64)], start: i64, end: i64) -> bool
 /// Traceability:
 /// - Ensembl VEP `AnnotationSource::Database::Transcript::prefetch_transcript_data()`
 ///   caches `mapper` on `_variation_effect_feature_cache`
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L333-L352
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L333-L352>
 /// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
 ///   resolves transcript positions through TranscriptMapper `genomic2cdna`
-///   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765>
 /// Read cdna_mapper_segments from a promoted List<Struct> parquet column.
 fn cdna_mapper_segments_from_list_column(
     col: &dyn Array,

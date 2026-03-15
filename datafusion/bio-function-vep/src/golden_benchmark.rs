@@ -548,7 +548,7 @@ pub const CSQ_FIELD_NAMES: &[&str] = &[
 ///
 /// Traceability:
 /// - VEP Constants.pm CSQ field order
-///   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138>
 ///
 /// Key differences from 74-field layout:
 /// - `SOURCE` removed (only present in `--merged` mode)

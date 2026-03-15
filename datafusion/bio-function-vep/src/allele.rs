@@ -25,7 +25,7 @@ pub struct VariantAlleleInput<'a> {
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 ///
 /// This is a source-equivalent port of the release/115 allele minimization
 /// used by Ensembl VEP's matched-alleles flow.
@@ -111,7 +111,7 @@ pub fn trim_sequences_ensembl_with_end(
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 ///
 /// Convenience wrapper for callers that start from a REF allele span where the
 /// end coordinate can be derived directly from `start + len(ref) - 1`.
@@ -128,7 +128,7 @@ pub fn trim_sequences_ensembl(
 
 /// Traceability:
 /// - Ensembl Variation `get_matched_variant_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258>
 ///
 /// Upstream matched-allele comparison reverse-complements parser alleles when
 /// the compared features are on opposite strands before sequence trimming.
@@ -150,7 +150,7 @@ fn reverse_complement_ascii(seq: &str) -> Option<String> {
 
 /// Traceability:
 /// - Ensembl Variation `get_matched_variant_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258>
 ///
 /// VEP matched-allele logic operates on `allele_string` in `REF/ALT...`
 /// form and ignores malformed/non-variant strings before comparison.
@@ -169,7 +169,7 @@ fn parse_variant_allele_string(allele_string: &str) -> Option<(&str, Vec<&str>)>
 
 /// Traceability:
 /// - Ensembl Variation `get_matched_variant_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258>
 ///
 /// Upstream allele minimization checks both left-first and right-first trim
 /// order for non-SNV alleles and only a single pass for SNVs.
@@ -183,7 +183,7 @@ fn trim_directions(ref_allele: &str, alt_allele: &str) -> &'static [bool] {
 
 /// Traceability:
 /// - Ensembl Variation `get_matched_variant_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258>
 ///
 /// This is a source-equivalent port of the release/115 matched-alleles
 /// algorithm used by Ensembl VEP `compare_existing()`.
@@ -263,7 +263,7 @@ pub fn get_matched_variant_alleles(
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 ///
 /// Convert VCF REF/ALT pair to VEP allele format.
 ///
@@ -279,7 +279,7 @@ pub fn get_matched_variant_alleles(
 ///
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String) {
     if ref_allele.len() == 1 && alt_allele.len() == 1 {
         // SNV
@@ -330,7 +330,7 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
 
 /// Traceability:
 /// - Ensembl VEP `Parser::VCF::create_VariationFeatures()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Parser/VCF.pm#L321-L345
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Parser/VCF.pm#L321-L345>
 ///
 /// Converts a biallelic VCF REF/ALT pair into the parser-level
 /// `VariationFeature->allele_string` representation used by upstream
@@ -370,9 +370,9 @@ pub fn vcf_to_vep_input_allele(
 
 /// Traceability:
 /// - Ensembl VEP `compare_existing()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206>
 /// - Ensembl Variation `get_matched_variant_alleles()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258>
 ///
 /// Check if a VCF variant matches a VEP-format allele_string.
 ///
@@ -387,7 +387,7 @@ pub fn vcf_to_vep_input_allele(
 ///
 /// Traceability:
 /// - Ensembl VEP `compare_existing()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206>
 pub fn allele_matches(vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool {
     let mut parts = allele_string.split('/');
 
@@ -415,7 +415,7 @@ pub fn allele_matches(vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 ///
 /// Relaxed allele matching for Existing_variation-style fallback.
 ///
@@ -465,7 +465,7 @@ pub fn allele_matches_relaxed(vcf_ref: &str, vcf_alt: &str, allele_string: &str)
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 ///
 /// Canonical event lengths are measured after the same common prefix/suffix
 /// trimming VEP uses before comparing indel allele classes.
@@ -505,7 +505,7 @@ fn canonical_event_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize)
 ///
 /// Traceability:
 /// - Ensembl VEP `compare_existing()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206>
 pub fn match_allele_udf() -> ScalarUDF {
     create_udf(
         "match_allele",
@@ -518,7 +518,7 @@ pub fn match_allele_udf() -> ScalarUDF {
 
 /// Traceability:
 /// - Ensembl VEP `compare_existing()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206>
 fn match_allele_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     match_allele_impl_with(args, allele_matches, "match_allele")
 }
@@ -530,7 +530,7 @@ fn match_allele_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 ///
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 pub fn match_allele_relaxed_udf() -> ScalarUDF {
     create_udf(
         "match_allele_relaxed",
@@ -543,14 +543,14 @@ pub fn match_allele_relaxed_udf() -> ScalarUDF {
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 fn match_allele_relaxed_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     match_allele_impl_with(args, allele_matches_relaxed, "match_allele_relaxed")
 }
 
 /// Traceability:
 /// - Ensembl VEP `compare_existing()`
-///   https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Variation.pm#L146-L206>
 fn match_allele_impl_with(
     args: &[ColumnarValue],
     matcher: fn(&str, &str, &str) -> bool,
@@ -603,7 +603,7 @@ fn match_allele_impl_with(
 ///
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 pub fn vep_allele_udf() -> ScalarUDF {
     create_udf(
         "vep_allele",
@@ -616,7 +616,7 @@ pub fn vep_allele_udf() -> ScalarUDF {
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 fn vep_allele_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     let refs = args[0].to_owned().into_array(1)?;
     let alts = args[1].to_owned().into_array(1)?;
@@ -652,7 +652,7 @@ fn vep_allele_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 ///
 /// Compute the common prefix length between VCF REF and ALT alleles.
 ///
@@ -693,7 +693,7 @@ fn vep_prefix_suffix_len(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 ///
 /// Compute VEP-normalized start coordinate from VCF POS, REF, ALT.
 ///
@@ -707,7 +707,7 @@ fn vep_prefix_suffix_len(ref_allele: &str, alt_allele: &str) -> (usize, usize) {
 ///
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 pub fn vep_norm_start(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> i64 {
     let (prefix_len, _) = vep_prefix_suffix_len(ref_allele, alt_allele);
     vcf_pos + prefix_len as i64
@@ -715,7 +715,7 @@ pub fn vep_norm_start(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> i64 {
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 ///
 /// Compute VEP-normalized end coordinate from VCF POS, REF, ALT.
 ///
@@ -731,7 +731,7 @@ pub fn vep_norm_end(vcf_pos: i64, ref_allele: &str, alt_allele: &str) -> i64 {
 ///
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 pub fn vep_norm_start_udf() -> ScalarUDF {
     create_udf(
         "vep_norm_start",
@@ -746,7 +746,7 @@ pub fn vep_norm_start_udf() -> ScalarUDF {
 ///
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 pub fn vep_norm_end_udf() -> ScalarUDF {
     create_udf(
         "vep_norm_end",
@@ -759,21 +759,21 @@ pub fn vep_norm_end_udf() -> ScalarUDF {
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 fn vep_norm_start_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     vep_norm_coord_impl(args, true, "vep_norm_start")
 }
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 fn vep_norm_end_impl(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     vep_norm_coord_impl(args, false, "vep_norm_end")
 }
 
 /// Traceability:
 /// - Ensembl Variation `trim_sequences()`
-///   https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
 fn vep_norm_coord_impl(
     args: &[ColumnarValue],
     is_start: bool,
