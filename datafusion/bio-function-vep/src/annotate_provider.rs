@@ -2830,10 +2830,13 @@ impl AnnotateProvider {
         profile_end!("7. sift_polyphen_cache_init", t_sift);
 
         let t_annotate = profile_start!();
+        let mut sift_load_ms = 0u128;
+        let mut annotate_ms = 0u128;
         let mut annotated_batches = Vec::with_capacity(base_batches.len());
         for batch in &base_batches {
             // Lazily load SIFT/PolyPhen windows as the batch loop advances.
             if sift_enabled {
+                let t_sift_win = std::time::Instant::now();
                 let table = sift_table_name.as_deref().unwrap();
                 let schema = batch.schema();
                 if let (Ok(ci), Ok(si), Ok(ei)) = (
@@ -2891,8 +2894,10 @@ impl AnnotateProvider {
                         sift_cache.evict_before(*batch_min);
                     }
                 }
+                sift_load_ms += t_sift_win.elapsed().as_millis();
             }
 
+            let t_ann = std::time::Instant::now();
             annotated_batches.push(self.annotate_batch_with_transcript_engine(
                 batch,
                 &engine,
@@ -2900,6 +2905,15 @@ impl AnnotateProvider {
                 &colocated_map,
                 &sift_cache,
             )?);
+            annotate_ms += t_ann.elapsed().as_millis();
+        }
+        if profiling_enabled() {
+            eprintln!(
+                "[VEP_PROFILE] 7a. sift_lazy_load_only...........................  {sift_load_ms:.1}ms"
+            );
+            eprintln!(
+                "[VEP_PROFILE] 7b. annotate_batches_only.........................  {annotate_ms:.1}ms"
+            );
         }
         profile_end!(
             "7+8. sift_lazy_load + annotate_batches",
