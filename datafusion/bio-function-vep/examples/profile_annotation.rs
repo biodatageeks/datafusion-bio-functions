@@ -121,15 +121,25 @@ async fn main() -> Result<()> {
     let mut options = Vec::new();
 
     // Register context tables.
+    // Try translation_core first, then fall back to translation (unsplit layout).
     let context_tables = [
         ("transcript", "transcripts_table"),
         ("exon", "exons_table"),
-        ("translation", "translations_table"),
+        ("translation_core", "translations_table"),
         ("regulatory", "regulatory_table"),
         ("motif", "motif_table"),
     ];
     for (file_stem, json_key) in &context_tables {
-        if let Ok(filename) = find_parquet_stem(&cache_dir, file_stem, &base) {
+        let stem_result = find_parquet_stem(&cache_dir, file_stem, &base)
+            .or_else(|_| {
+                // Fallback: "translation_core" -> "translation" for unsplit layout
+                if *file_stem == "translation_core" {
+                    find_parquet_stem(&cache_dir, "translation", &base)
+                } else {
+                    Err(DataFusionError::Execution("not found".to_string()))
+                }
+            });
+        if let Ok(filename) = stem_result {
             let table_name = filename.trim_end_matches(".parquet");
             let path = cache_dir.join(&filename);
             ctx.register_parquet(
@@ -141,6 +151,23 @@ async fn main() -> Result<()> {
             options.push(format!("\"{}\":\"{}\"", json_key, sql_literal(table_name)));
             eprintln!("[PREP] Registered {} -> {}", json_key, filename);
         }
+    }
+
+    // Register translation_sift separately for sift/polyphen window loading.
+    if let Ok(filename) = find_parquet_stem(&cache_dir, "translation_sift", &base) {
+        let table_name = filename.trim_end_matches(".parquet");
+        let path = cache_dir.join(&filename);
+        ctx.register_parquet(
+            table_name,
+            path.display().to_string().as_str(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+        options.push(format!(
+            "\"translations_sift_table\":\"{}\"",
+            sql_literal(table_name)
+        ));
+        eprintln!("[PREP] Registered translations_sift_table -> {}", filename);
     }
 
     options.push("\"extended_probes\":true".to_string());

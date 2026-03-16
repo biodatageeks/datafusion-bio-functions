@@ -74,6 +74,7 @@ use crate::annotation_store::{AnnotationBackend, build_store};
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
+use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     CachedPredictions, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
@@ -1579,8 +1580,6 @@ impl AnnotateProvider {
         if chroms.is_empty() {
             return String::new();
         }
-        // Include both "chr"-prefixed and bare variants so mismatched naming
-        // between VCF (chr22) and context tables (22) still matches.
         let mut expanded: HashSet<String> = HashSet::new();
         for c in chroms {
             let escaped = c.replace('\'', "''");
@@ -1595,13 +1594,87 @@ impl AnnotateProvider {
         format!(" WHERE chrom IN ({})", literals.join(", "))
     }
 
+    async fn projected_columns_for_table(
+        session: &SessionContext,
+        table: &str,
+        wanted: &[&str],
+    ) -> String {
+        let Ok(provider) = session.table(table).await else {
+            return "*".to_string();
+        };
+        let schema = provider.schema();
+        let arrow = schema.as_arrow();
+        let field_names: HashSet<&str> = arrow.fields().iter().map(|f| f.name().as_str()).collect();
+        let mut cols: Vec<&str> = Vec::new();
+        for &col in wanted {
+            let bare = col.trim_matches('"');
+            if field_names.contains(bare) {
+                cols.push(col);
+            }
+        }
+        if cols.is_empty() {
+            "*".to_string()
+        } else {
+            cols.join(", ")
+        }
+    }
+
     async fn load_transcripts(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<(Vec<TranscriptFeature>, HashMap<String, String>)> {
-        let filter = Self::chrom_filter_clause(chroms);
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let filter = worklist.chrom_filter_clause();
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &[
+                "transcript_id",
+                "stable_id",
+                "chrom",
+                "start",
+                "\"end\"",
+                "strand",
+                "biotype",
+                "cds_start",
+                "cds_end",
+                "cdna_coding_start",
+                "cdna_coding_end",
+                "gene_stable_id",
+                "gene_symbol",
+                "gene_symbol_source",
+                "gene_hgnc_id",
+                "refseq_id",
+                "source",
+                "version",
+                "raw_object_json",
+                "cds_start_nf",
+                "cds_end_nf",
+                "mature_mirna_regions",
+                "cdna_seq",
+                "bam_edit_status",
+                "has_non_polya_rna_edit",
+                "spliced_seq",
+                "translateable_seq",
+                "flags_str",
+                "cdna_mapper_segments",
+                "is_canonical",
+                "tsl",
+                "mane_select",
+                "mane_plus_clinical",
+                "translation_stable_id",
+                "gene_phenotype",
+                "ccds",
+                "swissprot",
+                "trembl",
+                "uniparc",
+                "uniprot_isoform",
+                "appris",
+                "ncrna_structure",
+            ],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
         let mut translateable_seq_by_tx = HashMap::new();
@@ -1849,7 +1922,7 @@ impl AnnotateProvider {
         Ok((out, translateable_seq_by_tx))
     }
 
-    async fn load_exons(&self, table: &str, chroms: &HashSet<String>) -> Result<Vec<ExonFeature>> {
+    async fn load_exons(&self, table: &str, worklist: &MissWorklist) -> Result<Vec<ExonFeature>> {
         let has_chrom = self
             .session
             .table(table)
@@ -1864,11 +1937,24 @@ impl AnnotateProvider {
             })
             .unwrap_or(false);
         let filter = if has_chrom {
-            Self::chrom_filter_clause(chroms)
+            worklist.chrom_filter_clause()
         } else {
             String::new()
         };
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &[
+                "transcript_id",
+                "stable_id",
+                "exon_number",
+                "start",
+                "\"end\"",
+                "chrom",
+            ],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -1927,7 +2013,7 @@ impl AnnotateProvider {
     async fn load_translations(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<Vec<TranslationFeature>> {
         let has_chrom = self
             .session
@@ -1943,11 +2029,32 @@ impl AnnotateProvider {
             })
             .unwrap_or(false);
         let filter = if has_chrom {
-            Self::chrom_filter_clause(chroms)
+            worklist.chrom_filter_clause()
         } else {
             String::new()
         };
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &[
+                "transcript_id",
+                "stable_id",
+                "chrom",
+                "start",
+                "\"end\"",
+                "cds_len",
+                "cds_length",
+                "protein_len",
+                "translation_seq",
+                "cds_sequence",
+                "cds_seq",
+                "coding_sequence",
+                "version",
+                "protein_features",
+            ],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -2104,10 +2211,23 @@ impl AnnotateProvider {
     async fn load_regulatory_features(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<Vec<RegulatoryFeature>> {
-        let filter = Self::chrom_filter_clause(chroms);
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let filter = worklist.interval_filter_sql();
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &[
+                "stable_id",
+                "feature_id",
+                "feature_type",
+                "chrom",
+                "start",
+                "\"end\"",
+            ],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -2165,10 +2285,16 @@ impl AnnotateProvider {
     async fn load_motif_features(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<Vec<MotifFeature>> {
-        let filter = Self::chrom_filter_clause(chroms);
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let filter = worklist.interval_filter_sql();
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &["motif_id", "feature_id", "chrom", "start", "\"end\""],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -2222,10 +2348,16 @@ impl AnnotateProvider {
     async fn load_mirna_features(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<Vec<MirnaFeature>> {
-        let filter = Self::chrom_filter_clause(chroms);
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let filter = worklist.interval_filter_sql();
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &["mirna_id", "feature_id", "chrom", "start", "\"end\""],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -2279,10 +2411,24 @@ impl AnnotateProvider {
     async fn load_structural_features(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<Vec<StructuralFeature>> {
-        let filter = Self::chrom_filter_clause(chroms);
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let filter = worklist.interval_filter_sql();
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &[
+                "feature_id",
+                "stable_id",
+                "feature_kind",
+                "event_type",
+                "chrom",
+                "start",
+                "\"end\"",
+            ],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -2473,27 +2619,11 @@ impl AnnotateProvider {
             format!("{} entries", colocated_map.len())
         );
 
-        // Check if there are any cache misses (rows without cached most_severe).
-        // Only load context tables if we actually need the transcript engine.
         let mut cache_hit_count = 0usize;
         let mut cache_miss_count = 0usize;
-        let has_cache_misses = base_batches.iter().any(|batch| {
-            let Ok(idx) = batch.schema().index_of("cache_most_severe_consequence") else {
-                cache_miss_count += batch.num_rows();
-                return true; // Column missing — all rows are misses.
-            };
-            let col = batch.column(idx);
-            let mut found_miss = false;
-            for row in 0..batch.num_rows() {
-                if string_at(col.as_ref(), row).is_none() {
-                    cache_miss_count += 1;
-                    found_miss = true;
-                } else {
-                    cache_hit_count += 1;
-                }
-            }
-            found_miss
-        });
+        let worklist =
+            collect_miss_worklist(&base_batches, &mut cache_hit_count, &mut cache_miss_count)?;
+        let has_cache_misses = !worklist.is_empty();
         if profiling_enabled() {
             let hit_rate = if total_vcf_rows > 0 {
                 cache_hit_count as f64 / total_vcf_rows as f64 * 100.0
@@ -2517,22 +2647,6 @@ impl AnnotateProvider {
             mirnas,
             structural,
         ) = if has_cache_misses {
-            // Extract distinct chrom values from VCF batches for predicate pushdown
-            let vcf_chroms: HashSet<String> = {
-                let mut set = HashSet::new();
-                for batch in &base_batches {
-                    if let Ok(idx) = batch.schema().index_of("chrom") {
-                        let col = batch.column(idx);
-                        for row in 0..batch.num_rows() {
-                            if let Some(v) = string_at(col.as_ref(), row) {
-                                set.insert(v);
-                            }
-                        }
-                    }
-                }
-                set
-            };
-
             let merged = self
                 .options_json
                 .as_deref()
@@ -2541,8 +2655,7 @@ impl AnnotateProvider {
 
             let t_tx = profile_start!();
             let (tx, translateable_seq_by_tx) = if let Some(table) = transcripts_table {
-                let (tx, translateable_seq_by_tx) =
-                    self.load_transcripts(table, &vcf_chroms).await?;
+                let (tx, translateable_seq_by_tx) = self.load_transcripts(table, &worklist).await?;
                 (
                     tx.into_iter()
                         .filter(|t| is_vep_transcript(&t.transcript_id, merged))
@@ -2558,9 +2671,14 @@ impl AnnotateProvider {
                 format!("{} transcripts", tx.len())
             );
 
+            let tx_ids: HashSet<String> = tx.iter().map(|t| t.transcript_id.clone()).collect();
+
             let t_ex = profile_start!();
             let ex = if let Some(table) = exons_table {
-                self.load_exons(table, &vcf_chroms).await?
+                let raw = self.load_exons(table, &worklist).await?;
+                raw.into_iter()
+                    .filter(|e| tx_ids.contains(&e.transcript_id))
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -2568,7 +2686,10 @@ impl AnnotateProvider {
 
             let t_tl = profile_start!();
             let tl = if let Some(table) = translations_table {
-                self.load_translations(table, &vcf_chroms).await?
+                let raw = self.load_translations(table, &worklist).await?;
+                raw.into_iter()
+                    .filter(|t| tx_ids.contains(&t.transcript_id))
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -2580,7 +2701,7 @@ impl AnnotateProvider {
 
             let t_rg = profile_start!();
             let rg = if let Some(table) = regulatory_table {
-                self.load_regulatory_features(table, &vcf_chroms).await?
+                self.load_regulatory_features(table, &worklist).await?
             } else {
                 Vec::new()
             };
@@ -2592,7 +2713,7 @@ impl AnnotateProvider {
 
             let t_mt = profile_start!();
             let mt = if let Some(table) = motif_table {
-                self.load_motif_features(table, &vcf_chroms).await?
+                self.load_motif_features(table, &worklist).await?
             } else {
                 Vec::new()
             };
@@ -2600,7 +2721,7 @@ impl AnnotateProvider {
 
             let t_mi = profile_start!();
             let mi = if let Some(table) = mirna_table {
-                self.load_mirna_features(table, &vcf_chroms).await?
+                self.load_mirna_features(table, &worklist).await?
             } else {
                 Vec::new()
             };
@@ -2608,7 +2729,7 @@ impl AnnotateProvider {
 
             let t_st = profile_start!();
             let st = if let Some(table) = sv_table {
-                self.load_structural_features(table, &vcf_chroms).await?
+                self.load_structural_features(table, &worklist).await?
             } else {
                 Vec::new()
             };
@@ -2699,7 +2820,12 @@ impl AnnotateProvider {
         // See biodatageeks/datafusion-bio-functions#38.
         let t_sift = profile_start!();
         let mut sift_cache = SiftPolyphenCache::new();
-        let sift_enabled = flags.everything && translations_table.is_some();
+        let sift_table_name: Option<String> = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_string_option(opts, "translations_sift_table"))
+            .or_else(|| translations_table.map(|s| s.to_string()));
+        let sift_enabled = flags.everything && sift_table_name.is_some();
         let mut loaded_windows: HashSet<(String, i64)> = HashSet::new();
         profile_end!("7. sift_polyphen_cache_init", t_sift);
 
@@ -2708,7 +2834,7 @@ impl AnnotateProvider {
         for batch in &base_batches {
             // Lazily load SIFT/PolyPhen windows as the batch loop advances.
             if sift_enabled {
-                let table = translations_table.unwrap();
+                let table = sift_table_name.as_deref().unwrap();
                 let schema = batch.schema();
                 if let (Ok(ci), Ok(si), Ok(ei)) = (
                     schema.index_of("chrom"),
@@ -4366,7 +4492,7 @@ fn bool_at(array: &dyn Array, row: usize) -> Option<bool> {
     None
 }
 
-fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
+pub(crate) fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
     if array.is_null(row) {
         return None;
     }
@@ -4397,7 +4523,7 @@ fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
     None
 }
 
-fn string_at(array: &dyn Array, row: usize) -> Option<String> {
+pub(crate) fn string_at(array: &dyn Array, row: usize) -> Option<String> {
     if array.is_null(row) {
         return None;
     }

@@ -48,6 +48,7 @@ pub mod hgvs;
 #[cfg(feature = "kv-cache")]
 pub mod kv_cache;
 pub mod lookup_provider;
+pub mod miss_worklist;
 pub mod schema_contract;
 pub mod so_terms;
 pub mod table_function;
