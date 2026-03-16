@@ -22,10 +22,12 @@
 //!     --everything \
 //!     --reference-fasta-path=/Users/mwiewior/research/data/vep/Homo_sapiens.GRCh38.dna.primary_assembly.fa
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use datafusion::arrow::array::Array;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
@@ -64,6 +66,10 @@ async fn main() -> Result<()> {
         .iter()
         .find_map(|a| a.strip_prefix("--reference-fasta-path="))
         .map(|s| s.to_string());
+    let output_vcf = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--output="))
+        .map(|s| PathBuf::from(s));
 
     eprintln!("=== VEP Annotation Profiler ===");
     eprintln!("VCF:          {}", vcf_gz.display());
@@ -232,6 +238,18 @@ async fn main() -> Result<()> {
         eprintln!("Output cols:  {}", batch.schema().fields().len());
     }
 
+    // Write output VCF if --output=<path> was specified.
+    if let Some(output_path) = &output_vcf {
+        let t_write = Instant::now();
+        write_vcf_output(&batches, output_path)?;
+        let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "VCF output:   {} ({:.1}ms)",
+            output_path.display(),
+            write_ms
+        );
+    }
+
     Ok(())
 }
 
@@ -271,6 +289,107 @@ fn find_parquet_stem(dir: &Path, stem: &str, base: &str) -> Result<String> {
         base,
         dir.display()
     )))
+}
+
+fn string_at(array: &dyn Array, row: usize) -> Option<String> {
+    use datafusion::arrow::array::{LargeStringArray, StringArray, StringViewArray};
+    if array.is_null(row) {
+        return None;
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Some(a.value(row).to_string());
+    }
+    None
+}
+
+fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
+    use datafusion::arrow::array::{Int32Array, Int64Array};
+    if array.is_null(row) {
+        return None;
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+        return Some(a.value(row));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+        return Some(a.value(row) as i64);
+    }
+    None
+}
+
+fn write_vcf_output(
+    batches: &[datafusion::arrow::array::RecordBatch],
+    path: &Path,
+) -> Result<()> {
+    use std::io::BufWriter;
+
+    let mut file = BufWriter::new(
+        std::fs::File::create(path)
+            .map_err(|e| DataFusionError::Execution(format!("cannot create {}: {e}", path.display())))?,
+    );
+
+    // Write VCF header.
+    writeln!(file, "##fileformat=VCFv4.2")
+        .map_err(|e| DataFusionError::Execution(format!("write error: {e}")))?;
+    writeln!(
+        file,
+        "##INFO=<ID=CSQ,Number=.,Type=String,Description=\"Consequence annotations from annotate_vep\">"
+    )
+    .map_err(|e| DataFusionError::Execution(format!("write error: {e}")))?;
+    writeln!(file, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO")
+        .map_err(|e| DataFusionError::Execution(format!("write error: {e}")))?;
+
+    for batch in batches {
+        let schema = batch.schema();
+        let chrom_idx = schema.index_of("chrom").ok();
+        let start_idx = schema.index_of("start").ok();
+        let ref_idx = schema.index_of("ref").ok();
+        let alt_idx = schema.index_of("alt").ok();
+        let csq_idx = schema.index_of("csq").ok();
+        let most_idx = schema.index_of("most_severe_consequence").ok();
+
+        for row in 0..batch.num_rows() {
+            let chrom = chrom_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_default();
+            let pos = start_idx
+                .and_then(|i| int64_at(batch.column(i).as_ref(), row))
+                .unwrap_or(0);
+            let ref_al = ref_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_default();
+            let alt_al = alt_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_default();
+            let csq = csq_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_default();
+            let _most = most_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_default();
+
+            let info = if csq.is_empty() {
+                ".".to_string()
+            } else {
+                format!("CSQ={csq}")
+            };
+
+            writeln!(
+                file,
+                "{chrom}\t{pos}\t.\t{ref_al}\t{alt_al}\t.\t.\t{info}"
+            )
+            .map_err(|e| DataFusionError::Execution(format!("write error: {e}")))?;
+        }
+    }
+
+    file.flush()
+        .map_err(|e| DataFusionError::Execution(format!("flush error: {e}")))?;
+    Ok(())
 }
 
 fn extract_base(variation_filename: &str) -> String {
