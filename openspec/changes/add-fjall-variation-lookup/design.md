@@ -90,17 +90,20 @@ Performance implication: the parquet backend remains dominated by streaming and 
 
 ---
 
-## Fjall 3.0.2 Reality Check
+## Fjall 3.0.2 → 3.1.0 Reality Check
 
-Reviewing the stock `fjall-3.0.2` and `lsm-tree-3.0.2` sources changes a few assumptions in the current spec:
+Reviewing the stock `fjall-3.0.2` through `fjall-3.1.0` sources changes a few assumptions in the current spec:
 
 - **Metadata pinning is coupled to partitioning.** Later levels default to partitioned index/filter blocks. In that layout fjall eagerly keeps only the top-level structures resident; lower partitions are still demand-loaded. `PinningPolicy::all(true)` alone does not achieve "all metadata pinned" unless metadata partitioning is disabled for the cold-start profile.
 - **`start_ingestion()` is faster, but it does not create the final read-optimized shape by itself.** It bypasses memtables and journaling, but the ingested tables are still registered as a new run and depend on follow-up compaction to reach steady state.
-- **`major_compact()` is not strategy-aware in stock fjall 3.0.2.** The public helper compacts with a hardcoded 64 MB target, so it can silently undo a larger table-size choice if the implementation assumes it honors the configured leveled strategy.
+- **`major_compact()` is not in the fjall 3.1.0 public API.** The 3.0.2 concern about its hardcoded 64 MB target is moot — it is no longer publicly exposed. The correct path is natural leveled compaction with `with_table_target_size(256 MiB)`, optionally enhanced with compaction filters (new in 3.1.0). See [`optimizations.md`](optimizations.md) Optimization 2 for details.
+- **Compaction filters are new in fjall 3.1.0.** The `fjall::compaction::filter` module provides `CompactionFilter` trait, `Factory` trait, `Verdict` enum (`Keep`, `Remove`, `RemoveWeak`, `ReplaceValue`, `Destroy`), and `Context` (with `is_last_level` flag). Registered via `DatabaseBuilder::with_compaction_filter_factories()`. This enables dedup, tombstone cleanup, value recompression, and lazy format migration during natural compaction — replacing the need for `major_compact()`.
 - **`HashRatioPolicy` is a bucket-per-item multiplier.** `0.75` means roughly 0.75 hash buckets per item in a data block, not "75% memory overhead".
 - **KV separation is available, but it is not free.** `with_kv_separation()` can reduce compaction/write amplification for large values, but point reads become two-hop reads (index table + blob file), which is often the wrong trade-off for lookup-heavy position entries unless the value-size distribution is large enough.
 
-These are implementation constraints, not reasons to abandon fjall. They do mean the OpenSpec should steer the implementation toward knobs that the stock 3.0.x API actually honors.
+These are implementation constraints, not reasons to abandon fjall. They do mean the OpenSpec should steer the implementation toward knobs that the fjall 3.1.0 API actually provides.
+
+**Additional optimizations** identified during the 3.1.0 review — including range-scan merge-join for sorted VCF, worker thread tuning, and `size_of()` buffer pre-sizing — are documented in [`optimizations.md`](optimizations.md).
 
 ---
 
@@ -432,9 +435,21 @@ KeyspaceCreateOptions::default()
 ### Database-Level Settings
 
 ```rust
+// Read-only open (annotation):
 Database::builder(path)
     .cache_size(512 * 1024 * 1024)  // 512 MB default (~345 MB pinned + ~167 MB data blocks)
-    .max_cached_files(Some(512))    // Safe headroom above ~300 SSTs with 256 MiB target
+    .max_cached_files(Some(128))    // Sequential WGS access: ~30 SSTs active per chromosome (see optimizations.md Opt 4)
+    .worker_threads(1)              // No compaction during reads (see optimizations.md Opt 5)
+    .open()
+
+// Write open (ingest):
+Database::builder(path)
+    .cache_size(256 * 1024 * 1024)
+    .max_cached_files(Some(512))    // Full headroom for build
+    .worker_threads(4)              // Compaction parallelism
+    .journal_compression(CompressionType::Lz4)  // (see optimizations.md Opt 7)
+    .manual_journal_persist(true)
+    .with_compaction_filter_factories(...)  // (see optimizations.md Opt 2)
     .open()
 ```
 
@@ -533,7 +548,7 @@ After pinning, **data block I/O becomes the dominant cost**. The ~3.7M distinct 
 
 ### Build Time (One-Time Cost)
 
-`start_ingestion()` for sorted bulk load: **~30 min to ~5-10 min** (3-6x) for the initial load step. Because stock fjall 3.0.2 still depends on subsequent compaction to reach the final steady-state layout, end-to-end build time must include that phase explicitly.
+`start_ingestion()` for sorted bulk load: **~30 min to ~5-10 min** (3-6x) for the initial load step. Fjall 3.1.0 relies on natural leveled compaction (not `major_compact()`, which is no longer in the public API) to reach the final steady-state layout. Compaction filters (see [`optimizations.md`](optimizations.md) Optimization 2) run during this natural compaction to handle dedup and cleanup.
 
 ---
 
@@ -546,11 +561,11 @@ After pinning, **data block I/O becomes the dominant cost**. The ~3.7M distinct 
 | DB on disk is ~74 GB (10B keys) / ~84 GB (18B keys) | 2.5x the 30 GB Parquet source | Acceptable for indexed point-lookup access pattern; position-only keys save ~10 GB |
 | Metadata partitioning makes "pin all metadata" ineffective | Hidden cold-start I/O remains | Disable filter/index partitioning in the cold-start profile before pinning |
 | `start_ingestion()` requires globally sorted input | Must sort or process per-chromosome | Variation cache is already sorted by `(chrom, position)`; process chromosomes sequentially |
-| `major_compact()` in stock fjall 3.0.2 hardcodes 64 MB target size | Can silently undo tuned table-size choices | Treat it as a measured, conditional step; do not assume it honors the configured leveled strategy |
+| `major_compact()` in stock fjall 3.0.2 hardcodes 64 MB target size | Can silently undo tuned table-size choices | **Resolved in 3.1.0:** `major_compact()` is not in the public API; use natural leveled compaction with configured `table_target_size` + compaction filters (see [`optimizations.md`](optimizations.md) Opt 2) |
 | 8 KiB blocks waste more on random access | Negligible -- VCF is always sorted | Could be made configurable if needed |
 | Hash ratio 0.75 increases in-memory block size | Bounded by block cache capacity | Only affects cached blocks; no disk space overhead |
 | KV separation can add a second point-read hop | Slower point lookups for medium/small values | Keep it off by default and gate it on measured compressed value sizes |
-| Fjall 3.x API changes | Update needed for new major versions | Pin to exact version; existing DB format is forward-compatible within fjall 3.x |
+| Fjall 3.x API changes | Update needed for new major versions | Pin to fjall 3.1.0; existing DB format is forward-compatible within fjall 3.x; 3.0.3 includes critical recovery bugfix |
 
 ## Open Questions
 
@@ -565,3 +580,5 @@ After pinning, **data block I/O becomes the dominant cost**. The ~3.7M distinct 
 
 - **Warmup step:** Yes — Decision 10 adds `warmup(chromosomes)` method to the backend trait (chromosome prefetch via `fadvise`/`madvise`)
 - **Key encoding change:** Yes — Decision 9 reduces keys from 18 to 10 bytes (position-only, end stored in value)
+- **`major_compact()` behavior:** Not in fjall 3.1.0 public API. Use natural leveled compaction with `table_target_size(256 MiB)` + compaction filters instead. See [`optimizations.md`](optimizations.md) Optimization 2.
+- **Range-scan vs point lookup:** For sorted WGS VCF, range-scan merge-join can bypass bloom filters entirely and reduce index traversals to block-boundary transitions. See [`optimizations.md`](optimizations.md) Optimization 3.

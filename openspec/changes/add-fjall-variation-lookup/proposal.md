@@ -4,9 +4,9 @@
 
 The current parquet-backed `lookup_variants()` path expands to a generic SQL interval join plus a row-wise `match_allele(ref, alt, allele_string)` post-filter. That means planner-dependent build/probe orientation, full-column streaming from Parquet, and repeated allele normalization even when ~95-98% of input variants in a typical WGS/WES analysis are exact cache hits that should be resolved via O(1) point lookup. This is a point-lookup problem masquerading as a range-join.
 
-An existing fjall-backed KV cache in `bio-function-vep` (`kv_cache/` module) already solves this with position-keyed entries, zstd dictionary compression, and allele matching -- but uses fjall's default configuration, and the current OpenSpec overstates a few stock fjall 3.x behaviors (notably metadata pinning, `start_ingestion()`, and `major_compact()`). The proposal needs to be tightened before implementation.
+An existing fjall-backed KV cache in `bio-function-vep` (`kv_cache/` module) already solves this with position-keyed entries, zstd dictionary compression, and allele matching -- but uses fjall's default configuration, and the original OpenSpec overstated a few stock fjall 3.0.2 behaviors (notably metadata pinning, `start_ingestion()`, and `major_compact()`). The upgrade to fjall 3.1.0 resolves the `major_compact()` concern entirely (not in 3.1.0 public API) and adds compaction filters for post-ingest optimization.
 
-This proposal focuses on **fjall tuning and ingest optimizations** for the existing position-keyed architecture, targeting the primary workload: open DB, annotate one VCF sample (4-5M variants), close.
+This proposal focuses on **fjall tuning and ingest optimizations** for the existing position-keyed architecture, targeting the primary workload: open DB, annotate one VCF sample (4-6M variants), close.
 
 ## What Changes
 
@@ -21,8 +21,8 @@ This proposal focuses on **fjall tuning and ingest optimizations** for the exist
 - **Session-configurable block cache** (default 512 MB) -- sized for cold-start working set
 
 ### Ingest Pipeline Optimization
-- **Use `Keyspace::start_ingestion()`** for sorted bulk load -- bypasses memtable/journal and is still materially faster than batch insert, but stock fjall 3.x still relies on compaction for the final read shape
-- **Use target-aware post-ingest compaction** -- do not blindly rely on `major_compact()`, because fjall 3.0.x hardcodes a 64 MB target there regardless of the configured strategy
+- **Use `Keyspace::start_ingestion()`** for sorted bulk load -- bypasses memtable/journal and is still materially faster than batch insert, but fjall 3.x still relies on compaction for the final read shape
+- **Use compaction filters (fjall 3.1.0)** for post-ingest optimization -- replaces the need for `major_compact()` (not in 3.1.0 public API); enables dedup, tombstone cleanup, and lazy format migration during natural leveled compaction which respects `table_target_size(256 MiB)`
 - **Zstd dictionary training** from sample data (already implemented)
 
 ### Backend Abstraction & Encoding Optimizations
@@ -50,7 +50,7 @@ The fjall KV cache lives in `bio-function-vep` (not `bio-format-ensembl-cache`) 
   - `datafusion/bio-function-vep/src/kv_cache/cache_exec.rs` -- unchanged (already implements extended probes + allele matching)
   - `datafusion/bio-function-vep/src/config.rs` -- add cache tuning options to `AnnotationConfig`
   - `datafusion/bio-function-vep/src/lookup_provider.rs` -- retained as parquet fallback path for `lookup_backend=parquet|hybrid|auto`
-  - `datafusion/bio-function-vep/Cargo.toml` -- fjall 3.x dependency (already present)
+  - `datafusion/bio-function-vep/Cargo.toml` -- fjall 3.1.0 dependency (upgrade from 3.0.2; includes critical recovery bugfix from 3.0.3 and compaction filters from 3.1.0)
   - `datafusion/bio-function-vep/src/kv_cache/mod.rs` -- `VepKvBackend` trait definition
   - `datafusion/bio-function-vep/src/kv_cache/fjall_backend.rs` -- extracted fjall backend implementing trait
   - `datafusion/bio-function-vep/src/kv_cache/lmdb_backend.rs` -- LMDB/heed backend (feature-gated under `lmdb-backend`)

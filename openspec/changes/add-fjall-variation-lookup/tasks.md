@@ -115,12 +115,14 @@
 - [ ] 2.1.5 Call `Ingestion::finish()` after all entries are written
 - [ ] 2.1.6 Handle the zstd dictionary training phase (sample 10K rows before sorted ingest, same as current)
 - [ ] 2.1.7 Merge existing entries for duplicate positions (same logic as current `merge_position_entries()`)
-- [ ] 2.1.8 Document and test the stock fjall 3.0.x behavior that ingested tables still require a follow-up compaction step for the final steady-state layout
+- [ ] 2.1.8 Document and test the fjall 3.1.0 behavior that ingested tables still require natural leveled compaction (not `major_compact()`) for the final steady-state layout
 
-### 2.2 Post-ingest compaction
-- [ ] 2.2.1 Evaluate whether `Keyspace::major_compact()` is acceptable for this workload given its stock 64 MB target size; if not, keep compaction strategy target-aware and document the limitation
-- [ ] 2.2.2 Persist metadata and dictionary after compaction
-- [ ] 2.2.3 Measure and log compaction time
+### 2.2 Post-ingest compaction (fjall 3.1.0)
+- [ ] 2.2.1 Rely on natural leveled compaction with `table_target_size(256 MiB)` instead of `major_compact()` (not in fjall 3.1.0 public API)
+- [ ] 2.2.2 Implement compaction filter factory via `DatabaseBuilder::with_compaction_filter_factories()` for the `data` keyspace: dedup duplicate position entries, tombstone cleanup at last level
+- [ ] 2.2.3 Persist metadata and dictionary after compaction
+- [ ] 2.2.4 Measure and log compaction time
+- [ ] 2.2.5 Test that compaction filter `Verdict::Keep` path has zero overhead on read-only workloads
 
 ### 2.3 Integration test for sorted ingest
 - [ ] 2.3.1 Build fjall DB using `build_sorted()` from test variation data
@@ -143,7 +145,7 @@
 - [ ] 3.2.2 Measure DB size (should be identical since encoding is unchanged)
 - [ ] 3.2.3 Measure post-compaction time
 - [ ] 3.2.4 Benchmark inline values vs KV separation thresholds (for example 1 KiB and 2 KiB) using real serialized `PositionEntry` size histograms
-- [ ] 3.2.5 Measure the effect of any `major_compact()` step separately from ingestion so its 64 MB stock target does not get hidden inside the total
+- [ ] 3.2.5 Measure natural leveled compaction time after `start_ingestion()` (replaces `major_compact()` which is not in fjall 3.1.0 public API)
 - [ ] 3.2.6 Benchmark zstd dictionary sizes: 112 KB (default), 256 KB, 512 KB — measure compression ratio and decompression throughput on representative VEP variation data
 
 ### 3.3 Correctness validation
@@ -152,3 +154,50 @@
 - [ ] 3.3.3 Verify extended coordinate probes still work with 8 KiB block size
 - [ ] 3.3.4 Run existing `kv_cache` test suite with tuned configuration
 - [ ] 3.3.5 Verify `lookup_backend=parquet|fjall|hybrid|auto` all produce identical annotation results on the same fixtures
+
+## 4. Phase 4: Fjall 3.1.0 Optimizations (see `optimizations.md`)
+
+### 4.0 Update fjall to 3.1.0
+- [ ] 4.0.1 Update `fjall = { version = "3.1.0", optional = true }` in `bio-function-vep/Cargo.toml`
+- [ ] 4.0.2 Verify all existing tests pass with fjall 3.1.0
+- [ ] 4.0.3 Verify DB format compatibility (3.0.2-created DBs open with 3.1.0)
+
+### 4.1 Compaction filters for post-ingest optimization (Optimization 2)
+- [ ] 4.1.1 Implement `VepCacheFilterFactory` implementing `fjall::compaction::filter::Factory`
+- [ ] 4.1.2 Implement `VepCacheFilter` implementing `CompactionFilter` with duplicate position dedup (`Verdict::Destroy` for older duplicates)
+- [ ] 4.1.3 Add tombstone cleanup at last level (`ctx.is_last_level` → `Verdict::Destroy`)
+- [ ] 4.1.4 Register filter factory via `DatabaseBuilder::with_compaction_filter_factories()` for `data` keyspace
+- [ ] 4.1.5 Add test: verify dedup filter removes stale entries after incremental re-ingest
+- [ ] 4.1.6 Add test: verify `Verdict::Keep` has zero overhead on read-only annotation
+- [ ] 4.1.7 Benchmark: natural leveled compaction (with filters) vs former `major_compact()` path
+
+### 4.2 Range-scan merge-join for sorted VCF (Optimization 3)
+- [ ] 4.2.1 Add `range_scan_lookup()` method to `VepKvBackend` trait using `range()` iterator
+- [ ] 4.2.2 Implement merge-join cursor in `KvLookupExec`: walk fjall range iterator + VCF batch simultaneously
+- [ ] 4.2.3 Handle novel variant detection via merge gap (no bloom filter needed)
+- [ ] 4.2.4 Handle extended coordinate probes as cursor seeks (±3 positions from iterator position)
+- [ ] 4.2.5 Implement hybrid density heuristic: range-scan for dense regions (>0.5 variants/block), point-lookup for sparse
+- [ ] 4.2.6 Add test: verify merge-join produces identical results to per-variant `get()` path
+- [ ] 4.2.7 Benchmark: merge-join vs point-lookup on 6M-variant WGS (expected ~2-4s savings)
+
+### 4.3 Read-only open tuning (Optimizations 4-5)
+- [ ] 4.3.1 Add `.worker_threads(1)` to `VepKvStore::open()` and `open_with_cache_size()` (read-only path)
+- [ ] 4.3.2 Reduce `max_cached_files` from 512 to 128 for sequential WGS access pattern
+- [ ] 4.3.3 Keep `worker_threads(4)` (or default) in `VepKvStore::create()` for ingest path
+- [ ] 4.3.4 Add test: verify annotation works correctly with `worker_threads(1)`
+
+### 4.4 Adaptive decompression buffer sizing (Optimization 6)
+- [ ] 4.4.1 Use `Keyspace::size_of(key)` to pre-size decompression buffer before `get()`
+- [ ] 4.4.2 Maintain running compression ratio hint from observed decompressions
+- [ ] 4.4.3 Add test: verify no retry loops needed for typical VEP entry sizes
+- [ ] 4.4.4 Benchmark: buffer pre-sizing vs current 16x heuristic on 1M entries
+
+### 4.5 Journal compression for fallback ingest (Optimization 7)
+- [ ] 4.5.1 Add `.journal_compression(CompressionType::Lz4)` to `VepKvStore::create()` database builder
+- [ ] 4.5.2 Benchmark: journal I/O with LZ4 vs uncompressed on `batch_insert_raw()` path
+
+### 4.6 Benchmarking: 6M lookups against 1.2B cache
+- [ ] 4.6.1 Create benchmark with 6M-variant WGS against full 1.2B-entry cache
+- [ ] 4.6.2 Measure: default config → tuned → tuned+prefetch → tuned+prefetch+merge-join
+- [ ] 4.6.3 Validate performance model estimates from `optimizations.md` (target: ~15-18s tuned+prefetch+merge-join on NVMe)
+- [ ] 4.6.4 Measure decompression and data block I/O as separate components (expected: ~6s and ~12s respectively)
