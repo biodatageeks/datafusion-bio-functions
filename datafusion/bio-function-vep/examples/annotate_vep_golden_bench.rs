@@ -441,22 +441,35 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
         .unwrap_or("");
 
     // Build table name -> parquet path mapping for known context tables.
-    let table_specs: Vec<(&str, &str)> = vec![
-        ("transcripts_table", "transcript"),
-        ("exons_table", "exon"),
-        ("translations_table", "translation"),
-        ("regulatory_table", "regulatory"),
-        ("motif_table", "motif"),
+    // For each key, try the primary stem first, then fallback stems.
+    let table_specs: Vec<(&str, &[&str])> = vec![
+        ("transcripts_table", &["transcript"] as &[&str]),
+        ("exons_table", &["exon"]),
+        ("translations_table", &["translation_core", "translation"]),
+        ("regulatory_table", &["regulatory"]),
+        ("motif_table", &["motif"]),
     ];
 
     let mut entries = Vec::new();
-    for (json_key, file_stem) in &table_specs {
-        let parquet_name = format!("{base}_{file_stem}{suffix}.parquet");
-        let parquet_path = context_dir.join(&parquet_name);
-        if parquet_path.exists() {
-            // Table name used for DataFusion registration (no .parquet extension).
-            let table_name = format!("{base}_{file_stem}{suffix}");
-            entries.push(format!("\"{json_key}\":\"{table_name}\""));
+    for (json_key, file_stems) in &table_specs {
+        for file_stem in *file_stems {
+            let parquet_name = format!("{base}_{file_stem}{suffix}.parquet");
+            let parquet_path = context_dir.join(&parquet_name);
+            if parquet_path.exists() {
+                let table_name = format!("{base}_{file_stem}{suffix}");
+                entries.push(format!("\"{json_key}\":\"{table_name}\""));
+                break;
+            }
+        }
+    }
+
+    // Discover split translation_sift for sift/polyphen window loading.
+    {
+        let sift_name = format!("{base}_translation_sift{suffix}.parquet");
+        let sift_path = context_dir.join(&sift_name);
+        if sift_path.exists() {
+            let table_name = format!("{base}_translation_sift{suffix}");
+            entries.push(format!("\"translations_sift_table\":\"{table_name}\""));
         }
     }
 
@@ -532,6 +545,7 @@ async fn register_context_tables(
         "transcripts_table",
         "exons_table",
         "translations_table",
+        "translations_sift_table",
         "regulatory_table",
         "motif_table",
     ];
