@@ -50,26 +50,28 @@ Perfect (0 mismatches): 80/80 fields
 ## Timing Breakdown (VEP_PROFILE, --everything mode, 325K VCF rows)
 
 ```
-[VEP_PROFILE] 1. variation_lookup (scan+collect)................  38552.2ms
-[VEP_PROFILE] 2. collect_variant_intervals......................     95.2ms
-[VEP_PROFILE] 3. colocated_map_build............................    387.3ms  320539 entries
+[VEP_PROFILE] 1. variation_lookup (scan+collect)................  38748.6ms
+[VEP_PROFILE] 2. collect_variant_intervals......................     98.0ms
+[VEP_PROFILE] 3. colocated_map_build............................    394.4ms  320539 entries
 [VEP_PROFILE] cache hits: 0, misses: 325785, hit rate: 0.0%
-[VEP_PROFILE] 4a. load_transcripts..............................    341.4ms  47849 transcripts
-[VEP_PROFILE] 4b. load_exons....................................     58.9ms  355800 exons
-[VEP_PROFILE] 4c. load_translations.............................     99.8ms  22832 translations
-[VEP_PROFILE] 4d. load_regulatory...............................      9.4ms  35815 features
+[VEP_PROFILE] 4a. load_transcripts..............................    286.2ms  47849 transcripts
+[VEP_PROFILE] 4b. load_exons....................................     49.5ms  355800 exons
+[VEP_PROFILE] 4c. load_translations.............................     92.1ms  22832 translations
+[VEP_PROFILE] 4d. load_regulatory...............................      7.6ms  35815 features
 [VEP_PROFILE] 4e. load_motif....................................      1.2ms
 [VEP_PROFILE] 4f. load_mirna....................................      0.0ms
 [VEP_PROFILE] 4g. load_structural...............................      0.0ms
-[VEP_PROFILE] 4. context_tables_total...........................    515.1ms
-[VEP_PROFILE] 5a. hydrate_refseq_cds............................     21.6ms
-[VEP_PROFILE] 5b. hydrate_transcript_cdna.......................    759.4ms
-[VEP_PROFILE] 6. prepared_context_build.........................     22.6ms
+[VEP_PROFILE] 4. context_tables_total...........................    439.6ms
+[VEP_PROFILE] 5a. hydrate_refseq_cds............................     19.1ms
+[VEP_PROFILE] 5b. hydrate_transcript_cdna.......................    946.4ms
+[VEP_PROFILE] 6. prepared_context_build.........................     22.2ms
 [VEP_PROFILE] 7. sift_polyphen_cache_init.......................      0.0ms
-[VEP_PROFILE] 7+8. sift_lazy_load + annotate_batches............  62753.9ms  51 sift windows loaded
-[VEP_PROFILE] 9. projection + memtable..........................     62.2ms
-[VEP_PROFILE] TOTAL scan_with_transcript_engine................. 103230.6ms
-annotate_vep_elapsed_s=104.571
+[VEP_PROFILE] 7a. sift_lazy_load_only...........................  35807.0ms
+[VEP_PROFILE] 7b. annotate_batches_only.........................   8789.0ms
+[VEP_PROFILE] 7+8. sift_lazy_load + annotate_batches............  49526.4ms  51 sift windows loaded
+[VEP_PROFILE] 9. projection + memtable..........................     55.8ms
+[VEP_PROFILE] TOTAL scan_with_transcript_engine.................  90312.6ms
+annotate_vep_elapsed_s=91.696
 ```
 
 ## Context Loading: Before vs After
@@ -86,14 +88,23 @@ Measured with `profile_annotation` example on same chr1-vep caches (non-everythi
 
 The 13s savings comes from column projection on `load_translations`: the old `SELECT *` loaded 132 MB of sift/polyphen data that the main loader discarded. The new code projects only the 8 core columns (~5 MB).
 
-## Note on --everything Mode Total
+## --everything Mode: Before vs After
 
-The --everything total (104.6s) shows minimal improvement over the baseline (107.7s) because:
-1. Context loading savings: -13.1s
-2. Sift window loading: ~62.8s (comparable to baseline ~57.7s — slight increase from split file overhead)
-3. Variation lookup: ~38.6s (comparable to baseline ~33.9s — run-to-run variance)
+| Stage | Baseline (master, unsplit) | After (this PR, split cache) | Savings |
+|-------|------|-------|---------|
+| variation_lookup | 33.9s | 38.7s | (run-to-run variance) |
+| context_tables_total | 13.6s | **0.4s** | **-13.2s** |
+| sift_lazy_load | 48.0s | **35.8s** | **-12.2s** |
+| annotate_batches | 8.7s | 8.8s | — |
+| other (hydrate, context build, etc.) | 3.5s | 2.0s | -1.5s |
+| **TOTAL** | **107.7s** | **91.7s** | **-16.0s (-15%)** |
 
-The context optimization is real (0.5s vs 13.6s) but represents only ~13% of the --everything total. The dominant costs — sift window loading (60%) and variation lookup (37%) — are not addressed by this PR.
+Optimizations applied:
+1. **Column projection** on `load_translations`: skip 132 MB sift/polyphen data → 13.1s → 0.1s
+2. **Compact sift predictions**: replace `HashMap<(i32, String), (String, f32)>` with sorted `Vec<CompactPrediction>` using u8-encoded amino acids and prediction types. Eliminates ~256M String allocations → 48.0s → 35.8s
+3. **MissWorklist** with interval predicates for regulatory/motif/mirna/structural
+4. **Rust-side transcript_id filter** for exons and translations
+5. **Split translation layout** support (translation_core + translation_sift)
 
 ## Cache Layout (chr1-vep)
 
