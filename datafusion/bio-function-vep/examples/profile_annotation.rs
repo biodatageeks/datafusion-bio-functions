@@ -309,7 +309,7 @@ fn string_at(array: &dyn Array, row: usize) -> Option<String> {
 }
 
 fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
-    use datafusion::arrow::array::{Int32Array, Int64Array};
+    use datafusion::arrow::array::{Int32Array, Int64Array, UInt32Array, UInt64Array};
     if array.is_null(row) {
         return None;
     }
@@ -318,6 +318,16 @@ fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
     }
     if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
         return Some(a.value(row) as i64);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
+        return Some(a.value(row) as i64);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
+        return Some(a.value(row) as i64);
+    }
+    // Try string (some VCF providers store POS as string)
+    if let Some(s) = string_at(array, row) {
+        return s.parse::<i64>().ok();
     }
     None
 }
@@ -348,8 +358,11 @@ fn write_vcf_output(
         let schema = batch.schema();
         let chrom_idx = schema.index_of("chrom").ok();
         let start_idx = schema.index_of("start").ok();
+        let id_idx = schema.index_of("id").ok();
         let ref_idx = schema.index_of("ref").ok();
         let alt_idx = schema.index_of("alt").ok();
+        let qual_idx = schema.index_of("qual").ok();
+        let filter_idx = schema.index_of("filter").ok();
         let csq_idx = schema.index_of("csq").ok();
         let most_idx = schema.index_of("most_severe_consequence").ok();
 
@@ -360,12 +373,21 @@ fn write_vcf_output(
             let pos = start_idx
                 .and_then(|i| int64_at(batch.column(i).as_ref(), row))
                 .unwrap_or(0);
+            let id = id_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_else(|| ".".to_string());
             let ref_al = ref_idx
                 .and_then(|i| string_at(batch.column(i).as_ref(), row))
                 .unwrap_or_default();
             let alt_al = alt_idx
                 .and_then(|i| string_at(batch.column(i).as_ref(), row))
                 .unwrap_or_default();
+            let qual = qual_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_else(|| ".".to_string());
+            let filter = filter_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_else(|| ".".to_string());
             let csq = csq_idx
                 .and_then(|i| string_at(batch.column(i).as_ref(), row))
                 .unwrap_or_default();
@@ -381,7 +403,7 @@ fn write_vcf_output(
 
             writeln!(
                 file,
-                "{chrom}\t{pos}\t.\t{ref_al}\t{alt_al}\t.\t.\t{info}"
+                "{chrom}\t{pos}\t{id}\t{ref_al}\t{alt_al}\t{qual}\t{filter}\t{info}"
             )
             .map_err(|e| DataFusionError::Execution(format!("write error: {e}")))?;
         }
