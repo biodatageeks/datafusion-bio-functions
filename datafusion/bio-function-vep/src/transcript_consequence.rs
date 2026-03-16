@@ -217,10 +217,101 @@ pub struct TranslationFeature {
 /// eagerly loading all prediction matrices. See #38.
 #[derive(Debug, Clone, Default)]
 pub struct CachedPredictions {
-    /// SIFT predictions: `(position, amino_acid)` → `(prediction, score)`.
-    pub sift: HashMap<(i32, String), (String, f32)>,
-    /// PolyPhen predictions: `(position, amino_acid)` → `(prediction, score)`.
-    pub polyphen: HashMap<(i32, String), (String, f32)>,
+    /// SIFT predictions sorted by (position, amino_acid_index) for binary search.
+    pub sift: Vec<CompactPrediction>,
+    /// PolyPhen predictions sorted by (position, amino_acid_index) for binary search.
+    pub polyphen: Vec<CompactPrediction>,
+}
+
+/// Compact prediction entry: 10 bytes vs ~80 bytes for HashMap<(i32,String),(String,f32)>.
+/// Amino acid and prediction are encoded as u8 indices to avoid String allocations.
+#[derive(Debug, Clone, Copy)]
+pub struct CompactPrediction {
+    pub position: i32,
+    pub amino_acid: u8,
+    pub prediction: u8,
+    pub score: f32,
+}
+
+impl CompactPrediction {
+    /// Encode a single-char amino acid to a u8 index (A=0..Y=24).
+    pub fn encode_amino_acid(aa: &str) -> Option<u8> {
+        let b = aa.as_bytes().first()?;
+        if b.is_ascii_uppercase() {
+            Some(b - b'A')
+        } else {
+            None
+        }
+    }
+
+    /// Encode prediction string to u8 index.
+    pub fn encode_prediction(pred: &str) -> u8 {
+        match pred {
+            "tolerated" => 0,
+            "deleterious" => 1,
+            "tolerated - low confidence" | "tolerated_low_confidence" => 2,
+            "deleterious - low confidence" | "deleterious_low_confidence" => 3,
+            // PolyPhen predictions
+            "benign" => 4,
+            "possibly damaging" | "possibly_damaging" => 5,
+            "probably damaging" | "probably_damaging" => 6,
+            "unknown" => 7,
+            _ => 8, // fallback
+        }
+    }
+
+    /// Decode prediction index back to string.
+    pub fn decode_prediction(idx: u8) -> &'static str {
+        match idx {
+            0 => "tolerated",
+            1 => "deleterious",
+            2 => "tolerated - low confidence",
+            3 => "deleterious - low confidence",
+            4 => "benign",
+            5 => "possibly damaging",
+            6 => "probably damaging",
+            7 => "unknown",
+            _ => "unknown",
+        }
+    }
+}
+
+impl CachedPredictions {
+    /// Look up a prediction by (position, amino_acid_str). Binary search on sorted Vec.
+    pub fn lookup_sift(&self, position: i32, amino_acid: &str) -> Option<(&'static str, f32)> {
+        Self::lookup_in(&self.sift, position, amino_acid)
+    }
+
+    pub fn lookup_polyphen(&self, position: i32, amino_acid: &str) -> Option<(&'static str, f32)> {
+        Self::lookup_in(&self.polyphen, position, amino_acid)
+    }
+
+    fn lookup_in(
+        preds: &[CompactPrediction],
+        position: i32,
+        amino_acid: &str,
+    ) -> Option<(&'static str, f32)> {
+        let aa = CompactPrediction::encode_amino_acid(amino_acid)?;
+        let idx = preds
+            .binary_search_by(|p| p.position.cmp(&position).then(p.amino_acid.cmp(&aa)))
+            .ok()?;
+        let p = &preds[idx];
+        Some((CompactPrediction::decode_prediction(p.prediction), p.score))
+    }
+
+    /// Sort both prediction vectors. Must be called after all entries are inserted.
+    pub fn sort(&mut self) {
+        self.sift.sort_unstable_by(|a, b| {
+            a.position
+                .cmp(&b.position)
+                .then(a.amino_acid.cmp(&b.amino_acid))
+        });
+        self.polyphen.sort_unstable_by(|a, b| {
+            a.position
+                .cmp(&b.position)
+                .then(a.amino_acid.cmp(&b.amino_acid))
+        });
+    }
 }
 
 /// LRU-style cache for SIFT/PolyPhen predictions, loaded per-transcript.

@@ -74,9 +74,10 @@ use crate::annotation_store::{AnnotationBackend, build_store};
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
+use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
-    CachedPredictions, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
+    CachedPredictions, CompactPrediction, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
     ProteinDomainFeature, RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind,
     SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequenceEngine, TranscriptFeature,
     TranslationFeature, VariantInput, is_vep_transcript,
@@ -356,6 +357,100 @@ const AF_COLUMNS: &[AfColumn] = &[
 ///
 /// Traceability:
 /// - Ensembl VEP `Config.pm` `--everything` expansion
+/// Cached parquet metadata for direct sift/polyphen window reads, bypassing DataFusion SQL.
+struct SiftDirectReader {
+    path: String,
+    arrow_meta: parquet::arrow::arrow_reader::ArrowReaderMetadata,
+    projection: parquet::arrow::ProjectionMask,
+    rg_ranges: Vec<(i64, i64)>,
+}
+
+impl SiftDirectReader {
+    /// Read a single genomic window directly from parquet, skipping DataFusion SQL planning.
+    fn load_window(
+        &self,
+        chrom: &str,
+        win_start: i64,
+        win_end: i64,
+        cache: &mut SiftPolyphenCache,
+    ) -> Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let matching_rgs: Vec<usize> = self
+            .rg_ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, e))| *s <= win_end && *e >= win_start)
+            .map(|(i, _)| i)
+            .collect();
+
+        if matching_rgs.is_empty() {
+            return Ok(());
+        }
+
+        let file = std::fs::File::open(&self.path).map_err(|e| {
+            DataFusionError::Execution(format!("failed to open sift file '{}': {e}", self.path))
+        })?;
+        let reader =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.arrow_meta.clone())
+                .with_projection(self.projection.clone())
+                .with_row_groups(matching_rgs)
+                .build()
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("failed to build sift reader: {e}"))
+                })?;
+
+        let chrom_norm = chrom.strip_prefix("chr").unwrap_or(chrom);
+
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| DataFusionError::Execution(format!("sift batch read error: {e}")))?;
+            let schema = batch.schema();
+            let tx_idx = schema
+                .index_of("transcript_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .ok();
+            let end_col_idx = schema.index_of("end").ok();
+            let chrom_col_idx = schema.index_of("chrom").ok();
+            let sift_col_idx = schema.index_of("sift_predictions").ok();
+            let pp_col_idx = schema.index_of("polyphen_predictions").ok();
+
+            let Some(tx_idx) = tx_idx else { continue };
+
+            for row in 0..batch.num_rows() {
+                // Filter by chromosome (the file may contain multiple chroms).
+                if let Some(ci) = chrom_col_idx {
+                    if let Some(row_chrom) = string_at(batch.column(ci).as_ref(), row) {
+                        let row_norm = row_chrom.strip_prefix("chr").unwrap_or(&row_chrom);
+                        if row_norm != chrom_norm {
+                            continue;
+                        }
+                    }
+                }
+                let Some(tx_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                    continue;
+                };
+                if cache.get(&tx_id).is_some() {
+                    continue;
+                }
+                let genomic_end = end_col_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(i64::MAX);
+                let mut preds = CachedPredictions::default();
+                if let Some(idx) = sift_col_idx {
+                    preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+                if let Some(idx) = pp_col_idx {
+                    preds.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+                preds.sort();
+                cache.insert(tx_id, preds, genomic_end);
+            }
+        }
+        Ok(())
+    }
+}
+
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L346-L374>
 #[derive(Debug, Clone)]
 struct VepFlags {
@@ -1141,16 +1236,13 @@ fn lookup_sift_polyphen(
         return empty();
     };
 
-    let key = (pos, alt_aa.to_string());
     let sift = preds
-        .sift
-        .get(&key)
-        .map(|(pred, score)| format_prediction(pred, *score))
+        .lookup_sift(pos, alt_aa)
+        .map(|(pred, score)| format_prediction(pred, score))
         .unwrap_or_default();
     let polyphen = preds
-        .polyphen
-        .get(&key)
-        .map(|(pred, score)| format_prediction(pred, *score))
+        .lookup_polyphen(pos, alt_aa)
+        .map(|(pred, score)| format_prediction(pred, score))
         .unwrap_or_default();
 
     (sift, polyphen)
@@ -1575,33 +1667,87 @@ impl AnnotateProvider {
         Ok(None)
     }
 
-    fn chrom_filter_clause(chroms: &HashSet<String>) -> String {
-        if chroms.is_empty() {
-            return String::new();
-        }
-        // Include both "chr"-prefixed and bare variants so mismatched naming
-        // between VCF (chr22) and context tables (22) still matches.
-        let mut expanded: HashSet<String> = HashSet::new();
-        for c in chroms {
-            let escaped = c.replace('\'', "''");
-            expanded.insert(escaped.clone());
-            if let Some(bare) = escaped.strip_prefix("chr") {
-                expanded.insert(bare.to_string());
-            } else {
-                expanded.insert(format!("chr{escaped}"));
+    async fn projected_columns_for_table(
+        session: &SessionContext,
+        table: &str,
+        wanted: &[&str],
+    ) -> String {
+        let Ok(provider) = session.table(table).await else {
+            return "*".to_string();
+        };
+        let schema = provider.schema();
+        let arrow = schema.as_arrow();
+        let field_names: HashSet<&str> = arrow.fields().iter().map(|f| f.name().as_str()).collect();
+        let mut cols: Vec<&str> = Vec::new();
+        for &col in wanted {
+            let bare = col.trim_matches('"');
+            if field_names.contains(bare) {
+                cols.push(col);
             }
         }
-        let literals: Vec<String> = expanded.iter().map(|c| format!("'{c}'")).collect();
-        format!(" WHERE chrom IN ({})", literals.join(", "))
+        if cols.is_empty() {
+            "*".to_string()
+        } else {
+            cols.join(", ")
+        }
     }
 
     async fn load_transcripts(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<(Vec<TranscriptFeature>, HashMap<String, String>)> {
-        let filter = Self::chrom_filter_clause(chroms);
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let filter = worklist.chrom_filter_clause();
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &[
+                "transcript_id",
+                "stable_id",
+                "chrom",
+                "start",
+                "\"end\"",
+                "strand",
+                "biotype",
+                "cds_start",
+                "cds_end",
+                "cdna_coding_start",
+                "cdna_coding_end",
+                "gene_stable_id",
+                "gene_symbol",
+                "gene_symbol_source",
+                "gene_hgnc_id",
+                "refseq_id",
+                "source",
+                "version",
+                "raw_object_json",
+                "cds_start_nf",
+                "cds_end_nf",
+                "mature_mirna_regions",
+                "cdna_seq",
+                "bam_edit_status",
+                "has_non_polya_rna_edit",
+                "spliced_seq",
+                "translateable_seq",
+                "flags_str",
+                "cdna_mapper_segments",
+                "is_canonical",
+                "tsl",
+                "mane_select",
+                "mane_plus_clinical",
+                "translation_stable_id",
+                "gene_phenotype",
+                "ccds",
+                "swissprot",
+                "trembl",
+                "uniparc",
+                "uniprot_isoform",
+                "appris",
+                "ncrna_structure",
+            ],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
         let mut translateable_seq_by_tx = HashMap::new();
@@ -1849,7 +1995,7 @@ impl AnnotateProvider {
         Ok((out, translateable_seq_by_tx))
     }
 
-    async fn load_exons(&self, table: &str, chroms: &HashSet<String>) -> Result<Vec<ExonFeature>> {
+    async fn load_exons(&self, table: &str, worklist: &MissWorklist) -> Result<Vec<ExonFeature>> {
         let has_chrom = self
             .session
             .table(table)
@@ -1864,11 +2010,24 @@ impl AnnotateProvider {
             })
             .unwrap_or(false);
         let filter = if has_chrom {
-            Self::chrom_filter_clause(chroms)
+            worklist.chrom_filter_clause()
         } else {
             String::new()
         };
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &[
+                "transcript_id",
+                "stable_id",
+                "exon_number",
+                "start",
+                "\"end\"",
+                "chrom",
+            ],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -1927,7 +2086,7 @@ impl AnnotateProvider {
     async fn load_translations(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<Vec<TranslationFeature>> {
         let has_chrom = self
             .session
@@ -1943,11 +2102,32 @@ impl AnnotateProvider {
             })
             .unwrap_or(false);
         let filter = if has_chrom {
-            Self::chrom_filter_clause(chroms)
+            worklist.chrom_filter_clause()
         } else {
             String::new()
         };
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &[
+                "transcript_id",
+                "stable_id",
+                "chrom",
+                "start",
+                "\"end\"",
+                "cds_len",
+                "cds_length",
+                "protein_len",
+                "translation_seq",
+                "cds_sequence",
+                "cds_seq",
+                "coding_sequence",
+                "version",
+                "protein_features",
+            ],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -2020,6 +2200,70 @@ impl AnnotateProvider {
     /// Window size for sliding-window SIFT/PolyPhen loading (5MB).
     const SIFT_WINDOW_SIZE: i64 = 5_000_000;
 
+    /// Try to build a direct parquet reader for sift windows, bypassing DataFusion SQL.
+    /// Returns cached metadata + projection + RG ranges if the file path can be resolved.
+    fn build_sift_direct_reader(path: &str) -> Option<SiftDirectReader> {
+        use parquet::arrow::ProjectionMask;
+        use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+        use parquet::file::statistics::Statistics;
+
+        let file = std::fs::File::open(path).ok()?;
+        let arrow_meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default()).ok()?;
+        let parquet_schema = arrow_meta.metadata().file_metadata().schema_descr_ptr();
+
+        // Find root column indices for projection
+        let arrow_schema = arrow_meta.schema();
+        let fields = arrow_schema.fields();
+        let find_idx = |name: &str| fields.iter().position(|f| f.name() == name);
+
+        let tid_root = find_idx("transcript_id")?;
+        let end_root = find_idx("end")?;
+        let sift_root = find_idx("sift_predictions")?;
+        let poly_root = find_idx("polyphen_predictions")?;
+        let chrom_root = find_idx("chrom");
+
+        let mut proj_indices = vec![tid_root, end_root, sift_root, poly_root];
+        if let Some(ci) = chrom_root {
+            proj_indices.push(ci);
+        }
+        let projection = ProjectionMask::roots(&parquet_schema, proj_indices);
+
+        // Pre-compute RG position ranges from column statistics
+        let num_rgs = arrow_meta.metadata().num_row_groups();
+        // Find physical column index for "start" and "end"
+        let leaf_cols = parquet_schema.columns();
+        let start_leaf = leaf_cols.iter().position(|c| c.name() == "start");
+        let end_leaf = leaf_cols.iter().position(|c| c.name() == "end");
+
+        let rg_ranges: Vec<(i64, i64)> = (0..num_rgs)
+            .map(|i| {
+                let rg = arrow_meta.metadata().row_group(i);
+                let min_start = start_leaf
+                    .and_then(|idx| rg.column(idx).statistics())
+                    .and_then(|s| match s {
+                        Statistics::Int64(v) => v.min_opt().copied(),
+                        _ => None,
+                    })
+                    .unwrap_or(i64::MIN);
+                let max_end = end_leaf
+                    .and_then(|idx| rg.column(idx).statistics())
+                    .and_then(|s| match s {
+                        Statistics::Int64(v) => v.max_opt().copied(),
+                        _ => None,
+                    })
+                    .unwrap_or(i64::MAX);
+                (min_start, max_end)
+            })
+            .collect();
+
+        Some(SiftDirectReader {
+            path: path.to_string(),
+            arrow_meta,
+            projection,
+            rg_ranges,
+        })
+    }
+
     /// Load SIFT/PolyPhen predictions for a single genomic window into the cache.
     ///
     /// Queries translations whose CDS overlaps the window `[win_start, win_end)`:
@@ -2079,21 +2323,12 @@ impl AnnotateProvider {
                     .unwrap_or(i64::MAX);
                 let mut preds = CachedPredictions::default();
                 if let Some(idx) = sift_col_idx {
-                    for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
-                        preds.sift.insert(
-                            (pred.position, pred.amino_acid),
-                            (pred.prediction, pred.score),
-                        );
-                    }
+                    preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
                 }
                 if let Some(idx) = pp_col_idx {
-                    for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
-                        preds.polyphen.insert(
-                            (pred.position, pred.amino_acid),
-                            (pred.prediction, pred.score),
-                        );
-                    }
+                    preds.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
                 }
+                preds.sort();
                 cache.insert(tx_id, preds, genomic_end);
             }
         }
@@ -2104,10 +2339,23 @@ impl AnnotateProvider {
     async fn load_regulatory_features(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<Vec<RegulatoryFeature>> {
-        let filter = Self::chrom_filter_clause(chroms);
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let filter = worklist.interval_filter_sql();
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &[
+                "stable_id",
+                "feature_id",
+                "feature_type",
+                "chrom",
+                "start",
+                "\"end\"",
+            ],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -2165,10 +2413,16 @@ impl AnnotateProvider {
     async fn load_motif_features(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<Vec<MotifFeature>> {
-        let filter = Self::chrom_filter_clause(chroms);
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let filter = worklist.interval_filter_sql();
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &["motif_id", "feature_id", "chrom", "start", "\"end\""],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -2222,10 +2476,16 @@ impl AnnotateProvider {
     async fn load_mirna_features(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<Vec<MirnaFeature>> {
-        let filter = Self::chrom_filter_clause(chroms);
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let filter = worklist.interval_filter_sql();
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &["mirna_id", "feature_id", "chrom", "start", "\"end\""],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -2279,10 +2539,24 @@ impl AnnotateProvider {
     async fn load_structural_features(
         &self,
         table: &str,
-        chroms: &HashSet<String>,
+        worklist: &MissWorklist,
     ) -> Result<Vec<StructuralFeature>> {
-        let filter = Self::chrom_filter_clause(chroms);
-        let query = format!("SELECT * FROM `{table}`{filter}");
+        let filter = worklist.interval_filter_sql();
+        let cols = Self::projected_columns_for_table(
+            &self.session,
+            table,
+            &[
+                "feature_id",
+                "stable_id",
+                "feature_kind",
+                "event_type",
+                "chrom",
+                "start",
+                "\"end\"",
+            ],
+        )
+        .await;
+        let query = format!("SELECT {cols} FROM `{table}`{filter}");
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
 
@@ -2473,27 +2747,11 @@ impl AnnotateProvider {
             format!("{} entries", colocated_map.len())
         );
 
-        // Check if there are any cache misses (rows without cached most_severe).
-        // Only load context tables if we actually need the transcript engine.
         let mut cache_hit_count = 0usize;
         let mut cache_miss_count = 0usize;
-        let has_cache_misses = base_batches.iter().any(|batch| {
-            let Ok(idx) = batch.schema().index_of("cache_most_severe_consequence") else {
-                cache_miss_count += batch.num_rows();
-                return true; // Column missing — all rows are misses.
-            };
-            let col = batch.column(idx);
-            let mut found_miss = false;
-            for row in 0..batch.num_rows() {
-                if string_at(col.as_ref(), row).is_none() {
-                    cache_miss_count += 1;
-                    found_miss = true;
-                } else {
-                    cache_hit_count += 1;
-                }
-            }
-            found_miss
-        });
+        let worklist =
+            collect_miss_worklist(&base_batches, &mut cache_hit_count, &mut cache_miss_count)?;
+        let has_cache_misses = !worklist.is_empty();
         if profiling_enabled() {
             let hit_rate = if total_vcf_rows > 0 {
                 cache_hit_count as f64 / total_vcf_rows as f64 * 100.0
@@ -2517,22 +2775,6 @@ impl AnnotateProvider {
             mirnas,
             structural,
         ) = if has_cache_misses {
-            // Extract distinct chrom values from VCF batches for predicate pushdown
-            let vcf_chroms: HashSet<String> = {
-                let mut set = HashSet::new();
-                for batch in &base_batches {
-                    if let Ok(idx) = batch.schema().index_of("chrom") {
-                        let col = batch.column(idx);
-                        for row in 0..batch.num_rows() {
-                            if let Some(v) = string_at(col.as_ref(), row) {
-                                set.insert(v);
-                            }
-                        }
-                    }
-                }
-                set
-            };
-
             let merged = self
                 .options_json
                 .as_deref()
@@ -2541,8 +2783,7 @@ impl AnnotateProvider {
 
             let t_tx = profile_start!();
             let (tx, translateable_seq_by_tx) = if let Some(table) = transcripts_table {
-                let (tx, translateable_seq_by_tx) =
-                    self.load_transcripts(table, &vcf_chroms).await?;
+                let (tx, translateable_seq_by_tx) = self.load_transcripts(table, &worklist).await?;
                 (
                     tx.into_iter()
                         .filter(|t| is_vep_transcript(&t.transcript_id, merged))
@@ -2558,9 +2799,14 @@ impl AnnotateProvider {
                 format!("{} transcripts", tx.len())
             );
 
+            let tx_ids: HashSet<String> = tx.iter().map(|t| t.transcript_id.clone()).collect();
+
             let t_ex = profile_start!();
             let ex = if let Some(table) = exons_table {
-                self.load_exons(table, &vcf_chroms).await?
+                let raw = self.load_exons(table, &worklist).await?;
+                raw.into_iter()
+                    .filter(|e| tx_ids.contains(&e.transcript_id))
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -2568,7 +2814,10 @@ impl AnnotateProvider {
 
             let t_tl = profile_start!();
             let tl = if let Some(table) = translations_table {
-                self.load_translations(table, &vcf_chroms).await?
+                let raw = self.load_translations(table, &worklist).await?;
+                raw.into_iter()
+                    .filter(|t| tx_ids.contains(&t.transcript_id))
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -2580,7 +2829,7 @@ impl AnnotateProvider {
 
             let t_rg = profile_start!();
             let rg = if let Some(table) = regulatory_table {
-                self.load_regulatory_features(table, &vcf_chroms).await?
+                self.load_regulatory_features(table, &worklist).await?
             } else {
                 Vec::new()
             };
@@ -2592,7 +2841,7 @@ impl AnnotateProvider {
 
             let t_mt = profile_start!();
             let mt = if let Some(table) = motif_table {
-                self.load_motif_features(table, &vcf_chroms).await?
+                self.load_motif_features(table, &worklist).await?
             } else {
                 Vec::new()
             };
@@ -2600,7 +2849,7 @@ impl AnnotateProvider {
 
             let t_mi = profile_start!();
             let mi = if let Some(table) = mirna_table {
-                self.load_mirna_features(table, &vcf_chroms).await?
+                self.load_mirna_features(table, &worklist).await?
             } else {
                 Vec::new()
             };
@@ -2608,7 +2857,7 @@ impl AnnotateProvider {
 
             let t_st = profile_start!();
             let st = if let Some(table) = sv_table {
-                self.load_structural_features(table, &vcf_chroms).await?
+                self.load_structural_features(table, &worklist).await?
             } else {
                 Vec::new()
             };
@@ -2699,16 +2948,45 @@ impl AnnotateProvider {
         // See biodatageeks/datafusion-bio-functions#38.
         let t_sift = profile_start!();
         let mut sift_cache = SiftPolyphenCache::new();
-        let sift_enabled = flags.everything && translations_table.is_some();
+        let sift_table_name: Option<String> = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_string_option(opts, "translations_sift_table"))
+            .or_else(|| translations_table.map(|s| s.to_string()));
+        let sift_enabled = flags.everything && sift_table_name.is_some();
         let mut loaded_windows: HashSet<(String, i64)> = HashSet::new();
+        // Try to build a direct parquet reader for sift, bypassing DataFusion SQL.
+        let sift_direct: Option<SiftDirectReader> = if sift_enabled {
+            let table_name = sift_table_name.as_deref().unwrap();
+            // Resolve file path: try cache_source parent dir + table_name.parquet
+            let cache_dir = std::path::Path::new(&self.cache_source)
+                .parent()
+                .map(|p| p.to_path_buf());
+            cache_dir.and_then(|dir| {
+                let path = dir.join(format!("{table_name}.parquet"));
+                if path.exists() {
+                    Self::build_sift_direct_reader(path.to_str()?)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if profiling_enabled() && sift_direct.is_some() {
+            eprintln!("[VEP_PROFILE] sift_direct_reader: enabled (bypassing DataFusion SQL)");
+        }
         profile_end!("7. sift_polyphen_cache_init", t_sift);
 
         let t_annotate = profile_start!();
+        let mut sift_load_ms = 0u128;
+        let mut annotate_ms = 0u128;
         let mut annotated_batches = Vec::with_capacity(base_batches.len());
         for batch in &base_batches {
             // Lazily load SIFT/PolyPhen windows as the batch loop advances.
             if sift_enabled {
-                let table = translations_table.unwrap();
+                let t_sift_win = std::time::Instant::now();
+                let table = sift_table_name.as_deref().unwrap();
                 let schema = batch.schema();
                 if let (Ok(ci), Ok(si), Ok(ei)) = (
                     schema.index_of("chrom"),
@@ -2746,14 +3024,23 @@ impl AnnotateProvider {
                         while ws <= window_start + Self::SIFT_WINDOW_SIZE {
                             let key = (chrom.clone(), ws);
                             if !loaded_windows.contains(&key) {
-                                self.load_sift_window(
-                                    table,
-                                    chrom,
-                                    ws,
-                                    ws + Self::SIFT_WINDOW_SIZE,
-                                    &mut sift_cache,
-                                )
-                                .await?;
+                                if let Some(ref direct) = sift_direct {
+                                    direct.load_window(
+                                        chrom,
+                                        ws,
+                                        ws + Self::SIFT_WINDOW_SIZE,
+                                        &mut sift_cache,
+                                    )?;
+                                } else {
+                                    self.load_sift_window(
+                                        table,
+                                        chrom,
+                                        ws,
+                                        ws + Self::SIFT_WINDOW_SIZE,
+                                        &mut sift_cache,
+                                    )
+                                    .await?;
+                                }
                                 loaded_windows.insert(key);
                             }
                             ws += Self::SIFT_WINDOW_SIZE;
@@ -2765,8 +3052,10 @@ impl AnnotateProvider {
                         sift_cache.evict_before(*batch_min);
                     }
                 }
+                sift_load_ms += t_sift_win.elapsed().as_millis();
             }
 
+            let t_ann = std::time::Instant::now();
             annotated_batches.push(self.annotate_batch_with_transcript_engine(
                 batch,
                 &engine,
@@ -2774,6 +3063,15 @@ impl AnnotateProvider {
                 &colocated_map,
                 &sift_cache,
             )?);
+            annotate_ms += t_ann.elapsed().as_millis();
+        }
+        if profiling_enabled() {
+            eprintln!(
+                "[VEP_PROFILE] 7a. sift_lazy_load_only...........................  {sift_load_ms}ms"
+            );
+            eprintln!(
+                "[VEP_PROFILE] 7b. annotate_batches_only.........................  {annotate_ms}ms"
+            );
         }
         profile_end!(
             "7+8. sift_lazy_load + annotate_batches",
@@ -2885,6 +3183,10 @@ impl AnnotateProvider {
         let mut most_builder =
             StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
 
+        // Reusable buffers to avoid per-row/per-CSQ-entry String allocations.
+        let mut csq_buf = String::with_capacity(4096);
+        let mut terms_buf = String::with_capacity(128);
+
         for row in 0..batch.num_rows() {
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
                 csq_builder.append_null();
@@ -2989,28 +3291,32 @@ impl AnnotateProvider {
                 variant_fields.pubmed,
             );
 
-            let (csq_string, most_str) = if let Some(most_val) = &cached_most {
+            let most_str;
+            csq_buf.clear();
+            if let Some(most_val) = &cached_most {
+                use std::fmt::Write;
                 // Cache hit — produce single CSQ entry with empty transcript fields.
                 let csq_val = cached_csq.unwrap_or_default();
                 let impact = SoTerm::from_str(most_val)
                     .map(|t| impact_label(t.impact()))
                     .unwrap_or_else(|| impact_label(SoImpact::Modifier));
-                let csq_entry = if flags.everything {
-                    // 80-field CSQ: 22 base + 20 Batch 1 + 33 Batch 3 + 5 motif.
-                    format!(
+                if flags.everything {
+                    let _ = write!(
+                        csq_buf,
                         "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
                          {variant_class}|||||||||||||||||||||\
                          {batch3_suffix}|||||"
-                    )
+                    );
                 } else {
-                    // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
-                    format!(
+                    let _ = write!(
+                        csq_buf,
                         "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
                          {variant_class}||||||||||||{batch3_suffix}"
-                    )
+                    );
                 };
-                (csq_entry, most_val.clone())
+                most_str = most_val.clone();
             } else {
+                use std::fmt::Write;
                 // Cache miss — compute via transcript engine and produce per-transcript CSQ.
                 let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
                     csq_builder.append_null();
@@ -3079,17 +3385,18 @@ impl AnnotateProvider {
                     all_terms.push(SoTerm::SequenceVariant);
                 }
                 let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
-                let most_str = most.as_str().to_string();
+                most_str = most.as_str().to_string();
 
-                // Build per-transcript CSQ entries, comma-separated.
-                let mut csq_entries: Vec<String> = Vec::with_capacity(assignments.len());
+                // Build per-transcript CSQ entries into reusable buffer (already cleared above).
                 for tc in &assignments {
-                    let terms_str = tc
-                        .terms
-                        .iter()
-                        .map(|t| t.as_str())
-                        .collect::<Vec<_>>()
-                        .join("&");
+                    terms_buf.clear();
+                    for (i, t) in tc.terms.iter().enumerate() {
+                        if i > 0 {
+                            terms_buf.push('&');
+                        }
+                        terms_buf.push_str(t.as_str());
+                    }
+                    let terms_str = terms_buf.as_str();
                     let tc_impact = most_severe_term(tc.terms.iter())
                         .map(|t| impact_label(t.impact()))
                         .unwrap_or_else(|| impact_label(SoImpact::Modifier));
@@ -3119,6 +3426,10 @@ impl AnnotateProvider {
                     let protein_pos = tc.protein_position.as_deref().unwrap_or("");
                     let amino_acids = tc.amino_acids.as_deref().unwrap_or("");
                     let codons_str = tc.codons.as_deref().unwrap_or("");
+                    // Write comma separator between CSQ entries.
+                    if !csq_buf.is_empty() {
+                        csq_buf.push(',');
+                    }
                     let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
                     let tc_flags = tc.flags.as_deref().unwrap_or("");
                     let hgvsc = if hgvs_flags.hgvsc {
@@ -3274,7 +3585,8 @@ impl AnnotateProvider {
                         // Traceability:
                         // - VEP Constants.pm CSQ field order for --everything
                         //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
-                        csq_entries.push(format!(
+                        let _ = write!(
+                            csq_buf,
                             "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
@@ -3285,10 +3597,11 @@ impl AnnotateProvider {
                              {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
                              {batch3_suffix}|||||"
-                        ));
+                        );
                     } else {
                         // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
-                        csq_entries.push(format!(
+                        let _ = write!(
+                            csq_buf,
                             "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
@@ -3297,28 +3610,29 @@ impl AnnotateProvider {
                              {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                              {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                              {batch3_suffix}"
-                        ));
+                        );
                     }
                 }
-                if csq_entries.is_empty() {
+                if csq_buf.is_empty() {
                     let impact = impact_label(SoImpact::Modifier);
                     if flags.everything {
-                        csq_entries.push(format!(
+                        let _ = write!(
+                            csq_buf,
                             "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
                              {variant_class}|||||||||||||||||||||\
                              {batch3_suffix}|||||"
-                        ));
+                        );
                     } else {
-                        csq_entries.push(format!(
+                        let _ = write!(
+                            csq_buf,
                             "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
                              {variant_class}||||||||||||{batch3_suffix}"
-                        ));
+                        );
                     }
                 }
-                (csq_entries.join(","), most_str)
             };
 
-            csq_builder.append_value(&csq_string);
+            csq_builder.append_value(&csq_buf);
             most_builder.append_value(&most_str);
         }
 
@@ -3529,18 +3843,9 @@ fn read_mirna_regions(batch: &RecordBatch, col_idx: usize, row: usize) -> Option
     Some(regions)
 }
 
-/// Transient prediction entry used only during parquet loading.
-/// Predictions are indexed into `SiftPolyphenCache` HashMap for O(1) lookup.
-struct ProteinPrediction {
-    position: i32,
-    amino_acid: String,
-    prediction: String,
-    score: f32,
-}
-
-/// Read SIFT or PolyPhen predictions from a
-/// `List<Struct<position: Int32, amino_acid: Utf8, prediction: Utf8, score: Float32>>` column.
-fn read_protein_predictions(col: &dyn Array, row: usize) -> Vec<ProteinPrediction> {
+/// Read predictions directly into CompactPrediction without intermediate String allocations.
+/// Reads `&str` from Arrow arrays and encodes amino acid/prediction as u8 in-place.
+fn read_compact_predictions(col: &dyn Array, row: usize) -> Vec<CompactPrediction> {
     if col.is_null(row) {
         return Vec::new();
     }
@@ -3568,65 +3873,35 @@ fn read_protein_predictions(col: &dyn Array, row: usize) -> Vec<ProteinPredictio
         return Vec::new();
     };
     let pos_arr = positions.as_any().downcast_ref::<Int32Array>();
-    let aa_arr = amino_acids
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .or_else(|| None);
+    let aa_arr = amino_acids.as_any().downcast_ref::<StringArray>();
     let aa_view = amino_acids.as_any().downcast_ref::<StringViewArray>();
-    let pred_arr = predictions
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .or_else(|| None);
+    let pred_arr = predictions.as_any().downcast_ref::<StringArray>();
     let pred_view = predictions.as_any().downcast_ref::<StringViewArray>();
     let score_arr = scores.as_any().downcast_ref::<Float32Array>();
 
     let mut out = Vec::with_capacity(end_off - start_off);
     for i in start_off..end_off {
-        let position = pos_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
-        let amino_acid = aa_arr
-            .and_then(|a| {
-                if a.is_null(i) {
-                    None
-                } else {
-                    Some(a.value(i).to_string())
-                }
-            })
-            .or_else(|| {
-                aa_view.and_then(|a| {
-                    if a.is_null(i) {
-                        None
-                    } else {
-                        Some(a.value(i).to_string())
-                    }
-                })
-            });
-        let prediction = pred_arr
-            .and_then(|a| {
-                if a.is_null(i) {
-                    None
-                } else {
-                    Some(a.value(i).to_string())
-                }
-            })
-            .or_else(|| {
-                pred_view.and_then(|a| {
-                    if a.is_null(i) {
-                        None
-                    } else {
-                        Some(a.value(i).to_string())
-                    }
-                })
-            });
+        let Some(pos) = pos_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+        else {
+            continue;
+        };
+        // Read &str directly from Arrow buffer (zero-copy), encode to u8
+        let aa_str = aa_arr
+            .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+            .or_else(|| aa_view.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) }));
+        let pred_str = pred_arr
+            .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+            .or_else(|| pred_view.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) }));
         let score = score_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
-        if let (Some(pos), Some(aa), Some(pred), Some(sc)) =
-            (position, amino_acid, prediction, score)
-        {
-            out.push(ProteinPrediction {
-                position: pos,
-                amino_acid: aa,
-                prediction: pred,
-                score: sc,
-            });
+        if let (Some(aa), Some(pred), Some(sc)) = (aa_str, pred_str, score) {
+            if let Some(aa_idx) = CompactPrediction::encode_amino_acid(aa) {
+                out.push(CompactPrediction {
+                    position: pos,
+                    amino_acid: aa_idx,
+                    prediction: CompactPrediction::encode_prediction(pred),
+                    score: sc,
+                });
+            }
         }
     }
     out
@@ -4366,7 +4641,7 @@ fn bool_at(array: &dyn Array, row: usize) -> Option<bool> {
     None
 }
 
-fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
+pub(crate) fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
     if array.is_null(row) {
         return None;
     }
@@ -4397,7 +4672,7 @@ fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
     None
 }
 
-fn string_at(array: &dyn Array, row: usize) -> Option<String> {
+pub(crate) fn string_at(array: &dyn Array, row: usize) -> Option<String> {
     if array.is_null(row) {
         return None;
     }
@@ -4711,18 +4986,26 @@ mod tests {
 
     fn make_sift_cache(entries: Vec<(&str, i32, &str, &str, f32, &str, f32)>) -> SiftPolyphenCache {
         let mut cache = SiftPolyphenCache::new();
-        // Group entries by transcript_id.
         let mut by_tx: HashMap<String, CachedPredictions> = HashMap::new();
         for (tx_id, pos, aa, sift_pred, sift_score, pp_pred, pp_score) in entries {
             let preds = by_tx.entry(tx_id.to_string()).or_default();
-            preds
-                .sift
-                .insert((pos, aa.to_string()), (sift_pred.to_string(), sift_score));
-            preds
-                .polyphen
-                .insert((pos, aa.to_string()), (pp_pred.to_string(), pp_score));
+            if let Some(aa_idx) = CompactPrediction::encode_amino_acid(aa) {
+                preds.sift.push(CompactPrediction {
+                    position: pos,
+                    amino_acid: aa_idx,
+                    prediction: CompactPrediction::encode_prediction(sift_pred),
+                    score: sift_score,
+                });
+                preds.polyphen.push(CompactPrediction {
+                    position: pos,
+                    amino_acid: aa_idx,
+                    prediction: CompactPrediction::encode_prediction(pp_pred),
+                    score: pp_score,
+                });
+            }
         }
-        for (tx_id, preds) in by_tx {
+        for (tx_id, mut preds) in by_tx {
+            preds.sort();
             cache.insert(tx_id, preds, i64::MAX);
         }
         cache
