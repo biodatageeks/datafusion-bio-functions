@@ -109,13 +109,7 @@ async fn main() -> Result<()> {
     // Register VCF.
     // None = include all INFO and FORMAT/sample fields from the VCF header.
     // This ensures original VCF fields flow through the annotation pipeline.
-    let vcf = VcfTableProvider::new(
-        sampled_vcf.display().to_string(),
-        None,
-        None,
-        None,
-        false,
-    )?;
+    let vcf = VcfTableProvider::new(sampled_vcf.display().to_string(), None, None, None, false)?;
     // Capture VCF field metadata before registration (metadata is lost through the pipeline).
     let vcf_schema = vcf.schema();
     ctx.register_table("sampled_vcf", Arc::new(vcf))?;
@@ -141,15 +135,14 @@ async fn main() -> Result<()> {
         ("motif", "motif_table"),
     ];
     for (file_stem, json_key) in &context_tables {
-        let stem_result = find_parquet_stem(&cache_dir, file_stem, &base)
-            .or_else(|_| {
-                // Fallback: "translation_core" -> "translation" for unsplit layout
-                if *file_stem == "translation_core" {
-                    find_parquet_stem(&cache_dir, "translation", &base)
-                } else {
-                    Err(DataFusionError::Execution("not found".to_string()))
-                }
-            });
+        let stem_result = find_parquet_stem(&cache_dir, file_stem, &base).or_else(|_| {
+            // Fallback: "translation_core" -> "translation" for unsplit layout
+            if *file_stem == "translation_core" {
+                find_parquet_stem(&cache_dir, "translation", &base)
+            } else {
+                Err(DataFusionError::Execution("not found".to_string()))
+            }
+        });
         if let Ok(filename) = stem_result {
             let table_name = filename.trim_end_matches(".parquet");
             let path = cache_dir.join(&filename);
@@ -344,10 +337,9 @@ fn write_vcf_output(
 ) -> Result<()> {
     use std::io::BufWriter;
 
-    let mut file = BufWriter::new(
-        std::fs::File::create(path)
-            .map_err(|e| DataFusionError::Execution(format!("cannot create {}: {e}", path.display())))?,
-    );
+    let mut file = BufWriter::new(std::fs::File::create(path).map_err(|e| {
+        DataFusionError::Execution(format!("cannot create {}: {e}", path.display()))
+    })?);
 
     let Some(first_batch) = batches.first() else {
         return Ok(());
@@ -357,7 +349,9 @@ fn write_vcf_output(
     // Classify columns using VCF field metadata from the ORIGINAL VCF input schema.
     // The annotation pipeline output loses metadata, so we look up each column name
     // in the input schema to find its "bio.vcf.field.field_type" = "INFO" or "FORMAT".
-    let core_vcf = ["chrom", "start", "end", "id", "ref", "alt", "qual", "filter"];
+    let core_vcf = [
+        "chrom", "start", "end", "id", "ref", "alt", "qual", "filter",
+    ];
     let mut info_col_indices: Vec<(usize, String)> = Vec::new();
     let mut format_col_indices: Vec<(usize, String)> = Vec::new();
     let mut sample_names: Vec<String> = Vec::new();
@@ -433,7 +427,10 @@ fn write_vcf_output(
     // For single-sample: format tags are just column names (GT, GQ, DP, ...).
     // For multi-sample: extract tag from "sampleName_tag" pattern.
     let format_tags: Vec<String> = if sample_names.len() <= 1 {
-        format_col_indices.iter().map(|(_, name)| name.clone()).collect()
+        format_col_indices
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect()
     } else {
         // Deduplicate tags from "{sample}_{tag}" column names.
         let mut tags = Vec::new();

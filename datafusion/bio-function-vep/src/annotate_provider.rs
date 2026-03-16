@@ -403,9 +403,8 @@ impl SiftDirectReader {
         let chrom_norm = chrom.strip_prefix("chr").unwrap_or(chrom);
 
         for batch_result in reader {
-            let batch = batch_result.map_err(|e| {
-                DataFusionError::Execution(format!("sift batch read error: {e}"))
-            })?;
+            let batch = batch_result
+                .map_err(|e| DataFusionError::Execution(format!("sift batch read error: {e}")))?;
             let schema = batch.schema();
             let tx_idx = schema
                 .index_of("transcript_id")
@@ -2245,11 +2244,9 @@ impl AnnotateProvider {
 
     /// Try to build a direct parquet reader for sift windows, bypassing DataFusion SQL.
     /// Returns cached metadata + projection + RG ranges if the file path can be resolved.
-    fn build_sift_direct_reader(
-        path: &str,
-    ) -> Option<SiftDirectReader> {
-        use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+    fn build_sift_direct_reader(path: &str) -> Option<SiftDirectReader> {
         use parquet::arrow::ProjectionMask;
+        use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
         use parquet::file::statistics::Statistics;
 
         let file = std::fs::File::open(path).ok()?;
@@ -3007,15 +3004,14 @@ impl AnnotateProvider {
             let cache_dir = std::path::Path::new(&self.cache_source)
                 .parent()
                 .map(|p| p.to_path_buf());
-            cache_dir
-                .and_then(|dir| {
-                    let path = dir.join(format!("{table_name}.parquet"));
-                    if path.exists() {
-                        Self::build_sift_direct_reader(path.to_str()?)
-                    } else {
-                        None
-                    }
-                })
+            cache_dir.and_then(|dir| {
+                let path = dir.join(format!("{table_name}.parquet"));
+                if path.exists() {
+                    Self::build_sift_direct_reader(path.to_str()?)
+                } else {
+                    None
+                }
+            })
         } else {
             None
         };
@@ -3347,13 +3343,15 @@ impl AnnotateProvider {
                     .map(|t| impact_label(t.impact()))
                     .unwrap_or_else(|| impact_label(SoImpact::Modifier));
                 if flags.everything {
-                    let _ = write!(csq_buf,
+                    let _ = write!(
+                        csq_buf,
                         "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
                          {variant_class}|||||||||||||||||||||\
                          {batch3_suffix}|||||"
                     );
                 } else {
-                    let _ = write!(csq_buf,
+                    let _ = write!(
+                        csq_buf,
                         "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
                          {variant_class}||||||||||||{batch3_suffix}"
                     );
@@ -3629,7 +3627,8 @@ impl AnnotateProvider {
                         // Traceability:
                         // - VEP Constants.pm CSQ field order for --everything
                         //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
-                        let _ = write!(csq_buf,
+                        let _ = write!(
+                            csq_buf,
                             "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
@@ -3643,7 +3642,8 @@ impl AnnotateProvider {
                         );
                     } else {
                         // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
-                        let _ = write!(csq_buf,
+                        let _ = write!(
+                            csq_buf,
                             "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
@@ -3658,13 +3658,15 @@ impl AnnotateProvider {
                 if csq_buf.is_empty() {
                     let impact = impact_label(SoImpact::Modifier);
                     if flags.everything {
-                        let _ = write!(csq_buf,
+                        let _ = write!(
+                            csq_buf,
                             "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
                              {variant_class}|||||||||||||||||||||\
                              {batch3_suffix}|||||"
                         );
                     } else {
-                        let _ = write!(csq_buf,
+                        let _ = write!(
+                            csq_buf,
                             "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
                              {variant_class}||||||||||||{batch3_suffix}"
                         );
@@ -3940,11 +3942,8 @@ fn read_compact_predictions(col: &dyn Array, row: usize) -> Vec<CompactPredictio
             .or_else(|| aa_view.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) }));
         let pred_str = pred_arr
             .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
-            .or_else(|| {
-                pred_view.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
-            });
-        let score =
-            score_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
+            .or_else(|| pred_view.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) }));
+        let score = score_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
         if let (Some(aa), Some(pred), Some(sc)) = (aa_str, pred_str, score) {
             if let Some(aa_idx) = CompactPrediction::encode_amino_acid(aa) {
                 out.push(CompactPrediction {

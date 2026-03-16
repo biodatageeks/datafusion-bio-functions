@@ -139,16 +139,15 @@ fn test_vcf_roundtrip_noodles_can_parse() {
 
     // Read back with noodles-vcf and verify it parses.
     let file = std::fs::File::open(path).unwrap();
-    let mut reader = noodles_vcf::io::reader::Builder::default().build_from_reader(BufReader::new(file)).unwrap();
+    let mut reader = noodles_vcf::io::reader::Builder::default()
+        .build_from_reader(BufReader::new(file))
+        .unwrap();
 
     let header = reader.read_header().unwrap();
 
     // Verify header.
     assert_eq!(header.sample_names().len(), 1);
-    assert!(header
-        .sample_names()
-        .iter()
-        .any(|s| s.as_str() == "HG002"));
+    assert!(header.sample_names().iter().any(|s| s.as_str() == "HG002"));
 
     // Verify INFO CSQ is defined.
     assert!(header.infos().get("CSQ").is_some());
@@ -175,10 +174,7 @@ fn test_vcf_roundtrip_positions_correct() {
     write_test_vcf(&batches, path, "SAMPLE1");
 
     let content = std::fs::read_to_string(path).unwrap();
-    let data_lines: Vec<&str> = content
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .collect();
+    let data_lines: Vec<&str> = content.lines().filter(|l| !l.starts_with('#')).collect();
 
     assert_eq!(data_lines.len(), 3);
 
@@ -206,7 +202,9 @@ fn test_vcf_roundtrip_csq_preserved() {
     write_test_vcf(&batches, path, "SAMPLE1");
 
     let file = std::fs::File::open(path).unwrap();
-    let mut reader = noodles_vcf::io::reader::Builder::default().build_from_reader(BufReader::new(file)).unwrap();
+    let mut reader = noodles_vcf::io::reader::Builder::default()
+        .build_from_reader(BufReader::new(file))
+        .unwrap();
     let _header = reader.read_header().unwrap();
 
     let mut records: Vec<_> = reader.records().map(|r| r.unwrap()).collect();
@@ -239,7 +237,9 @@ fn test_vcf_roundtrip_empty_batches() {
     write_test_vcf(&[], path, "SAMPLE1");
 
     let file = std::fs::File::open(path).unwrap();
-    let mut reader = noodles_vcf::io::reader::Builder::default().build_from_reader(BufReader::new(file)).unwrap();
+    let mut reader = noodles_vcf::io::reader::Builder::default()
+        .build_from_reader(BufReader::new(file))
+        .unwrap();
     let header = reader.read_header().unwrap();
 
     assert_eq!(header.sample_names().len(), 1);

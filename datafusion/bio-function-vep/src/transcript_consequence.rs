@@ -291,19 +291,31 @@ impl CachedPredictions {
         Self::lookup_in(&self.polyphen, position, amino_acid)
     }
 
-    fn lookup_in(preds: &[CompactPrediction], position: i32, amino_acid: &str) -> Option<(&'static str, f32)> {
+    fn lookup_in(
+        preds: &[CompactPrediction],
+        position: i32,
+        amino_acid: &str,
+    ) -> Option<(&'static str, f32)> {
         let aa = CompactPrediction::encode_amino_acid(amino_acid)?;
-        let idx = preds.binary_search_by(|p| {
-            p.position.cmp(&position).then(p.amino_acid.cmp(&aa))
-        }).ok()?;
+        let idx = preds
+            .binary_search_by(|p| p.position.cmp(&position).then(p.amino_acid.cmp(&aa)))
+            .ok()?;
         let p = &preds[idx];
         Some((CompactPrediction::decode_prediction(p.prediction), p.score))
     }
 
     /// Sort both prediction vectors. Must be called after all entries are inserted.
     pub fn sort(&mut self) {
-        self.sift.sort_unstable_by(|a, b| a.position.cmp(&b.position).then(a.amino_acid.cmp(&b.amino_acid)));
-        self.polyphen.sort_unstable_by(|a, b| a.position.cmp(&b.position).then(a.amino_acid.cmp(&b.amino_acid)));
+        self.sift.sort_unstable_by(|a, b| {
+            a.position
+                .cmp(&b.position)
+                .then(a.amino_acid.cmp(&b.amino_acid))
+        });
+        self.polyphen.sort_unstable_by(|a, b| {
+            a.position
+                .cmp(&b.position)
+                .then(a.amino_acid.cmp(&b.amino_acid))
+        });
     }
 }
 
