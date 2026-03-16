@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     let output_vcf = args
         .iter()
         .find_map(|a| a.strip_prefix("--output="))
-        .map(|s| PathBuf::from(s));
+        .map(PathBuf::from);
 
     eprintln!("=== VEP Annotation Profiler ===");
     eprintln!("VCF:          {}", vcf_gz.display());
@@ -395,15 +395,15 @@ fn write_vcf_output(
             _ => {}
         }
     }
+    if sample_names.is_empty()
+        && !format_col_indices.is_empty()
+        && let Some(samples_json) = vcf_input_schema.metadata().get("bio.vcf.samples")
+        && let Ok(names) = serde_json::from_str::<Vec<String>>(samples_json)
+    {
+        sample_names = names;
+    }
     if sample_names.is_empty() && !format_col_indices.is_empty() {
-        if let Some(samples_json) = vcf_input_schema.metadata().get("bio.vcf.samples") {
-            if let Ok(names) = serde_json::from_str::<Vec<String>>(samples_json) {
-                sample_names = names;
-            }
-        }
-        if sample_names.is_empty() {
-            sample_names.push("SAMPLE".to_string());
-        }
+        sample_names.push("SAMPLE".to_string());
     }
 
     // Write VCF header.
@@ -435,9 +435,10 @@ fn write_vcf_output(
         // Deduplicate tags from "{sample}_{tag}" column names.
         let mut tags = Vec::new();
         for (_, name) in &format_col_indices {
-            if let Some(tag) = name.split('_').last() {
-                if !tags.contains(&tag.to_string()) {
-                    tags.push(tag.to_string());
+            if let Some(tag) = name.rsplit('_').next() {
+                let tag_str = tag.to_string();
+                if !tags.contains(&tag_str) {
+                    tags.push(tag_str);
                 }
             }
         }
@@ -487,10 +488,10 @@ fn write_vcf_output(
             // Build INFO field: original INFO fields + CSQ.
             let mut info_parts: Vec<String> = Vec::new();
             for (idx, name) in &info_col_indices {
-                if let Some(val) = string_at(batch.column(*idx).as_ref(), row) {
-                    if !val.is_empty() {
-                        info_parts.push(format!("{name}={val}"));
-                    }
+                if let Some(val) = string_at(batch.column(*idx).as_ref(), row)
+                    && !val.is_empty()
+                {
+                    info_parts.push(format!("{name}={val}"));
                 }
             }
             if !csq.is_empty() {

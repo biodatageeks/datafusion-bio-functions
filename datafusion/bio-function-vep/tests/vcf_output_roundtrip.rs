@@ -207,7 +207,7 @@ fn test_vcf_roundtrip_csq_preserved() {
         .unwrap();
     let _header = reader.read_header().unwrap();
 
-    let mut records: Vec<_> = reader.records().map(|r| r.unwrap()).collect();
+    let records: Vec<_> = reader.records().map(|r| r.unwrap()).collect();
     assert_eq!(records.len(), 3);
 
     // First record should have CSQ in INFO.
