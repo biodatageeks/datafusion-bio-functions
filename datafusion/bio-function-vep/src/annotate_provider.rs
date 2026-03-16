@@ -77,7 +77,7 @@ use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
-    CachedPredictions, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
+    CachedPredictions, CompactPrediction, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
     ProteinDomainFeature, RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind,
     SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequenceEngine, TranscriptFeature,
     TranslationFeature, VariantInput, is_vep_transcript,
@@ -1142,16 +1142,13 @@ fn lookup_sift_polyphen(
         return empty();
     };
 
-    let key = (pos, alt_aa.to_string());
     let sift = preds
-        .sift
-        .get(&key)
-        .map(|(pred, score)| format_prediction(pred, *score))
+        .lookup_sift(pos, alt_aa)
+        .map(|(pred, score)| format_prediction(pred, score))
         .unwrap_or_default();
     let polyphen = preds
-        .polyphen
-        .get(&key)
-        .map(|(pred, score)| format_prediction(pred, *score))
+        .lookup_polyphen(pos, alt_aa)
+        .map(|(pred, score)| format_prediction(pred, score))
         .unwrap_or_default();
 
     (sift, polyphen)
@@ -2187,20 +2184,29 @@ impl AnnotateProvider {
                 let mut preds = CachedPredictions::default();
                 if let Some(idx) = sift_col_idx {
                     for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
-                        preds.sift.insert(
-                            (pred.position, pred.amino_acid),
-                            (pred.prediction, pred.score),
-                        );
+                        if let Some(aa) = CompactPrediction::encode_amino_acid(&pred.amino_acid) {
+                            preds.sift.push(CompactPrediction {
+                                position: pred.position,
+                                amino_acid: aa,
+                                prediction: CompactPrediction::encode_prediction(&pred.prediction),
+                                score: pred.score,
+                            });
+                        }
                     }
                 }
                 if let Some(idx) = pp_col_idx {
                     for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
-                        preds.polyphen.insert(
-                            (pred.position, pred.amino_acid),
-                            (pred.prediction, pred.score),
-                        );
+                        if let Some(aa) = CompactPrediction::encode_amino_acid(&pred.amino_acid) {
+                            preds.polyphen.push(CompactPrediction {
+                                position: pred.position,
+                                amino_acid: aa,
+                                prediction: CompactPrediction::encode_prediction(&pred.prediction),
+                                score: pred.score,
+                            });
+                        }
                     }
                 }
+                preds.sort();
                 cache.insert(tx_id, preds, genomic_end);
             }
         }
@@ -4851,18 +4857,26 @@ mod tests {
 
     fn make_sift_cache(entries: Vec<(&str, i32, &str, &str, f32, &str, f32)>) -> SiftPolyphenCache {
         let mut cache = SiftPolyphenCache::new();
-        // Group entries by transcript_id.
         let mut by_tx: HashMap<String, CachedPredictions> = HashMap::new();
         for (tx_id, pos, aa, sift_pred, sift_score, pp_pred, pp_score) in entries {
             let preds = by_tx.entry(tx_id.to_string()).or_default();
-            preds
-                .sift
-                .insert((pos, aa.to_string()), (sift_pred.to_string(), sift_score));
-            preds
-                .polyphen
-                .insert((pos, aa.to_string()), (pp_pred.to_string(), pp_score));
+            if let Some(aa_idx) = CompactPrediction::encode_amino_acid(aa) {
+                preds.sift.push(CompactPrediction {
+                    position: pos,
+                    amino_acid: aa_idx,
+                    prediction: CompactPrediction::encode_prediction(sift_pred),
+                    score: sift_score,
+                });
+                preds.polyphen.push(CompactPrediction {
+                    position: pos,
+                    amino_acid: aa_idx,
+                    prediction: CompactPrediction::encode_prediction(pp_pred),
+                    score: pp_score,
+                });
+            }
         }
-        for (tx_id, preds) in by_tx {
+        for (tx_id, mut preds) in by_tx {
+            preds.sort();
             cache.insert(tx_id, preds, i64::MAX);
         }
         cache
