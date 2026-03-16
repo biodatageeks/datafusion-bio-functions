@@ -3229,6 +3229,10 @@ impl AnnotateProvider {
         let mut most_builder =
             StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
 
+        // Reusable buffers to avoid per-row/per-CSQ-entry String allocations.
+        let mut csq_buf = String::with_capacity(4096);
+        let mut terms_buf = String::with_capacity(128);
+
         for row in 0..batch.num_rows() {
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
                 csq_builder.append_null();
@@ -3333,28 +3337,30 @@ impl AnnotateProvider {
                 variant_fields.pubmed,
             );
 
-            let (csq_string, most_str) = if let Some(most_val) = &cached_most {
+            let most_str;
+            csq_buf.clear();
+            if let Some(most_val) = &cached_most {
+                use std::fmt::Write;
                 // Cache hit — produce single CSQ entry with empty transcript fields.
                 let csq_val = cached_csq.unwrap_or_default();
                 let impact = SoTerm::from_str(most_val)
                     .map(|t| impact_label(t.impact()))
                     .unwrap_or_else(|| impact_label(SoImpact::Modifier));
-                let csq_entry = if flags.everything {
-                    // 80-field CSQ: 22 base + 20 Batch 1 + 33 Batch 3 + 5 motif.
-                    format!(
+                if flags.everything {
+                    let _ = write!(csq_buf,
                         "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
                          {variant_class}|||||||||||||||||||||\
                          {batch3_suffix}|||||"
-                    )
+                    );
                 } else {
-                    // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
-                    format!(
+                    let _ = write!(csq_buf,
                         "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
                          {variant_class}||||||||||||{batch3_suffix}"
-                    )
+                    );
                 };
-                (csq_entry, most_val.clone())
+                most_str = most_val.clone();
             } else {
+                use std::fmt::Write;
                 // Cache miss — compute via transcript engine and produce per-transcript CSQ.
                 let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
                     csq_builder.append_null();
@@ -3423,17 +3429,18 @@ impl AnnotateProvider {
                     all_terms.push(SoTerm::SequenceVariant);
                 }
                 let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
-                let most_str = most.as_str().to_string();
+                most_str = most.as_str().to_string();
 
-                // Build per-transcript CSQ entries, comma-separated.
-                let mut csq_entries: Vec<String> = Vec::with_capacity(assignments.len());
+                // Build per-transcript CSQ entries into reusable buffer (already cleared above).
                 for tc in &assignments {
-                    let terms_str = tc
-                        .terms
-                        .iter()
-                        .map(|t| t.as_str())
-                        .collect::<Vec<_>>()
-                        .join("&");
+                    terms_buf.clear();
+                    for (i, t) in tc.terms.iter().enumerate() {
+                        if i > 0 {
+                            terms_buf.push('&');
+                        }
+                        terms_buf.push_str(t.as_str());
+                    }
+                    let terms_str = terms_buf.as_str();
                     let tc_impact = most_severe_term(tc.terms.iter())
                         .map(|t| impact_label(t.impact()))
                         .unwrap_or_else(|| impact_label(SoImpact::Modifier));
@@ -3463,6 +3470,10 @@ impl AnnotateProvider {
                     let protein_pos = tc.protein_position.as_deref().unwrap_or("");
                     let amino_acids = tc.amino_acids.as_deref().unwrap_or("");
                     let codons_str = tc.codons.as_deref().unwrap_or("");
+                    // Write comma separator between CSQ entries.
+                    if !csq_buf.is_empty() {
+                        csq_buf.push(',');
+                    }
                     let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
                     let tc_flags = tc.flags.as_deref().unwrap_or("");
                     let hgvsc = if hgvs_flags.hgvsc {
@@ -3618,7 +3629,7 @@ impl AnnotateProvider {
                         // Traceability:
                         // - VEP Constants.pm CSQ field order for --everything
                         //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
-                        csq_entries.push(format!(
+                        let _ = write!(csq_buf,
                             "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
@@ -3629,10 +3640,10 @@ impl AnnotateProvider {
                              {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
                              {batch3_suffix}|||||"
-                        ));
+                        );
                     } else {
                         // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
-                        csq_entries.push(format!(
+                        let _ = write!(csq_buf,
                             "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
@@ -3641,28 +3652,27 @@ impl AnnotateProvider {
                              {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                              {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                              {batch3_suffix}"
-                        ));
+                        );
                     }
                 }
-                if csq_entries.is_empty() {
+                if csq_buf.is_empty() {
                     let impact = impact_label(SoImpact::Modifier);
                     if flags.everything {
-                        csq_entries.push(format!(
+                        let _ = write!(csq_buf,
                             "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
                              {variant_class}|||||||||||||||||||||\
                              {batch3_suffix}|||||"
-                        ));
+                        );
                     } else {
-                        csq_entries.push(format!(
+                        let _ = write!(csq_buf,
                             "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
                              {variant_class}||||||||||||{batch3_suffix}"
-                        ));
+                        );
                     }
                 }
-                (csq_entries.join(","), most_str)
             };
 
-            csq_builder.append_value(&csq_string);
+            csq_builder.append_value(&csq_buf);
             most_builder.append_value(&most_str);
         }
 
