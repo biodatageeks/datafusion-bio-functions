@@ -2981,78 +2981,94 @@ impl AnnotateProvider {
         let t_annotate = profile_start!();
         let mut sift_load_ms = 0u128;
         let mut annotate_ms = 0u128;
+        let mut sift_skipped_batches = 0usize;
         let mut annotated_batches = Vec::with_capacity(base_batches.len());
         for batch in &base_batches {
             // Lazily load SIFT/PolyPhen windows as the batch loop advances.
+            // Gate: skip sift loading for batches where ALL rows are cache hits
+            // (cache_most_severe_consequence is non-null). With the fjall backend
+            // providing ~95%+ hit rates, this skips most batches and reduces
+            // sift window loading from ~24s to ~2s.
             if sift_enabled {
-                let t_sift_win = std::time::Instant::now();
-                let table = sift_table_name.as_deref().unwrap();
-                let schema = batch.schema();
-                if let (Ok(ci), Ok(si), Ok(ei)) = (
-                    schema.index_of("chrom"),
-                    schema.index_of("start"),
-                    schema.index_of("end"),
-                ) {
-                    // Collect per-chrom min/max positions in this batch.
-                    let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
-                    for row in 0..batch.num_rows() {
-                        if let (Some(c), Some(s), Some(e)) = (
-                            string_at(batch.column(ci).as_ref(), row),
-                            int64_at(batch.column(si).as_ref(), row),
-                            int64_at(batch.column(ei).as_ref(), row),
-                        ) {
-                            let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
-                            let entry = batch_chrom_bounds
-                                .entry(c_norm)
-                                .or_insert((i64::MAX, i64::MIN));
-                            entry.0 = entry.0.min(s);
-                            entry.1 = entry.1.max(e);
-                        }
-                    }
-
-                    for (chrom, (batch_min, batch_max)) in &batch_chrom_bounds {
-                        let window_start =
-                            (batch_max / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
-
-                        // Also load the window containing the minimum position
-                        // (may differ from the max window).
-                        let min_window_start =
-                            (batch_min / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
-
-                        // Load all windows from the min to the max + next window.
-                        let mut ws = min_window_start;
-                        while ws <= window_start + Self::SIFT_WINDOW_SIZE {
-                            let key = (chrom.clone(), ws);
-                            if !loaded_windows.contains(&key) {
-                                if let Some(ref direct) = sift_direct {
-                                    direct.load_window(
-                                        chrom,
-                                        ws,
-                                        ws + Self::SIFT_WINDOW_SIZE,
-                                        &mut sift_cache,
-                                    )?;
-                                } else {
-                                    self.load_sift_window(
-                                        table,
-                                        chrom,
-                                        ws,
-                                        ws + Self::SIFT_WINDOW_SIZE,
-                                        &mut sift_cache,
-                                    )
-                                    .await?;
-                                }
-                                loaded_windows.insert(key);
+                // Check if this batch has any cache misses that need the transcript engine.
+                // If all rows have cache_most_severe_consequence populated, skip sift loading.
+                let batch_has_miss = batch
+                    .schema()
+                    .index_of("cache_most_severe_consequence")
+                    .ok()
+                    .map_or(true, |idx| batch.column(idx).null_count() > 0);
+                if !batch_has_miss {
+                    sift_skipped_batches += 1;
+                } else {
+                    let t_sift_win = std::time::Instant::now();
+                    let table = sift_table_name.as_deref().unwrap();
+                    let schema = batch.schema();
+                    if let (Ok(ci), Ok(si), Ok(ei)) = (
+                        schema.index_of("chrom"),
+                        schema.index_of("start"),
+                        schema.index_of("end"),
+                    ) {
+                        // Collect per-chrom min/max positions in this batch.
+                        let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
+                        for row in 0..batch.num_rows() {
+                            if let (Some(c), Some(s), Some(e)) = (
+                                string_at(batch.column(ci).as_ref(), row),
+                                int64_at(batch.column(si).as_ref(), row),
+                                int64_at(batch.column(ei).as_ref(), row),
+                            ) {
+                                let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
+                                let entry = batch_chrom_bounds
+                                    .entry(c_norm)
+                                    .or_insert((i64::MAX, i64::MIN));
+                                entry.0 = entry.0.min(s);
+                                entry.1 = entry.1.max(e);
                             }
-                            ws += Self::SIFT_WINDOW_SIZE;
                         }
 
-                        // Evict entries whose genomic end is behind the batch
-                        // minimum (position-sorted VCF guarantees no future
-                        // batch will need them).
-                        sift_cache.evict_before(*batch_min);
+                        for (chrom, (batch_min, batch_max)) in &batch_chrom_bounds {
+                            let window_start =
+                                (batch_max / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
+
+                            // Also load the window containing the minimum position
+                            // (may differ from the max window).
+                            let min_window_start =
+                                (batch_min / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
+
+                            // Load all windows from the min to the max + next window.
+                            let mut ws = min_window_start;
+                            while ws <= window_start + Self::SIFT_WINDOW_SIZE {
+                                let key = (chrom.clone(), ws);
+                                if !loaded_windows.contains(&key) {
+                                    if let Some(ref direct) = sift_direct {
+                                        direct.load_window(
+                                            chrom,
+                                            ws,
+                                            ws + Self::SIFT_WINDOW_SIZE,
+                                            &mut sift_cache,
+                                        )?;
+                                    } else {
+                                        self.load_sift_window(
+                                            table,
+                                            chrom,
+                                            ws,
+                                            ws + Self::SIFT_WINDOW_SIZE,
+                                            &mut sift_cache,
+                                        )
+                                        .await?;
+                                    }
+                                    loaded_windows.insert(key);
+                                }
+                                ws += Self::SIFT_WINDOW_SIZE;
+                            }
+
+                            // Evict entries whose genomic end is behind the batch
+                            // minimum (position-sorted VCF guarantees no future
+                            // batch will need them).
+                            sift_cache.evict_before(*batch_min);
+                        }
                     }
-                }
-                sift_load_ms += t_sift_win.elapsed().as_millis();
+                    sift_load_ms += t_sift_win.elapsed().as_millis();
+                } // end else (batch_has_miss)
             }
 
             let t_ann = std::time::Instant::now();
@@ -3072,6 +3088,12 @@ impl AnnotateProvider {
             eprintln!(
                 "[VEP_PROFILE] 7b. annotate_batches_only.........................  {annotate_ms}ms"
             );
+            if sift_skipped_batches > 0 {
+                eprintln!(
+                    "[VEP_PROFILE] 7c. sift_skipped_batches (cache hits).............  {sift_skipped_batches}/{} batches",
+                    base_batches.len()
+                );
+            }
         }
         profile_end!(
             "7+8. sift_lazy_load + annotate_batches",
