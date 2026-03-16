@@ -2183,28 +2183,10 @@ impl AnnotateProvider {
                     .unwrap_or(i64::MAX);
                 let mut preds = CachedPredictions::default();
                 if let Some(idx) = sift_col_idx {
-                    for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
-                        if let Some(aa) = CompactPrediction::encode_amino_acid(&pred.amino_acid) {
-                            preds.sift.push(CompactPrediction {
-                                position: pred.position,
-                                amino_acid: aa,
-                                prediction: CompactPrediction::encode_prediction(&pred.prediction),
-                                score: pred.score,
-                            });
-                        }
-                    }
+                    preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
                 }
                 if let Some(idx) = pp_col_idx {
-                    for pred in read_protein_predictions(batch.column(idx).as_ref(), row) {
-                        if let Some(aa) = CompactPrediction::encode_amino_acid(&pred.amino_acid) {
-                            preds.polyphen.push(CompactPrediction {
-                                position: pred.position,
-                                amino_acid: aa,
-                                prediction: CompactPrediction::encode_prediction(&pred.prediction),
-                                score: pred.score,
-                            });
-                        }
-                    }
+                    preds.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
                 }
                 preds.sort();
                 cache.insert(tx_id, preds, genomic_end);
@@ -3682,6 +3664,73 @@ struct ProteinPrediction {
     amino_acid: String,
     prediction: String,
     score: f32,
+}
+
+/// Read predictions directly into CompactPrediction without intermediate String allocations.
+/// Reads `&str` from Arrow arrays and encodes amino acid/prediction as u8 in-place.
+fn read_compact_predictions(col: &dyn Array, row: usize) -> Vec<CompactPrediction> {
+    if col.is_null(row) {
+        return Vec::new();
+    }
+    let Some(list_arr) = col.as_any().downcast_ref::<ListArray>() else {
+        return Vec::new();
+    };
+    let offsets = list_arr.offsets();
+    let start_off = offsets[row] as usize;
+    let end_off = offsets[row + 1] as usize;
+    if start_off == end_off {
+        return Vec::new();
+    }
+    let values = list_arr.values();
+    let struct_arr = values.as_struct();
+    let Some(positions) = struct_arr.column_by_name("position") else {
+        return Vec::new();
+    };
+    let Some(amino_acids) = struct_arr.column_by_name("amino_acid") else {
+        return Vec::new();
+    };
+    let Some(predictions) = struct_arr.column_by_name("prediction") else {
+        return Vec::new();
+    };
+    let Some(scores) = struct_arr.column_by_name("score") else {
+        return Vec::new();
+    };
+    let pos_arr = positions.as_any().downcast_ref::<Int32Array>();
+    let aa_arr = amino_acids.as_any().downcast_ref::<StringArray>();
+    let aa_view = amino_acids.as_any().downcast_ref::<StringViewArray>();
+    let pred_arr = predictions.as_any().downcast_ref::<StringArray>();
+    let pred_view = predictions.as_any().downcast_ref::<StringViewArray>();
+    let score_arr = scores.as_any().downcast_ref::<Float32Array>();
+
+    let mut out = Vec::with_capacity(end_off - start_off);
+    for i in start_off..end_off {
+        let Some(pos) = pos_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+        else {
+            continue;
+        };
+        // Read &str directly from Arrow buffer (zero-copy), encode to u8
+        let aa_str = aa_arr
+            .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+            .or_else(|| aa_view.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) }));
+        let pred_str = pred_arr
+            .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+            .or_else(|| {
+                pred_view.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+            });
+        let score =
+            score_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
+        if let (Some(aa), Some(pred), Some(sc)) = (aa_str, pred_str, score) {
+            if let Some(aa_idx) = CompactPrediction::encode_amino_acid(aa) {
+                out.push(CompactPrediction {
+                    position: pos,
+                    amino_acid: aa_idx,
+                    prediction: CompactPrediction::encode_prediction(pred),
+                    score: sc,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Read SIFT or PolyPhen predictions from a
