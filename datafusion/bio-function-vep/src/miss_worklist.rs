@@ -7,8 +7,13 @@ use crate::annotate_provider::string_at;
 
 const COALESCE_GAP: i64 = 1_000_000;
 
+/// Maximum number of interval clauses before falling back to chrom-only filtering
+/// to avoid massive OR clauses that overflow DataFusion's parser/planner stack.
+const MAX_INTERVAL_CLAUSES: usize = 50;
+
 #[derive(Debug)]
 pub struct MissWorklist {
+    /// Bare chromosome names (without "chr" prefix), e.g. "1", "X", "MT".
     pub chroms: HashSet<String>,
     pub intervals: HashMap<String, Vec<(i64, i64)>>,
 }
@@ -51,7 +56,7 @@ impl MissWorklist {
         // If too many intervals, fall back to chrom-only filter to avoid
         // massive OR clauses that overflow DataFusion's parser/planner stack.
         let total_intervals: usize = self.intervals.values().map(|v| v.len()).sum();
-        if total_intervals > 50 {
+        if total_intervals > MAX_INTERVAL_CLAUSES {
             return self.chrom_filter_clause();
         }
         let mut clauses: Vec<String> = Vec::new();

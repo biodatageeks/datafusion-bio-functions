@@ -2218,30 +2218,6 @@ impl AnnotateProvider {
     /// Window size for sliding-window SIFT/PolyPhen loading (5MB).
     const SIFT_WINDOW_SIZE: i64 = 5_000_000;
 
-    /// Resolve the local file path for a registered parquet table.
-    async fn resolve_parquet_path(session: &SessionContext, table_name: &str) -> Option<String> {
-        use datafusion::catalog::TableProvider;
-        let provider = session.table_provider(table_name).await.ok()?;
-        // ListingTable stores the file URL; extract via debug string as a
-        // lightweight approach that avoids downcasting to a concrete type.
-        let debug = format!("{:?}", provider);
-        // Look for a file:// or absolute path pattern in the debug output.
-        // ListingTable debug contains: url=ListingTableUrl { ... path/to/file.parquet }
-        // Fall back to reconstructing from table name.
-        if let Some(start) = debug.find("url=") {
-            let rest = &debug[start + 4..];
-            if let Some(end) = rest.find(".parquet") {
-                let chunk = &rest[..end + 8]; // include ".parquet"
-                // Extract the path portion
-                if let Some(path_start) = chunk.rfind('/') {
-                    // Full path: find the actual file system path
-                    let _ = path_start; // we need the full path, not just filename
-                }
-            }
-        }
-        None // fall back to session.sql() path
-    }
-
     /// Try to build a direct parquet reader for sift windows, bypassing DataFusion SQL.
     /// Returns cached metadata + projection + RG ranges if the file path can be resolved.
     fn build_sift_direct_reader(path: &str) -> Option<SiftDirectReader> {
@@ -3109,10 +3085,10 @@ impl AnnotateProvider {
         }
         if profiling_enabled() {
             eprintln!(
-                "[VEP_PROFILE] 7a. sift_lazy_load_only...........................  {sift_load_ms:.1}ms"
+                "[VEP_PROFILE] 7a. sift_lazy_load_only...........................  {sift_load_ms}ms"
             );
             eprintln!(
-                "[VEP_PROFILE] 7b. annotate_batches_only.........................  {annotate_ms:.1}ms"
+                "[VEP_PROFILE] 7b. annotate_batches_only.........................  {annotate_ms}ms"
             );
         }
         profile_end!(
@@ -3885,15 +3861,6 @@ fn read_mirna_regions(batch: &RecordBatch, col_idx: usize, row: usize) -> Option
     Some(regions)
 }
 
-/// Transient prediction entry used only during parquet loading.
-/// Predictions are indexed into `SiftPolyphenCache` HashMap for O(1) lookup.
-struct ProteinPrediction {
-    position: i32,
-    amino_acid: String,
-    prediction: String,
-    score: f32,
-}
-
 /// Read predictions directly into CompactPrediction without intermediate String allocations.
 /// Reads `&str` from Arrow arrays and encodes amino acid/prediction as u8 in-place.
 fn read_compact_predictions(col: &dyn Array, row: usize) -> Vec<CompactPrediction> {
@@ -3953,100 +3920,6 @@ fn read_compact_predictions(col: &dyn Array, row: usize) -> Vec<CompactPredictio
                     score: sc,
                 });
             }
-        }
-    }
-    out
-}
-
-/// Read SIFT or PolyPhen predictions from a
-/// `List<Struct<position: Int32, amino_acid: Utf8, prediction: Utf8, score: Float32>>` column.
-fn read_protein_predictions(col: &dyn Array, row: usize) -> Vec<ProteinPrediction> {
-    if col.is_null(row) {
-        return Vec::new();
-    }
-    let Some(list_arr) = col.as_any().downcast_ref::<ListArray>() else {
-        return Vec::new();
-    };
-    let offsets = list_arr.offsets();
-    let start_off = offsets[row] as usize;
-    let end_off = offsets[row + 1] as usize;
-    if start_off == end_off {
-        return Vec::new();
-    }
-    let values = list_arr.values();
-    let struct_arr = values.as_struct();
-    let Some(positions) = struct_arr.column_by_name("position") else {
-        return Vec::new();
-    };
-    let Some(amino_acids) = struct_arr.column_by_name("amino_acid") else {
-        return Vec::new();
-    };
-    let Some(predictions) = struct_arr.column_by_name("prediction") else {
-        return Vec::new();
-    };
-    let Some(scores) = struct_arr.column_by_name("score") else {
-        return Vec::new();
-    };
-    let pos_arr = positions.as_any().downcast_ref::<Int32Array>();
-    let aa_arr = amino_acids
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .or_else(|| None);
-    let aa_view = amino_acids.as_any().downcast_ref::<StringViewArray>();
-    let pred_arr = predictions
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .or_else(|| None);
-    let pred_view = predictions.as_any().downcast_ref::<StringViewArray>();
-    let score_arr = scores.as_any().downcast_ref::<Float32Array>();
-
-    let mut out = Vec::with_capacity(end_off - start_off);
-    for i in start_off..end_off {
-        let position = pos_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
-        let amino_acid = aa_arr
-            .and_then(|a| {
-                if a.is_null(i) {
-                    None
-                } else {
-                    Some(a.value(i).to_string())
-                }
-            })
-            .or_else(|| {
-                aa_view.and_then(|a| {
-                    if a.is_null(i) {
-                        None
-                    } else {
-                        Some(a.value(i).to_string())
-                    }
-                })
-            });
-        let prediction = pred_arr
-            .and_then(|a| {
-                if a.is_null(i) {
-                    None
-                } else {
-                    Some(a.value(i).to_string())
-                }
-            })
-            .or_else(|| {
-                pred_view.and_then(|a| {
-                    if a.is_null(i) {
-                        None
-                    } else {
-                        Some(a.value(i).to_string())
-                    }
-                })
-            });
-        let score = score_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
-        if let (Some(pos), Some(aa), Some(pred), Some(sc)) =
-            (position, amino_acid, prediction, score)
-        {
-            out.push(ProteinPrediction {
-                position: pos,
-                amino_acid: aa,
-                prediction: pred,
-                score: sc,
-            });
         }
     }
     out
