@@ -47,31 +47,45 @@ term_set_accuracy=100.0%
 Perfect (0 mismatches): 80/80 fields
 ```
 
-## Timing Breakdown (VEP_PROFILE, --everything mode, 325K VCF rows)
+## Timing Breakdown (VEP_PROFILE, --everything mode, profile_annotation, 321K VCF rows)
 
 ```
-[VEP_PROFILE] 1. variation_lookup (scan+collect)................  38748.6ms
-[VEP_PROFILE] 2. collect_variant_intervals......................     98.0ms
-[VEP_PROFILE] 3. colocated_map_build............................    394.4ms  320539 entries
-[VEP_PROFILE] cache hits: 0, misses: 325785, hit rate: 0.0%
-[VEP_PROFILE] 4a. load_transcripts..............................    286.2ms  47849 transcripts
-[VEP_PROFILE] 4b. load_exons....................................     49.5ms  355800 exons
-[VEP_PROFILE] 4c. load_translations.............................     92.1ms  22832 translations
-[VEP_PROFILE] 4d. load_regulatory...............................      7.6ms  35815 features
-[VEP_PROFILE] 4e. load_motif....................................      1.2ms
+[VEP_PROFILE] 1. variation_lookup (scan+collect)................  39782.7ms  321713 VCF rows, 10840 batches
+[VEP_PROFILE] 2. collect_variant_intervals......................     82.3ms
+[VEP_PROFILE] 3. colocated_map_build............................    358.6ms  314926 entries
+[VEP_PROFILE] cache hits: 0, misses: 321713, hit rate: 0.0%
+[VEP_PROFILE] 4a. load_transcripts..............................    329.6ms  47849 transcripts
+[VEP_PROFILE] 4b. load_exons....................................     58.0ms  355800 exons
+[VEP_PROFILE] 4c. load_translations.............................    107.0ms  22832 translations
+[VEP_PROFILE] 4d. load_regulatory...............................     11.3ms  35815 features
+[VEP_PROFILE] 4e. load_motif....................................      1.1ms
 [VEP_PROFILE] 4f. load_mirna....................................      0.0ms
 [VEP_PROFILE] 4g. load_structural...............................      0.0ms
-[VEP_PROFILE] 4. context_tables_total...........................    439.6ms
-[VEP_PROFILE] 5a. hydrate_refseq_cds............................     19.1ms
-[VEP_PROFILE] 5b. hydrate_transcript_cdna.......................    946.4ms
-[VEP_PROFILE] 6. prepared_context_build.........................     22.2ms
+[VEP_PROFILE] 4. context_tables_total...........................    512.8ms
+[VEP_PROFILE] 5a. hydrate_refseq_cds............................     21.8ms  0 hydrated
+[VEP_PROFILE] 5b. hydrate_transcript_cdna.......................    785.2ms
+[VEP_PROFILE] 6. prepared_context_build.........................     24.3ms  1 tx_trees chroms
 [VEP_PROFILE] 7. sift_polyphen_cache_init.......................      0.0ms
-[VEP_PROFILE] 7a. sift_lazy_load_only...........................  35807.0ms
-[VEP_PROFILE] 7b. annotate_batches_only.........................   8789.0ms
-[VEP_PROFILE] 7+8. sift_lazy_load + annotate_batches............  49526.4ms  51 sift windows loaded
-[VEP_PROFILE] 9. projection + memtable..........................     55.8ms
-[VEP_PROFILE] TOTAL scan_with_transcript_engine.................  90312.6ms
-annotate_vep_elapsed_s=91.696
+[VEP_PROFILE] 7a. sift_lazy_load_only...........................  26111.0ms
+[VEP_PROFILE] 7b. annotate_batches_only.........................   8533.0ms
+[VEP_PROFILE] 7+8. sift_lazy_load + annotate_batches............  39566.1ms  10840 batches, 321713 total rows, 51 sift windows loaded
+[VEP_PROFILE] 9. projection + memtable..........................     31.0ms
+[VEP_PROFILE] TOTAL scan_with_transcript_engine.................  81219.6ms  321713 VCF rows
+Total time:   82274.6ms (82.27s)
+Throughput:   3910 variants/sec
+VCF output:   866.0ms
+```
+
+### profile_annotation invocation
+
+```bash
+VEP_PROFILE=1 cargo run -p datafusion-bio-function-vep --release --example profile_annotation -- \
+  vep-benchmark/data/HG002_chr1.vcf.gz \
+  /Users/mwiewior/research/data/vep/chr1-vep \
+  320000 \
+  --everything \
+  --reference-fasta-path=/Users/mwiewior/research/data/vep/Homo_sapiens.GRCh38.dna.primary_assembly.fa \
+  --output=/tmp/HG002_chr1_annotated.vcf
 ```
 
 ## Context Loading: Before vs After
@@ -92,19 +106,22 @@ The 13s savings comes from column projection on `load_translations`: the old `SE
 
 | Stage | Baseline (master, unsplit) | After (this PR, split cache) | Savings |
 |-------|------|-------|---------|
-| variation_lookup | 33.9s | 38.7s | (run-to-run variance) |
-| context_tables_total | 13.6s | **0.4s** | **-13.2s** |
-| sift_lazy_load | 48.0s | **35.8s** | **-12.2s** |
-| annotate_batches | 8.7s | 8.8s | — |
-| other (hydrate, context build, etc.) | 3.5s | 2.0s | -1.5s |
-| **TOTAL** | **107.7s** | **91.7s** | **-16.0s (-15%)** |
+| variation_lookup | 33.9s | 39.8s | (run-to-run variance) |
+| context_tables_total | 13.6s | **0.5s** | **-13.1s** |
+| sift_lazy_load | 48.0s | **26.1s** | **-21.9s** |
+| annotate_batches | 8.7s | 8.5s | — |
+| hydrate_transcript_cdna | 1.1s | 0.8s | -0.3s |
+| VCF sink | — | 0.9s | (new) |
+| other | 2.4s | 0.5s | -1.9s |
+| **TOTAL** | **107.7s** | **82.3s** | **-25.4s (-24%)** |
 
 Optimizations applied:
 1. **Column projection** on `load_translations`: skip 132 MB sift/polyphen data → 13.1s → 0.1s
-2. **Compact sift predictions**: replace `HashMap<(i32, String), (String, f32)>` with sorted `Vec<CompactPrediction>` using u8-encoded amino acids and prediction types. Eliminates ~256M String allocations → 48.0s → 35.8s
-3. **MissWorklist** with interval predicates for regulatory/motif/mirna/structural
-4. **Rust-side transcript_id filter** for exons and translations
-5. **Split translation layout** support (translation_core + translation_sift)
+2. **Compact sift predictions**: replace `HashMap<(i32, String), (String, f32)>` with sorted `Vec<CompactPrediction>` using u8-encoded amino acids and prediction types. Eliminates ~256M String allocations
+3. **Zero-copy Arrow parsing** for sift: read `&str` directly from Arrow buffers and encode to u8 in-place, bypassing intermediate `ProteinPrediction` structs with heap-allocated Strings. Combined with (2): 48.0s → 26.1s
+4. **MissWorklist** with interval predicates for regulatory/motif/mirna/structural
+5. **Rust-side transcript_id filter** for exons and translations
+6. **Split translation layout** support (translation_core + translation_sift)
 
 ## Cache Layout (chr1-vep)
 
