@@ -106,10 +106,12 @@ async fn main() -> Result<()> {
     register_vep_functions(&ctx);
 
     // Register VCF.
+    // None = include all INFO and FORMAT/sample fields from the VCF header.
+    // This ensures original VCF fields flow through the annotation pipeline.
     let vcf = VcfTableProvider::new(
         sampled_vcf.display().to_string(),
-        Some(vec![]),
-        Some(vec![]),
+        None,
+        None,
         None,
         false,
     )?;
@@ -343,16 +345,68 @@ fn write_vcf_output(
             .map_err(|e| DataFusionError::Execution(format!("cannot create {}: {e}", path.display())))?,
     );
 
+    let Some(first_batch) = batches.first() else {
+        return Ok(());
+    };
+    let schema = first_batch.schema();
+
+    // Identify column roles from the output schema.
+    let core_vcf = ["chrom", "start", "end", "id", "ref", "alt", "qual", "filter"];
+    let annotation_cols = [
+        "csq",
+        "most_severe_consequence",
+        "variation_name",
+        "clin_sig",
+        "clin_sig_allele",
+        "clinical_impact",
+        "phenotype_or_disease",
+        "pubmed",
+        "somatic",
+        "minor_allele",
+        "minor_allele_freq",
+    ];
+    // Frequency columns from the annotation cache.
+    let freq_prefixes = ["AF", "AFR", "AMR", "EAS", "EUR", "SAS", "gnomAD", "clinvar", "cosmic", "dbsnp", "MAX_AF"];
+
+    // Columns that are original VCF INFO fields (not core VCF, not annotation output).
+    let mut info_col_indices: Vec<(usize, String)> = Vec::new();
+    // FORMAT/sample columns (contain ':' separator in names like "HG002").
+    let format_sample_indices: Vec<(usize, String)> = Vec::new();
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let name = field.name().as_str();
+        if core_vcf.contains(&name) {
+            continue;
+        }
+        if annotation_cols.contains(&name) {
+            continue;
+        }
+        if freq_prefixes.iter().any(|p| name.starts_with(p)) {
+            continue;
+        }
+        // Heuristic: sample columns are typically short names without underscores
+        // that appear after all INFO/annotation columns. The VCF provider puts
+        // FORMAT fields as "sample:field" or just "sample" columns.
+        // For now, treat all remaining columns as INFO fields.
+        info_col_indices.push((idx, name.to_string()));
+    }
+
     // Write VCF header.
-    writeln!(file, "##fileformat=VCFv4.2")
-        .map_err(|e| DataFusionError::Execution(format!("write error: {e}")))?;
+    let wr = |e: std::io::Error| DataFusionError::Execution(format!("write error: {e}"));
+    writeln!(file, "##fileformat=VCFv4.2").map_err(wr)?;
     writeln!(
         file,
         "##INFO=<ID=CSQ,Number=.,Type=String,Description=\"Consequence annotations from annotate_vep\">"
     )
-    .map_err(|e| DataFusionError::Execution(format!("write error: {e}")))?;
-    writeln!(file, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO")
-        .map_err(|e| DataFusionError::Execution(format!("write error: {e}")))?;
+    .map_err(wr)?;
+    write!(file, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").map_err(wr)?;
+    if !format_sample_indices.is_empty() {
+        write!(file, "\tFORMAT").map_err(wr)?;
+        for (_, name) in &format_sample_indices {
+            write!(file, "\t{name}").map_err(wr)?;
+        }
+    }
+    writeln!(file).map_err(wr)?;
 
     for batch in batches {
         let schema = batch.schema();
@@ -364,7 +418,6 @@ fn write_vcf_output(
         let qual_idx = schema.index_of("qual").ok();
         let filter_idx = schema.index_of("filter").ok();
         let csq_idx = schema.index_of("csq").ok();
-        let most_idx = schema.index_of("most_severe_consequence").ok();
 
         for row in 0..batch.num_rows() {
             let chrom = chrom_idx
@@ -375,6 +428,7 @@ fn write_vcf_output(
                 .unwrap_or(0);
             let id = id_idx
                 .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| ".".to_string());
             let ref_al = ref_idx
                 .and_then(|i| string_at(batch.column(i).as_ref(), row))
@@ -384,28 +438,40 @@ fn write_vcf_output(
                 .unwrap_or_default();
             let qual = qual_idx
                 .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| ".".to_string());
             let filter = filter_idx
                 .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| ".".to_string());
             let csq = csq_idx
                 .and_then(|i| string_at(batch.column(i).as_ref(), row))
                 .unwrap_or_default();
-            let _most = most_idx
-                .and_then(|i| string_at(batch.column(i).as_ref(), row))
-                .unwrap_or_default();
 
-            let info = if csq.is_empty() {
+            // Build INFO field: original INFO fields + CSQ.
+            let mut info_parts: Vec<String> = Vec::new();
+            for (idx, name) in &info_col_indices {
+                if let Some(val) = string_at(batch.column(*idx).as_ref(), row) {
+                    if !val.is_empty() {
+                        info_parts.push(format!("{name}={val}"));
+                    }
+                }
+            }
+            if !csq.is_empty() {
+                info_parts.push(format!("CSQ={csq}"));
+            }
+            let info = if info_parts.is_empty() {
                 ".".to_string()
             } else {
-                format!("CSQ={csq}")
+                info_parts.join(";")
             };
 
-            writeln!(
+            write!(
                 file,
                 "{chrom}\t{pos}\t{id}\t{ref_al}\t{alt_al}\t{qual}\t{filter}\t{info}"
             )
-            .map_err(|e| DataFusionError::Execution(format!("write error: {e}")))?;
+            .map_err(wr)?;
+            writeln!(file).map_err(wr)?;
         }
     }
 
