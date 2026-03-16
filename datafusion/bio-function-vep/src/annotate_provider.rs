@@ -357,6 +357,101 @@ const AF_COLUMNS: &[AfColumn] = &[
 ///
 /// Traceability:
 /// - Ensembl VEP `Config.pm` `--everything` expansion
+/// Cached parquet metadata for direct sift/polyphen window reads, bypassing DataFusion SQL.
+struct SiftDirectReader {
+    path: String,
+    arrow_meta: parquet::arrow::arrow_reader::ArrowReaderMetadata,
+    projection: parquet::arrow::ProjectionMask,
+    rg_ranges: Vec<(i64, i64)>,
+}
+
+impl SiftDirectReader {
+    /// Read a single genomic window directly from parquet, skipping DataFusion SQL planning.
+    fn load_window(
+        &self,
+        chrom: &str,
+        win_start: i64,
+        win_end: i64,
+        cache: &mut SiftPolyphenCache,
+    ) -> Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let matching_rgs: Vec<usize> = self
+            .rg_ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, e))| *s <= win_end && *e >= win_start)
+            .map(|(i, _)| i)
+            .collect();
+
+        if matching_rgs.is_empty() {
+            return Ok(());
+        }
+
+        let file = std::fs::File::open(&self.path).map_err(|e| {
+            DataFusionError::Execution(format!("failed to open sift file '{}': {e}", self.path))
+        })?;
+        let reader =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.arrow_meta.clone())
+                .with_projection(self.projection.clone())
+                .with_row_groups(matching_rgs)
+                .build()
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("failed to build sift reader: {e}"))
+                })?;
+
+        let chrom_norm = chrom.strip_prefix("chr").unwrap_or(chrom);
+
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| {
+                DataFusionError::Execution(format!("sift batch read error: {e}"))
+            })?;
+            let schema = batch.schema();
+            let tx_idx = schema
+                .index_of("transcript_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .ok();
+            let end_col_idx = schema.index_of("end").ok();
+            let chrom_col_idx = schema.index_of("chrom").ok();
+            let sift_col_idx = schema.index_of("sift_predictions").ok();
+            let pp_col_idx = schema.index_of("polyphen_predictions").ok();
+
+            let Some(tx_idx) = tx_idx else { continue };
+
+            for row in 0..batch.num_rows() {
+                // Filter by chromosome (the file may contain multiple chroms).
+                if let Some(ci) = chrom_col_idx {
+                    if let Some(row_chrom) = string_at(batch.column(ci).as_ref(), row) {
+                        let row_norm = row_chrom.strip_prefix("chr").unwrap_or(&row_chrom);
+                        if row_norm != chrom_norm {
+                            continue;
+                        }
+                    }
+                }
+                let Some(tx_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                    continue;
+                };
+                if cache.get(&tx_id).is_some() {
+                    continue;
+                }
+                let genomic_end = end_col_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(i64::MAX);
+                let mut preds = CachedPredictions::default();
+                if let Some(idx) = sift_col_idx {
+                    preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+                if let Some(idx) = pp_col_idx {
+                    preds.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+                preds.sort();
+                cache.insert(tx_id, preds, genomic_end);
+            }
+        }
+        Ok(())
+    }
+}
+
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L346-L374>
 #[derive(Debug, Clone)]
 struct VepFlags {
@@ -2124,6 +2219,96 @@ impl AnnotateProvider {
     /// Window size for sliding-window SIFT/PolyPhen loading (5MB).
     const SIFT_WINDOW_SIZE: i64 = 5_000_000;
 
+    /// Resolve the local file path for a registered parquet table.
+    async fn resolve_parquet_path(session: &SessionContext, table_name: &str) -> Option<String> {
+        use datafusion::catalog::TableProvider;
+        let provider = session.table_provider(table_name).await.ok()?;
+        // ListingTable stores the file URL; extract via debug string as a
+        // lightweight approach that avoids downcasting to a concrete type.
+        let debug = format!("{:?}", provider);
+        // Look for a file:// or absolute path pattern in the debug output.
+        // ListingTable debug contains: url=ListingTableUrl { ... path/to/file.parquet }
+        // Fall back to reconstructing from table name.
+        if let Some(start) = debug.find("url=") {
+            let rest = &debug[start + 4..];
+            if let Some(end) = rest.find(".parquet") {
+                let chunk = &rest[..end + 8]; // include ".parquet"
+                // Extract the path portion
+                if let Some(path_start) = chunk.rfind('/') {
+                    // Full path: find the actual file system path
+                    let _ = path_start; // we need the full path, not just filename
+                }
+            }
+        }
+        None // fall back to session.sql() path
+    }
+
+    /// Try to build a direct parquet reader for sift windows, bypassing DataFusion SQL.
+    /// Returns cached metadata + projection + RG ranges if the file path can be resolved.
+    fn build_sift_direct_reader(
+        path: &str,
+    ) -> Option<SiftDirectReader> {
+        use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+        use parquet::arrow::ProjectionMask;
+        use parquet::file::statistics::Statistics;
+
+        let file = std::fs::File::open(path).ok()?;
+        let arrow_meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default()).ok()?;
+        let parquet_schema = arrow_meta.metadata().file_metadata().schema_descr_ptr();
+
+        // Find root column indices for projection
+        let arrow_schema = arrow_meta.schema();
+        let fields = arrow_schema.fields();
+        let find_idx = |name: &str| fields.iter().position(|f| f.name() == name);
+
+        let tid_root = find_idx("transcript_id")?;
+        let end_root = find_idx("end")?;
+        let sift_root = find_idx("sift_predictions")?;
+        let poly_root = find_idx("polyphen_predictions")?;
+        let chrom_root = find_idx("chrom");
+
+        let mut proj_indices = vec![tid_root, end_root, sift_root, poly_root];
+        if let Some(ci) = chrom_root {
+            proj_indices.push(ci);
+        }
+        let projection = ProjectionMask::roots(&parquet_schema, proj_indices);
+
+        // Pre-compute RG position ranges from column statistics
+        let num_rgs = arrow_meta.metadata().num_row_groups();
+        // Find physical column index for "start" and "end"
+        let leaf_cols = parquet_schema.columns();
+        let start_leaf = leaf_cols.iter().position(|c| c.name() == "start");
+        let end_leaf = leaf_cols.iter().position(|c| c.name() == "end");
+
+        let rg_ranges: Vec<(i64, i64)> = (0..num_rgs)
+            .map(|i| {
+                let rg = arrow_meta.metadata().row_group(i);
+                let min_start = start_leaf
+                    .and_then(|idx| rg.column(idx).statistics())
+                    .and_then(|s| match s {
+                        Statistics::Int64(v) => v.min_opt().copied(),
+                        _ => None,
+                    })
+                    .unwrap_or(i64::MIN);
+                let max_end = end_leaf
+                    .and_then(|idx| rg.column(idx).statistics())
+                    .and_then(|s| match s {
+                        Statistics::Int64(v) => v.max_opt().copied(),
+                        _ => None,
+                    })
+                    .unwrap_or(i64::MAX);
+                (min_start, max_end)
+            })
+            .collect();
+
+        Some(SiftDirectReader {
+            path: path.to_string(),
+            arrow_meta,
+            projection,
+            rg_ranges,
+        })
+    }
+
     /// Load SIFT/PolyPhen predictions for a single genomic window into the cache.
     ///
     /// Queries translations whose CDS overlaps the window `[win_start, win_end)`:
@@ -2815,6 +3000,28 @@ impl AnnotateProvider {
             .or_else(|| translations_table.map(|s| s.to_string()));
         let sift_enabled = flags.everything && sift_table_name.is_some();
         let mut loaded_windows: HashSet<(String, i64)> = HashSet::new();
+        // Try to build a direct parquet reader for sift, bypassing DataFusion SQL.
+        let sift_direct: Option<SiftDirectReader> = if sift_enabled {
+            let table_name = sift_table_name.as_deref().unwrap();
+            // Resolve file path: try cache_source parent dir + table_name.parquet
+            let cache_dir = std::path::Path::new(&self.cache_source)
+                .parent()
+                .map(|p| p.to_path_buf());
+            cache_dir
+                .and_then(|dir| {
+                    let path = dir.join(format!("{table_name}.parquet"));
+                    if path.exists() {
+                        Self::build_sift_direct_reader(path.to_str()?)
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        };
+        if profiling_enabled() && sift_direct.is_some() {
+            eprintln!("[VEP_PROFILE] sift_direct_reader: enabled (bypassing DataFusion SQL)");
+        }
         profile_end!("7. sift_polyphen_cache_init", t_sift);
 
         let t_annotate = profile_start!();
@@ -2863,14 +3070,23 @@ impl AnnotateProvider {
                         while ws <= window_start + Self::SIFT_WINDOW_SIZE {
                             let key = (chrom.clone(), ws);
                             if !loaded_windows.contains(&key) {
-                                self.load_sift_window(
-                                    table,
-                                    chrom,
-                                    ws,
-                                    ws + Self::SIFT_WINDOW_SIZE,
-                                    &mut sift_cache,
-                                )
-                                .await?;
+                                if let Some(ref direct) = sift_direct {
+                                    direct.load_window(
+                                        chrom,
+                                        ws,
+                                        ws + Self::SIFT_WINDOW_SIZE,
+                                        &mut sift_cache,
+                                    )?;
+                                } else {
+                                    self.load_sift_window(
+                                        table,
+                                        chrom,
+                                        ws,
+                                        ws + Self::SIFT_WINDOW_SIZE,
+                                        &mut sift_cache,
+                                    )
+                                    .await?;
+                                }
                                 loaded_windows.insert(key);
                             }
                             ws += Self::SIFT_WINDOW_SIZE;

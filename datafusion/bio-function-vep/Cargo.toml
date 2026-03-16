@@ -25,13 +25,13 @@ coitrees = "0.4.0"
 serde_json = "1"
 noodles-core = "0.16"
 noodles-fasta = "0.49"
+parquet = { version = "56", features = ["arrow"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "45562f3beb230c23008b19bfe6c172bd1c5923fa" }
 env_logger = "0.11"
 tempfile = "3"
-parquet = { version = "56", features = ["arrow"] }
 
 [[example]]
 name = "vcf_batch_stats"
