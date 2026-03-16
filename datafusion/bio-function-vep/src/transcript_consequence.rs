@@ -244,11 +244,6 @@ impl CompactPrediction {
         }
     }
 
-    /// Decode amino acid index back to a single char.
-    pub fn decode_amino_acid(idx: u8) -> String {
-        String::from((b'A' + idx) as char)
-    }
-
     /// Encode prediction string to u8 index.
     pub fn encode_prediction(pred: &str) -> u8 {
         match pred {

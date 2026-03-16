@@ -341,7 +341,14 @@ fn write_vcf_output(
         DataFusionError::Execution(format!("cannot create {}: {e}", path.display()))
     })?);
 
+    let wr = |e: std::io::Error| DataFusionError::Execution(format!("write error: {e}"));
+
     let Some(first_batch) = batches.first() else {
+        // Write a minimal valid VCF header even for empty results.
+        writeln!(file, "##fileformat=VCFv4.2").map_err(wr)?;
+        writeln!(file, "##INFO=<ID=CSQ,Number=.,Type=String,Description=\"Consequence annotations from annotate_vep\">").map_err(wr)?;
+        writeln!(file, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").map_err(wr)?;
+        file.flush().map_err(wr)?;
         return Ok(());
     };
     let schema = first_batch.schema();
@@ -407,7 +414,6 @@ fn write_vcf_output(
     }
 
     // Write VCF header.
-    let wr = |e: std::io::Error| DataFusionError::Execution(format!("write error: {e}"));
     writeln!(file, "##fileformat=VCFv4.2").map_err(wr)?;
     writeln!(
         file,

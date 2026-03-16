@@ -1667,24 +1667,6 @@ impl AnnotateProvider {
         Ok(None)
     }
 
-    fn chrom_filter_clause(chroms: &HashSet<String>) -> String {
-        if chroms.is_empty() {
-            return String::new();
-        }
-        let mut expanded: HashSet<String> = HashSet::new();
-        for c in chroms {
-            let escaped = c.replace('\'', "''");
-            expanded.insert(escaped.clone());
-            if let Some(bare) = escaped.strip_prefix("chr") {
-                expanded.insert(bare.to_string());
-            } else {
-                expanded.insert(format!("chr{escaped}"));
-            }
-        }
-        let literals: Vec<String> = expanded.iter().map(|c| format!("'{c}'")).collect();
-        format!(" WHERE chrom IN ({})", literals.join(", "))
-    }
-
     async fn projected_columns_for_table(
         session: &SessionContext,
         table: &str,
