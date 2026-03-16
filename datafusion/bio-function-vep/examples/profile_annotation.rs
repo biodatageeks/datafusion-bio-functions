@@ -29,6 +29,7 @@ use std::time::Instant;
 
 use datafusion::arrow::array::Array;
 use datafusion::common::{DataFusionError, Result};
+use datafusion::datasource::TableProvider;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::golden_benchmark::sample_gz_vcf_first_n;
@@ -115,6 +116,8 @@ async fn main() -> Result<()> {
         None,
         false,
     )?;
+    // Capture VCF field metadata before registration (metadata is lost through the pipeline).
+    let vcf_schema = vcf.schema();
     ctx.register_table("sampled_vcf", Arc::new(vcf))?;
 
     // Register cache parquet tables.
@@ -243,7 +246,7 @@ async fn main() -> Result<()> {
     // Write output VCF if --output=<path> was specified.
     if let Some(output_path) = &output_vcf {
         let t_write = Instant::now();
-        write_vcf_output(&batches, output_path)?;
+        write_vcf_output(&batches, output_path, &vcf_schema)?;
         let write_ms = t_write.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
             "VCF output:   {} ({:.1}ms)",
@@ -337,6 +340,7 @@ fn int64_at(array: &dyn Array, row: usize) -> Option<i64> {
 fn write_vcf_output(
     batches: &[datafusion::arrow::array::RecordBatch],
     path: &Path,
+    vcf_input_schema: &datafusion::arrow::datatypes::SchemaRef,
 ) -> Result<()> {
     use std::io::BufWriter;
 
@@ -350,45 +354,62 @@ fn write_vcf_output(
     };
     let schema = first_batch.schema();
 
-    // Identify column roles from the output schema.
+    // Classify columns using VCF field metadata from the ORIGINAL VCF input schema.
+    // The annotation pipeline output loses metadata, so we look up each column name
+    // in the input schema to find its "bio.vcf.field.field_type" = "INFO" or "FORMAT".
     let core_vcf = ["chrom", "start", "end", "id", "ref", "alt", "qual", "filter"];
-    let annotation_cols = [
-        "csq",
-        "most_severe_consequence",
-        "variation_name",
-        "clin_sig",
-        "clin_sig_allele",
-        "clinical_impact",
-        "phenotype_or_disease",
-        "pubmed",
-        "somatic",
-        "minor_allele",
-        "minor_allele_freq",
-    ];
-    // Frequency columns from the annotation cache.
-    let freq_prefixes = ["AF", "AFR", "AMR", "EAS", "EUR", "SAS", "gnomAD", "clinvar", "cosmic", "dbsnp", "MAX_AF"];
-
-    // Columns that are original VCF INFO fields (not core VCF, not annotation output).
     let mut info_col_indices: Vec<(usize, String)> = Vec::new();
-    // FORMAT/sample columns (contain ':' separator in names like "HG002").
-    let format_sample_indices: Vec<(usize, String)> = Vec::new();
+    let mut format_col_indices: Vec<(usize, String)> = Vec::new();
+    let mut sample_names: Vec<String> = Vec::new();
+
+    // Build a lookup from the VCF input schema.
+    let vcf_field_types: std::collections::HashMap<&str, &str> = vcf_input_schema
+        .fields()
+        .iter()
+        .filter_map(|f| {
+            f.metadata()
+                .get("bio.vcf.field.field_type")
+                .map(|ft| (f.name().as_str(), ft.as_str()))
+        })
+        .collect();
 
     for (idx, field) in schema.fields().iter().enumerate() {
         let name = field.name().as_str();
         if core_vcf.contains(&name) {
             continue;
         }
-        if annotation_cols.contains(&name) {
-            continue;
+        match vcf_field_types.get(name).copied() {
+            Some("INFO") => {
+                info_col_indices.push((idx, name.to_string()));
+            }
+            Some("FORMAT") => {
+                let format_id = vcf_input_schema
+                    .field_with_name(name)
+                    .ok()
+                    .and_then(|f| f.metadata().get("bio.vcf.field.format_id").cloned())
+                    .unwrap_or_else(|| name.to_string());
+                let sample = if name.ends_with(&format_id) && name.len() > format_id.len() {
+                    name[..name.len() - format_id.len() - 1].to_string()
+                } else {
+                    String::new()
+                };
+                if !sample.is_empty() && !sample_names.contains(&sample) {
+                    sample_names.push(sample);
+                }
+                format_col_indices.push((idx, name.to_string()));
+            }
+            _ => {}
         }
-        if freq_prefixes.iter().any(|p| name.starts_with(p)) {
-            continue;
+    }
+    if sample_names.is_empty() && !format_col_indices.is_empty() {
+        if let Some(samples_json) = vcf_input_schema.metadata().get("bio.vcf.samples") {
+            if let Ok(names) = serde_json::from_str::<Vec<String>>(samples_json) {
+                sample_names = names;
+            }
         }
-        // Heuristic: sample columns are typically short names without underscores
-        // that appear after all INFO/annotation columns. The VCF provider puts
-        // FORMAT fields as "sample:field" or just "sample" columns.
-        // For now, treat all remaining columns as INFO fields.
-        info_col_indices.push((idx, name.to_string()));
+        if sample_names.is_empty() {
+            sample_names.push("SAMPLE".to_string());
+        }
     }
 
     // Write VCF header.
@@ -400,13 +421,31 @@ fn write_vcf_output(
     )
     .map_err(wr)?;
     write!(file, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").map_err(wr)?;
-    if !format_sample_indices.is_empty() {
+    if !format_col_indices.is_empty() {
         write!(file, "\tFORMAT").map_err(wr)?;
-        for (_, name) in &format_sample_indices {
+        for name in &sample_names {
             write!(file, "\t{name}").map_err(wr)?;
         }
     }
     writeln!(file).map_err(wr)?;
+
+    // Pre-compute FORMAT tag order for each sample.
+    // For single-sample: format tags are just column names (GT, GQ, DP, ...).
+    // For multi-sample: extract tag from "sampleName_tag" pattern.
+    let format_tags: Vec<String> = if sample_names.len() <= 1 {
+        format_col_indices.iter().map(|(_, name)| name.clone()).collect()
+    } else {
+        // Deduplicate tags from "{sample}_{tag}" column names.
+        let mut tags = Vec::new();
+        for (_, name) in &format_col_indices {
+            if let Some(tag) = name.split('_').last() {
+                if !tags.contains(&tag.to_string()) {
+                    tags.push(tag.to_string());
+                }
+            }
+        }
+        tags
+    };
 
     for batch in batches {
         let schema = batch.schema();
@@ -471,6 +510,29 @@ fn write_vcf_output(
                 "{chrom}\t{pos}\t{id}\t{ref_al}\t{alt_al}\t{qual}\t{filter}\t{info}"
             )
             .map_err(wr)?;
+
+            // Write FORMAT and sample columns.
+            if !format_col_indices.is_empty() {
+                write!(file, "\t{}", format_tags.join(":")).map_err(wr)?;
+                for sample in &sample_names {
+                    let mut sample_values: Vec<String> = Vec::new();
+                    for tag in &format_tags {
+                        // Column name: "tag" (single sample) or "sample_tag" (multi sample)
+                        let col_name = if sample_names.len() <= 1 {
+                            tag.clone()
+                        } else {
+                            format!("{sample}_{tag}")
+                        };
+                        let val = schema
+                            .index_of(&col_name)
+                            .ok()
+                            .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                            .unwrap_or_else(|| ".".to_string());
+                        sample_values.push(val);
+                    }
+                    write!(file, "\t{}", sample_values.join(":")).map_err(wr)?;
+                }
+            }
             writeln!(file).map_err(wr)?;
         }
     }
