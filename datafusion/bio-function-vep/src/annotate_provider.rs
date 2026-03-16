@@ -2151,7 +2151,6 @@ impl AnnotateProvider {
         win_start: i64,
         win_end: i64,
         cache: &mut SiftPolyphenCache,
-        restrict_to: Option<&HashSet<String>>,
     ) -> Result<()> {
         let escaped_chrom = Self::escaped_sql_literal(chrom);
         let query = format!(
@@ -2181,12 +2180,6 @@ impl AnnotateProvider {
                 // Skip if already cached (window overlap with previous window).
                 if cache.get(&tx_id).is_some() {
                     continue;
-                }
-                // Skip transcripts not in the needed set (e.g., non-coding).
-                if let Some(ids) = restrict_to {
-                    if !ids.contains(&tx_id) {
-                        continue;
-                    }
                 }
                 let genomic_end = end_col_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
@@ -2756,12 +2749,6 @@ impl AnnotateProvider {
         };
         profile_end!("4. context_tables_total", t_ctx_load);
 
-        // Collect translation transcript_ids for sift loading filter.
-        let translation_tx_ids: HashSet<String> = translations
-            .iter()
-            .map(|t| t.transcript_id.clone())
-            .collect();
-
         let t_hydrate = profile_start!();
         let hydrated_transcript_ids = if let Some(reader) = hgvs_reference_reader.as_mut() {
             hydrate_refseq_translation_cds_from_reference(
@@ -2843,13 +2830,10 @@ impl AnnotateProvider {
         profile_end!("7. sift_polyphen_cache_init", t_sift);
 
         let t_annotate = profile_start!();
-        let mut sift_load_ms = 0u128;
-        let mut annotate_ms = 0u128;
         let mut annotated_batches = Vec::with_capacity(base_batches.len());
         for batch in &base_batches {
             // Lazily load SIFT/PolyPhen windows as the batch loop advances.
             if sift_enabled {
-                let t_sift_win = std::time::Instant::now();
                 let table = sift_table_name.as_deref().unwrap();
                 let schema = batch.schema();
                 if let (Ok(ci), Ok(si), Ok(ei)) = (
@@ -2894,7 +2878,6 @@ impl AnnotateProvider {
                                     ws,
                                     ws + Self::SIFT_WINDOW_SIZE,
                                     &mut sift_cache,
-                                    Some(&translation_tx_ids),
                                 )
                                 .await?;
                                 loaded_windows.insert(key);
@@ -2908,10 +2891,8 @@ impl AnnotateProvider {
                         sift_cache.evict_before(*batch_min);
                     }
                 }
-                sift_load_ms += t_sift_win.elapsed().as_millis();
             }
 
-            let t_ann = std::time::Instant::now();
             annotated_batches.push(self.annotate_batch_with_transcript_engine(
                 batch,
                 &engine,
@@ -2919,15 +2900,6 @@ impl AnnotateProvider {
                 &colocated_map,
                 &sift_cache,
             )?);
-            annotate_ms += t_ann.elapsed().as_millis();
-        }
-        if profiling_enabled() {
-            eprintln!(
-                "[VEP_PROFILE] 7a. sift_lazy_load_only...........................  {sift_load_ms:.1}ms"
-            );
-            eprintln!(
-                "[VEP_PROFILE] 7b. annotate_batches_only.........................  {annotate_ms:.1}ms"
-            );
         }
         profile_end!(
             "7+8. sift_lazy_load + annotate_batches",
