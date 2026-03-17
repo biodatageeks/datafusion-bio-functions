@@ -713,6 +713,15 @@ impl KvLookupStream {
                         .and_then(output_allele_from_allele_string)
                         .map(str::to_string);
 
+                    // Visibility filter: mirrors VEP's Tabix query window.
+                    // Only cache variants with START in [compare_start-1, compare_end+1]
+                    // are visible, matching existing_start_is_visible_to_input_row().
+                    let vis_start = (active_compare_start - 1).min(active_compare_end + 1);
+                    let vis_end = (active_compare_start - 1).max(active_compare_end + 1);
+                    if *probe_start < vis_start || *probe_start > vis_end {
+                        continue;
+                    }
+
                     // Iterate alleles at this position for colocated collection.
                     for allele_idx in 0..reader.num_alleles() {
                         let var_name = reader.read_string_value(ci.variation_name, allele_idx);
