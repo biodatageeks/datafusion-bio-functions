@@ -33,8 +33,8 @@ use crate::allele::{
 };
 use crate::variant_lookup_exec::{
     AF_COL_NAMES, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
-    build_shifted_compare_state, compare_existing_variant_alleles, output_allele_from_allele_string,
-    read_reference_sequence,
+    build_shifted_compare_state, compare_existing_variant_alleles,
+    output_allele_from_allele_string, read_reference_sequence,
 };
 
 /// Lookup match mode.
@@ -62,6 +62,8 @@ pub struct KvLookupExec {
     /// shifted deletions, tandem repeat window). When false, probe only
     /// the exact normalized interval.
     extended_probes: bool,
+    /// Maximum allowed `failed` flag value from the cache.
+    allowed_failed: i64,
     properties: PlanProperties,
     /// Cache schema column positions for requested cache output columns.
     output_col_positions: Vec<usize>,
@@ -84,6 +86,7 @@ impl KvLookupExec {
         vcf_zero_based: bool,
         cache_zero_based: bool,
         extended_probes: bool,
+        allowed_failed: i64,
     ) -> Result<Self> {
         let input_schema = input.schema();
         let cache_schema = store.schema();
@@ -122,6 +125,7 @@ impl KvLookupExec {
             vcf_zero_based,
             cache_zero_based,
             extended_probes,
+            allowed_failed,
             properties,
             output_col_positions,
             colocated_sink: None,
@@ -198,6 +202,7 @@ impl ExecutionPlan for KvLookupExec {
             self.vcf_zero_based,
             self.cache_zero_based,
             self.extended_probes,
+            self.allowed_failed,
         )?;
         if let Some(sink) = &self.colocated_sink {
             exec = exec.with_colocated_sink(Arc::clone(sink));
@@ -224,6 +229,7 @@ impl ExecutionPlan for KvLookupExec {
             self.vcf_zero_based,
             self.cache_zero_based,
             self.extended_probes,
+            self.allowed_failed,
             self.output_col_positions.clone(),
             self.colocated_sink.clone(),
             self.reference_fasta_path.clone(),
@@ -243,12 +249,14 @@ struct KvLookupStream {
     vcf_zero_based: bool,
     cache_zero_based: bool,
     extended_probes: bool,
+    allowed_failed: i64,
     output_col_positions: Vec<usize>,
     colocated_sink: Option<ColocatedSink>,
     /// Cached column indices for co-located collection in the KV entry.
     coloc_col_indices: Option<KvColocIndices>,
     /// Optional indexed reference FASTA reader for genomic shift state.
-    reference_reader: Option<noodles_fasta::IndexedReader<noodles_fasta::io::BufReader<std::fs::File>>>,
+    reference_reader:
+        Option<noodles_fasta::IndexedReader<noodles_fasta::io::BufReader<std::fs::File>>>,
     profile_enabled: bool,
     profile_emitted: bool,
     profile: LookupProfile,
@@ -259,6 +267,7 @@ struct KvColocIndices {
     variation_name: usize,
     _allele_string_col: usize,
     end_col: Option<usize>,
+    failed: Option<usize>,
     somatic: Option<usize>,
     pheno: Option<usize>,
     clin_sig: Option<usize>,
@@ -386,6 +395,7 @@ impl KvLookupStream {
         vcf_zero_based: bool,
         cache_zero_based: bool,
         extended_probes: bool,
+        allowed_failed: i64,
         output_col_positions: Vec<usize>,
         colocated_sink: Option<ColocatedSink>,
         reference_fasta_path: Option<String>,
@@ -401,7 +411,9 @@ impl KvLookupStream {
             reference_fasta_path.as_deref().and_then(|path| {
                 open_indexed_fasta(path)
                     .map_err(|e| {
-                        eprintln!("[KvLookupStream] warning: failed to open reference FASTA {path}: {e}");
+                        eprintln!(
+                            "[KvLookupStream] warning: failed to open reference FASTA {path}: {e}"
+                        );
                         e
                     })
                     .ok()
@@ -421,6 +433,7 @@ impl KvLookupStream {
             vcf_zero_based,
             cache_zero_based,
             extended_probes,
+            allowed_failed,
             output_col_positions,
             colocated_sink,
             coloc_col_indices,
@@ -505,6 +518,10 @@ impl KvLookupStream {
             .index_of("end")
             .ok()
             .and_then(|schema_idx| stored_cols.iter().position(|&c| c == schema_idx));
+        let failed_stored_col_idx: Option<usize> = cache_schema
+            .index_of("failed")
+            .ok()
+            .and_then(|schema_idx| stored_cols.iter().position(|&c| c == schema_idx));
 
         let col_map: Vec<usize> = self
             .output_col_positions
@@ -558,63 +575,13 @@ impl KvLookupStream {
             // Probe a small set of start positions used by VEP-style caches.
             // All variants at a given (chrom, start) are in one entry, so we
             // only need to probe distinct start values.
-            let mut probe_starts: Vec<i64> = Vec::with_capacity(4);
-            probe_starts.push(norm_start_i64);
-            if self.extended_probes {
-                if norm_start == norm_end {
-                    let shifted = i64::from(norm_start.saturating_add(1));
-                    if !probe_starts.contains(&shifted) {
-                        probe_starts.push(shifted);
-                    }
-                } else {
-                    if !probe_starts.contains(&norm_end_i64) {
-                        probe_starts.push(norm_end_i64);
-                    }
-                }
-                // Probe prefix-trimmed coordinates used by VEP allele normalization
-                // (e.g. REF=TTA ALT=T -> cache allele TA/- at shifted start).
-                for alt in vcf_alt.split(['|', ',']).filter(|a| !a.is_empty()) {
-                    let shift_usize = common_prefix_len(vcf_ref, alt);
-                    if shift_usize == 0 {
-                        continue;
-                    }
-                    let shift = shift_usize as i64;
-                    if let Some(shifted_start) = norm_start_i64.checked_add(shift) {
-                        if !probe_starts.contains(&shifted_start) {
-                            probe_starts.push(shifted_start);
-                        }
-                    }
-                }
-                // Deletions in tandem repeats may be right/left shifted in cache coordinates.
-                // Probe a bounded window of equivalent deletion start positions.
-                for alt in vcf_alt.split(['|', ',']).filter(|a| !a.is_empty()) {
-                    let (ref_event_len, alt_event_len) = canonical_event_lengths(vcf_ref, alt);
-                    if ref_event_len == 0 || alt_event_len != 0 {
-                        continue;
-                    }
-                    let del_len = ref_event_len as i64;
-                    let max_shift = del_len.min(32);
-                    for base_start in [norm_start_i64, norm_start_i64.saturating_sub(1)] {
-                        for shift in 0..=max_shift {
-                            let Some(candidate_start) = base_start.checked_add(shift) else {
-                                continue;
-                            };
-                            let Some(candidate_end) = candidate_start.checked_add(del_len - 1)
-                            else {
-                                continue;
-                            };
-                            // Mirror SQL interval semantics: only consider intervals overlapping
-                            // the normalized VCF interval.
-                            if candidate_start > norm_end_i64 || candidate_end < norm_start_i64 {
-                                continue;
-                            }
-                            if !probe_starts.contains(&candidate_start) {
-                                probe_starts.push(candidate_start);
-                            }
-                        }
-                    }
-                }
-            }
+            let probe_starts = build_probe_starts(
+                norm_start_i64,
+                norm_end_i64,
+                vcf_ref,
+                vcf_alt,
+                self.extended_probes,
+            );
 
             let mut emitted_match = false;
             for probe_start in &probe_starts {
@@ -635,7 +602,25 @@ impl KvLookupStream {
                 // must overlap the VCF variant's interval. This prevents matching
                 // alleles at the same start position but with non-overlapping end.
                 matched_allele_rows.clear();
+                let vcf_iv_start = norm_start_i64.min(norm_end_i64);
+                let vcf_iv_end = norm_start_i64.max(norm_end_i64);
                 for allele_idx in 0..reader.num_alleles() {
+                    let failed = failed_stored_col_idx
+                        .and_then(|idx| reader.read_i64_value(idx, allele_idx))
+                        .unwrap_or(0);
+                    if failed > self.allowed_failed {
+                        continue;
+                    }
+
+                    let existing_end = end_stored_col_idx
+                        .and_then(|idx| reader.read_i64_value(idx, allele_idx))
+                        .unwrap_or(*probe_start);
+                    let cache_iv_start = (*probe_start).min(existing_end);
+                    let cache_iv_end = (*probe_start).max(existing_end);
+                    if cache_iv_start > vcf_iv_end || cache_iv_end < vcf_iv_start {
+                        continue;
+                    }
+
                     let allele_str = reader.allele_string(allele_idx);
                     if (self.exact_matcher)(vcf_ref, vcf_alt, allele_str) {
                         matched_allele_rows.push(allele_idx);
@@ -724,6 +709,14 @@ impl KvLookupStream {
 
                     // Iterate alleles at this position for colocated collection.
                     for allele_idx in 0..reader.num_alleles() {
+                        let failed = ci
+                            .failed
+                            .and_then(|idx| reader.read_i64_value(idx, allele_idx))
+                            .unwrap_or(0);
+                        if failed > self.allowed_failed {
+                            continue;
+                        }
+
                         let var_name = reader.read_string_value(ci.variation_name, allele_idx);
                         let var_name = match var_name {
                             Some(v) if !v.is_empty() => v,
@@ -765,15 +758,6 @@ impl KvLookupStream {
                             compare_output_allele: compare_output_allele.clone(),
                             unshifted_output_allele: unshifted_output_allele.clone(),
                         });
-
-                        // Dedup by variation_name within the same position.
-                        if sink_value
-                            .entries
-                            .iter()
-                            .any(|e| e.variation_name == var_name)
-                        {
-                            continue;
-                        }
 
                         let somatic = ci
                             .somatic
@@ -1051,6 +1035,77 @@ fn normalize_vcf_coords(
 }
 
 #[inline]
+fn push_unique_probe_start(probe_starts: &mut Vec<i64>, start: i64) {
+    if !probe_starts.contains(&start) {
+        probe_starts.push(start);
+    }
+}
+
+fn build_probe_starts(
+    norm_start_i64: i64,
+    norm_end_i64: i64,
+    vcf_ref: &str,
+    vcf_alt: &str,
+    extended_probes: bool,
+) -> Vec<i64> {
+    let mut probe_starts: Vec<i64> = Vec::with_capacity(6);
+    push_unique_probe_start(&mut probe_starts, norm_start_i64);
+
+    if !extended_probes {
+        return probe_starts;
+    }
+
+    if norm_start_i64 == norm_end_i64 {
+        push_unique_probe_start(&mut probe_starts, norm_start_i64.saturating_add(1));
+    } else {
+        push_unique_probe_start(&mut probe_starts, norm_end_i64);
+    }
+
+    for alt in vcf_alt.split(['|', ',']).filter(|a| !a.is_empty()) {
+        let (_, _, input_start) = vcf_to_vep_input_allele(norm_start_i64, vcf_ref, alt);
+        push_unique_probe_start(&mut probe_starts, input_start);
+
+        let shift_usize = common_prefix_len(vcf_ref, alt);
+        if shift_usize == 0 {
+            continue;
+        }
+        let shift = shift_usize as i64;
+        if let Some(shifted_start) = norm_start_i64.checked_add(shift) {
+            push_unique_probe_start(&mut probe_starts, shifted_start);
+        }
+    }
+
+    // Deletions in tandem repeats may be right/left shifted in cache coordinates.
+    // Probe a bounded window of equivalent deletion start positions.
+    for alt in vcf_alt.split(['|', ',']).filter(|a| !a.is_empty()) {
+        let (ref_event_len, alt_event_len) = canonical_event_lengths(vcf_ref, alt);
+        if ref_event_len == 0 || alt_event_len != 0 {
+            continue;
+        }
+        let del_len = ref_event_len as i64;
+        let max_shift = del_len.min(32);
+        for base_start in [norm_start_i64, norm_start_i64.saturating_sub(1)] {
+            for shift in 0..=max_shift {
+                let Some(candidate_start) = base_start.checked_add(shift) else {
+                    continue;
+                };
+                let Some(candidate_end) = candidate_start.checked_add(del_len - 1) else {
+                    continue;
+                };
+                // Mirror SQL interval semantics: only consider intervals overlapping
+                // the normalized VCF interval.
+                if candidate_start > norm_end_i64 || candidate_end < norm_start_i64 {
+                    continue;
+                }
+                push_unique_probe_start(&mut probe_starts, candidate_start);
+            }
+        }
+    }
+
+    probe_starts
+}
+
+#[inline]
 fn common_prefix_len(left: &str, right: &str) -> usize {
     left.as_bytes()
         .iter()
@@ -1121,6 +1176,7 @@ fn resolve_kv_coloc_indices(store: &VepKvStore) -> Option<KvColocIndices> {
         variation_name,
         _allele_string_col: allele_string_col,
         end_col: find_stored_idx("end"),
+        failed: find_stored_idx("failed"),
         somatic: find_stored_idx("somatic"),
         pheno: find_stored_idx("phenotype_or_disease"),
         clin_sig: find_stored_idx("clin_sig"),
@@ -1155,5 +1211,34 @@ impl Stream for KvLookupStream {
 impl RecordBatchStream for KvLookupStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_probe_starts_includes_parser_input_start_for_shifted_insertions() {
+        let probe_starts = build_probe_starts(
+            215230092,
+            215230102,
+            "TACACACACAC",
+            "TATACACACACACACAC",
+            true,
+        );
+
+        assert_eq!(probe_starts[0], 215230092);
+        assert!(probe_starts.contains(&215230093));
+        assert!(probe_starts.contains(&215230094));
+    }
+
+    #[test]
+    fn build_probe_starts_includes_parser_input_start_for_repeat_insertions() {
+        let probe_starts = build_probe_starts(165387539, 165387541, "CTG", "CTCTGTG", true);
+
+        assert_eq!(probe_starts[0], 165387539);
+        assert!(probe_starts.contains(&165387540));
+        assert!(probe_starts.contains(&165387541));
     }
 }

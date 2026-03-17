@@ -242,6 +242,7 @@ impl TableProvider for LookupProvider {
                         self.coord_normalizer.input_zero_based,
                         self.coord_normalizer.cache_zero_based,
                         self.extended_probes,
+                        self.allowed_failed,
                     )?;
                     exec = exec.with_reference_fasta_path(self.reference_fasta_path.clone());
                     if let Some(ref sink) = self.colocated_sink {
@@ -623,6 +624,75 @@ mod tests {
             alleles.iter().any(|v| v.as_deref() == Some("TA/-")),
             "Expected TA/- allele from KV lookup, got: {alleles:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_kv_filters_failed_rows() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(Int64Array::from(vec![101, 101])),
+                Arc::new(StringArray::from(vec!["rs_keep", "rs_failed"])),
+                Arc::new(StringArray::from(vec!["A/G", "A/G"])),
+                Arc::new(StringArray::from(vec!["benign", "pathogenic"])),
+                Arc::new(Int64Array::from(vec![0, 1])),
+            ],
+        )
+        .unwrap();
+
+        // col_indices: end(2), variation_name(3), allele_string(4), clin_sig(5), failed(6)
+        let entry = serialize_position_entry(&[0, 1], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        let cache_dir = unique_temp_dir("vep-kv-failed-filter");
+
+        let store = VepKvStore::create(&cache_dir, cache_schema).unwrap();
+        store.put_position_entry("1", 100, &entry).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
+        ctx.register_table("var_cache", Arc::new(kv_provider))
+            .unwrap();
+
+        let batches = ctx
+            .sql(
+                "SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,clin_sig')",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for value in string_values(col) {
+                if let Some(v) = value {
+                    names.push(v);
+                }
+            }
+        }
+
+        assert_eq!(names, vec!["rs_keep".to_string()]);
 
         let _ = std::fs::remove_dir_all(&cache_dir);
     }

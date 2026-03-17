@@ -167,7 +167,9 @@ pub(crate) enum ShiftableIndelKind {
 ///
 /// Genomic shift state is only defined for simple insertion/deletion allele
 /// strings. Substitutions and multi-ALT representations bypass this path.
-pub(crate) fn parse_shiftable_indel(allele_string: &str) -> Option<(&str, &str, ShiftableIndelKind)> {
+pub(crate) fn parse_shiftable_indel(
+    allele_string: &str,
+) -> Option<(&str, &str, ShiftableIndelKind)> {
     let (ref_allele, alt_allele) = allele_string.split_once('/')?;
     if ref_allele == "-" && !alt_allele.is_empty() && alt_allele != "-" {
         return Some((ref_allele, alt_allele, ShiftableIndelKind::Insertion));
