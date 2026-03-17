@@ -1585,288 +1585,315 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_appends_annotation_columns() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_data", Arc::new(vcf_table()))
-            .expect("register vcf table");
-        ctx.register_table("var_cache", Arc::new(cache_table()))
-            .expect("register cache table");
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_data", Arc::new(vcf_table()))
+                .expect("register vcf table");
+            ctx.register_table("var_cache", Arc::new(cache_table()))
+                .expect("register cache table");
 
-        let df = ctx
-            .sql("SELECT * FROM annotate_vep('vcf_data', 'var_cache', 'parquet')")
-            .await
-            .expect("annotate_vep query should parse");
+            let sql = format!("SELECT * FROM annotate_vep('vcf_data', 'var_cache', '{backend}')");
+            let df = ctx
+                .sql(&sql)
+                .await
+                .expect("annotate_vep query should parse");
 
-        let batches = df.collect().await.expect("collect annotate_vep");
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 2);
+            let batches = df.collect().await.expect("collect annotate_vep");
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 2, "backend={backend}");
 
-        let mut csq_values = Vec::new();
-        let mut most_values = Vec::new();
-        for batch in &batches {
-            assert!(batch.column_by_name("csq").is_some());
-            assert!(batch.column_by_name("most_severe_consequence").is_some());
-            csq_values.extend(string_values(
-                batch.column_by_name("csq").expect("csq column exists"),
-            ));
-            most_values.extend(string_values(
-                batch
-                    .column_by_name("most_severe_consequence")
-                    .expect("most_severe_consequence column exists"),
-            ));
+            let mut csq_values = Vec::new();
+            let mut most_values = Vec::new();
+            for batch in &batches {
+                assert!(batch.column_by_name("csq").is_some());
+                assert!(batch.column_by_name("most_severe_consequence").is_some());
+                csq_values.extend(string_values(
+                    batch.column_by_name("csq").expect("csq column exists"),
+                ));
+                most_values.extend(string_values(
+                    batch
+                        .column_by_name("most_severe_consequence")
+                        .expect("most_severe_consequence column exists"),
+                ));
+            }
+            assert!(
+                csq_values
+                    .iter()
+                    .any(|v| v.as_ref().is_some_and(|s| s.contains("sequence_variant"))),
+                "backend={backend}"
+            );
+            assert!(csq_values.iter().any(|v| v.is_none()), "backend={backend}");
+            assert!(
+                most_values
+                    .iter()
+                    .any(|v| v.as_ref() == Some(&"sequence_variant".to_string())),
+                "backend={backend}"
+            );
+            assert!(most_values.iter().any(|v| v.is_none()), "backend={backend}");
         }
-        assert!(
-            csq_values
-                .iter()
-                .any(|v| v.as_ref().is_some_and(|s| s.contains("sequence_variant")))
-        );
-        assert!(csq_values.iter().any(|v| v.is_none()));
-        assert!(
-            most_values
-                .iter()
-                .any(|v| v.as_ref() == Some(&"sequence_variant".to_string()))
-        );
-        assert!(most_values.iter().any(|v| v.is_none()));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_projection_includes_null_placeholder_fields() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_data", Arc::new(vcf_table()))
-            .expect("register vcf table");
-        ctx.register_table("var_cache", Arc::new(cache_table()))
-            .expect("register cache table");
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_data", Arc::new(vcf_table()))
+                .expect("register vcf table");
+            ctx.register_table("var_cache", Arc::new(cache_table()))
+                .expect("register cache table");
 
-        let df = ctx
-            .sql("SELECT chrom, csq FROM annotate_vep('vcf_data', 'var_cache', 'parquet')")
-            .await
-            .expect("projection query should parse");
+            let sql = format!(
+                "SELECT chrom, csq FROM annotate_vep('vcf_data', 'var_cache', '{backend}')"
+            );
+            let df = ctx.sql(&sql).await.expect("projection query should parse");
 
-        let batches = df.collect().await.expect("collect projected annotate_vep");
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 2);
-        for batch in &batches {
-            assert_eq!(batch.num_columns(), 2);
-            assert_eq!(batch.schema().field(0).name(), "chrom");
-            assert_eq!(batch.schema().field(1).name(), "csq");
+            let batches = df.collect().await.expect("collect projected annotate_vep");
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 2, "backend={backend}");
+            for batch in &batches {
+                assert_eq!(batch.num_columns(), 2, "backend={backend}");
+                assert_eq!(batch.schema().field(0).name(), "chrom");
+                assert_eq!(batch.schema().field(1).name(), "csq");
+            }
+            let mut csq_values = Vec::new();
+            for batch in &batches {
+                csq_values.extend(string_values(
+                    batch.column_by_name("csq").expect("csq column exists"),
+                ));
+            }
+            assert!(csq_values.iter().any(|v| v.is_some()), "backend={backend}");
+            assert!(csq_values.iter().any(|v| v.is_none()), "backend={backend}");
         }
-        let mut csq_values = Vec::new();
-        for batch in &batches {
-            csq_values.extend(string_values(
-                batch.column_by_name("csq").expect("csq column exists"),
-            ));
-        }
-        assert!(csq_values.iter().any(|v| v.is_some()));
-        assert!(csq_values.iter().any(|v| v.is_none()));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_uses_transcript_context_tables_when_available() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_data", Arc::new(vcf_table()))
-            .expect("register vcf table");
-        ctx.register_table("var_cache", Arc::new(cache_table()))
-            .expect("register cache table");
-        ctx.register_table("var_cache_transcripts", Arc::new(transcripts_table()))
-            .expect("register transcripts table");
-        ctx.register_table("var_cache_exons", Arc::new(exons_table()))
-            .expect("register exons table");
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_data", Arc::new(vcf_table()))
+                .expect("register vcf table");
+            ctx.register_table("var_cache", Arc::new(cache_table()))
+                .expect("register cache table");
+            ctx.register_table("var_cache_transcripts", Arc::new(transcripts_table()))
+                .expect("register transcripts table");
+            ctx.register_table("var_cache_exons", Arc::new(exons_table()))
+                .expect("register exons table");
 
-        let df = ctx
-            .sql(
+            let sql = format!(
                 "SELECT chrom, csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_data', 'var_cache', 'parquet') \
-                 ORDER BY chrom",
-            )
-            .await
-            .expect("query should parse");
+                 FROM annotate_vep('vcf_data', 'var_cache', '{backend}') \
+                 ORDER BY chrom"
+            );
+            let df = ctx.sql(&sql).await.expect("query should parse");
 
-        let batches = df
-            .collect()
-            .await
-            .expect("collect transcript-aware annotate_vep");
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 2);
+            let batches = df
+                .collect()
+                .await
+                .expect("collect transcript-aware annotate_vep");
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 2, "backend={backend}");
 
-        let mut chrom = Vec::new();
-        let mut csq = Vec::new();
-        let mut most = Vec::new();
-        for batch in &batches {
-            chrom.extend(string_values(
-                batch.column_by_name("chrom").expect("chrom column exists"),
-            ));
-            csq.extend(string_values(
-                batch.column_by_name("csq").expect("csq column exists"),
-            ));
-            most.extend(string_values(
-                batch
-                    .column_by_name("most_severe_consequence")
-                    .expect("most_severe_consequence column exists"),
-            ));
+            let mut chrom = Vec::new();
+            let mut csq = Vec::new();
+            let mut most = Vec::new();
+            for batch in &batches {
+                chrom.extend(string_values(
+                    batch.column_by_name("chrom").expect("chrom column exists"),
+                ));
+                csq.extend(string_values(
+                    batch.column_by_name("csq").expect("csq column exists"),
+                ));
+                most.extend(string_values(
+                    batch
+                        .column_by_name("most_severe_consequence")
+                        .expect("most_severe_consequence column exists"),
+                ));
+            }
+
+            assert_eq!(
+                chrom,
+                vec![Some("1".to_string()), Some("2".to_string())],
+                "backend={backend}"
+            );
+            assert!(csq.iter().all(|v| v.is_some()), "backend={backend}");
+            assert!(most.iter().all(|v| v.is_some()), "backend={backend}");
+            assert!(
+                csq[0]
+                    .as_ref()
+                    .is_some_and(|s| s.contains("coding_sequence_variant")),
+                "backend={backend}"
+            );
+            assert!(
+                csq[1]
+                    .as_ref()
+                    .is_some_and(|s| s.contains("non_coding_transcript_exon_variant")),
+                "backend={backend}"
+            );
+            assert_eq!(
+                most,
+                vec![
+                    Some("coding_sequence_variant".to_string()),
+                    Some("non_coding_transcript_exon_variant".to_string())
+                ],
+                "backend={backend}"
+            );
         }
-
-        assert_eq!(chrom, vec![Some("1".to_string()), Some("2".to_string())]);
-        assert!(csq.iter().all(|v| v.is_some()));
-        assert!(most.iter().all(|v| v.is_some()));
-        // Without translation tables, SNV in CDS produces
-        // coding_sequence_variant (no codon evidence for missense).
-        assert!(
-            csq[0]
-                .as_ref()
-                .is_some_and(|s| s.contains("coding_sequence_variant"))
-        );
-        // variation_name is not emitted in CSQ (VEP Existing_variation is empty for non-merged caches).
-        assert!(
-            csq[1]
-                .as_ref()
-                .is_some_and(|s| s.contains("non_coding_transcript_exon_variant"))
-        );
-        assert_eq!(
-            most,
-            vec![
-                Some("coding_sequence_variant".to_string()),
-                Some("non_coding_transcript_exon_variant".to_string())
-            ]
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_uses_options_json_table_overrides_for_transcript_context() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_data", Arc::new(vcf_table()))
-            .expect("register vcf table");
-        ctx.register_table("var_cache", Arc::new(cache_table()))
-            .expect("register cache table");
-        ctx.register_table("tx_ctx", Arc::new(transcripts_table()))
-            .expect("register transcript context table");
-        ctx.register_table("ex_ctx", Arc::new(exons_table()))
-            .expect("register exon context table");
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_data", Arc::new(vcf_table()))
+                .expect("register vcf table");
+            ctx.register_table("var_cache", Arc::new(cache_table()))
+                .expect("register cache table");
+            ctx.register_table("tx_ctx", Arc::new(transcripts_table()))
+                .expect("register transcript context table");
+            ctx.register_table("ex_ctx", Arc::new(exons_table()))
+                .expect("register exon context table");
 
-        let df = ctx
-            .sql(
+            let sql = format!(
                 "SELECT csq, most_severe_consequence \
                  FROM annotate_vep( \
                    'vcf_data', \
                    'var_cache', \
-                   'parquet', \
-                   '{\"transcripts_table\":\"tx_ctx\",\"exons_table\":\"ex_ctx\"}' \
-                 )",
-            )
-            .await
-            .expect("query should parse");
+                   '{backend}', \
+                   '{{\"transcripts_table\":\"tx_ctx\",\"exons_table\":\"ex_ctx\"}}' \
+                 )"
+            );
+            let df = ctx.sql(&sql).await.expect("query should parse");
 
-        let batches = df
-            .collect()
-            .await
-            .expect("collect transcript-aware annotate_vep");
-        let mut csq = Vec::new();
-        let mut most = Vec::new();
-        for batch in &batches {
-            csq.extend(string_values(
-                batch.column_by_name("csq").expect("csq column exists"),
-            ));
-            most.extend(string_values(
-                batch
-                    .column_by_name("most_severe_consequence")
-                    .expect("most_severe_consequence column exists"),
-            ));
+            let batches = df
+                .collect()
+                .await
+                .expect("collect transcript-aware annotate_vep");
+            let mut csq = Vec::new();
+            let mut most = Vec::new();
+            for batch in &batches {
+                csq.extend(string_values(
+                    batch.column_by_name("csq").expect("csq column exists"),
+                ));
+                most.extend(string_values(
+                    batch
+                        .column_by_name("most_severe_consequence")
+                        .expect("most_severe_consequence column exists"),
+                ));
+            }
+            assert!(csq.iter().all(|v| v.is_some()), "backend={backend}");
+            assert!(most.iter().all(|v| v.is_some()), "backend={backend}");
         }
-        assert!(csq.iter().all(|v| v.is_some()));
-        assert!(most.iter().all(|v| v.is_some()));
     }
 
     // Mirrors Ensembl VEP Runner distance coverage:
     // - https://github.com/Ensembl/ensembl-vep/blob/release/115/t/Runner.t#L535-L571
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_respects_options_json_distance_for_upstream_and_downstream() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_distance", Arc::new(distance_vcf_table()))
-            .expect("register distance vcf");
-        ctx.register_table("var_distance_cache", Arc::new(distance_cache_table()))
-            .expect("register distance cache");
-        ctx.register_table(
-            "var_distance_cache_transcripts",
-            Arc::new(distance_transcripts_table()),
-        )
-        .expect("register distance transcripts");
-        ctx.register_table("var_distance_cache_exons", Arc::new(distance_exons_table()))
-            .expect("register distance exons");
-
-        let default_batches = ctx
-            .sql("SELECT csq FROM annotate_vep('vcf_distance', 'var_distance_cache', 'parquet')")
-            .await
-            .expect("default distance query should parse")
-            .collect()
-            .await
-            .expect("collect default distance annotate_vep");
-        let default_csq = string_values(
-            default_batches[0]
-                .column_by_name("csq")
-                .expect("default csq column exists"),
-        );
-        let default_csq0 = default_csq[0]
-            .as_ref()
-            .expect("default csq should be present");
-        assert!(default_csq0.contains("intergenic_variant"));
-        assert!(!default_csq0.contains("ENSTDISTUP"));
-        assert!(!default_csq0.contains("ENSTDISTDOWN"));
-
-        let numeric_batches = ctx
-            .sql(
-                "SELECT csq FROM annotate_vep( \
-                   'vcf_distance', \
-                   'var_distance_cache', \
-                   'parquet', \
-                   '{\"distance\":10000}' \
-                 )",
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_distance", Arc::new(distance_vcf_table()))
+                .expect("register distance vcf");
+            ctx.register_table("var_distance_cache", Arc::new(distance_cache_table()))
+                .expect("register distance cache");
+            ctx.register_table(
+                "var_distance_cache_transcripts",
+                Arc::new(distance_transcripts_table()),
             )
-            .await
-            .expect("numeric distance query should parse")
-            .collect()
-            .await
-            .expect("collect numeric distance annotate_vep");
-        let numeric_csq = string_values(
-            numeric_batches[0]
-                .column_by_name("csq")
-                .expect("numeric csq column exists"),
-        );
-        let numeric_csq0 = numeric_csq[0]
-            .as_ref()
-            .expect("numeric csq should be present");
-        let numeric_entries = csq_entries(numeric_csq0);
-        assert_eq!(numeric_entries.len(), 1);
-        let upstream_entry = find_csq_entry(numeric_csq0, "Transcript", "ENSTDISTUP");
-        assert_eq!(upstream_entry[1], "upstream_gene_variant");
-        assert_eq!(upstream_entry[18], "7079");
-        assert!(!numeric_csq0.contains("ENSTDISTDOWN"));
+            .expect("register distance transcripts");
+            ctx.register_table("var_distance_cache_exons", Arc::new(distance_exons_table()))
+                .expect("register distance exons");
 
-        let pair_batches = ctx
-            .sql(
-                "SELECT csq FROM annotate_vep( \
-                   'vcf_distance', \
-                   'var_distance_cache', \
-                   'parquet', \
-                   '{\"distance\":\"10000,20000\"}' \
-                 )",
-            )
-            .await
-            .expect("pair distance query should parse")
-            .collect()
-            .await
-            .expect("collect pair distance annotate_vep");
-        let pair_csq = string_values(
-            pair_batches[0]
-                .column_by_name("csq")
-                .expect("pair csq column exists"),
-        );
-        let pair_csq0 = pair_csq[0].as_ref().expect("pair csq should be present");
-        let pair_entries = csq_entries(pair_csq0);
-        assert_eq!(pair_entries.len(), 2);
-        let upstream_entry = find_csq_entry(pair_csq0, "Transcript", "ENSTDISTUP");
-        let downstream_entry = find_csq_entry(pair_csq0, "Transcript", "ENSTDISTDOWN");
-        assert_eq!(upstream_entry[1], "upstream_gene_variant");
-        assert_eq!(upstream_entry[18], "7079");
-        assert_eq!(downstream_entry[1], "downstream_gene_variant");
-        assert_eq!(downstream_entry[18], "15000");
+            let default_batches = ctx
+                .sql(&format!(
+                    "SELECT csq FROM annotate_vep('vcf_distance', 'var_distance_cache', '{backend}')"
+                ))
+                .await
+                .expect("default distance query should parse")
+                .collect()
+                .await
+                .expect("collect default distance annotate_vep");
+            let default_csq = string_values(
+                default_batches[0]
+                    .column_by_name("csq")
+                    .expect("default csq column exists"),
+            );
+            let default_csq0 = default_csq[0]
+                .as_ref()
+                .expect("default csq should be present");
+            assert!(
+                default_csq0.contains("intergenic_variant"),
+                "backend={backend}"
+            );
+            assert!(!default_csq0.contains("ENSTDISTUP"), "backend={backend}");
+            assert!(!default_csq0.contains("ENSTDISTDOWN"), "backend={backend}");
+
+            let numeric_batches = ctx
+                .sql(&format!(
+                    "SELECT csq FROM annotate_vep( \
+                       'vcf_distance', \
+                       'var_distance_cache', \
+                       '{backend}', \
+                       '{{\"distance\":10000}}' \
+                     )"
+                ))
+                .await
+                .expect("numeric distance query should parse")
+                .collect()
+                .await
+                .expect("collect numeric distance annotate_vep");
+            let numeric_csq = string_values(
+                numeric_batches[0]
+                    .column_by_name("csq")
+                    .expect("numeric csq column exists"),
+            );
+            let numeric_csq0 = numeric_csq[0]
+                .as_ref()
+                .expect("numeric csq should be present");
+            let numeric_entries = csq_entries(numeric_csq0);
+            assert_eq!(numeric_entries.len(), 1, "backend={backend}");
+            let upstream_entry = find_csq_entry(numeric_csq0, "Transcript", "ENSTDISTUP");
+            assert_eq!(
+                upstream_entry[1], "upstream_gene_variant",
+                "backend={backend}"
+            );
+            assert_eq!(upstream_entry[18], "7079", "backend={backend}");
+            assert!(!numeric_csq0.contains("ENSTDISTDOWN"), "backend={backend}");
+
+            let pair_batches = ctx
+                .sql(&format!(
+                    "SELECT csq FROM annotate_vep( \
+                       'vcf_distance', \
+                       'var_distance_cache', \
+                       '{backend}', \
+                       '{{\"distance\":\"10000,20000\"}}' \
+                     )"
+                ))
+                .await
+                .expect("pair distance query should parse")
+                .collect()
+                .await
+                .expect("collect pair distance annotate_vep");
+            let pair_csq = string_values(
+                pair_batches[0]
+                    .column_by_name("csq")
+                    .expect("pair csq column exists"),
+            );
+            let pair_csq0 = pair_csq[0].as_ref().expect("pair csq should be present");
+            let pair_entries = csq_entries(pair_csq0);
+            assert_eq!(pair_entries.len(), 2, "backend={backend}");
+            let upstream_entry = find_csq_entry(pair_csq0, "Transcript", "ENSTDISTUP");
+            let downstream_entry = find_csq_entry(pair_csq0, "Transcript", "ENSTDISTDOWN");
+            assert_eq!(
+                upstream_entry[1], "upstream_gene_variant",
+                "backend={backend}"
+            );
+            assert_eq!(upstream_entry[18], "7079", "backend={backend}");
+            assert_eq!(
+                downstream_entry[1], "downstream_gene_variant",
+                "backend={backend}"
+            );
+            assert_eq!(downstream_entry[18], "15000", "backend={backend}");
+        }
     }
 
     // Mirrors Ensembl VEP offline HGVS gating and output toggles:
@@ -1874,171 +1901,187 @@ mod tests {
     // - https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1698-L1715
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_hgvs_fields_require_flag_and_reference_fasta() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_hgvs", Arc::new(hgvs_vcf_table()))
-            .expect("register hgvs vcf");
-        ctx.register_table("var_hgvs_cache", Arc::new(hgvs_cache_table()))
-            .expect("register hgvs cache");
-        ctx.register_table(
-            "var_hgvs_cache_transcripts",
-            Arc::new(hgvs_transcripts_table()),
-        )
-        .expect("register hgvs transcripts");
-        ctx.register_table("var_hgvs_cache_exons", Arc::new(hgvs_exons_table()))
-            .expect("register hgvs exons");
-        ctx.register_table(
-            "var_hgvs_cache_translations",
-            Arc::new(hgvs_translations_table()),
-        )
-        .expect("register hgvs translations");
-
-        let default_batches = ctx
-            .sql("SELECT csq FROM annotate_vep('vcf_hgvs', 'var_hgvs_cache', 'parquet')")
-            .await
-            .expect("default hgvs query should parse")
-            .collect()
-            .await
-            .expect("collect default hgvs annotate_vep");
-        let default_csq = string_values(
-            default_batches[0]
-                .column_by_name("csq")
-                .expect("default csq column exists"),
-        );
-        let default_entry = csq_entries(default_csq[0].as_ref().expect("default csq present"))
-            .into_iter()
-            .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
-            .expect("transcript entry should exist");
-        assert_eq!(default_entry[10], "");
-        assert_eq!(default_entry[11], "");
-
-        let missing_fasta_err = ctx
-            .sql(
-                "SELECT csq FROM annotate_vep( \
-                   'vcf_hgvs', \
-                   'var_hgvs_cache', \
-                   'parquet', \
-                   '{\"hgvs\":true}' \
-                 )",
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_hgvs", Arc::new(hgvs_vcf_table()))
+                .expect("register hgvs vcf");
+            ctx.register_table("var_hgvs_cache", Arc::new(hgvs_cache_table()))
+                .expect("register hgvs cache");
+            ctx.register_table(
+                "var_hgvs_cache_transcripts",
+                Arc::new(hgvs_transcripts_table()),
             )
-            .await
-            .expect("hgvs query should parse")
-            .collect()
-            .await
-            .expect_err("hgvs without reference fasta should fail")
-            .to_string();
-        assert!(missing_fasta_err.contains("Cannot generate HGVS coordinates"));
+            .expect("register hgvs transcripts");
+            ctx.register_table("var_hgvs_cache_exons", Arc::new(hgvs_exons_table()))
+                .expect("register hgvs exons");
+            ctx.register_table(
+                "var_hgvs_cache_translations",
+                Arc::new(hgvs_translations_table()),
+            )
+            .expect("register hgvs translations");
 
-        let (_fasta_dir, fasta_path) = write_test_indexed_fasta("1", "NNNNNNNNNN");
+            let default_batches = ctx
+                .sql(&format!(
+                    "SELECT csq FROM annotate_vep('vcf_hgvs', 'var_hgvs_cache', '{backend}')"
+                ))
+                .await
+                .expect("default hgvs query should parse")
+                .collect()
+                .await
+                .expect("collect default hgvs annotate_vep");
+            let default_csq = string_values(
+                default_batches[0]
+                    .column_by_name("csq")
+                    .expect("default csq column exists"),
+            );
+            let default_entry = csq_entries(default_csq[0].as_ref().expect("default csq present"))
+                .into_iter()
+                .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
+                .expect("transcript entry should exist");
+            assert_eq!(default_entry[10], "", "backend={backend}");
+            assert_eq!(default_entry[11], "", "backend={backend}");
 
-        let hgvs_batches = ctx
-            .sql(&format!(
-                "SELECT csq FROM annotate_vep( \
-                   'vcf_hgvs', \
-                   'var_hgvs_cache', \
-                   'parquet', \
-                   '{{\"hgvs\":true,\"reference_fasta_path\":\"{}\"}}' \
-                 )",
-                fasta_path.replace('\'', "''")
-            ))
-            .await
-            .expect("hgvs enabled query should parse")
-            .collect()
-            .await
-            .expect("collect hgvs enabled annotate_vep");
-        let hgvs_csq = string_values(
-            hgvs_batches[0]
-                .column_by_name("csq")
-                .expect("hgvs csq column exists"),
-        );
-        let hgvs_entry = csq_entries(hgvs_csq[0].as_ref().expect("hgvs csq present"))
+            let missing_fasta_err = ctx
+                .sql(&format!(
+                    "SELECT csq FROM annotate_vep( \
+                       'vcf_hgvs', \
+                       'var_hgvs_cache', \
+                       '{backend}', \
+                       '{{\"hgvs\":true}}' \
+                     )"
+                ))
+                .await
+                .expect("hgvs query should parse")
+                .collect()
+                .await
+                .expect_err("hgvs without reference fasta should fail")
+                .to_string();
+            assert!(
+                missing_fasta_err.contains("Cannot generate HGVS coordinates"),
+                "backend={backend}"
+            );
+
+            let (_fasta_dir, fasta_path) = write_test_indexed_fasta("1", "NNNNNNNNNN");
+
+            let hgvs_batches = ctx
+                .sql(&format!(
+                    "SELECT csq FROM annotate_vep( \
+                       'vcf_hgvs', \
+                       'var_hgvs_cache', \
+                       '{backend}', \
+                       '{{\"hgvs\":true,\"reference_fasta_path\":\"{}\"}}' \
+                     )",
+                    fasta_path.replace('\'', "''")
+                ))
+                .await
+                .expect("hgvs enabled query should parse")
+                .collect()
+                .await
+                .expect("collect hgvs enabled annotate_vep");
+            let hgvs_csq = string_values(
+                hgvs_batches[0]
+                    .column_by_name("csq")
+                    .expect("hgvs csq column exists"),
+            );
+            let hgvs_entry = csq_entries(hgvs_csq[0].as_ref().expect("hgvs csq present"))
+                .into_iter()
+                .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
+                .expect("transcript hgvs entry should exist");
+            assert_eq!(
+                hgvs_entry[10], "ENSTHGVS000001.1:c.4G>A",
+                "backend={backend}"
+            );
+            assert_eq!(
+                hgvs_entry[11], "ENSPHGVS000001.1:p.Ala2Thr",
+                "backend={backend}"
+            );
+
+            let hgvs_prediction_batches = ctx
+                .sql(&format!(
+                    "SELECT csq FROM annotate_vep( \
+                       'vcf_hgvs', \
+                       'var_hgvs_cache', \
+                       '{backend}', \
+                       '{{\"hgvsp\":true,\"hgvsp_use_prediction\":true,\"reference_fasta_path\":\"{}\"}}' \
+                     )",
+                    fasta_path.replace('\'', "''")
+                ))
+                .await
+                .expect("hgvs prediction query should parse")
+                .collect()
+                .await
+                .expect("collect hgvs prediction annotate_vep");
+            let hgvs_prediction_csq = string_values(
+                hgvs_prediction_batches[0]
+                    .column_by_name("csq")
+                    .expect("hgvs prediction csq column exists"),
+            );
+            let hgvs_prediction_entry = csq_entries(
+                hgvs_prediction_csq[0]
+                    .as_ref()
+                    .expect("hgvs prediction csq present"),
+            )
             .into_iter()
             .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
-            .expect("transcript hgvs entry should exist");
-        assert_eq!(hgvs_entry[10], "ENSTHGVS000001.1:c.4G>A");
-        assert_eq!(hgvs_entry[11], "ENSPHGVS000001.1:p.Ala2Thr");
-
-        let hgvs_prediction_batches = ctx
-            .sql(&format!(
-                "SELECT csq FROM annotate_vep( \
-                   'vcf_hgvs', \
-                   'var_hgvs_cache', \
-                   'parquet', \
-                   '{{\"hgvsp\":true,\"hgvsp_use_prediction\":true,\"reference_fasta_path\":\"{}\"}}' \
-                 )",
-                fasta_path.replace('\'', "''")
-            ))
-            .await
-            .expect("hgvs prediction query should parse")
-            .collect()
-            .await
-            .expect("collect hgvs prediction annotate_vep");
-        let hgvs_prediction_csq = string_values(
-            hgvs_prediction_batches[0]
-                .column_by_name("csq")
-                .expect("hgvs prediction csq column exists"),
-        );
-        let hgvs_prediction_entry = csq_entries(
-            hgvs_prediction_csq[0]
-                .as_ref()
-                .expect("hgvs prediction csq present"),
-        )
-        .into_iter()
-        .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
-        .expect("transcript hgvs prediction entry should exist");
-        assert_eq!(hgvs_prediction_entry[10], "");
-        assert_eq!(hgvs_prediction_entry[11], "ENSPHGVS000001.1:p.(Ala2Thr)");
+            .expect("transcript hgvs prediction entry should exist");
+            assert_eq!(hgvs_prediction_entry[10], "", "backend={backend}");
+            assert_eq!(
+                hgvs_prediction_entry[11], "ENSPHGVS000001.1:p.(Ala2Thr)",
+                "backend={backend}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_uses_translation_context_for_synonymous_classification() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_syn", Arc::new(synonymous_vcf_table()))
-            .expect("register synonymous vcf table");
-        ctx.register_table("var_syn_cache", Arc::new(synonymous_cache_table()))
-            .expect("register synonymous cache table");
-        ctx.register_table(
-            "var_syn_cache_transcripts",
-            Arc::new(synonymous_transcripts_table()),
-        )
-        .expect("register transcripts table");
-        ctx.register_table("var_syn_cache_exons", Arc::new(synonymous_exons_table()))
-            .expect("register exons table");
-        ctx.register_table(
-            "var_syn_cache_translations",
-            Arc::new(synonymous_translations_table()),
-        )
-        .expect("register translations table");
-
-        let df = ctx
-            .sql(
-                "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_syn', 'var_syn_cache', 'parquet')",
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_syn", Arc::new(synonymous_vcf_table()))
+                .expect("register synonymous vcf table");
+            ctx.register_table("var_syn_cache", Arc::new(synonymous_cache_table()))
+                .expect("register synonymous cache table");
+            ctx.register_table(
+                "var_syn_cache_transcripts",
+                Arc::new(synonymous_transcripts_table()),
             )
-            .await
-            .expect("query should parse");
-        let batches = df.collect().await.expect("collect annotate_vep");
-        let mut csq = Vec::new();
-        let mut most = Vec::new();
-        for batch in &batches {
-            csq.extend(string_values(
-                batch.column_by_name("csq").expect("csq column exists"),
-            ));
-            most.extend(string_values(
-                batch
-                    .column_by_name("most_severe_consequence")
-                    .expect("most_severe_consequence column exists"),
-            ));
+            .expect("register transcripts table");
+            ctx.register_table("var_syn_cache_exons", Arc::new(synonymous_exons_table()))
+                .expect("register exons table");
+            ctx.register_table(
+                "var_syn_cache_translations",
+                Arc::new(synonymous_translations_table()),
+            )
+            .expect("register translations table");
+
+            let sql = format!(
+                "SELECT csq, most_severe_consequence \
+                 FROM annotate_vep('vcf_syn', 'var_syn_cache', '{backend}')"
+            );
+            let df = ctx.sql(&sql).await.expect("query should parse");
+            let batches = df.collect().await.expect("collect annotate_vep");
+            let mut csq = Vec::new();
+            let mut most = Vec::new();
+            for batch in &batches {
+                csq.extend(string_values(
+                    batch.column_by_name("csq").expect("csq column exists"),
+                ));
+                most.extend(string_values(
+                    batch
+                        .column_by_name("most_severe_consequence")
+                        .expect("most_severe_consequence column exists"),
+                ));
+            }
+            assert_eq!(csq.len(), 1, "backend={backend}");
+            assert_eq!(most.len(), 1, "backend={backend}");
+            let csq0 = csq[0].as_ref().expect("csq should be present");
+            assert!(csq0.contains("synonymous_variant"), "backend={backend}");
+            assert!(!csq0.contains("missense_variant"), "backend={backend}");
+            assert_eq!(
+                most[0],
+                Some("synonymous_variant".to_string()),
+                "backend={backend}: translation-aware codon classification should produce synonymous_variant",
+            );
         }
-        assert_eq!(csq.len(), 1);
-        assert_eq!(most.len(), 1);
-        let csq0 = csq[0].as_ref().expect("csq should be present");
-        assert!(csq0.contains("synonymous_variant"));
-        assert!(!csq0.contains("missense_variant"));
-        assert_eq!(
-            most[0],
-            Some("synonymous_variant".to_string()),
-            "translation-aware codon classification should produce synonymous_variant",
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2153,52 +2196,69 @@ mod tests {
     // Mirrors the cache-backed regulatory source coverage from:
     // - https://github.com/Ensembl/ensembl-vep/blob/release/115/t/AnnotationSource_Cache_RegFeat.t#L166-L205
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_annotate_vep_deduplicates_duplicate_regulatory_rows_from_parquet_context_table() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_reg_dup", Arc::new(context_vcf_table()))
-            .expect("register duplicate regulatory vcf");
-        ctx.register_table("var_reg_dup_cache", Arc::new(context_cache_table()))
-            .expect("register duplicate regulatory cache");
+    async fn test_annotate_vep_deduplicates_duplicate_regulatory_rows_from_context_table() {
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_reg_dup", Arc::new(context_vcf_table()))
+                .expect("register duplicate regulatory vcf");
+            ctx.register_table("var_reg_dup_cache", Arc::new(context_cache_table()))
+                .expect("register duplicate regulatory cache");
 
-        let duplicate_batch = regulatory_feature_batch(&[
-            ("ENSR_DUP", "1", 150, 160, Some("promoter")),
-            ("ENSR_DUP", "1", 150, 160, Some("promoter")),
-        ]);
-        let _parquet_dir =
-            register_single_batch_parquet(&ctx, "reg_dup_table", &duplicate_batch).await;
+            let duplicate_batch = regulatory_feature_batch(&[
+                ("ENSR_DUP", "1", 150, 160, Some("promoter")),
+                ("ENSR_DUP", "1", 150, 160, Some("promoter")),
+            ]);
+            // For parquet backend, test via Parquet file; for fjall, use MemTable.
+            // Both exercise the same dedup logic.
+            let _parquet_dir = if backend == "parquet" {
+                Some(register_single_batch_parquet(&ctx, "reg_dup_table", &duplicate_batch).await)
+            } else {
+                let dup_schema = duplicate_batch.schema();
+                let dup_mem =
+                    MemTable::try_new(dup_schema, vec![vec![duplicate_batch.clone()]]).unwrap();
+                ctx.register_table("reg_dup_table", Arc::new(dup_mem))
+                    .unwrap();
+                None
+            };
 
-        let batches = ctx
-            .sql(
+            let sql = format!(
                 "SELECT csq, most_severe_consequence \
                  FROM annotate_vep( \
                    'vcf_reg_dup', \
                    'var_reg_dup_cache', \
-                   'parquet', \
-                   '{\"regulatory_table\":\"reg_dup_table\"}' \
-                 )",
-            )
-            .await
-            .expect("duplicate regulatory query should parse")
-            .collect()
-            .await
-            .expect("collect duplicate regulatory annotate_vep");
+                   '{backend}', \
+                   '{{\"regulatory_table\":\"reg_dup_table\"}}' \
+                 )"
+            );
+            let batches = ctx
+                .sql(&sql)
+                .await
+                .expect("duplicate regulatory query should parse")
+                .collect()
+                .await
+                .expect("collect duplicate regulatory annotate_vep");
 
-        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
-        let most = string_values(
-            batches[0]
-                .column_by_name("most_severe_consequence")
-                .expect("most severe column exists"),
-        );
-        let csq0 = csq[0].as_ref().expect("csq should be present");
-        let entries = csq_entries(csq0);
-        let regulatory_entries: Vec<&Vec<&str>> = entries
-            .iter()
-            .filter(|fields| fields.len() == 74 && fields[5] == "RegulatoryFeature")
-            .collect();
-        assert_eq!(regulatory_entries.len(), 1);
-        assert_eq!(regulatory_entries[0][6], "ENSR_DUP");
-        assert_eq!(regulatory_entries[0][7], "promoter");
-        assert_eq!(most[0], Some("regulatory_region_variant".to_string()));
+            let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+            let most = string_values(
+                batches[0]
+                    .column_by_name("most_severe_consequence")
+                    .expect("most severe column exists"),
+            );
+            let csq0 = csq[0].as_ref().expect("csq should be present");
+            let entries = csq_entries(csq0);
+            let regulatory_entries: Vec<&Vec<&str>> = entries
+                .iter()
+                .filter(|fields| fields.len() == 74 && fields[5] == "RegulatoryFeature")
+                .collect();
+            assert_eq!(regulatory_entries.len(), 1, "backend={backend}");
+            assert_eq!(regulatory_entries[0][6], "ENSR_DUP", "backend={backend}");
+            assert_eq!(regulatory_entries[0][7], "promoter", "backend={backend}");
+            assert_eq!(
+                most[0],
+                Some("regulatory_region_variant".to_string()),
+                "backend={backend}"
+            );
+        }
     }
 
     // Mirrors Ensembl VEP regulatory output serialization coverage:
@@ -2206,64 +2266,71 @@ mod tests {
     // - https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1802-L1829
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_regulatory_csq_serializer_matches_vep_output_factory_shape() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_reg_ser", Arc::new(context_vcf_table()))
-            .expect("register regulatory serializer vcf");
-        ctx.register_table("var_reg_ser_cache", Arc::new(context_cache_table()))
-            .expect("register regulatory serializer cache");
-        ctx.register_table(
-            "var_reg_ser_cache_regulatory_features",
-            Arc::new(regulatory_table_with_rows(&[(
-                "ENSR00000140763",
-                "1",
-                150,
-                160,
-                Some("promoter"),
-            )])),
-        )
-        .expect("register regulatory serializer table");
-
-        let batches = ctx
-            .sql(
-                "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_reg_ser', 'var_reg_ser_cache', 'parquet')",
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_reg_ser", Arc::new(context_vcf_table()))
+                .expect("register regulatory serializer vcf");
+            ctx.register_table("var_reg_ser_cache", Arc::new(context_cache_table()))
+                .expect("register regulatory serializer cache");
+            ctx.register_table(
+                "var_reg_ser_cache_regulatory_features",
+                Arc::new(regulatory_table_with_rows(&[(
+                    "ENSR00000140763",
+                    "1",
+                    150,
+                    160,
+                    Some("promoter"),
+                )])),
             )
-            .await
-            .expect("regulatory serializer query should parse")
-            .collect()
-            .await
-            .expect("collect regulatory serializer annotate_vep");
+            .expect("register regulatory serializer table");
 
-        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
-        let most = string_values(
-            batches[0]
-                .column_by_name("most_severe_consequence")
-                .expect("most severe column exists"),
-        );
-        let csq0 = csq[0].as_ref().expect("csq should be present");
-        let entries = csq_entries(csq0);
-        assert_eq!(entries.len(), 2);
+            let sql = format!(
+                "SELECT csq, most_severe_consequence \
+                 FROM annotate_vep('vcf_reg_ser', 'var_reg_ser_cache', '{backend}')"
+            );
+            let batches = ctx
+                .sql(&sql)
+                .await
+                .expect("regulatory serializer query should parse")
+                .collect()
+                .await
+                .expect("collect regulatory serializer annotate_vep");
 
-        let entry = find_csq_entry(csq0, "RegulatoryFeature", "ENSR00000140763");
-        assert_eq!(entry.len(), 74);
-        assert_eq!(entry[0], "G");
-        assert_eq!(entry[1], "regulatory_region_variant");
-        assert_eq!(entry[2], "MODIFIER");
-        assert_eq!(entry[3], "");
-        assert_eq!(entry[4], "");
-        assert_eq!(entry[5], "RegulatoryFeature");
-        assert_eq!(entry[6], "ENSR00000140763");
-        assert_eq!(entry[7], "promoter");
-        assert_eq!(entry[8], "");
-        assert_eq!(entry[9], "");
-        assert_eq!(entry[18], "");
-        assert!(
-            entries
-                .iter()
-                .any(|fields| fields.len() == 74 && fields[1] == "intergenic_variant"),
-            "regulatory-only output should retain the orthogonal intergenic entry"
-        );
-        assert_eq!(most[0], Some("regulatory_region_variant".to_string()));
+            let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+            let most = string_values(
+                batches[0]
+                    .column_by_name("most_severe_consequence")
+                    .expect("most severe column exists"),
+            );
+            let csq0 = csq[0].as_ref().expect("csq should be present");
+            let entries = csq_entries(csq0);
+            assert_eq!(entries.len(), 2, "backend={backend}");
+
+            let entry = find_csq_entry(csq0, "RegulatoryFeature", "ENSR00000140763");
+            assert_eq!(entry.len(), 74, "backend={backend}");
+            assert_eq!(entry[0], "G", "backend={backend}");
+            assert_eq!(entry[1], "regulatory_region_variant", "backend={backend}");
+            assert_eq!(entry[2], "MODIFIER", "backend={backend}");
+            assert_eq!(entry[3], "", "backend={backend}");
+            assert_eq!(entry[4], "", "backend={backend}");
+            assert_eq!(entry[5], "RegulatoryFeature", "backend={backend}");
+            assert_eq!(entry[6], "ENSR00000140763", "backend={backend}");
+            assert_eq!(entry[7], "promoter", "backend={backend}");
+            assert_eq!(entry[8], "", "backend={backend}");
+            assert_eq!(entry[9], "", "backend={backend}");
+            assert_eq!(entry[18], "", "backend={backend}");
+            assert!(
+                entries
+                    .iter()
+                    .any(|fields| fields.len() == 74 && fields[1] == "intergenic_variant"),
+                "backend={backend}: regulatory-only output should retain the orthogonal intergenic entry"
+            );
+            assert_eq!(
+                most[0],
+                Some("regulatory_region_variant".to_string()),
+                "backend={backend}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2450,142 +2517,146 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_translation_parity_handles_negative_strand_synonymous_case() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_neg", Arc::new(neg_strand_vcf_table()))
-            .expect("register negative-strand vcf");
-        ctx.register_table("var_neg_cache", Arc::new(neg_strand_cache_table()))
-            .expect("register negative-strand cache");
-        ctx.register_table(
-            "var_neg_cache_transcripts",
-            Arc::new(neg_strand_transcripts_table()),
-        )
-        .expect("register negative-strand transcripts");
-        ctx.register_table("var_neg_cache_exons", Arc::new(neg_strand_exons_table()))
-            .expect("register negative-strand exons");
-        ctx.register_table(
-            "var_neg_cache_translations",
-            Arc::new(neg_strand_translations_table()),
-        )
-        .expect("register negative-strand translations");
-
-        let df = ctx
-            .sql(
-                "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_neg', 'var_neg_cache', 'parquet')",
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_neg", Arc::new(neg_strand_vcf_table()))
+                .expect("register negative-strand vcf");
+            ctx.register_table("var_neg_cache", Arc::new(neg_strand_cache_table()))
+                .expect("register negative-strand cache");
+            ctx.register_table(
+                "var_neg_cache_transcripts",
+                Arc::new(neg_strand_transcripts_table()),
             )
-            .await
-            .expect("query should parse");
-        let batches = df.collect().await.expect("collect annotate_vep");
-        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
-        let most = string_values(
-            batches[0]
-                .column_by_name("most_severe_consequence")
-                .expect("most_severe_consequence column exists"),
-        );
-        let csq0 = csq[0].as_ref().expect("csq should be present");
-        assert_terms_sorted_by_rank(csq0);
-        assert_term_set_exact(csq0, &["synonymous_variant"]);
-        assert_eq!(most[0], Some("synonymous_variant".to_string()));
+            .expect("register negative-strand transcripts");
+            ctx.register_table("var_neg_cache_exons", Arc::new(neg_strand_exons_table()))
+                .expect("register negative-strand exons");
+            ctx.register_table(
+                "var_neg_cache_translations",
+                Arc::new(neg_strand_translations_table()),
+            )
+            .expect("register negative-strand translations");
+
+            let sql = format!(
+                "SELECT csq, most_severe_consequence \
+                 FROM annotate_vep('vcf_neg', 'var_neg_cache', '{backend}')"
+            );
+            let df = ctx.sql(&sql).await.expect("query should parse");
+            let batches = df.collect().await.expect("collect annotate_vep");
+            let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+            let most = string_values(
+                batches[0]
+                    .column_by_name("most_severe_consequence")
+                    .expect("most_severe_consequence column exists"),
+            );
+            let csq0 = csq[0].as_ref().expect("csq should be present");
+            assert_terms_sorted_by_rank(csq0);
+            assert_term_set_exact(csq0, &["synonymous_variant"]);
+            assert_eq!(
+                most[0],
+                Some("synonymous_variant".to_string()),
+                "backend={backend}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_translation_parity_handles_inframe_stop_loss_case() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_stop_loss", Arc::new(stop_loss_vcf_table()))
-            .expect("register stop-loss vcf");
-        ctx.register_table("var_stop_loss_cache", Arc::new(stop_loss_cache_table()))
-            .expect("register stop-loss cache");
-        ctx.register_table(
-            "var_stop_loss_cache_transcripts",
-            Arc::new(stop_loss_transcripts_table()),
-        )
-        .expect("register stop-loss transcripts");
-        ctx.register_table(
-            "var_stop_loss_cache_exons",
-            Arc::new(stop_loss_exons_table()),
-        )
-        .expect("register stop-loss exons");
-        ctx.register_table(
-            "var_stop_loss_cache_translations",
-            Arc::new(stop_loss_translations_table()),
-        )
-        .expect("register stop-loss translations");
-
-        let df = ctx
-            .sql(
-                "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_stop_loss', 'var_stop_loss_cache', 'parquet')",
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_stop_loss", Arc::new(stop_loss_vcf_table()))
+                .expect("register stop-loss vcf");
+            ctx.register_table("var_stop_loss_cache", Arc::new(stop_loss_cache_table()))
+                .expect("register stop-loss cache");
+            ctx.register_table(
+                "var_stop_loss_cache_transcripts",
+                Arc::new(stop_loss_transcripts_table()),
             )
-            .await
-            .expect("query should parse");
-        let batches = df.collect().await.expect("collect annotate_vep");
-        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
-        let most = string_values(
-            batches[0]
-                .column_by_name("most_severe_consequence")
-                .expect("most_severe_consequence column exists"),
-        );
-        let csq0 = csq[0].as_ref().expect("csq should be present");
-        assert_terms_sorted_by_rank(csq0);
-        // VEP suppresses stop_lost alongside inframe indels.
-        assert_term_set_exact(csq0, &["inframe_deletion"]);
-        assert_eq!(most[0], Some("inframe_deletion".to_string()));
+            .expect("register stop-loss transcripts");
+            ctx.register_table(
+                "var_stop_loss_cache_exons",
+                Arc::new(stop_loss_exons_table()),
+            )
+            .expect("register stop-loss exons");
+            ctx.register_table(
+                "var_stop_loss_cache_translations",
+                Arc::new(stop_loss_translations_table()),
+            )
+            .expect("register stop-loss translations");
+
+            let sql = format!(
+                "SELECT csq, most_severe_consequence \
+                 FROM annotate_vep('vcf_stop_loss', 'var_stop_loss_cache', '{backend}')"
+            );
+            let df = ctx.sql(&sql).await.expect("query should parse");
+            let batches = df.collect().await.expect("collect annotate_vep");
+            let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+            let most = string_values(
+                batches[0]
+                    .column_by_name("most_severe_consequence")
+                    .expect("most_severe_consequence column exists"),
+            );
+            let csq0 = csq[0].as_ref().expect("csq should be present");
+            assert_terms_sorted_by_rank(csq0);
+            assert_term_set_exact(csq0, &["inframe_deletion"]);
+            assert_eq!(
+                most[0],
+                Some("inframe_deletion".to_string()),
+                "backend={backend}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_csq_has_74_pipe_delimited_fields_per_transcript() {
-        let ctx = create_vep_session();
-        ctx.register_table("vcf_data", Arc::new(vcf_table()))
-            .expect("register vcf table");
-        ctx.register_table("var_cache", Arc::new(cache_table()))
-            .expect("register cache table");
-        ctx.register_table("var_cache_transcripts", Arc::new(transcripts_table()))
-            .expect("register transcripts table");
-        ctx.register_table("var_cache_exons", Arc::new(exons_table()))
-            .expect("register exons table");
+        for backend in ["parquet", "fjall"] {
+            let ctx = create_vep_session();
+            ctx.register_table("vcf_data", Arc::new(vcf_table()))
+                .expect("register vcf table");
+            ctx.register_table("var_cache", Arc::new(cache_table()))
+                .expect("register cache table");
+            ctx.register_table("var_cache_transcripts", Arc::new(transcripts_table()))
+                .expect("register transcripts table");
+            ctx.register_table("var_cache_exons", Arc::new(exons_table()))
+                .expect("register exons table");
 
-        let df = ctx
-            .sql(
-                "SELECT csq FROM annotate_vep('vcf_data', 'var_cache', 'parquet') \
-                 ORDER BY chrom",
-            )
-            .await
-            .expect("query should parse");
-        let batches = df.collect().await.expect("collect annotate_vep");
-        let csq_values = string_values(batches[0].column_by_name("csq").expect("csq column"));
+            let sql = format!(
+                "SELECT csq FROM annotate_vep('vcf_data', 'var_cache', '{backend}') \
+                 ORDER BY chrom"
+            );
+            let df = ctx.sql(&sql).await.expect("query should parse");
+            let batches = df.collect().await.expect("collect annotate_vep");
+            let csq_values = string_values(batches[0].column_by_name("csq").expect("csq column"));
 
-        for csq_opt in &csq_values {
-            let Some(csq) = csq_opt else { continue };
-            // Each CSQ entry (comma-separated) should have exactly 74 pipe-delimited fields.
-            for entry in csq.split(',') {
-                let fields: Vec<&str> = entry.split('|').collect();
-                assert_eq!(
-                    fields.len(),
-                    74,
-                    "CSQ entry should have 74 pipe-delimited fields, got {}: {:?}",
-                    fields.len(),
-                    entry
-                );
-                // Allele (field 0) should be non-empty.
-                assert!(!fields[0].is_empty(), "Allele field should not be empty");
-                // Consequence (field 1) should be non-empty.
-                assert!(
-                    !fields[1].is_empty(),
-                    "Consequence field should not be empty"
-                );
-                // IMPACT (field 2) should be one of the standard values.
-                assert!(
-                    ["HIGH", "MODERATE", "LOW", "MODIFIER"].contains(&fields[2]),
-                    "IMPACT field should be a standard value, got: {}",
-                    fields[2]
-                );
-                // Feature_type (field 5) should be set for transcript hits.
-                // Feature (field 6) should match transcript_id when Feature_type is "Transcript".
-                if fields[5] == "Transcript" {
-                    assert!(
-                        !fields[6].is_empty(),
-                        "Feature should have transcript_id when Feature_type is Transcript"
+            for csq_opt in &csq_values {
+                let Some(csq) = csq_opt else { continue };
+                for entry in csq.split(',') {
+                    let fields: Vec<&str> = entry.split('|').collect();
+                    assert_eq!(
+                        fields.len(),
+                        74,
+                        "backend={backend}: CSQ entry should have 74 pipe-delimited fields, got {}: {:?}",
+                        fields.len(),
+                        entry
                     );
+                    assert!(
+                        !fields[0].is_empty(),
+                        "backend={backend}: Allele field should not be empty"
+                    );
+                    assert!(
+                        !fields[1].is_empty(),
+                        "backend={backend}: Consequence field should not be empty"
+                    );
+                    assert!(
+                        ["HIGH", "MODERATE", "LOW", "MODIFIER"].contains(&fields[2]),
+                        "backend={backend}: IMPACT field should be a standard value, got: {}",
+                        fields[2]
+                    );
+                    if fields[5] == "Transcript" {
+                        assert!(
+                            !fields[6].is_empty(),
+                            "backend={backend}: Feature should have transcript_id when Feature_type is Transcript"
+                        );
+                    }
                 }
             }
         }

@@ -1453,4 +1453,481 @@ mod tests {
             "Expected all three variation_names in output"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // KV (fjall) parity tests — mirrors of the Parquet-path tests above
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_kv_left_join_preserves_unmatched_vcf_rows() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+
+        // Two cache entries matching chr1:100 and chr1:200 — nothing for chr2:500.
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Int64Array::from(vec![101, 201])),
+                Arc::new(StringArray::from(vec!["rs123", "rs456"])),
+                Arc::new(StringArray::from(vec!["A/G", "C/T"])),
+                Arc::new(StringArray::from(vec!["benign", "pathogenic"])),
+                Arc::new(Int64Array::from(vec![0, 0])),
+            ],
+        )
+        .unwrap();
+
+        // Store both alleles at their respective positions.
+        let entry_100 = serialize_position_entry(&[0], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        let entry_200 = serialize_position_entry(&[1], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        let cache_dir = unique_temp_dir("vep-kv-left-join");
+        let store = VepKvStore::create(&cache_dir, cache_schema).unwrap();
+        store.put_position_entry("1", 100, &entry_100).unwrap();
+        store.put_position_entry("1", 200, &entry_200).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
+        ctx.register_table("var_cache", Arc::new(kv_provider))
+            .unwrap();
+
+        let batches = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'clin_sig')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 3,
+            "Expected 3 rows (2 matched + 1 unmatched), got {total_rows}"
+        );
+
+        let mut chroms = Vec::new();
+        let mut clin_sigs = Vec::new();
+        for batch in &batches {
+            let chrom_col = batch.column_by_name("chrom").unwrap();
+            let clin_sig_col = batch.column_by_name("cache_clin_sig").unwrap();
+            let chrom_vals = string_values(chrom_col);
+            let clin_sig_vals = string_values(clin_sig_col);
+            for i in 0..batch.num_rows() {
+                chroms.push(chrom_vals[i].clone().unwrap_or_else(|| "NULL".to_string()));
+                clin_sigs.push(
+                    clin_sig_vals[i]
+                        .clone()
+                        .unwrap_or_else(|| "NULL".to_string()),
+                );
+            }
+        }
+
+        assert!(
+            chroms.contains(&"chr2".to_string()),
+            "Expected 'chr2' (unmatched VCF row) in output, got chroms: {chroms:?}"
+        );
+        let chr2_idx = chroms.iter().position(|c| c == "chr2").unwrap();
+        assert_eq!(
+            clin_sigs[chr2_idx], "NULL",
+            "Expected NULL clin_sig for unmatched chr2 row, got: {}",
+            clin_sigs[chr2_idx]
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_kv_no_false_matches_at_adjacent_positions() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(StringArray::from(vec!["A", "C"])),
+                Arc::new(StringArray::from(vec!["G", "T"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+        ctx.register_table("vcf_kv_adj", Arc::new(vcf)).unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+
+        // TRUE matches at 100 and 200; DECOYS at 101 and 201.
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1", "1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 101, 200, 201])),
+                Arc::new(Int64Array::from(vec![100, 101, 200, 201])),
+                Arc::new(StringArray::from(vec!["rs100", "rs101", "rs200", "rs201"])),
+                Arc::new(StringArray::from(vec!["A/G", "T/G", "C/T", "G/T"])),
+                Arc::new(StringArray::from(vec![
+                    "benign",
+                    "decoy_101",
+                    "pathogenic",
+                    "decoy_201",
+                ])),
+                Arc::new(Int64Array::from(vec![0, 0, 0, 0])),
+            ],
+        )
+        .unwrap();
+
+        let cache_dir = unique_temp_dir("vep-kv-adj-pos");
+        let store = VepKvStore::create(&cache_dir, cache_schema).unwrap();
+
+        // Each position gets its own entry.
+        let entry_100 = serialize_position_entry(&[0], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        let entry_101 = serialize_position_entry(&[1], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        let entry_200 = serialize_position_entry(&[2], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        let entry_201 = serialize_position_entry(&[3], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        store.put_position_entry("1", 100, &entry_100).unwrap();
+        store.put_position_entry("1", 101, &entry_101).unwrap();
+        store.put_position_entry("1", 200, &entry_200).unwrap();
+        store.put_position_entry("1", 201, &entry_201).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
+        ctx.register_table("cache_kv_adj", Arc::new(kv_provider))
+            .unwrap();
+
+        let batches = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_kv_adj', 'cache_kv_adj', 'variation_name,clin_sig')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 2,
+            "Expected exactly 2 rows (one match per VCF variant, no decoys), got {total_rows}"
+        );
+
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+        assert!(var_names.contains(&"rs100".to_string()));
+        assert!(var_names.contains(&"rs200".to_string()));
+        assert!(!var_names.contains(&"rs101".to_string()));
+        assert!(!var_names.contains(&"rs201".to_string()));
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_kv_matches_pipe_joined_multi_alt_input() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G|T"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+        ctx.register_table("vcf_kv_multi", Arc::new(vcf)).unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(StringArray::from(vec!["rs_g_match", "rs_c_miss"])),
+                Arc::new(StringArray::from(vec!["A/G", "A/C"])),
+                Arc::new(StringArray::from(vec!["benign", "benign"])),
+                Arc::new(Int64Array::from(vec![0, 0])),
+            ],
+        )
+        .unwrap();
+
+        // Both alleles at same position → single position entry.
+        let entry = serialize_position_entry(&[0, 1], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        let cache_dir = unique_temp_dir("vep-kv-multi-alt");
+        let store = VepKvStore::create(&cache_dir, cache_schema).unwrap();
+        store.put_position_entry("1", 100, &entry).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
+        ctx.register_table("cache_kv_multi", Arc::new(kv_provider))
+            .unwrap();
+
+        let batches = ctx
+            .sql(
+                "SELECT * FROM lookup_variants('vcf_kv_multi', 'cache_kv_multi', 'variation_name')",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "Expected one row from ALT=G|T matching A/G");
+
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+        assert_eq!(var_names, vec!["rs_g_match"]);
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_kv_matches_insertion_style_cache_coordinates() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["AT"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+        ctx.register_table("vcf_kv_ins", Arc::new(vcf)).unwrap();
+
+        // Insertion-style cache: start=101, end=100 (start > end).
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![101, 102])),
+                Arc::new(Int64Array::from(vec![100, 101])),
+                Arc::new(StringArray::from(vec!["rs_ins_match", "rs_ins_miss"])),
+                Arc::new(StringArray::from(vec!["-/T", "-/T"])),
+                Arc::new(StringArray::from(vec!["pathogenic", "pathogenic"])),
+                Arc::new(Int64Array::from(vec![0, 0])),
+            ],
+        )
+        .unwrap();
+
+        let cache_dir = unique_temp_dir("vep-kv-ins-style");
+        let store = VepKvStore::create(&cache_dir, cache_schema).unwrap();
+        // Store at the cache start positions.
+        let entry_101 = serialize_position_entry(&[0], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        let entry_102 = serialize_position_entry(&[1], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        store.put_position_entry("1", 101, &entry_101).unwrap();
+        store.put_position_entry("1", 102, &entry_102).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
+        ctx.register_table("cache_kv_ins", Arc::new(kv_provider))
+            .unwrap();
+
+        let batches = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_kv_ins', 'cache_kv_ins', 'variation_name', 'exact', true)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 1,
+            "Expected one match against insertion-style cache coordinates"
+        );
+
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+        assert_eq!(var_names, vec!["rs_ins_match"]);
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_kv_cache_duplicates_produce_separate_rows() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+        ctx.register_table("vcf_kv_dup", Arc::new(vcf)).unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        // Three alleles at the same position, all A/G with different variation_names.
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(StringArray::from(vec!["rs100", "COSM123", "rs100_dup"])),
+                Arc::new(StringArray::from(vec!["A/G", "A/G", "A/G"])),
+                Arc::new(StringArray::from(vec!["benign", "benign", "benign"])),
+                Arc::new(Int64Array::from(vec![0, 0, 0])),
+            ],
+        )
+        .unwrap();
+
+        // All three rows go into a single position entry.
+        let entry =
+            serialize_position_entry(&[0, 1, 2], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        let cache_dir = unique_temp_dir("vep-kv-dup");
+        let store = VepKvStore::create(&cache_dir, cache_schema).unwrap();
+        store.put_position_entry("1", 100, &entry).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let kv_provider = KvCacheTableProvider::open(&cache_dir).unwrap();
+        ctx.register_table("cache_kv_dup", Arc::new(kv_provider))
+            .unwrap();
+
+        let batches = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_kv_dup', 'cache_kv_dup', 'variation_name,clin_sig')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 3,
+            "Expected 3 rows (one per cache duplicate), got {total_rows}"
+        );
+
+        let mut var_names = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for val in string_values(col) {
+                if let Some(v) = val {
+                    var_names.push(v);
+                }
+            }
+        }
+        var_names.sort();
+        assert_eq!(
+            var_names,
+            vec!["COSM123", "rs100", "rs100_dup"],
+            "Expected all three variation_names in output"
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
 }
