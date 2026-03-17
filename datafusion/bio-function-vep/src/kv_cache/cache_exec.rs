@@ -241,6 +241,7 @@ struct KvLookupStream {
 struct KvColocIndices {
     variation_name: usize,
     _allele_string_col: usize,
+    end_col: Option<usize>,
     somatic: Option<usize>,
     pheno: Option<usize>,
     clin_sig: Option<usize>,
@@ -619,7 +620,7 @@ impl KvLookupStream {
                     let input_allele_string = format!("{input_ref}/{input_alt}");
                     let (_vep_ref, vep_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
 
-                    // Iterate ALL alleles at this position for colocated collection.
+                    // Iterate alleles at this position for colocated collection.
                     for allele_idx in 0..reader.num_alleles() {
                         let var_name = reader.read_string_value(ci.variation_name, allele_idx);
                         let var_name = match var_name {
@@ -642,6 +643,11 @@ impl KvLookupStream {
                                 strand: 1,
                             },
                         );
+
+                        // Skip variants whose alleles don't match the input variant.
+                        if matched_alleles.is_empty() {
+                            continue;
+                        }
 
                         let key: ColocatedKey = (
                             chrom_norm.clone(),
@@ -1009,6 +1015,7 @@ fn resolve_kv_coloc_indices(store: &VepKvStore) -> Option<KvColocIndices> {
     Some(KvColocIndices {
         variation_name,
         _allele_string_col: allele_string_col,
+        end_col: find_stored_idx("end"),
         somatic: find_stored_idx("somatic"),
         pheno: find_stored_idx("phenotype_or_disease"),
         clin_sig: find_stored_idx("clin_sig"),
