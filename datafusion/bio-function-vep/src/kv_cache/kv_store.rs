@@ -20,15 +20,16 @@ const MAX_DECOMPRESSED_ENTRY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Format version 0: position-keyed entries — one fjall entry per genomic position.
 ///
-/// Each `(chrom, start, end)` maps to a zstd-compressed serialized entry containing
-/// the allele table and column-major data. Only positions matching VCF queries are fetched.
+/// Each `(chrom, start)` maps to a zstd-compressed serialized entry containing
+/// the allele table and column-major data (including the `end` column).
+/// All variants at the same `(chrom, start)` are merged into one entry.
 pub const FORMAT_V0: u8 = 0;
 
 /// Wrapper around fjall `Database` for VEP cache storage.
 ///
 /// Layout:
 /// - `meta` keyspace: schema (Arrow IPC), format version, zstd dictionary
-/// - `data` keyspace: `(chrom, start, end)` -> compressed position entry
+/// - `data` keyspace: `(chrom, start)` -> compressed position entry
 pub struct VepKvStore {
     root_path: PathBuf,
     db: Database,
@@ -202,31 +203,6 @@ impl VepKvStore {
         &self.schema
     }
 
-    /// Get all position entries with the given chrom and start, regardless of end.
-    /// Uses fjall prefix scan on the first 10 bytes of the key (chrom_code + start).
-    pub fn get_position_entries_by_start(
-        &self,
-        chrom_code: u16,
-        start: i64,
-    ) -> Result<Vec<(i64, fjall::UserValue)>> {
-        use fjall::Readable;
-
-        let mut prefix = Vec::with_capacity(10);
-        prefix.extend_from_slice(&chrom_code.to_be_bytes());
-        prefix.extend_from_slice(&start.to_be_bytes());
-
-        let snap = self.db.snapshot();
-        let mut results = Vec::new();
-        for guard in snap.prefix(&self.data, &prefix) {
-            let (key, value) = guard.into_inner().map_err(fjall_err)?;
-            if key.len() >= 18 {
-                let end = i64::from_be_bytes(key[10..18].try_into().unwrap());
-                results.push((end, value));
-            }
-        }
-        Ok(results)
-    }
-
     pub fn root_path(&self) -> &Path {
         &self.root_path
     }
@@ -244,29 +220,22 @@ impl VepKvStore {
     // --- position-keyed API ---
 
     /// Write a position entry.
-    pub fn put_position_entry(
-        &self,
-        chrom: &str,
-        start: i64,
-        end: i64,
-        value: &[u8],
-    ) -> Result<()> {
-        let key = super::key_encoding::encode_position_key(chrom, start, end);
+    pub fn put_position_entry(&self, chrom: &str, start: i64, value: &[u8]) -> Result<()> {
+        let key = super::key_encoding::encode_position_key(chrom, start);
         self.data.insert(&key, value).map_err(fjall_err)?;
         Ok(())
     }
 
-    /// Read a position entry by chrom code + coordinates.
+    /// Read a position entry by chrom code + start.
     ///
     /// Uses a pre-encoded key buffer for hot-path efficiency.
     pub fn get_position_entry(
         &self,
         chrom_code: u16,
         start: i64,
-        end: i64,
     ) -> Result<Option<fjall::UserValue>> {
-        let mut key_buf = Vec::with_capacity(18);
-        super::key_encoding::encode_position_key_buf(chrom_code, start, end, &mut key_buf);
+        let mut key_buf = Vec::with_capacity(10);
+        super::key_encoding::encode_position_key_buf(chrom_code, start, &mut key_buf);
         match self.data.get(&key_buf) {
             Ok(v) => Ok(v),
             Err(e) => Err(fjall_err(e)),
@@ -302,9 +271,8 @@ impl VepKvStore {
         &self,
         chrom_code: u16,
         start: i64,
-        end: i64,
     ) -> Result<Option<Vec<u8>>> {
-        let raw = self.get_position_entry(chrom_code, start, end)?;
+        let raw = self.get_position_entry(chrom_code, start)?;
         match raw {
             None => Ok(None),
             Some(compressed) => {
@@ -364,11 +332,10 @@ impl VepKvStore {
         &self,
         chrom_code: u16,
         start: i64,
-        end: i64,
         decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
         buf: &mut Vec<u8>,
     ) -> Result<bool> {
-        let raw = self.get_position_entry(chrom_code, start, end)?;
+        let raw = self.get_position_entry(chrom_code, start)?;
         match raw {
             None => Ok(false),
             Some(compressed) => match decompressor {
@@ -540,18 +507,15 @@ mod tests {
         assert_eq!(store.format_version(), FORMAT_V0);
 
         let value = b"test_position_data";
-        store.put_position_entry("1", 100, 100, value).unwrap();
+        store.put_position_entry("1", 100, value).unwrap();
         store.persist().unwrap();
 
         let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
-        let loaded = store
-            .get_position_entry(chrom_code, 100, 100)
-            .unwrap()
-            .unwrap();
+        let loaded = store.get_position_entry(chrom_code, 100).unwrap().unwrap();
         assert_eq!(&*loaded, value);
 
         // Missing position returns None.
-        let missing = store.get_position_entry(chrom_code, 999, 999).unwrap();
+        let missing = store.get_position_entry(chrom_code, 999).unwrap();
         assert!(missing.is_none());
 
         // Reopen and verify persistence.
@@ -559,7 +523,7 @@ mod tests {
         let reopened = VepKvStore::open(dir.path()).unwrap();
         assert_eq!(reopened.format_version(), FORMAT_V0);
         let loaded = reopened
-            .get_position_entry(chrom_code, 100, 100)
+            .get_position_entry(chrom_code, 100)
             .unwrap()
             .unwrap();
         assert_eq!(&*loaded, value);
@@ -595,7 +559,7 @@ mod tests {
         for (i, sample) in samples.iter().enumerate() {
             let compressed = compressor.compress(sample).unwrap();
             store
-                .put_position_entry("1", i as i64, i as i64, &compressed)
+                .put_position_entry("1", i as i64, &compressed)
                 .unwrap();
         }
         store.persist().unwrap();
@@ -609,7 +573,7 @@ mod tests {
         let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
         for (i, sample) in samples.iter().enumerate() {
             let decompressed = reopened
-                .get_position_entry_decompressed(chrom_code, i as i64, i as i64)
+                .get_position_entry_decompressed(chrom_code, i as i64)
                 .unwrap()
                 .unwrap();
             assert_eq!(&decompressed, sample, "mismatch at entry {i}");
@@ -618,7 +582,7 @@ mod tests {
         // Missing entry still returns None.
         assert!(
             reopened
-                .get_position_entry_decompressed(chrom_code, 9999, 9999)
+                .get_position_entry_decompressed(chrom_code, 9999)
                 .unwrap()
                 .is_none()
         );
@@ -656,14 +620,14 @@ mod tests {
             "test payload is not compressed enough to trigger resize retry"
         );
 
-        store.put_position_entry("1", 42, 42, &compressed).unwrap();
+        store.put_position_entry("1", 42, &compressed).unwrap();
         store.persist().unwrap();
         drop(store);
 
         let reopened = VepKvStore::open(dir.path()).unwrap();
         let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
         let decompressed = reopened
-            .get_position_entry_decompressed(chrom_code, 42, 42)
+            .get_position_entry_decompressed(chrom_code, 42)
             .unwrap()
             .unwrap();
         assert_eq!(decompressed, huge);

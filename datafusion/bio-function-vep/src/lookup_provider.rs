@@ -484,11 +484,13 @@ mod tests {
         )
         .unwrap();
 
-        let entry = serialize_position_entry(&[0], &cache_batch, &[3, 4, 5], 4).unwrap();
+        // col_indices: end(2), variation_name(3), allele_string(4), clin_sig(5), failed(6)
+        // (chrom=0 and start=1 are excluded from the entry; end is stored inside)
+        let entry = serialize_position_entry(&[0], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
         let cache_dir = unique_temp_dir("vep-kv-dispatch");
 
         let store = VepKvStore::create(&cache_dir, cache_schema).unwrap();
-        store.put_position_entry("1", 100, 101, &entry).unwrap();
+        store.put_position_entry("1", 100, &entry).unwrap();
         store.persist().unwrap();
         drop(store);
 
@@ -581,10 +583,11 @@ mod tests {
         )
         .unwrap();
 
-        let entry = serialize_position_entry(&[0], &cache_batch, &[3, 4, 5], 4).unwrap();
+        // col_indices: end(2), variation_name(3), allele_string(4), clin_sig(5), failed(6)
+        let entry = serialize_position_entry(&[0], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
         let cache_dir = unique_temp_dir("vep-kv-prefix-shift");
         let store = VepKvStore::create(&cache_dir, cache_schema).unwrap();
-        store.put_position_entry("1", 101, 103, &entry).unwrap();
+        store.put_position_entry("1", 101, &entry).unwrap();
         store.persist().unwrap();
         drop(store);
 
@@ -672,10 +675,11 @@ mod tests {
         )
         .unwrap();
 
-        let entry = serialize_position_entry(&[0], &cache_batch, &[3, 4, 5], 4).unwrap();
+        // col_indices: end(2), variation_name(3), allele_string(4), clin_sig(5), failed(6)
+        let entry = serialize_position_entry(&[0], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
         let cache_dir = unique_temp_dir("vep-kv-repeat-shift");
         let store = VepKvStore::create(&cache_dir, cache_schema).unwrap();
-        store.put_position_entry("1", 66, 79, &entry).unwrap();
+        store.put_position_entry("1", 66, &entry).unwrap();
         store.persist().unwrap();
         drop(store);
 

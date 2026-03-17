@@ -1,8 +1,10 @@
 //! Parquet -> fjall cache ingestion pipeline (streaming).
 //!
 //! Loads a VEP variation cache from Parquet into a fjall KV store,
-//! storing one zstd-compressed entry per genomic position and
+//! storing one zstd-compressed entry per `(chrom, start)` position and
 //! parallelizing across DataFusion physical partitions.
+//! All variants at the same `(chrom, start)` — regardless of `end` —
+//! are merged into a single entry with `end` stored as a regular column.
 //!
 //! Streaming approach:
 //! 1. A sample of up to 10,000 rows is read from the source table to train
@@ -220,10 +222,10 @@ impl CacheLoader {
 
         let chrom_col_idx = schema.index_of("chrom")?;
         let start_col_idx = schema.index_of("start")?;
-        let end_col_idx = schema.index_of("end")?;
         let allele_col_idx = schema.index_of("allele_string")?;
+        // `end` is stored as a regular column inside the entry (not part of the key).
         let col_indices: Vec<usize> = (0..schema.fields().len())
-            .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+            .filter(|&i| i != chrom_col_idx && i != start_col_idx)
             .collect();
 
         // Serialize position entries from sample batches.
@@ -234,15 +236,13 @@ impl CacheLoader {
             }
             let chrom_col = batch.column(chrom_col_idx);
             let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
-            let ends = batch.column(end_col_idx).as_primitive::<Int64Type>();
 
-            let mut groups: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
+            let mut groups: HashMap<(String, i64), Vec<usize>> = HashMap::new();
             for row in 0..batch.num_rows() {
                 let chrom = string_value(chrom_col.as_ref(), row);
                 let start = starts.value(row);
-                let end = ends.value(row);
                 groups
-                    .entry((chrom.to_string(), start, end))
+                    .entry((chrom.to_string(), start))
                     .or_default()
                     .push(row);
             }
@@ -386,24 +386,22 @@ fn flush_positions_uncompressed(
 ) -> Result<(u64, u64)> {
     let chrom_col_idx = schema.index_of("chrom")?;
     let start_col_idx = schema.index_of("start")?;
-    let end_col_idx = schema.index_of("end")?;
     let allele_col_idx = schema.index_of("allele_string")?;
 
     let chrom_col = batch.column(chrom_col_idx);
     let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
-    let ends = batch.column(end_col_idx).as_primitive::<Int64Type>();
 
+    // `end` is stored as a regular column inside the entry.
     let col_indices: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+        .filter(|&i| i != chrom_col_idx && i != start_col_idx)
         .collect();
 
-    let mut groups: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<(String, i64), Vec<usize>> = HashMap::new();
     for row in 0..batch.num_rows() {
         let chrom = string_value(chrom_col.as_ref(), row);
         let start = starts.value(row);
-        let end = ends.value(row);
         groups
-            .entry((chrom.to_string(), start, end))
+            .entry((chrom.to_string(), start))
             .or_default()
             .push(row);
     }
@@ -411,14 +409,14 @@ fn flush_positions_uncompressed(
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(groups.len());
     let mut total_bytes = 0u64;
 
-    for ((chrom, start, end), rows) in &groups {
+    for ((chrom, start), rows) in &groups {
         let mut value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
         if let Some(existing) =
-            store.get_position_entry_decompressed(chrom_to_code(chrom), *start, *end)?
+            store.get_position_entry_decompressed(chrom_to_code(chrom), *start)?
         {
             value = merge_position_entries(&existing, &value, schema)?;
         }
-        let key = encode_position_key(chrom, *start, *end);
+        let key = encode_position_key(chrom, *start);
         total_bytes += value.len() as u64;
         entries.push((key, value));
     }
@@ -439,24 +437,22 @@ fn flush_positions_compressed(
 ) -> Result<(u64, u64)> {
     let chrom_col_idx = schema.index_of("chrom")?;
     let start_col_idx = schema.index_of("start")?;
-    let end_col_idx = schema.index_of("end")?;
     let allele_col_idx = schema.index_of("allele_string")?;
 
     let chrom_col = batch.column(chrom_col_idx);
     let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
-    let ends = batch.column(end_col_idx).as_primitive::<Int64Type>();
 
+    // `end` is stored as a regular column inside the entry.
     let col_indices: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+        .filter(|&i| i != chrom_col_idx && i != start_col_idx)
         .collect();
 
-    let mut groups: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<(String, i64), Vec<usize>> = HashMap::new();
     for row in 0..batch.num_rows() {
         let chrom = string_value(chrom_col.as_ref(), row);
         let start = starts.value(row);
-        let end = ends.value(row);
         groups
-            .entry((chrom.to_string(), start, end))
+            .entry((chrom.to_string(), start))
             .or_default()
             .push(row);
     }
@@ -464,10 +460,10 @@ fn flush_positions_compressed(
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(groups.len());
     let mut total_bytes = 0u64;
 
-    for ((chrom, start, end), rows) in &groups {
+    for ((chrom, start), rows) in &groups {
         let chrom_code = chrom_to_code(chrom);
         let mut raw_value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
-        if let Some(existing_compressed) = store.get_position_entry(chrom_code, *start, *end)? {
+        if let Some(existing_compressed) = store.get_position_entry(chrom_code, *start)? {
             let mut existing_raw = Vec::new();
             decompress_into_buffer_with_retry(
                 decompressor,
@@ -480,7 +476,7 @@ fn flush_positions_compressed(
         let compressed = compressor
             .compress(&raw_value)
             .map_err(|e| DataFusionError::Execution(format!("zstd compression failed: {e}")))?;
-        let key = encode_position_key(chrom, *start, *end);
+        let key = encode_position_key(chrom, *start);
         total_bytes += compressed.len() as u64;
         entries.push((key, compressed));
     }
@@ -493,8 +489,9 @@ fn flush_positions_compressed(
 
 /// Merge two serialized entries for the same genomic position.
 ///
-/// This preserves all allele rows when the same `(chrom,start,end)` appears in
-/// multiple input batches/partitions.
+/// This preserves all allele rows when the same `(chrom,start)` appears in
+/// multiple input batches/partitions. Entries with different `end` values
+/// are merged together since `end` is stored as a regular column.
 fn merge_position_entries(existing: &[u8], incoming: &[u8], schema: &SchemaRef) -> Result<Vec<u8>> {
     let existing_reader = PositionEntryReader::new(existing)?;
     let incoming_reader = PositionEntryReader::new(incoming)?;
@@ -509,9 +506,9 @@ fn merge_position_entries(existing: &[u8], incoming: &[u8], schema: &SchemaRef) 
 
     let chrom_col_idx = schema.index_of("chrom")?;
     let start_col_idx = schema.index_of("start")?;
-    let end_col_idx = schema.index_of("end")?;
+    // `end` is stored inside the entry as a regular column, not excluded.
     let stored_col_indices: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+        .filter(|&i| i != chrom_col_idx && i != start_col_idx)
         .collect();
 
     if stored_col_indices.len() != existing_reader.num_cols() {
@@ -629,7 +626,7 @@ mod tests {
         let loader = CacheLoader::new("source", dir.path().to_str().unwrap());
         let stats = loader.load(&ctx).await.unwrap();
 
-        // 4 rows -> 4 unique positions: (1,100,100), (1,500000,500000), (1,1500000,1500000), (2,100,100)
+        // 4 rows -> 4 unique positions: (1,100), (1,500000), (1,1500000), (2,100)
         assert_eq!(stats.total_variants, 4);
         assert!(stats.total_positions > 0);
 
@@ -642,29 +639,29 @@ mod tests {
         let chrom_code_2 = crate::kv_cache::key_encoding::chrom_to_code("2");
 
         let entry = store
-            .get_position_entry_decompressed(chrom_code_1, 100, 100)
+            .get_position_entry_decompressed(chrom_code_1, 100)
             .unwrap();
         assert!(entry.is_some());
 
         let entry = store
-            .get_position_entry_decompressed(chrom_code_1, 500_000, 500_000)
+            .get_position_entry_decompressed(chrom_code_1, 500_000)
             .unwrap();
         assert!(entry.is_some());
 
         let entry = store
-            .get_position_entry_decompressed(chrom_code_2, 100, 100)
+            .get_position_entry_decompressed(chrom_code_2, 100)
             .unwrap();
         assert!(entry.is_some());
 
         // Missing position.
         let entry = store
-            .get_position_entry_decompressed(chrom_code_1, 999, 999)
+            .get_position_entry_decompressed(chrom_code_1, 999)
             .unwrap();
         assert!(entry.is_none());
 
         // Verify a position entry can be deserialized after decompression.
         let raw = store
-            .get_position_entry_decompressed(chrom_code_1, 100, 100)
+            .get_position_entry_decompressed(chrom_code_1, 100)
             .unwrap()
             .unwrap();
         let reader = crate::kv_cache::position_entry::PositionEntryReader::new(&raw).unwrap();

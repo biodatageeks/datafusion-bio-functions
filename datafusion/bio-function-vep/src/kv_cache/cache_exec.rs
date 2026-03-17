@@ -441,15 +441,15 @@ impl KvLookupStream {
         let mut matched_allele_rows: Vec<usize> = Vec::new();
 
         // Determine which column indices in the entry correspond to our output columns.
-        // Entry stores all columns except chrom/start/end, in schema order minus those 3.
+        // Entry stores all columns except chrom/start, in schema order minus those 2.
+        // (`end` is stored as a regular column inside the entry.)
         let cache_schema = self.store.schema();
         let cache_chrom_idx = cache_schema.index_of("chrom").unwrap_or(usize::MAX);
         let cache_start_idx = cache_schema.index_of("start").unwrap_or(usize::MAX);
-        let cache_end_idx = cache_schema.index_of("end").unwrap_or(usize::MAX);
 
         // Build mapping: output_col_positions[i] -> index within the entry's column list.
         let stored_cols: Vec<usize> = (0..cache_schema.fields().len())
-            .filter(|&i| i != cache_chrom_idx && i != cache_start_idx && i != cache_end_idx)
+            .filter(|&i| i != cache_chrom_idx && i != cache_start_idx)
             .collect();
         let col_map: Vec<usize> = self
             .output_col_positions
@@ -500,27 +500,20 @@ impl KvLookupStream {
 
             let chrom_code = chrom_to_code(chrom);
 
-            // Probe a small set of coordinate encodings used by VEP-style caches:
-            // - exact normalized interval
-            // - indel point encodings at interval boundaries
-            // - insertion-style start>end form for point variants
-            let mut probe_keys: Vec<(i64, i64)> = Vec::with_capacity(4);
-            probe_keys.push((norm_start_i64, norm_end_i64));
+            // Probe a small set of start positions used by VEP-style caches.
+            // All variants at a given (chrom, start) are in one entry, so we
+            // only need to probe distinct start values.
+            let mut probe_starts: Vec<i64> = Vec::with_capacity(4);
+            probe_starts.push(norm_start_i64);
             if self.extended_probes {
                 if norm_start == norm_end {
                     let shifted = i64::from(norm_start.saturating_add(1));
-                    if !probe_keys.contains(&(shifted, norm_start_i64)) {
-                        probe_keys.push((shifted, norm_start_i64));
+                    if !probe_starts.contains(&shifted) {
+                        probe_starts.push(shifted);
                     }
                 } else {
-                    if !probe_keys.contains(&(norm_end_i64, norm_end_i64)) {
-                        probe_keys.push((norm_end_i64, norm_end_i64));
-                    }
-                    if !probe_keys.contains(&(norm_start_i64, norm_start_i64)) {
-                        probe_keys.push((norm_start_i64, norm_start_i64));
-                    }
-                    if !probe_keys.contains(&(norm_end_i64, norm_start_i64)) {
-                        probe_keys.push((norm_end_i64, norm_start_i64));
+                    if !probe_starts.contains(&norm_end_i64) {
+                        probe_starts.push(norm_end_i64);
                     }
                 }
                 // Probe prefix-trimmed coordinates used by VEP allele normalization
@@ -530,41 +523,15 @@ impl KvLookupStream {
                     if shift_usize == 0 {
                         continue;
                     }
-                    let ref_remaining = vcf_ref.len().saturating_sub(shift_usize);
-                    let alt_remaining = alt.len().saturating_sub(shift_usize);
                     let shift = shift_usize as i64;
                     if let Some(shifted_start) = norm_start_i64.checked_add(shift) {
-                        if !probe_keys.contains(&(shifted_start, norm_end_i64)) {
-                            probe_keys.push((shifted_start, norm_end_i64));
-                        }
-                        if !probe_keys.contains(&(shifted_start, shifted_start)) {
-                            probe_keys.push((shifted_start, shifted_start));
-                        }
-                        if !probe_keys.contains(&(norm_end_i64, shifted_start)) {
-                            probe_keys.push((norm_end_i64, shifted_start));
-                        }
-                        // For insertions: the cache may store the variant with a wider
-                        // end coordinate (e.g., GCC/GCCCAGCC at 602114-602116 for an
-                        // insertion that VEP normalizes to -/GCCCA at 602114).
-                        // Scan all entries at (chrom, shifted_start) to find matches
-                        // that the bidirectional allele trimming will resolve.
-                        if ref_remaining == 0 && alt_remaining > 0 {
-                            if let Ok(entries) = self
-                                .store
-                                .get_position_entries_by_start(chrom_code, shifted_start)
-                            {
-                                for (end, _) in &entries {
-                                    if !probe_keys.contains(&(shifted_start, *end)) {
-                                        probe_keys.push((shifted_start, *end));
-                                    }
-                                }
-                            }
+                        if !probe_starts.contains(&shifted_start) {
+                            probe_starts.push(shifted_start);
                         }
                     }
                 }
                 // Deletions in tandem repeats may be right/left shifted in cache coordinates.
-                // Probe a bounded window of equivalent deletion intervals that still overlap
-                // the normalized VCF interval.
+                // Probe a bounded window of equivalent deletion start positions.
                 for alt in vcf_alt.split(['|', ',']).filter(|a| !a.is_empty()) {
                     let (ref_event_len, alt_event_len) = canonical_event_lengths(vcf_ref, alt);
                     if ref_event_len == 0 || alt_event_len != 0 {
@@ -586,8 +553,8 @@ impl KvLookupStream {
                             if candidate_start > norm_end_i64 || candidate_end < norm_start_i64 {
                                 continue;
                             }
-                            if !probe_keys.contains(&(candidate_start, candidate_end)) {
-                                probe_keys.push((candidate_start, candidate_end));
+                            if !probe_starts.contains(&candidate_start) {
+                                probe_starts.push(candidate_start);
                             }
                         }
                     }
@@ -595,11 +562,10 @@ impl KvLookupStream {
             }
 
             let mut emitted_match = false;
-            for (probe_start, probe_end) in probe_keys {
+            for probe_start in &probe_starts {
                 let found = self.store.get_position_entry_fast(
                     chrom_code,
-                    probe_start,
-                    probe_end,
+                    *probe_start,
                     decompressor.as_mut(),
                     &mut decompress_buf,
                 )?;
@@ -671,7 +637,7 @@ impl KvLookupStream {
                             },
                             VariantAlleleInput {
                                 allele_string: allele_str,
-                                pos: probe_start,
+                                pos: *probe_start,
                                 strand: 1,
                             },
                         );
@@ -1012,17 +978,16 @@ fn canonical_event_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize)
 
 /// Resolve column indices within the KV entry for co-located fields.
 ///
-/// The entry stores all cache schema columns except chrom/start/end, in schema order
-/// minus those three. We need to find variation_name, allele_string, somatic, etc.
+/// The entry stores all cache schema columns except chrom/start, in schema order
+/// minus those two. `end` is stored as a regular column inside the entry.
 fn resolve_kv_coloc_indices(store: &VepKvStore) -> Option<KvColocIndices> {
     let cache_schema = store.schema();
     let cache_chrom_idx = cache_schema.index_of("chrom").unwrap_or(usize::MAX);
     let cache_start_idx = cache_schema.index_of("start").unwrap_or(usize::MAX);
-    let cache_end_idx = cache_schema.index_of("end").unwrap_or(usize::MAX);
 
     // Build the stored column mapping (same logic as process_batch).
     let stored_cols: Vec<usize> = (0..cache_schema.fields().len())
-        .filter(|&i| i != cache_chrom_idx && i != cache_start_idx && i != cache_end_idx)
+        .filter(|&i| i != cache_chrom_idx && i != cache_start_idx)
         .collect();
 
     let find_stored_idx = |name: &str| -> Option<usize> {
