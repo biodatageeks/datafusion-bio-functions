@@ -478,13 +478,8 @@ impl KvLookupStream {
                     if shift_usize == 0 {
                         continue;
                     }
-                    // Apply shifted probes only to deletion-like events. For insertions,
-                    // probing shifted point keys produces false positives.
                     let ref_remaining = vcf_ref.len().saturating_sub(shift_usize);
                     let alt_remaining = alt.len().saturating_sub(shift_usize);
-                    if ref_remaining <= alt_remaining {
-                        continue;
-                    }
                     let shift = shift_usize as i64;
                     if let Some(shifted_start) = norm_start_i64.checked_add(shift) {
                         if !probe_keys.contains(&(shifted_start, norm_end_i64)) {
@@ -495,6 +490,23 @@ impl KvLookupStream {
                         }
                         if !probe_keys.contains(&(norm_end_i64, shifted_start)) {
                             probe_keys.push((norm_end_i64, shifted_start));
+                        }
+                        // For insertions: the cache may store the variant with a wider
+                        // end coordinate (e.g., GCC/GCCCAGCC at 602114-602116 for an
+                        // insertion that VEP normalizes to -/GCCCA at 602114).
+                        // Scan all entries at (chrom, shifted_start) to find matches
+                        // that the bidirectional allele trimming will resolve.
+                        if ref_remaining == 0 && alt_remaining > 0 {
+                            if let Ok(entries) = self
+                                .store
+                                .get_position_entries_by_start(chrom_code, shifted_start)
+                            {
+                                for (end, _) in &entries {
+                                    if !probe_keys.contains(&(shifted_start, *end)) {
+                                        probe_keys.push((shifted_start, *end));
+                                    }
+                                }
+                            }
                         }
                     }
                 }

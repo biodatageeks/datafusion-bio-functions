@@ -202,6 +202,31 @@ impl VepKvStore {
         &self.schema
     }
 
+    /// Get all position entries with the given chrom and start, regardless of end.
+    /// Uses fjall prefix scan on the first 10 bytes of the key (chrom_code + start).
+    pub fn get_position_entries_by_start(
+        &self,
+        chrom_code: u16,
+        start: i64,
+    ) -> Result<Vec<(i64, fjall::UserValue)>> {
+        use fjall::Readable;
+
+        let mut prefix = Vec::with_capacity(10);
+        prefix.extend_from_slice(&chrom_code.to_be_bytes());
+        prefix.extend_from_slice(&start.to_be_bytes());
+
+        let snap = self.db.snapshot();
+        let mut results = Vec::new();
+        for guard in snap.prefix(&self.data, &prefix) {
+            let (key, value) = guard.into_inner().map_err(fjall_err)?;
+            if key.len() >= 18 {
+                let end = i64::from_be_bytes(key[10..18].try_into().unwrap());
+                results.push((end, value));
+            }
+        }
+        Ok(results)
+    }
+
     pub fn root_path(&self) -> &Path {
         &self.root_path
     }
