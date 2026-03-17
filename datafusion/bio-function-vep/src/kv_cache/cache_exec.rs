@@ -451,6 +451,7 @@ impl KvLookupStream {
         let stored_cols: Vec<usize> = (0..cache_schema.fields().len())
             .filter(|&i| i != cache_chrom_idx && i != cache_start_idx)
             .collect();
+
         let col_map: Vec<usize> = self
             .output_col_positions
             .iter()
