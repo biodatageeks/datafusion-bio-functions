@@ -55,6 +55,10 @@ name = "load_cache_full"
 required-features = ["kv-cache"]
 
 [[example]]
+name = "load_sift_cache"
+required-features = ["kv-cache"]
+
+[[example]]
 name = "bench_annotate"
 required-features = ["kv-cache"]
 

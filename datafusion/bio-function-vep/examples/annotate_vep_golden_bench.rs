@@ -414,8 +414,9 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
         return Ok(None);
     };
 
-    // Derive base name from cache_source (e.g. "115_GRCh38_variation_22" -> "115_GRCh38")
-    // by stripping "_variation*" or "_variants*" suffix.
+    // Derive base name from cache_source or context_dir.
+    // For fjall: cache_source is a directory path, so derive base from context_dir parquet files.
+    // For parquet: derive from cache_source filename (e.g. "115_GRCh38_variation_22" -> "115_GRCh38").
     let cache_stem = Path::new(&args.cache_source)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -426,7 +427,27 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
     } else if let Some(idx) = cache_stem.find("_variants") {
         &cache_stem[..idx]
     } else {
-        cache_stem
+        // Fjall backend: derive base from a parquet file in context_dir.
+        let found = std::fs::read_dir(context_dir).ok().and_then(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .find(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.contains("variation") && name.ends_with(".parquet")
+                })
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let stem = name.trim_end_matches(".parquet");
+                    if let Some(idx) = stem.find("_variation") {
+                        stem[..idx].to_string()
+                    } else {
+                        stem.to_string()
+                    }
+                })
+        });
+        found
+            .map(|s| &*Box::leak(s.into_boxed_str()))
+            .unwrap_or(cache_stem)
     };
 
     // Derive suffix (e.g. "_22" from "115_GRCh38_variation_22").

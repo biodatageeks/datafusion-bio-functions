@@ -105,6 +105,11 @@ pub(crate) fn decompress_into_buffer_with_retry(
 }
 
 impl VepKvStore {
+    /// Access the underlying fjall Database handle.
+    pub fn database(&self) -> &Database {
+        &self.db
+    }
+
     /// Open an existing KV store with default settings (256 MB block cache).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_cache_size(path, 256 * 1024 * 1024)

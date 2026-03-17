@@ -10,7 +10,9 @@ pub mod key_encoding;
 pub mod kv_store;
 pub mod loader;
 pub mod position_entry;
+pub mod sift_store;
 
 pub use cache_provider::KvCacheTableProvider;
 pub use kv_store::VepKvStore;
 pub use loader::CacheLoader;
+pub use sift_store::SiftKvStore;

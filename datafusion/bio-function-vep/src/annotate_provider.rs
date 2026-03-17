@@ -1026,6 +1026,157 @@ fn build_colocated_map_from_sink(
     map
 }
 
+/// Build colocated map from base_batches output columns (for fjall backend).
+/// Extracts cache_* columns that contain variation metadata from the KV lookup.
+fn build_colocated_map_from_batches(
+    batches: &[RecordBatch],
+) -> HashMap<ColocatedKey, ColocatedData> {
+    let mut map: HashMap<ColocatedKey, ColocatedData> = HashMap::new();
+
+    for batch in batches {
+        let schema = batch.schema();
+        let chrom_idx = schema.index_of("chrom").ok();
+        let start_idx = schema.index_of("start").ok();
+        let end_idx = schema.index_of("end").ok();
+        let ref_idx = schema.index_of("ref").ok();
+        let alt_idx = schema.index_of("alt").ok();
+        let var_name_idx = schema.index_of("cache_variation_name").ok();
+        let allele_str_idx = schema.index_of("cache_allele_string").ok();
+        let clin_sig_idx = schema.index_of("cache_clin_sig").ok();
+        let clin_sig_allele_idx = schema.index_of("cache_clin_sig_allele").ok();
+        let somatic_idx = schema.index_of("cache_somatic").ok();
+        let pheno_idx = schema.index_of("cache_phenotype_or_disease").ok();
+        let pubmed_idx = schema.index_of("cache_pubmed").ok();
+
+        // Collect AF column indices.
+        let af_col_names: Vec<String> = CACHE_OUTPUT_COLUMNS
+            .iter()
+            .filter(|c| {
+                c.starts_with("AF")
+                    || c.starts_with("gnomAD")
+                    || c.starts_with("AFR")
+                    || c.starts_with("AMR")
+                    || c.starts_with("EAS")
+                    || c.starts_with("EUR")
+                    || c.starts_with("SAS")
+            })
+            .map(|c| format!("cache_{c}"))
+            .collect();
+        let af_indices: Vec<Option<usize>> = af_col_names
+            .iter()
+            .map(|name| schema.index_of(name).ok())
+            .collect();
+
+        let Some(chrom_idx) = chrom_idx else {
+            continue;
+        };
+        let Some(start_idx) = start_idx else {
+            continue;
+        };
+        let Some(end_idx) = end_idx else {
+            continue;
+        };
+
+        for row in 0..batch.num_rows() {
+            let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                continue;
+            };
+            let end = int64_at(batch.column(end_idx).as_ref(), row).unwrap_or(start);
+
+            let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom).to_string();
+
+            let ref_allele = ref_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_default();
+            let alt_allele = alt_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_default();
+            let (input_ref, input_alt, input_start) =
+                crate::allele::vcf_to_vep_input_allele(start, &ref_allele, &alt_allele);
+            let input_allele_string = format!("{input_ref}/{input_alt}");
+            let key = (chrom_norm, input_start, end, input_allele_string);
+
+            let variation_name = var_name_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_default();
+            if variation_name.is_empty() {
+                continue;
+            }
+
+            let allele_string = allele_str_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_default();
+
+            let ref_allele = ref_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_default();
+            let alt_allele = alt_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .unwrap_or_default();
+
+            let (vep_ref, vep_alt) = crate::allele::vcf_to_vep_allele(&ref_allele, &alt_allele);
+            let matched = MatchedVariantAllele {
+                a_allele: vep_ref.clone(),
+                a_index: 0,
+                b_allele: vep_alt.clone(),
+                b_index: 0,
+            };
+
+            let somatic = somatic_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let pheno = pheno_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let clin_sig = clin_sig_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
+            let clin_sig_allele =
+                clin_sig_allele_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
+            let pubmed = pubmed_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
+
+            let af_values: Vec<String> = af_indices
+                .iter()
+                .map(|idx| {
+                    idx.and_then(|i| string_at(batch.column(i).as_ref(), row))
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            let entry = ColocatedEntry {
+                variation_name: variation_name.clone(),
+                allele_string,
+                matched_alleles: vec![matched],
+                somatic,
+                pheno,
+                clin_sig: clin_sig.clone(),
+                clin_sig_allele: clin_sig_allele.clone(),
+                pubmed: pubmed.clone(),
+                af_values,
+            };
+
+            let data = map.entry(key).or_insert_with(|| ColocatedData {
+                entries: Vec::new(),
+                compare_output_allele: Some(vep_alt.clone()),
+                unshifted_output_allele: None,
+            });
+
+            // Dedup by variation_name within the same position.
+            if !data
+                .entries
+                .iter()
+                .any(|e| e.variation_name == variation_name)
+            {
+                data.entries.push(entry);
+            }
+        }
+    }
+    map
+}
+
 /// Traceability:
 /// - Ensembl VEP `output_hash_to_vcf_info_chunk()`
 ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory/VCF.pm#L379-L405>
@@ -1207,7 +1358,9 @@ fn lookup_sift_polyphen(
     transcript_id: Option<&str>,
     protein_position: Option<&str>,
     amino_acids: Option<&str>,
-    cache: &SiftPolyphenCache,
+    cache: &mut SiftPolyphenCache,
+    #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
+    #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
 ) -> (String, String) {
     let empty = || (String::new(), String::new());
 
@@ -1232,6 +1385,17 @@ fn lookup_sift_polyphen(
     let Some(tx_id) = transcript_id else {
         return empty();
     };
+
+    // Lazy load from fjall sift keyspace on cache miss.
+    if cache.get(tx_id).is_none() {
+        #[cfg(feature = "kv-cache")]
+        if let Some(kv) = sift_kv {
+            if let Ok(Some(preds)) = kv.get(tx_id) {
+                cache.insert(tx_id.to_string(), preds, i64::MAX);
+            }
+        }
+    }
+
     let Some(preds) = cache.get(tx_id) else {
         return empty();
     };
@@ -2734,10 +2898,17 @@ impl AnnotateProvider {
         profile_end!("2. collect_variant_intervals", t_intervals);
 
         // Build co-located variant aggregation from the piggybacked sink.
+        // For fjall backend: the sink is empty because KvLookupExec doesn't populate it.
+        // Fall back to building from base_batches output columns.
         let t_coloc = profile_start!();
         let colocated_map = if flags.check_existing {
             let guard = coloc_sink.lock().unwrap();
-            build_colocated_map_from_sink(&guard)
+            if guard.is_empty() {
+                // Fjall path: build from base_batches cache_* columns.
+                build_colocated_map_from_batches(&base_batches)
+            } else {
+                build_colocated_map_from_sink(&guard)
+            }
         } else {
             HashMap::new()
         };
@@ -2948,16 +3119,45 @@ impl AnnotateProvider {
         // See biodatageeks/datafusion-bio-functions#38.
         let t_sift = profile_start!();
         let mut sift_cache = SiftPolyphenCache::new();
-        let sift_table_name: Option<String> = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_string_option(opts, "translations_sift_table"))
-            .or_else(|| translations_table.map(|s| s.to_string()));
-        let sift_enabled = flags.everything && sift_table_name.is_some();
+
+        // Try fjall sift keyspace first (O(1) per-transcript lookup).
+        // Reuse the Database handle from the variation cache (already opened by KvCacheTableProvider).
+        #[cfg(feature = "kv-cache")]
+        let sift_kv: Option<crate::kv_cache::SiftKvStore> = self
+            .session
+            .table_provider(cache_table)
+            .await
+            .ok()
+            .and_then(|provider| {
+                provider
+                    .as_any()
+                    .downcast_ref::<KvCacheTableProvider>()
+                    .and_then(|kv| {
+                        crate::kv_cache::SiftKvStore::open(kv.store().database())
+                            .ok()
+                            .flatten()
+                    })
+            });
+        #[cfg(not(feature = "kv-cache"))]
+        let sift_kv: Option<()> = None;
+
+        let sift_table_name: Option<String> = if sift_kv.is_some() {
+            None // Don't need parquet sift table when using fjall
+        } else {
+            self.options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_string_option(opts, "translations_sift_table"))
+                .or_else(|| translations_table.map(|s| s.to_string()))
+        };
+        let sift_enabled = flags.everything && (sift_table_name.is_some() || sift_kv.is_some());
         let mut loaded_windows: HashSet<(String, i64)> = HashSet::new();
         // Try to build a direct parquet reader for sift, bypassing DataFusion SQL.
-        let sift_direct: Option<SiftDirectReader> = if sift_enabled {
-            let table_name = sift_table_name.as_deref().unwrap();
+        let sift_direct: Option<SiftDirectReader> = if sift_enabled && sift_kv.is_none() {
+            let Some(table_name) = sift_table_name.as_deref() else {
+                return Err(DataFusionError::Execution(
+                    "sift enabled but no sift table or fjall sift keyspace available".to_string(),
+                ));
+            };
             // Resolve file path: try cache_source parent dir + table_name.parquet
             let cache_dir = std::path::Path::new(&self.cache_source)
                 .parent()
@@ -2973,8 +3173,12 @@ impl AnnotateProvider {
         } else {
             None
         };
-        if profiling_enabled() && sift_direct.is_some() {
-            eprintln!("[VEP_PROFILE] sift_direct_reader: enabled (bypassing DataFusion SQL)");
+        if profiling_enabled() {
+            if sift_kv.is_some() {
+                eprintln!("[VEP_PROFILE] sift_kv_store: enabled (per-transcript fjall lookup)");
+            } else if sift_direct.is_some() {
+                eprintln!("[VEP_PROFILE] sift_direct_reader: enabled (bypassing DataFusion SQL)");
+            }
         }
         profile_end!("7. sift_polyphen_cache_init", t_sift);
 
@@ -2989,9 +3193,8 @@ impl AnnotateProvider {
             // (cache_most_severe_consequence is non-null). With the fjall backend
             // providing ~95%+ hit rates, this skips most batches and reduces
             // sift window loading from ~24s to ~2s.
-            if sift_enabled {
-                // Check if this batch has any cache misses that need the transcript engine.
-                // If all rows have cache_most_severe_consequence populated, skip sift loading.
+            if sift_enabled && sift_kv.is_none() {
+                // Windowed parquet sift loading (skipped when fjall sift keyspace available).
                 let batch_has_miss = batch
                     .schema()
                     .index_of("cache_most_severe_consequence")
@@ -3077,7 +3280,8 @@ impl AnnotateProvider {
                 &engine,
                 &ctx,
                 &colocated_map,
-                &sift_cache,
+                &mut sift_cache,
+                &sift_kv,
             )?);
             annotate_ms += t_ann.elapsed().as_millis();
         }
@@ -3139,13 +3343,16 @@ impl AnnotateProvider {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn annotate_batch_with_transcript_engine(
         &self,
         batch: &RecordBatch,
         engine: &TranscriptConsequenceEngine,
         ctx: &PreparedContext<'_>,
         colocated_map: &HashMap<ColocatedKey, ColocatedData>,
-        sift_cache: &SiftPolyphenCache,
+        sift_cache: &mut SiftPolyphenCache,
+        #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
+        #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
@@ -3561,6 +3768,10 @@ impl AnnotateProvider {
                             tc.protein_position.as_deref(),
                             tc.amino_acids.as_deref(),
                             sift_cache,
+                            #[cfg(feature = "kv-cache")]
+                            sift_kv,
+                            #[cfg(not(feature = "kv-cache"))]
+                            _sift_kv,
                         );
                         // DOMAINS: overlapping protein domain features.
                         // VEP gates DOMAINS on $pre->{coding} which requires
@@ -5035,7 +5246,7 @@ mod tests {
 
     #[test]
     fn test_lookup_sift_polyphen_single_aa_match() {
-        let cache = make_sift_cache(vec![(
+        let mut cache = make_sift_cache(vec![(
             "ENST00000001",
             42,
             "I",
@@ -5044,15 +5255,20 @@ mod tests {
             "probably damaging",
             0.999,
         )]);
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST00000001"), Some("42"), Some("V/I"), &cache);
+        let (sift, polyphen) = lookup_sift_polyphen(
+            Some("ENST00000001"),
+            Some("42"),
+            Some("V/I"),
+            &mut cache,
+            &None,
+        );
         assert_eq!(sift, "deleterious(0.01)");
         assert_eq!(polyphen, "probably_damaging(0.999)");
     }
 
     #[test]
     fn test_lookup_sift_polyphen_non_substitution_skipped() {
-        let cache = make_sift_cache(vec![(
+        let mut cache = make_sift_cache(vec![(
             "ENST00000001",
             42,
             "I",
@@ -5062,23 +5278,38 @@ mod tests {
             0.0,
         )]);
         // Multi-char alt amino acid — not a single substitution.
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST00000001"), Some("42"), Some("V/IL"), &cache);
+        let (sift, polyphen) = lookup_sift_polyphen(
+            Some("ENST00000001"),
+            Some("42"),
+            Some("V/IL"),
+            &mut cache,
+            &None,
+        );
         assert!(sift.is_empty());
         assert!(polyphen.is_empty());
 
         // Range position — indel, should be skipped.
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST00000001"), Some("42-43"), Some("V/I"), &cache);
+        let (sift, polyphen) = lookup_sift_polyphen(
+            Some("ENST00000001"),
+            Some("42-43"),
+            Some("V/I"),
+            &mut cache,
+            &None,
+        );
         assert!(sift.is_empty());
         assert!(polyphen.is_empty());
     }
 
     #[test]
     fn test_lookup_sift_polyphen_missing_transcript() {
-        let cache = SiftPolyphenCache::new();
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST_MISSING"), Some("42"), Some("V/I"), &cache);
+        let mut cache = SiftPolyphenCache::new();
+        let (sift, polyphen) = lookup_sift_polyphen(
+            Some("ENST_MISSING"),
+            Some("42"),
+            Some("V/I"),
+            &mut cache,
+            &None,
+        );
         assert!(sift.is_empty());
         assert!(polyphen.is_empty());
     }
