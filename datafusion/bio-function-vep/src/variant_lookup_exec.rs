@@ -151,12 +151,12 @@ fn push_exact_candidates(
 ///
 /// OutputFactory compares co-located rows against the ALT/output component of
 /// the parser/build-side allele string that `compare_existing()` retained.
-fn output_allele_from_allele_string(allele_string: &str) -> Option<&str> {
+pub(crate) fn output_allele_from_allele_string(allele_string: &str) -> Option<&str> {
     allele_string.split_once('/').map(|(_, alt)| alt)
 }
 
 #[derive(Clone, Copy)]
-enum ShiftableIndelKind {
+pub(crate) enum ShiftableIndelKind {
     Insertion,
     Deletion,
 }
@@ -167,7 +167,7 @@ enum ShiftableIndelKind {
 ///
 /// Genomic shift state is only defined for simple insertion/deletion allele
 /// strings. Substitutions and multi-ALT representations bypass this path.
-fn parse_shiftable_indel(allele_string: &str) -> Option<(&str, &str, ShiftableIndelKind)> {
+pub(crate) fn parse_shiftable_indel(allele_string: &str) -> Option<(&str, &str, ShiftableIndelKind)> {
     let (ref_allele, alt_allele) = allele_string.split_once('/')?;
     if ref_allele == "-" && !alt_allele.is_empty() && alt_allele != "-" {
         return Some((ref_allele, alt_allele, ShiftableIndelKind::Insertion));
@@ -214,7 +214,7 @@ fn build_reference_region(chrom: &str, start: i64, end: i64) -> Result<Region> {
 ///
 /// The downstream flank used for VEP-style repeat shifting comes directly
 /// from the indexed reference FASTA, not from local allele heuristics.
-fn read_reference_sequence<R>(
+pub(crate) fn read_reference_sequence<R>(
     reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
     chrom: &str,
     start: i64,
@@ -244,7 +244,7 @@ where
 /// indel shifting loop. It rotates the shifted sequence through the 3' flank
 /// and advances genomic coordinates one base at a time until the next flank
 /// base no longer matches.
-fn perform_forward_genomic_shift(
+pub(crate) fn perform_forward_genomic_shift(
     seq_to_check: &str,
     post_seq: &str,
     start: i64,
@@ -297,7 +297,7 @@ fn perform_forward_genomic_shift(
 /// matching: active compare space becomes the shifted indel representation,
 /// while the original minimized representation is retained separately as
 /// `unshifted_*`.
-fn build_shifted_compare_state<R>(
+pub(crate) fn build_shifted_compare_state<R>(
     reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
     chrom: &str,
     allele_string: &str,
@@ -430,16 +430,46 @@ fn compare_existing_variant(
     existing_start: i64,
     existing_end: i64,
 ) -> Option<Vec<MatchedVariantAllele>> {
+    compare_existing_variant_alleles(
+        &input_row.compare_allele_string,
+        input_row.compare_start,
+        input_row.compare_end,
+        input_row.unshifted_allele_string.as_deref(),
+        input_row.unshifted_start,
+        existing_allele_string,
+        existing_start,
+        existing_end,
+    )
+}
+
+/// Two-pass allele matching for colocated variant collection.
+///
+/// This replicates VEP's `compare_existing()` logic: first match with
+/// shifted/compare-space alleles, then (if unshifted state exists) also match
+/// with unshifted alleles and merge the results.
+///
+/// Returns `None` when both passes produce zero matches (variant should be
+/// skipped). Returns `Some(vec![])` for unknown-allele records that match on
+/// exact coordinates.
+pub(crate) fn compare_existing_variant_alleles(
+    compare_allele_string: &str,
+    compare_start: i64,
+    compare_end: i64,
+    unshifted_allele_string: Option<&str>,
+    unshifted_start: Option<i64>,
+    existing_allele_string: &str,
+    existing_start: i64,
+    existing_end: i64,
+) -> Option<Vec<MatchedVariantAllele>> {
     if !existing_allele_string.contains('/') {
-        return (existing_start == input_row.compare_start
-            && existing_end == input_row.compare_end)
+        return (existing_start == compare_start && existing_end == compare_end)
             .then_some(Vec::new());
     }
 
     let mut matched_alleles = get_matched_variant_alleles(
         VariantAlleleInput {
-            allele_string: &input_row.compare_allele_string,
-            pos: input_row.compare_start,
+            allele_string: compare_allele_string,
+            pos: compare_start,
             strand: 1,
         },
         VariantAlleleInput {
@@ -449,15 +479,12 @@ fn compare_existing_variant(
         },
     );
 
-    if let (Some(unshifted_allele_string), Some(unshifted_start)) = (
-        input_row.unshifted_allele_string.as_deref(),
-        input_row.unshifted_start,
-    ) {
+    if let (Some(unshifted_as), Some(unshifted_s)) = (unshifted_allele_string, unshifted_start) {
         let mut seen = matched_alleles.iter().cloned().collect::<HashSet<_>>();
         for matched in get_matched_variant_alleles(
             VariantAlleleInput {
-                allele_string: unshifted_allele_string,
-                pos: unshifted_start,
+                allele_string: unshifted_as,
+                pos: unshifted_s,
                 strand: 1,
             },
             VariantAlleleInput {

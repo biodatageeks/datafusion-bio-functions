@@ -617,9 +617,9 @@ impl<'a> PositionEntryReader<'a> {
         }
     }
 
-    /// Read a single i64 value from a column at the given allele row.
+    /// Read a single integer value (any width) from a column, widened to i64.
     ///
-    /// Returns `None` if the value is null or the column is not an Int64 type.
+    /// Returns `None` if the value is null or the column is not an integer type.
     pub fn read_i64_value(&self, col_idx: usize, allele_row: usize) -> Option<i64> {
         if col_idx >= self.col_offsets.len() {
             return None;
@@ -628,14 +628,43 @@ impl<'a> PositionEntryReader<'a> {
         let dt = decode_data_type(type_code).ok()?;
         let data = &self.data[col_offset..];
 
+        if !is_non_null(data, allele_row) {
+            return None;
+        }
+        let values_off = null_bitmap_size(self.num_alleles);
+
         match dt {
+            DataType::Int8 => {
+                let off = values_off + allele_row;
+                Some(data[off] as i8 as i64)
+            }
+            DataType::UInt8 => {
+                let off = values_off + allele_row;
+                Some(data[off] as i64)
+            }
+            DataType::Int16 => {
+                let off = values_off + allele_row * 2;
+                Some(i16::from_le_bytes(data[off..off + 2].try_into().unwrap()) as i64)
+            }
+            DataType::UInt16 => {
+                let off = values_off + allele_row * 2;
+                Some(u16::from_le_bytes(data[off..off + 2].try_into().unwrap()) as i64)
+            }
+            DataType::Int32 => {
+                let off = values_off + allele_row * 4;
+                Some(i32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as i64)
+            }
+            DataType::UInt32 => {
+                let off = values_off + allele_row * 4;
+                Some(u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as i64)
+            }
             DataType::Int64 => {
-                if !is_non_null(data, allele_row) {
-                    return None;
-                }
-                let values_off = null_bitmap_size(self.num_alleles);
                 let off = values_off + allele_row * 8;
                 Some(i64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
+            }
+            DataType::UInt64 => {
+                let off = values_off + allele_row * 8;
+                Some(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()) as i64)
             }
             _ => None,
         }

@@ -29,9 +29,12 @@ use super::kv_store::VepKvStore;
 use super::position_entry::{PositionEntryReader, make_builder};
 use crate::allele::{
     VariantAlleleInput, get_matched_variant_alleles, vcf_to_vep_allele, vcf_to_vep_input_allele,
+    vep_norm_end, vep_norm_start,
 };
 use crate::variant_lookup_exec::{
     AF_COL_NAMES, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
+    build_shifted_compare_state, compare_existing_variant_alleles, output_allele_from_allele_string,
+    read_reference_sequence,
 };
 
 /// Lookup match mode.
@@ -64,6 +67,9 @@ pub struct KvLookupExec {
     output_col_positions: Vec<usize>,
     /// Optional sink for co-located data collected during probe phase.
     colocated_sink: Option<ColocatedSink>,
+    /// Optional indexed reference FASTA for genomic shift state in colocated
+    /// matching (parity with parquet path's two-pass allele matching).
+    reference_fasta_path: Option<String>,
 }
 
 impl KvLookupExec {
@@ -119,12 +125,19 @@ impl KvLookupExec {
             properties,
             output_col_positions,
             colocated_sink: None,
+            reference_fasta_path: None,
         })
     }
 
     /// Set the co-located data sink for piggybacked collection during probe.
     pub fn with_colocated_sink(mut self, sink: ColocatedSink) -> Self {
         self.colocated_sink = Some(sink);
+        self
+    }
+
+    /// Set the reference FASTA path for genomic shift state in colocated matching.
+    pub fn with_reference_fasta_path(mut self, path: Option<String>) -> Self {
+        self.reference_fasta_path = path;
         self
     }
 }
@@ -189,6 +202,7 @@ impl ExecutionPlan for KvLookupExec {
         if let Some(sink) = &self.colocated_sink {
             exec = exec.with_colocated_sink(Arc::clone(sink));
         }
+        exec = exec.with_reference_fasta_path(self.reference_fasta_path.clone());
         Ok(Arc::new(exec))
     }
 
@@ -212,6 +226,7 @@ impl ExecutionPlan for KvLookupExec {
             self.extended_probes,
             self.output_col_positions.clone(),
             self.colocated_sink.clone(),
+            self.reference_fasta_path.clone(),
         )))
     }
 }
@@ -232,6 +247,8 @@ struct KvLookupStream {
     colocated_sink: Option<ColocatedSink>,
     /// Cached column indices for co-located collection in the KV entry.
     coloc_col_indices: Option<KvColocIndices>,
+    /// Optional indexed reference FASTA reader for genomic shift state.
+    reference_reader: Option<noodles_fasta::IndexedReader<noodles_fasta::io::BufReader<std::fs::File>>>,
     profile_enabled: bool,
     profile_emitted: bool,
     profile: LookupProfile,
@@ -248,6 +265,19 @@ struct KvColocIndices {
     clin_sig_allele: Option<usize>,
     pubmed: Option<usize>,
     af_indices: Vec<Option<usize>>,
+}
+
+/// Open an indexed FASTA reader from a file path.
+fn open_indexed_fasta(
+    path: &str,
+) -> Result<noodles_fasta::IndexedReader<noodles_fasta::io::BufReader<std::fs::File>>> {
+    noodles_fasta::io::indexed_reader::Builder::default()
+        .build_from_path(path)
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "failed to open indexed reference FASTA '{path}': {e}"
+            ))
+        })
 }
 
 #[derive(Default)]
@@ -358,11 +388,27 @@ impl KvLookupStream {
         extended_probes: bool,
         output_col_positions: Vec<usize>,
         colocated_sink: Option<ColocatedSink>,
+        reference_fasta_path: Option<String>,
     ) -> Self {
         // Resolve colocated column indices within the KV entry if we have a sink.
         let coloc_col_indices = colocated_sink
             .as_ref()
             .and_then(|_| resolve_kv_coloc_indices(&store));
+
+        // Open the reference FASTA reader if a path is provided and we have a
+        // colocated sink (shift state is only needed for colocated matching).
+        let reference_reader = if colocated_sink.is_some() {
+            reference_fasta_path.as_deref().and_then(|path| {
+                open_indexed_fasta(path)
+                    .map_err(|e| {
+                        eprintln!("[KvLookupStream] warning: failed to open reference FASTA {path}: {e}");
+                        e
+                    })
+                    .ok()
+            })
+        } else {
+            None
+        };
 
         Self {
             input,
@@ -378,6 +424,7 @@ impl KvLookupStream {
             output_col_positions,
             colocated_sink,
             coloc_col_indices,
+            reference_reader,
             profile_enabled: std::env::var_os("VEP_KV_PROFILE").is_some(),
             profile_emitted: false,
             profile: LookupProfile::default(),
@@ -595,31 +642,32 @@ impl KvLookupStream {
                     }
                 }
 
-                if matched_allele_rows.is_empty() {
-                    continue;
-                }
-
-                emitted_match = true;
-                for _ in &matched_allele_rows {
-                    vcf_indices.push(row as u32);
-                }
-                for (col_out_idx, builder) in builders.iter_mut().enumerate() {
-                    let entry_idx = col_map[col_out_idx];
-                    if entry_idx == usize::MAX {
-                        // Column not found in entry -> nulls.
-                        for _ in &matched_allele_rows {
-                            append_null_to_builder(builder.as_mut())?;
+                if !matched_allele_rows.is_empty() {
+                    emitted_match = true;
+                    for _ in &matched_allele_rows {
+                        vcf_indices.push(row as u32);
+                    }
+                    for (col_out_idx, builder) in builders.iter_mut().enumerate() {
+                        let entry_idx = col_map[col_out_idx];
+                        if entry_idx == usize::MAX {
+                            // Column not found in entry -> nulls.
+                            for _ in &matched_allele_rows {
+                                append_null_to_builder(builder.as_mut())?;
+                            }
+                        } else {
+                            reader.append_column_values(
+                                entry_idx,
+                                &matched_allele_rows,
+                                builder.as_mut(),
+                            )?;
                         }
-                    } else {
-                        reader.append_column_values(
-                            entry_idx,
-                            &matched_allele_rows,
-                            builder.as_mut(),
-                        )?;
                     }
                 }
 
                 // --- Co-located data collection (piggybacked on same probe) ---
+                // Runs for ALL probed positions, not just when primary allele matched.
+                // This mirrors the parquet path which streams all cache rows and
+                // checks colocated eligibility independently of primary lookup.
                 if let (Some(buf), Some(ci)) = (coloc_buf.as_mut(), self.coloc_col_indices.as_ref())
                 {
                     // Compute VCF input allele key once per VCF row match.
@@ -627,7 +675,43 @@ impl KvLookupStream {
                     let (input_ref, input_alt, input_start) =
                         vcf_to_vep_input_allele(norm_start_i64, vcf_ref, vcf_alt);
                     let input_allele_string = format!("{input_ref}/{input_alt}");
-                    let (_vep_ref, vep_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
+                    let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
+                    let compare_allele_string = format!("{compare_ref}/{compare_alt}");
+                    let vep_start = vep_norm_start(norm_start_i64, vcf_ref, vcf_alt);
+                    let vep_end = vep_norm_end(norm_start_i64, vcf_ref, vcf_alt);
+
+                    // Compute genomic shift state (mirrors parquet path's BuildRow logic).
+                    let mut active_compare_allele_string = compare_allele_string.clone();
+                    let mut active_compare_start = vep_start;
+                    let mut active_compare_end = vep_end;
+                    let mut unshifted_allele_string: Option<String> = None;
+                    let mut unshifted_start: Option<i64> = None;
+
+                    if let Some(ref_reader) = self.reference_reader.as_mut() {
+                        if let Ok(Some((shifted_as, shifted_s, shifted_e))) =
+                            build_shifted_compare_state(
+                                ref_reader,
+                                &chrom_norm,
+                                &compare_allele_string,
+                                vep_start,
+                                vep_end,
+                            )
+                        {
+                            unshifted_allele_string = Some(compare_allele_string.clone());
+                            unshifted_start = Some(vep_start);
+                            active_compare_allele_string = shifted_as;
+                            active_compare_start = shifted_s;
+                            active_compare_end = shifted_e;
+                        }
+                    }
+
+                    let compare_output_allele =
+                        output_allele_from_allele_string(&active_compare_allele_string)
+                            .map(str::to_string);
+                    let unshifted_output_allele = unshifted_allele_string
+                        .as_deref()
+                        .and_then(output_allele_from_allele_string)
+                        .map(str::to_string);
 
                     // Iterate alleles at this position for colocated collection.
                     for allele_idx in 0..reader.num_alleles() {
@@ -639,24 +723,26 @@ impl KvLookupStream {
 
                         let allele_str = reader.allele_string(allele_idx);
 
-                        // Use get_matched_variant_alleles for proper allele comparison.
-                        let matched_alleles = get_matched_variant_alleles(
-                            VariantAlleleInput {
-                                allele_string: &input_allele_string,
-                                pos: input_start,
-                                strand: 1,
-                            },
-                            VariantAlleleInput {
-                                allele_string: allele_str,
-                                pos: *probe_start,
-                                strand: 1,
-                            },
-                        );
+                        // Read existing variant's end coordinate from the entry.
+                        let existing_end = ci
+                            .end_col
+                            .and_then(|idx| reader.read_i64_value(idx, allele_idx))
+                            .unwrap_or(*probe_start);
 
-                        // Skip variants whose alleles don't match the input variant.
-                        if matched_alleles.is_empty() {
+                        // Two-pass allele matching (shifted + unshifted) for parity
+                        // with parquet path's compare_existing_variant().
+                        let Some(matched_alleles) = compare_existing_variant_alleles(
+                            &active_compare_allele_string,
+                            active_compare_start,
+                            active_compare_end,
+                            unshifted_allele_string.as_deref(),
+                            unshifted_start,
+                            allele_str,
+                            *probe_start,
+                            existing_end,
+                        ) else {
                             continue;
-                        }
+                        };
 
                         let key: ColocatedKey = (
                             chrom_norm.clone(),
@@ -667,8 +753,8 @@ impl KvLookupStream {
 
                         let sink_value = buf.entry(key).or_insert_with(|| ColocatedSinkValue {
                             entries: Vec::new(),
-                            compare_output_allele: Some(vep_alt.clone()),
-                            unshifted_output_allele: None,
+                            compare_output_allele: compare_output_allele.clone(),
+                            unshifted_output_allele: unshifted_output_allele.clone(),
                         });
 
                         // Dedup by variation_name within the same position.
@@ -998,6 +1084,7 @@ fn canonical_event_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize)
 /// minus those two. `end` is stored as a regular column inside the entry.
 fn resolve_kv_coloc_indices(store: &VepKvStore) -> Option<KvColocIndices> {
     let cache_schema = store.schema();
+
     let cache_chrom_idx = cache_schema.index_of("chrom").unwrap_or(usize::MAX);
     let cache_start_idx = cache_schema.index_of("start").unwrap_or(usize::MAX);
 
@@ -1032,11 +1119,6 @@ fn resolve_kv_coloc_indices(store: &VepKvStore) -> Option<KvColocIndices> {
         pubmed: find_stored_idx("pubmed"),
         af_indices,
     })
-}
-
-/// Extract the alt allele component from an allele_string like "A/G" -> "G".
-fn output_allele_from_allele_string(allele_string: &str) -> Option<&str> {
-    allele_string.split_once('/').map(|(_, alt)| alt)
 }
 
 impl Stream for KvLookupStream {

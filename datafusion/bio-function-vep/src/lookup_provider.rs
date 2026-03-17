@@ -243,6 +243,7 @@ impl TableProvider for LookupProvider {
                         self.coord_normalizer.cache_zero_based,
                         self.extended_probes,
                     )?;
+                    exec = exec.with_reference_fasta_path(self.reference_fasta_path.clone());
                     if let Some(ref sink) = self.colocated_sink {
                         exec = exec.with_colocated_sink(Arc::clone(sink));
                     }
