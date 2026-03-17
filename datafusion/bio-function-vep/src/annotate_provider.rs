@@ -1026,157 +1026,6 @@ fn build_colocated_map_from_sink(
     map
 }
 
-/// Build colocated map from base_batches output columns (for fjall backend).
-/// Extracts cache_* columns that contain variation metadata from the KV lookup.
-fn build_colocated_map_from_batches(
-    batches: &[RecordBatch],
-) -> HashMap<ColocatedKey, ColocatedData> {
-    let mut map: HashMap<ColocatedKey, ColocatedData> = HashMap::new();
-
-    for batch in batches {
-        let schema = batch.schema();
-        let chrom_idx = schema.index_of("chrom").ok();
-        let start_idx = schema.index_of("start").ok();
-        let end_idx = schema.index_of("end").ok();
-        let ref_idx = schema.index_of("ref").ok();
-        let alt_idx = schema.index_of("alt").ok();
-        let var_name_idx = schema.index_of("cache_variation_name").ok();
-        let allele_str_idx = schema.index_of("cache_allele_string").ok();
-        let clin_sig_idx = schema.index_of("cache_clin_sig").ok();
-        let clin_sig_allele_idx = schema.index_of("cache_clin_sig_allele").ok();
-        let somatic_idx = schema.index_of("cache_somatic").ok();
-        let pheno_idx = schema.index_of("cache_phenotype_or_disease").ok();
-        let pubmed_idx = schema.index_of("cache_pubmed").ok();
-
-        // Collect AF column indices.
-        let af_col_names: Vec<String> = CACHE_OUTPUT_COLUMNS
-            .iter()
-            .filter(|c| {
-                c.starts_with("AF")
-                    || c.starts_with("gnomAD")
-                    || c.starts_with("AFR")
-                    || c.starts_with("AMR")
-                    || c.starts_with("EAS")
-                    || c.starts_with("EUR")
-                    || c.starts_with("SAS")
-            })
-            .map(|c| format!("cache_{c}"))
-            .collect();
-        let af_indices: Vec<Option<usize>> = af_col_names
-            .iter()
-            .map(|name| schema.index_of(name).ok())
-            .collect();
-
-        let Some(chrom_idx) = chrom_idx else {
-            continue;
-        };
-        let Some(start_idx) = start_idx else {
-            continue;
-        };
-        let Some(end_idx) = end_idx else {
-            continue;
-        };
-
-        for row in 0..batch.num_rows() {
-            let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
-                continue;
-            };
-            let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
-                continue;
-            };
-            let end = int64_at(batch.column(end_idx).as_ref(), row).unwrap_or(start);
-
-            let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom).to_string();
-
-            let ref_allele = ref_idx
-                .and_then(|i| string_at(batch.column(i).as_ref(), row))
-                .unwrap_or_default();
-            let alt_allele = alt_idx
-                .and_then(|i| string_at(batch.column(i).as_ref(), row))
-                .unwrap_or_default();
-            let (input_ref, input_alt, input_start) =
-                crate::allele::vcf_to_vep_input_allele(start, &ref_allele, &alt_allele);
-            let input_allele_string = format!("{input_ref}/{input_alt}");
-            let key = (chrom_norm, input_start, end, input_allele_string);
-
-            let variation_name = var_name_idx
-                .and_then(|i| string_at(batch.column(i).as_ref(), row))
-                .unwrap_or_default();
-            if variation_name.is_empty() {
-                continue;
-            }
-
-            let allele_string = allele_str_idx
-                .and_then(|i| string_at(batch.column(i).as_ref(), row))
-                .unwrap_or_default();
-
-            let ref_allele = ref_idx
-                .and_then(|i| string_at(batch.column(i).as_ref(), row))
-                .unwrap_or_default();
-            let alt_allele = alt_idx
-                .and_then(|i| string_at(batch.column(i).as_ref(), row))
-                .unwrap_or_default();
-
-            let (vep_ref, vep_alt) = crate::allele::vcf_to_vep_allele(&ref_allele, &alt_allele);
-            let matched = MatchedVariantAllele {
-                a_allele: vep_ref.clone(),
-                a_index: 0,
-                b_allele: vep_alt.clone(),
-                b_index: 0,
-            };
-
-            let somatic = somatic_idx
-                .and_then(|i| string_at(batch.column(i).as_ref(), row))
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            let pheno = pheno_idx
-                .and_then(|i| string_at(batch.column(i).as_ref(), row))
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            let clin_sig = clin_sig_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
-            let clin_sig_allele =
-                clin_sig_allele_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
-            let pubmed = pubmed_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
-
-            let af_values: Vec<String> = af_indices
-                .iter()
-                .map(|idx| {
-                    idx.and_then(|i| string_at(batch.column(i).as_ref(), row))
-                        .unwrap_or_default()
-                })
-                .collect();
-
-            let entry = ColocatedEntry {
-                variation_name: variation_name.clone(),
-                allele_string,
-                matched_alleles: vec![matched],
-                somatic,
-                pheno,
-                clin_sig: clin_sig.clone(),
-                clin_sig_allele: clin_sig_allele.clone(),
-                pubmed: pubmed.clone(),
-                af_values,
-            };
-
-            let data = map.entry(key).or_insert_with(|| ColocatedData {
-                entries: Vec::new(),
-                compare_output_allele: Some(vep_alt.clone()),
-                unshifted_output_allele: None,
-            });
-
-            // Dedup by variation_name within the same position.
-            if !data
-                .entries
-                .iter()
-                .any(|e| e.variation_name == variation_name)
-            {
-                data.entries.push(entry);
-            }
-        }
-    }
-    map
-}
-
 /// Traceability:
 /// - Ensembl VEP `output_hash_to_vcf_info_chunk()`
 ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory/VCF.pm#L379-L405>
@@ -2898,17 +2747,11 @@ impl AnnotateProvider {
         profile_end!("2. collect_variant_intervals", t_intervals);
 
         // Build co-located variant aggregation from the piggybacked sink.
-        // For fjall backend: the sink is empty because KvLookupExec doesn't populate it.
-        // Fall back to building from base_batches output columns.
+        // Both parquet and fjall backends populate the sink during lookup.
         let t_coloc = profile_start!();
         let colocated_map = if flags.check_existing {
             let guard = coloc_sink.lock().unwrap();
-            if guard.is_empty() {
-                // Fjall path: build from base_batches cache_* columns.
-                build_colocated_map_from_batches(&base_batches)
-            } else {
-                build_colocated_map_from_sink(&guard)
-            }
+            build_colocated_map_from_sink(&guard)
         } else {
             HashMap::new()
         };

@@ -2,6 +2,7 @@
 //! a fjall KV store per-position for annotation.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,6 +27,12 @@ use super::allele_index::AlleleMatcher;
 use super::key_encoding::chrom_to_code;
 use super::kv_store::VepKvStore;
 use super::position_entry::{PositionEntryReader, make_builder};
+use crate::allele::{
+    VariantAlleleInput, get_matched_variant_alleles, vcf_to_vep_allele, vcf_to_vep_input_allele,
+};
+use crate::variant_lookup_exec::{
+    AF_COL_NAMES, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
+};
 
 /// Lookup match mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +62,8 @@ pub struct KvLookupExec {
     properties: PlanProperties,
     /// Cache schema column positions for requested cache output columns.
     output_col_positions: Vec<usize>,
+    /// Optional sink for co-located data collected during probe phase.
+    colocated_sink: Option<ColocatedSink>,
 }
 
 impl KvLookupExec {
@@ -109,7 +118,14 @@ impl KvLookupExec {
             extended_probes,
             properties,
             output_col_positions,
+            colocated_sink: None,
         })
+    }
+
+    /// Set the co-located data sink for piggybacked collection during probe.
+    pub fn with_colocated_sink(mut self, sink: ColocatedSink) -> Self {
+        self.colocated_sink = Some(sink);
+        self
     }
 }
 
@@ -159,7 +175,7 @@ impl ExecutionPlan for KvLookupExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 1);
-        Ok(Arc::new(KvLookupExec::new(
+        let mut exec = KvLookupExec::new(
             children[0].clone(),
             self.store.clone(),
             self.cache_columns.clone(),
@@ -169,7 +185,11 @@ impl ExecutionPlan for KvLookupExec {
             self.vcf_zero_based,
             self.cache_zero_based,
             self.extended_probes,
-        )?))
+        )?;
+        if let Some(sink) = &self.colocated_sink {
+            exec = exec.with_colocated_sink(Arc::clone(sink));
+        }
+        Ok(Arc::new(exec))
     }
 
     fn execute(
@@ -191,6 +211,7 @@ impl ExecutionPlan for KvLookupExec {
             self.cache_zero_based,
             self.extended_probes,
             self.output_col_positions.clone(),
+            self.colocated_sink.clone(),
         )))
     }
 }
@@ -208,9 +229,24 @@ struct KvLookupStream {
     cache_zero_based: bool,
     extended_probes: bool,
     output_col_positions: Vec<usize>,
+    colocated_sink: Option<ColocatedSink>,
+    /// Cached column indices for co-located collection in the KV entry.
+    coloc_col_indices: Option<KvColocIndices>,
     profile_enabled: bool,
     profile_emitted: bool,
     profile: LookupProfile,
+}
+
+/// Column indices within the KV entry's stored columns for co-located fields.
+struct KvColocIndices {
+    variation_name: usize,
+    _allele_string_col: usize,
+    somatic: Option<usize>,
+    pheno: Option<usize>,
+    clin_sig: Option<usize>,
+    clin_sig_allele: Option<usize>,
+    pubmed: Option<usize>,
+    af_indices: Vec<Option<usize>>,
 }
 
 #[derive(Default)]
@@ -320,7 +356,13 @@ impl KvLookupStream {
         cache_zero_based: bool,
         extended_probes: bool,
         output_col_positions: Vec<usize>,
+        colocated_sink: Option<ColocatedSink>,
     ) -> Self {
+        // Resolve colocated column indices within the KV entry if we have a sink.
+        let coloc_col_indices = colocated_sink
+            .as_ref()
+            .and_then(|_| resolve_kv_coloc_indices(&store));
+
         Self {
             input,
             store,
@@ -333,6 +375,8 @@ impl KvLookupStream {
             cache_zero_based,
             extended_probes,
             output_col_positions,
+            colocated_sink,
+            coloc_col_indices,
             profile_enabled: std::env::var_os("VEP_KV_PROFILE").is_some(),
             profile_emitted: false,
             profile: LookupProfile::default(),
@@ -423,6 +467,14 @@ impl KvLookupStream {
         } else {
             None
         };
+
+        // Local buffer for colocated data (flushed to the shared sink after the loop).
+        let mut coloc_buf: Option<HashMap<ColocatedKey, ColocatedSinkValue>> =
+            if self.colocated_sink.is_some() && self.coloc_col_indices.is_some() {
+                Some(HashMap::new())
+            } else {
+                None
+            };
 
         for row in 0..num_rows {
             let raw_chrom = chroms.value_or_empty(row);
@@ -589,6 +641,103 @@ impl KvLookupStream {
                         )?;
                     }
                 }
+
+                // --- Co-located data collection (piggybacked on same probe) ---
+                if let (Some(buf), Some(ci)) = (coloc_buf.as_mut(), self.coloc_col_indices.as_ref())
+                {
+                    // Compute VCF input allele key once per VCF row match.
+                    let chrom_norm = chrom.to_string();
+                    let (input_ref, input_alt, input_start) =
+                        vcf_to_vep_input_allele(norm_start_i64, vcf_ref, vcf_alt);
+                    let input_allele_string = format!("{input_ref}/{input_alt}");
+                    let (_vep_ref, vep_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
+
+                    // Iterate ALL alleles at this position for colocated collection.
+                    for allele_idx in 0..reader.num_alleles() {
+                        let var_name = reader.read_string_value(ci.variation_name, allele_idx);
+                        let var_name = match var_name {
+                            Some(v) if !v.is_empty() => v,
+                            _ => continue,
+                        };
+
+                        let allele_str = reader.allele_string(allele_idx);
+
+                        // Use get_matched_variant_alleles for proper allele comparison.
+                        let matched_alleles = get_matched_variant_alleles(
+                            VariantAlleleInput {
+                                allele_string: &input_allele_string,
+                                pos: input_start,
+                                strand: 1,
+                            },
+                            VariantAlleleInput {
+                                allele_string: allele_str,
+                                pos: probe_start,
+                                strand: 1,
+                            },
+                        );
+
+                        let key: ColocatedKey = (
+                            chrom_norm.clone(),
+                            input_start,
+                            norm_end_i64,
+                            input_allele_string.clone(),
+                        );
+
+                        let sink_value = buf.entry(key).or_insert_with(|| ColocatedSinkValue {
+                            entries: Vec::new(),
+                            compare_output_allele: Some(vep_alt.clone()),
+                            unshifted_output_allele: None,
+                        });
+
+                        // Dedup by variation_name within the same position.
+                        if sink_value
+                            .entries
+                            .iter()
+                            .any(|e| e.variation_name == var_name)
+                        {
+                            continue;
+                        }
+
+                        let somatic = ci
+                            .somatic
+                            .and_then(|idx| reader.read_i64_value(idx, allele_idx))
+                            .unwrap_or(0);
+                        let pheno = ci
+                            .pheno
+                            .and_then(|idx| reader.read_i64_value(idx, allele_idx))
+                            .unwrap_or(0);
+                        let clin_sig = ci
+                            .clin_sig
+                            .and_then(|idx| reader.read_string_value(idx, allele_idx));
+                        let clin_sig_allele = ci
+                            .clin_sig_allele
+                            .and_then(|idx| reader.read_string_value(idx, allele_idx));
+                        let pubmed = ci
+                            .pubmed
+                            .and_then(|idx| reader.read_string_value(idx, allele_idx));
+                        let af_values: Vec<String> = ci
+                            .af_indices
+                            .iter()
+                            .map(|opt_idx| {
+                                opt_idx
+                                    .and_then(|idx| reader.read_string_value(idx, allele_idx))
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+
+                        sink_value.entries.push(ColocatedCacheEntry {
+                            variation_name: var_name,
+                            allele_string: allele_str.to_string(),
+                            matched_alleles,
+                            somatic,
+                            pheno,
+                            clin_sig,
+                            clin_sig_allele,
+                            pubmed,
+                            af_values,
+                        });
+                    }
+                }
             }
 
             if !emitted_match {
@@ -596,6 +745,29 @@ impl KvLookupStream {
                 vcf_indices.push(row as u32);
                 for builder in &mut builders {
                     append_null_to_builder(builder.as_mut())?;
+                }
+            }
+        }
+
+        // Flush colocated data to the shared sink.
+        if let (Some(buf), Some(sink)) = (coloc_buf, &self.colocated_sink) {
+            if !buf.is_empty() {
+                let mut guard = sink.lock().unwrap();
+                for (key, mut value) in buf {
+                    guard
+                        .entry(key)
+                        .and_modify(|existing| {
+                            if existing.compare_output_allele.is_none() {
+                                existing.compare_output_allele =
+                                    value.compare_output_allele.clone();
+                            }
+                            if existing.unshifted_output_allele.is_none() {
+                                existing.unshifted_output_allele =
+                                    value.unshifted_output_allele.clone();
+                            }
+                            existing.entries.append(&mut value.entries);
+                        })
+                        .or_insert(value);
                 }
             }
         }
@@ -836,6 +1008,53 @@ fn canonical_event_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize)
     }
 
     (ref_end - ref_start, alt_end - alt_start)
+}
+
+/// Resolve column indices within the KV entry for co-located fields.
+///
+/// The entry stores all cache schema columns except chrom/start/end, in schema order
+/// minus those three. We need to find variation_name, allele_string, somatic, etc.
+fn resolve_kv_coloc_indices(store: &VepKvStore) -> Option<KvColocIndices> {
+    let cache_schema = store.schema();
+    let cache_chrom_idx = cache_schema.index_of("chrom").unwrap_or(usize::MAX);
+    let cache_start_idx = cache_schema.index_of("start").unwrap_or(usize::MAX);
+    let cache_end_idx = cache_schema.index_of("end").unwrap_or(usize::MAX);
+
+    // Build the stored column mapping (same logic as process_batch).
+    let stored_cols: Vec<usize> = (0..cache_schema.fields().len())
+        .filter(|&i| i != cache_chrom_idx && i != cache_start_idx && i != cache_end_idx)
+        .collect();
+
+    let find_stored_idx = |name: &str| -> Option<usize> {
+        cache_schema
+            .index_of(name)
+            .ok()
+            .and_then(|schema_idx| stored_cols.iter().position(|&c| c == schema_idx))
+    };
+
+    let variation_name = find_stored_idx("variation_name")?;
+    let allele_string_col = find_stored_idx("allele_string")?;
+
+    let af_indices: Vec<Option<usize>> = AF_COL_NAMES
+        .iter()
+        .map(|name| find_stored_idx(name))
+        .collect();
+
+    Some(KvColocIndices {
+        variation_name,
+        _allele_string_col: allele_string_col,
+        somatic: find_stored_idx("somatic"),
+        pheno: find_stored_idx("phenotype_or_disease"),
+        clin_sig: find_stored_idx("clin_sig"),
+        clin_sig_allele: find_stored_idx("clin_sig_allele"),
+        pubmed: find_stored_idx("pubmed"),
+        af_indices,
+    })
+}
+
+/// Extract the alt allele component from an allele_string like "A/G" -> "G".
+fn output_allele_from_allele_string(allele_string: &str) -> Option<&str> {
+    allele_string.split_once('/').map(|(_, alt)| alt)
 }
 
 impl Stream for KvLookupStream {

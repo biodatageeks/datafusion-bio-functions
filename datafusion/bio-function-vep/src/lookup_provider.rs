@@ -232,7 +232,7 @@ impl TableProvider for LookupProvider {
                     let vcf_df = self.session.table(&self.vcf_table).await?;
                     let vcf_plan = vcf_df.create_physical_plan().await?;
 
-                    let plan: Arc<dyn ExecutionPlan> = Arc::new(KvLookupExec::new(
+                    let mut exec = KvLookupExec::new(
                         vcf_plan,
                         store,
                         self.cache_columns.clone(),
@@ -242,7 +242,11 @@ impl TableProvider for LookupProvider {
                         self.coord_normalizer.input_zero_based,
                         self.coord_normalizer.cache_zero_based,
                         self.extended_probes,
-                    )?);
+                    )?;
+                    if let Some(ref sink) = self.colocated_sink {
+                        exec = exec.with_colocated_sink(Arc::clone(sink));
+                    }
+                    let plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
                     return wrap_with_projection(plan, projection);
                 }
             }
