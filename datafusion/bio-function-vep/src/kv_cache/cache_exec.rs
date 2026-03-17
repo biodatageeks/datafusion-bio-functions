@@ -453,6 +453,12 @@ impl KvLookupStream {
             .filter(|&i| i != cache_chrom_idx && i != cache_start_idx)
             .collect();
 
+        // Find end column for interval overlap filtering in the main match loop.
+        let end_stored_col_idx: Option<usize> = cache_schema
+            .index_of("end")
+            .ok()
+            .and_then(|schema_idx| stored_cols.iter().position(|&c| c == schema_idx));
+
         let col_map: Vec<usize> = self
             .output_col_positions
             .iter()
@@ -578,6 +584,9 @@ impl KvLookupStream {
                 let reader = PositionEntryReader::new(&decompress_buf)?;
 
                 // Match alleles within this position entry (reuse buffer).
+                // Filter by end-coordinate overlap: the cache allele's (start, end)
+                // must overlap the VCF variant's interval. This prevents matching
+                // alleles at the same start position but with non-overlapping end.
                 matched_allele_rows.clear();
                 for allele_idx in 0..reader.num_alleles() {
                     let allele_str = reader.allele_string(allele_idx);
