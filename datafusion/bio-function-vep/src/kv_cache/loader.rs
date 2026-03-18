@@ -188,6 +188,19 @@ impl CacheLoader {
 
         store.persist()?;
 
+        // Major-compact the data keyspace so the LSM tree is fully optimized
+        // for reads (bloom filters built, levels merged) before first use.
+        info!("Running major compaction on data keyspace...");
+        let compact_start = Instant::now();
+        store
+            .data_partition()
+            .major_compact()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        info!(
+            "Major compaction completed in {:.1}s",
+            compact_start.elapsed().as_secs_f64()
+        );
+
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(
             "Loaded {total_variants} variants into {total_positions} positions ({total_bytes} bytes) in {elapsed:.1}s"
