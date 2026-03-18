@@ -6,7 +6,8 @@
 //! All variants at the same `(chrom, start)` are merged into a single entry.
 
 use ahash::AHashMap;
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 /// Canonical chromosome order: 1-22, X, Y, MT.
 /// Maps chromosome name (without "chr" prefix) to a 2-byte big-endian code.
@@ -30,7 +31,7 @@ const CHROM_NAMES: &[&str] = &[
 ];
 
 /// First code assigned to non-canonical contigs (canonical use 1..=25).
-const NON_CANONICAL_START: u16 = 25;
+const NON_CANONICAL_START: u16 = 26;
 
 /// Map a chromosome name (with or without "chr" prefix) to its 2-byte code.
 ///
@@ -85,11 +86,18 @@ pub fn encode_position_key_buf(chrom_code: u16, start: i64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&start.to_be_bytes());
 }
 
+/// Global registry tracking which contig name was assigned which non-canonical code.
+/// Used to detect hash collisions during cache creation.
+static NON_CANONICAL_REGISTRY: LazyLock<Mutex<HashMap<u16, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Deterministic code for non-canonical chromosomes.
 /// Uses a hash-based approach to assign stable codes in the range
-/// `NON_CANONICAL_START..=u16::MAX` (65511 possible values), which is
+/// `NON_CANONICAL_START..=u16::MAX` (65510 possible values), which is
 /// much wider than the previous 15-bit (32768) space and reduces
 /// collision probability for non-canonical contig names.
+///
+/// Panics if two different contig names hash to the same code (collision).
 fn non_canonical_code(chrom: &str) -> u16 {
     // FNV-1a 32-bit hash for better distribution.
     let mut hash: u32 = 0x811c_9dc5;
@@ -97,8 +105,27 @@ fn non_canonical_code(chrom: &str) -> u16 {
         hash ^= b as u32;
         hash = hash.wrapping_mul(0x0100_0193);
     }
-    let range = (u16::MAX as u32) - (NON_CANONICAL_START as u32) + 1; // 65511
-    NON_CANONICAL_START + (hash % range) as u16
+    let range = (u16::MAX as u32) - (NON_CANONICAL_START as u32) + 1;
+    let code = NON_CANONICAL_START + (hash % range) as u16;
+
+    // Check for collisions: different contig name mapping to the same code.
+    let mut registry = NON_CANONICAL_REGISTRY.lock().unwrap();
+    match registry.entry(code) {
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            if entry.get() != chrom {
+                panic!(
+                    "non-canonical contig hash collision: '{}' and '{}' both map to code {code}",
+                    entry.get(),
+                    chrom
+                );
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(chrom.to_string());
+        }
+    }
+
+    code
 }
 
 #[cfg(test)]
@@ -177,5 +204,16 @@ mod tests {
     fn test_chrom_code_chr_prefix_stripped() {
         assert_eq!(chrom_to_code("chr1"), chrom_to_code("1"));
         assert_eq!(chrom_to_code("chrX"), chrom_to_code("X"));
+    }
+
+    #[test]
+    fn test_no_canonical_code_in_non_canonical_range() {
+        for chrom in CHROM_NAMES.iter().chain(&["X", "Y", "MT"]) {
+            let code = chrom_to_code(chrom);
+            assert!(
+                code < NON_CANONICAL_START,
+                "canonical chrom '{chrom}' has code {code} which falls in non-canonical range (>= {NON_CANONICAL_START})"
+            );
+        }
     }
 }

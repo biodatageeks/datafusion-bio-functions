@@ -336,7 +336,15 @@ impl<'a> PositionEntryReader<'a> {
     /// Get the allele string for a given allele index.
     pub fn allele_string(&self, idx: usize) -> &str {
         let (off, len) = self.allele_offsets[idx];
-        std::str::from_utf8(&self.data[off..off + len]).unwrap_or("")
+        match std::str::from_utf8(&self.data[off..off + len]) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!(
+                    "allele_string: invalid UTF-8 at allele index {idx}: {e}"
+                );
+                ""
+            }
+        }
     }
 
     /// Append selected allele rows for a given column into an ArrayBuilder.
@@ -557,10 +565,17 @@ impl<'a> PositionEntryReader<'a> {
                         let end_off = offsets_start + row * 4;
                         let end = u32::from_le_bytes(data[end_off..end_off + 4].try_into().unwrap())
                             as usize;
-                        let s = std::str::from_utf8(
+                        let s = match std::str::from_utf8(
                             &data[string_data_start + start..string_data_start + end],
-                        )
-                        .unwrap_or("");
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log::debug!(
+                                    "append_column_values: invalid UTF-8 at row {row}: {e}"
+                                );
+                                ""
+                            }
+                        };
                         b.append_value(s);
                     }
                 }
