@@ -123,9 +123,9 @@ impl VepKvStore {
         &self.db
     }
 
-    /// Open an existing KV store with default settings (256 MB block cache).
+    /// Open an existing KV store with default settings (1 GB block cache).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_cache_size(path, 256 * 1024 * 1024)
+        Self::open_with_cache_size(path, 1024 * 1024 * 1024)
     }
 
     /// Open an existing KV store with a custom fjall block cache size (bytes).
@@ -166,19 +166,28 @@ impl VepKvStore {
 
     /// Create a new KV store with the given schema.
     ///
-    /// Uses write-optimized settings for bulk loading:
-    /// - `manual_journal_persist` — skip per-batch fsync (persist once at the end)
-    /// - L0 threshold raised to 16 — defer compaction during ingestion
+    /// Uses cold-start-optimized settings from the design spec:
+    /// - **Decision 1:** Disable metadata partitioning, pin all filter/index blocks
+    /// - **Decision 2:** `expect_point_read_hits` — skip L6 bloom filters (~1.7GB saved)
+    /// - **Decision 3:** Data block hash index (0.75) for O(1) within-block lookups
+    /// - **Decision 4:** 8 KiB data blocks — half the I/O ops for sorted access
+    /// - **Decision 6:** Bloom FPR 0.01% for tight novel-variant rejection
     /// - LZ4 disabled on data blocks — values are already zstd-compressed
+    /// - L0 threshold 16 — defer compaction during bulk ingestion
     pub fn create(path: impl AsRef<Path>, schema: SchemaRef) -> Result<Self> {
         let root_path = path.as_ref().to_path_buf();
         let db = Database::builder(&root_path)
-            .cache_size(256 * 1024 * 1024)
+            .cache_size(1024 * 1024 * 1024) // Decision 7: 1 GB block cache
             .manual_journal_persist(true)
             .open()
             .map_err(fjall_err)?;
 
-        // Data keyspace: write-optimized for bulk loading.
+        use fjall::config::{
+            BlockSizePolicy, BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry,
+            HashRatioPolicy, PartitioningPolicy, PinningPolicy,
+        };
+
+        // Data keyspace: cold-start-optimized for point lookups.
         let data_opts = || {
             KeyspaceCreateOptions::default()
                 .manual_journal_persist(true)
@@ -186,6 +195,24 @@ impl VepKvStore {
                     fjall::compaction::Leveled::default().with_l0_threshold(16),
                 ))
                 .data_block_compression_policy(fjall::config::CompressionPolicy::disabled())
+                // Decision 1: disable metadata partitioning, pin all filter/index blocks.
+                // Full (non-partitioned) indexes on all levels so entire block index
+                // is resident from open — eliminates the extra I/O hop that partitioned
+                // indexes require on first access.
+                .filter_block_partitioning_policy(PartitioningPolicy::all(false))
+                .index_block_partitioning_policy(PartitioningPolicy::all(false))
+                .filter_block_pinning_policy(PinningPolicy::all(true))
+                .index_block_pinning_policy(PinningPolicy::all(true))
+                // Decision 2: skip bloom on last level (95%+ hit rate)
+                .expect_point_read_hits(true)
+                // Decision 3: O(1) within-block lookup via hash index
+                .data_block_hash_ratio_policy(HashRatioPolicy::all(0.75))
+                // Decision 4: 8 KiB data blocks
+                .data_block_size_policy(BlockSizePolicy::all(8 * 1024))
+                // Decision 6: tight bloom FPR (0.01%)
+                .filter_policy(FilterPolicy::all(FilterPolicyEntry::Bloom(
+                    BloomConstructionPolicy::FalsePositiveRate(0.0001),
+                )))
         };
 
         let data = db.keyspace(DATA_KEYSPACE, data_opts).map_err(fjall_err)?;
