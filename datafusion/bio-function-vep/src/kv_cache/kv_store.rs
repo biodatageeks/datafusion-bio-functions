@@ -63,6 +63,22 @@ fn next_capacity(current: usize) -> Option<usize> {
     }
 }
 
+fn initial_decompress_capacity(compressed: &[u8]) -> usize {
+    if let Ok(Some(content_size)) = zstd::zstd_safe::get_frame_content_size(compressed) {
+        if let Ok(content_size) = usize::try_from(content_size) {
+            return content_size
+                .max(MIN_DECOMPRESS_CAPACITY)
+                .min(MAX_DECOMPRESSED_ENTRY_BYTES);
+        }
+    }
+
+    compressed
+        .len()
+        .saturating_mul(16)
+        .max(MIN_DECOMPRESS_CAPACITY)
+        .min(MAX_DECOMPRESSED_ENTRY_BYTES)
+}
+
 /// Decompress a zstd payload into a reusable buffer, growing capacity as needed.
 pub(crate) fn decompress_into_buffer_with_retry(
     decompressor: &mut zstd::bulk::Decompressor<'_>,
@@ -70,11 +86,7 @@ pub(crate) fn decompress_into_buffer_with_retry(
     out: &mut Vec<u8>,
     context: &str,
 ) -> Result<()> {
-    let mut target_capacity = compressed
-        .len()
-        .saturating_mul(16)
-        .max(MIN_DECOMPRESS_CAPACITY)
-        .min(MAX_DECOMPRESSED_ENTRY_BYTES);
+    let mut target_capacity = initial_decompress_capacity(compressed);
 
     if out.capacity() < target_capacity {
         out.reserve(target_capacity - out.capacity());
@@ -120,6 +132,7 @@ impl VepKvStore {
     pub fn open_with_cache_size(path: impl AsRef<Path>, cache_size_bytes: u64) -> Result<Self> {
         let root_path = path.as_ref().to_path_buf();
         let db = Database::builder(&root_path)
+            .worker_threads(1)
             .cache_size(cache_size_bytes)
             .open()
             .map_err(fjall_err)?;
@@ -283,12 +296,8 @@ impl VepKvStore {
                                 "failed to create zstd decompressor: {e}"
                             ))
                         })?;
-                    let mut decompressed = Vec::with_capacity(
-                        compressed
-                            .len()
-                            .saturating_mul(16)
-                            .max(MIN_DECOMPRESS_CAPACITY),
-                    );
+                    let mut decompressed =
+                        Vec::with_capacity(initial_decompress_capacity(&compressed));
                     decompress_into_buffer_with_retry(
                         &mut decompressor,
                         &compressed,
@@ -589,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zstd_decompression_retries_when_destination_buffer_too_small() {
+    fn test_zstd_decompression_handles_large_expansion_ratio() {
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
 
@@ -614,10 +623,10 @@ mod tests {
         let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &dict).unwrap();
         let compressed = compressor.compress(&huge).unwrap();
 
-        // Guard the regression condition: initial 16x guess is insufficient.
+        // Guard the regression condition from the old heuristic-only sizing path.
         assert!(
             huge.len() > compressed.len() * 16,
-            "test payload is not compressed enough to trigger resize retry"
+            "test payload is not compressed enough to exercise large expansion"
         );
 
         store.put_position_entry("1", 42, &compressed).unwrap();

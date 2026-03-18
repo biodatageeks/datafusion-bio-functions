@@ -71,6 +71,7 @@ use crate::allele::{
     MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::annotation_store::{AnnotationBackend, build_store};
+use crate::config;
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
@@ -1412,7 +1413,15 @@ impl AnnotateProvider {
             AnnotationBackend::Fjall => {
                 #[cfg(feature = "kv-cache")]
                 {
-                    let provider = KvCacheTableProvider::open(&self.cache_source).map_err(|e| {
+                    let annotation_config = config::resolve(&self.session);
+                    let cache_size_bytes = annotation_config
+                        .cache_size_mb
+                        .saturating_mul(1024 * 1024);
+                    let provider = KvCacheTableProvider::open_with_cache_size(
+                        &self.cache_source,
+                        cache_size_bytes,
+                    )
+                    .map_err(|e| {
                         DataFusionError::Execution(format!(
                             "annotate_vep(): failed to open fjall cache '{}': {e}",
                             self.cache_source
