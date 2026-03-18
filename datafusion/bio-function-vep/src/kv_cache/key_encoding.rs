@@ -6,8 +6,7 @@
 //! All variants at the same `(chrom, start)` are merged into a single entry.
 
 use ahash::AHashMap;
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 /// Canonical chromosome order: 1-22, X, Y, MT.
 /// Maps chromosome name (without "chr" prefix) to a 2-byte big-endian code.
@@ -30,7 +29,9 @@ const CHROM_NAMES: &[&str] = &[
     "18", "19", "20", "21", "22",
 ];
 
-/// First code assigned to non-canonical contigs (canonical use 1..=25).
+/// First code assigned to non-canonical contigs.
+/// Canonical codes: 1..=22 (autosomes), 0x0017=X, 0x0018=Y, 0x0019=MT (=25).
+/// Non-canonical range starts at 26 to avoid colliding with MT.
 const NON_CANONICAL_START: u16 = 26;
 
 /// Map a chromosome name (with or without "chr" prefix) to its 2-byte code.
@@ -86,46 +87,42 @@ pub fn encode_position_key_buf(chrom_code: u16, start: i64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&start.to_be_bytes());
 }
 
-/// Global registry tracking which contig name was assigned which non-canonical code.
-/// Used to detect hash collisions during cache creation.
-static NON_CANONICAL_REGISTRY: LazyLock<Mutex<HashMap<u16, String>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 /// Deterministic code for non-canonical chromosomes.
-/// Uses a hash-based approach to assign stable codes in the range
-/// `NON_CANONICAL_START..=u16::MAX` (65510 possible values), which is
-/// much wider than the previous 15-bit (32768) space and reduces
-/// collision probability for non-canonical contig names.
-///
-/// Panics if two different contig names hash to the same code (collision).
+/// Uses FNV-1a hash to assign stable codes in the range
+/// `NON_CANONICAL_START..=u16::MAX` (65510 possible values).
+/// Lock-free — safe for the hot read path.
 fn non_canonical_code(chrom: &str) -> u16 {
-    // FNV-1a 32-bit hash for better distribution.
     let mut hash: u32 = 0x811c_9dc5;
     for b in chrom.bytes() {
         hash ^= b as u32;
         hash = hash.wrapping_mul(0x0100_0193);
     }
     let range = (u16::MAX as u32) - (NON_CANONICAL_START as u32) + 1;
-    let code = NON_CANONICAL_START + (hash % range) as u16;
+    NON_CANONICAL_START + (hash % range) as u16
+}
 
-    // Check for collisions: different contig name mapping to the same code.
-    let mut registry = NON_CANONICAL_REGISTRY.lock().unwrap();
-    match registry.entry(code) {
-        std::collections::hash_map::Entry::Occupied(entry) => {
-            if entry.get() != chrom {
+/// Validate that a set of non-canonical contig names has no hash collisions.
+///
+/// Call this during cache creation after collecting all contig names.
+/// Panics if two different names map to the same code.
+pub fn validate_non_canonical_contigs(contigs: &[&str]) {
+    let mut seen: AHashMap<u16, &str> = AHashMap::new();
+    for &contig in contigs {
+        if CHROM_TO_CODE.get(contig).is_some() {
+            continue; // canonical — skip
+        }
+        let code = non_canonical_code(contig);
+        if let Some(&existing) = seen.get(&code) {
+            if existing != contig {
                 panic!(
-                    "non-canonical contig hash collision: '{}' and '{}' both map to code {code}",
-                    entry.get(),
-                    chrom
+                    "non-canonical contig hash collision: '{}' and '{}' both map to code {}",
+                    existing, contig, code
                 );
             }
-        }
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(chrom.to_string());
+        } else {
+            seen.insert(code, contig);
         }
     }
-
-    code
 }
 
 #[cfg(test)]
@@ -212,8 +209,33 @@ mod tests {
             let code = chrom_to_code(chrom);
             assert!(
                 code < NON_CANONICAL_START,
-                "canonical chrom '{chrom}' has code {code} which falls in non-canonical range (>= {NON_CANONICAL_START})"
+                "canonical chrom '{chrom}' has code {code} >= NON_CANONICAL_START {NON_CANONICAL_START}"
             );
         }
+    }
+
+    #[test]
+    fn test_validate_non_canonical_contigs_no_collision() {
+        // Should not panic for distinct contigs.
+        validate_non_canonical_contigs(&["GL000220.1", "KI270733.1", "chrUn_gl000220"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "hash collision")]
+    fn test_validate_non_canonical_contigs_detects_collision() {
+        // Brute-force find two strings that collide.
+        let mut codes: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+        let mut colliders = None;
+        for i in 0..100_000u32 {
+            let name = format!("contig_{i}");
+            let code = non_canonical_code(&name);
+            if let Some(existing) = codes.get(&code) {
+                colliders = Some((existing.clone(), name));
+                break;
+            }
+            codes.insert(code, name);
+        }
+        let (a, b) = colliders.expect("no collision found in 100K contigs — increase range");
+        validate_non_canonical_contigs(&[&a, &b]);
     }
 }

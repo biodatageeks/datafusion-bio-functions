@@ -563,17 +563,10 @@ impl<'a> PositionEntryReader<'a> {
                         let end_off = offsets_start + row * 4;
                         let end = u32::from_le_bytes(data[end_off..end_off + 4].try_into().unwrap())
                             as usize;
-                        let s = match std::str::from_utf8(
+                        let s = std::str::from_utf8(
                             &data[string_data_start + start..string_data_start + end],
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log::debug!(
-                                    "append_column_values: invalid UTF-8 at row {row}: {e}"
-                                );
-                                ""
-                            }
-                        };
+                        )
+                        .unwrap_or("");
                         b.append_value(s);
                     }
                 }

@@ -20,9 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datafusion::arrow::array::{
-    Array, AsArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
-};
+use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray, StringViewArray};
 use datafusion::arrow::datatypes::{DataType, Int64Type, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
@@ -587,16 +585,14 @@ fn train_dict(samples: &[&[u8]], dict_size_kb: u32) -> Result<Vec<u8>> {
     Ok(dict)
 }
 
-/// Extract a string value from a Utf8, LargeUtf8, or Utf8View array.
+/// Extract a string value from either Utf8 or Utf8View array.
 fn string_value(col: &dyn Array, row: usize) -> &str {
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
         arr.value(row)
     } else if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
         arr.value(row)
-    } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
-        arr.value(row)
     } else {
-        panic!("Expected Utf8, LargeUtf8, or Utf8View column for chrom")
+        panic!("Expected Utf8 or Utf8View column for chrom")
     }
 }
 
