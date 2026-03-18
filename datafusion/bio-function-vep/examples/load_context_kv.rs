@@ -4,8 +4,6 @@
 //! Usage:
 //!   load_context_kv <fjall_db_path> <exon_parquet> <translation_parquet>
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 
 use datafusion::arrow::array::{Array, Int64Array, ListArray, StringArray, StringViewArray};
