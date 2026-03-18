@@ -583,6 +583,59 @@ fn string_value(col: &dyn Array, row: usize) -> &str {
     }
 }
 
+/// Load translation features into the fjall database's translations keyspace.
+///
+/// Opens (or creates) the translations keyspace and inserts each feature
+/// keyed by `transcript_id`.
+pub fn load_translations_into_kv(
+    db: &fjall::Database,
+    translations: &[crate::transcript_consequence::TranslationFeature],
+) -> Result<usize> {
+    use super::context_store::TranslationKvStore;
+
+    let store = TranslationKvStore::create(db)?;
+    for t in translations {
+        store.put(t)?;
+    }
+    info!(
+        "Loaded {} translations into fjall translations keyspace",
+        translations.len()
+    );
+    Ok(translations.len())
+}
+
+/// Load exon features into the fjall database's exons keyspace.
+///
+/// Groups exons by `transcript_id`, sorts each group by `exon_number`,
+/// then stores one entry per transcript.
+pub fn load_exons_into_kv(
+    db: &fjall::Database,
+    exons: &[crate::transcript_consequence::ExonFeature],
+) -> Result<usize> {
+    use super::context_store::ExonKvStore;
+
+    let store = ExonKvStore::create(db)?;
+
+    // Group by transcript_id.
+    let mut by_tx: HashMap<&str, Vec<crate::transcript_consequence::ExonFeature>> = HashMap::new();
+    for e in exons {
+        by_tx
+            .entry(e.transcript_id.as_str())
+            .or_default()
+            .push(e.clone());
+    }
+    let tx_count = by_tx.len();
+    for (tx_id, mut group) in by_tx {
+        store.put(tx_id, &mut group)?;
+    }
+    info!(
+        "Loaded {} exons for {} transcripts into fjall exons keyspace",
+        exons.len(),
+        tx_count
+    );
+    Ok(exons.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2823,9 +2823,42 @@ impl AnnotateProvider {
             );
 
             let tx_ids: HashSet<String> = tx.iter().map(|t| t.transcript_id.clone()).collect();
+            let tx_id_refs: Vec<&str> = tx_ids.iter().map(|s| s.as_str()).collect();
+
+            // Try fjall context keyspaces (O(1) per-transcript) before falling
+            // back to Parquet SQL.  Reuse the Database handle from the variation
+            // cache that is already opened by KvCacheTableProvider.
+            #[cfg(feature = "kv-cache")]
+            let (exon_kv, translation_kv): (
+                Option<crate::kv_cache::ExonKvStore>,
+                Option<crate::kv_cache::TranslationKvStore>,
+            ) = {
+                let pair = self
+                    .session
+                    .table_provider(cache_table)
+                    .await
+                    .ok()
+                    .and_then(|provider| {
+                        provider
+                            .as_any()
+                            .downcast_ref::<KvCacheTableProvider>()
+                            .map(|kv| kv.store().database().clone())
+                    });
+                match pair {
+                    Some(db) => (
+                        crate::kv_cache::ExonKvStore::open(&db).ok().flatten(),
+                        crate::kv_cache::TranslationKvStore::open(&db).ok().flatten(),
+                    ),
+                    None => (None, None),
+                }
+            };
+            #[cfg(not(feature = "kv-cache"))]
+            let (exon_kv, translation_kv): (Option<()>, Option<()>) = (None, None);
 
             let t_ex = profile_start!();
-            let ex = if let Some(table) = exons_table {
+            let ex = if let Some(ref ex_kv) = exon_kv {
+                ex_kv.get_many(&tx_id_refs)?
+            } else if let Some(table) = exons_table {
                 let raw = self.load_exons(table, &worklist).await?;
                 raw.into_iter()
                     .filter(|e| tx_ids.contains(&e.transcript_id))
@@ -2833,10 +2866,12 @@ impl AnnotateProvider {
             } else {
                 Vec::new()
             };
-            profile_end!("4b. load_exons", t_ex, format!("{} exons", ex.len()));
+            profile_end!("4b. load_exons", t_ex, format!("{} exons (kv={})", ex.len(), exon_kv.is_some()));
 
             let t_tl = profile_start!();
-            let tl = if let Some(table) = translations_table {
+            let tl = if let Some(ref tl_kv) = translation_kv {
+                tl_kv.get_many(&tx_id_refs)?
+            } else if let Some(table) = translations_table {
                 let raw = self.load_translations(table, &worklist).await?;
                 raw.into_iter()
                     .filter(|t| tx_ids.contains(&t.transcript_id))
@@ -2847,7 +2882,7 @@ impl AnnotateProvider {
             profile_end!(
                 "4c. load_translations",
                 t_tl,
-                format!("{} translations", tl.len())
+                format!("{} translations (kv={})", tl.len(), translation_kv.is_some())
             );
 
             let t_rg = profile_start!();
