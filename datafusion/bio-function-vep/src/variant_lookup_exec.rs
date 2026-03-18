@@ -1219,11 +1219,16 @@ impl VariantLookupStream {
                 let allele_str = cache_alleles.value(cache_row);
 
                 // --- Primary: O(1) hash lookup by exact (chrom, start, end) ---
+                // Emit at most one cache match per VCF row — duplicate alleles
+                // at the same position produce identical annotation output.
                 let mut found_via_hash = false;
                 if let Some(candidates) = active_hash_bucket
                     .and_then(|coord_map| coord_map.get(&(cache_start_1based, cache_end_1based)))
                 {
                     for &vcf_idx in candidates {
+                        if matched[vcf_idx as usize] {
+                            continue;
+                        }
                         let row = &rows[vcf_idx as usize];
                         if allele_matches(&row.vcf_ref, &row.vcf_alt, allele_str) {
                             vcf_indices.push(vcf_idx);

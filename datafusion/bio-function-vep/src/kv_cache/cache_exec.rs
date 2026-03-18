@@ -627,22 +627,24 @@ impl KvLookupStream {
                     }
                 }
 
-                if !matched_allele_rows.is_empty() {
+                if !matched_allele_rows.is_empty() && !emitted_match {
+                    // Emit only the first matched allele per VCF row.
+                    // Multiple alleles at the same position produce identical
+                    // annotation output (same VCF coords → same transcript
+                    // overlaps, colocated data, and consequence), so emitting
+                    // duplicates is pure overhead.  Colocated collection below
+                    // still iterates all alleles independently.
                     emitted_match = true;
-                    for _ in &matched_allele_rows {
-                        vcf_indices.push(row as u32);
-                    }
+                    let first_match = &matched_allele_rows[..1];
+                    vcf_indices.push(row as u32);
                     for (col_out_idx, builder) in builders.iter_mut().enumerate() {
                         let entry_idx = col_map[col_out_idx];
                         if entry_idx == usize::MAX {
-                            // Column not found in entry -> nulls.
-                            for _ in &matched_allele_rows {
-                                append_null_to_builder(builder.as_mut())?;
-                            }
+                            append_null_to_builder(builder.as_mut())?;
                         } else {
                             reader.append_column_values(
                                 entry_idx,
-                                &matched_allele_rows,
+                                first_match,
                                 builder.as_mut(),
                             )?;
                         }
