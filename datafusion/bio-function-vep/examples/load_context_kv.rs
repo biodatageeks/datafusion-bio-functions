@@ -9,7 +9,9 @@ use std::time::Instant;
 use datafusion::arrow::array::{Array, Int64Array, ListArray, StringArray, StringViewArray};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
-use datafusion_bio_function_vep::kv_cache::loader::{load_exons_into_kv, load_translations_into_kv};
+use datafusion_bio_function_vep::kv_cache::loader::{
+    load_exons_into_kv, load_translations_into_kv,
+};
 use datafusion_bio_function_vep::transcript_consequence::{
     ExonFeature, ProteinDomainFeature, TranslationFeature,
 };
@@ -28,7 +30,7 @@ fn string_at(col: &dyn Array, row: usize) -> Option<String> {
 }
 
 fn int64_at(col: &dyn Array, row: usize) -> Option<i64> {
-    use datafusion::arrow::array::{Int32Array, Int16Array, Int8Array};
+    use datafusion::arrow::array::{Int8Array, Int16Array, Int32Array};
     if col.is_null(row) {
         return None;
     }
@@ -61,7 +63,9 @@ fn read_protein_features(col: &dyn Array, row: usize) -> Vec<ProteinDomainFeatur
         return Vec::new();
     }
     let values = list_arr.values();
-    let struct_arr = values.as_any().downcast_ref::<datafusion::arrow::array::StructArray>();
+    let struct_arr = values
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::StructArray>();
     let Some(struct_arr) = struct_arr else {
         return Vec::new();
     };
@@ -173,10 +177,8 @@ async fn load_translations_from_parquet(
                 .and_then(|v| usize::try_from(v).ok());
             let translation_seq =
                 translation_seq_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
-            let cds_sequence =
-                cds_seq_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
-            let stable_id =
-                stable_id_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
+            let cds_sequence = cds_seq_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
+            let stable_id = stable_id_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
             let version = version_idx
                 .and_then(|i| int64_at(batch.column(i).as_ref(), row))
                 .and_then(|v| i32::try_from(v).ok());
@@ -203,7 +205,10 @@ async fn load_translations_from_parquet(
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("Usage: {} <fjall_db_path> <exon_parquet> <translation_parquet>", args[0]);
+        eprintln!(
+            "Usage: {} <fjall_db_path> <exon_parquet> <translation_parquet>",
+            args[0]
+        );
         std::process::exit(1);
     }
     let fjall_path = &args[1];
@@ -219,7 +224,11 @@ async fn main() -> Result<()> {
     println!("Loading exons from {exon_parquet}...");
     let t0 = Instant::now();
     let exons = load_exons_from_parquet(&ctx, "exons").await?;
-    println!("  parsed {} exons in {:.3}s", exons.len(), t0.elapsed().as_secs_f64());
+    println!(
+        "  parsed {} exons in {:.3}s",
+        exons.len(),
+        t0.elapsed().as_secs_f64()
+    );
 
     println!("Loading translations from {translation_parquet}...");
     let t0 = Instant::now();
@@ -242,7 +251,10 @@ async fn main() -> Result<()> {
 
     let t0 = Instant::now();
     let n_tl = load_translations_into_kv(&db, &translations)?;
-    println!("  wrote {n_tl} translations in {:.3}s", t0.elapsed().as_secs_f64());
+    println!(
+        "  wrote {n_tl} translations in {:.3}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     let t0 = Instant::now();
     db.persist(fjall::PersistMode::SyncAll)

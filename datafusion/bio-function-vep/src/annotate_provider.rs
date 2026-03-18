@@ -1414,9 +1414,8 @@ impl AnnotateProvider {
                 #[cfg(feature = "kv-cache")]
                 {
                     let annotation_config = config::resolve(&self.session);
-                    let cache_size_bytes = annotation_config
-                        .cache_size_mb
-                        .saturating_mul(1024 * 1024);
+                    let cache_size_bytes =
+                        annotation_config.cache_size_mb.saturating_mul(1024 * 1024);
                     let provider = KvCacheTableProvider::open_with_cache_size(
                         &self.cache_source,
                         cache_size_bytes,
@@ -2847,7 +2846,9 @@ impl AnnotateProvider {
                 match pair {
                     Some(db) => (
                         crate::kv_cache::ExonKvStore::open(&db).ok().flatten(),
-                        crate::kv_cache::TranslationKvStore::open(&db).ok().flatten(),
+                        crate::kv_cache::TranslationKvStore::open(&db)
+                            .ok()
+                            .flatten(),
                     ),
                     None => (None, None),
                 }
@@ -2866,7 +2867,11 @@ impl AnnotateProvider {
             } else {
                 Vec::new()
             };
-            profile_end!("4b. load_exons", t_ex, format!("{} exons (kv={})", ex.len(), exon_kv.is_some()));
+            profile_end!(
+                "4b. load_exons",
+                t_ex,
+                format!("{} exons (kv={})", ex.len(), exon_kv.is_some())
+            );
 
             let t_tl = profile_start!();
             let tl = if let Some(ref tl_kv) = translation_kv {
@@ -2882,7 +2887,11 @@ impl AnnotateProvider {
             profile_end!(
                 "4c. load_translations",
                 t_tl,
-                format!("{} translations (kv={})", tl.len(), translation_kv.is_some())
+                format!(
+                    "{} translations (kv={})",
+                    tl.len(),
+                    translation_kv.is_some()
+                )
             );
 
             let t_rg = profile_start!();

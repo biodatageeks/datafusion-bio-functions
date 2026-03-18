@@ -103,11 +103,7 @@ impl TranslationKvStore {
 
     /// Retrieve a translation feature by transcript_id. Returns `None` on miss.
     pub fn get(&self, transcript_id: &str) -> Result<Option<TranslationFeature>> {
-        let Some(raw) = self
-            .ks
-            .get(transcript_id.as_bytes())
-            .map_err(fjall_err)?
-        else {
+        let Some(raw) = self.ks.get(transcript_id.as_bytes()).map_err(fjall_err)? else {
             return Ok(None);
         };
         deserialize_translation(transcript_id, &raw).map(Some)
@@ -179,11 +175,7 @@ impl ExonKvStore {
 
     /// Retrieve exons for a transcript_id. Returns empty vec on miss.
     pub fn get(&self, transcript_id: &str) -> Result<Vec<ExonFeature>> {
-        let Some(raw) = self
-            .ks
-            .get(transcript_id.as_bytes())
-            .map_err(fjall_err)?
-        else {
+        let Some(raw) = self.ks.get(transcript_id.as_bytes()).map_err(fjall_err)? else {
             return Ok(Vec::new());
         };
         deserialize_exons(transcript_id, &raw)
@@ -382,9 +374,7 @@ fn serialize_exons(exons: &[ExonFeature]) -> Vec<u8> {
 
 fn deserialize_exons(transcript_id: &str, data: &[u8]) -> Result<Vec<ExonFeature>> {
     if data.len() < 4 {
-        return Err(DataFusionError::Execution(
-            "exon entry too short".into(),
-        ));
+        return Err(DataFusionError::Execution("exon entry too short".into()));
     }
     let mut off = 0;
     let count = read_u32(data, &mut off)? as usize;

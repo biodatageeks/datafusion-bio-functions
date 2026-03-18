@@ -339,9 +339,7 @@ impl<'a> PositionEntryReader<'a> {
         match std::str::from_utf8(&self.data[off..off + len]) {
             Ok(s) => s,
             Err(e) => {
-                log::warn!(
-                    "allele_string: invalid UTF-8 at allele index {idx}: {e}"
-                );
+                log::warn!("allele_string: invalid UTF-8 at allele index {idx}: {e}");
                 ""
             }
         }
