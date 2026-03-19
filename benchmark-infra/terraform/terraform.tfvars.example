@@ -1,0 +1,27 @@
+# Copy to terraform.tfvars and fill in your values
+
+# ── GCP Project ─────────────────────────────────────────────────────
+billing_account_id = "012345-6789AB-CDEF01"
+project_id         = "vep-benchmark-001"       # must be globally unique
+project_name       = "VEP Benchmark"
+# org_id           = "123456789"               # optional, omit for personal accounts
+
+# ── Region ──────────────────────────────────────────────────────────
+region       = "europe-west1"
+zone         = "europe-west1-b"
+machine_type               = "c3-highmem-8"    # 8 vCPUs, 64 GB RAM
+disk_size_gb               = 200
+disk_provisioned_iops      = 3000              # baseline 3000, max 160000
+disk_provisioned_throughput = 140               # MiB/s, baseline 140, max 2400
+
+# ── SSH ──────────────────────────────────────────────────────────────
+ssh_user          = "benchmark"
+ssh_pub_key_path  = "~/.ssh/id_rsa.pub"
+ssh_priv_key_path = "~/.ssh/id_rsa"
+
+# ── Local data paths (source for rsync to VM) ────────────────────────
+local_vcf_dir           = "/Users/mwiewior/research/git/datafusion-bio-functions/vep-benchmark/data"
+local_fasta_path        = "/Users/mwiewior/research/data/vep/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+local_chr1_vep_dir      = "/Users/mwiewior/research/data/vep/chr1-vep"
+local_ensembl_cache_dir = "/Users/mwiewior/research/data/vep/homo_sapiens/115_GRCh38"
+local_repo_dir          = "/Users/mwiewior/research/git/datafusion-bio-functions"
