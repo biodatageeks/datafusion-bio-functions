@@ -56,6 +56,11 @@ struct StreamContext {
     /// was skipped (too few samples) — partitions store entries uncompressed.
     dict: Option<Arc<Vec<u8>>>,
     zstd_level: i32,
+    /// Serializes read-merge-write operations across partitions to prevent
+    /// concurrent merges from silently dropping alleles when the same
+    /// `(chrom, start)` key appears in multiple partitions (e.g., at
+    /// partition boundaries for sorted input).
+    merge_lock: Arc<std::sync::Mutex<()>>,
 }
 
 /// Builder for loading a Parquet-based VEP cache into fjall.
@@ -146,6 +151,7 @@ impl CacheLoader {
         let semaphore = self
             .parallelism
             .map(|n| Arc::new(tokio::sync::Semaphore::new(n.min(partition_count))));
+        let merge_lock = Arc::new(std::sync::Mutex::new(()));
 
         let mut handles = Vec::with_capacity(partition_count);
 
@@ -158,6 +164,7 @@ impl CacheLoader {
                 schema: schema.clone(),
                 dict: dict.clone(),
                 zstd_level: self.zstd_level,
+                merge_lock: Arc::clone(&merge_lock),
             };
 
             handles.push(tokio::spawn(async move {
@@ -359,9 +366,16 @@ async fn stream_partition(
                     "missing zstd decompressor while compression is enabled".to_string(),
                 )
             })?;
+            let lock = Arc::clone(&ctx.merge_lock);
             let (comp_back, dec_back, positions, bytes) = tokio::task::spawn_blocking(move || {
-                let result =
-                    flush_positions_compressed(&store, &schema, &batch_clone, &mut comp, &mut dec);
+                let result = flush_positions_compressed(
+                    &store,
+                    &schema,
+                    &batch_clone,
+                    &mut comp,
+                    &mut dec,
+                    &lock,
+                );
                 result.map(|(p, b)| (comp, dec, p, b))
             })
             .await
@@ -371,8 +385,9 @@ async fn stream_partition(
             stats.total_positions += positions;
             stats.total_bytes += bytes;
         } else {
+            let lock = Arc::clone(&ctx.merge_lock);
             let (positions, bytes) = tokio::task::spawn_blocking(move || {
-                flush_positions_uncompressed(&store, &schema, &batch_clone)
+                flush_positions_uncompressed(&store, &schema, &batch_clone, &lock)
             })
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))??;
@@ -396,6 +411,7 @@ fn flush_positions_uncompressed(
     store: &VepKvStore,
     schema: &SchemaRef,
     batch: &RecordBatch,
+    merge_lock: &std::sync::Mutex<()>,
 ) -> Result<(u64, u64)> {
     let chrom_col_idx = schema.index_of("chrom")?;
     let start_col_idx = schema.index_of("start")?;
@@ -424,6 +440,9 @@ fn flush_positions_uncompressed(
 
     for ((chrom, start), rows) in &groups {
         let mut value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+        // Serialize read-merge-write to prevent concurrent partitions from
+        // overwriting each other's alleles at shared boundary positions.
+        let _guard = merge_lock.lock().unwrap();
         if let Some(existing) =
             store.get_position_entry_decompressed(chrom_to_code(chrom), *start)?
         {
@@ -432,6 +451,7 @@ fn flush_positions_uncompressed(
         let key = encode_position_key(chrom, *start);
         total_bytes += value.len() as u64;
         entries.push((key, value));
+        drop(_guard);
     }
 
     let num_positions = entries.len() as u64;
@@ -447,6 +467,7 @@ fn flush_positions_compressed(
     batch: &RecordBatch,
     compressor: &mut zstd::bulk::Compressor<'_>,
     decompressor: &mut zstd::bulk::Decompressor<'_>,
+    merge_lock: &std::sync::Mutex<()>,
 ) -> Result<(u64, u64)> {
     let chrom_col_idx = schema.index_of("chrom")?;
     let start_col_idx = schema.index_of("start")?;
@@ -476,6 +497,9 @@ fn flush_positions_compressed(
     for ((chrom, start), rows) in &groups {
         let chrom_code = chrom_to_code(chrom);
         let mut raw_value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+        // Serialize read-merge-write to prevent concurrent partitions from
+        // overwriting each other's alleles at shared boundary positions.
+        let _guard = merge_lock.lock().unwrap();
         if let Some(existing_compressed) = store.get_position_entry(chrom_code, *start)? {
             let mut existing_raw = Vec::new();
             decompress_into_buffer_with_retry(
@@ -492,6 +516,7 @@ fn flush_positions_compressed(
         let key = encode_position_key(chrom, *start);
         total_bytes += compressed.len() as u64;
         entries.push((key, compressed));
+        drop(_guard);
     }
 
     let num_positions = entries.len() as u64;
