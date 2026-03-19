@@ -31,13 +31,15 @@ ENSEMBL_OUT="${RESULTS_DIR}/ensembl_chr1_${TIMESTAMP}.vcf"
 ENSEMBL_START=$(date +%s%N)
 
 docker run --rm \
+  --user "$(id -u):$(id -g)" \
   -v "${DATA_DIR}:/opt/vep/.vep" \
-  -v "${DATA_DIR}/vcf:/work" \
+  -v "${DATA_DIR}/vcf:/work:ro" \
   -v "$(dirname "${FASTA}"):/fasta" \
+  -v "${RESULTS_DIR}:/output" \
   "${VEP_IMAGE}" \
   vep \
     --input_file /work/HG002_chr1.vcf.gz \
-    --output_file /work/ensembl_output.vcf \
+    --output_file /output/ensembl_output.vcf \
     --vcf \
     --offline \
     --cache \
@@ -55,8 +57,8 @@ echo "Ensembl VEP time: ${ENSEMBL_MS}ms ($(echo "scale=1; ${ENSEMBL_MS}/1000" | 
 echo "" | tee -a "${RESULT_FILE}"
 
 # Move output
-if [ -f "${DATA_DIR}/vcf/ensembl_output.vcf" ]; then
-  mv "${DATA_DIR}/vcf/ensembl_output.vcf" "${ENSEMBL_OUT}"
+if [ -f "${RESULTS_DIR}/ensembl_output.vcf" ]; then
+  mv "${RESULTS_DIR}/ensembl_output.vcf" "${ENSEMBL_OUT}"
   echo "Ensembl output: ${ENSEMBL_OUT}" | tee -a "${RESULT_FILE}"
 fi
 
