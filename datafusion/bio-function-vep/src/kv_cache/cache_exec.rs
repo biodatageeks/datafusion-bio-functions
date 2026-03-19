@@ -815,7 +815,9 @@ impl KvLookupStream {
         // Flush colocated data to the shared sink.
         if let (Some(buf), Some(sink)) = (coloc_buf, &self.colocated_sink) {
             if !buf.is_empty() {
-                let mut guard = sink.lock().unwrap();
+                let mut guard = sink.lock().map_err(|e| {
+                    DataFusionError::Execution(format!("colocated sink mutex poisoned: {e}"))
+                })?;
                 for (key, mut value) in buf {
                     guard
                         .entry(key)

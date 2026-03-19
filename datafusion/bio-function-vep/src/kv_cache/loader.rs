@@ -20,7 +20,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray, StringViewArray};
+use datafusion::arrow::array::{
+    Array, AsArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+};
 use datafusion::arrow::datatypes::{DataType, Int64Type, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
@@ -435,27 +437,25 @@ fn flush_positions_uncompressed(
             .push(row);
     }
 
-    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(groups.len());
     let mut total_bytes = 0u64;
+    let mut num_positions = 0u64;
 
     for ((chrom, start), rows) in &groups {
         let mut value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
-        // Serialize read-merge-write to prevent concurrent partitions from
-        // overwriting each other's alleles at shared boundary positions.
+        // Read-merge-write must be atomic: hold the lock through the write
+        // to prevent concurrent partitions from overwriting each other's
+        // alleles at shared boundary positions.
         let _guard = merge_lock.lock().unwrap();
         if let Some(existing) =
             store.get_position_entry_decompressed(chrom_to_code(chrom), *start)?
         {
             value = merge_position_entries(&existing, &value, schema)?;
         }
-        let key = encode_position_key(chrom, *start);
-        total_bytes += value.len() as u64;
-        entries.push((key, value));
+        store.put_position_entry(chrom, *start, &value)?;
         drop(_guard);
+        total_bytes += value.len() as u64;
+        num_positions += 1;
     }
-
-    let num_positions = entries.len() as u64;
-    store.batch_insert_position_entries(&entries)?;
 
     Ok((num_positions, total_bytes))
 }
@@ -491,14 +491,15 @@ fn flush_positions_compressed(
             .push(row);
     }
 
-    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(groups.len());
     let mut total_bytes = 0u64;
+    let mut num_positions = 0u64;
 
     for ((chrom, start), rows) in &groups {
         let chrom_code = chrom_to_code(chrom);
         let mut raw_value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
-        // Serialize read-merge-write to prevent concurrent partitions from
-        // overwriting each other's alleles at shared boundary positions.
+        // Read-merge-write must be atomic: hold the lock through the write
+        // to prevent concurrent partitions from overwriting each other's
+        // alleles at shared boundary positions.
         let _guard = merge_lock.lock().unwrap();
         if let Some(existing_compressed) = store.get_position_entry(chrom_code, *start)? {
             let mut existing_raw = Vec::new();
@@ -513,14 +514,11 @@ fn flush_positions_compressed(
         let compressed = compressor
             .compress(&raw_value)
             .map_err(|e| DataFusionError::Execution(format!("zstd compression failed: {e}")))?;
-        let key = encode_position_key(chrom, *start);
-        total_bytes += compressed.len() as u64;
-        entries.push((key, compressed));
+        store.put_position_entry(chrom, *start, &compressed)?;
         drop(_guard);
+        total_bytes += compressed.len() as u64;
+        num_positions += 1;
     }
-
-    let num_positions = entries.len() as u64;
-    store.batch_insert_position_entries(&entries)?;
 
     Ok((num_positions, total_bytes))
 }
@@ -610,14 +608,16 @@ fn train_dict(samples: &[&[u8]], dict_size_kb: u32) -> Result<Vec<u8>> {
     Ok(dict)
 }
 
-/// Extract a string value from either Utf8 or Utf8View array.
+/// Extract a string value from a Utf8, LargeUtf8, or Utf8View array.
 fn string_value(col: &dyn Array, row: usize) -> &str {
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
         arr.value(row)
     } else if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
         arr.value(row)
+    } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+        arr.value(row)
     } else {
-        panic!("Expected Utf8 or Utf8View column for chrom")
+        panic!("Expected Utf8, LargeUtf8, or Utf8View column for chrom")
     }
 }
 

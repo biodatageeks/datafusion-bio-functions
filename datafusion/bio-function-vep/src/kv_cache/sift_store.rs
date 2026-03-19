@@ -147,3 +147,97 @@ fn deserialize_predictions(data: &[u8]) -> Result<CachedPredictions> {
     // Already sorted (stored sorted during ingestion)
     Ok(CachedPredictions { sift, polyphen })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_predictions() -> CachedPredictions {
+        CachedPredictions {
+            sift: vec![
+                CompactPrediction {
+                    position: 10,
+                    amino_acid: 1,
+                    prediction: 0,
+                    score: 0.05,
+                },
+                CompactPrediction {
+                    position: 20,
+                    amino_acid: 2,
+                    prediction: 1,
+                    score: 0.95,
+                },
+            ],
+            polyphen: vec![CompactPrediction {
+                position: 10,
+                amino_acid: 1,
+                prediction: 2,
+                score: 0.88,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_sift_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+
+        let store = SiftKvStore::create(&db).unwrap();
+        let preds = make_predictions();
+        store.put("ENST00000123456", &preds).unwrap();
+
+        let loaded = store.get("ENST00000123456").unwrap().unwrap();
+        assert_eq!(loaded.sift.len(), 2);
+        assert_eq!(loaded.polyphen.len(), 1);
+        assert_eq!(loaded.sift[0].position, 10);
+        assert_eq!(loaded.sift[1].position, 20);
+        assert!((loaded.sift[0].score - 0.05).abs() < f32::EPSILON);
+        assert_eq!(loaded.polyphen[0].prediction, 2);
+    }
+
+    #[test]
+    fn test_sift_missing_key_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+
+        let store = SiftKvStore::create(&db).unwrap();
+        store.put("ENST00000123456", &make_predictions()).unwrap();
+
+        assert!(store.get("MISSING").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_deserialize_truncated_header() {
+        // Only 4 bytes — too short for the 8-byte header.
+        let result = deserialize_predictions(&[0, 0, 0, 0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_truncated_body() {
+        // Header claims 1 sift + 1 polyphen (needs 8 + 20 = 28 bytes)
+        // but only 8 bytes provided.
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(&1u32.to_le_bytes()); // sift_count = 1
+        data[4..8].copy_from_slice(&1u32.to_le_bytes()); // polyphen_count = 1
+        let result = deserialize_predictions(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_open_empty_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+
+        assert!(SiftKvStore::open(&db).unwrap().is_none());
+    }
+}
