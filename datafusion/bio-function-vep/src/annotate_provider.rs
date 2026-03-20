@@ -62,7 +62,7 @@ use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext};
+use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext, col, lit};
 use noodles_core::{Position, Region};
 use noodles_fasta as fasta;
 use serde_json::Value;
@@ -83,6 +83,7 @@ use crate::transcript_consequence::{
     SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequenceEngine, TranscriptFeature,
     TranslationFeature, VariantInput, is_vep_transcript,
 };
+use crate::partitioned_cache::PartitionedParquetCache;
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
 };
@@ -2652,6 +2653,550 @@ impl AnnotateProvider {
         Ok(out)
     }
 
+    /// Discover contigs present in the VCF input (zero-cost from schema metadata).
+    ///
+    /// The VCF table provider stores contigs in Arrow schema metadata as
+    /// `"bio.vcf.contigs"` → JSON array of `{id, length, metadata}`.
+    /// When a TBI index exists, these come from the TBI header's reference names.
+    /// Falls back to `SELECT DISTINCT chrom` if metadata is missing.
+    async fn discover_vcf_contigs(&self) -> Result<Vec<String>> {
+        // Try schema metadata first (zero cost — no scan needed).
+        let table = self.session.table(&self.vcf_table).await?;
+        let schema = table.schema();
+        let arrow_schema = schema.as_arrow();
+        if let Some(contigs_json) = arrow_schema.metadata().get("bio.vcf.contigs") {
+            if let Ok(contigs) =
+                serde_json::from_str::<Vec<serde_json::Value>>(contigs_json)
+            {
+                let ids: Vec<String> = contigs
+                    .iter()
+                    .filter_map(|v| v.get("id").and_then(|id| id.as_str()).map(String::from))
+                    .collect();
+                if !ids.is_empty() {
+                    return Ok(ids);
+                }
+            }
+        }
+
+        // Fallback: scan chrom column (needed for non-VCF table providers).
+        let query = format!(
+            "SELECT DISTINCT chrom FROM `{}`",
+            Self::escaped_sql_literal(&self.vcf_table)
+        );
+        let batches = self.session.sql(&query).await?.collect().await?;
+        let mut contigs = Vec::new();
+        for batch in &batches {
+            let col = batch.column(0);
+            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        contigs.push(arr.value(i).to_string());
+                    }
+                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        contigs.push(arr.value(i).to_string());
+                    }
+                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        contigs.push(arr.value(i).to_string());
+                    }
+                }
+            }
+        }
+        Ok(contigs)
+    }
+
+    /// Partitioned per-contig annotation pipeline.
+    ///
+    /// For each contig discovered in the VCF:
+    /// 1. Register per-chrom variation parquet, run lookup
+    /// 2. Register per-chrom context parquet (transcript, exon, etc.)
+    /// 3. Load context, build PreparedContext, annotate
+    /// 4. Deregister ephemeral tables, free memory
+    /// 5. Collect annotated batches
+    async fn scan_with_transcript_engine_partitioned(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        requested_columns: &[&str],
+        extended_probes: bool,
+        cache: &PartitionedParquetCache,
+        translations_sift_table: Option<&str>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let t_total = profile_start!();
+        if profiling_enabled() {
+            eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned START ======");
+        }
+
+        let flags = VepFlags::from_options_json(self.options_json.as_deref());
+        let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
+        let merged = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
+            .unwrap_or(false);
+        let allowed_failed = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "failed"))
+            .unwrap_or(0);
+        let reference_fasta_path = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_string_option(opts, "reference_fasta_path"));
+        Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
+        let (upstream_distance, downstream_distance) = self.transcript_distance_config();
+
+        // Discover contigs from VCF.
+        let t_contigs = profile_start!();
+        let vcf_contigs = self.discover_vcf_contigs().await?;
+        // Intersect with available cache chroms.
+        let cache_chroms: HashSet<&str> = cache
+            .available_chroms()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let contigs: Vec<&str> = vcf_contigs
+            .iter()
+            .filter(|c| cache_chroms.contains(c.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        profile_end!(
+            "0. discover_contigs",
+            t_contigs,
+            format!(
+                "{} VCF contigs, {} in cache, {} to process",
+                vcf_contigs.len(),
+                cache_chroms.len(),
+                contigs.len()
+            )
+        );
+
+        let cache_columns: Vec<String> =
+            requested_columns.iter().map(|s| s.to_string()).collect();
+
+        let mut all_annotated: Vec<RecordBatch> = Vec::new();
+        let mut total_vcf_rows = 0usize;
+
+        for chrom in &contigs {
+            let t_contig = profile_start!();
+            if profiling_enabled() {
+                eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
+            }
+
+            // Track ephemeral tables registered for this contig so we can
+            // deregister them at the end.
+            let mut ephemeral_tables: Vec<String> = Vec::new();
+
+            // 1. Register per-chrom variation parquet.
+            let var_table = crate::partitioned_cache::register_chrom_parquet(
+                &self.session,
+                cache,
+                "variation",
+                chrom,
+            )
+            .await?;
+            let Some(var_table) = var_table else {
+                if profiling_enabled() {
+                    eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (no variation) ------");
+                }
+                continue;
+            };
+            ephemeral_tables.push(var_table.clone());
+
+            // 2. Read VCF for this contig using filter pushdown (tabix seek).
+            let t_var = profile_start!();
+            let vcf_df = self
+                .session
+                .table(&self.vcf_table)
+                .await?
+                .filter(col("chrom").eq(lit(*chrom)))?;
+
+            let vcf_schema = vcf_df.schema().as_arrow().clone();
+            let cache_schema = self
+                .session
+                .table(&var_table)
+                .await?
+                .schema()
+                .as_arrow()
+                .clone();
+
+            // Build lookup provider scoped to this contig's VCF + variation.
+            let coloc_sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+            let mut provider = LookupProvider::new(
+                Arc::clone(&self.session),
+                self.vcf_table.clone(),
+                var_table.clone(),
+                vcf_schema,
+                cache_schema,
+                cache_columns.clone(),
+                extended_probes,
+                allowed_failed,
+                None,
+            )?;
+            // Override VCF input to use the filtered (single-contig) plan.
+            provider.set_vcf_filter(Some(col("chrom").eq(lit(*chrom))));
+            if flags.check_existing {
+                provider.set_colocated_sink(Arc::clone(&coloc_sink));
+            }
+
+            let plan = provider.scan(state, None, &[], None).await?;
+            let task_ctx = self.session.task_ctx();
+            let base_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
+            let contig_rows: usize = base_batches.iter().map(|b| b.num_rows()).sum();
+            total_vcf_rows += contig_rows;
+            profile_end!(
+                &format!("{chrom}: 1. variation_lookup"),
+                t_var,
+                format!("{contig_rows} rows, {} batches", base_batches.len())
+            );
+
+            if contig_rows == 0 {
+                // Deregister variation table and skip.
+                for tbl in &ephemeral_tables {
+                    crate::partitioned_cache::deregister_table(&self.session, tbl).await?;
+                }
+                if profiling_enabled() {
+                    eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (0 rows) ------");
+                }
+                continue;
+            }
+
+            // 3. Variant intervals + colocated map.
+            let input_variant_intervals = collect_input_variant_intervals(&base_batches)?;
+            let indel_variant_intervals = collect_indel_variant_intervals(&base_batches)?;
+            let colocated_map = if flags.check_existing {
+                let guard = coloc_sink.lock().unwrap();
+                build_colocated_map_from_sink(&guard)
+            } else {
+                HashMap::new()
+            };
+
+            // 4. Cache miss worklist (single-contig).
+            let mut cache_hit_count = 0usize;
+            let mut cache_miss_count = 0usize;
+            let worklist =
+                collect_miss_worklist(&base_batches, &mut cache_hit_count, &mut cache_miss_count)?;
+            let has_cache_misses = !worklist.is_empty();
+            if profiling_enabled() {
+                let hit_rate = if contig_rows > 0 {
+                    cache_hit_count as f64 / contig_rows as f64 * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[VEP_PROFILE] {chrom}: cache hits={cache_hit_count}, misses={cache_miss_count}, rate={hit_rate:.1}%"
+                );
+            }
+
+            // 5. Load context tables for this contig.
+            let t_ctx = profile_start!();
+            let (
+                mut transcripts,
+                translateable_seq_by_tx,
+                exons,
+                mut translations,
+                regulatory,
+                motifs,
+                mirnas,
+                structural,
+            ) = if has_cache_misses {
+                // Register per-chrom context parquet files.
+                let tx_table = crate::partitioned_cache::register_chrom_parquet(
+                    &self.session, cache, "transcript", chrom,
+                ).await?;
+                if let Some(ref t) = tx_table { ephemeral_tables.push(t.clone()); }
+
+                let ex_table = crate::partitioned_cache::register_chrom_parquet(
+                    &self.session, cache, "exon", chrom,
+                ).await?;
+                if let Some(ref t) = ex_table { ephemeral_tables.push(t.clone()); }
+
+                let tl_table = crate::partitioned_cache::register_chrom_parquet(
+                    &self.session, cache, "translation_core", chrom,
+                ).await?;
+                if let Some(ref t) = tl_table { ephemeral_tables.push(t.clone()); }
+
+                let rg_table = crate::partitioned_cache::register_chrom_parquet(
+                    &self.session, cache, "regulatory", chrom,
+                ).await?;
+                if let Some(ref t) = rg_table { ephemeral_tables.push(t.clone()); }
+
+                let mt_table = crate::partitioned_cache::register_chrom_parquet(
+                    &self.session, cache, "motif", chrom,
+                ).await?;
+                if let Some(ref t) = mt_table { ephemeral_tables.push(t.clone()); }
+
+                // Load transcripts (no WHERE needed — file IS the contig filter).
+                let tx = if let Some(ref table) = tx_table {
+                    let (tx, seq) = self.load_transcripts(table, &worklist).await?;
+                    let filtered: Vec<_> = tx.into_iter()
+                        .filter(|t| is_vep_transcript(&t.transcript_id, merged))
+                        .collect();
+                    (filtered, seq)
+                } else {
+                    (Vec::new(), HashMap::new())
+                };
+                let (tx_vec, translateable_seq) = tx;
+
+                let tx_ids: HashSet<String> =
+                    tx_vec.iter().map(|t| t.transcript_id.clone()).collect();
+
+                let ex = if let Some(ref table) = ex_table {
+                    let raw = self.load_exons(table, &worklist).await?;
+                    raw.into_iter()
+                        .filter(|e| tx_ids.contains(&e.transcript_id))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                let tl = if let Some(ref table) = tl_table {
+                    let raw = self.load_translations(table, &worklist).await?;
+                    raw.into_iter()
+                        .filter(|t| tx_ids.contains(&t.transcript_id))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                let rg = if let Some(ref table) = rg_table {
+                    self.load_regulatory_features(table, &worklist).await?
+                } else {
+                    Vec::new()
+                };
+
+                let mt = if let Some(ref table) = mt_table {
+                    self.load_motif_features(table, &worklist).await?
+                } else {
+                    Vec::new()
+                };
+
+                // mirna and sv: use monolithic tables if available, skip for
+                // partitioned path for now (they are rare).
+                let mi: Vec<MirnaFeature> = Vec::new();
+                let st: Vec<StructuralFeature> = Vec::new();
+
+                (tx_vec, translateable_seq, ex, tl, rg, mt, mi, st)
+            } else {
+                (
+                    Vec::new(), HashMap::new(), Vec::new(), Vec::new(),
+                    Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+                )
+            };
+            profile_end!(&format!("{chrom}: 4. context_load"), t_ctx);
+
+            // 5a. Hydrate RefSeq CDS from reference FASTA.
+            let mut hgvs_reference_reader = if hgvs_flags.any() && hgvs_flags.shift_hgvs {
+                reference_fasta_path
+                    .as_deref()
+                    .map(|path| {
+                        fasta::io::indexed_reader::Builder::default()
+                            .build_from_path(path)
+                            .map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "failed to open indexed reference FASTA '{path}': {e}"
+                                ))
+                            })
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let hydrated_transcript_ids =
+                if let Some(reader) = hgvs_reference_reader.as_mut() {
+                    hydrate_refseq_translation_cds_from_reference(
+                        reader,
+                        &transcripts,
+                        &exons,
+                        &mut translations,
+                        &input_variant_intervals,
+                    )?
+                } else {
+                    HashSet::new()
+                };
+            apply_translateable_seq_overrides(
+                &mut translations,
+                &translateable_seq_by_tx,
+                &hydrated_transcript_ids,
+            );
+            if let Some(reader) = hgvs_reference_reader.as_mut() {
+                hydrate_transcript_cdna_from_reference(
+                    reader,
+                    &mut transcripts,
+                    &exons,
+                    &indel_variant_intervals,
+                    &input_variant_intervals,
+                )?;
+            }
+
+            // 6. Build PreparedContext + engine for this contig.
+            let t_prep = profile_start!();
+            let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
+                upstream_distance,
+                downstream_distance,
+                hgvs_flags.shift_hgvs,
+            );
+            let ctx = PreparedContext::new(
+                &transcripts, &exons, &translations, &regulatory,
+                &motifs, &mirnas, &structural,
+            );
+            profile_end!(&format!("{chrom}: 6. prepared_context"), t_prep);
+
+            // 7. SIFT/PolyPhen cache (per-contig, fresh).
+            let mut sift_cache = SiftPolyphenCache::new();
+            #[cfg(not(feature = "kv-cache"))]
+            let sift_kv: Option<()> = None;
+            #[cfg(feature = "kv-cache")]
+            let sift_kv: Option<crate::kv_cache::SiftKvStore> = None;
+
+            // Build per-contig SIFT direct reader from partitioned cache.
+            // Use the parquet file path directly — no DataFusion registration needed.
+            let sift_enabled = flags.everything;
+            let sift_direct: Option<SiftDirectReader> = if sift_enabled {
+                // Prefer explicit sift table path, then partitioned cache path.
+                translations_sift_table
+                    .and_then(|table| {
+                        let path = std::path::Path::new(table);
+                        if path.exists() {
+                            Self::build_sift_direct_reader(table)
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        cache
+                            .context_path("translation_sift", chrom)
+                            .and_then(|p| Self::build_sift_direct_reader(p.to_str()?))
+                    })
+            } else {
+                None
+            };
+            let mut loaded_windows: HashSet<(String, i64)> = HashSet::new();
+
+            // 8. Annotate batches for this contig.
+            let t_ann = profile_start!();
+            let mut contig_annotated = Vec::with_capacity(base_batches.len());
+            for batch in &base_batches {
+                // Lazy SIFT window loading (same logic as monolithic path).
+                if sift_enabled && sift_kv.is_none() && sift_direct.is_some() {
+                    let batch_has_miss = batch
+                        .schema()
+                        .index_of("cache_most_severe_consequence")
+                        .ok()
+                        .map_or(true, |idx| batch.column(idx).null_count() > 0);
+                    if batch_has_miss {
+                        let schema = batch.schema();
+                        if let (Ok(ci), Ok(si), Ok(ei)) = (
+                            schema.index_of("chrom"),
+                            schema.index_of("start"),
+                            schema.index_of("end"),
+                        ) {
+                            let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
+                            for row in 0..batch.num_rows() {
+                                if let (Some(c), Some(s), Some(e)) = (
+                                    string_at(batch.column(ci).as_ref(), row),
+                                    int64_at(batch.column(si).as_ref(), row),
+                                    int64_at(batch.column(ei).as_ref(), row),
+                                ) {
+                                    let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
+                                    let entry = batch_chrom_bounds
+                                        .entry(c_norm)
+                                        .or_insert((i64::MAX, i64::MIN));
+                                    entry.0 = entry.0.min(s);
+                                    entry.1 = entry.1.max(e);
+                                }
+                            }
+                            for (ch, (batch_min, batch_max)) in &batch_chrom_bounds {
+                                let window_start =
+                                    (batch_max / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
+                                let min_window_start =
+                                    (batch_min / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
+                                let mut ws = min_window_start;
+                                while ws <= window_start + Self::SIFT_WINDOW_SIZE {
+                                    let key = (ch.clone(), ws);
+                                    if !loaded_windows.contains(&key) {
+                                        if let Some(ref direct) = sift_direct {
+                                            direct.load_window(
+                                                ch, ws, ws + Self::SIFT_WINDOW_SIZE,
+                                                &mut sift_cache,
+                                            )?;
+                                        }
+                                        loaded_windows.insert(key);
+                                    }
+                                    ws += Self::SIFT_WINDOW_SIZE;
+                                }
+                                sift_cache.evict_before(*batch_min);
+                            }
+                        }
+                    }
+                }
+
+                contig_annotated.push(self.annotate_batch_with_transcript_engine(
+                    batch,
+                    &engine,
+                    &ctx,
+                    &colocated_map,
+                    &mut sift_cache,
+                    &sift_kv,
+                )?);
+            }
+            profile_end!(
+                &format!("{chrom}: 8. annotate_batches"),
+                t_ann,
+                format!("{} batches", contig_annotated.len())
+            );
+
+            all_annotated.extend(contig_annotated);
+
+            // 9. Deregister ephemeral tables for this contig.
+            for tbl in &ephemeral_tables {
+                crate::partitioned_cache::deregister_table(&self.session, tbl).await?;
+            }
+
+            profile_end!(
+                &format!("{chrom}: TOTAL"),
+                t_contig,
+                format!("{contig_rows} rows")
+            );
+            if profiling_enabled() {
+                eprintln!("[VEP_PROFILE] ------ contig {chrom} END ------");
+            }
+        }
+
+        // Project and return.
+        let projected_batches = if let Some(indices) = projection {
+            let mut out = Vec::with_capacity(all_annotated.len());
+            for batch in all_annotated {
+                out.push(batch.project(indices)?);
+            }
+            out
+        } else {
+            all_annotated
+        };
+        let projected_schema = if let Some(indices) = projection {
+            Arc::new(self.schema.project(indices)?)
+        } else {
+            self.schema.clone()
+        };
+
+        let mem = MemTable::try_new(projected_schema, vec![projected_batches])?;
+        let result = mem.scan(state, None, &[], None).await;
+        profile_end!(
+            "TOTAL scan_partitioned",
+            t_total,
+            format!("{total_vcf_rows} VCF rows, {} contigs", contigs.len())
+        );
+        if profiling_enabled() {
+            eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned END ======");
+        }
+        result
+    }
+
     async fn scan_with_transcript_engine(
         &self,
         state: &dyn Session,
@@ -4869,6 +5414,90 @@ impl TableProvider for AnnotateProvider {
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let _store = build_store(self.backend, self.cache_source.clone());
+
+        // Check for partitioned per-chromosome cache layout.
+        // Opt-in/out via "partitioned": true/false in options_json.
+        let partitioned_opt = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_bool_option(opts, "partitioned"));
+        let partitioned_cache = if partitioned_opt != Some(false)
+            && self.backend == AnnotationBackend::Parquet
+        {
+            PartitionedParquetCache::detect(&self.cache_source)
+        } else {
+            None
+        };
+        // When explicitly requested or auto-detected, use partitioned path.
+        if let Some(ref cache) = partitioned_cache {
+            if profiling_enabled() {
+                eprintln!(
+                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {}",
+                    cache.available_chroms().len(),
+                    self.cache_source
+                );
+            }
+
+            // Determine requested cache columns from one variation parquet.
+            let sample_chrom = &cache.available_chroms()[0];
+            let sample_table = crate::partitioned_cache::register_chrom_parquet(
+                &self.session, cache, "variation", sample_chrom,
+            ).await?;
+            let sample_table = sample_table.ok_or_else(|| {
+                DataFusionError::Execution(
+                    "partitioned cache: no variation parquet for sample chrom".to_string(),
+                )
+            })?;
+            let cache_schema = self
+                .session
+                .table(&sample_table)
+                .await?
+                .schema()
+                .as_arrow()
+                .clone();
+            let available_cache_columns: HashSet<String> = cache_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let mut preferred_columns = vec!["consequence_types", "most_severe_consequence"];
+            for &c in CACHE_OUTPUT_COLUMNS {
+                if !preferred_columns.contains(&c) {
+                    preferred_columns.push(c);
+                }
+            }
+            let requested_columns: Vec<&str> = preferred_columns
+                .iter()
+                .copied()
+                .filter(|name| available_cache_columns.contains(*name))
+                .collect();
+
+            let extended_probes = self
+                .options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_bool_option(opts, "extended_probes"))
+                .unwrap_or(true);
+
+            let translations_sift_table = self
+                .options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_string_option(opts, "translations_sift_table"));
+
+            // Deregister sample table (will be re-registered per contig).
+            crate::partitioned_cache::deregister_table(&self.session, &sample_table).await?;
+
+            return self
+                .scan_with_transcript_engine_partitioned(
+                    state,
+                    projection,
+                    &requested_columns,
+                    extended_probes,
+                    cache,
+                    translations_sift_table.as_deref(),
+                )
+                .await;
+        }
+
         let cache_table = self.resolve_cache_table_name().await?;
 
         let cache_schema = self

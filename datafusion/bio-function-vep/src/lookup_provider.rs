@@ -88,6 +88,9 @@ pub struct LookupProvider {
     schema: SchemaRef,
     /// Optional sink for co-located data collection during probe phase.
     colocated_sink: Option<ColocatedSink>,
+    /// Optional filter to apply to the VCF input (e.g., `chrom = 'chr1'`
+    /// for per-contig partitioned annotation).
+    vcf_filter: Option<Expr>,
 }
 
 fn normalize_cache_output_type(data_type: &DataType) -> DataType {
@@ -151,12 +154,22 @@ impl LookupProvider {
             reference_fasta_path,
             schema,
             colocated_sink: None,
+            vcf_filter: None,
         })
     }
 
     /// Set the co-located data sink for piggybacked collection during probe.
     pub fn set_colocated_sink(&mut self, sink: ColocatedSink) {
         self.colocated_sink = Some(sink);
+    }
+
+    /// Set an optional filter to apply to VCF input before lookup.
+    ///
+    /// Used by the partitioned annotation path to scope VCF reading to a
+    /// single contig via filter pushdown (`chrom = 'chrN'`), which triggers
+    /// tabix-indexed seeks in the VCF table provider.
+    pub fn set_vcf_filter(&mut self, filter: Option<Expr>) {
+        self.vcf_filter = filter;
     }
 }
 
@@ -230,6 +243,11 @@ impl TableProvider for LookupProvider {
                     let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
 
                     let vcf_df = self.session.table(&self.vcf_table).await?;
+                    let vcf_df = if let Some(ref filter) = self.vcf_filter {
+                        vcf_df.filter(filter.clone())?
+                    } else {
+                        vcf_df
+                    };
                     let vcf_plan = vcf_df.create_physical_plan().await?;
 
                     let mut exec = KvLookupExec::new(
@@ -258,6 +276,11 @@ impl TableProvider for LookupProvider {
         let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
 
         let vcf_df = self.session.table(&self.vcf_table).await?;
+        let vcf_df = if let Some(ref filter) = self.vcf_filter {
+            vcf_df.filter(filter.clone())?
+        } else {
+            vcf_df
+        };
         let vcf_plan = vcf_df.create_physical_plan().await?;
 
         // Project cache to only the columns needed: join keys + requested output columns.

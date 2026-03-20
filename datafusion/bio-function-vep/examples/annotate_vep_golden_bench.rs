@@ -403,6 +403,65 @@ async fn main() -> Result<()> {
 /// Scans context_dir for files matching known patterns and builds the
 /// JSON string to pass as the 4th argument to `annotate_vep()`.
 fn build_options_json(args: &Args) -> Result<Option<String>> {
+    // Detect partitioned per-chromosome cache layout.
+    let is_partitioned = Path::new(&args.cache_source).join("variation").is_dir();
+    if is_partitioned {
+        // Partitioned path: AnnotateProvider::scan() handles everything.
+        let mut entries = Vec::new();
+        entries.push("\"partitioned\":true".to_string());
+        entries.push(format!("\"extended_probes\":{}", args.extended_probes));
+
+        if args.everything {
+            entries.push("\"everything\":true".to_string());
+            let fasta_path = args.reference_fasta_path.as_ref().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "--everything requires --reference-fasta-path=/path/to/reference.fa[.gz]"
+                        .to_string(),
+                )
+            })?;
+            entries.push(format!(
+                "\"reference_fasta_path\":\"{}\"",
+                sql_literal(fasta_path.to_str().ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "reference_fasta_path must be valid UTF-8".to_string(),
+                    )
+                })?)
+            ));
+        } else {
+            if args.hgvs {
+                entries.push("\"hgvs\":true".to_string());
+                if let Some(shift_hgvs) = args.shift_hgvs {
+                    entries.push(format!("\"shift_hgvs\":{shift_hgvs}"));
+                }
+                let fasta_path = args.reference_fasta_path.as_ref().ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "--hgvs requires --reference-fasta-path=/path/to/reference.fa[.gz]"
+                            .to_string(),
+                    )
+                })?;
+                entries.push(format!(
+                    "\"reference_fasta_path\":\"{}\"",
+                    sql_literal(fasta_path.to_str().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "reference_fasta_path must be valid UTF-8".to_string(),
+                        )
+                    })?)
+                ));
+            }
+            entries.push("\"check_existing\":true".to_string());
+            entries.push("\"af\":true".to_string());
+            entries.push("\"af_1kg\":true".to_string());
+            entries.push("\"af_gnomade\":true".to_string());
+            entries.push("\"af_gnomadg\":true".to_string());
+            entries.push("\"max_af\":true".to_string());
+            entries.push("\"pubmed\":true".to_string());
+        }
+        if args.merged {
+            entries.push("\"merged\":true".to_string());
+        }
+        return Ok(Some(format!("{{{}}}", entries.join(","))));
+    }
+
     // Use explicit context_dir, or derive from cache_source parent directory.
     let context_dir = args
         .context_dir

@@ -49,6 +49,7 @@ pub mod hgvs;
 pub mod kv_cache;
 pub mod lookup_provider;
 pub mod miss_worklist;
+pub mod partitioned_cache;
 pub mod schema_contract;
 pub mod so_terms;
 pub mod table_function;
