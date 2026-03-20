@@ -1,8 +1,9 @@
 //! Key encoding for position-keyed entries in the fjall KV store.
 //!
-//! Keys are encoded as `[chrom_code_2B][start_BE_8B][end_BE_8B]` (18 bytes)
+//! Keys are encoded as `[chrom_code_2B][start_BE_8B]` (10 bytes)
 //! so that lexicographic byte ordering matches genomic ordering: chromosomes
 //! in canonical order (1-22, X, Y, MT), positions in ascending order.
+//! All variants at the same `(chrom, start)` are merged into a single entry.
 
 use ahash::AHashMap;
 use std::sync::LazyLock;
@@ -28,8 +29,10 @@ const CHROM_NAMES: &[&str] = &[
     "18", "19", "20", "21", "22",
 ];
 
-/// First code assigned to non-canonical contigs (canonical use 1..=25).
-const NON_CANONICAL_START: u16 = 25;
+/// First code assigned to non-canonical contigs.
+/// Canonical codes: 1..=22 (autosomes), 0x0017=X, 0x0018=Y, 0x0019=MT (=25).
+/// Non-canonical range starts at 26 to avoid colliding with MT.
+const NON_CANONICAL_START: u16 = 26;
 
 /// Map a chromosome name (with or without "chr" prefix) to its 2-byte code.
 ///
@@ -50,57 +53,76 @@ pub fn code_to_chrom(code: u16) -> Option<&'static str> {
     CODE_TO_CHROM.get(&code).copied()
 }
 
-/// Encode a position key: `[2B chrom_code BE][8B start BE][8B end BE]` = 18 bytes.
+/// Encode a position key: `[2B chrom_code BE][8B start BE]` = 10 bytes.
 ///
 /// Lexicographic byte ordering matches genomic ordering.
-pub fn encode_position_key(chrom: &str, start: i64, end: i64) -> Vec<u8> {
+pub fn encode_position_key(chrom: &str, start: i64) -> Vec<u8> {
     let code = chrom_to_code(chrom);
-    let mut key = Vec::with_capacity(18);
+    let mut key = Vec::with_capacity(10);
     key.extend_from_slice(&code.to_be_bytes());
     key.extend_from_slice(&start.to_be_bytes());
-    key.extend_from_slice(&end.to_be_bytes());
     key
 }
 
-/// Decode a position key back into `(chrom, start, end)`.
-pub fn decode_position_key(key: &[u8]) -> (String, i64, i64) {
-    assert!(key.len() >= 18, "position key must be at least 18 bytes");
+/// Decode a position key back into `(chrom, start)`.
+pub fn decode_position_key(key: &[u8]) -> (String, i64) {
+    assert!(key.len() >= 10, "position key must be at least 10 bytes");
     let code = u16::from_be_bytes([key[0], key[1]]);
     let start = i64::from_be_bytes(key[2..10].try_into().unwrap());
-    let end = i64::from_be_bytes(key[10..18].try_into().unwrap());
 
     let chrom = CODE_TO_CHROM
         .get(&code)
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("unk_{code:04x}"));
 
-    (chrom, start, end)
+    (chrom, start)
 }
 
 /// Encode a position key into a reusable buffer (hot-path variant).
 ///
-/// The buffer is cleared and filled with 18 bytes.
-pub fn encode_position_key_buf(chrom_code: u16, start: i64, end: i64, buf: &mut Vec<u8>) {
+/// The buffer is cleared and filled with 10 bytes.
+pub fn encode_position_key_buf(chrom_code: u16, start: i64, buf: &mut Vec<u8>) {
     buf.clear();
     buf.extend_from_slice(&chrom_code.to_be_bytes());
     buf.extend_from_slice(&start.to_be_bytes());
-    buf.extend_from_slice(&end.to_be_bytes());
 }
 
 /// Deterministic code for non-canonical chromosomes.
-/// Uses a hash-based approach to assign stable codes in the range
-/// `NON_CANONICAL_START..=u16::MAX` (65511 possible values), which is
-/// much wider than the previous 15-bit (32768) space and reduces
-/// collision probability for non-canonical contig names.
+/// Uses FNV-1a hash to assign stable codes in the range
+/// `NON_CANONICAL_START..=u16::MAX` (65510 possible values).
+/// Lock-free — safe for the hot read path.
 fn non_canonical_code(chrom: &str) -> u16 {
-    // FNV-1a 32-bit hash for better distribution.
     let mut hash: u32 = 0x811c_9dc5;
     for b in chrom.bytes() {
         hash ^= b as u32;
         hash = hash.wrapping_mul(0x0100_0193);
     }
-    let range = (u16::MAX as u32) - (NON_CANONICAL_START as u32) + 1; // 65511
+    let range = (u16::MAX as u32) - (NON_CANONICAL_START as u32) + 1;
     NON_CANONICAL_START + (hash % range) as u16
+}
+
+/// Validate that a set of non-canonical contig names has no hash collisions.
+///
+/// Call this during cache creation after collecting all contig names.
+/// Panics if two different names map to the same code.
+pub fn validate_non_canonical_contigs(contigs: &[&str]) {
+    let mut seen: AHashMap<u16, &str> = AHashMap::new();
+    for &contig in contigs {
+        if CHROM_TO_CODE.get(contig).is_some() {
+            continue; // canonical — skip
+        }
+        let code = non_canonical_code(contig);
+        if let Some(&existing) = seen.get(&code) {
+            if existing != contig {
+                panic!(
+                    "non-canonical contig hash collision: '{}' and '{}' both map to code {}",
+                    existing, contig, code
+                );
+            }
+        } else {
+            seen.insert(code, contig);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -109,49 +131,42 @@ mod tests {
 
     #[test]
     fn test_position_key_roundtrip() {
-        let key = encode_position_key("1", 12345, 12345);
-        assert_eq!(key.len(), 18);
-        let (chrom, start, end) = decode_position_key(&key);
+        let key = encode_position_key("1", 12345);
+        assert_eq!(key.len(), 10);
+        let (chrom, start) = decode_position_key(&key);
         assert_eq!(chrom, "1");
         assert_eq!(start, 12345);
-        assert_eq!(end, 12345);
 
-        let key = encode_position_key("chr22", 100, 200);
-        let (chrom, start, end) = decode_position_key(&key);
+        let key = encode_position_key("chr22", 100);
+        let (chrom, start) = decode_position_key(&key);
         assert_eq!(chrom, "22");
         assert_eq!(start, 100);
-        assert_eq!(end, 200);
     }
 
     #[test]
     fn test_position_key_chr_prefix_stripped() {
-        let k1 = encode_position_key("chr1", 100, 100);
-        let k2 = encode_position_key("1", 100, 100);
+        let k1 = encode_position_key("chr1", 100);
+        let k2 = encode_position_key("1", 100);
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn test_position_key_lexicographic_ordering() {
         // Same chrom, start ordering
-        let k1 = encode_position_key("1", 100, 100);
-        let k2 = encode_position_key("1", 200, 200);
+        let k1 = encode_position_key("1", 100);
+        let k2 = encode_position_key("1", 200);
         assert!(k1 < k2);
 
         // Different chroms
-        let k1 = encode_position_key("1", 0, 0);
-        let k2 = encode_position_key("2", 0, 0);
-        assert!(k1 < k2);
-
-        // Same start, different end
-        let k1 = encode_position_key("1", 100, 100);
-        let k2 = encode_position_key("1", 100, 200);
+        let k1 = encode_position_key("1", 0);
+        let k2 = encode_position_key("2", 0);
         assert!(k1 < k2);
 
         // Chromosome 22 < X < Y < MT
-        let k22 = encode_position_key("22", 0, 0);
-        let kx = encode_position_key("X", 0, 0);
-        let ky = encode_position_key("Y", 0, 0);
-        let kmt = encode_position_key("MT", 0, 0);
+        let k22 = encode_position_key("22", 0);
+        let kx = encode_position_key("X", 0);
+        let ky = encode_position_key("Y", 0);
+        let kmt = encode_position_key("MT", 0);
         assert!(k22 < kx);
         assert!(kx < ky);
         assert!(ky < kmt);
@@ -161,18 +176,16 @@ mod tests {
     fn test_position_key_buf() {
         let mut buf = Vec::new();
         let code = chrom_to_code("22");
-        encode_position_key_buf(code, 12345, 12345, &mut buf);
-        assert_eq!(buf.len(), 18);
-        let (chrom, start, end) = decode_position_key(&buf);
+        encode_position_key_buf(code, 12345, &mut buf);
+        assert_eq!(buf.len(), 10);
+        let (chrom, start) = decode_position_key(&buf);
         assert_eq!(chrom, "22");
         assert_eq!(start, 12345);
-        assert_eq!(end, 12345);
 
         // Reuse buffer
-        encode_position_key_buf(code, 99999, 99999, &mut buf);
-        let (_, start, end) = decode_position_key(&buf);
+        encode_position_key_buf(code, 99999, &mut buf);
+        let (_, start) = decode_position_key(&buf);
         assert_eq!(start, 99999);
-        assert_eq!(end, 99999);
     }
 
     #[test]
@@ -188,5 +201,41 @@ mod tests {
     fn test_chrom_code_chr_prefix_stripped() {
         assert_eq!(chrom_to_code("chr1"), chrom_to_code("1"));
         assert_eq!(chrom_to_code("chrX"), chrom_to_code("X"));
+    }
+
+    #[test]
+    fn test_no_canonical_code_in_non_canonical_range() {
+        for chrom in CHROM_NAMES.iter().chain(&["X", "Y", "MT"]) {
+            let code = chrom_to_code(chrom);
+            assert!(
+                code < NON_CANONICAL_START,
+                "canonical chrom '{chrom}' has code {code} >= NON_CANONICAL_START {NON_CANONICAL_START}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_non_canonical_contigs_no_collision() {
+        // Should not panic for distinct contigs.
+        validate_non_canonical_contigs(&["GL000220.1", "KI270733.1", "chrUn_gl000220"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "hash collision")]
+    fn test_validate_non_canonical_contigs_detects_collision() {
+        // Brute-force find two strings that collide.
+        let mut codes: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+        let mut colliders = None;
+        for i in 0..100_000u32 {
+            let name = format!("contig_{i}");
+            let code = non_canonical_code(&name);
+            if let Some(existing) = codes.get(&code) {
+                colliders = Some((existing.clone(), name));
+                break;
+            }
+            codes.insert(code, name);
+        }
+        let (a, b) = colliders.expect("no collision found in 100K contigs — increase range");
+        validate_non_canonical_contigs(&[&a, &b]);
     }
 }

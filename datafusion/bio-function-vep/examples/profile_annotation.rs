@@ -96,9 +96,34 @@ async fn main() -> Result<()> {
         t_sample.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Detect cache file naming (e.g. "115_GRCh38_variation_1_vep").
-    let variation_file = find_parquet(&cache_dir, "variation")?;
-    let base = extract_base(&variation_file);
+    // Detect if cache_dir is a fjall cache (directory with keyspaces/) or parquet directory.
+    let is_fjall = cache_dir.join("keyspaces").is_dir();
+    let backend = if is_fjall { "fjall" } else { "parquet" };
+    eprintln!("[PREP] Backend: {}", backend);
+
+    let (variation_path_str, context_dir, base) = if is_fjall {
+        // Fjall: cache_dir IS the fjall database path.
+        // Context tables are in the parent directory.
+        let context = cache_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| cache_dir.clone());
+        let base_name = find_parquet(&context, "variation")
+            .ok()
+            .map(|f| extract_base(&f))
+            .unwrap_or_default();
+        (cache_dir.display().to_string(), context, base_name)
+    } else {
+        // Parquet: find variation parquet in cache_dir.
+        let variation_file = find_parquet(&cache_dir, "variation")?;
+        let base_name = extract_base(&variation_file);
+        let variation_path = cache_dir.join(&variation_file);
+        (
+            variation_path.display().to_string(),
+            cache_dir.clone(),
+            base_name,
+        )
+    };
     eprintln!("[PREP] Base name: {}", base);
 
     // Set up session.
@@ -114,14 +139,17 @@ async fn main() -> Result<()> {
     let vcf_schema = vcf.schema();
     ctx.register_table("sampled_vcf", Arc::new(vcf))?;
 
-    // Register cache parquet tables.
-    let variation_path = cache_dir.join(&variation_file);
-    ctx.register_parquet(
-        "variation_cache",
-        variation_path.display().to_string().as_str(),
-        ParquetReadOptions::default(),
-    )
-    .await?;
+    // Register variation cache.
+    // For fjall: the UDTF opens the DB internally — don't pre-register.
+    // For parquet: register as a DataFusion table for SQL access.
+    if !is_fjall {
+        ctx.register_parquet(
+            "variation_cache",
+            &variation_path_str,
+            ParquetReadOptions::default(),
+        )
+        .await?;
+    }
 
     let mut options = Vec::new();
 
@@ -135,17 +163,17 @@ async fn main() -> Result<()> {
         ("motif", "motif_table"),
     ];
     for (file_stem, json_key) in &context_tables {
-        let stem_result = find_parquet_stem(&cache_dir, file_stem, &base).or_else(|_| {
+        let stem_result = find_parquet_stem(&context_dir, file_stem, &base).or_else(|_| {
             // Fallback: "translation_core" -> "translation" for unsplit layout
             if *file_stem == "translation_core" {
-                find_parquet_stem(&cache_dir, "translation", &base)
+                find_parquet_stem(&context_dir, "translation", &base)
             } else {
                 Err(DataFusionError::Execution("not found".to_string()))
             }
         });
         if let Ok(filename) = stem_result {
             let table_name = filename.trim_end_matches(".parquet");
-            let path = cache_dir.join(&filename);
+            let path = context_dir.join(&filename);
             ctx.register_parquet(
                 table_name,
                 path.display().to_string().as_str(),
@@ -158,9 +186,9 @@ async fn main() -> Result<()> {
     }
 
     // Register translation_sift separately for sift/polyphen window loading.
-    if let Ok(filename) = find_parquet_stem(&cache_dir, "translation_sift", &base) {
+    if let Ok(filename) = find_parquet_stem(&context_dir, "translation_sift", &base) {
         let table_name = filename.trim_end_matches(".parquet");
-        let path = cache_dir.join(&filename);
+        let path = context_dir.join(&filename);
         ctx.register_parquet(
             table_name,
             path.display().to_string().as_str(),
@@ -208,8 +236,8 @@ async fn main() -> Result<()> {
     // Run annotation with profiling.
     let sql = format!(
         "SELECT * FROM annotate_vep('sampled_vcf', '{}', '{}', '{}')",
-        sql_literal(variation_path.display().to_string().as_str()),
-        sql_literal("parquet"),
+        sql_literal(&variation_path_str),
+        sql_literal(backend),
         sql_literal(&options_json)
     );
 

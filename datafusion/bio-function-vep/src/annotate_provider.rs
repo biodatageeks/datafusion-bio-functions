@@ -71,6 +71,7 @@ use crate::allele::{
     MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::annotation_store::{AnnotationBackend, build_store};
+use crate::config;
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
@@ -1207,7 +1208,9 @@ fn lookup_sift_polyphen(
     transcript_id: Option<&str>,
     protein_position: Option<&str>,
     amino_acids: Option<&str>,
-    cache: &SiftPolyphenCache,
+    cache: &mut SiftPolyphenCache,
+    #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
+    #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
 ) -> (String, String) {
     let empty = || (String::new(), String::new());
 
@@ -1232,6 +1235,17 @@ fn lookup_sift_polyphen(
     let Some(tx_id) = transcript_id else {
         return empty();
     };
+
+    // Lazy load from fjall sift keyspace on cache miss.
+    if cache.get(tx_id).is_none() {
+        #[cfg(feature = "kv-cache")]
+        if let Some(kv) = sift_kv {
+            if let Ok(Some(preds)) = kv.get(tx_id) {
+                cache.insert(tx_id.to_string(), preds, i64::MAX);
+            }
+        }
+    }
+
     let Some(preds) = cache.get(tx_id) else {
         return empty();
     };
@@ -1399,7 +1413,14 @@ impl AnnotateProvider {
             AnnotationBackend::Fjall => {
                 #[cfg(feature = "kv-cache")]
                 {
-                    let provider = KvCacheTableProvider::open(&self.cache_source).map_err(|e| {
+                    let annotation_config = config::resolve(&self.session);
+                    let cache_size_bytes =
+                        annotation_config.cache_size_mb.saturating_mul(1024 * 1024);
+                    let provider = KvCacheTableProvider::open_with_cache_size(
+                        &self.cache_source,
+                        cache_size_bytes,
+                    )
+                    .map_err(|e| {
                         DataFusionError::Execution(format!(
                             "annotate_vep(): failed to open fjall cache '{}': {e}",
                             self.cache_source
@@ -2734,6 +2755,7 @@ impl AnnotateProvider {
         profile_end!("2. collect_variant_intervals", t_intervals);
 
         // Build co-located variant aggregation from the piggybacked sink.
+        // Both parquet and fjall backends populate the sink during lookup.
         let t_coloc = profile_start!();
         let colocated_map = if flags.check_existing {
             let guard = coloc_sink.lock().unwrap();
@@ -2800,9 +2822,44 @@ impl AnnotateProvider {
             );
 
             let tx_ids: HashSet<String> = tx.iter().map(|t| t.transcript_id.clone()).collect();
+            let tx_id_refs: Vec<&str> = tx_ids.iter().map(|s| s.as_str()).collect();
+
+            // Try fjall context keyspaces (O(1) per-transcript) before falling
+            // back to Parquet SQL.  Reuse the Database handle from the variation
+            // cache that is already opened by KvCacheTableProvider.
+            #[cfg(feature = "kv-cache")]
+            let (exon_kv, translation_kv): (
+                Option<crate::kv_cache::ExonKvStore>,
+                Option<crate::kv_cache::TranslationKvStore>,
+            ) = {
+                let pair = self
+                    .session
+                    .table_provider(cache_table)
+                    .await
+                    .ok()
+                    .and_then(|provider| {
+                        provider
+                            .as_any()
+                            .downcast_ref::<KvCacheTableProvider>()
+                            .map(|kv| kv.store().database().clone())
+                    });
+                match pair {
+                    Some(db) => (
+                        crate::kv_cache::ExonKvStore::open(&db).ok().flatten(),
+                        crate::kv_cache::TranslationKvStore::open(&db)
+                            .ok()
+                            .flatten(),
+                    ),
+                    None => (None, None),
+                }
+            };
+            #[cfg(not(feature = "kv-cache"))]
+            let (exon_kv, translation_kv): (Option<()>, Option<()>) = (None, None);
 
             let t_ex = profile_start!();
-            let ex = if let Some(table) = exons_table {
+            let ex = if let Some(ref ex_kv) = exon_kv {
+                ex_kv.get_many(&tx_id_refs)?
+            } else if let Some(table) = exons_table {
                 let raw = self.load_exons(table, &worklist).await?;
                 raw.into_iter()
                     .filter(|e| tx_ids.contains(&e.transcript_id))
@@ -2810,10 +2867,16 @@ impl AnnotateProvider {
             } else {
                 Vec::new()
             };
-            profile_end!("4b. load_exons", t_ex, format!("{} exons", ex.len()));
+            profile_end!(
+                "4b. load_exons",
+                t_ex,
+                format!("{} exons (kv={})", ex.len(), exon_kv.is_some())
+            );
 
             let t_tl = profile_start!();
-            let tl = if let Some(table) = translations_table {
+            let tl = if let Some(ref tl_kv) = translation_kv {
+                tl_kv.get_many(&tx_id_refs)?
+            } else if let Some(table) = translations_table {
                 let raw = self.load_translations(table, &worklist).await?;
                 raw.into_iter()
                     .filter(|t| tx_ids.contains(&t.transcript_id))
@@ -2824,7 +2887,11 @@ impl AnnotateProvider {
             profile_end!(
                 "4c. load_translations",
                 t_tl,
-                format!("{} translations", tl.len())
+                format!(
+                    "{} translations (kv={})",
+                    tl.len(),
+                    translation_kv.is_some()
+                )
             );
 
             let t_rg = profile_start!();
@@ -2948,16 +3015,45 @@ impl AnnotateProvider {
         // See biodatageeks/datafusion-bio-functions#38.
         let t_sift = profile_start!();
         let mut sift_cache = SiftPolyphenCache::new();
-        let sift_table_name: Option<String> = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_string_option(opts, "translations_sift_table"))
-            .or_else(|| translations_table.map(|s| s.to_string()));
-        let sift_enabled = flags.everything && sift_table_name.is_some();
+
+        // Try fjall sift keyspace first (O(1) per-transcript lookup).
+        // Reuse the Database handle from the variation cache (already opened by KvCacheTableProvider).
+        #[cfg(feature = "kv-cache")]
+        let sift_kv: Option<crate::kv_cache::SiftKvStore> = self
+            .session
+            .table_provider(cache_table)
+            .await
+            .ok()
+            .and_then(|provider| {
+                provider
+                    .as_any()
+                    .downcast_ref::<KvCacheTableProvider>()
+                    .and_then(|kv| {
+                        crate::kv_cache::SiftKvStore::open(kv.store().database())
+                            .ok()
+                            .flatten()
+                    })
+            });
+        #[cfg(not(feature = "kv-cache"))]
+        let sift_kv: Option<()> = None;
+
+        let sift_table_name: Option<String> = if sift_kv.is_some() {
+            None // Don't need parquet sift table when using fjall
+        } else {
+            self.options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_string_option(opts, "translations_sift_table"))
+                .or_else(|| translations_table.map(|s| s.to_string()))
+        };
+        let sift_enabled = flags.everything && (sift_table_name.is_some() || sift_kv.is_some());
         let mut loaded_windows: HashSet<(String, i64)> = HashSet::new();
         // Try to build a direct parquet reader for sift, bypassing DataFusion SQL.
-        let sift_direct: Option<SiftDirectReader> = if sift_enabled {
-            let table_name = sift_table_name.as_deref().unwrap();
+        let sift_direct: Option<SiftDirectReader> = if sift_enabled && sift_kv.is_none() {
+            let Some(table_name) = sift_table_name.as_deref() else {
+                return Err(DataFusionError::Execution(
+                    "sift enabled but no sift table or fjall sift keyspace available".to_string(),
+                ));
+            };
             // Resolve file path: try cache_source parent dir + table_name.parquet
             let cache_dir = std::path::Path::new(&self.cache_source)
                 .parent()
@@ -2973,86 +3069,105 @@ impl AnnotateProvider {
         } else {
             None
         };
-        if profiling_enabled() && sift_direct.is_some() {
-            eprintln!("[VEP_PROFILE] sift_direct_reader: enabled (bypassing DataFusion SQL)");
+        if profiling_enabled() {
+            if sift_kv.is_some() {
+                eprintln!("[VEP_PROFILE] sift_kv_store: enabled (per-transcript fjall lookup)");
+            } else if sift_direct.is_some() {
+                eprintln!("[VEP_PROFILE] sift_direct_reader: enabled (bypassing DataFusion SQL)");
+            }
         }
         profile_end!("7. sift_polyphen_cache_init", t_sift);
 
         let t_annotate = profile_start!();
         let mut sift_load_ms = 0u128;
         let mut annotate_ms = 0u128;
+        let mut sift_skipped_batches = 0usize;
         let mut annotated_batches = Vec::with_capacity(base_batches.len());
         for batch in &base_batches {
             // Lazily load SIFT/PolyPhen windows as the batch loop advances.
-            if sift_enabled {
-                let t_sift_win = std::time::Instant::now();
-                let table = sift_table_name.as_deref().unwrap();
-                let schema = batch.schema();
-                if let (Ok(ci), Ok(si), Ok(ei)) = (
-                    schema.index_of("chrom"),
-                    schema.index_of("start"),
-                    schema.index_of("end"),
-                ) {
-                    // Collect per-chrom min/max positions in this batch.
-                    let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
-                    for row in 0..batch.num_rows() {
-                        if let (Some(c), Some(s), Some(e)) = (
-                            string_at(batch.column(ci).as_ref(), row),
-                            int64_at(batch.column(si).as_ref(), row),
-                            int64_at(batch.column(ei).as_ref(), row),
-                        ) {
-                            let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
-                            let entry = batch_chrom_bounds
-                                .entry(c_norm)
-                                .or_insert((i64::MAX, i64::MIN));
-                            entry.0 = entry.0.min(s);
-                            entry.1 = entry.1.max(e);
-                        }
-                    }
-
-                    for (chrom, (batch_min, batch_max)) in &batch_chrom_bounds {
-                        let window_start =
-                            (batch_max / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
-
-                        // Also load the window containing the minimum position
-                        // (may differ from the max window).
-                        let min_window_start =
-                            (batch_min / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
-
-                        // Load all windows from the min to the max + next window.
-                        let mut ws = min_window_start;
-                        while ws <= window_start + Self::SIFT_WINDOW_SIZE {
-                            let key = (chrom.clone(), ws);
-                            if !loaded_windows.contains(&key) {
-                                if let Some(ref direct) = sift_direct {
-                                    direct.load_window(
-                                        chrom,
-                                        ws,
-                                        ws + Self::SIFT_WINDOW_SIZE,
-                                        &mut sift_cache,
-                                    )?;
-                                } else {
-                                    self.load_sift_window(
-                                        table,
-                                        chrom,
-                                        ws,
-                                        ws + Self::SIFT_WINDOW_SIZE,
-                                        &mut sift_cache,
-                                    )
-                                    .await?;
-                                }
-                                loaded_windows.insert(key);
+            // Gate: skip sift loading for batches where ALL rows are cache hits
+            // (cache_most_severe_consequence is non-null). With the fjall backend
+            // providing ~95%+ hit rates, this skips most batches and reduces
+            // sift window loading from ~24s to ~2s.
+            if sift_enabled && sift_kv.is_none() {
+                // Windowed parquet sift loading (skipped when fjall sift keyspace available).
+                let batch_has_miss = batch
+                    .schema()
+                    .index_of("cache_most_severe_consequence")
+                    .ok()
+                    .map_or(true, |idx| batch.column(idx).null_count() > 0);
+                if !batch_has_miss {
+                    sift_skipped_batches += 1;
+                } else {
+                    let t_sift_win = std::time::Instant::now();
+                    let table = sift_table_name.as_deref().unwrap();
+                    let schema = batch.schema();
+                    if let (Ok(ci), Ok(si), Ok(ei)) = (
+                        schema.index_of("chrom"),
+                        schema.index_of("start"),
+                        schema.index_of("end"),
+                    ) {
+                        // Collect per-chrom min/max positions in this batch.
+                        let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
+                        for row in 0..batch.num_rows() {
+                            if let (Some(c), Some(s), Some(e)) = (
+                                string_at(batch.column(ci).as_ref(), row),
+                                int64_at(batch.column(si).as_ref(), row),
+                                int64_at(batch.column(ei).as_ref(), row),
+                            ) {
+                                let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
+                                let entry = batch_chrom_bounds
+                                    .entry(c_norm)
+                                    .or_insert((i64::MAX, i64::MIN));
+                                entry.0 = entry.0.min(s);
+                                entry.1 = entry.1.max(e);
                             }
-                            ws += Self::SIFT_WINDOW_SIZE;
                         }
 
-                        // Evict entries whose genomic end is behind the batch
-                        // minimum (position-sorted VCF guarantees no future
-                        // batch will need them).
-                        sift_cache.evict_before(*batch_min);
+                        for (chrom, (batch_min, batch_max)) in &batch_chrom_bounds {
+                            let window_start =
+                                (batch_max / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
+
+                            // Also load the window containing the minimum position
+                            // (may differ from the max window).
+                            let min_window_start =
+                                (batch_min / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
+
+                            // Load all windows from the min to the max + next window.
+                            let mut ws = min_window_start;
+                            while ws <= window_start + Self::SIFT_WINDOW_SIZE {
+                                let key = (chrom.clone(), ws);
+                                if !loaded_windows.contains(&key) {
+                                    if let Some(ref direct) = sift_direct {
+                                        direct.load_window(
+                                            chrom,
+                                            ws,
+                                            ws + Self::SIFT_WINDOW_SIZE,
+                                            &mut sift_cache,
+                                        )?;
+                                    } else {
+                                        self.load_sift_window(
+                                            table,
+                                            chrom,
+                                            ws,
+                                            ws + Self::SIFT_WINDOW_SIZE,
+                                            &mut sift_cache,
+                                        )
+                                        .await?;
+                                    }
+                                    loaded_windows.insert(key);
+                                }
+                                ws += Self::SIFT_WINDOW_SIZE;
+                            }
+
+                            // Evict entries whose genomic end is behind the batch
+                            // minimum (position-sorted VCF guarantees no future
+                            // batch will need them).
+                            sift_cache.evict_before(*batch_min);
+                        }
                     }
-                }
-                sift_load_ms += t_sift_win.elapsed().as_millis();
+                    sift_load_ms += t_sift_win.elapsed().as_millis();
+                } // end else (batch_has_miss)
             }
 
             let t_ann = std::time::Instant::now();
@@ -3061,7 +3176,8 @@ impl AnnotateProvider {
                 &engine,
                 &ctx,
                 &colocated_map,
-                &sift_cache,
+                &mut sift_cache,
+                &sift_kv,
             )?);
             annotate_ms += t_ann.elapsed().as_millis();
         }
@@ -3072,6 +3188,12 @@ impl AnnotateProvider {
             eprintln!(
                 "[VEP_PROFILE] 7b. annotate_batches_only.........................  {annotate_ms}ms"
             );
+            if sift_skipped_batches > 0 {
+                eprintln!(
+                    "[VEP_PROFILE] 7c. sift_skipped_batches (cache hits).............  {sift_skipped_batches}/{} batches",
+                    base_batches.len()
+                );
+            }
         }
         profile_end!(
             "7+8. sift_lazy_load + annotate_batches",
@@ -3117,13 +3239,16 @@ impl AnnotateProvider {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn annotate_batch_with_transcript_engine(
         &self,
         batch: &RecordBatch,
         engine: &TranscriptConsequenceEngine,
         ctx: &PreparedContext<'_>,
         colocated_map: &HashMap<ColocatedKey, ColocatedData>,
-        sift_cache: &SiftPolyphenCache,
+        sift_cache: &mut SiftPolyphenCache,
+        #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
+        #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
@@ -3539,6 +3664,10 @@ impl AnnotateProvider {
                             tc.protein_position.as_deref(),
                             tc.amino_acids.as_deref(),
                             sift_cache,
+                            #[cfg(feature = "kv-cache")]
+                            sift_kv,
+                            #[cfg(not(feature = "kv-cache"))]
+                            _sift_kv,
                         );
                         // DOMAINS: overlapping protein domain features.
                         // VEP gates DOMAINS on $pre->{coding} which requires
@@ -5013,7 +5142,7 @@ mod tests {
 
     #[test]
     fn test_lookup_sift_polyphen_single_aa_match() {
-        let cache = make_sift_cache(vec![(
+        let mut cache = make_sift_cache(vec![(
             "ENST00000001",
             42,
             "I",
@@ -5022,15 +5151,20 @@ mod tests {
             "probably damaging",
             0.999,
         )]);
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST00000001"), Some("42"), Some("V/I"), &cache);
+        let (sift, polyphen) = lookup_sift_polyphen(
+            Some("ENST00000001"),
+            Some("42"),
+            Some("V/I"),
+            &mut cache,
+            &None,
+        );
         assert_eq!(sift, "deleterious(0.01)");
         assert_eq!(polyphen, "probably_damaging(0.999)");
     }
 
     #[test]
     fn test_lookup_sift_polyphen_non_substitution_skipped() {
-        let cache = make_sift_cache(vec![(
+        let mut cache = make_sift_cache(vec![(
             "ENST00000001",
             42,
             "I",
@@ -5040,23 +5174,38 @@ mod tests {
             0.0,
         )]);
         // Multi-char alt amino acid — not a single substitution.
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST00000001"), Some("42"), Some("V/IL"), &cache);
+        let (sift, polyphen) = lookup_sift_polyphen(
+            Some("ENST00000001"),
+            Some("42"),
+            Some("V/IL"),
+            &mut cache,
+            &None,
+        );
         assert!(sift.is_empty());
         assert!(polyphen.is_empty());
 
         // Range position — indel, should be skipped.
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST00000001"), Some("42-43"), Some("V/I"), &cache);
+        let (sift, polyphen) = lookup_sift_polyphen(
+            Some("ENST00000001"),
+            Some("42-43"),
+            Some("V/I"),
+            &mut cache,
+            &None,
+        );
         assert!(sift.is_empty());
         assert!(polyphen.is_empty());
     }
 
     #[test]
     fn test_lookup_sift_polyphen_missing_transcript() {
-        let cache = SiftPolyphenCache::new();
-        let (sift, polyphen) =
-            lookup_sift_polyphen(Some("ENST_MISSING"), Some("42"), Some("V/I"), &cache);
+        let mut cache = SiftPolyphenCache::new();
+        let (sift, polyphen) = lookup_sift_polyphen(
+            Some("ENST_MISSING"),
+            Some("42"),
+            Some("V/I"),
+            &mut cache,
+            &None,
+        );
         assert!(sift.is_empty());
         assert!(polyphen.is_empty());
     }

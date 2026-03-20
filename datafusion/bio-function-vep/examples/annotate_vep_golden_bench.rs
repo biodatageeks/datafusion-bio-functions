@@ -414,27 +414,78 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
         return Ok(None);
     };
 
-    // Derive base name from cache_source (e.g. "115_GRCh38_variation_22" -> "115_GRCh38")
-    // by stripping "_variation*" or "_variants*" suffix.
+    // Derive base name from cache_source or context_dir.
+    // For fjall: cache_source is a directory path, so derive base from context_dir parquet files.
+    // For parquet: derive from cache_source filename (e.g. "115_GRCh38_variation_22" -> "115_GRCh38").
     let cache_stem = Path::new(&args.cache_source)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
-    let base = if let Some(idx) = cache_stem.find("_variation") {
-        &cache_stem[..idx]
-    } else if let Some(idx) = cache_stem.find("_variants") {
-        &cache_stem[..idx]
+    // For fjall backend: cache_source is a directory, not a parquet file.
+    // Don't extract base from directory name — use context_dir discovery.
+    let is_fjall_dir = Path::new(&args.cache_source).join("keyspaces").is_dir();
+
+    let base = if !is_fjall_dir {
+        if let Some(idx) = cache_stem.find("_variation") {
+            &cache_stem[..idx]
+        } else if let Some(idx) = cache_stem.find("_variants") {
+            &cache_stem[..idx]
+        } else {
+            cache_stem
+        }
     } else {
-        cache_stem
+        // Fjall backend: derive base from a parquet file in context_dir.
+        let found = std::fs::read_dir(context_dir).ok().and_then(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .find(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.contains("variation") && name.ends_with(".parquet")
+                })
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let stem = name.trim_end_matches(".parquet");
+                    if let Some(idx) = stem.find("_variation") {
+                        stem[..idx].to_string()
+                    } else {
+                        stem.to_string()
+                    }
+                })
+        });
+        found
+            .map(|s| &*Box::leak(s.into_boxed_str()))
+            .unwrap_or(cache_stem)
     };
 
-    // Derive suffix (e.g. "_22" from "115_GRCh38_variation_22").
-    let suffix = cache_stem
+    // Derive suffix (e.g. "_1_vep" from "115_GRCh38_variation_1_vep").
+    // For fjall: derive from the variation parquet in context_dir, not from cache_stem.
+    let suffix_source = if is_fjall_dir {
+        std::fs::read_dir(context_dir)
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .find(|e| {
+                        let n = e.file_name().to_string_lossy().to_string();
+                        n.contains("variation") && n.ends_with(".parquet")
+                    })
+                    .map(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .trim_end_matches(".parquet")
+                            .to_string()
+                    })
+            })
+            .unwrap_or_default()
+    } else {
+        cache_stem.to_string()
+    };
+    let suffix = suffix_source
         .strip_prefix(base)
         .and_then(|rest| rest.strip_prefix("_variation"))
         .or_else(|| {
-            cache_stem
+            suffix_source
                 .strip_prefix(base)
                 .and_then(|rest| rest.strip_prefix("_variants"))
         })

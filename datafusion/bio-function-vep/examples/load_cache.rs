@@ -97,7 +97,7 @@ async fn main() -> datafusion::common::Result<()> {
     let mut read_iters = 0u32;
     for pos in 0..20u64 {
         if store
-            .get_position_entry_decompressed(chrom_code, pos as i64, pos as i64)?
+            .get_position_entry_decompressed(chrom_code, pos as i64)?
             .is_some()
         {
             read_iters += 1;
@@ -112,7 +112,7 @@ async fn main() -> datafusion::common::Result<()> {
     // Single lookup from mid-range
     let mid_pos = stats.total_positions / 2;
     let single_start = Instant::now();
-    let _ = store.get_position_entry_decompressed(chrom_code, mid_pos as i64, mid_pos as i64)?;
+    let _ = store.get_position_entry_decompressed(chrom_code, mid_pos as i64)?;
     let single_read_ms = single_start.elapsed().as_secs_f64() * 1000.0;
 
     drop(store);

@@ -1,0 +1,151 @@
+---
+- name: Provision VEP benchmark VM
+  hosts: all
+  become: true
+  vars:
+    benchmark_user: "{{ ansible_user }}"
+    data_dir: /data/vep
+    repo_dir: /home/{{ ansible_user }}/datafusion-bio-functions
+    vep_docker_image: "ensemblorg/ensembl-vep:release_115.2"
+    # geerlingguy.docker
+    docker_users:
+      - "{{ benchmark_user }}"
+    # geerlingguy.pip
+    pip_install_packages:
+      - name: docker
+
+  pre_tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+  roles:
+    - geerlingguy.pip
+    - geerlingguy.docker
+
+  tasks:
+    # ── System packages ───────────────────────────────────────────────
+    - name: Install system dependencies
+      apt:
+        name:
+          - build-essential
+          - pkg-config
+          - libssl-dev
+          - curl
+          - git
+          - htop
+          - pigz
+          - samtools
+          - tabix
+          - byobu
+        state: present
+
+    # ── Pull VEP image ────────────────────────────────────────────────
+    - name: Pull Ensembl VEP Docker image
+      community.docker.docker_image:
+        name: "{{ vep_docker_image }}"
+        source: pull
+
+    # ── Rust toolchain ────────────────────────────────────────────────
+    - name: Install Rust via rustup
+      become: no
+      shell: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      args:
+        creates: /home/{{ benchmark_user }}/.cargo/bin/rustc
+
+    - name: Install Rust 1.91.0 toolchain
+      become: no
+      shell: |
+        source /home/{{ benchmark_user }}/.cargo/env
+        rustup install 1.91.0
+        rustup default 1.91.0
+      args:
+        executable: /bin/bash
+
+    # ── Data directories ──────────────────────────────────────────────
+    - name: Create data directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ benchmark_user }}"
+        group: "{{ benchmark_user }}"
+        mode: "0755"
+      loop:
+        - "{{ data_dir }}"
+        - "{{ data_dir }}/chr1-vep"
+        - "{{ data_dir }}/homo_sapiens/115_GRCh38"
+        - "{{ data_dir }}/vcf"
+        - "{{ data_dir }}/results"
+
+    # ── Sync data files ───────────────────────────────────────────────
+    - name: Sync VCF files
+      synchronize:
+        src: "{{ local_vcf_dir }}/"
+        dest: "{{ data_dir }}/vcf/"
+        rsync_opts:
+          - "--include=HG002_chr1.vcf.gz"
+          - "--include=HG002_chr1.vcf.gz.tbi"
+          - "--include=output/"
+          - "--include=output/everything/"
+          - "--include=output/everything/HG002_chr1_0_vep115_golden.vcf"
+          - "--exclude=*"
+
+    - name: Sync reference FASTA
+      synchronize:
+        src: "{{ local_fasta_path }}"
+        dest: "{{ data_dir }}/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+
+    - name: Sync FASTA index (if exists)
+      synchronize:
+        src: "{{ local_fasta_path }}.fai"
+        dest: "{{ data_dir }}/Homo_sapiens.GRCh38.dna.primary_assembly.fa.fai"
+      ignore_errors: yes
+
+    - name: Sync chr1-vep parquet cache
+      synchronize:
+        src: "{{ local_chr1_vep_dir }}/"
+        dest: "{{ data_dir }}/chr1-vep/"
+
+    - name: Sync VEP Ensembl cache (homo_sapiens/115_GRCh38)
+      synchronize:
+        src: "{{ local_ensembl_cache_dir }}/"
+        dest: "{{ data_dir }}/homo_sapiens/115_GRCh38/"
+
+    # ── Clone and build the project ──────────────────────────────────
+    - name: Sync project source
+      synchronize:
+        src: "{{ local_repo_dir }}/"
+        dest: "{{ repo_dir }}/"
+        rsync_opts:
+          - "--exclude=target"
+          - "--exclude=.git"
+          - "--exclude=mutants.out*"
+          - "--exclude=vep-benchmark/data"
+
+    - name: Fix project ownership
+      file:
+        path: "{{ repo_dir }}"
+        owner: "{{ benchmark_user }}"
+        group: "{{ benchmark_user }}"
+        recurse: yes
+
+    - name: Build project (release)
+      become: no
+      shell: |
+        source /home/{{ benchmark_user }}/.cargo/env
+        cd {{ repo_dir }}
+        cargo build --release -p datafusion-bio-function-vep
+      args:
+        executable: /bin/bash
+      environment:
+        CARGO_INCREMENTAL: "0"
+
+    # ── Copy benchmark runner script ──────────────────────────────────
+    - name: Copy benchmark runner
+      copy:
+        src: ../scripts/run_benchmark.sh
+        dest: /home/{{ benchmark_user }}/run_benchmark.sh
+        owner: "{{ benchmark_user }}"
+        mode: "0755"

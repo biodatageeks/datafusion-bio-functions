@@ -336,7 +336,13 @@ impl<'a> PositionEntryReader<'a> {
     /// Get the allele string for a given allele index.
     pub fn allele_string(&self, idx: usize) -> &str {
         let (off, len) = self.allele_offsets[idx];
-        std::str::from_utf8(&self.data[off..off + len]).unwrap_or("")
+        match std::str::from_utf8(&self.data[off..off + len]) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("allele_string: invalid UTF-8 at allele index {idx}: {e}");
+                ""
+            }
+        }
     }
 
     /// Append selected allele rows for a given column into an ArrayBuilder.
@@ -572,6 +578,102 @@ impl<'a> PositionEntryReader<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Read a single string value from a column at the given allele row.
+    ///
+    /// Returns `None` if the value is null or the column is not a string type.
+    pub fn read_string_value(&self, col_idx: usize, allele_row: usize) -> Option<String> {
+        if col_idx >= self.col_offsets.len() {
+            return None;
+        }
+        let (col_offset, type_code) = self.col_offsets[col_idx];
+        let dt = decode_data_type(type_code).ok()?;
+        let data = &self.data[col_offset..];
+        let n = self.num_alleles;
+
+        match dt {
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                if !is_non_null(data, allele_row) {
+                    return None;
+                }
+                let str_data_off = null_bitmap_size(n);
+                let offsets_start = str_data_off + 4;
+                let string_data_start = offsets_start + n * 4;
+
+                let start = if allele_row == 0 {
+                    0
+                } else {
+                    let off = offsets_start + (allele_row - 1) * 4;
+                    u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize
+                };
+                let end_off = offsets_start + allele_row * 4;
+                let end =
+                    u32::from_le_bytes(data[end_off..end_off + 4].try_into().unwrap()) as usize;
+                let s =
+                    std::str::from_utf8(&data[string_data_start + start..string_data_start + end])
+                        .unwrap_or("");
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Read a single integer value (any width) from a column, widened to i64.
+    ///
+    /// Returns `None` if the value is null or the column is not an integer type.
+    pub fn read_i64_value(&self, col_idx: usize, allele_row: usize) -> Option<i64> {
+        if col_idx >= self.col_offsets.len() {
+            return None;
+        }
+        let (col_offset, type_code) = self.col_offsets[col_idx];
+        let dt = decode_data_type(type_code).ok()?;
+        let data = &self.data[col_offset..];
+
+        if !is_non_null(data, allele_row) {
+            return None;
+        }
+        let values_off = null_bitmap_size(self.num_alleles);
+
+        match dt {
+            DataType::Int8 => {
+                let off = values_off + allele_row;
+                Some(data[off] as i8 as i64)
+            }
+            DataType::UInt8 => {
+                let off = values_off + allele_row;
+                Some(data[off] as i64)
+            }
+            DataType::Int16 => {
+                let off = values_off + allele_row * 2;
+                Some(i16::from_le_bytes(data[off..off + 2].try_into().unwrap()) as i64)
+            }
+            DataType::UInt16 => {
+                let off = values_off + allele_row * 2;
+                Some(u16::from_le_bytes(data[off..off + 2].try_into().unwrap()) as i64)
+            }
+            DataType::Int32 => {
+                let off = values_off + allele_row * 4;
+                Some(i32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as i64)
+            }
+            DataType::UInt32 => {
+                let off = values_off + allele_row * 4;
+                Some(u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as i64)
+            }
+            DataType::Int64 => {
+                let off = values_off + allele_row * 8;
+                Some(i64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
+            }
+            DataType::UInt64 => {
+                let off = values_off + allele_row * 8;
+                Some(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()) as i64)
+            }
+            _ => None,
+        }
     }
 }
 

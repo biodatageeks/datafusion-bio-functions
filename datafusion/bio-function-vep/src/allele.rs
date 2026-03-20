@@ -391,26 +391,66 @@ pub fn vcf_to_vep_input_allele(
 pub fn allele_matches(vcf_ref: &str, vcf_alt: &str, allele_string: &str) -> bool {
     let mut parts = allele_string.split('/');
 
-    let Some(ref_allele) = parts.next() else {
+    let Some(cache_ref) = parts.next() else {
         return false;
     };
+    let cache_alts: Vec<&str> = parts.collect();
 
     for alt in vcf_alt.split(['|', ',']).filter(|alt| !alt.is_empty()) {
+        // Left-first trimming (standard VEP normalization).
         let (vep_ref, vep_alt) = vcf_to_vep_allele(vcf_ref, alt);
 
-        // Verify reference allele: accept either VEP-format (prefix-stripped)
-        // or VCF-format (full REF) since caches may use either convention.
-        if ref_allele != vep_ref && ref_allele != vcf_ref {
-            continue;
+        if (cache_ref == vep_ref || cache_ref == vcf_ref)
+            && cache_alts.iter().any(|&a| a == vep_alt)
+        {
+            return true;
         }
 
-        // Check if any ALT allele matches this ALT token.
-        if parts.clone().any(|a| a == vep_alt) {
-            return true;
+        // Bidirectional matching: also trim each cache allele right-first
+        // to handle cases where the cache stores a different representation
+        // of the same variant (e.g., GCC/GCCCAGCC vs -/GCCCA).
+        // Traceability: VEP get_matched_variant_alleles uses _get_trim_directions
+        // which tries both direction=0 (left-first) and direction=1 (right-first).
+        for &cache_alt in &cache_alts {
+            let (trimmed_ref, trimmed_alt) = trim_right_first(cache_ref, cache_alt);
+            if trimmed_ref == vep_ref && trimmed_alt == vep_alt {
+                return true;
+            }
         }
     }
 
     false
+}
+
+/// Trim shared suffix first, then shared prefix (right-first trimming).
+/// Returns (ref, alt) after trimming, using "-" for empty strings.
+fn trim_right_first(ref_allele: &str, alt_allele: &str) -> (String, String) {
+    let mut r = ref_allele.as_bytes().to_vec();
+    let mut a = alt_allele.as_bytes().to_vec();
+
+    // Right-trim: strip matching chars from the end.
+    while !r.is_empty() && !a.is_empty() && r.last() == a.last() {
+        r.pop();
+        a.pop();
+    }
+
+    // Left-trim: strip matching chars from the start.
+    while !r.is_empty() && !a.is_empty() && r.first() == a.first() {
+        r.remove(0);
+        a.remove(0);
+    }
+
+    let ref_str = if r.is_empty() {
+        "-".to_string()
+    } else {
+        String::from_utf8(r).unwrap_or_default()
+    };
+    let alt_str = if a.is_empty() {
+        "-".to_string()
+    } else {
+        String::from_utf8(a).unwrap_or_default()
+    };
+    (ref_str, alt_str)
 }
 
 /// Traceability:

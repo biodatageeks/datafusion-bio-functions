@@ -20,15 +20,16 @@ const MAX_DECOMPRESSED_ENTRY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Format version 0: position-keyed entries — one fjall entry per genomic position.
 ///
-/// Each `(chrom, start, end)` maps to a zstd-compressed serialized entry containing
-/// the allele table and column-major data. Only positions matching VCF queries are fetched.
+/// Each `(chrom, start)` maps to a zstd-compressed serialized entry containing
+/// the allele table and column-major data (including the `end` column).
+/// All variants at the same `(chrom, start)` are merged into one entry.
 pub const FORMAT_V0: u8 = 0;
 
 /// Wrapper around fjall `Database` for VEP cache storage.
 ///
 /// Layout:
 /// - `meta` keyspace: schema (Arrow IPC), format version, zstd dictionary
-/// - `data` keyspace: `(chrom, start, end)` -> compressed position entry
+/// - `data` keyspace: `(chrom, start)` -> compressed position entry
 pub struct VepKvStore {
     root_path: PathBuf,
     db: Database,
@@ -62,6 +63,22 @@ fn next_capacity(current: usize) -> Option<usize> {
     }
 }
 
+fn initial_decompress_capacity(compressed: &[u8]) -> usize {
+    if let Ok(Some(content_size)) = zstd::zstd_safe::get_frame_content_size(compressed) {
+        if let Ok(content_size) = usize::try_from(content_size) {
+            return content_size
+                .max(MIN_DECOMPRESS_CAPACITY)
+                .min(MAX_DECOMPRESSED_ENTRY_BYTES);
+        }
+    }
+
+    compressed
+        .len()
+        .saturating_mul(16)
+        .max(MIN_DECOMPRESS_CAPACITY)
+        .min(MAX_DECOMPRESSED_ENTRY_BYTES)
+}
+
 /// Decompress a zstd payload into a reusable buffer, growing capacity as needed.
 pub(crate) fn decompress_into_buffer_with_retry(
     decompressor: &mut zstd::bulk::Decompressor<'_>,
@@ -69,11 +86,7 @@ pub(crate) fn decompress_into_buffer_with_retry(
     out: &mut Vec<u8>,
     context: &str,
 ) -> Result<()> {
-    let mut target_capacity = compressed
-        .len()
-        .saturating_mul(16)
-        .max(MIN_DECOMPRESS_CAPACITY)
-        .min(MAX_DECOMPRESSED_ENTRY_BYTES);
+    let mut target_capacity = initial_decompress_capacity(compressed);
 
     if out.capacity() < target_capacity {
         out.reserve(target_capacity - out.capacity());
@@ -105,15 +118,21 @@ pub(crate) fn decompress_into_buffer_with_retry(
 }
 
 impl VepKvStore {
-    /// Open an existing KV store with default settings (256 MB block cache).
+    /// Access the underlying fjall Database handle.
+    pub fn database(&self) -> &Database {
+        &self.db
+    }
+
+    /// Open an existing KV store with default settings (1 GB block cache).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_cache_size(path, 256 * 1024 * 1024)
+        Self::open_with_cache_size(path, 1024 * 1024 * 1024)
     }
 
     /// Open an existing KV store with a custom fjall block cache size (bytes).
     pub fn open_with_cache_size(path: impl AsRef<Path>, cache_size_bytes: u64) -> Result<Self> {
         let root_path = path.as_ref().to_path_buf();
         let db = Database::builder(&root_path)
+            .worker_threads(1)
             .cache_size(cache_size_bytes)
             .open()
             .map_err(fjall_err)?;
@@ -147,19 +166,28 @@ impl VepKvStore {
 
     /// Create a new KV store with the given schema.
     ///
-    /// Uses write-optimized settings for bulk loading:
-    /// - `manual_journal_persist` — skip per-batch fsync (persist once at the end)
-    /// - L0 threshold raised to 16 — defer compaction during ingestion
+    /// Uses cold-start-optimized settings from the design spec:
+    /// - **Decision 1:** Disable metadata partitioning, pin all filter/index blocks
+    /// - **Decision 2:** `expect_point_read_hits` — skip L6 bloom filters (~1.7GB saved)
+    /// - **Decision 3:** Data block hash index (0.75) for O(1) within-block lookups
+    /// - **Decision 4:** 8 KiB data blocks — half the I/O ops for sorted access
+    /// - **Decision 6:** Bloom FPR 0.01% for tight novel-variant rejection
     /// - LZ4 disabled on data blocks — values are already zstd-compressed
+    /// - L0 threshold 16 — defer compaction during bulk ingestion
     pub fn create(path: impl AsRef<Path>, schema: SchemaRef) -> Result<Self> {
         let root_path = path.as_ref().to_path_buf();
         let db = Database::builder(&root_path)
-            .cache_size(256 * 1024 * 1024)
+            .cache_size(1024 * 1024 * 1024) // Decision 7: 1 GB block cache
             .manual_journal_persist(true)
             .open()
             .map_err(fjall_err)?;
 
-        // Data keyspace: write-optimized for bulk loading.
+        use fjall::config::{
+            BlockSizePolicy, BloomConstructionPolicy, FilterPolicy, FilterPolicyEntry,
+            HashRatioPolicy, PartitioningPolicy, PinningPolicy,
+        };
+
+        // Data keyspace: cold-start-optimized for point lookups.
         let data_opts = || {
             KeyspaceCreateOptions::default()
                 .manual_journal_persist(true)
@@ -167,6 +195,24 @@ impl VepKvStore {
                     fjall::compaction::Leveled::default().with_l0_threshold(16),
                 ))
                 .data_block_compression_policy(fjall::config::CompressionPolicy::disabled())
+                // Decision 1: disable metadata partitioning, pin all filter/index blocks.
+                // Full (non-partitioned) indexes on all levels so entire block index
+                // is resident from open — eliminates the extra I/O hop that partitioned
+                // indexes require on first access.
+                .filter_block_partitioning_policy(PartitioningPolicy::all(false))
+                .index_block_partitioning_policy(PartitioningPolicy::all(false))
+                .filter_block_pinning_policy(PinningPolicy::all(true))
+                .index_block_pinning_policy(PinningPolicy::all(true))
+                // Decision 2: skip bloom on last level (95%+ hit rate)
+                .expect_point_read_hits(true)
+                // Decision 3: O(1) within-block lookup via hash index
+                .data_block_hash_ratio_policy(HashRatioPolicy::all(0.75))
+                // Decision 4: 8 KiB data blocks
+                .data_block_size_policy(BlockSizePolicy::all(8 * 1024))
+                // Decision 6: tight bloom FPR (0.01%)
+                .filter_policy(FilterPolicy::all(FilterPolicyEntry::Bloom(
+                    BloomConstructionPolicy::FalsePositiveRate(0.0001),
+                )))
         };
 
         let data = db.keyspace(DATA_KEYSPACE, data_opts).map_err(fjall_err)?;
@@ -214,29 +260,22 @@ impl VepKvStore {
     // --- position-keyed API ---
 
     /// Write a position entry.
-    pub fn put_position_entry(
-        &self,
-        chrom: &str,
-        start: i64,
-        end: i64,
-        value: &[u8],
-    ) -> Result<()> {
-        let key = super::key_encoding::encode_position_key(chrom, start, end);
+    pub fn put_position_entry(&self, chrom: &str, start: i64, value: &[u8]) -> Result<()> {
+        let key = super::key_encoding::encode_position_key(chrom, start);
         self.data.insert(&key, value).map_err(fjall_err)?;
         Ok(())
     }
 
-    /// Read a position entry by chrom code + coordinates.
+    /// Read a position entry by chrom code + start.
     ///
     /// Uses a pre-encoded key buffer for hot-path efficiency.
     pub fn get_position_entry(
         &self,
         chrom_code: u16,
         start: i64,
-        end: i64,
     ) -> Result<Option<fjall::UserValue>> {
-        let mut key_buf = Vec::with_capacity(18);
-        super::key_encoding::encode_position_key_buf(chrom_code, start, end, &mut key_buf);
+        let mut key_buf = Vec::with_capacity(10);
+        super::key_encoding::encode_position_key_buf(chrom_code, start, &mut key_buf);
         match self.data.get(&key_buf) {
             Ok(v) => Ok(v),
             Err(e) => Err(fjall_err(e)),
@@ -272,9 +311,8 @@ impl VepKvStore {
         &self,
         chrom_code: u16,
         start: i64,
-        end: i64,
     ) -> Result<Option<Vec<u8>>> {
-        let raw = self.get_position_entry(chrom_code, start, end)?;
+        let raw = self.get_position_entry(chrom_code, start)?;
         match raw {
             None => Ok(None),
             Some(compressed) => {
@@ -285,12 +323,8 @@ impl VepKvStore {
                                 "failed to create zstd decompressor: {e}"
                             ))
                         })?;
-                    let mut decompressed = Vec::with_capacity(
-                        compressed
-                            .len()
-                            .saturating_mul(16)
-                            .max(MIN_DECOMPRESS_CAPACITY),
-                    );
+                    let mut decompressed =
+                        Vec::with_capacity(initial_decompress_capacity(&compressed));
                     decompress_into_buffer_with_retry(
                         &mut decompressor,
                         &compressed,
@@ -334,11 +368,10 @@ impl VepKvStore {
         &self,
         chrom_code: u16,
         start: i64,
-        end: i64,
         decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
         buf: &mut Vec<u8>,
     ) -> Result<bool> {
-        let raw = self.get_position_entry(chrom_code, start, end)?;
+        let raw = self.get_position_entry(chrom_code, start)?;
         match raw {
             None => Ok(false),
             Some(compressed) => match decompressor {
@@ -510,18 +543,15 @@ mod tests {
         assert_eq!(store.format_version(), FORMAT_V0);
 
         let value = b"test_position_data";
-        store.put_position_entry("1", 100, 100, value).unwrap();
+        store.put_position_entry("1", 100, value).unwrap();
         store.persist().unwrap();
 
         let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
-        let loaded = store
-            .get_position_entry(chrom_code, 100, 100)
-            .unwrap()
-            .unwrap();
+        let loaded = store.get_position_entry(chrom_code, 100).unwrap().unwrap();
         assert_eq!(&*loaded, value);
 
         // Missing position returns None.
-        let missing = store.get_position_entry(chrom_code, 999, 999).unwrap();
+        let missing = store.get_position_entry(chrom_code, 999).unwrap();
         assert!(missing.is_none());
 
         // Reopen and verify persistence.
@@ -529,7 +559,7 @@ mod tests {
         let reopened = VepKvStore::open(dir.path()).unwrap();
         assert_eq!(reopened.format_version(), FORMAT_V0);
         let loaded = reopened
-            .get_position_entry(chrom_code, 100, 100)
+            .get_position_entry(chrom_code, 100)
             .unwrap()
             .unwrap();
         assert_eq!(&*loaded, value);
@@ -565,7 +595,7 @@ mod tests {
         for (i, sample) in samples.iter().enumerate() {
             let compressed = compressor.compress(sample).unwrap();
             store
-                .put_position_entry("1", i as i64, i as i64, &compressed)
+                .put_position_entry("1", i as i64, &compressed)
                 .unwrap();
         }
         store.persist().unwrap();
@@ -579,7 +609,7 @@ mod tests {
         let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
         for (i, sample) in samples.iter().enumerate() {
             let decompressed = reopened
-                .get_position_entry_decompressed(chrom_code, i as i64, i as i64)
+                .get_position_entry_decompressed(chrom_code, i as i64)
                 .unwrap()
                 .unwrap();
             assert_eq!(&decompressed, sample, "mismatch at entry {i}");
@@ -588,14 +618,14 @@ mod tests {
         // Missing entry still returns None.
         assert!(
             reopened
-                .get_position_entry_decompressed(chrom_code, 9999, 9999)
+                .get_position_entry_decompressed(chrom_code, 9999)
                 .unwrap()
                 .is_none()
         );
     }
 
     #[test]
-    fn test_zstd_decompression_retries_when_destination_buffer_too_small() {
+    fn test_zstd_decompression_handles_large_expansion_ratio() {
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
 
@@ -620,20 +650,20 @@ mod tests {
         let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &dict).unwrap();
         let compressed = compressor.compress(&huge).unwrap();
 
-        // Guard the regression condition: initial 16x guess is insufficient.
+        // Guard the regression condition from the old heuristic-only sizing path.
         assert!(
             huge.len() > compressed.len() * 16,
-            "test payload is not compressed enough to trigger resize retry"
+            "test payload is not compressed enough to exercise large expansion"
         );
 
-        store.put_position_entry("1", 42, 42, &compressed).unwrap();
+        store.put_position_entry("1", 42, &compressed).unwrap();
         store.persist().unwrap();
         drop(store);
 
         let reopened = VepKvStore::open(dir.path()).unwrap();
         let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
         let decompressed = reopened
-            .get_position_entry_decompressed(chrom_code, 42, 42)
+            .get_position_entry_decompressed(chrom_code, 42)
             .unwrap()
             .unwrap();
         assert_eq!(decompressed, huge);

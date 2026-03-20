@@ -1,8 +1,10 @@
 //! Parquet -> fjall cache ingestion pipeline (streaming).
 //!
 //! Loads a VEP variation cache from Parquet into a fjall KV store,
-//! storing one zstd-compressed entry per genomic position and
+//! storing one zstd-compressed entry per `(chrom, start)` position and
 //! parallelizing across DataFusion physical partitions.
+//! All variants at the same `(chrom, start)` — regardless of `end` —
+//! are merged into a single entry with `end` stored as a regular column.
 //!
 //! Streaming approach:
 //! 1. A sample of up to 10,000 rows is read from the source table to train
@@ -18,7 +20,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datafusion::arrow::array::{Array, AsArray, RecordBatch, StringArray, StringViewArray};
+use datafusion::arrow::array::{
+    Array, AsArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+};
 use datafusion::arrow::datatypes::{DataType, Int64Type, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
@@ -54,6 +58,11 @@ struct StreamContext {
     /// was skipped (too few samples) — partitions store entries uncompressed.
     dict: Option<Arc<Vec<u8>>>,
     zstd_level: i32,
+    /// Serializes read-merge-write operations across partitions to prevent
+    /// concurrent merges from silently dropping alleles when the same
+    /// `(chrom, start)` key appears in multiple partitions (e.g., at
+    /// partition boundaries for sorted input).
+    merge_lock: Arc<std::sync::Mutex<()>>,
 }
 
 /// Builder for loading a Parquet-based VEP cache into fjall.
@@ -144,6 +153,7 @@ impl CacheLoader {
         let semaphore = self
             .parallelism
             .map(|n| Arc::new(tokio::sync::Semaphore::new(n.min(partition_count))));
+        let merge_lock = Arc::new(std::sync::Mutex::new(()));
 
         let mut handles = Vec::with_capacity(partition_count);
 
@@ -156,6 +166,7 @@ impl CacheLoader {
                 schema: schema.clone(),
                 dict: dict.clone(),
                 zstd_level: self.zstd_level,
+                merge_lock: Arc::clone(&merge_lock),
             };
 
             handles.push(tokio::spawn(async move {
@@ -185,6 +196,19 @@ impl CacheLoader {
         }
 
         store.persist()?;
+
+        // Major-compact the data keyspace so the LSM tree is fully optimized
+        // for reads (bloom filters built, levels merged) before first use.
+        info!("Running major compaction on data keyspace...");
+        let compact_start = Instant::now();
+        store
+            .data_partition()
+            .major_compact()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        info!(
+            "Major compaction completed in {:.1}s",
+            compact_start.elapsed().as_secs_f64()
+        );
 
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(
@@ -220,10 +244,10 @@ impl CacheLoader {
 
         let chrom_col_idx = schema.index_of("chrom")?;
         let start_col_idx = schema.index_of("start")?;
-        let end_col_idx = schema.index_of("end")?;
         let allele_col_idx = schema.index_of("allele_string")?;
+        // `end` is stored as a regular column inside the entry (not part of the key).
         let col_indices: Vec<usize> = (0..schema.fields().len())
-            .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+            .filter(|&i| i != chrom_col_idx && i != start_col_idx)
             .collect();
 
         // Serialize position entries from sample batches.
@@ -234,15 +258,13 @@ impl CacheLoader {
             }
             let chrom_col = batch.column(chrom_col_idx);
             let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
-            let ends = batch.column(end_col_idx).as_primitive::<Int64Type>();
 
-            let mut groups: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
+            let mut groups: HashMap<(String, i64), Vec<usize>> = HashMap::new();
             for row in 0..batch.num_rows() {
                 let chrom = string_value(chrom_col.as_ref(), row);
                 let start = starts.value(row);
-                let end = ends.value(row);
                 groups
-                    .entry((chrom.to_string(), start, end))
+                    .entry((chrom.to_string(), start))
                     .or_default()
                     .push(row);
             }
@@ -346,9 +368,16 @@ async fn stream_partition(
                     "missing zstd decompressor while compression is enabled".to_string(),
                 )
             })?;
+            let lock = Arc::clone(&ctx.merge_lock);
             let (comp_back, dec_back, positions, bytes) = tokio::task::spawn_blocking(move || {
-                let result =
-                    flush_positions_compressed(&store, &schema, &batch_clone, &mut comp, &mut dec);
+                let result = flush_positions_compressed(
+                    &store,
+                    &schema,
+                    &batch_clone,
+                    &mut comp,
+                    &mut dec,
+                    &lock,
+                );
                 result.map(|(p, b)| (comp, dec, p, b))
             })
             .await
@@ -358,8 +387,9 @@ async fn stream_partition(
             stats.total_positions += positions;
             stats.total_bytes += bytes;
         } else {
+            let lock = Arc::clone(&ctx.merge_lock);
             let (positions, bytes) = tokio::task::spawn_blocking(move || {
-                flush_positions_uncompressed(&store, &schema, &batch_clone)
+                flush_positions_uncompressed(&store, &schema, &batch_clone, &lock)
             })
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))??;
@@ -383,48 +413,49 @@ fn flush_positions_uncompressed(
     store: &VepKvStore,
     schema: &SchemaRef,
     batch: &RecordBatch,
+    merge_lock: &std::sync::Mutex<()>,
 ) -> Result<(u64, u64)> {
     let chrom_col_idx = schema.index_of("chrom")?;
     let start_col_idx = schema.index_of("start")?;
-    let end_col_idx = schema.index_of("end")?;
     let allele_col_idx = schema.index_of("allele_string")?;
 
     let chrom_col = batch.column(chrom_col_idx);
     let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
-    let ends = batch.column(end_col_idx).as_primitive::<Int64Type>();
 
+    // `end` is stored as a regular column inside the entry.
     let col_indices: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+        .filter(|&i| i != chrom_col_idx && i != start_col_idx)
         .collect();
 
-    let mut groups: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<(String, i64), Vec<usize>> = HashMap::new();
     for row in 0..batch.num_rows() {
         let chrom = string_value(chrom_col.as_ref(), row);
         let start = starts.value(row);
-        let end = ends.value(row);
         groups
-            .entry((chrom.to_string(), start, end))
+            .entry((chrom.to_string(), start))
             .or_default()
             .push(row);
     }
 
-    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(groups.len());
     let mut total_bytes = 0u64;
+    let mut num_positions = 0u64;
 
-    for ((chrom, start, end), rows) in &groups {
+    for ((chrom, start), rows) in &groups {
         let mut value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+        // Read-merge-write must be atomic: hold the lock through the write
+        // to prevent concurrent partitions from overwriting each other's
+        // alleles at shared boundary positions.
+        let _guard = merge_lock.lock().unwrap();
         if let Some(existing) =
-            store.get_position_entry_decompressed(chrom_to_code(chrom), *start, *end)?
+            store.get_position_entry_decompressed(chrom_to_code(chrom), *start)?
         {
             value = merge_position_entries(&existing, &value, schema)?;
         }
-        let key = encode_position_key(chrom, *start, *end);
+        store.put_position_entry(chrom, *start, &value)?;
+        drop(_guard);
         total_bytes += value.len() as u64;
-        entries.push((key, value));
+        num_positions += 1;
     }
-
-    let num_positions = entries.len() as u64;
-    store.batch_insert_position_entries(&entries)?;
 
     Ok((num_positions, total_bytes))
 }
@@ -436,38 +467,41 @@ fn flush_positions_compressed(
     batch: &RecordBatch,
     compressor: &mut zstd::bulk::Compressor<'_>,
     decompressor: &mut zstd::bulk::Decompressor<'_>,
+    merge_lock: &std::sync::Mutex<()>,
 ) -> Result<(u64, u64)> {
     let chrom_col_idx = schema.index_of("chrom")?;
     let start_col_idx = schema.index_of("start")?;
-    let end_col_idx = schema.index_of("end")?;
     let allele_col_idx = schema.index_of("allele_string")?;
 
     let chrom_col = batch.column(chrom_col_idx);
     let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
-    let ends = batch.column(end_col_idx).as_primitive::<Int64Type>();
 
+    // `end` is stored as a regular column inside the entry.
     let col_indices: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+        .filter(|&i| i != chrom_col_idx && i != start_col_idx)
         .collect();
 
-    let mut groups: HashMap<(String, i64, i64), Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<(String, i64), Vec<usize>> = HashMap::new();
     for row in 0..batch.num_rows() {
         let chrom = string_value(chrom_col.as_ref(), row);
         let start = starts.value(row);
-        let end = ends.value(row);
         groups
-            .entry((chrom.to_string(), start, end))
+            .entry((chrom.to_string(), start))
             .or_default()
             .push(row);
     }
 
-    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(groups.len());
     let mut total_bytes = 0u64;
+    let mut num_positions = 0u64;
 
-    for ((chrom, start, end), rows) in &groups {
+    for ((chrom, start), rows) in &groups {
         let chrom_code = chrom_to_code(chrom);
         let mut raw_value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
-        if let Some(existing_compressed) = store.get_position_entry(chrom_code, *start, *end)? {
+        // Read-merge-write must be atomic: hold the lock through the write
+        // to prevent concurrent partitions from overwriting each other's
+        // alleles at shared boundary positions.
+        let _guard = merge_lock.lock().unwrap();
+        if let Some(existing_compressed) = store.get_position_entry(chrom_code, *start)? {
             let mut existing_raw = Vec::new();
             decompress_into_buffer_with_retry(
                 decompressor,
@@ -480,21 +514,20 @@ fn flush_positions_compressed(
         let compressed = compressor
             .compress(&raw_value)
             .map_err(|e| DataFusionError::Execution(format!("zstd compression failed: {e}")))?;
-        let key = encode_position_key(chrom, *start, *end);
+        store.put_position_entry(chrom, *start, &compressed)?;
+        drop(_guard);
         total_bytes += compressed.len() as u64;
-        entries.push((key, compressed));
+        num_positions += 1;
     }
-
-    let num_positions = entries.len() as u64;
-    store.batch_insert_position_entries(&entries)?;
 
     Ok((num_positions, total_bytes))
 }
 
 /// Merge two serialized entries for the same genomic position.
 ///
-/// This preserves all allele rows when the same `(chrom,start,end)` appears in
-/// multiple input batches/partitions.
+/// This preserves all allele rows when the same `(chrom,start)` appears in
+/// multiple input batches/partitions. Entries with different `end` values
+/// are merged together since `end` is stored as a regular column.
 fn merge_position_entries(existing: &[u8], incoming: &[u8], schema: &SchemaRef) -> Result<Vec<u8>> {
     let existing_reader = PositionEntryReader::new(existing)?;
     let incoming_reader = PositionEntryReader::new(incoming)?;
@@ -509,9 +542,9 @@ fn merge_position_entries(existing: &[u8], incoming: &[u8], schema: &SchemaRef) 
 
     let chrom_col_idx = schema.index_of("chrom")?;
     let start_col_idx = schema.index_of("start")?;
-    let end_col_idx = schema.index_of("end")?;
+    // `end` is stored inside the entry as a regular column, not excluded.
     let stored_col_indices: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| i != chrom_col_idx && i != start_col_idx && i != end_col_idx)
+        .filter(|&i| i != chrom_col_idx && i != start_col_idx)
         .collect();
 
     if stored_col_indices.len() != existing_reader.num_cols() {
@@ -575,15 +608,70 @@ fn train_dict(samples: &[&[u8]], dict_size_kb: u32) -> Result<Vec<u8>> {
     Ok(dict)
 }
 
-/// Extract a string value from either Utf8 or Utf8View array.
+/// Extract a string value from a Utf8, LargeUtf8, or Utf8View array.
 fn string_value(col: &dyn Array, row: usize) -> &str {
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
         arr.value(row)
     } else if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
         arr.value(row)
+    } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+        arr.value(row)
     } else {
-        panic!("Expected Utf8 or Utf8View column for chrom")
+        panic!("Expected Utf8, LargeUtf8, or Utf8View column for chrom")
     }
+}
+
+/// Load translation features into the fjall database's translations keyspace.
+///
+/// Opens (or creates) the translations keyspace and inserts each feature
+/// keyed by `transcript_id`.
+pub fn load_translations_into_kv(
+    db: &fjall::Database,
+    translations: &[crate::transcript_consequence::TranslationFeature],
+) -> Result<usize> {
+    use super::context_store::TranslationKvStore;
+
+    let store = TranslationKvStore::create(db)?;
+    for t in translations {
+        store.put(t)?;
+    }
+    info!(
+        "Loaded {} translations into fjall translations keyspace",
+        translations.len()
+    );
+    Ok(translations.len())
+}
+
+/// Load exon features into the fjall database's exons keyspace.
+///
+/// Groups exons by `transcript_id`, sorts each group by `exon_number`,
+/// then stores one entry per transcript.
+pub fn load_exons_into_kv(
+    db: &fjall::Database,
+    exons: &[crate::transcript_consequence::ExonFeature],
+) -> Result<usize> {
+    use super::context_store::ExonKvStore;
+
+    let store = ExonKvStore::create(db)?;
+
+    // Group by transcript_id.
+    let mut by_tx: HashMap<&str, Vec<crate::transcript_consequence::ExonFeature>> = HashMap::new();
+    for e in exons {
+        by_tx
+            .entry(e.transcript_id.as_str())
+            .or_default()
+            .push(e.clone());
+    }
+    let tx_count = by_tx.len();
+    for (tx_id, mut group) in by_tx {
+        store.put(tx_id, &mut group)?;
+    }
+    info!(
+        "Loaded {} exons for {} transcripts into fjall exons keyspace",
+        exons.len(),
+        tx_count
+    );
+    Ok(exons.len())
 }
 
 #[cfg(test)]
@@ -629,7 +717,7 @@ mod tests {
         let loader = CacheLoader::new("source", dir.path().to_str().unwrap());
         let stats = loader.load(&ctx).await.unwrap();
 
-        // 4 rows -> 4 unique positions: (1,100,100), (1,500000,500000), (1,1500000,1500000), (2,100,100)
+        // 4 rows -> 4 unique positions: (1,100), (1,500000), (1,1500000), (2,100)
         assert_eq!(stats.total_variants, 4);
         assert!(stats.total_positions > 0);
 
@@ -642,29 +730,29 @@ mod tests {
         let chrom_code_2 = crate::kv_cache::key_encoding::chrom_to_code("2");
 
         let entry = store
-            .get_position_entry_decompressed(chrom_code_1, 100, 100)
+            .get_position_entry_decompressed(chrom_code_1, 100)
             .unwrap();
         assert!(entry.is_some());
 
         let entry = store
-            .get_position_entry_decompressed(chrom_code_1, 500_000, 500_000)
+            .get_position_entry_decompressed(chrom_code_1, 500_000)
             .unwrap();
         assert!(entry.is_some());
 
         let entry = store
-            .get_position_entry_decompressed(chrom_code_2, 100, 100)
+            .get_position_entry_decompressed(chrom_code_2, 100)
             .unwrap();
         assert!(entry.is_some());
 
         // Missing position.
         let entry = store
-            .get_position_entry_decompressed(chrom_code_1, 999, 999)
+            .get_position_entry_decompressed(chrom_code_1, 999)
             .unwrap();
         assert!(entry.is_none());
 
         // Verify a position entry can be deserialized after decompression.
         let raw = store
-            .get_position_entry_decompressed(chrom_code_1, 100, 100)
+            .get_position_entry_decompressed(chrom_code_1, 100)
             .unwrap()
             .unwrap();
         let reader = crate::kv_cache::position_entry::PositionEntryReader::new(&raw).unwrap();
