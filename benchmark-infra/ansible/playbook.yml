@@ -87,6 +87,8 @@
         rsync_opts:
           - "--include=HG002_chr1.vcf.gz"
           - "--include=HG002_chr1.vcf.gz.tbi"
+          - "--include=HG002_GRCh38_1_22_v4.2.1_benchmark.vcf.gz"
+          - "--include=HG002_GRCh38_1_22_v4.2.1_benchmark.vcf.gz.tbi"
           - "--include=output/"
           - "--include=output/everything/"
           - "--include=output/everything/HG002_chr1_0_vep115_golden.vcf"
@@ -113,6 +115,13 @@
         src: "{{ local_ensembl_cache_dir }}/"
         dest: "{{ data_dir }}/homo_sapiens/115_GRCh38/"
 
+    - name: Fix data directory ownership
+      file:
+        path: "{{ data_dir }}"
+        owner: "{{ benchmark_user }}"
+        group: "{{ benchmark_user }}"
+        recurse: yes
+
     # ── Clone and build the project ──────────────────────────────────
     - name: Sync project source
       synchronize:
@@ -136,7 +145,7 @@
       shell: |
         source /home/{{ benchmark_user }}/.cargo/env
         cd {{ repo_dir }}
-        cargo build --release -p datafusion-bio-function-vep
+        cargo build --release -p datafusion-bio-function-vep --examples
       args:
         executable: /bin/bash
       environment:
