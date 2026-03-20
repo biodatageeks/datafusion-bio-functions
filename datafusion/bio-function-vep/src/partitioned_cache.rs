@@ -32,6 +32,7 @@ pub const CONTEXT_TYPES: &[&str] = &[
 ];
 
 /// Represents a partitioned per-chromosome parquet cache directory.
+#[derive(Clone)]
 pub struct PartitionedParquetCache {
     base_dir: PathBuf,
     /// Chromosomes available in the variation subdirectory (from filenames).
@@ -84,12 +85,11 @@ impl PartitionedParquetCache {
     /// Path to a per-chromosome parquet file for a given context type.
     /// Returns `None` if the file does not exist.
     pub fn context_path(&self, context_type: &str, chrom: &str) -> Option<PathBuf> {
-        let path = self.base_dir.join(context_type).join(format!("{chrom}.parquet"));
-        if path.exists() {
-            Some(path)
-        } else {
-            None
-        }
+        let path = self
+            .base_dir
+            .join(context_type)
+            .join(format!("{chrom}.parquet"));
+        if path.exists() { Some(path) } else { None }
     }
 
     /// Whether a per-chromosome parquet file exists for a given context type.
@@ -185,7 +185,10 @@ mod tests {
             "chr22".to_string(),
         ];
         chroms.sort_by_key(|a| natural_chrom_order(a));
-        assert_eq!(chroms, vec!["chr1", "chr2", "chr10", "chr22", "chrX", "chrY", "chrMT"]);
+        assert_eq!(
+            chroms,
+            vec!["chr1", "chr2", "chr10", "chr22", "chrX", "chrY", "chrMT"]
+        );
     }
 
     #[test]

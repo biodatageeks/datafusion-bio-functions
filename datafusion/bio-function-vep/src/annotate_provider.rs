@@ -9,11 +9,14 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Seek};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskCtx, Poll};
 use std::time::Instant;
 
 /// Returns true when VEP_PROFILE env var is set (any value).
@@ -61,8 +64,15 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{MemTable, TableProvider, TableType};
+use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties,
+};
 use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext, col, lit};
+use futures::{Future, Stream};
 use noodles_core::{Position, Region};
 use noodles_fasta as fasta;
 use serde_json::Value;
@@ -76,6 +86,7 @@ use crate::config;
 use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
+use crate::partitioned_cache::PartitionedParquetCache;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
@@ -83,7 +94,6 @@ use crate::transcript_consequence::{
     SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequenceEngine, TranscriptFeature,
     TranslationFeature, VariantInput, is_vep_transcript,
 };
-use crate::partitioned_cache::PartitionedParquetCache;
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
 };
@@ -2718,14 +2728,13 @@ impl AnnotateProvider {
     /// 5. Collect annotated batches
     async fn scan_with_transcript_engine_partitioned(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         requested_columns: &[&str],
         extended_probes: bool,
         cache: &PartitionedParquetCache,
         translations_sift_table: Option<&str>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let t_total = profile_start!();
         if profiling_enabled() {
             eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned START ======");
         }
@@ -2752,16 +2761,15 @@ impl AnnotateProvider {
         // Discover contigs from VCF.
         let t_contigs = profile_start!();
         let vcf_contigs = self.discover_vcf_contigs().await?;
-        // Intersect with available cache chroms.
         let cache_chroms: HashSet<&str> = cache
             .available_chroms()
             .iter()
             .map(|s| s.as_str())
             .collect();
-        let contigs: Vec<&str> = vcf_contigs
+        let contigs: Vec<String> = vcf_contigs
             .iter()
             .filter(|c| cache_chroms.contains(c.as_str()))
-            .map(|s| s.as_str())
+            .cloned()
             .collect();
         profile_end!(
             "0. discover_contigs",
@@ -2774,425 +2782,46 @@ impl AnnotateProvider {
             )
         );
 
-        let cache_columns: Vec<String> =
-            requested_columns.iter().map(|s| s.to_string()).collect();
+        let cache_columns: Vec<String> = requested_columns.iter().map(|s| s.to_string()).collect();
 
-        let mut all_annotated: Vec<RecordBatch> = Vec::new();
-        let mut total_vcf_rows = 0usize;
-
-        for chrom in &contigs {
-            let t_contig = profile_start!();
-            if profiling_enabled() {
-                eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
-            }
-
-            // Track ephemeral tables registered for this contig so we can
-            // deregister them at the end.
-            let mut ephemeral_tables: Vec<String> = Vec::new();
-
-            // 1. Register per-chrom variation parquet.
-            let var_table = crate::partitioned_cache::register_chrom_parquet(
-                &self.session,
-                cache,
-                "variation",
-                chrom,
-            )
-            .await?;
-            let Some(var_table) = var_table else {
-                if profiling_enabled() {
-                    eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (no variation) ------");
-                }
-                continue;
-            };
-            ephemeral_tables.push(var_table.clone());
-
-            // 2. Read VCF for this contig using filter pushdown (tabix seek).
-            let t_var = profile_start!();
-            let vcf_df = self
-                .session
-                .table(&self.vcf_table)
-                .await?
-                .filter(col("chrom").eq(lit(*chrom)))?;
-
-            let vcf_schema = vcf_df.schema().as_arrow().clone();
-            let cache_schema = self
-                .session
-                .table(&var_table)
-                .await?
-                .schema()
-                .as_arrow()
-                .clone();
-
-            // Build lookup provider scoped to this contig's VCF + variation.
-            let coloc_sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
-            let mut provider = LookupProvider::new(
-                Arc::clone(&self.session),
-                self.vcf_table.clone(),
-                var_table.clone(),
-                vcf_schema,
-                cache_schema,
-                cache_columns.clone(),
-                extended_probes,
-                allowed_failed,
-                None,
-            )?;
-            // Override VCF input to use the filtered (single-contig) plan.
-            provider.set_vcf_filter(Some(col("chrom").eq(lit(*chrom))));
-            if flags.check_existing {
-                provider.set_colocated_sink(Arc::clone(&coloc_sink));
-            }
-
-            let plan = provider.scan(state, None, &[], None).await?;
-            let task_ctx = self.session.task_ctx();
-            let base_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
-            let contig_rows: usize = base_batches.iter().map(|b| b.num_rows()).sum();
-            total_vcf_rows += contig_rows;
-            profile_end!(
-                &format!("{chrom}: 1. variation_lookup"),
-                t_var,
-                format!("{contig_rows} rows, {} batches", base_batches.len())
-            );
-
-            if contig_rows == 0 {
-                // Deregister variation table and skip.
-                for tbl in &ephemeral_tables {
-                    crate::partitioned_cache::deregister_table(&self.session, tbl).await?;
-                }
-                if profiling_enabled() {
-                    eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (0 rows) ------");
-                }
-                continue;
-            }
-
-            // 3. Variant intervals + colocated map.
-            let input_variant_intervals = collect_input_variant_intervals(&base_batches)?;
-            let indel_variant_intervals = collect_indel_variant_intervals(&base_batches)?;
-            let colocated_map = if flags.check_existing {
-                let guard = coloc_sink.lock().unwrap();
-                build_colocated_map_from_sink(&guard)
-            } else {
-                HashMap::new()
-            };
-
-            // 4. Cache miss worklist (single-contig).
-            let mut cache_hit_count = 0usize;
-            let mut cache_miss_count = 0usize;
-            let worklist =
-                collect_miss_worklist(&base_batches, &mut cache_hit_count, &mut cache_miss_count)?;
-            let has_cache_misses = !worklist.is_empty();
-            if profiling_enabled() {
-                let hit_rate = if contig_rows > 0 {
-                    cache_hit_count as f64 / contig_rows as f64 * 100.0
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "[VEP_PROFILE] {chrom}: cache hits={cache_hit_count}, misses={cache_miss_count}, rate={hit_rate:.1}%"
-                );
-            }
-
-            // 5. Load context tables for this contig.
-            let t_ctx = profile_start!();
-            let (
-                mut transcripts,
-                translateable_seq_by_tx,
-                exons,
-                mut translations,
-                regulatory,
-                motifs,
-                mirnas,
-                structural,
-            ) = if has_cache_misses {
-                // Register per-chrom context parquet files.
-                let tx_table = crate::partitioned_cache::register_chrom_parquet(
-                    &self.session, cache, "transcript", chrom,
-                ).await?;
-                if let Some(ref t) = tx_table { ephemeral_tables.push(t.clone()); }
-
-                let ex_table = crate::partitioned_cache::register_chrom_parquet(
-                    &self.session, cache, "exon", chrom,
-                ).await?;
-                if let Some(ref t) = ex_table { ephemeral_tables.push(t.clone()); }
-
-                let tl_table = crate::partitioned_cache::register_chrom_parquet(
-                    &self.session, cache, "translation_core", chrom,
-                ).await?;
-                if let Some(ref t) = tl_table { ephemeral_tables.push(t.clone()); }
-
-                let rg_table = crate::partitioned_cache::register_chrom_parquet(
-                    &self.session, cache, "regulatory", chrom,
-                ).await?;
-                if let Some(ref t) = rg_table { ephemeral_tables.push(t.clone()); }
-
-                let mt_table = crate::partitioned_cache::register_chrom_parquet(
-                    &self.session, cache, "motif", chrom,
-                ).await?;
-                if let Some(ref t) = mt_table { ephemeral_tables.push(t.clone()); }
-
-                // Load transcripts (no WHERE needed — file IS the contig filter).
-                let tx = if let Some(ref table) = tx_table {
-                    let (tx, seq) = self.load_transcripts(table, &worklist).await?;
-                    let filtered: Vec<_> = tx.into_iter()
-                        .filter(|t| is_vep_transcript(&t.transcript_id, merged))
-                        .collect();
-                    (filtered, seq)
-                } else {
-                    (Vec::new(), HashMap::new())
-                };
-                let (tx_vec, translateable_seq) = tx;
-
-                let tx_ids: HashSet<String> =
-                    tx_vec.iter().map(|t| t.transcript_id.clone()).collect();
-
-                let ex = if let Some(ref table) = ex_table {
-                    let raw = self.load_exons(table, &worklist).await?;
-                    raw.into_iter()
-                        .filter(|e| tx_ids.contains(&e.transcript_id))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                let tl = if let Some(ref table) = tl_table {
-                    let raw = self.load_translations(table, &worklist).await?;
-                    raw.into_iter()
-                        .filter(|t| tx_ids.contains(&t.transcript_id))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                let rg = if let Some(ref table) = rg_table {
-                    self.load_regulatory_features(table, &worklist).await?
-                } else {
-                    Vec::new()
-                };
-
-                let mt = if let Some(ref table) = mt_table {
-                    self.load_motif_features(table, &worklist).await?
-                } else {
-                    Vec::new()
-                };
-
-                // mirna and sv: use monolithic tables if available, skip for
-                // partitioned path for now (they are rare).
-                let mi: Vec<MirnaFeature> = Vec::new();
-                let st: Vec<StructuralFeature> = Vec::new();
-
-                (tx_vec, translateable_seq, ex, tl, rg, mt, mi, st)
-            } else {
-                (
-                    Vec::new(), HashMap::new(), Vec::new(), Vec::new(),
-                    Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-                )
-            };
-            profile_end!(&format!("{chrom}: 4. context_load"), t_ctx);
-
-            // 5a. Hydrate RefSeq CDS from reference FASTA.
-            let mut hgvs_reference_reader = if hgvs_flags.any() && hgvs_flags.shift_hgvs {
-                reference_fasta_path
-                    .as_deref()
-                    .map(|path| {
-                        fasta::io::indexed_reader::Builder::default()
-                            .build_from_path(path)
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "failed to open indexed reference FASTA '{path}': {e}"
-                                ))
-                            })
-                    })
-                    .transpose()?
-            } else {
-                None
-            };
-            let hydrated_transcript_ids =
-                if let Some(reader) = hgvs_reference_reader.as_mut() {
-                    hydrate_refseq_translation_cds_from_reference(
-                        reader,
-                        &transcripts,
-                        &exons,
-                        &mut translations,
-                        &input_variant_intervals,
-                    )?
-                } else {
-                    HashSet::new()
-                };
-            apply_translateable_seq_overrides(
-                &mut translations,
-                &translateable_seq_by_tx,
-                &hydrated_transcript_ids,
-            );
-            if let Some(reader) = hgvs_reference_reader.as_mut() {
-                hydrate_transcript_cdna_from_reference(
-                    reader,
-                    &mut transcripts,
-                    &exons,
-                    &indel_variant_intervals,
-                    &input_variant_intervals,
-                )?;
-            }
-
-            // 6. Build PreparedContext + engine for this contig.
-            let t_prep = profile_start!();
-            let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
-                upstream_distance,
-                downstream_distance,
-                hgvs_flags.shift_hgvs,
-            );
-            let ctx = PreparedContext::new(
-                &transcripts, &exons, &translations, &regulatory,
-                &motifs, &mirnas, &structural,
-            );
-            profile_end!(&format!("{chrom}: 6. prepared_context"), t_prep);
-
-            // 7. SIFT/PolyPhen cache (per-contig, fresh).
-            let mut sift_cache = SiftPolyphenCache::new();
-            #[cfg(not(feature = "kv-cache"))]
-            let sift_kv: Option<()> = None;
-            #[cfg(feature = "kv-cache")]
-            let sift_kv: Option<crate::kv_cache::SiftKvStore> = None;
-
-            // Build per-contig SIFT direct reader from partitioned cache.
-            // Use the parquet file path directly — no DataFusion registration needed.
-            let sift_enabled = flags.everything;
-            let sift_direct: Option<SiftDirectReader> = if sift_enabled {
-                // Prefer explicit sift table path, then partitioned cache path.
-                translations_sift_table
-                    .and_then(|table| {
-                        let path = std::path::Path::new(table);
-                        if path.exists() {
-                            Self::build_sift_direct_reader(table)
-                        } else {
-                            None
-                        }
-                    })
-                    .or_else(|| {
-                        cache
-                            .context_path("translation_sift", chrom)
-                            .and_then(|p| Self::build_sift_direct_reader(p.to_str()?))
-                    })
-            } else {
-                None
-            };
-            let mut loaded_windows: HashSet<(String, i64)> = HashSet::new();
-
-            // 8. Annotate batches for this contig.
-            let t_ann = profile_start!();
-            let mut contig_annotated = Vec::with_capacity(base_batches.len());
-            for batch in &base_batches {
-                // Lazy SIFT window loading (same logic as monolithic path).
-                if sift_enabled && sift_kv.is_none() && sift_direct.is_some() {
-                    let batch_has_miss = batch
-                        .schema()
-                        .index_of("cache_most_severe_consequence")
-                        .ok()
-                        .map_or(true, |idx| batch.column(idx).null_count() > 0);
-                    if batch_has_miss {
-                        let schema = batch.schema();
-                        if let (Ok(ci), Ok(si), Ok(ei)) = (
-                            schema.index_of("chrom"),
-                            schema.index_of("start"),
-                            schema.index_of("end"),
-                        ) {
-                            let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
-                            for row in 0..batch.num_rows() {
-                                if let (Some(c), Some(s), Some(e)) = (
-                                    string_at(batch.column(ci).as_ref(), row),
-                                    int64_at(batch.column(si).as_ref(), row),
-                                    int64_at(batch.column(ei).as_ref(), row),
-                                ) {
-                                    let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
-                                    let entry = batch_chrom_bounds
-                                        .entry(c_norm)
-                                        .or_insert((i64::MAX, i64::MIN));
-                                    entry.0 = entry.0.min(s);
-                                    entry.1 = entry.1.max(e);
-                                }
-                            }
-                            for (ch, (batch_min, batch_max)) in &batch_chrom_bounds {
-                                let window_start =
-                                    (batch_max / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
-                                let min_window_start =
-                                    (batch_min / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
-                                let mut ws = min_window_start;
-                                while ws <= window_start + Self::SIFT_WINDOW_SIZE {
-                                    let key = (ch.clone(), ws);
-                                    if !loaded_windows.contains(&key) {
-                                        if let Some(ref direct) = sift_direct {
-                                            direct.load_window(
-                                                ch, ws, ws + Self::SIFT_WINDOW_SIZE,
-                                                &mut sift_cache,
-                                            )?;
-                                        }
-                                        loaded_windows.insert(key);
-                                    }
-                                    ws += Self::SIFT_WINDOW_SIZE;
-                                }
-                                sift_cache.evict_before(*batch_min);
-                            }
-                        }
-                    }
-                }
-
-                contig_annotated.push(self.annotate_batch_with_transcript_engine(
-                    batch,
-                    &engine,
-                    &ctx,
-                    &colocated_map,
-                    &mut sift_cache,
-                    &sift_kv,
-                )?);
-            }
-            profile_end!(
-                &format!("{chrom}: 8. annotate_batches"),
-                t_ann,
-                format!("{} batches", contig_annotated.len())
-            );
-
-            all_annotated.extend(contig_annotated);
-
-            // 9. Deregister ephemeral tables for this contig.
-            for tbl in &ephemeral_tables {
-                crate::partitioned_cache::deregister_table(&self.session, tbl).await?;
-            }
-
-            profile_end!(
-                &format!("{chrom}: TOTAL"),
-                t_contig,
-                format!("{contig_rows} rows")
-            );
-            if profiling_enabled() {
-                eprintln!("[VEP_PROFILE] ------ contig {chrom} END ------");
-            }
-        }
-
-        // Project and return.
-        let projected_batches = if let Some(indices) = projection {
-            let mut out = Vec::with_capacity(all_annotated.len());
-            for batch in all_annotated {
-                out.push(batch.project(indices)?);
-            }
-            out
-        } else {
-            all_annotated
-        };
         let projected_schema = if let Some(indices) = projection {
             Arc::new(self.schema.project(indices)?)
         } else {
             self.schema.clone()
         };
 
-        let mem = MemTable::try_new(projected_schema, vec![projected_batches])?;
-        let result = mem.scan(state, None, &[], None).await;
-        profile_end!(
-            "TOTAL scan_partitioned",
-            t_total,
-            format!("{total_vcf_rows} VCF rows, {} contigs", contigs.len())
+        let config = ContigAnnotationConfig {
+            vcf_table: self.vcf_table.clone(),
+            options_json: self.options_json.clone(),
+            cache_columns,
+            extended_probes,
+            translations_sift_table: translations_sift_table.map(|s| s.to_string()),
+            flags,
+            hgvs_flags,
+            merged,
+            allowed_failed,
+            reference_fasta_path,
+            upstream_distance,
+            downstream_distance,
+            projection: projection.cloned(),
+        };
+
+        let exec = ContigAnnotationExec::new(
+            projected_schema,
+            self.schema.clone(),
+            contigs,
+            Arc::clone(&self.session),
+            Arc::new(cache.clone()),
+            config,
         );
+
         if profiling_enabled() {
-            eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned END ======");
+            eprintln!(
+                "[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned: returning ContigAnnotationExec ======"
+            );
         }
-        result
+
+        Ok(Arc::new(exec))
     }
 
     async fn scan_with_transcript_engine(
@@ -5390,6 +5019,685 @@ impl Debug for AnnotateProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Streaming contig-by-contig ExecutionPlan
+// ---------------------------------------------------------------------------
+
+/// Bundled configuration for per-contig annotation (extracted from AnnotateProvider).
+#[derive(Clone)]
+struct ContigAnnotationConfig {
+    vcf_table: String,
+    options_json: Option<String>,
+    cache_columns: Vec<String>,
+    extended_probes: bool,
+    translations_sift_table: Option<String>,
+    flags: VepFlags,
+    hgvs_flags: HgvsFlags,
+    merged: bool,
+    allowed_failed: i64,
+    reference_fasta_path: Option<String>,
+    upstream_distance: i64,
+    downstream_distance: i64,
+    projection: Option<Vec<usize>>,
+}
+
+/// Leaf `ExecutionPlan` that processes contigs one at a time via a state-machine
+/// stream, reclaiming memory after each contig completes.
+struct ContigAnnotationExec {
+    projected_schema: SchemaRef,
+    full_schema: SchemaRef,
+    contigs: Vec<String>,
+    session: Arc<SessionContext>,
+    cache: Arc<PartitionedParquetCache>,
+    config: ContigAnnotationConfig,
+    properties: PlanProperties,
+}
+
+impl ContigAnnotationExec {
+    fn new(
+        projected_schema: SchemaRef,
+        full_schema: SchemaRef,
+        contigs: Vec<String>,
+        session: Arc<SessionContext>,
+        cache: Arc<PartitionedParquetCache>,
+        config: ContigAnnotationConfig,
+    ) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(projected_schema.clone()),
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            projected_schema,
+            full_schema,
+            contigs,
+            session,
+            cache,
+            config,
+            properties,
+        }
+    }
+}
+
+impl Debug for ContigAnnotationExec {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ContigAnnotationExec {{ contigs: {}, schema_fields: {} }}",
+            self.contigs.len(),
+            self.projected_schema.fields().len()
+        )
+    }
+}
+
+impl DisplayAs for ContigAnnotationExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ContigAnnotationExec: contigs={}", self.contigs.len())
+    }
+}
+
+impl ExecutionPlan for ContigAnnotationExec {
+    fn name(&self) -> &str {
+        "ContigAnnotationExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.projected_schema.clone()
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        Ok(Box::pin(ContigAnnotationStream::new(
+            self.projected_schema.clone(),
+            self.full_schema.clone(),
+            self.contigs.clone(),
+            Arc::clone(&self.session),
+            Arc::clone(&self.cache),
+            self.config.clone(),
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State-machine stream
+// ---------------------------------------------------------------------------
+
+type ContigFuture = Pin<Box<dyn Future<Output = Result<VecDeque<RecordBatch>>> + Send>>;
+
+enum StreamState {
+    StartContig,
+    PreparingContig(ContigFuture),
+    Draining(VecDeque<RecordBatch>),
+    Done,
+}
+
+struct ContigAnnotationStream {
+    projected_schema: SchemaRef,
+    full_schema: SchemaRef,
+    contigs: VecDeque<String>,
+    session: Arc<SessionContext>,
+    cache: Arc<PartitionedParquetCache>,
+    config: ContigAnnotationConfig,
+    state: StreamState,
+}
+
+impl ContigAnnotationStream {
+    fn new(
+        projected_schema: SchemaRef,
+        full_schema: SchemaRef,
+        contigs: Vec<String>,
+        session: Arc<SessionContext>,
+        cache: Arc<PartitionedParquetCache>,
+        config: ContigAnnotationConfig,
+    ) -> Self {
+        Self {
+            projected_schema,
+            full_schema,
+            contigs: VecDeque::from(contigs),
+            session,
+            cache,
+            config,
+            state: StreamState::StartContig,
+        }
+    }
+}
+
+impl RecordBatchStream for ContigAnnotationStream {
+    fn schema(&self) -> SchemaRef {
+        self.projected_schema.clone()
+    }
+}
+
+impl Stream for ContigAnnotationStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskCtx<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match &mut self.state {
+                StreamState::Done => return Poll::Ready(None),
+
+                StreamState::Draining(deque) => {
+                    if let Some(batch) = deque.pop_front() {
+                        return Poll::Ready(Some(Ok(batch)));
+                    }
+                    // Deque exhausted → memory freed → next contig.
+                    self.state = StreamState::StartContig;
+                }
+
+                StreamState::StartContig => {
+                    let Some(chrom) = self.contigs.pop_front() else {
+                        self.state = StreamState::Done;
+                        return Poll::Ready(None);
+                    };
+                    let session = Arc::clone(&self.session);
+                    let cache = Arc::clone(&self.cache);
+                    let config = self.config.clone();
+                    let full_schema = self.full_schema.clone();
+                    let projected_schema = self.projected_schema.clone();
+                    let projection = config.projection.clone();
+
+                    let fut: ContigFuture = Box::pin(async move {
+                        prepare_and_annotate_contig(
+                            &session,
+                            &cache,
+                            &chrom,
+                            &config,
+                            &full_schema,
+                            &projected_schema,
+                            projection.as_deref(),
+                        )
+                        .await
+                    });
+                    self.state = StreamState::PreparingContig(fut);
+                }
+
+                StreamState::PreparingContig(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => {
+                        self.state = StreamState::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Ready(Ok(batches)) => {
+                        if batches.is_empty() {
+                            self.state = StreamState::StartContig;
+                        } else {
+                            self.state = StreamState::Draining(batches);
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-contig processing future (extracted from the old for-loop body)
+// ---------------------------------------------------------------------------
+
+/// Process a single contig: register ephemeral tables, run variation lookup,
+/// load context, annotate all batches, deregister tables, return results.
+///
+/// All borrowed context (`PreparedContext<'a>`) is consumed within this future —
+/// no lifetime escapes.
+async fn prepare_and_annotate_contig(
+    session: &SessionContext,
+    cache: &PartitionedParquetCache,
+    chrom: &str,
+    config: &ContigAnnotationConfig,
+    full_schema: &SchemaRef,
+    projected_schema: &SchemaRef,
+    projection: Option<&[usize]>,
+) -> Result<VecDeque<RecordBatch>> {
+    let t_contig = profile_start!();
+    if profiling_enabled() {
+        eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
+    }
+
+    // Derive VCF-only schema (without annotation columns appended by AnnotateProvider::new).
+    let vcf_field_count = full_schema
+        .fields()
+        .len()
+        .saturating_sub(2 + CACHE_OUTPUT_COLUMNS.len());
+    let vcf_only_schema = Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
+
+    let mut ephemeral_tables: Vec<String> = Vec::new();
+
+    // 1. Register per-chrom variation parquet.
+    let var_table =
+        crate::partitioned_cache::register_chrom_parquet(session, cache, "variation", chrom)
+            .await?;
+    let Some(var_table) = var_table else {
+        if profiling_enabled() {
+            eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (no variation) ------");
+        }
+        return Ok(VecDeque::new());
+    };
+    ephemeral_tables.push(var_table.clone());
+
+    // 2. Read VCF for this contig using filter pushdown (tabix seek).
+    let t_var = profile_start!();
+    let vcf_df = session
+        .table(&config.vcf_table)
+        .await?
+        .filter(col("chrom").eq(lit(chrom)))?;
+
+    let vcf_schema = vcf_df.schema().as_arrow().clone();
+    let cache_schema = session.table(&var_table).await?.schema().as_arrow().clone();
+
+    // Build lookup provider scoped to this contig's VCF + variation.
+    let coloc_sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+    let mut provider = LookupProvider::new(
+        Arc::new(session.clone()),
+        config.vcf_table.clone(),
+        var_table.clone(),
+        vcf_schema,
+        cache_schema,
+        config.cache_columns.clone(),
+        config.extended_probes,
+        config.allowed_failed,
+        None,
+    )?;
+    provider.set_vcf_filter(Some(col("chrom").eq(lit(chrom))));
+    if config.flags.check_existing {
+        provider.set_colocated_sink(Arc::clone(&coloc_sink));
+    }
+
+    let session_state = session.state();
+    let plan = provider.scan(&session_state, None, &[], None).await?;
+    let task_ctx = session.task_ctx();
+    let base_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
+    let contig_rows: usize = base_batches.iter().map(|b| b.num_rows()).sum();
+    profile_end!(
+        &format!("{chrom}: 1. variation_lookup"),
+        t_var,
+        format!("{contig_rows} rows, {} batches", base_batches.len())
+    );
+
+    if contig_rows == 0 {
+        for tbl in &ephemeral_tables {
+            crate::partitioned_cache::deregister_table(session, tbl).await?;
+        }
+        if profiling_enabled() {
+            eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (0 rows) ------");
+        }
+        return Ok(VecDeque::new());
+    }
+
+    // 3. Variant intervals + colocated map.
+    let input_variant_intervals = collect_input_variant_intervals(&base_batches)?;
+    let indel_variant_intervals = collect_indel_variant_intervals(&base_batches)?;
+    let colocated_map = if config.flags.check_existing {
+        let guard = coloc_sink.lock().unwrap();
+        build_colocated_map_from_sink(&guard)
+    } else {
+        HashMap::new()
+    };
+
+    // 4. Cache miss worklist (single-contig).
+    let mut cache_hit_count = 0usize;
+    let mut cache_miss_count = 0usize;
+    let worklist =
+        collect_miss_worklist(&base_batches, &mut cache_hit_count, &mut cache_miss_count)?;
+    let has_cache_misses = !worklist.is_empty();
+    if profiling_enabled() {
+        let hit_rate = if contig_rows > 0 {
+            cache_hit_count as f64 / contig_rows as f64 * 100.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[VEP_PROFILE] {chrom}: cache hits={cache_hit_count}, misses={cache_miss_count}, rate={hit_rate:.1}%"
+        );
+    }
+
+    // 5. Load context tables for this contig.
+    let t_ctx = profile_start!();
+    let (
+        mut transcripts,
+        translateable_seq_by_tx,
+        exons,
+        mut translations,
+        regulatory,
+        motifs,
+        mirnas,
+        structural,
+    ) = if has_cache_misses {
+        let tx_table =
+            crate::partitioned_cache::register_chrom_parquet(session, cache, "transcript", chrom)
+                .await?;
+        if let Some(ref t) = tx_table {
+            ephemeral_tables.push(t.clone());
+        }
+
+        let ex_table =
+            crate::partitioned_cache::register_chrom_parquet(session, cache, "exon", chrom).await?;
+        if let Some(ref t) = ex_table {
+            ephemeral_tables.push(t.clone());
+        }
+
+        let tl_table = crate::partitioned_cache::register_chrom_parquet(
+            session,
+            cache,
+            "translation_core",
+            chrom,
+        )
+        .await?;
+        if let Some(ref t) = tl_table {
+            ephemeral_tables.push(t.clone());
+        }
+
+        let rg_table =
+            crate::partitioned_cache::register_chrom_parquet(session, cache, "regulatory", chrom)
+                .await?;
+        if let Some(ref t) = rg_table {
+            ephemeral_tables.push(t.clone());
+        }
+
+        let mt_table =
+            crate::partitioned_cache::register_chrom_parquet(session, cache, "motif", chrom)
+                .await?;
+        if let Some(ref t) = mt_table {
+            ephemeral_tables.push(t.clone());
+        }
+
+        // Create a temporary AnnotateProvider for calling load_* methods.
+        let tmp_provider = AnnotateProvider::new(
+            Arc::new(session.clone()),
+            config.vcf_table.clone(),
+            String::new(),
+            AnnotationBackend::Parquet,
+            config.options_json.clone(),
+            vcf_only_schema.clone(),
+        );
+
+        let tx = if let Some(ref table) = tx_table {
+            let (tx, seq) = tmp_provider.load_transcripts(table, &worklist).await?;
+            let filtered: Vec<_> = tx
+                .into_iter()
+                .filter(|t| is_vep_transcript(&t.transcript_id, config.merged))
+                .collect();
+            (filtered, seq)
+        } else {
+            (Vec::new(), HashMap::new())
+        };
+        let (tx_vec, translateable_seq) = tx;
+
+        let tx_ids: HashSet<String> = tx_vec.iter().map(|t| t.transcript_id.clone()).collect();
+
+        let ex = if let Some(ref table) = ex_table {
+            let raw = tmp_provider.load_exons(table, &worklist).await?;
+            raw.into_iter()
+                .filter(|e| tx_ids.contains(&e.transcript_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let tl = if let Some(ref table) = tl_table {
+            let raw = tmp_provider.load_translations(table, &worklist).await?;
+            raw.into_iter()
+                .filter(|t| tx_ids.contains(&t.transcript_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let rg = if let Some(ref table) = rg_table {
+            tmp_provider
+                .load_regulatory_features(table, &worklist)
+                .await?
+        } else {
+            Vec::new()
+        };
+
+        let mt = if let Some(ref table) = mt_table {
+            tmp_provider.load_motif_features(table, &worklist).await?
+        } else {
+            Vec::new()
+        };
+
+        let mi: Vec<MirnaFeature> = Vec::new();
+        let st: Vec<StructuralFeature> = Vec::new();
+
+        (tx_vec, translateable_seq, ex, tl, rg, mt, mi, st)
+    } else {
+        (
+            Vec::new(),
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    profile_end!(&format!("{chrom}: 4. context_load"), t_ctx);
+
+    // 5a. Hydrate RefSeq CDS from reference FASTA.
+    let mut hgvs_reference_reader = if config.hgvs_flags.any() && config.hgvs_flags.shift_hgvs {
+        config
+            .reference_fasta_path
+            .as_deref()
+            .map(|path| {
+                fasta::io::indexed_reader::Builder::default()
+                    .build_from_path(path)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "failed to open indexed reference FASTA '{path}': {e}"
+                        ))
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let hydrated_transcript_ids = if let Some(reader) = hgvs_reference_reader.as_mut() {
+        hydrate_refseq_translation_cds_from_reference(
+            reader,
+            &transcripts,
+            &exons,
+            &mut translations,
+            &input_variant_intervals,
+        )?
+    } else {
+        HashSet::new()
+    };
+    apply_translateable_seq_overrides(
+        &mut translations,
+        &translateable_seq_by_tx,
+        &hydrated_transcript_ids,
+    );
+    if let Some(reader) = hgvs_reference_reader.as_mut() {
+        hydrate_transcript_cdna_from_reference(
+            reader,
+            &mut transcripts,
+            &exons,
+            &indel_variant_intervals,
+            &input_variant_intervals,
+        )?;
+    }
+
+    // 6. Build PreparedContext + engine for this contig.
+    let t_prep = profile_start!();
+    let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
+        config.upstream_distance,
+        config.downstream_distance,
+        config.hgvs_flags.shift_hgvs,
+    );
+    let ctx = PreparedContext::new(
+        &transcripts,
+        &exons,
+        &translations,
+        &regulatory,
+        &motifs,
+        &mirnas,
+        &structural,
+    );
+    profile_end!(&format!("{chrom}: 6. prepared_context"), t_prep);
+
+    // 7. SIFT/PolyPhen cache (per-contig, fresh).
+    // Use a temporary AnnotateProvider for calling annotate_batch_with_transcript_engine.
+    let tmp_provider = AnnotateProvider::new(
+        Arc::new(session.clone()),
+        config.vcf_table.clone(),
+        String::new(),
+        AnnotationBackend::Parquet,
+        config.options_json.clone(),
+        vcf_only_schema.clone(),
+    );
+
+    let mut sift_cache = SiftPolyphenCache::new();
+    #[cfg(not(feature = "kv-cache"))]
+    let sift_kv: Option<()> = None;
+    #[cfg(feature = "kv-cache")]
+    let sift_kv: Option<crate::kv_cache::SiftKvStore> = None;
+
+    let sift_enabled = config.flags.everything;
+    let sift_direct: Option<SiftDirectReader> = if sift_enabled {
+        config
+            .translations_sift_table
+            .as_deref()
+            .and_then(|table| {
+                let path = std::path::Path::new(table);
+                if path.exists() {
+                    AnnotateProvider::build_sift_direct_reader(table)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                cache
+                    .context_path("translation_sift", chrom)
+                    .and_then(|p| AnnotateProvider::build_sift_direct_reader(p.to_str()?))
+            })
+    } else {
+        None
+    };
+    let mut loaded_windows: HashSet<(String, i64)> = HashSet::new();
+
+    // 8. Annotate batches for this contig.
+    let t_ann = profile_start!();
+    let mut contig_annotated = VecDeque::with_capacity(base_batches.len());
+    for batch in &base_batches {
+        // Lazy SIFT window loading.
+        if sift_enabled && sift_kv.is_none() && sift_direct.is_some() {
+            let batch_has_miss = batch
+                .schema()
+                .index_of("cache_most_severe_consequence")
+                .ok()
+                .map_or(true, |idx| batch.column(idx).null_count() > 0);
+            if batch_has_miss {
+                let schema = batch.schema();
+                if let (Ok(ci), Ok(si), Ok(ei)) = (
+                    schema.index_of("chrom"),
+                    schema.index_of("start"),
+                    schema.index_of("end"),
+                ) {
+                    let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
+                    for row in 0..batch.num_rows() {
+                        if let (Some(c), Some(s), Some(e)) = (
+                            string_at(batch.column(ci).as_ref(), row),
+                            int64_at(batch.column(si).as_ref(), row),
+                            int64_at(batch.column(ei).as_ref(), row),
+                        ) {
+                            let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
+                            let entry = batch_chrom_bounds
+                                .entry(c_norm)
+                                .or_insert((i64::MAX, i64::MIN));
+                            entry.0 = entry.0.min(s);
+                            entry.1 = entry.1.max(e);
+                        }
+                    }
+                    for (ch, (batch_min, batch_max)) in &batch_chrom_bounds {
+                        let window_start = (batch_max / AnnotateProvider::SIFT_WINDOW_SIZE)
+                            * AnnotateProvider::SIFT_WINDOW_SIZE;
+                        let min_window_start = (batch_min / AnnotateProvider::SIFT_WINDOW_SIZE)
+                            * AnnotateProvider::SIFT_WINDOW_SIZE;
+                        let mut ws = min_window_start;
+                        while ws <= window_start + AnnotateProvider::SIFT_WINDOW_SIZE {
+                            let key = (ch.clone(), ws);
+                            if !loaded_windows.contains(&key) {
+                                if let Some(ref direct) = sift_direct {
+                                    direct.load_window(
+                                        ch,
+                                        ws,
+                                        ws + AnnotateProvider::SIFT_WINDOW_SIZE,
+                                        &mut sift_cache,
+                                    )?;
+                                }
+                                loaded_windows.insert(key);
+                            }
+                            ws += AnnotateProvider::SIFT_WINDOW_SIZE;
+                        }
+                        sift_cache.evict_before(*batch_min);
+                    }
+                }
+            }
+        }
+
+        let annotated = tmp_provider.annotate_batch_with_transcript_engine(
+            batch,
+            &engine,
+            &ctx,
+            &colocated_map,
+            &mut sift_cache,
+            &sift_kv,
+        )?;
+
+        // Apply projection if needed.
+        if let Some(indices) = projection {
+            contig_annotated.push_back(annotated.project(indices)?);
+        } else {
+            contig_annotated.push_back(annotated);
+        }
+    }
+    profile_end!(
+        &format!("{chrom}: 8. annotate_batches"),
+        t_ann,
+        format!("{} batches", contig_annotated.len())
+    );
+
+    // 9. Deregister ephemeral tables for this contig.
+    for tbl in &ephemeral_tables {
+        crate::partitioned_cache::deregister_table(session, tbl).await?;
+    }
+
+    profile_end!(
+        &format!("{chrom}: TOTAL"),
+        t_contig,
+        format!("{contig_rows} rows")
+    );
+    if profiling_enabled() {
+        eprintln!("[VEP_PROFILE] ------ contig {chrom} END ------");
+    }
+
+    Ok(contig_annotated)
+}
+
 #[async_trait]
 impl TableProvider for AnnotateProvider {
     fn as_any(&self) -> &dyn Any {
@@ -5419,13 +5727,12 @@ impl TableProvider for AnnotateProvider {
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "partitioned"));
-        let partitioned_cache = if partitioned_opt != Some(false)
-            && self.backend == AnnotationBackend::Parquet
-        {
-            PartitionedParquetCache::detect(&self.cache_source)
-        } else {
-            None
-        };
+        let partitioned_cache =
+            if partitioned_opt != Some(false) && self.backend == AnnotationBackend::Parquet {
+                PartitionedParquetCache::detect(&self.cache_source)
+            } else {
+                None
+            };
         // When explicitly requested or auto-detected, use partitioned path.
         if let Some(ref cache) = partitioned_cache {
             if profiling_enabled() {
@@ -5439,8 +5746,12 @@ impl TableProvider for AnnotateProvider {
             // Determine requested cache columns from one variation parquet.
             let sample_chrom = &cache.available_chroms()[0];
             let sample_table = crate::partitioned_cache::register_chrom_parquet(
-                &self.session, cache, "variation", sample_chrom,
-            ).await?;
+                &self.session,
+                cache,
+                "variation",
+                sample_chrom,
+            )
+            .await?;
             let sample_table = sample_table.ok_or_else(|| {
                 DataFusionError::Execution(
                     "partitioned cache: no variation parquet for sample chrom".to_string(),
