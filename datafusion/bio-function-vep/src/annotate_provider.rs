@@ -2653,32 +2653,30 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    /// Discover contigs present in the VCF input (zero-cost from schema metadata).
+    /// Discover contigs present in the VCF input.
     ///
-    /// The VCF table provider stores contigs in Arrow schema metadata as
-    /// `"bio.vcf.contigs"` → JSON array of `{id, length, metadata}`.
-    /// When a TBI index exists, these come from the TBI header's reference names.
-    /// Falls back to `SELECT DISTINCT chrom` if metadata is missing.
+    /// Prefers `"bio.vcf.contigs.indexed"` (TBI-derived, data-bearing only,
+    /// zero cost), then falls back to `SELECT DISTINCT chrom` which scans
+    /// the VCF but returns only contigs with actual data.
+    ///
+    /// Does NOT use `"bio.vcf.contigs"` (all VCF header contigs) because
+    /// GRCh38 headers list ~195 contigs even when only 1–22 have data.
     async fn discover_vcf_contigs(&self) -> Result<Vec<String>> {
-        // Try schema metadata first (zero cost — no scan needed).
         let table = self.session.table(&self.vcf_table).await?;
         let schema = table.schema();
         let arrow_schema = schema.as_arrow();
-        if let Some(contigs_json) = arrow_schema.metadata().get("bio.vcf.contigs") {
-            if let Ok(contigs) =
-                serde_json::from_str::<Vec<serde_json::Value>>(contigs_json)
-            {
-                let ids: Vec<String> = contigs
-                    .iter()
-                    .filter_map(|v| v.get("id").and_then(|id| id.as_str()).map(String::from))
-                    .collect();
-                if !ids.is_empty() {
-                    return Ok(ids);
+        let metadata = arrow_schema.metadata();
+
+        // Priority 1: TBI-indexed contigs (only data-bearing contigs, zero cost).
+        if let Some(indexed_json) = metadata.get("bio.vcf.contigs.indexed") {
+            if let Ok(contigs) = serde_json::from_str::<Vec<String>>(indexed_json) {
+                if !contigs.is_empty() {
+                    return Ok(contigs);
                 }
             }
         }
 
-        // Fallback: scan chrom column (needed for non-VCF table providers).
+        // Priority 2: scan chrom column for actual data-bearing contigs.
         let query = format!(
             "SELECT DISTINCT chrom FROM `{}`",
             Self::escaped_sql_literal(&self.vcf_table)
