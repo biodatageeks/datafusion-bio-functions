@@ -184,8 +184,8 @@ resource "ansible_playbook" "provision" {
 # ── Outputs ──────────────────────────────────────────────────────────
 
 output "project_id" {
-  description = "GCP project ID (protected from destroy)"
-  value       = google_project.benchmark.project_id
+  description = "GCP project ID (survives destroy)"
+  value       = var.project_id
 }
 
 output "instance_ip" {
