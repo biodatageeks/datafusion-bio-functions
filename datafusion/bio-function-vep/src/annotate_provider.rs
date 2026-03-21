@@ -2694,6 +2694,21 @@ impl AnnotateProvider {
             #[cfg(feature = "kv-cache")]
             use_fjall: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
+            sift_kv_store: kv_store.as_ref().and_then(|store| {
+                // Prefer standalone translation_sift.fjall/ (matches parquet naming),
+                // fall back to sift keyspace inside variation.fjall/.
+                let parent = store.root_path().parent()?;
+                let sift_path = parent.join("translation_sift.fjall");
+                crate::kv_cache::SiftKvStore::open_path(&sift_path)
+                    .ok()
+                    .flatten()
+                    .or_else(|| {
+                        crate::kv_cache::SiftKvStore::open(store.database())
+                            .ok()
+                            .flatten()
+                    })
+            }),
+            #[cfg(feature = "kv-cache")]
             kv_store,
         };
 
@@ -4348,6 +4363,9 @@ struct ContigAnnotationConfig {
     /// Shared fjall KV store handle (opened once, reused across contigs).
     #[cfg(feature = "kv-cache")]
     kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
+    /// Shared fjall SIFT store (opened once, reused across contigs).
+    #[cfg(feature = "kv-cache")]
+    sift_kv_store: Option<crate::kv_cache::SiftKvStore>,
 }
 
 /// Leaf `ExecutionPlan` that processes contigs one at a time via a state-machine
@@ -4541,6 +4559,9 @@ enum StreamState {
     CleaningUp(CleanupFuture),
     /// Deregister ephemeral tables after an error, then propagate the error.
     ErrorCleaningUp(CleanupFuture, DataFusionError),
+    /// Final async cleanup (e.g., deregister global KV table) before Done.
+    /// Unlike CleaningUp, transitions to Done instead of StartContig.
+    FinalCleanup(CleanupFuture),
     Done,
 }
 
@@ -4762,20 +4783,24 @@ impl Stream for ContigAnnotationStream {
                 StreamState::StartContig => {
                     let Some(chrom) = self.contigs.pop_front() else {
                         // All contigs processed. Deregister the global KV
-                        // table if fjall was used.
+                        // variation table if fjall was used, via async cleanup
+                        // future (safe on any Tokio runtime flavor).
                         #[cfg(feature = "kv-cache")]
                         if self.config.use_fjall {
                             let session = Arc::clone(&self.session);
-                            tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(async {
-                                    crate::partitioned_cache::deregister_table(
-                                        &session,
-                                        "__vep_kv_variation",
-                                    )
-                                    .await
-                                    .ok();
-                                });
+                            let fut: CleanupFuture = Box::pin(async move {
+                                crate::partitioned_cache::deregister_table(
+                                    &session,
+                                    "__vep_kv_variation",
+                                )
+                                .await
+                                .ok();
+                                Ok(())
                             });
+                            // Transition to FinalCleanup which goes to Done
+                            // (not StartContig, avoiding the infinite loop).
+                            self.state = StreamState::FinalCleanup(fut);
+                            continue;
                         }
                         self.state = StreamState::Done;
                         return Poll::Ready(None);
@@ -4872,25 +4897,12 @@ impl Stream for ContigAnnotationStream {
                             None
                         };
 
+                        // Reuse the pre-opened SiftKvStore from config (opened
+                        // once, shared across contigs) rather than re-opening
+                        // the fjall DB every contig.
                         #[cfg(feature = "kv-cache")]
                         let sift_kv = if use_fjall_sift && config.flags.everything {
-                            // Prefer standalone translation_sift.fjall/ (matches parquet naming),
-                            // fall back to sift keyspace inside variation.fjall/.
-                            let standalone = config.kv_store.as_ref().and_then(|store| {
-                                let var_path = store.root_path();
-                                let parent = var_path.parent()?;
-                                let sift_path = parent.join("translation_sift.fjall");
-                                crate::kv_cache::SiftKvStore::open_path(&sift_path)
-                                    .ok()
-                                    .flatten()
-                            });
-                            standalone.or_else(|| {
-                                config.kv_store.as_ref().and_then(|store| {
-                                    crate::kv_cache::SiftKvStore::open(store.database())
-                                        .ok()
-                                        .flatten()
-                                })
-                            })
+                            config.sift_kv_store.clone()
                         } else {
                             None
                         };
@@ -5119,6 +5131,14 @@ impl Stream for ContigAnnotationStream {
                             unreachable!()
                         };
                         return Poll::Ready(Some(Err(original_err)));
+                    }
+                },
+
+                StreamState::FinalCleanup(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(_) => {
+                        self.state = StreamState::Done;
+                        return Poll::Ready(None);
                     }
                 },
             }

@@ -23,6 +23,7 @@ fn fjall_err(e: fjall::Error) -> DataFusionError {
 }
 
 /// Store for SIFT/PolyPhen predictions keyed by transcript_id.
+#[derive(Clone)]
 pub struct SiftKvStore {
     sift_ks: Keyspace,
 }
