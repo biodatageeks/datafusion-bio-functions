@@ -8,7 +8,7 @@
 //! - Emits unmatched VCF rows with NULL cache columns (LEFT JOIN semantics)
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::io::{BufRead, Seek};
 use std::pin::Pin;
@@ -815,7 +815,10 @@ struct VariantLookupStream {
     coloc_indices: Option<ColocIndices>,
     /// Matched batches buffered during probe (emitted after probe completes
     /// so that the colocated sink is fully populated).
-    matched_batches: Vec<RecordBatch>,
+    /// Note: peaks at the full chromosome result set size (~300K rows for
+    /// chr1 WGS). This is inherent — the colocated sink must be complete
+    /// before downstream annotation can use it.
+    matched_batches: VecDeque<RecordBatch>,
 }
 
 impl VariantLookupStream {
@@ -849,7 +852,7 @@ impl VariantLookupStream {
             cache_indices: None,
             colocated_sink,
             coloc_indices: None,
-            matched_batches: Vec::new(),
+            matched_batches: VecDeque::new(),
         }
     }
 
@@ -1574,7 +1577,7 @@ impl Stream for VariantLookupStream {
                                 Ok(Some(output)) => {
                                     // Buffer matched rows — don't emit yet.
                                     // The colocated sink is still being populated.
-                                    self.matched_batches.push(output);
+                                    self.matched_batches.push_back(output);
                                     continue;
                                 }
                                 Ok(None) => continue,
@@ -1592,9 +1595,7 @@ impl Stream for VariantLookupStream {
                     }
                 }
                 StreamState::EmitMatched => {
-                    if let Some(batch) = self.matched_batches.first() {
-                        // Yield matched batches one at a time.
-                        let batch = self.matched_batches.remove(0);
+                    if let Some(batch) = self.matched_batches.pop_front() {
                         return Poll::Ready(Some(Ok(batch)));
                     }
                     // All matched emitted — continue to unmatched.
