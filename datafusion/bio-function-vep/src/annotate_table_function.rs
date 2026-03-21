@@ -108,12 +108,92 @@ mod tests {
     use datafusion::arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
-    use datafusion::prelude::ParquetReadOptions;
     use parquet::arrow::ArrowWriter;
     use std::collections::BTreeSet;
     use std::fs::File;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// Write record batches into the partitioned cache layout under
+    /// `{tmpdir}/{table_type}/{chrom}.parquet`, grouping rows by the "chrom"
+    /// column in each batch.
+    fn write_partitioned_cache(tmpdir: &TempDir, table_type: &str, batches: &[RecordBatch]) {
+        let type_dir = tmpdir.path().join(table_type);
+        std::fs::create_dir_all(&type_dir).expect("create type dir");
+
+        // Collect all rows grouped by chrom value.
+        let mut chrom_batches: std::collections::HashMap<String, Vec<RecordBatch>> =
+            std::collections::HashMap::new();
+
+        for batch in batches {
+            let schema = batch.schema();
+            let chrom_idx = schema
+                .index_of("chrom")
+                .expect("batch must have a 'chrom' column");
+            let chrom_arr = batch
+                .column(chrom_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("chrom column must be StringArray");
+
+            // Get unique chroms in this batch.
+            let unique_chroms: BTreeSet<String> = (0..chrom_arr.len())
+                .map(|i| chrom_arr.value(i).to_string())
+                .collect();
+
+            for chrom in unique_chroms {
+                // Build boolean mask for this chrom.
+                let indices: Vec<u32> = (0..chrom_arr.len())
+                    .filter(|&i| chrom_arr.value(i) == chrom)
+                    .map(|i| i as u32)
+                    .collect();
+                let indices_arr = datafusion::arrow::array::UInt32Array::from(indices);
+                let filtered_columns: Vec<Arc<dyn Array>> = (0..batch.num_columns())
+                    .map(|c| {
+                        datafusion::arrow::compute::take(
+                            batch.column(c).as_ref(),
+                            &indices_arr,
+                            None,
+                        )
+                        .expect("take should succeed")
+                    })
+                    .collect();
+                let filtered_batch =
+                    RecordBatch::try_new(schema.clone(), filtered_columns).expect("filtered batch");
+                chrom_batches.entry(chrom).or_default().push(filtered_batch);
+            }
+        }
+
+        // Write per-chrom parquet files.
+        for (chrom, batches) in &chrom_batches {
+            let path = type_dir.join(format!("{chrom}.parquet"));
+            let file = File::create(&path).expect("create parquet file");
+            let mut writer = ArrowWriter::try_new(file, batches[0].schema(), None)
+                .expect("create parquet writer");
+            for b in batches {
+                writer.write(b).expect("write parquet batch");
+            }
+            writer.close().expect("close parquet writer");
+        }
+    }
+
+    /// Convenience: write a single RecordBatch to the partitioned cache.
+    fn write_batch_to_cache(tmpdir: &TempDir, table_type: &str, batch: &RecordBatch) {
+        write_partitioned_cache(tmpdir, table_type, &[batch.clone()]);
+    }
+
+    /// Write a RecordBatch directly into a specific chrom parquet file,
+    /// for tables that do not have a "chrom" column (e.g. exons, translations).
+    fn write_batch_to_chrom(tmpdir: &TempDir, table_type: &str, chrom: &str, batch: &RecordBatch) {
+        let type_dir = tmpdir.path().join(table_type);
+        std::fs::create_dir_all(&type_dir).expect("create type dir");
+        let path = type_dir.join(format!("{chrom}.parquet"));
+        let file = File::create(&path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, batch.schema(), None).expect("create parquet writer");
+        writer.write(batch).expect("write parquet batch");
+        writer.close().expect("close parquet writer");
+    }
 
     fn vcf_table() -> MemTable {
         let schema = Arc::new(Schema::new(vec![
@@ -137,10 +217,12 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid vcf memtable")
     }
 
-    fn cache_table() -> MemTable {
+    fn cache_batch() -> RecordBatch {
         use crate::annotate_provider::CACHE_OUTPUT_COLUMNS;
 
         // Core columns required for the join.
+        // Two rows: chrom "1" at pos 100 (matches vcf_table row 1) and
+        // chrom "2" at pos 200 (matches vcf_table row 2).
         let mut fields = vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -149,11 +231,11 @@ mod tests {
             Field::new("failed", DataType::Int64, false),
         ];
         let mut columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = vec![
-            Arc::new(StringArray::from(vec!["1"])),
-            Arc::new(Int64Array::from(vec![100])),
-            Arc::new(Int64Array::from(vec![101])),
-            Arc::new(StringArray::from(vec!["A/G"])),
-            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(StringArray::from(vec!["1", "2"])),
+            Arc::new(Int64Array::from(vec![100, 200])),
+            Arc::new(Int64Array::from(vec![101, 201])),
+            Arc::new(StringArray::from(vec!["A/G", "C/T"])),
+            Arc::new(Int64Array::from(vec![0, 0])),
         ];
         // Add all CACHE_OUTPUT_COLUMNS as nullable Utf8.
         for &col in CACHE_OUTPUT_COLUMNS {
@@ -163,14 +245,13 @@ mod tests {
                 "clin_sig" => Some("benign"),
                 _ => None,
             };
-            columns.push(Arc::new(StringArray::from(vec![val])));
+            columns.push(Arc::new(StringArray::from(vec![val, None])));
         }
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), columns).expect("valid cache batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid cache memtable")
+        RecordBatch::try_new(schema, columns).expect("valid cache batch")
     }
 
-    fn transcripts_table() -> MemTable {
+    fn transcripts_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
@@ -181,8 +262,8 @@ mod tests {
             Field::new("cds_start", DataType::Int64, true),
             Field::new("cds_end", DataType::Int64, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec![
                     "ENST00000000010",
@@ -197,19 +278,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![180, 0])),
             ],
         )
-        .expect("valid transcript batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid transcript memtable")
+        .expect("valid transcript batch")
     }
 
-    fn exons_table() -> MemTable {
+    fn exons_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("exon_number", DataType::Int64, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec![
                     "ENST00000000010",
@@ -220,8 +300,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![200, 250])),
             ],
         )
-        .expect("valid exon batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid exon memtable")
+        .expect("valid exon batch")
     }
 
     fn synonymous_vcf_table() -> MemTable {
@@ -246,7 +325,7 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid synonymous vcf memtable")
     }
 
-    fn synonymous_cache_table() -> MemTable {
+    fn synonymous_cache_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -257,8 +336,8 @@ mod tests {
             Field::new("AF", DataType::Float64, true),
             Field::new("failed", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![100])),
@@ -270,11 +349,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![0])),
             ],
         )
-        .expect("valid synonymous cache batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid synonymous cache memtable")
+        .expect("valid synonymous cache batch")
     }
 
-    fn synonymous_transcripts_table() -> MemTable {
+    fn synonymous_transcripts_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
@@ -285,8 +363,8 @@ mod tests {
             Field::new("cds_start", DataType::Int64, true),
             Field::new("cds_end", DataType::Int64, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000001"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -298,19 +376,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![105])),
             ],
         )
-        .expect("valid synonymous transcript batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid synonymous transcript memtable")
+        .expect("valid synonymous transcript batch")
     }
 
-    fn synonymous_exons_table() -> MemTable {
+    fn synonymous_exons_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("exon_number", DataType::Int64, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000001"])),
                 Arc::new(Int64Array::from(vec![1])),
@@ -318,11 +395,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![140])),
             ],
         )
-        .expect("valid synonymous exon batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid synonymous exon memtable")
+        .expect("valid synonymous exon batch")
     }
 
-    fn synonymous_translations_table() -> MemTable {
+    fn synonymous_translations_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("cds_len", DataType::Int64, true),
@@ -331,8 +407,8 @@ mod tests {
             Field::new("cds_sequence", DataType::Utf8, true),
         ]));
         // CDS from 97..105 => ATG GCT TAA
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000001"])),
                 Arc::new(Int64Array::from(vec![9])),
@@ -341,9 +417,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["ATGGCTTAA"])),
             ],
         )
-        .expect("valid synonymous translations batch");
-        MemTable::try_new(schema, vec![vec![batch]])
-            .expect("valid synonymous translations memtable")
+        .expect("valid synonymous translations batch")
     }
 
     fn context_vcf_table() -> MemTable {
@@ -368,7 +442,7 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid context vcf memtable")
     }
 
-    fn context_cache_table() -> MemTable {
+    fn context_cache_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -379,8 +453,8 @@ mod tests {
             Field::new("AF", DataType::Float64, true),
             Field::new("failed", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![155])),
@@ -392,11 +466,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![0])),
             ],
         )
-        .expect("valid context cache batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid context cache memtable")
+        .expect("valid context cache batch")
     }
 
-    fn context_transcripts_table() -> MemTable {
+    fn context_transcripts_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
@@ -407,8 +480,8 @@ mod tests {
             Field::new("cds_start", DataType::Int64, true),
             Field::new("cds_end", DataType::Int64, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000002"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -420,19 +493,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![240])),
             ],
         )
-        .expect("valid context transcript batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid context transcript memtable")
+        .expect("valid context transcript batch")
     }
 
-    fn context_exons_table() -> MemTable {
+    fn context_exons_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("exon_number", DataType::Int64, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000002"])),
                 Arc::new(Int64Array::from(vec![1])),
@@ -440,19 +512,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![250])),
             ],
         )
-        .expect("valid context exon batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid context exon memtable")
+        .expect("valid context exon batch")
     }
 
-    fn context_regulatory_table() -> MemTable {
+    fn context_regulatory_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("stable_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["reg_ctx"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -460,19 +531,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![160])),
             ],
         )
-        .expect("valid context regulatory batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid context regulatory memtable")
+        .expect("valid context regulatory batch")
     }
 
-    fn context_motif_table() -> MemTable {
+    fn context_motif_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("motif_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["motif_ctx"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -480,60 +550,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![160])),
             ],
         )
-        .expect("valid context motif batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid context motif memtable")
-    }
-
-    fn context_mirna_table() -> MemTable {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("mirna_id", DataType::Utf8, false),
-            Field::new("chrom", DataType::Utf8, false),
-            Field::new("start", DataType::Int64, false),
-            Field::new("end", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["mir_ctx"])),
-                Arc::new(StringArray::from(vec!["1"])),
-                Arc::new(Int64Array::from(vec![150])),
-                Arc::new(Int64Array::from(vec![160])),
-            ],
-        )
-        .expect("valid context miRNA batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid context miRNA memtable")
-    }
-
-    fn context_sv_table() -> MemTable {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("feature_id", DataType::Utf8, false),
-            Field::new("feature_kind", DataType::Utf8, false),
-            Field::new("event_type", DataType::Utf8, false),
-            Field::new("chrom", DataType::Utf8, false),
-            Field::new("start", DataType::Int64, false),
-            Field::new("end", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "sv_tx_ablation",
-                    "sv_reg_amp",
-                    "sv_tfbs_ablation",
-                ])),
-                Arc::new(StringArray::from(vec!["transcript", "regulatory", "tfbs"])),
-                Arc::new(StringArray::from(vec![
-                    "ablation",
-                    "amplification",
-                    "ablation",
-                ])),
-                Arc::new(StringArray::from(vec!["1", "1", "1"])),
-                Arc::new(Int64Array::from(vec![150, 150, 150])),
-                Arc::new(Int64Array::from(vec![160, 160, 160])),
-            ],
-        )
-        .expect("valid context sv batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid context sv memtable")
+        .expect("valid context motif batch")
     }
 
     fn golden_context_vcf_table() -> MemTable {
@@ -558,7 +575,7 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid golden context vcf memtable")
     }
 
-    fn golden_context_cache_table() -> MemTable {
+    fn golden_context_cache_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -569,8 +586,8 @@ mod tests {
             Field::new("AF", DataType::Float64, true),
             Field::new("failed", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![500])),
@@ -582,11 +599,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![0])),
             ],
         )
-        .expect("valid golden context cache batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid golden context cache memtable")
+        .expect("valid golden context cache batch")
     }
 
-    fn golden_context_transcripts_table() -> MemTable {
+    fn golden_context_transcripts_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
@@ -597,8 +613,8 @@ mod tests {
             Field::new("cds_start", DataType::Int64, true),
             Field::new("cds_end", DataType::Int64, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000003"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -610,20 +626,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![20_080])),
             ],
         )
-        .expect("valid golden context transcript batch");
-        MemTable::try_new(schema, vec![vec![batch]])
-            .expect("valid golden context transcript memtable")
+        .expect("valid golden context transcript batch")
     }
 
-    fn golden_context_exons_table() -> MemTable {
+    fn golden_context_exons_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("exon_number", DataType::Int64, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000003"])),
                 Arc::new(Int64Array::from(vec![1])),
@@ -631,19 +645,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![20_100])),
             ],
         )
-        .expect("valid golden context exon batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid golden context exon memtable")
+        .expect("valid golden context exon batch")
     }
 
-    fn golden_context_regulatory_table() -> MemTable {
+    fn golden_context_regulatory_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("stable_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["reg_golden"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -651,20 +664,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![505])),
             ],
         )
-        .expect("valid golden context regulatory batch");
-        MemTable::try_new(schema, vec![vec![batch]])
-            .expect("valid golden context regulatory memtable")
+        .expect("valid golden context regulatory batch")
     }
 
-    fn golden_context_motif_table() -> MemTable {
+    fn golden_context_motif_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("motif_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["motif_golden"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -672,85 +683,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![505])),
             ],
         )
-        .expect("valid golden context motif batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid golden context motif memtable")
-    }
-
-    fn golden_context_mirna_table() -> MemTable {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("mirna_id", DataType::Utf8, false),
-            Field::new("chrom", DataType::Utf8, false),
-            Field::new("start", DataType::Int64, false),
-            Field::new("end", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec!["mirna_golden"])),
-                Arc::new(StringArray::from(vec!["1"])),
-                Arc::new(Int64Array::from(vec![495])),
-                Arc::new(Int64Array::from(vec![505])),
-            ],
-        )
-        .expect("valid golden context miRNA batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid golden context miRNA memtable")
-    }
-
-    fn golden_context_sv_table() -> MemTable {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("feature_id", DataType::Utf8, false),
-            Field::new("feature_kind", DataType::Utf8, false),
-            Field::new("event_type", DataType::Utf8, false),
-            Field::new("chrom", DataType::Utf8, false),
-            Field::new("start", DataType::Int64, false),
-            Field::new("end", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "sv_tx_ablation",
-                    "sv_tx_amplification",
-                    "sv_tx_elongation",
-                    "sv_tx_truncation",
-                    "sv_reg_ablation",
-                    "sv_reg_amplification",
-                    "sv_tfbs_ablation",
-                    "sv_tfbs_amplification",
-                ])),
-                Arc::new(StringArray::from(vec![
-                    "transcript",
-                    "transcript",
-                    "transcript",
-                    "transcript",
-                    "regulatory",
-                    "regulatory",
-                    "tfbs",
-                    "tfbs",
-                ])),
-                Arc::new(StringArray::from(vec![
-                    "ablation",
-                    "amplification",
-                    "elongation",
-                    "truncation",
-                    "ablation",
-                    "amplification",
-                    "ablation",
-                    "amplification",
-                ])),
-                Arc::new(StringArray::from(vec![
-                    "1", "1", "1", "1", "1", "1", "1", "1",
-                ])),
-                Arc::new(Int64Array::from(vec![
-                    495, 495, 495, 495, 495, 495, 495, 495,
-                ])),
-                Arc::new(Int64Array::from(vec![
-                    505, 505, 505, 505, 505, 505, 505, 505,
-                ])),
-            ],
-        )
-        .expect("valid golden context sv batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid golden context sv memtable")
+        .expect("valid golden context motif batch")
     }
 
     fn splice_vcf_table() -> MemTable {
@@ -775,7 +708,7 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid splice vcf memtable")
     }
 
-    fn splice_cache_table() -> MemTable {
+    fn splice_cache_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -786,8 +719,8 @@ mod tests {
             Field::new("AF", DataType::Float64, true),
             Field::new("failed", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![151])),
@@ -799,11 +732,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![0])),
             ],
         )
-        .expect("valid splice cache batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid splice cache memtable")
+        .expect("valid splice cache batch")
     }
 
-    fn splice_transcripts_table() -> MemTable {
+    fn splice_transcripts_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
@@ -814,8 +746,8 @@ mod tests {
             Field::new("cds_start", DataType::Int64, true),
             Field::new("cds_end", DataType::Int64, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000004"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -827,19 +759,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![280])),
             ],
         )
-        .expect("valid splice transcript batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid splice transcript memtable")
+        .expect("valid splice transcript batch")
     }
 
-    fn splice_exons_table() -> MemTable {
+    fn splice_exons_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("exon_number", DataType::Int64, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec![
                     "ENST00000000004",
@@ -850,8 +781,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![150, 300])),
             ],
         )
-        .expect("valid splice exon batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid splice exon memtable")
+        .expect("valid splice exon batch")
     }
 
     fn repeat_shift_vcf_table() -> MemTable {
@@ -876,7 +806,7 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid repeat-shift vcf memtable")
     }
 
-    fn repeat_shift_cache_table() -> MemTable {
+    fn repeat_shift_cache_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -887,8 +817,8 @@ mod tests {
             Field::new("AF", DataType::Float64, true),
             Field::new("failed", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![66])),
@@ -900,11 +830,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![0])),
             ],
         )
-        .expect("valid repeat-shift cache batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid repeat-shift cache memtable")
+        .expect("valid repeat-shift cache batch")
     }
 
-    fn repeat_shift_transcripts_table() -> MemTable {
+    fn repeat_shift_transcripts_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
@@ -915,8 +844,8 @@ mod tests {
             Field::new("cds_start", DataType::Int64, true),
             Field::new("cds_end", DataType::Int64, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000005"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -928,20 +857,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![110])),
             ],
         )
-        .expect("valid repeat-shift transcript batch");
-        MemTable::try_new(schema, vec![vec![batch]])
-            .expect("valid repeat-shift transcript memtable")
+        .expect("valid repeat-shift transcript batch")
     }
 
-    fn repeat_shift_exons_table() -> MemTable {
+    fn repeat_shift_exons_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("exon_number", DataType::Int64, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000005"])),
                 Arc::new(Int64Array::from(vec![1])),
@@ -949,8 +876,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![120])),
             ],
         )
-        .expect("valid repeat-shift exon batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid repeat-shift exon memtable")
+        .expect("valid repeat-shift exon batch")
     }
 
     fn neg_strand_vcf_table() -> MemTable {
@@ -975,7 +901,7 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid negative-strand vcf memtable")
     }
 
-    fn neg_strand_cache_table() -> MemTable {
+    fn neg_strand_cache_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -986,8 +912,8 @@ mod tests {
             Field::new("AF", DataType::Float64, true),
             Field::new("failed", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![103])),
@@ -999,11 +925,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![0])),
             ],
         )
-        .expect("valid negative-strand cache batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid negative-strand cache memtable")
+        .expect("valid negative-strand cache batch")
     }
 
-    fn neg_strand_transcripts_table() -> MemTable {
+    fn neg_strand_transcripts_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
@@ -1014,8 +939,8 @@ mod tests {
             Field::new("cds_start", DataType::Int64, true),
             Field::new("cds_end", DataType::Int64, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000006"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -1027,20 +952,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![108])),
             ],
         )
-        .expect("valid negative-strand transcript batch");
-        MemTable::try_new(schema, vec![vec![batch]])
-            .expect("valid negative-strand transcript memtable")
+        .expect("valid negative-strand transcript batch")
     }
 
-    fn neg_strand_exons_table() -> MemTable {
+    fn neg_strand_exons_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("exon_number", DataType::Int64, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000006"])),
                 Arc::new(Int64Array::from(vec![1])),
@@ -1048,11 +971,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![140])),
             ],
         )
-        .expect("valid negative-strand exon batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid negative-strand exon memtable")
+        .expect("valid negative-strand exon batch")
     }
 
-    fn neg_strand_translations_table() -> MemTable {
+    fn neg_strand_translations_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("cds_len", DataType::Int64, true),
@@ -1060,8 +982,8 @@ mod tests {
             Field::new("translation_seq", DataType::Utf8, true),
             Field::new("cds_sequence", DataType::Utf8, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000006"])),
                 Arc::new(Int64Array::from(vec![9])),
@@ -1070,9 +992,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["ATGGCTTAA"])),
             ],
         )
-        .expect("valid negative-strand translation batch");
-        MemTable::try_new(schema, vec![vec![batch]])
-            .expect("valid negative-strand translation memtable")
+        .expect("valid negative-strand translation batch")
     }
 
     fn stop_loss_vcf_table() -> MemTable {
@@ -1097,7 +1017,7 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid stop-loss vcf memtable")
     }
 
-    fn stop_loss_cache_table() -> MemTable {
+    fn stop_loss_cache_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -1108,8 +1028,8 @@ mod tests {
             Field::new("AF", DataType::Float64, true),
             Field::new("failed", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![106])),
@@ -1121,11 +1041,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![0])),
             ],
         )
-        .expect("valid stop-loss cache batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid stop-loss cache memtable")
+        .expect("valid stop-loss cache batch")
     }
 
-    fn stop_loss_transcripts_table() -> MemTable {
+    fn stop_loss_transcripts_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
@@ -1136,8 +1055,8 @@ mod tests {
             Field::new("cds_start", DataType::Int64, true),
             Field::new("cds_end", DataType::Int64, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000007"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -1149,19 +1068,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![108])),
             ],
         )
-        .expect("valid stop-loss transcript batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid stop-loss transcript memtable")
+        .expect("valid stop-loss transcript batch")
     }
 
-    fn stop_loss_exons_table() -> MemTable {
+    fn stop_loss_exons_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("exon_number", DataType::Int64, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000007"])),
                 Arc::new(Int64Array::from(vec![1])),
@@ -1169,11 +1087,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![140])),
             ],
         )
-        .expect("valid stop-loss exon batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid stop-loss exon memtable")
+        .expect("valid stop-loss exon batch")
     }
 
-    fn stop_loss_translations_table() -> MemTable {
+    fn stop_loss_translations_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("cds_len", DataType::Int64, true),
@@ -1181,8 +1098,8 @@ mod tests {
             Field::new("translation_seq", DataType::Utf8, true),
             Field::new("cds_sequence", DataType::Utf8, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENST00000000007"])),
                 Arc::new(Int64Array::from(vec![9])),
@@ -1191,8 +1108,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["ATGGCTTAA"])),
             ],
         )
-        .expect("valid stop-loss translation batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid stop-loss translation memtable")
+        .expect("valid stop-loss translation batch")
     }
 
     fn hgvs_vcf_table() -> MemTable {
@@ -1217,7 +1133,7 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid hgvs vcf memtable")
     }
 
-    fn hgvs_cache_table() -> MemTable {
+    fn hgvs_cache_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -1228,8 +1144,8 @@ mod tests {
             Field::new("AF", DataType::Float64, true),
             Field::new("failed", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![103])),
@@ -1241,11 +1157,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![0])),
             ],
         )
-        .expect("valid hgvs cache batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid hgvs cache memtable")
+        .expect("valid hgvs cache batch")
     }
 
-    fn hgvs_transcripts_table() -> MemTable {
+    fn hgvs_transcripts_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
@@ -1258,8 +1173,8 @@ mod tests {
             Field::new("version", DataType::Int64, true),
             Field::new("translation_stable_id", DataType::Utf8, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENSTHGVS000001"])),
                 Arc::new(StringArray::from(vec!["1"])),
@@ -1273,19 +1188,18 @@ mod tests {
                 Arc::new(StringArray::from(vec!["ENSPHGVS000001"])),
             ],
         )
-        .expect("valid hgvs transcript batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid hgvs transcript memtable")
+        .expect("valid hgvs transcript batch")
     }
 
-    fn hgvs_exons_table() -> MemTable {
+    fn hgvs_exons_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("exon_number", DataType::Int64, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENSTHGVS000001"])),
                 Arc::new(Int64Array::from(vec![1])),
@@ -1293,11 +1207,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![140])),
             ],
         )
-        .expect("valid hgvs exon batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid hgvs exon memtable")
+        .expect("valid hgvs exon batch")
     }
 
-    fn hgvs_translations_table() -> MemTable {
+    fn hgvs_translations_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("cds_len", DataType::Int64, true),
@@ -1308,8 +1221,8 @@ mod tests {
             Field::new("version", DataType::Int64, true),
         ]));
         // CDS from 100..108 => ATG GCT TAA, variant 103 G>A gives Ala2Thr.
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENSTHGVS000001"])),
                 Arc::new(Int64Array::from(vec![9])),
@@ -1320,8 +1233,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![1])),
             ],
         )
-        .expect("valid hgvs translation batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid hgvs translation memtable")
+        .expect("valid hgvs translation batch")
     }
 
     fn write_test_indexed_fasta(
@@ -1372,7 +1284,7 @@ mod tests {
         MemTable::try_new(schema, vec![vec![batch]]).expect("valid distance vcf memtable")
     }
 
-    fn distance_cache_table() -> MemTable {
+    fn distance_cache_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
@@ -1383,8 +1295,8 @@ mod tests {
             Field::new("AF", DataType::Float64, true),
             Field::new("failed", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["1"])),
                 Arc::new(Int64Array::from(vec![30_000])),
@@ -1396,11 +1308,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![0])),
             ],
         )
-        .expect("valid distance cache batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid distance cache memtable")
+        .expect("valid distance cache batch")
     }
 
-    fn distance_transcripts_table() -> MemTable {
+    fn distance_transcripts_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("chrom", DataType::Utf8, false),
@@ -1411,8 +1322,8 @@ mod tests {
             Field::new("cds_start", DataType::Int64, true),
             Field::new("cds_end", DataType::Int64, true),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENSTDISTUP", "ENSTDISTDOWN"])),
                 Arc::new(StringArray::from(vec!["1", "1"])),
@@ -1424,19 +1335,18 @@ mod tests {
                 Arc::new(Int64Array::from(vec![None::<i64>, None])),
             ],
         )
-        .expect("valid distance transcript batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid distance transcript memtable")
+        .expect("valid distance transcript batch")
     }
 
-    fn distance_exons_table() -> MemTable {
+    fn distance_exons_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("exon_number", DataType::Int64, false),
             Field::new("start", DataType::Int64, false),
             Field::new("end", DataType::Int64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(StringArray::from(vec!["ENSTDISTUP", "ENSTDISTDOWN"])),
                 Arc::new(Int64Array::from(vec![1, 1])),
@@ -1444,8 +1354,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![37_200, 15_000])),
             ],
         )
-        .expect("valid distance exon batch");
-        MemTable::try_new(schema, vec![vec![batch]]).expect("valid distance exon memtable")
+        .expect("valid distance exon batch")
     }
 
     fn string_values(col: &Arc<dyn datafusion::arrow::array::Array>) -> Vec<Option<String>> {
@@ -1516,33 +1425,6 @@ mod tests {
         .expect("valid regulatory feature batch")
     }
 
-    fn regulatory_table_with_rows(rows: &[(&str, &str, i64, i64, Option<&str>)]) -> MemTable {
-        let batch = regulatory_feature_batch(rows);
-        MemTable::try_new(batch.schema(), vec![vec![batch]]).expect("valid regulatory memtable")
-    }
-
-    async fn register_single_batch_parquet(
-        ctx: &datafusion::prelude::SessionContext,
-        table_name: &str,
-        batch: &RecordBatch,
-    ) -> TempDir {
-        let dir = tempfile::tempdir().expect("create temp parquet dir");
-        let path = dir.path().join(format!("{table_name}.parquet"));
-        let file = File::create(&path).expect("create parquet file");
-        let mut writer =
-            ArrowWriter::try_new(file, batch.schema(), None).expect("create parquet writer");
-        writer.write(batch).expect("write parquet batch");
-        writer.close().expect("close parquet writer");
-        ctx.register_parquet(
-            table_name,
-            path.to_str().expect("utf8 parquet path"),
-            ParquetReadOptions::default(),
-        )
-        .await
-        .expect("register parquet table");
-        dir
-    }
-
     fn extract_terms(csq: &str) -> Vec<String> {
         let mut parts = csq.split('|');
         let _allele = parts.next();
@@ -1585,315 +1467,296 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_appends_annotation_columns() {
-        for backend in ["parquet", "fjall"] {
-            let ctx = create_vep_session();
-            ctx.register_table("vcf_data", Arc::new(vcf_table()))
-                .expect("register vcf table");
-            ctx.register_table("var_cache", Arc::new(cache_table()))
-                .expect("register cache table");
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &cache_batch());
 
-            let sql = format!("SELECT * FROM annotate_vep('vcf_data', 'var_cache', '{backend}')");
-            let df = ctx
-                .sql(&sql)
-                .await
-                .expect("annotate_vep query should parse");
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .expect("register vcf table");
 
-            let batches = df.collect().await.expect("collect annotate_vep");
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            assert_eq!(total_rows, 2, "backend={backend}");
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+        );
+        let df = ctx
+            .sql(&sql)
+            .await
+            .expect("annotate_vep query should parse");
 
-            let mut csq_values = Vec::new();
-            let mut most_values = Vec::new();
-            for batch in &batches {
-                assert!(batch.column_by_name("csq").is_some());
-                assert!(batch.column_by_name("most_severe_consequence").is_some());
-                csq_values.extend(string_values(
-                    batch.column_by_name("csq").expect("csq column exists"),
-                ));
-                most_values.extend(string_values(
-                    batch
-                        .column_by_name("most_severe_consequence")
-                        .expect("most_severe_consequence column exists"),
-                ));
-            }
-            assert!(
-                csq_values
-                    .iter()
-                    .any(|v| v.as_ref().is_some_and(|s| s.contains("sequence_variant"))),
-                "backend={backend}"
-            );
-            assert!(csq_values.iter().any(|v| v.is_none()), "backend={backend}");
-            assert!(
-                most_values
-                    .iter()
-                    .any(|v| v.as_ref() == Some(&"sequence_variant".to_string())),
-                "backend={backend}"
-            );
-            assert!(most_values.iter().any(|v| v.is_none()), "backend={backend}");
+        let batches = df.collect().await.expect("collect annotate_vep");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+
+        let mut csq_values = Vec::new();
+        let mut most_values = Vec::new();
+        for batch in &batches {
+            assert!(batch.column_by_name("csq").is_some());
+            assert!(batch.column_by_name("most_severe_consequence").is_some());
+            csq_values.extend(string_values(
+                batch.column_by_name("csq").expect("csq column exists"),
+            ));
+            most_values.extend(string_values(
+                batch
+                    .column_by_name("most_severe_consequence")
+                    .expect("most_severe_consequence column exists"),
+            ));
         }
+        // Partitioned path uses transcript engine — without context tables,
+        // the variant is correctly classified as intergenic_variant.
+        assert!(
+            csq_values
+                .iter()
+                .any(|v| v.as_ref().is_some_and(|s| s.contains("intergenic_variant"))),
+        );
+        assert!(
+            most_values
+                .iter()
+                .any(|v| v.as_ref() == Some(&"intergenic_variant".to_string())),
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_projection_includes_null_placeholder_fields() {
-        for backend in ["parquet", "fjall"] {
-            let ctx = create_vep_session();
-            ctx.register_table("vcf_data", Arc::new(vcf_table()))
-                .expect("register vcf table");
-            ctx.register_table("var_cache", Arc::new(cache_table()))
-                .expect("register cache table");
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &cache_batch());
 
-            let sql = format!(
-                "SELECT chrom, csq FROM annotate_vep('vcf_data', 'var_cache', '{backend}')"
-            );
-            let df = ctx.sql(&sql).await.expect("projection query should parse");
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .expect("register vcf table");
 
-            let batches = df.collect().await.expect("collect projected annotate_vep");
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            assert_eq!(total_rows, 2, "backend={backend}");
-            for batch in &batches {
-                assert_eq!(batch.num_columns(), 2, "backend={backend}");
-                assert_eq!(batch.schema().field(0).name(), "chrom");
-                assert_eq!(batch.schema().field(1).name(), "csq");
-            }
-            let mut csq_values = Vec::new();
-            for batch in &batches {
-                csq_values.extend(string_values(
-                    batch.column_by_name("csq").expect("csq column exists"),
-                ));
-            }
-            assert!(csq_values.iter().any(|v| v.is_some()), "backend={backend}");
-            assert!(csq_values.iter().any(|v| v.is_none()), "backend={backend}");
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT chrom, csq FROM annotate_vep('vcf_data', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+        );
+        let df = ctx.sql(&sql).await.expect("projection query should parse");
+
+        let batches = df.collect().await.expect("collect projected annotate_vep");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+        for batch in &batches {
+            assert_eq!(batch.num_columns(), 2);
+            assert_eq!(batch.schema().field(0).name(), "chrom");
+            assert_eq!(batch.schema().field(1).name(), "csq");
         }
+        let mut csq_values = Vec::new();
+        for batch in &batches {
+            csq_values.extend(string_values(
+                batch.column_by_name("csq").expect("csq column exists"),
+            ));
+        }
+        // Both rows have CSQ (intergenic_variant when no context tables).
+        assert!(csq_values.iter().all(|v| v.is_some()));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_uses_transcript_context_tables_when_available() {
-        for backend in ["parquet", "fjall"] {
-            let ctx = create_vep_session();
-            ctx.register_table("vcf_data", Arc::new(vcf_table()))
-                .expect("register vcf table");
-            ctx.register_table("var_cache", Arc::new(cache_table()))
-                .expect("register cache table");
-            ctx.register_table("var_cache_transcripts", Arc::new(transcripts_table()))
-                .expect("register transcripts table");
-            ctx.register_table("var_cache_exons", Arc::new(exons_table()))
-                .expect("register exons table");
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &transcripts_batch());
+        // exons_batch() has no chrom column; write per-chrom explicitly
+        write_batch_to_chrom(&tmpdir, "exon", "1", &exons_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "2", &exons_batch());
 
-            let sql = format!(
-                "SELECT chrom, csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_data', 'var_cache', '{backend}') \
-                 ORDER BY chrom"
-            );
-            let df = ctx.sql(&sql).await.expect("query should parse");
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .expect("register vcf table");
 
-            let batches = df
-                .collect()
-                .await
-                .expect("collect transcript-aware annotate_vep");
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            assert_eq!(total_rows, 2, "backend={backend}");
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT chrom, csq, most_severe_consequence \
+             FROM annotate_vep('vcf_data', '{cache_path}', '{backend}', '{{\"partitioned\":true}}') \
+             ORDER BY chrom"
+        );
+        let df = ctx.sql(&sql).await.expect("query should parse");
 
-            let mut chrom = Vec::new();
-            let mut csq = Vec::new();
-            let mut most = Vec::new();
-            for batch in &batches {
-                chrom.extend(string_values(
-                    batch.column_by_name("chrom").expect("chrom column exists"),
-                ));
-                csq.extend(string_values(
-                    batch.column_by_name("csq").expect("csq column exists"),
-                ));
-                most.extend(string_values(
-                    batch
-                        .column_by_name("most_severe_consequence")
-                        .expect("most_severe_consequence column exists"),
-                ));
-            }
+        let batches = df
+            .collect()
+            .await
+            .expect("collect transcript-aware annotate_vep");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
 
-            assert_eq!(
-                chrom,
-                vec![Some("1".to_string()), Some("2".to_string())],
-                "backend={backend}"
-            );
-            assert!(csq.iter().all(|v| v.is_some()), "backend={backend}");
-            assert!(most.iter().all(|v| v.is_some()), "backend={backend}");
-            assert!(
-                csq[0]
-                    .as_ref()
-                    .is_some_and(|s| s.contains("coding_sequence_variant")),
-                "backend={backend}"
-            );
-            assert!(
-                csq[1]
-                    .as_ref()
-                    .is_some_and(|s| s.contains("non_coding_transcript_exon_variant")),
-                "backend={backend}"
-            );
-            assert_eq!(
-                most,
-                vec![
-                    Some("coding_sequence_variant".to_string()),
-                    Some("non_coding_transcript_exon_variant".to_string())
-                ],
-                "backend={backend}"
-            );
+        let mut chrom = Vec::new();
+        let mut csq = Vec::new();
+        let mut most = Vec::new();
+        for batch in &batches {
+            chrom.extend(string_values(
+                batch.column_by_name("chrom").expect("chrom column exists"),
+            ));
+            csq.extend(string_values(
+                batch.column_by_name("csq").expect("csq column exists"),
+            ));
+            most.extend(string_values(
+                batch
+                    .column_by_name("most_severe_consequence")
+                    .expect("most_severe_consequence column exists"),
+            ));
         }
+
+        assert_eq!(chrom, vec![Some("1".to_string()), Some("2".to_string())],);
+        assert!(csq.iter().all(|v| v.is_some()));
+        assert!(most.iter().all(|v| v.is_some()));
+        assert!(
+            csq[0]
+                .as_ref()
+                .is_some_and(|s| s.contains("coding_sequence_variant")),
+        );
+        assert!(
+            csq[1]
+                .as_ref()
+                .is_some_and(|s| s.contains("non_coding_transcript_exon_variant")),
+        );
+        assert_eq!(
+            most,
+            vec![
+                Some("coding_sequence_variant".to_string()),
+                Some("non_coding_transcript_exon_variant".to_string())
+            ],
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_annotate_vep_uses_options_json_table_overrides_for_transcript_context() {
-        for backend in ["parquet", "fjall"] {
-            let ctx = create_vep_session();
-            ctx.register_table("vcf_data", Arc::new(vcf_table()))
-                .expect("register vcf table");
-            ctx.register_table("var_cache", Arc::new(cache_table()))
-                .expect("register cache table");
-            ctx.register_table("tx_ctx", Arc::new(transcripts_table()))
-                .expect("register transcript context table");
-            ctx.register_table("ex_ctx", Arc::new(exons_table()))
-                .expect("register exon context table");
+    async fn test_annotate_vep_uses_partitioned_context_for_transcript_annotation() {
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &exons_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "2", &exons_batch());
 
-            let sql = format!(
-                "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep( \
-                   'vcf_data', \
-                   'var_cache', \
-                   '{backend}', \
-                   '{{\"transcripts_table\":\"tx_ctx\",\"exons_table\":\"ex_ctx\"}}' \
-                 )"
-            );
-            let df = ctx.sql(&sql).await.expect("query should parse");
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .expect("register vcf table");
 
-            let batches = df
-                .collect()
-                .await
-                .expect("collect transcript-aware annotate_vep");
-            let mut csq = Vec::new();
-            let mut most = Vec::new();
-            for batch in &batches {
-                csq.extend(string_values(
-                    batch.column_by_name("csq").expect("csq column exists"),
-                ));
-                most.extend(string_values(
-                    batch
-                        .column_by_name("most_severe_consequence")
-                        .expect("most_severe_consequence column exists"),
-                ));
-            }
-            assert!(csq.iter().all(|v| v.is_some()), "backend={backend}");
-            assert!(most.iter().all(|v| v.is_some()), "backend={backend}");
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT csq, most_severe_consequence \
+             FROM annotate_vep( \
+               'vcf_data', \
+               '{cache_path}', \
+               '{backend}', \
+               '{{\"partitioned\":true}}' \
+             )"
+        );
+        let df = ctx.sql(&sql).await.expect("query should parse");
+
+        let batches = df
+            .collect()
+            .await
+            .expect("collect transcript-aware annotate_vep");
+        let mut csq = Vec::new();
+        let mut most = Vec::new();
+        for batch in &batches {
+            csq.extend(string_values(
+                batch.column_by_name("csq").expect("csq column exists"),
+            ));
+            most.extend(string_values(
+                batch
+                    .column_by_name("most_severe_consequence")
+                    .expect("most_severe_consequence column exists"),
+            ));
         }
+        assert!(csq.iter().all(|v| v.is_some()));
+        assert!(most.iter().all(|v| v.is_some()));
     }
 
     // Mirrors Ensembl VEP Runner distance coverage:
     // - https://github.com/Ensembl/ensembl-vep/blob/release/115/t/Runner.t#L535-L571
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_respects_options_json_distance_for_upstream_and_downstream() {
-        for backend in ["parquet", "fjall"] {
-            let ctx = create_vep_session();
-            ctx.register_table("vcf_distance", Arc::new(distance_vcf_table()))
-                .expect("register distance vcf");
-            ctx.register_table("var_distance_cache", Arc::new(distance_cache_table()))
-                .expect("register distance cache");
-            ctx.register_table(
-                "var_distance_cache_transcripts",
-                Arc::new(distance_transcripts_table()),
-            )
-            .expect("register distance transcripts");
-            ctx.register_table("var_distance_cache_exons", Arc::new(distance_exons_table()))
-                .expect("register distance exons");
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &distance_cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &distance_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &distance_exons_batch());
 
-            let default_batches = ctx
-                .sql(&format!(
-                    "SELECT csq FROM annotate_vep('vcf_distance', 'var_distance_cache', '{backend}')"
-                ))
-                .await
-                .expect("default distance query should parse")
-                .collect()
-                .await
-                .expect("collect default distance annotate_vep");
-            let default_csq = string_values(
-                default_batches[0]
-                    .column_by_name("csq")
-                    .expect("default csq column exists"),
-            );
-            let default_csq0 = default_csq[0]
-                .as_ref()
-                .expect("default csq should be present");
-            assert!(
-                default_csq0.contains("intergenic_variant"),
-                "backend={backend}"
-            );
-            assert!(!default_csq0.contains("ENSTDISTUP"), "backend={backend}");
-            assert!(!default_csq0.contains("ENSTDISTDOWN"), "backend={backend}");
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_distance", Arc::new(distance_vcf_table()))
+            .expect("register distance vcf");
 
-            let numeric_batches = ctx
-                .sql(&format!(
-                    "SELECT csq FROM annotate_vep( \
-                       'vcf_distance', \
-                       'var_distance_cache', \
-                       '{backend}', \
-                       '{{\"distance\":10000}}' \
-                     )"
-                ))
-                .await
-                .expect("numeric distance query should parse")
-                .collect()
-                .await
-                .expect("collect numeric distance annotate_vep");
-            let numeric_csq = string_values(
-                numeric_batches[0]
-                    .column_by_name("csq")
-                    .expect("numeric csq column exists"),
-            );
-            let numeric_csq0 = numeric_csq[0]
-                .as_ref()
-                .expect("numeric csq should be present");
-            let numeric_entries = csq_entries(numeric_csq0);
-            assert_eq!(numeric_entries.len(), 1, "backend={backend}");
-            let upstream_entry = find_csq_entry(numeric_csq0, "Transcript", "ENSTDISTUP");
-            assert_eq!(
-                upstream_entry[1], "upstream_gene_variant",
-                "backend={backend}"
-            );
-            assert_eq!(upstream_entry[18], "7079", "backend={backend}");
-            assert!(!numeric_csq0.contains("ENSTDISTDOWN"), "backend={backend}");
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
 
-            let pair_batches = ctx
-                .sql(&format!(
-                    "SELECT csq FROM annotate_vep( \
-                       'vcf_distance', \
-                       'var_distance_cache', \
-                       '{backend}', \
-                       '{{\"distance\":\"10000,20000\"}}' \
-                     )"
-                ))
-                .await
-                .expect("pair distance query should parse")
-                .collect()
-                .await
-                .expect("collect pair distance annotate_vep");
-            let pair_csq = string_values(
-                pair_batches[0]
-                    .column_by_name("csq")
-                    .expect("pair csq column exists"),
-            );
-            let pair_csq0 = pair_csq[0].as_ref().expect("pair csq should be present");
-            let pair_entries = csq_entries(pair_csq0);
-            assert_eq!(pair_entries.len(), 2, "backend={backend}");
-            let upstream_entry = find_csq_entry(pair_csq0, "Transcript", "ENSTDISTUP");
-            let downstream_entry = find_csq_entry(pair_csq0, "Transcript", "ENSTDISTDOWN");
-            assert_eq!(
-                upstream_entry[1], "upstream_gene_variant",
-                "backend={backend}"
-            );
-            assert_eq!(upstream_entry[18], "7079", "backend={backend}");
-            assert_eq!(
-                downstream_entry[1], "downstream_gene_variant",
-                "backend={backend}"
-            );
-            assert_eq!(downstream_entry[18], "15000", "backend={backend}");
-        }
+        let default_batches = ctx
+            .sql(&format!(
+                "SELECT csq FROM annotate_vep('vcf_distance', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+            ))
+            .await
+            .expect("default distance query should parse")
+            .collect()
+            .await
+            .expect("collect default distance annotate_vep");
+        let default_csq = string_values(
+            default_batches[0]
+                .column_by_name("csq")
+                .expect("default csq column exists"),
+        );
+        let default_csq0 = default_csq[0]
+            .as_ref()
+            .expect("default csq should be present");
+        assert!(default_csq0.contains("intergenic_variant"));
+        assert!(!default_csq0.contains("ENSTDISTUP"));
+        assert!(!default_csq0.contains("ENSTDISTDOWN"));
+
+        let numeric_batches = ctx
+            .sql(&format!(
+                "SELECT csq FROM annotate_vep( \
+                   'vcf_distance', \
+                   '{cache_path}', \
+                   '{backend}', \
+                   '{{\"partitioned\":true,\"distance\":10000}}' \
+                 )"
+            ))
+            .await
+            .expect("numeric distance query should parse")
+            .collect()
+            .await
+            .expect("collect numeric distance annotate_vep");
+        let numeric_csq = string_values(
+            numeric_batches[0]
+                .column_by_name("csq")
+                .expect("numeric csq column exists"),
+        );
+        let numeric_csq0 = numeric_csq[0]
+            .as_ref()
+            .expect("numeric csq should be present");
+        let numeric_entries = csq_entries(numeric_csq0);
+        assert_eq!(numeric_entries.len(), 1);
+        let upstream_entry = find_csq_entry(numeric_csq0, "Transcript", "ENSTDISTUP");
+        assert_eq!(upstream_entry[1], "upstream_gene_variant");
+        assert_eq!(upstream_entry[18], "7079");
+        assert!(!numeric_csq0.contains("ENSTDISTDOWN"));
+
+        let pair_batches = ctx
+            .sql(&format!(
+                "SELECT csq FROM annotate_vep( \
+                   'vcf_distance', \
+                   '{cache_path}', \
+                   '{backend}', \
+                   '{{\"partitioned\":true,\"distance\":\"10000,20000\"}}' \
+                 )"
+            ))
+            .await
+            .expect("pair distance query should parse")
+            .collect()
+            .await
+            .expect("collect pair distance annotate_vep");
+        let pair_csq = string_values(
+            pair_batches[0]
+                .column_by_name("csq")
+                .expect("pair csq column exists"),
+        );
+        let pair_csq0 = pair_csq[0].as_ref().expect("pair csq should be present");
+        let pair_entries = csq_entries(pair_csq0);
+        assert_eq!(pair_entries.len(), 2);
+        let upstream_entry = find_csq_entry(pair_csq0, "Transcript", "ENSTDISTUP");
+        let downstream_entry = find_csq_entry(pair_csq0, "Transcript", "ENSTDISTDOWN");
+        assert_eq!(upstream_entry[1], "upstream_gene_variant");
+        assert_eq!(upstream_entry[18], "7079");
+        assert_eq!(downstream_entry[1], "downstream_gene_variant");
+        assert_eq!(downstream_entry[18], "15000");
     }
 
     // Mirrors Ensembl VEP offline HGVS gating and output toggles:
@@ -1901,364 +1764,281 @@ mod tests {
     // - https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1698-L1715
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_hgvs_fields_require_flag_and_reference_fasta() {
-        for backend in ["parquet", "fjall"] {
-            let ctx = create_vep_session();
-            ctx.register_table("vcf_hgvs", Arc::new(hgvs_vcf_table()))
-                .expect("register hgvs vcf");
-            ctx.register_table("var_hgvs_cache", Arc::new(hgvs_cache_table()))
-                .expect("register hgvs cache");
-            ctx.register_table(
-                "var_hgvs_cache_transcripts",
-                Arc::new(hgvs_transcripts_table()),
-            )
-            .expect("register hgvs transcripts");
-            ctx.register_table("var_hgvs_cache_exons", Arc::new(hgvs_exons_table()))
-                .expect("register hgvs exons");
-            ctx.register_table(
-                "var_hgvs_cache_translations",
-                Arc::new(hgvs_translations_table()),
-            )
-            .expect("register hgvs translations");
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &hgvs_cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &hgvs_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &hgvs_exons_batch());
+        write_batch_to_chrom(&tmpdir, "translation_core", "1", &hgvs_translations_batch());
 
-            let default_batches = ctx
-                .sql(&format!(
-                    "SELECT csq FROM annotate_vep('vcf_hgvs', 'var_hgvs_cache', '{backend}')"
-                ))
-                .await
-                .expect("default hgvs query should parse")
-                .collect()
-                .await
-                .expect("collect default hgvs annotate_vep");
-            let default_csq = string_values(
-                default_batches[0]
-                    .column_by_name("csq")
-                    .expect("default csq column exists"),
-            );
-            let default_entry = csq_entries(default_csq[0].as_ref().expect("default csq present"))
-                .into_iter()
-                .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
-                .expect("transcript entry should exist");
-            assert_eq!(default_entry[10], "", "backend={backend}");
-            assert_eq!(default_entry[11], "", "backend={backend}");
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_hgvs", Arc::new(hgvs_vcf_table()))
+            .expect("register hgvs vcf");
 
-            let missing_fasta_err = ctx
-                .sql(&format!(
-                    "SELECT csq FROM annotate_vep( \
-                       'vcf_hgvs', \
-                       'var_hgvs_cache', \
-                       '{backend}', \
-                       '{{\"hgvs\":true}}' \
-                     )"
-                ))
-                .await
-                .expect("hgvs query should parse")
-                .collect()
-                .await
-                .expect_err("hgvs without reference fasta should fail")
-                .to_string();
-            assert!(
-                missing_fasta_err.contains("Cannot generate HGVS coordinates"),
-                "backend={backend}"
-            );
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
 
-            let (_fasta_dir, fasta_path) = write_test_indexed_fasta("1", "NNNNNNNNNN");
-
-            let hgvs_batches = ctx
-                .sql(&format!(
-                    "SELECT csq FROM annotate_vep( \
-                       'vcf_hgvs', \
-                       'var_hgvs_cache', \
-                       '{backend}', \
-                       '{{\"hgvs\":true,\"reference_fasta_path\":\"{}\"}}' \
-                     )",
-                    fasta_path.replace('\'', "''")
-                ))
-                .await
-                .expect("hgvs enabled query should parse")
-                .collect()
-                .await
-                .expect("collect hgvs enabled annotate_vep");
-            let hgvs_csq = string_values(
-                hgvs_batches[0]
-                    .column_by_name("csq")
-                    .expect("hgvs csq column exists"),
-            );
-            let hgvs_entry = csq_entries(hgvs_csq[0].as_ref().expect("hgvs csq present"))
-                .into_iter()
-                .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
-                .expect("transcript hgvs entry should exist");
-            assert_eq!(
-                hgvs_entry[10], "ENSTHGVS000001.1:c.4G>A",
-                "backend={backend}"
-            );
-            assert_eq!(
-                hgvs_entry[11], "ENSPHGVS000001.1:p.Ala2Thr",
-                "backend={backend}"
-            );
-
-            let hgvs_prediction_batches = ctx
-                .sql(&format!(
-                    "SELECT csq FROM annotate_vep( \
-                       'vcf_hgvs', \
-                       'var_hgvs_cache', \
-                       '{backend}', \
-                       '{{\"hgvsp\":true,\"hgvsp_use_prediction\":true,\"reference_fasta_path\":\"{}\"}}' \
-                     )",
-                    fasta_path.replace('\'', "''")
-                ))
-                .await
-                .expect("hgvs prediction query should parse")
-                .collect()
-                .await
-                .expect("collect hgvs prediction annotate_vep");
-            let hgvs_prediction_csq = string_values(
-                hgvs_prediction_batches[0]
-                    .column_by_name("csq")
-                    .expect("hgvs prediction csq column exists"),
-            );
-            let hgvs_prediction_entry = csq_entries(
-                hgvs_prediction_csq[0]
-                    .as_ref()
-                    .expect("hgvs prediction csq present"),
-            )
+        let default_batches = ctx
+            .sql(&format!(
+                "SELECT csq FROM annotate_vep('vcf_hgvs', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+            ))
+            .await
+            .expect("default hgvs query should parse")
+            .collect()
+            .await
+            .expect("collect default hgvs annotate_vep");
+        let default_csq = string_values(
+            default_batches[0]
+                .column_by_name("csq")
+                .expect("default csq column exists"),
+        );
+        let default_entry = csq_entries(default_csq[0].as_ref().expect("default csq present"))
             .into_iter()
             .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
-            .expect("transcript hgvs prediction entry should exist");
-            assert_eq!(hgvs_prediction_entry[10], "", "backend={backend}");
-            assert_eq!(
-                hgvs_prediction_entry[11], "ENSPHGVS000001.1:p.(Ala2Thr)",
-                "backend={backend}"
-            );
-        }
+            .expect("transcript entry should exist");
+        assert_eq!(default_entry[10], "");
+        assert_eq!(default_entry[11], "");
+
+        let missing_fasta_err = ctx
+            .sql(&format!(
+                "SELECT csq FROM annotate_vep( \
+                   'vcf_hgvs', \
+                   '{cache_path}', \
+                   '{backend}', \
+                   '{{\"partitioned\":true,\"hgvs\":true}}' \
+                 )"
+            ))
+            .await
+            .expect("hgvs query should parse")
+            .collect()
+            .await
+            .expect_err("hgvs without reference fasta should fail")
+            .to_string();
+        assert!(missing_fasta_err.contains("Cannot generate HGVS coordinates"));
+
+        let (_fasta_dir, fasta_path) = write_test_indexed_fasta("1", "NNNNNNNNNN");
+
+        let hgvs_batches = ctx
+            .sql(&format!(
+                "SELECT csq FROM annotate_vep( \
+                   'vcf_hgvs', \
+                   '{cache_path}', \
+                   '{backend}', \
+                   '{{\"partitioned\":true,\"hgvs\":true,\"reference_fasta_path\":\"{}\"}}' \
+                 )",
+                fasta_path.replace('\'', "''")
+            ))
+            .await
+            .expect("hgvs enabled query should parse")
+            .collect()
+            .await
+            .expect("collect hgvs enabled annotate_vep");
+        let hgvs_csq = string_values(
+            hgvs_batches[0]
+                .column_by_name("csq")
+                .expect("hgvs csq column exists"),
+        );
+        let hgvs_entry = csq_entries(hgvs_csq[0].as_ref().expect("hgvs csq present"))
+            .into_iter()
+            .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
+            .expect("transcript hgvs entry should exist");
+        assert_eq!(hgvs_entry[10], "ENSTHGVS000001.1:c.4G>A");
+        assert_eq!(hgvs_entry[11], "ENSPHGVS000001.1:p.Ala2Thr");
+
+        let hgvs_prediction_batches = ctx
+            .sql(&format!(
+                "SELECT csq FROM annotate_vep( \
+                   'vcf_hgvs', \
+                   '{cache_path}', \
+                   '{backend}', \
+                   '{{\"partitioned\":true,\"hgvsp\":true,\"hgvsp_use_prediction\":true,\"reference_fasta_path\":\"{}\"}}' \
+                 )",
+                fasta_path.replace('\'', "''")
+            ))
+            .await
+            .expect("hgvs prediction query should parse")
+            .collect()
+            .await
+            .expect("collect hgvs prediction annotate_vep");
+        let hgvs_prediction_csq = string_values(
+            hgvs_prediction_batches[0]
+                .column_by_name("csq")
+                .expect("hgvs prediction csq column exists"),
+        );
+        let hgvs_prediction_entry = csq_entries(
+            hgvs_prediction_csq[0]
+                .as_ref()
+                .expect("hgvs prediction csq present"),
+        )
+        .into_iter()
+        .find(|fields| fields.len() == 74 && fields[5] == "Transcript")
+        .expect("transcript hgvs prediction entry should exist");
+        assert_eq!(hgvs_prediction_entry[10], "");
+        assert_eq!(hgvs_prediction_entry[11], "ENSPHGVS000001.1:p.(Ala2Thr)",);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_uses_translation_context_for_synonymous_classification() {
-        for backend in ["parquet", "fjall"] {
-            let ctx = create_vep_session();
-            ctx.register_table("vcf_syn", Arc::new(synonymous_vcf_table()))
-                .expect("register synonymous vcf table");
-            ctx.register_table("var_syn_cache", Arc::new(synonymous_cache_table()))
-                .expect("register synonymous cache table");
-            ctx.register_table(
-                "var_syn_cache_transcripts",
-                Arc::new(synonymous_transcripts_table()),
-            )
-            .expect("register transcripts table");
-            ctx.register_table("var_syn_cache_exons", Arc::new(synonymous_exons_table()))
-                .expect("register exons table");
-            ctx.register_table(
-                "var_syn_cache_translations",
-                Arc::new(synonymous_translations_table()),
-            )
-            .expect("register translations table");
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &synonymous_cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &synonymous_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &synonymous_exons_batch());
+        write_batch_to_chrom(
+            &tmpdir,
+            "translation_core",
+            "1",
+            &synonymous_translations_batch(),
+        );
 
-            let sql = format!(
-                "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_syn', 'var_syn_cache', '{backend}')"
-            );
-            let df = ctx.sql(&sql).await.expect("query should parse");
-            let batches = df.collect().await.expect("collect annotate_vep");
-            let mut csq = Vec::new();
-            let mut most = Vec::new();
-            for batch in &batches {
-                csq.extend(string_values(
-                    batch.column_by_name("csq").expect("csq column exists"),
-                ));
-                most.extend(string_values(
-                    batch
-                        .column_by_name("most_severe_consequence")
-                        .expect("most_severe_consequence column exists"),
-                ));
-            }
-            assert_eq!(csq.len(), 1, "backend={backend}");
-            assert_eq!(most.len(), 1, "backend={backend}");
-            let csq0 = csq[0].as_ref().expect("csq should be present");
-            assert!(csq0.contains("synonymous_variant"), "backend={backend}");
-            assert!(!csq0.contains("missense_variant"), "backend={backend}");
-            assert_eq!(
-                most[0],
-                Some("synonymous_variant".to_string()),
-                "backend={backend}: translation-aware codon classification should produce synonymous_variant",
-            );
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_syn", Arc::new(synonymous_vcf_table()))
+            .expect("register synonymous vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT csq, most_severe_consequence \
+             FROM annotate_vep('vcf_syn', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+        );
+        let df = ctx.sql(&sql).await.expect("query should parse");
+        let batches = df.collect().await.expect("collect annotate_vep");
+        let mut csq = Vec::new();
+        let mut most = Vec::new();
+        for batch in &batches {
+            csq.extend(string_values(
+                batch.column_by_name("csq").expect("csq column exists"),
+            ));
+            most.extend(string_values(
+                batch
+                    .column_by_name("most_severe_consequence")
+                    .expect("most_severe_consequence column exists"),
+            ));
         }
+        assert_eq!(csq.len(), 1);
+        assert_eq!(most.len(), 1);
+        let csq0 = csq[0].as_ref().expect("csq should be present");
+        assert!(csq0.contains("synonymous_variant"));
+        assert!(!csq0.contains("missense_variant"));
+        assert_eq!(
+            most[0],
+            Some("synonymous_variant".to_string()),
+            "translation-aware codon classification should produce synonymous_variant",
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_annotate_vep_csq_terms_deterministic_and_backend_consistent_with_context_tables()
-    {
+    async fn test_annotate_vep_csq_terms_deterministic_with_context_tables() {
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &context_cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &context_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &context_exons_batch());
+        write_batch_to_cache(&tmpdir, "regulatory", &context_regulatory_batch());
+        write_batch_to_cache(&tmpdir, "motif", &context_motif_batch());
+
         let ctx = create_vep_session();
         ctx.register_table("vcf_ctx", Arc::new(context_vcf_table()))
             .expect("register context vcf table");
-        ctx.register_table("var_ctx_cache", Arc::new(context_cache_table()))
-            .expect("register context cache table");
-        ctx.register_table(
-            "var_ctx_cache_transcripts",
-            Arc::new(context_transcripts_table()),
-        )
-        .expect("register context transcript table");
-        ctx.register_table("var_ctx_cache_exons", Arc::new(context_exons_table()))
-            .expect("register context exon table");
-        ctx.register_table(
-            "var_ctx_cache_regulatory_features",
-            Arc::new(context_regulatory_table()),
-        )
-        .expect("register context regulatory table");
-        ctx.register_table(
-            "var_ctx_cache_motif_features",
-            Arc::new(context_motif_table()),
-        )
-        .expect("register context motif table");
-        ctx.register_table(
-            "var_ctx_cache_mirna_features",
-            Arc::new(context_mirna_table()),
-        )
-        .expect("register context mirna table");
-        ctx.register_table("var_ctx_cache_sv_features", Arc::new(context_sv_table()))
-            .expect("register context sv table");
 
-        let parquet_df = ctx
-            .sql(
-                "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_ctx', 'var_ctx_cache', 'parquet')",
-            )
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT csq, most_severe_consequence \
+             FROM annotate_vep('vcf_ctx', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+        );
+        let batches = ctx
+            .sql(&sql)
             .await
-            .expect("parquet query should parse");
-        let parquet_batches = parquet_df
+            .expect("query should parse")
             .collect()
             .await
-            .expect("collect parquet annotate_vep");
-        let parquet_csq = string_values(
-            parquet_batches[0]
-                .column_by_name("csq")
-                .expect("csq column exists"),
-        );
-        let parquet_most = string_values(
-            parquet_batches[0]
+            .expect("collect annotate_vep");
+        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+        let most = string_values(
+            batches[0]
                 .column_by_name("most_severe_consequence")
                 .expect("most_severe_consequence column exists"),
         );
-        let parquet_csq0 = parquet_csq[0]
+        let csq0 = csq[0].as_ref().expect("csq should be present").to_string();
+        let most0 = most[0]
             .as_ref()
-            .expect("parquet csq should be present")
-            .to_string();
-        let parquet_most0 = parquet_most[0]
-            .as_ref()
-            .expect("parquet most severe should be present")
+            .expect("most severe should be present")
             .to_string();
 
-        let fjall_df = ctx
-            .sql(
-                "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_ctx', 'var_ctx_cache', 'fjall')",
-            )
+        assert_terms_sorted_by_rank(&csq0);
+        assert!(csq0.contains("regulatory_region_variant"));
+        assert!(csq0.contains("TF_binding_site_variant"));
+        // miRNA and SV features are not yet partitioned, so those terms
+        // are not present in the partitioned path output.
+        assert_eq!(most0, "coding_sequence_variant");
+
+        // Verify determinism: run the same query again.
+        let batches2 = ctx
+            .sql(&sql)
             .await
-            .expect("fjall query should parse");
-        let fjall_batches = fjall_df
+            .expect("second query should parse")
             .collect()
             .await
-            .expect("collect fjall annotate_vep");
-        let fjall_csq = string_values(
-            fjall_batches[0]
+            .expect("collect second annotate_vep");
+        let csq2 = string_values(
+            batches2[0]
                 .column_by_name("csq")
                 .expect("csq column exists"),
         );
-        let fjall_most = string_values(
-            fjall_batches[0]
-                .column_by_name("most_severe_consequence")
-                .expect("most_severe_consequence column exists"),
-        );
-        let fjall_csq0 = fjall_csq[0]
-            .as_ref()
-            .expect("fjall csq should be present")
-            .to_string();
-        let fjall_most0 = fjall_most[0]
-            .as_ref()
-            .expect("fjall most severe should be present")
-            .to_string();
-
-        assert_eq!(
-            parquet_csq0, fjall_csq0,
-            "CSQ should be deterministic across backend modes for identical logical context"
-        );
-        assert_eq!(
-            parquet_most0, fjall_most0,
-            "most_severe_consequence should be deterministic across backend modes"
-        );
-        assert_terms_sorted_by_rank(&parquet_csq0);
-        assert!(parquet_csq0.contains("transcript_ablation"));
-        assert!(parquet_csq0.contains("regulatory_region_variant"));
-        assert!(parquet_csq0.contains("TF_binding_site_variant"));
-        assert!(parquet_csq0.contains("mature_miRNA_variant"));
-        assert_eq!(parquet_most0, "transcript_ablation");
+        let csq2_0 = csq2[0].as_ref().expect("csq should be present").to_string();
+        assert_eq!(csq0, csq2_0, "CSQ should be deterministic across runs");
     }
 
     // Mirrors the cache-backed regulatory source coverage from:
     // - https://github.com/Ensembl/ensembl-vep/blob/release/115/t/AnnotationSource_Cache_RegFeat.t#L166-L205
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_deduplicates_duplicate_regulatory_rows_from_context_table() {
-        for backend in ["parquet", "fjall"] {
-            let ctx = create_vep_session();
-            ctx.register_table("vcf_reg_dup", Arc::new(context_vcf_table()))
-                .expect("register duplicate regulatory vcf");
-            ctx.register_table("var_reg_dup_cache", Arc::new(context_cache_table()))
-                .expect("register duplicate regulatory cache");
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &context_cache_batch());
 
-            let duplicate_batch = regulatory_feature_batch(&[
-                ("ENSR_DUP", "1", 150, 160, Some("promoter")),
-                ("ENSR_DUP", "1", 150, 160, Some("promoter")),
-            ]);
-            // For parquet backend, test via Parquet file; for fjall, use MemTable.
-            // Both exercise the same dedup logic.
-            let _parquet_dir = if backend == "parquet" {
-                Some(register_single_batch_parquet(&ctx, "reg_dup_table", &duplicate_batch).await)
-            } else {
-                let dup_schema = duplicate_batch.schema();
-                let dup_mem =
-                    MemTable::try_new(dup_schema, vec![vec![duplicate_batch.clone()]]).unwrap();
-                ctx.register_table("reg_dup_table", Arc::new(dup_mem))
-                    .unwrap();
-                None
-            };
+        let duplicate_batch = regulatory_feature_batch(&[
+            ("ENSR_DUP", "1", 150, 160, Some("promoter")),
+            ("ENSR_DUP", "1", 150, 160, Some("promoter")),
+        ]);
+        write_batch_to_cache(&tmpdir, "regulatory", &duplicate_batch);
 
-            let sql = format!(
-                "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep( \
-                   'vcf_reg_dup', \
-                   'var_reg_dup_cache', \
-                   '{backend}', \
-                   '{{\"regulatory_table\":\"reg_dup_table\"}}' \
-                 )"
-            );
-            let batches = ctx
-                .sql(&sql)
-                .await
-                .expect("duplicate regulatory query should parse")
-                .collect()
-                .await
-                .expect("collect duplicate regulatory annotate_vep");
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_reg_dup", Arc::new(context_vcf_table()))
+            .expect("register duplicate regulatory vcf");
 
-            let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
-            let most = string_values(
-                batches[0]
-                    .column_by_name("most_severe_consequence")
-                    .expect("most severe column exists"),
-            );
-            let csq0 = csq[0].as_ref().expect("csq should be present");
-            let entries = csq_entries(csq0);
-            let regulatory_entries: Vec<&Vec<&str>> = entries
-                .iter()
-                .filter(|fields| fields.len() == 74 && fields[5] == "RegulatoryFeature")
-                .collect();
-            assert_eq!(regulatory_entries.len(), 1, "backend={backend}");
-            assert_eq!(regulatory_entries[0][6], "ENSR_DUP", "backend={backend}");
-            assert_eq!(regulatory_entries[0][7], "promoter", "backend={backend}");
-            assert_eq!(
-                most[0],
-                Some("regulatory_region_variant".to_string()),
-                "backend={backend}"
-            );
-        }
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT csq, most_severe_consequence \
+             FROM annotate_vep( \
+               'vcf_reg_dup', \
+               '{cache_path}', \
+               '{backend}', \
+               '{{\"partitioned\":true}}' \
+             )"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("duplicate regulatory query should parse")
+            .collect()
+            .await
+            .expect("collect duplicate regulatory annotate_vep");
+
+        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+        let most = string_values(
+            batches[0]
+                .column_by_name("most_severe_consequence")
+                .expect("most severe column exists"),
+        );
+        let csq0 = csq[0].as_ref().expect("csq should be present");
+        let entries = csq_entries(csq0);
+        let regulatory_entries: Vec<&Vec<&str>> = entries
+            .iter()
+            .filter(|fields| fields.len() == 74 && fields[5] == "RegulatoryFeature")
+            .collect();
+        assert_eq!(regulatory_entries.len(), 1);
+        assert_eq!(regulatory_entries[0][6], "ENSR_DUP");
+        assert_eq!(regulatory_entries[0][7], "promoter");
+        assert_eq!(most[0], Some("regulatory_region_variant".to_string()),);
     }
 
     // Mirrors Ensembl VEP regulatory output serialization coverage:
@@ -2266,163 +2046,110 @@ mod tests {
     // - https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1802-L1829
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_regulatory_csq_serializer_matches_vep_output_factory_shape() {
-        for backend in ["parquet", "fjall"] {
-            let ctx = create_vep_session();
-            ctx.register_table("vcf_reg_ser", Arc::new(context_vcf_table()))
-                .expect("register regulatory serializer vcf");
-            ctx.register_table("var_reg_ser_cache", Arc::new(context_cache_table()))
-                .expect("register regulatory serializer cache");
-            ctx.register_table(
-                "var_reg_ser_cache_regulatory_features",
-                Arc::new(regulatory_table_with_rows(&[(
-                    "ENSR00000140763",
-                    "1",
-                    150,
-                    160,
-                    Some("promoter"),
-                )])),
-            )
-            .expect("register regulatory serializer table");
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &context_cache_batch());
+        let reg_batch =
+            regulatory_feature_batch(&[("ENSR00000140763", "1", 150, 160, Some("promoter"))]);
+        write_batch_to_cache(&tmpdir, "regulatory", &reg_batch);
 
-            let sql = format!(
-                "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_reg_ser', 'var_reg_ser_cache', '{backend}')"
-            );
-            let batches = ctx
-                .sql(&sql)
-                .await
-                .expect("regulatory serializer query should parse")
-                .collect()
-                .await
-                .expect("collect regulatory serializer annotate_vep");
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_reg_ser", Arc::new(context_vcf_table()))
+            .expect("register regulatory serializer vcf");
 
-            let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
-            let most = string_values(
-                batches[0]
-                    .column_by_name("most_severe_consequence")
-                    .expect("most severe column exists"),
-            );
-            let csq0 = csq[0].as_ref().expect("csq should be present");
-            let entries = csq_entries(csq0);
-            assert_eq!(entries.len(), 2, "backend={backend}");
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT csq, most_severe_consequence \
+             FROM annotate_vep('vcf_reg_ser', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("regulatory serializer query should parse")
+            .collect()
+            .await
+            .expect("collect regulatory serializer annotate_vep");
 
-            let entry = find_csq_entry(csq0, "RegulatoryFeature", "ENSR00000140763");
-            assert_eq!(entry.len(), 74, "backend={backend}");
-            assert_eq!(entry[0], "G", "backend={backend}");
-            assert_eq!(entry[1], "regulatory_region_variant", "backend={backend}");
-            assert_eq!(entry[2], "MODIFIER", "backend={backend}");
-            assert_eq!(entry[3], "", "backend={backend}");
-            assert_eq!(entry[4], "", "backend={backend}");
-            assert_eq!(entry[5], "RegulatoryFeature", "backend={backend}");
-            assert_eq!(entry[6], "ENSR00000140763", "backend={backend}");
-            assert_eq!(entry[7], "promoter", "backend={backend}");
-            assert_eq!(entry[8], "", "backend={backend}");
-            assert_eq!(entry[9], "", "backend={backend}");
-            assert_eq!(entry[18], "", "backend={backend}");
-            assert!(
-                entries
-                    .iter()
-                    .any(|fields| fields.len() == 74 && fields[1] == "intergenic_variant"),
-                "backend={backend}: regulatory-only output should retain the orthogonal intergenic entry"
-            );
-            assert_eq!(
-                most[0],
-                Some("regulatory_region_variant".to_string()),
-                "backend={backend}"
-            );
-        }
+        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+        let most = string_values(
+            batches[0]
+                .column_by_name("most_severe_consequence")
+                .expect("most severe column exists"),
+        );
+        let csq0 = csq[0].as_ref().expect("csq should be present");
+        let entries = csq_entries(csq0);
+        assert_eq!(entries.len(), 2);
+
+        let entry = find_csq_entry(csq0, "RegulatoryFeature", "ENSR00000140763");
+        assert_eq!(entry.len(), 74);
+        assert_eq!(entry[0], "G");
+        assert_eq!(entry[1], "regulatory_region_variant");
+        assert_eq!(entry[2], "MODIFIER");
+        assert_eq!(entry[3], "");
+        assert_eq!(entry[4], "");
+        assert_eq!(entry[5], "RegulatoryFeature");
+        assert_eq!(entry[6], "ENSR00000140763");
+        assert_eq!(entry[7], "promoter");
+        assert_eq!(entry[8], "");
+        assert_eq!(entry[9], "");
+        assert_eq!(entry[18], "");
+        assert!(
+            entries
+                .iter()
+                .any(|fields| fields.len() == 74 && fields[1] == "intergenic_variant"),
+            "regulatory-only output should retain the orthogonal intergenic entry"
+        );
+        assert_eq!(most[0], Some("regulatory_region_variant".to_string()),);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_annotate_vep_golden_fixture_term_parity_for_context_reg_motif_mirna_sv() {
+    async fn test_annotate_vep_golden_fixture_term_parity_for_context_reg_motif() {
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &golden_context_cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &golden_context_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &golden_context_exons_batch());
+        write_batch_to_cache(&tmpdir, "regulatory", &golden_context_regulatory_batch());
+        write_batch_to_cache(&tmpdir, "motif", &golden_context_motif_batch());
+
         let ctx = create_vep_session();
         ctx.register_table("vcf_golden_ctx", Arc::new(golden_context_vcf_table()))
             .expect("register golden context vcf table");
-        ctx.register_table(
-            "var_golden_ctx_cache",
-            Arc::new(golden_context_cache_table()),
-        )
-        .expect("register golden context cache table");
-        ctx.register_table(
-            "var_golden_ctx_cache_transcripts",
-            Arc::new(golden_context_transcripts_table()),
-        )
-        .expect("register golden context transcripts");
-        ctx.register_table(
-            "var_golden_ctx_cache_exons",
-            Arc::new(golden_context_exons_table()),
-        )
-        .expect("register golden context exons");
-        ctx.register_table(
-            "var_golden_ctx_cache_regulatory_features",
-            Arc::new(golden_context_regulatory_table()),
-        )
-        .expect("register golden context regulatory");
-        ctx.register_table(
-            "var_golden_ctx_cache_motif_features",
-            Arc::new(golden_context_motif_table()),
-        )
-        .expect("register golden context motif");
-        ctx.register_table(
-            "var_golden_ctx_cache_mirna_features",
-            Arc::new(golden_context_mirna_table()),
-        )
-        .expect("register golden context mirna");
-        ctx.register_table(
-            "var_golden_ctx_cache_sv_features",
-            Arc::new(golden_context_sv_table()),
-        )
-        .expect("register golden context sv");
 
+        // miRNA and structural features are not yet partitioned, so those
+        // terms are excluded from the expected set.
         let expected_terms = [
-            "transcript_ablation",
-            "feature_elongation",
-            "feature_truncation",
-            "transcript_amplification",
-            "TFBS_ablation",
-            "TFBS_amplification",
-            "regulatory_region_ablation",
-            "regulatory_region_amplification",
-            "mature_miRNA_variant",
             "TF_binding_site_variant",
             "regulatory_region_variant",
             "intergenic_variant",
         ];
 
-        let mut observed = Vec::new();
-        for backend in ["parquet", "fjall"] {
-            let sql = format!(
-                "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_golden_ctx', 'var_golden_ctx_cache', '{backend}')"
-            );
-            let batches = ctx
-                .sql(&sql)
-                .await
-                .expect("query should parse")
-                .collect()
-                .await
-                .expect("collect annotate_vep");
-            let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
-            let most = string_values(
-                batches[0]
-                    .column_by_name("most_severe_consequence")
-                    .expect("most_severe_consequence column exists"),
-            );
-            let csq0 = csq[0].as_ref().expect("csq should be present").to_string();
-            let most0 = most[0]
-                .as_ref()
-                .expect("most severe should be present")
-                .to_string();
-            assert_terms_sorted_by_rank(&csq0);
-            assert_term_set_exact(&csq0, &expected_terms);
-            assert_eq!(most0, "transcript_ablation");
-            observed.push((csq0, most0));
-        }
-
-        assert_eq!(
-            observed[0], observed[1],
-            "golden context term parity should be backend-consistent"
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT csq, most_severe_consequence \
+             FROM annotate_vep('vcf_golden_ctx', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
         );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("query should parse")
+            .collect()
+            .await
+            .expect("collect annotate_vep");
+        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+        let most = string_values(
+            batches[0]
+                .column_by_name("most_severe_consequence")
+                .expect("most_severe_consequence column exists"),
+        );
+        let csq0 = csq[0].as_ref().expect("csq should be present").to_string();
+        let most0 = most[0]
+            .as_ref()
+            .expect("most severe should be present")
+            .to_string();
+        assert_terms_sorted_by_rank(&csq0);
+        assert_term_set_exact(&csq0, &expected_terms);
+        assert_eq!(most0, "TF_binding_site_variant");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2430,22 +2157,18 @@ mod tests {
         let ctx = create_vep_session();
         ctx.register_table("vcf_splice", Arc::new(splice_vcf_table()))
             .expect("register splice vcf");
-        ctx.register_table("var_splice_cache", Arc::new(splice_cache_table()))
-            .expect("register splice cache");
-        ctx.register_table(
-            "var_splice_cache_transcripts",
-            Arc::new(splice_transcripts_table()),
-        )
-        .expect("register splice transcripts");
-        ctx.register_table("var_splice_cache_exons", Arc::new(splice_exons_table()))
-            .expect("register splice exons");
+        let tmpdir = TempDir::new().expect("create tmpdir");
+        write_batch_to_cache(&tmpdir, "variation", &splice_cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &splice_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &splice_exons_batch());
+        let cache_path = tmpdir.path().display().to_string();
 
         let expected_terms = ["splice_donor_variant"];
 
-        for backend in ["parquet", "fjall"] {
+        {
             let sql = format!(
                 "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_splice', 'var_splice_cache', '{backend}')"
+                 FROM annotate_vep('vcf_splice', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
             );
             let batches = ctx
                 .sql(&sql)
@@ -2472,25 +2195,18 @@ mod tests {
         let ctx = create_vep_session();
         ctx.register_table("vcf_repeat", Arc::new(repeat_shift_vcf_table()))
             .expect("register repeat vcf");
-        ctx.register_table("var_repeat_cache", Arc::new(repeat_shift_cache_table()))
-            .expect("register repeat cache");
-        ctx.register_table(
-            "var_repeat_cache_transcripts",
-            Arc::new(repeat_shift_transcripts_table()),
-        )
-        .expect("register repeat transcripts");
-        ctx.register_table(
-            "var_repeat_cache_exons",
-            Arc::new(repeat_shift_exons_table()),
-        )
-        .expect("register repeat exons");
+        let tmpdir = TempDir::new().expect("create tmpdir");
+        write_batch_to_cache(&tmpdir, "variation", &repeat_shift_cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &repeat_shift_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &repeat_shift_exons_batch());
+        let cache_path = tmpdir.path().display().to_string();
 
         let expected_terms = ["frameshift_variant"];
 
-        for backend in ["parquet", "fjall"] {
+        {
             let sql = format!(
                 "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_repeat', 'var_repeat_cache', '{backend}')"
+                 FROM annotate_vep('vcf_repeat', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
             );
             let batches = ctx
                 .sql(&sql)
@@ -2517,28 +2233,25 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_translation_parity_handles_negative_strand_synonymous_case() {
-        for backend in ["parquet", "fjall"] {
+        {
             let ctx = create_vep_session();
             ctx.register_table("vcf_neg", Arc::new(neg_strand_vcf_table()))
                 .expect("register negative-strand vcf");
-            ctx.register_table("var_neg_cache", Arc::new(neg_strand_cache_table()))
-                .expect("register negative-strand cache");
-            ctx.register_table(
-                "var_neg_cache_transcripts",
-                Arc::new(neg_strand_transcripts_table()),
-            )
-            .expect("register negative-strand transcripts");
-            ctx.register_table("var_neg_cache_exons", Arc::new(neg_strand_exons_table()))
-                .expect("register negative-strand exons");
-            ctx.register_table(
-                "var_neg_cache_translations",
-                Arc::new(neg_strand_translations_table()),
-            )
-            .expect("register negative-strand translations");
+            let tmpdir = TempDir::new().expect("create tmpdir");
+            write_batch_to_cache(&tmpdir, "variation", &neg_strand_cache_batch());
+            write_batch_to_cache(&tmpdir, "transcript", &neg_strand_transcripts_batch());
+            write_batch_to_chrom(&tmpdir, "exon", "1", &neg_strand_exons_batch());
+            write_batch_to_chrom(
+                &tmpdir,
+                "translation_core",
+                "1",
+                &neg_strand_translations_batch(),
+            );
+            let cache_path = tmpdir.path().display().to_string();
 
             let sql = format!(
                 "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_neg', 'var_neg_cache', '{backend}')"
+                 FROM annotate_vep('vcf_neg', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
             );
             let df = ctx.sql(&sql).await.expect("query should parse");
             let batches = df.collect().await.expect("collect annotate_vep");
@@ -2554,38 +2267,32 @@ mod tests {
             assert_eq!(
                 most[0],
                 Some("synonymous_variant".to_string()),
-                "backend={backend}"
+                "backend=parquet"
             );
         }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_translation_parity_handles_inframe_stop_loss_case() {
-        for backend in ["parquet", "fjall"] {
+        {
             let ctx = create_vep_session();
             ctx.register_table("vcf_stop_loss", Arc::new(stop_loss_vcf_table()))
                 .expect("register stop-loss vcf");
-            ctx.register_table("var_stop_loss_cache", Arc::new(stop_loss_cache_table()))
-                .expect("register stop-loss cache");
-            ctx.register_table(
-                "var_stop_loss_cache_transcripts",
-                Arc::new(stop_loss_transcripts_table()),
-            )
-            .expect("register stop-loss transcripts");
-            ctx.register_table(
-                "var_stop_loss_cache_exons",
-                Arc::new(stop_loss_exons_table()),
-            )
-            .expect("register stop-loss exons");
-            ctx.register_table(
-                "var_stop_loss_cache_translations",
-                Arc::new(stop_loss_translations_table()),
-            )
-            .expect("register stop-loss translations");
+            let tmpdir = TempDir::new().expect("create tmpdir");
+            write_batch_to_cache(&tmpdir, "variation", &stop_loss_cache_batch());
+            write_batch_to_cache(&tmpdir, "transcript", &stop_loss_transcripts_batch());
+            write_batch_to_chrom(&tmpdir, "exon", "1", &stop_loss_exons_batch());
+            write_batch_to_chrom(
+                &tmpdir,
+                "translation_core",
+                "1",
+                &stop_loss_translations_batch(),
+            );
+            let cache_path = tmpdir.path().display().to_string();
 
             let sql = format!(
                 "SELECT csq, most_severe_consequence \
-                 FROM annotate_vep('vcf_stop_loss', 'var_stop_loss_cache', '{backend}')"
+                 FROM annotate_vep('vcf_stop_loss', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
             );
             let df = ctx.sql(&sql).await.expect("query should parse");
             let batches = df.collect().await.expect("collect annotate_vep");
@@ -2601,26 +2308,27 @@ mod tests {
             assert_eq!(
                 most[0],
                 Some("inframe_deletion".to_string()),
-                "backend={backend}"
+                "backend=parquet"
             );
         }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_csq_has_74_pipe_delimited_fields_per_transcript() {
-        for backend in ["parquet", "fjall"] {
+        {
             let ctx = create_vep_session();
             ctx.register_table("vcf_data", Arc::new(vcf_table()))
                 .expect("register vcf table");
-            ctx.register_table("var_cache", Arc::new(cache_table()))
-                .expect("register cache table");
-            ctx.register_table("var_cache_transcripts", Arc::new(transcripts_table()))
-                .expect("register transcripts table");
-            ctx.register_table("var_cache_exons", Arc::new(exons_table()))
-                .expect("register exons table");
+            let tmpdir = TempDir::new().expect("create tmpdir");
+            write_batch_to_cache(&tmpdir, "variation", &cache_batch());
+            write_batch_to_cache(&tmpdir, "transcript", &transcripts_batch());
+            write_batch_to_chrom(&tmpdir, "exon", "1", &exons_batch());
+            write_batch_to_chrom(&tmpdir, "exon", "2", &exons_batch());
+            let cache_path = tmpdir.path().display().to_string();
+            let backend = "parquet";
 
             let sql = format!(
-                "SELECT csq FROM annotate_vep('vcf_data', 'var_cache', '{backend}') \
+                "SELECT csq FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', '{{\"partitioned\":true}}') \
                  ORDER BY chrom"
             );
             let df = ctx.sql(&sql).await.expect("query should parse");

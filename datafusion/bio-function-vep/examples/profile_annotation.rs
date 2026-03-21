@@ -96,10 +96,14 @@ async fn main() -> Result<()> {
         t_sample.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Detect if cache_dir is a fjall cache (directory with keyspaces/) or parquet directory.
+    // Detect cache layout: fjall (keyspaces/), partitioned parquet (variation/), or flat parquet.
     let is_fjall = cache_dir.join("keyspaces").is_dir();
+    let is_partitioned = !is_fjall && cache_dir.join("variation").is_dir();
     let backend = if is_fjall { "fjall" } else { "parquet" };
     eprintln!("[PREP] Backend: {}", backend);
+    if is_partitioned {
+        eprintln!("[PREP] Layout: partitioned per-chromosome");
+    }
 
     let (variation_path_str, context_dir, base) = if is_fjall {
         // Fjall: cache_dir IS the fjall database path.
@@ -113,8 +117,17 @@ async fn main() -> Result<()> {
             .map(|f| extract_base(&f))
             .unwrap_or_default();
         (cache_dir.display().to_string(), context, base_name)
+    } else if is_partitioned {
+        // Partitioned parquet: cache_dir contains variation/, transcript/, etc.
+        // Pass the directory itself as cache_source — PartitionedParquetCache::detect()
+        // in AnnotateProvider::scan() handles registration per contig.
+        (
+            cache_dir.display().to_string(),
+            cache_dir.clone(),
+            String::new(),
+        )
     } else {
-        // Parquet: find variation parquet in cache_dir.
+        // Flat parquet: find variation parquet in cache_dir.
         let variation_file = find_parquet(&cache_dir, "variation")?;
         let base_name = extract_base(&variation_file);
         let variation_path = cache_dir.join(&variation_file);
@@ -141,8 +154,9 @@ async fn main() -> Result<()> {
 
     // Register variation cache.
     // For fjall: the UDTF opens the DB internally — don't pre-register.
-    // For parquet: register as a DataFusion table for SQL access.
-    if !is_fjall {
+    // For partitioned: PartitionedParquetCache handles per-contig registration.
+    // For flat parquet: register as a DataFusion table for SQL access.
+    if !is_fjall && !is_partitioned {
         ctx.register_parquet(
             "variation_cache",
             &variation_path_str,
@@ -153,25 +167,46 @@ async fn main() -> Result<()> {
 
     let mut options = Vec::new();
 
-    // Register context tables.
-    // Try translation_core first, then fall back to translation (unsplit layout).
-    let context_tables = [
-        ("transcript", "transcripts_table"),
-        ("exon", "exons_table"),
-        ("translation_core", "translations_table"),
-        ("regulatory", "regulatory_table"),
-        ("motif", "motif_table"),
-    ];
-    for (file_stem, json_key) in &context_tables {
-        let stem_result = find_parquet_stem(&context_dir, file_stem, &base).or_else(|_| {
-            // Fallback: "translation_core" -> "translation" for unsplit layout
-            if *file_stem == "translation_core" {
-                find_parquet_stem(&context_dir, "translation", &base)
-            } else {
-                Err(DataFusionError::Execution("not found".to_string()))
+    if is_partitioned {
+        // Partitioned path: context tables are handled internally per contig.
+        // Signal partitioned mode explicitly.
+        options.push("\"partitioned\":true".to_string());
+        eprintln!("[PREP] Partitioned mode — context tables loaded per contig internally");
+    } else {
+        // Register context tables (flat layout).
+        // Try translation_core first, then fall back to translation (unsplit layout).
+        let context_tables = [
+            ("transcript", "transcripts_table"),
+            ("exon", "exons_table"),
+            ("translation_core", "translations_table"),
+            ("regulatory", "regulatory_table"),
+            ("motif", "motif_table"),
+        ];
+        for (file_stem, json_key) in &context_tables {
+            let stem_result = find_parquet_stem(&context_dir, file_stem, &base).or_else(|_| {
+                // Fallback: "translation_core" -> "translation" for unsplit layout
+                if *file_stem == "translation_core" {
+                    find_parquet_stem(&context_dir, "translation", &base)
+                } else {
+                    Err(DataFusionError::Execution("not found".to_string()))
+                }
+            });
+            if let Ok(filename) = stem_result {
+                let table_name = filename.trim_end_matches(".parquet");
+                let path = context_dir.join(&filename);
+                ctx.register_parquet(
+                    table_name,
+                    path.display().to_string().as_str(),
+                    ParquetReadOptions::default(),
+                )
+                .await?;
+                options.push(format!("\"{}\":\"{}\"", json_key, sql_literal(table_name)));
+                eprintln!("[PREP] Registered {} -> {}", json_key, filename);
             }
-        });
-        if let Ok(filename) = stem_result {
+        }
+
+        // Register translation_sift separately for sift/polyphen window loading.
+        if let Ok(filename) = find_parquet_stem(&context_dir, "translation_sift", &base) {
             let table_name = filename.trim_end_matches(".parquet");
             let path = context_dir.join(&filename);
             ctx.register_parquet(
@@ -180,26 +215,12 @@ async fn main() -> Result<()> {
                 ParquetReadOptions::default(),
             )
             .await?;
-            options.push(format!("\"{}\":\"{}\"", json_key, sql_literal(table_name)));
-            eprintln!("[PREP] Registered {} -> {}", json_key, filename);
+            options.push(format!(
+                "\"translations_sift_table\":\"{}\"",
+                sql_literal(table_name)
+            ));
+            eprintln!("[PREP] Registered translations_sift_table -> {}", filename);
         }
-    }
-
-    // Register translation_sift separately for sift/polyphen window loading.
-    if let Ok(filename) = find_parquet_stem(&context_dir, "translation_sift", &base) {
-        let table_name = filename.trim_end_matches(".parquet");
-        let path = context_dir.join(&filename);
-        ctx.register_parquet(
-            table_name,
-            path.display().to_string().as_str(),
-            ParquetReadOptions::default(),
-        )
-        .await?;
-        options.push(format!(
-            "\"translations_sift_table\":\"{}\"",
-            sql_literal(table_name)
-        ));
-        eprintln!("[PREP] Registered translations_sift_table -> {}", filename);
     }
 
     options.push("\"extended_probes\":true".to_string());

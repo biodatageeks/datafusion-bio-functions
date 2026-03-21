@@ -8,7 +8,7 @@
 //! - Emits unmatched VCF rows with NULL cache columns (LEFT JOIN semantics)
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::io::{BufRead, Seek};
 use std::pin::Pin;
@@ -761,8 +761,12 @@ struct CacheIndices {
 enum StreamState {
     /// Collecting VCF (build) batches.
     CollectBuild,
-    /// Processing cache (probe) batches.
+    /// Processing cache (probe) batches — matched rows are buffered, not
+    /// emitted, so that the colocated sink is fully populated before any
+    /// downstream consumer sees the first batch.
     ProcessProbe,
+    /// Emitting buffered matched rows (probe complete, sink is final).
+    EmitMatched,
     /// Emitting unmatched build rows.
     EmitUnmatched,
     /// Done.
@@ -809,6 +813,12 @@ struct VariantLookupStream {
     colocated_sink: Option<ColocatedSink>,
     /// Cached column indices for co-located collection.
     coloc_indices: Option<ColocIndices>,
+    /// Matched batches buffered during probe (emitted after probe completes
+    /// so that the colocated sink is fully populated).
+    /// Note: peaks at the full chromosome result set size (~300K rows for
+    /// chr1 WGS). This is inherent — the colocated sink must be complete
+    /// before downstream annotation can use it.
+    matched_batches: VecDeque<RecordBatch>,
 }
 
 impl VariantLookupStream {
@@ -842,6 +852,7 @@ impl VariantLookupStream {
             cache_indices: None,
             colocated_sink,
             coloc_indices: None,
+            matched_batches: VecDeque::new(),
         }
     }
 
@@ -1563,7 +1574,12 @@ impl Stream for VariantLookupStream {
                                 continue;
                             }
                             match self.process_probe_batch(&batch) {
-                                Ok(Some(output)) => return Poll::Ready(Some(Ok(output))),
+                                Ok(Some(output)) => {
+                                    // Buffer matched rows — don't emit yet.
+                                    // The colocated sink is still being populated.
+                                    self.matched_batches.push_back(output);
+                                    continue;
+                                }
                                 Ok(None) => continue,
                                 Err(e) => return Poll::Ready(Some(Err(e))),
                             }
@@ -1571,11 +1587,20 @@ impl Stream for VariantLookupStream {
                         Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                         Poll::Ready(None) => {
                             self.cache_stream = None;
-                            self.state = StreamState::EmitUnmatched;
+                            // Probe complete — colocated sink is final.
+                            self.state = StreamState::EmitMatched;
                             continue;
                         }
                         Poll::Pending => return Poll::Pending,
                     }
+                }
+                StreamState::EmitMatched => {
+                    if let Some(batch) = self.matched_batches.pop_front() {
+                        return Poll::Ready(Some(Ok(batch)));
+                    }
+                    // All matched emitted — continue to unmatched.
+                    self.state = StreamState::EmitUnmatched;
+                    continue;
                 }
                 StreamState::EmitUnmatched => {
                     self.state = StreamState::Done;

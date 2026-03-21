@@ -29,7 +29,7 @@ parquet = { version = "56", features = ["arrow"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "45562f3beb230c23008b19bfe6c172bd1c5923fa" }
+datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "e92ff6fa169d611d67e280551cd3e1a037254093" }
 noodles-vcf = { git = "https://github.com/biodatageeks/noodles.git", rev = "9b7b2c5b6531373918302d4c07410e583f1b5b5c" }
 env_logger = "0.11"
 tempfile = "3"

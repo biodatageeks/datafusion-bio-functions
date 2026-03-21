@@ -19,6 +19,21 @@ pub struct MissWorklist {
 }
 
 impl MissWorklist {
+    /// Build a single-chrom worklist without scanning base_batches.
+    ///
+    /// Used by the partitioned path where the per-chrom parquet file IS the
+    /// filter, so no variant scanning is needed. The `expanded_chroms()` set
+    /// will cover both bare and "chr"-prefixed forms.
+    pub fn for_chrom(chrom: &str) -> Self {
+        let bare = chrom.strip_prefix("chr").unwrap_or(chrom).to_string();
+        let mut chroms = HashSet::new();
+        chroms.insert(bare);
+        MissWorklist {
+            chroms,
+            intervals: HashMap::new(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.chroms.is_empty()
     }

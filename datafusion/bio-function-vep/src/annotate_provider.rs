@@ -9,11 +9,14 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Seek};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskCtx, Poll};
 use std::time::Instant;
 
 /// Returns true when VEP_PROFILE env var is set (any value).
@@ -61,8 +64,15 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{MemTable, TableProvider, TableType};
+use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties,
+};
+use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext, col, lit};
+use futures::{Future, Stream};
 use noodles_core::{Position, Region};
 use noodles_fasta as fasta;
 use serde_json::Value;
@@ -76,6 +86,7 @@ use crate::config;
 use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
+use crate::partitioned_cache::PartitionedParquetCache;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
@@ -137,6 +148,10 @@ pub const CACHE_OUTPUT_COLUMNS: &[&str] = &[
     "cosmic_ids",
     "dbsnp_ids",
 ];
+
+/// Number of annotation columns appended after VCF fields by `AnnotateProvider::new`:
+/// `csq` + `most_severe_consequence` + all `CACHE_OUTPUT_COLUMNS`.
+const ANNOTATION_COLUMN_COUNT: usize = 2 + CACHE_OUTPUT_COLUMNS.len();
 
 /// AF column definition: how to read, emit, and name each frequency population.
 struct AfColumn {
@@ -1390,68 +1405,6 @@ impl AnnotateProvider {
         }
     }
 
-    async fn resolve_cache_table_name(&self) -> Result<String> {
-        if self.session.table(&self.cache_source).await.is_ok() {
-            return Ok(self.cache_source.clone());
-        }
-
-        let table_name = self.generated_cache_table_name();
-        if self.session.table(&table_name).await.is_ok() {
-            return Ok(table_name);
-        }
-
-        match self.backend {
-            AnnotationBackend::Parquet => {
-                self.session
-                    .register_parquet(
-                        &table_name,
-                        &self.cache_source,
-                        ParquetReadOptions::default(),
-                    )
-                    .await?;
-            }
-            AnnotationBackend::Fjall => {
-                #[cfg(feature = "kv-cache")]
-                {
-                    let annotation_config = config::resolve(&self.session);
-                    let cache_size_bytes =
-                        annotation_config.cache_size_mb.saturating_mul(1024 * 1024);
-                    let provider = KvCacheTableProvider::open_with_cache_size(
-                        &self.cache_source,
-                        cache_size_bytes,
-                    )
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "annotate_vep(): failed to open fjall cache '{}': {e}",
-                            self.cache_source
-                        ))
-                    })?;
-                    self.session
-                        .register_table(&table_name, Arc::new(provider))?;
-                }
-                #[cfg(not(feature = "kv-cache"))]
-                {
-                    return Err(DataFusionError::Execution(
-                        "annotate_vep(): fjall backend requires kv-cache feature".to_string(),
-                    ));
-                }
-            }
-        }
-
-        Ok(table_name)
-    }
-
-    fn generated_cache_table_name(&self) -> String {
-        let mut hasher = DefaultHasher::new();
-        self.backend.as_str().hash(&mut hasher);
-        self.cache_source.hash(&mut hasher);
-        format!(
-            "__annotate_cache_{}_{:x}",
-            self.backend.as_str(),
-            hasher.finish()
-        )
-    }
-
     fn escaped_sql_literal(value: &str) -> String {
         value.replace('\'', "''")
     }
@@ -1460,7 +1413,7 @@ impl AnnotateProvider {
         self.schema
             .fields()
             .len()
-            .saturating_sub(2 + CACHE_OUTPUT_COLUMNS.len())
+            .saturating_sub(ANNOTATION_COLUMN_COUNT)
     }
 
     fn vcf_field_names(&self) -> Vec<String> {
@@ -1623,69 +1576,6 @@ impl AnnotateProvider {
                 ))
             })?;
         Ok(())
-    }
-
-    async fn resolve_transcript_context_tables(
-        &self,
-        cache_table: &str,
-    ) -> Result<Option<(String, String)>> {
-        let mut candidates: Vec<(String, String)> = Vec::new();
-
-        if let Some(options) = self.options_json.as_deref() {
-            let tx = Self::parse_json_string_option(options, "transcripts_table");
-            let ex = Self::parse_json_string_option(options, "exons_table");
-            if let (Some(tx_table), Some(exon_table)) = (tx, ex) {
-                candidates.push((tx_table, exon_table));
-            }
-        }
-
-        candidates.push((
-            format!("{cache_table}_transcripts"),
-            format!("{cache_table}_exons"),
-        ));
-
-        if cache_table != self.cache_source {
-            candidates.push((
-                format!("{}_transcripts", self.cache_source),
-                format!("{}_exons", self.cache_source),
-            ));
-        }
-
-        for (tx_table, exon_table) in candidates {
-            if self.session.table(&tx_table).await.is_ok()
-                && self.session.table(&exon_table).await.is_ok()
-            {
-                return Ok(Some((tx_table, exon_table)));
-            }
-        }
-        Ok(None)
-    }
-
-    async fn resolve_optional_context_table(
-        &self,
-        options_key: &str,
-        cache_table: &str,
-        suffix: &str,
-    ) -> Result<Option<String>> {
-        if let Some(options) = self.options_json.as_deref() {
-            if let Some(name) = Self::parse_json_string_option(options, options_key) {
-                if self.session.table(&name).await.is_ok() {
-                    return Ok(Some(name));
-                }
-            }
-        }
-
-        let primary = format!("{cache_table}_{suffix}");
-        if self.session.table(&primary).await.is_ok() {
-            return Ok(Some(primary));
-        }
-        if cache_table != self.cache_source {
-            let secondary = format!("{}_{}", self.cache_source, suffix);
-            if self.session.table(&secondary).await.is_ok() {
-                return Ok(Some(secondary));
-            }
-        }
-        Ok(None)
     }
 
     async fn projected_columns_for_table(
@@ -2652,47 +2542,89 @@ impl AnnotateProvider {
         Ok(out)
     }
 
-    async fn scan_with_transcript_engine(
+    /// Discover contigs present in the VCF input.
+    ///
+    /// Prefers `"bio.vcf.contigs.indexed"` (TBI-derived, data-bearing only,
+    /// zero cost), then falls back to `SELECT DISTINCT chrom` which scans
+    /// the VCF but returns only contigs with actual data.
+    ///
+    /// Does NOT use `"bio.vcf.contigs"` (all VCF header contigs) because
+    /// GRCh38 headers list ~195 contigs even when only 1–22 have data.
+    async fn discover_vcf_contigs(&self) -> Result<Vec<String>> {
+        let table = self.session.table(&self.vcf_table).await?;
+        let schema = table.schema();
+        let arrow_schema = schema.as_arrow();
+        let metadata = arrow_schema.metadata();
+
+        // Priority 1: TBI-indexed contigs (only data-bearing contigs, zero cost).
+        if let Some(indexed_json) = metadata.get("bio.vcf.contigs.indexed") {
+            if let Ok(contigs) = serde_json::from_str::<Vec<String>>(indexed_json) {
+                if !contigs.is_empty() {
+                    return Ok(contigs);
+                }
+            }
+        }
+
+        // Priority 2: scan chrom column for actual data-bearing contigs.
+        let query = format!(
+            "SELECT DISTINCT chrom FROM `{}`",
+            Self::escaped_sql_literal(&self.vcf_table)
+        );
+        let batches = self.session.sql(&query).await?.collect().await?;
+        let mut contigs = Vec::new();
+        for batch in &batches {
+            let col = batch.column(0);
+            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        contigs.push(arr.value(i).to_string());
+                    }
+                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        contigs.push(arr.value(i).to_string());
+                    }
+                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        contigs.push(arr.value(i).to_string());
+                    }
+                }
+            }
+        }
+        Ok(contigs)
+    }
+
+    /// Partitioned per-contig annotation pipeline.
+    ///
+    /// For each contig discovered in the VCF:
+    /// 1. Register per-chrom variation parquet, run lookup
+    /// 2. Register per-chrom context parquet (transcript, exon, etc.)
+    /// 3. Load context, build PreparedContext, annotate
+    /// 4. Deregister ephemeral tables, free memory
+    /// 5. Collect annotated batches
+    async fn scan_with_transcript_engine_partitioned(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         requested_columns: &[&str],
         extended_probes: bool,
-        cache_table: &str,
-        transcripts_table: Option<&str>,
-        exons_table: Option<&str>,
-        translations_table: Option<&str>,
-        regulatory_table: Option<&str>,
-        motif_table: Option<&str>,
-        mirna_table: Option<&str>,
-        sv_table: Option<&str>,
+        cache: &PartitionedParquetCache,
+        translations_sift_table: Option<&str>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let t_total = profile_start!();
         if profiling_enabled() {
-            eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine START ======");
+            eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned START ======");
         }
+
         let flags = VepFlags::from_options_json(self.options_json.as_deref());
         let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
-
-        // Build the lookup plan directly (bypassing SQL) so we can attach
-        // a co-located data sink that piggybacks on the same cache scan.
-        let coloc_sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
-
-        let vcf_schema = self
-            .session
-            .table(&self.vcf_table)
-            .await?
-            .schema()
-            .as_arrow()
-            .clone();
-        let cache_schema = self
-            .session
-            .table(cache_table)
-            .await?
-            .schema()
-            .as_arrow()
-            .clone();
-        let cache_columns: Vec<String> = requested_columns.iter().map(|s| s.to_string()).collect();
+        let merged = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
+            .unwrap_or(false);
         let allowed_failed = self
             .options_json
             .as_deref()
@@ -2703,540 +2635,78 @@ impl AnnotateProvider {
             .as_deref()
             .and_then(|opts| Self::parse_json_string_option(opts, "reference_fasta_path"));
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
-        let mut hgvs_reference_reader = if hgvs_flags.any() && hgvs_flags.shift_hgvs {
-            reference_fasta_path
-                .as_deref()
-                .map(|path| {
-                    fasta::io::indexed_reader::Builder::default()
-                        .build_from_path(path)
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "failed to open indexed reference FASTA '{path}': {e}"
-                            ))
-                        })
-                })
-                .transpose()?
-        } else {
-            None
-        };
-        let mut provider = LookupProvider::new(
-            Arc::clone(&self.session),
-            self.vcf_table.clone(),
-            cache_table.to_string(),
-            vcf_schema,
-            cache_schema,
-            cache_columns,
-            extended_probes,
-            allowed_failed,
-            None,
-        )?;
-        if flags.check_existing {
-            provider.set_colocated_sink(Arc::clone(&coloc_sink));
-        }
-
-        let t_var = profile_start!();
-        let plan = provider.scan(state, None, &[], None).await?;
-        let task_ctx = self.session.task_ctx();
-        let base_batches = datafusion::physical_plan::collect(plan, task_ctx).await?;
-        let total_vcf_rows: usize = base_batches.iter().map(|b| b.num_rows()).sum();
-        profile_end!(
-            "1. variation_lookup (scan+collect)",
-            t_var,
-            format!(
-                "{} VCF rows, {} batches",
-                total_vcf_rows,
-                base_batches.len()
-            )
-        );
-
-        let t_intervals = profile_start!();
-        let input_variant_intervals = collect_input_variant_intervals(&base_batches)?;
-        let indel_variant_intervals = collect_indel_variant_intervals(&base_batches)?;
-        profile_end!("2. collect_variant_intervals", t_intervals);
-
-        // Build co-located variant aggregation from the piggybacked sink.
-        // Both parquet and fjall backends populate the sink during lookup.
-        let t_coloc = profile_start!();
-        let colocated_map = if flags.check_existing {
-            let guard = coloc_sink.lock().unwrap();
-            build_colocated_map_from_sink(&guard)
-        } else {
-            HashMap::new()
-        };
-        profile_end!(
-            "3. colocated_map_build",
-            t_coloc,
-            format!("{} entries", colocated_map.len())
-        );
-
-        let mut cache_hit_count = 0usize;
-        let mut cache_miss_count = 0usize;
-        let worklist =
-            collect_miss_worklist(&base_batches, &mut cache_hit_count, &mut cache_miss_count)?;
-        let has_cache_misses = !worklist.is_empty();
-        if profiling_enabled() {
-            let hit_rate = if total_vcf_rows > 0 {
-                cache_hit_count as f64 / total_vcf_rows as f64 * 100.0
-            } else {
-                0.0
-            };
-            eprintln!(
-                "[VEP_PROFILE] cache hits: {}, misses: {}, hit rate: {:.1}%",
-                cache_hit_count, cache_miss_count, hit_rate
-            );
-        }
-
-        let t_ctx_load = profile_start!();
-        let (
-            mut transcripts,
-            translateable_seq_by_tx,
-            exons,
-            mut translations,
-            regulatory,
-            motifs,
-            mirnas,
-            structural,
-        ) = if has_cache_misses {
-            let merged = self
-                .options_json
-                .as_deref()
-                .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
-                .unwrap_or(false);
-
-            let t_tx = profile_start!();
-            let (tx, translateable_seq_by_tx) = if let Some(table) = transcripts_table {
-                let (tx, translateable_seq_by_tx) = self.load_transcripts(table, &worklist).await?;
-                (
-                    tx.into_iter()
-                        .filter(|t| is_vep_transcript(&t.transcript_id, merged))
-                        .collect::<Vec<_>>(),
-                    translateable_seq_by_tx,
-                )
-            } else {
-                (Vec::new(), HashMap::new())
-            };
-            profile_end!(
-                "4a. load_transcripts",
-                t_tx,
-                format!("{} transcripts", tx.len())
-            );
-
-            let tx_ids: HashSet<String> = tx.iter().map(|t| t.transcript_id.clone()).collect();
-            let tx_id_refs: Vec<&str> = tx_ids.iter().map(|s| s.as_str()).collect();
-
-            // Try fjall context keyspaces (O(1) per-transcript) before falling
-            // back to Parquet SQL.  Reuse the Database handle from the variation
-            // cache that is already opened by KvCacheTableProvider.
-            #[cfg(feature = "kv-cache")]
-            let (exon_kv, translation_kv): (
-                Option<crate::kv_cache::ExonKvStore>,
-                Option<crate::kv_cache::TranslationKvStore>,
-            ) = {
-                let pair = self
-                    .session
-                    .table_provider(cache_table)
-                    .await
-                    .ok()
-                    .and_then(|provider| {
-                        provider
-                            .as_any()
-                            .downcast_ref::<KvCacheTableProvider>()
-                            .map(|kv| kv.store().database().clone())
-                    });
-                match pair {
-                    Some(db) => (
-                        crate::kv_cache::ExonKvStore::open(&db).ok().flatten(),
-                        crate::kv_cache::TranslationKvStore::open(&db)
-                            .ok()
-                            .flatten(),
-                    ),
-                    None => (None, None),
-                }
-            };
-            #[cfg(not(feature = "kv-cache"))]
-            let (exon_kv, translation_kv): (Option<()>, Option<()>) = (None, None);
-
-            let t_ex = profile_start!();
-            let ex = if let Some(ref ex_kv) = exon_kv {
-                ex_kv.get_many(&tx_id_refs)?
-            } else if let Some(table) = exons_table {
-                let raw = self.load_exons(table, &worklist).await?;
-                raw.into_iter()
-                    .filter(|e| tx_ids.contains(&e.transcript_id))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            profile_end!(
-                "4b. load_exons",
-                t_ex,
-                format!("{} exons (kv={})", ex.len(), exon_kv.is_some())
-            );
-
-            let t_tl = profile_start!();
-            let tl = if let Some(ref tl_kv) = translation_kv {
-                tl_kv.get_many(&tx_id_refs)?
-            } else if let Some(table) = translations_table {
-                let raw = self.load_translations(table, &worklist).await?;
-                raw.into_iter()
-                    .filter(|t| tx_ids.contains(&t.transcript_id))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            profile_end!(
-                "4c. load_translations",
-                t_tl,
-                format!(
-                    "{} translations (kv={})",
-                    tl.len(),
-                    translation_kv.is_some()
-                )
-            );
-
-            let t_rg = profile_start!();
-            let rg = if let Some(table) = regulatory_table {
-                self.load_regulatory_features(table, &worklist).await?
-            } else {
-                Vec::new()
-            };
-            profile_end!(
-                "4d. load_regulatory",
-                t_rg,
-                format!("{} features", rg.len())
-            );
-
-            let t_mt = profile_start!();
-            let mt = if let Some(table) = motif_table {
-                self.load_motif_features(table, &worklist).await?
-            } else {
-                Vec::new()
-            };
-            profile_end!("4e. load_motif", t_mt);
-
-            let t_mi = profile_start!();
-            let mi = if let Some(table) = mirna_table {
-                self.load_mirna_features(table, &worklist).await?
-            } else {
-                Vec::new()
-            };
-            profile_end!("4f. load_mirna", t_mi);
-
-            let t_st = profile_start!();
-            let st = if let Some(table) = sv_table {
-                self.load_structural_features(table, &worklist).await?
-            } else {
-                Vec::new()
-            };
-            profile_end!("4g. load_structural", t_st);
-            (tx, translateable_seq_by_tx, ex, tl, rg, mt, mi, st)
-        } else {
-            (
-                Vec::new(),
-                HashMap::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            )
-        };
-        profile_end!("4. context_tables_total", t_ctx_load);
-
-        let t_hydrate = profile_start!();
-        let hydrated_transcript_ids = if let Some(reader) = hgvs_reference_reader.as_mut() {
-            hydrate_refseq_translation_cds_from_reference(
-                reader,
-                &transcripts,
-                &exons,
-                &mut translations,
-                &input_variant_intervals,
-            )?
-        } else {
-            HashSet::new()
-        };
-        apply_translateable_seq_overrides(
-            &mut translations,
-            &translateable_seq_by_tx,
-            &hydrated_transcript_ids,
-        );
-        profile_end!(
-            "5a. hydrate_refseq_cds",
-            t_hydrate,
-            format!("{} hydrated", hydrated_transcript_ids.len())
-        );
-
-        let t_cdna = profile_start!();
-        // Hydrate full spliced cDNA on transcripts that lack spliced_seq so
-        // that three_prime_utr_seq() can find the UTR for stop-loss/frameshift
-        // extension distance computation.
-        if let Some(reader) = hgvs_reference_reader.as_mut() {
-            hydrate_transcript_cdna_from_reference(
-                reader,
-                &mut transcripts,
-                &exons,
-                &indel_variant_intervals,
-                &input_variant_intervals,
-            )?;
-        }
-        profile_end!("5b. hydrate_transcript_cdna", t_cdna);
-
-        let t_prep = profile_start!();
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
-        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
-            upstream_distance,
-            downstream_distance,
-            hgvs_flags.shift_hgvs,
-        );
-        let ctx = PreparedContext::new(
-            &transcripts,
-            &exons,
-            &translations,
-            &regulatory,
-            &motifs,
-            &mirnas,
-            &structural,
-        );
+
+        // Discover contigs from VCF.
+        let t_contigs = profile_start!();
+        let vcf_contigs = self.discover_vcf_contigs().await?;
+        // Build expanded cache chrom set with both bare and chr-prefixed forms
+        // so that VCF "chr1" matches cache "1" and vice versa.
+        let mut cache_chroms: HashSet<String> = HashSet::new();
+        for c in cache.available_chroms() {
+            cache_chroms.insert(c.clone());
+            if let Some(bare) = c.strip_prefix("chr") {
+                cache_chroms.insert(bare.to_string());
+            } else {
+                cache_chroms.insert(format!("chr{c}"));
+            }
+        }
+        let contigs: Vec<String> = vcf_contigs
+            .iter()
+            .filter(|c| cache_chroms.contains(c.as_str()))
+            .cloned()
+            .collect();
         profile_end!(
-            "6. prepared_context_build",
-            t_prep,
-            format!("{} tx_trees chroms", ctx.tx_trees.len())
-        );
-
-        // Build SIFT/PolyPhen prediction cache using lazy sliding windows.
-        //
-        // Instead of loading all translations upfront, windows are loaded
-        // lazily as the annotation batch loop advances through genomic
-        // positions. SQL queries only fire when a batch crosses a 5MB window
-        // boundary. Entries whose genomic end falls behind the current batch
-        // are evicted (safe because VCF is position-sorted).
-        //
-        // See biodatageeks/datafusion-bio-functions#38.
-        let t_sift = profile_start!();
-        let mut sift_cache = SiftPolyphenCache::new();
-
-        // Try fjall sift keyspace first (O(1) per-transcript lookup).
-        // Reuse the Database handle from the variation cache (already opened by KvCacheTableProvider).
-        #[cfg(feature = "kv-cache")]
-        let sift_kv: Option<crate::kv_cache::SiftKvStore> = self
-            .session
-            .table_provider(cache_table)
-            .await
-            .ok()
-            .and_then(|provider| {
-                provider
-                    .as_any()
-                    .downcast_ref::<KvCacheTableProvider>()
-                    .and_then(|kv| {
-                        crate::kv_cache::SiftKvStore::open(kv.store().database())
-                            .ok()
-                            .flatten()
-                    })
-            });
-        #[cfg(not(feature = "kv-cache"))]
-        let sift_kv: Option<()> = None;
-
-        let sift_table_name: Option<String> = if sift_kv.is_some() {
-            None // Don't need parquet sift table when using fjall
-        } else {
-            self.options_json
-                .as_deref()
-                .and_then(|opts| Self::parse_json_string_option(opts, "translations_sift_table"))
-                .or_else(|| translations_table.map(|s| s.to_string()))
-        };
-        let sift_enabled = flags.everything && (sift_table_name.is_some() || sift_kv.is_some());
-        let mut loaded_windows: HashSet<(String, i64)> = HashSet::new();
-        // Try to build a direct parquet reader for sift, bypassing DataFusion SQL.
-        let sift_direct: Option<SiftDirectReader> = if sift_enabled && sift_kv.is_none() {
-            let Some(table_name) = sift_table_name.as_deref() else {
-                return Err(DataFusionError::Execution(
-                    "sift enabled but no sift table or fjall sift keyspace available".to_string(),
-                ));
-            };
-            // Resolve file path: try cache_source parent dir + table_name.parquet
-            let cache_dir = std::path::Path::new(&self.cache_source)
-                .parent()
-                .map(|p| p.to_path_buf());
-            cache_dir.and_then(|dir| {
-                let path = dir.join(format!("{table_name}.parquet"));
-                if path.exists() {
-                    Self::build_sift_direct_reader(path.to_str()?)
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
-        if profiling_enabled() {
-            if sift_kv.is_some() {
-                eprintln!("[VEP_PROFILE] sift_kv_store: enabled (per-transcript fjall lookup)");
-            } else if sift_direct.is_some() {
-                eprintln!("[VEP_PROFILE] sift_direct_reader: enabled (bypassing DataFusion SQL)");
-            }
-        }
-        profile_end!("7. sift_polyphen_cache_init", t_sift);
-
-        let t_annotate = profile_start!();
-        let mut sift_load_ms = 0u128;
-        let mut annotate_ms = 0u128;
-        let mut sift_skipped_batches = 0usize;
-        let mut annotated_batches = Vec::with_capacity(base_batches.len());
-        for batch in &base_batches {
-            // Lazily load SIFT/PolyPhen windows as the batch loop advances.
-            // Gate: skip sift loading for batches where ALL rows are cache hits
-            // (cache_most_severe_consequence is non-null). With the fjall backend
-            // providing ~95%+ hit rates, this skips most batches and reduces
-            // sift window loading from ~24s to ~2s.
-            if sift_enabled && sift_kv.is_none() {
-                // Windowed parquet sift loading (skipped when fjall sift keyspace available).
-                let batch_has_miss = batch
-                    .schema()
-                    .index_of("cache_most_severe_consequence")
-                    .ok()
-                    .map_or(true, |idx| batch.column(idx).null_count() > 0);
-                if !batch_has_miss {
-                    sift_skipped_batches += 1;
-                } else {
-                    let t_sift_win = std::time::Instant::now();
-                    let table = sift_table_name.as_deref().unwrap();
-                    let schema = batch.schema();
-                    if let (Ok(ci), Ok(si), Ok(ei)) = (
-                        schema.index_of("chrom"),
-                        schema.index_of("start"),
-                        schema.index_of("end"),
-                    ) {
-                        // Collect per-chrom min/max positions in this batch.
-                        let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
-                        for row in 0..batch.num_rows() {
-                            if let (Some(c), Some(s), Some(e)) = (
-                                string_at(batch.column(ci).as_ref(), row),
-                                int64_at(batch.column(si).as_ref(), row),
-                                int64_at(batch.column(ei).as_ref(), row),
-                            ) {
-                                let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
-                                let entry = batch_chrom_bounds
-                                    .entry(c_norm)
-                                    .or_insert((i64::MAX, i64::MIN));
-                                entry.0 = entry.0.min(s);
-                                entry.1 = entry.1.max(e);
-                            }
-                        }
-
-                        for (chrom, (batch_min, batch_max)) in &batch_chrom_bounds {
-                            let window_start =
-                                (batch_max / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
-
-                            // Also load the window containing the minimum position
-                            // (may differ from the max window).
-                            let min_window_start =
-                                (batch_min / Self::SIFT_WINDOW_SIZE) * Self::SIFT_WINDOW_SIZE;
-
-                            // Load all windows from the min to the max + next window.
-                            let mut ws = min_window_start;
-                            while ws <= window_start + Self::SIFT_WINDOW_SIZE {
-                                let key = (chrom.clone(), ws);
-                                if !loaded_windows.contains(&key) {
-                                    if let Some(ref direct) = sift_direct {
-                                        direct.load_window(
-                                            chrom,
-                                            ws,
-                                            ws + Self::SIFT_WINDOW_SIZE,
-                                            &mut sift_cache,
-                                        )?;
-                                    } else {
-                                        self.load_sift_window(
-                                            table,
-                                            chrom,
-                                            ws,
-                                            ws + Self::SIFT_WINDOW_SIZE,
-                                            &mut sift_cache,
-                                        )
-                                        .await?;
-                                    }
-                                    loaded_windows.insert(key);
-                                }
-                                ws += Self::SIFT_WINDOW_SIZE;
-                            }
-
-                            // Evict entries whose genomic end is behind the batch
-                            // minimum (position-sorted VCF guarantees no future
-                            // batch will need them).
-                            sift_cache.evict_before(*batch_min);
-                        }
-                    }
-                    sift_load_ms += t_sift_win.elapsed().as_millis();
-                } // end else (batch_has_miss)
-            }
-
-            let t_ann = std::time::Instant::now();
-            annotated_batches.push(self.annotate_batch_with_transcript_engine(
-                batch,
-                &engine,
-                &ctx,
-                &colocated_map,
-                &mut sift_cache,
-                &sift_kv,
-            )?);
-            annotate_ms += t_ann.elapsed().as_millis();
-        }
-        if profiling_enabled() {
-            eprintln!(
-                "[VEP_PROFILE] 7a. sift_lazy_load_only...........................  {sift_load_ms}ms"
-            );
-            eprintln!(
-                "[VEP_PROFILE] 7b. annotate_batches_only.........................  {annotate_ms}ms"
-            );
-            if sift_skipped_batches > 0 {
-                eprintln!(
-                    "[VEP_PROFILE] 7c. sift_skipped_batches (cache hits).............  {sift_skipped_batches}/{} batches",
-                    base_batches.len()
-                );
-            }
-        }
-        profile_end!(
-            "7+8. sift_lazy_load + annotate_batches",
-            t_annotate,
+            "0. discover_contigs",
+            t_contigs,
             format!(
-                "{} batches, {} total rows, {} sift windows loaded",
-                annotated_batches.len(),
-                annotated_batches
-                    .iter()
-                    .map(|b| b.num_rows())
-                    .sum::<usize>(),
-                loaded_windows.len()
+                "{} VCF contigs, {} in cache, {} to process",
+                vcf_contigs.len(),
+                cache.available_chroms().len(),
+                contigs.len()
             )
         );
 
-        let t_project = profile_start!();
-        let projected_batches = if let Some(indices) = projection {
-            let mut out = Vec::with_capacity(annotated_batches.len());
-            for batch in annotated_batches {
-                out.push(batch.project(indices)?);
-            }
-            out
-        } else {
-            annotated_batches
-        };
+        let cache_columns: Vec<String> = requested_columns.iter().map(|s| s.to_string()).collect();
+
         let projected_schema = if let Some(indices) = projection {
             Arc::new(self.schema.project(indices)?)
         } else {
             self.schema.clone()
         };
 
-        let mem = MemTable::try_new(projected_schema, vec![projected_batches])?;
-        let result = mem.scan(state, None, &[], None).await;
-        profile_end!("9. projection + memtable", t_project);
-        profile_end!(
-            "TOTAL scan_with_transcript_engine",
-            t_total,
-            format!("{} VCF rows", total_vcf_rows)
+        let config = ContigAnnotationConfig {
+            vcf_table: self.vcf_table.clone(),
+            options_json: self.options_json.clone(),
+            cache_columns,
+            extended_probes,
+            translations_sift_table: translations_sift_table.map(|s| s.to_string()),
+            flags,
+            hgvs_flags,
+            merged,
+            allowed_failed,
+            reference_fasta_path,
+            upstream_distance,
+            downstream_distance,
+            projection: projection.cloned(),
+        };
+
+        let exec = ContigAnnotationExec::new(
+            projected_schema,
+            self.schema.clone(),
+            contigs,
+            Arc::clone(&self.session),
+            Arc::new(cache.clone()),
+            config,
         );
+
         if profiling_enabled() {
-            eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine END ======");
+            eprintln!(
+                "[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned: returning ContigAnnotationExec ======"
+            );
         }
-        result
+
+        Ok(Arc::new(exec))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3765,8 +3235,7 @@ impl AnnotateProvider {
             most_builder.append_value(&most_str);
         }
 
-        let mut out_cols =
-            Vec::with_capacity(self.vcf_field_count() + 2 + CACHE_OUTPUT_COLUMNS.len());
+        let mut out_cols = Vec::with_capacity(self.vcf_field_count() + ANNOTATION_COLUMN_COUNT);
         for name in self.vcf_field_names() {
             let idx = schema.index_of(&name).map_err(|_| {
                 DataFusionError::Execution(format!(
@@ -4847,6 +4316,917 @@ impl Debug for AnnotateProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Streaming contig-by-contig ExecutionPlan
+// ---------------------------------------------------------------------------
+
+/// Bundled configuration for per-contig annotation (extracted from AnnotateProvider).
+#[derive(Clone)]
+struct ContigAnnotationConfig {
+    vcf_table: String,
+    options_json: Option<String>,
+    cache_columns: Vec<String>,
+    extended_probes: bool,
+    translations_sift_table: Option<String>,
+    flags: VepFlags,
+    hgvs_flags: HgvsFlags,
+    merged: bool,
+    allowed_failed: i64,
+    reference_fasta_path: Option<String>,
+    upstream_distance: i64,
+    downstream_distance: i64,
+    projection: Option<Vec<usize>>,
+}
+
+/// Leaf `ExecutionPlan` that processes contigs one at a time via a state-machine
+/// stream, reclaiming memory after each contig completes.
+struct ContigAnnotationExec {
+    projected_schema: SchemaRef,
+    full_schema: SchemaRef,
+    contigs: Vec<String>,
+    session: Arc<SessionContext>,
+    cache: Arc<PartitionedParquetCache>,
+    config: ContigAnnotationConfig,
+    properties: PlanProperties,
+}
+
+impl ContigAnnotationExec {
+    fn new(
+        projected_schema: SchemaRef,
+        full_schema: SchemaRef,
+        contigs: Vec<String>,
+        session: Arc<SessionContext>,
+        cache: Arc<PartitionedParquetCache>,
+        config: ContigAnnotationConfig,
+    ) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(projected_schema.clone()),
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            projected_schema,
+            full_schema,
+            contigs,
+            session,
+            cache,
+            config,
+            properties,
+        }
+    }
+}
+
+impl Debug for ContigAnnotationExec {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ContigAnnotationExec {{ contigs: {}, schema_fields: {} }}",
+            self.contigs.len(),
+            self.projected_schema.fields().len()
+        )
+    }
+}
+
+impl DisplayAs for ContigAnnotationExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ContigAnnotationExec: contigs={}", self.contigs.len())
+    }
+}
+
+impl ExecutionPlan for ContigAnnotationExec {
+    fn name(&self) -> &str {
+        "ContigAnnotationExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.projected_schema.clone()
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        Ok(Box::pin(ContigAnnotationStream::new(
+            self.projected_schema.clone(),
+            self.full_schema.clone(),
+            self.contigs.clone(),
+            Arc::clone(&self.session),
+            Arc::clone(&self.cache),
+            self.config.clone(),
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State-machine stream — window-based streaming annotation
+// ---------------------------------------------------------------------------
+
+/// Number of lookup batches to accumulate before hydrating + annotating.
+/// Each window triggers a PreparedContext rebuild (~22ms).
+/// With ~30 rows/batch: 1000 batches ≈ 30K variants per window.
+const HYDRATION_WINDOW_SIZE: usize = 1000;
+
+type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
+
+/// Everything needed to start streaming annotation for a contig.
+/// Produced by `prepare_contig_context()`.
+struct ContigReadyState {
+    lookup_stream: SendableRecordBatchStream,
+    coloc_sink: ColocatedSink,
+    transcripts: Vec<TranscriptFeature>,
+    translateable_seq_by_tx: HashMap<String, String>,
+    exons: Vec<ExonFeature>,
+    translations: Vec<TranslationFeature>,
+    regulatory: Vec<RegulatoryFeature>,
+    motifs: Vec<MotifFeature>,
+    mirnas: Vec<MirnaFeature>,
+    structural: Vec<StructuralFeature>,
+    ephemeral_tables: Vec<String>,
+    chrom: String,
+    t_contig: Instant,
+}
+
+/// Mutable annotation state for window-based streaming within a single contig.
+struct ContigAnnotationState {
+    /// Dropped after exhaustion to reclaim BuildSide memory (COITrees, hash
+    /// indices, concatenated VCF batch).
+    lookup_stream: Option<SendableRecordBatchStream>,
+    // Context data (transcripts/translations mutated by HGVS hydration).
+    transcripts: Vec<TranscriptFeature>,
+    translateable_seq_by_tx: HashMap<String, String>,
+    exons: Vec<ExonFeature>,
+    translations: Vec<TranslationFeature>,
+    regulatory: Vec<RegulatoryFeature>,
+    motifs: Vec<MotifFeature>,
+    mirnas: Vec<MirnaFeature>,
+    structural: Vec<StructuralFeature>,
+    // Colocated (built lazily from sink on first window).
+    colocated_map: HashMap<ColocatedKey, ColocatedData>,
+    colocated_map_built: bool,
+    coloc_sink: ColocatedSink,
+    // HGVS hydration tracking — already-hydrated transcripts are skipped.
+    hydrated_cds_tx_ids: HashSet<String>,
+    hgvs_reader: Option<FastaReader>,
+    // SIFT state (same sliding-window pattern as before).
+    sift_cache: SiftPolyphenCache,
+    sift_direct: Option<SiftDirectReader>,
+    loaded_sift_windows: HashSet<(String, i64)>,
+    // Annotation engine + provider.
+    tmp_provider: AnnotateProvider,
+    engine: TranscriptConsequenceEngine,
+    // Window buffer.
+    window_buffer: Vec<RecordBatch>,
+    lookup_done: bool,
+    // Cleanup + profiling.
+    ephemeral_tables: Vec<String>,
+    chrom: String,
+    config: ContigAnnotationConfig,
+    session: Arc<SessionContext>,
+    cache: Arc<PartitionedParquetCache>,
+    t_contig: Instant,
+    contig_rows: usize,
+}
+
+type PrepareFuture = Pin<Box<dyn Future<Output = Result<Option<ContigReadyState>>> + Send>>;
+type CleanupFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+enum StreamState {
+    StartContig,
+    /// Async setup: register tables, parallel context load + lookup stream creation.
+    PreparingContig(PrepareFuture),
+    /// Pull from lookup stream, accumulate windows, hydrate + annotate.
+    AnnotatingContig(ContigAnnotationState),
+    /// Yield annotated batches from the current window, then resume annotation.
+    DrainingWindow {
+        batches: VecDeque<RecordBatch>,
+        annotation_state: ContigAnnotationState,
+    },
+    /// Deregister ephemeral tables after contig completes.
+    CleaningUp(CleanupFuture),
+    /// Deregister ephemeral tables after an error, then propagate the error.
+    ErrorCleaningUp(CleanupFuture, DataFusionError),
+    Done,
+}
+
+/// Spawn an async future to deregister ephemeral tables.
+fn make_cleanup_future(session: Arc<SessionContext>, tables: Vec<String>) -> CleanupFuture {
+    Box::pin(async move {
+        for tbl in &tables {
+            crate::partitioned_cache::deregister_table(&session, tbl).await?;
+        }
+        Ok(())
+    })
+}
+
+struct ContigAnnotationStream {
+    projected_schema: SchemaRef,
+    full_schema: SchemaRef,
+    contigs: VecDeque<String>,
+    session: Arc<SessionContext>,
+    cache: Arc<PartitionedParquetCache>,
+    config: ContigAnnotationConfig,
+    state: StreamState,
+}
+
+impl ContigAnnotationStream {
+    fn new(
+        projected_schema: SchemaRef,
+        full_schema: SchemaRef,
+        contigs: Vec<String>,
+        session: Arc<SessionContext>,
+        cache: Arc<PartitionedParquetCache>,
+        config: ContigAnnotationConfig,
+    ) -> Self {
+        Self {
+            projected_schema,
+            full_schema,
+            contigs: VecDeque::from(contigs),
+            session,
+            cache,
+            config,
+            state: StreamState::StartContig,
+        }
+    }
+}
+
+impl RecordBatchStream for ContigAnnotationStream {
+    fn schema(&self) -> SchemaRef {
+        self.projected_schema.clone()
+    }
+}
+
+/// Hydrate a window of batches: compute variant intervals, hydrate new
+/// transcripts (skip already-hydrated), apply translateable_seq overrides.
+/// Mirrors the SIFT sliding-window pattern.
+fn hydrate_window(
+    transcripts: &mut [TranscriptFeature],
+    exons: &[ExonFeature],
+    translations: &mut [TranslationFeature],
+    translateable_seq_by_tx: &HashMap<String, String>,
+    hgvs_reader: &mut Option<FastaReader>,
+    hydrated_cds_tx_ids: &mut HashSet<String>,
+    window_batches: &[RecordBatch],
+    hgvs_flags: HgvsFlags,
+) -> Result<()> {
+    if !hgvs_flags.any() || !hgvs_flags.shift_hgvs {
+        return Ok(());
+    }
+    let Some(reader) = hgvs_reader.as_mut() else {
+        return Ok(());
+    };
+
+    let input_intervals = collect_input_variant_intervals(window_batches)?;
+    let indel_intervals = collect_indel_variant_intervals(window_batches)?;
+
+    // CDS hydration — skip transcripts already hydrated in previous windows.
+    let newly_hydrated = hydrate_refseq_translation_cds_from_reference(
+        reader,
+        transcripts,
+        exons,
+        translations,
+        &input_intervals,
+    )?;
+    // Merge newly hydrated IDs into cumulative set.
+    let first_window = hydrated_cds_tx_ids.is_empty();
+    hydrated_cds_tx_ids.extend(newly_hydrated.iter().cloned());
+
+    // Apply translateable_seq overrides for newly hydrated transcripts.
+    apply_translateable_seq_overrides(translations, translateable_seq_by_tx, &newly_hydrated);
+
+    // cDNA hydration (already skips transcripts with existing spliced_seq).
+    hydrate_transcript_cdna_from_reference(
+        reader,
+        transcripts,
+        exons,
+        &indel_intervals,
+        &input_intervals,
+    )?;
+
+    if first_window && profiling_enabled() {
+        eprintln!(
+            "[VEP_PROFILE] first window HGVS hydration: {} CDS transcripts",
+            hydrated_cds_tx_ids.len()
+        );
+    }
+    Ok(())
+}
+
+/// Annotate a window of batches: build PreparedContext, run SIFT loading,
+/// annotate each batch, apply projection.
+fn annotate_window(
+    ann: &mut ContigAnnotationState,
+    window_batches: &[RecordBatch],
+    projection: Option<&[usize]>,
+) -> Result<VecDeque<RecordBatch>> {
+    let engine = &ann.engine;
+    let ctx = PreparedContext::new(
+        &ann.transcripts,
+        &ann.exons,
+        &ann.translations,
+        &ann.regulatory,
+        &ann.motifs,
+        &ann.mirnas,
+        &ann.structural,
+    );
+
+    let sift_enabled = ann.config.flags.everything;
+    let mut out = VecDeque::with_capacity(window_batches.len());
+
+    for batch in window_batches {
+        // Lazy SIFT window loading (same pattern as before).
+        if sift_enabled && ann.sift_direct.is_some() {
+            let batch_has_miss = batch
+                .schema()
+                .index_of("cache_most_severe_consequence")
+                .ok()
+                .map_or(true, |idx| batch.column(idx).null_count() > 0);
+            if batch_has_miss {
+                let schema = batch.schema();
+                if let (Ok(ci), Ok(si), Ok(ei)) = (
+                    schema.index_of("chrom"),
+                    schema.index_of("start"),
+                    schema.index_of("end"),
+                ) {
+                    let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
+                    for row in 0..batch.num_rows() {
+                        if let (Some(c), Some(s), Some(e)) = (
+                            string_at(batch.column(ci).as_ref(), row),
+                            int64_at(batch.column(si).as_ref(), row),
+                            int64_at(batch.column(ei).as_ref(), row),
+                        ) {
+                            let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
+                            let entry = batch_chrom_bounds
+                                .entry(c_norm)
+                                .or_insert((i64::MAX, i64::MIN));
+                            entry.0 = entry.0.min(s);
+                            entry.1 = entry.1.max(e);
+                        }
+                    }
+                    for (ch, (batch_min, batch_max)) in &batch_chrom_bounds {
+                        let window_start = (batch_max / AnnotateProvider::SIFT_WINDOW_SIZE)
+                            * AnnotateProvider::SIFT_WINDOW_SIZE;
+                        let min_window_start = (batch_min / AnnotateProvider::SIFT_WINDOW_SIZE)
+                            * AnnotateProvider::SIFT_WINDOW_SIZE;
+                        let mut ws = min_window_start;
+                        while ws <= window_start + AnnotateProvider::SIFT_WINDOW_SIZE {
+                            let key = (ch.clone(), ws);
+                            if !ann.loaded_sift_windows.contains(&key) {
+                                if let Some(ref direct) = ann.sift_direct {
+                                    direct.load_window(
+                                        ch,
+                                        ws,
+                                        ws + AnnotateProvider::SIFT_WINDOW_SIZE,
+                                        &mut ann.sift_cache,
+                                    )?;
+                                }
+                                ann.loaded_sift_windows.insert(key);
+                            }
+                            ws += AnnotateProvider::SIFT_WINDOW_SIZE;
+                        }
+                        ann.sift_cache.evict_before(*batch_min);
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(feature = "kv-cache"))]
+        let sift_kv: Option<()> = None;
+        #[cfg(feature = "kv-cache")]
+        let sift_kv: Option<crate::kv_cache::SiftKvStore> = None;
+
+        let annotated = ann.tmp_provider.annotate_batch_with_transcript_engine(
+            batch,
+            engine,
+            &ctx,
+            &ann.colocated_map,
+            &mut ann.sift_cache,
+            &sift_kv,
+        )?;
+
+        if let Some(indices) = projection {
+            out.push_back(annotated.project(indices)?);
+        } else {
+            out.push_back(annotated);
+        }
+    }
+    Ok(out)
+}
+
+impl Stream for ContigAnnotationStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskCtx<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match &mut self.state {
+                StreamState::Done => return Poll::Ready(None),
+
+                StreamState::StartContig => {
+                    let Some(chrom) = self.contigs.pop_front() else {
+                        self.state = StreamState::Done;
+                        return Poll::Ready(None);
+                    };
+                    let session = Arc::clone(&self.session);
+                    let cache = Arc::clone(&self.cache);
+                    let config = self.config.clone();
+                    let full_schema = self.full_schema.clone();
+
+                    let fut: PrepareFuture = Box::pin(async move {
+                        prepare_contig_context(session, cache, chrom, config, full_schema).await
+                    });
+                    self.state = StreamState::PreparingContig(fut);
+                }
+
+                StreamState::PreparingContig(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => {
+                        self.state = StreamState::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        // Contig skipped (no variation table).
+                        self.state = StreamState::StartContig;
+                    }
+                    Poll::Ready(Ok(Some(ready))) => {
+                        let projected_schema = self.projected_schema.clone();
+                        let full_schema = self.full_schema.clone();
+                        let session = Arc::clone(&self.session);
+                        let cache = Arc::clone(&self.cache);
+                        let config = self.config.clone();
+
+                        // Derive VCF-only schema for AnnotateProvider.
+                        let vcf_field_count = full_schema
+                            .fields()
+                            .len()
+                            .saturating_sub(ANNOTATION_COLUMN_COUNT);
+                        let vcf_only_schema =
+                            Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
+
+                        let tmp_provider = AnnotateProvider::new(
+                            Arc::clone(&session),
+                            config.vcf_table.clone(),
+                            String::new(),
+                            AnnotationBackend::Parquet,
+                            config.options_json.clone(),
+                            vcf_only_schema,
+                        );
+                        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
+                            config.upstream_distance,
+                            config.downstream_distance,
+                            config.hgvs_flags.shift_hgvs,
+                        );
+                        let hgvs_reader = if config.hgvs_flags.any() && config.hgvs_flags.shift_hgvs
+                        {
+                            config.reference_fasta_path.as_deref().and_then(|path| {
+                                fasta::io::indexed_reader::Builder::default()
+                                    .build_from_path(path)
+                                    .ok()
+                            })
+                        } else {
+                            None
+                        };
+                        let sift_direct: Option<SiftDirectReader> = if config.flags.everything {
+                            config
+                                .translations_sift_table
+                                .as_deref()
+                                .and_then(|table| {
+                                    let path = std::path::Path::new(table);
+                                    if path.exists() {
+                                        AnnotateProvider::build_sift_direct_reader(table)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .or_else(|| {
+                                    cache
+                                        .context_path("translation_sift", &ready.chrom)
+                                        .and_then(|p| {
+                                            AnnotateProvider::build_sift_direct_reader(p.to_str()?)
+                                        })
+                                })
+                        } else {
+                            None
+                        };
+
+                        self.state = StreamState::AnnotatingContig(ContigAnnotationState {
+                            lookup_stream: Some(ready.lookup_stream),
+                            transcripts: ready.transcripts,
+                            translateable_seq_by_tx: ready.translateable_seq_by_tx,
+                            exons: ready.exons,
+                            translations: ready.translations,
+                            regulatory: ready.regulatory,
+                            motifs: ready.motifs,
+                            mirnas: ready.mirnas,
+                            structural: ready.structural,
+                            colocated_map: HashMap::new(),
+                            colocated_map_built: false,
+                            coloc_sink: ready.coloc_sink,
+                            hydrated_cds_tx_ids: HashSet::new(),
+                            hgvs_reader,
+                            sift_cache: SiftPolyphenCache::new(),
+                            sift_direct,
+                            loaded_sift_windows: HashSet::new(),
+                            tmp_provider,
+                            engine,
+                            window_buffer: Vec::with_capacity(HYDRATION_WINDOW_SIZE),
+                            lookup_done: false,
+                            ephemeral_tables: ready.ephemeral_tables,
+                            chrom: ready.chrom,
+                            config,
+                            session,
+                            cache,
+                            t_contig: ready.t_contig,
+                            contig_rows: 0,
+                        });
+                    }
+                },
+
+                StreamState::AnnotatingContig(ann) => {
+                    // Pull batches from lookup stream into window buffer.
+                    // VariantLookupExec now buffers matched rows during probe
+                    // and only emits them after probe completes, so the
+                    // colocated sink is fully populated when the first batch
+                    // arrives here.
+                    if !ann.lookup_done {
+                        let stream = ann
+                            .lookup_stream
+                            .as_mut()
+                            .expect("stream alive during lookup");
+                        match stream.as_mut().poll_next(cx) {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(Some(Ok(batch))) => {
+                                ann.contig_rows += batch.num_rows();
+                                ann.window_buffer.push(batch);
+                                if ann.window_buffer.len() < HYDRATION_WINDOW_SIZE {
+                                    continue; // Keep filling window.
+                                }
+                            }
+                            Poll::Ready(Some(Err(e))) => {
+                                let session = Arc::clone(&ann.session);
+                                let tables = ann.ephemeral_tables.clone();
+                                self.state = StreamState::ErrorCleaningUp(
+                                    make_cleanup_future(session, tables),
+                                    e,
+                                );
+                                continue;
+                            }
+                            Poll::Ready(None) => {
+                                ann.lookup_done = true;
+                                // Drop the lookup stream to reclaim BuildSide
+                                // memory (COITrees, hash indices, concatenated
+                                // VCF batch) — no longer needed.
+                                ann.lookup_stream = None;
+                                // Also clear the colocated sink — its data has
+                                // been copied into colocated_map already (or
+                                // will be on next loop iteration).
+                                if let Ok(mut guard) = ann.coloc_sink.lock() {
+                                    guard.clear();
+                                }
+                                profile_end!(
+                                    &format!("{}: 1. variation_lookup", ann.chrom),
+                                    ann.t_contig,
+                                    format!("{} rows", ann.contig_rows)
+                                );
+                            }
+                        }
+                    }
+
+                    // Process window (full or final partial).
+                    // Take ownership of state to work with it.
+                    let StreamState::AnnotatingContig(mut ann) =
+                        std::mem::replace(&mut self.state, StreamState::Done)
+                    else {
+                        unreachable!()
+                    };
+
+                    if ann.window_buffer.is_empty() {
+                        // No more data — clean up. Drop heavy state eagerly
+                        // before the async cleanup future runs.
+                        profile_end!(
+                            &format!("{}: TOTAL", ann.chrom),
+                            ann.t_contig,
+                            format!("{} rows", ann.contig_rows)
+                        );
+                        if profiling_enabled() {
+                            eprintln!("[VEP_PROFILE] ------ contig {} END ------", ann.chrom);
+                        }
+                        // Eagerly reclaim per-contig memory.
+                        ann.colocated_map = HashMap::new();
+                        ann.transcripts = Vec::new();
+                        ann.exons = Vec::new();
+                        ann.translations = Vec::new();
+                        ann.regulatory = Vec::new();
+                        ann.motifs = Vec::new();
+                        let fut = make_cleanup_future(
+                            Arc::clone(&ann.session),
+                            std::mem::take(&mut ann.ephemeral_tables),
+                        );
+                        self.state = StreamState::CleaningUp(fut);
+                        continue;
+                    }
+
+                    // Build colocated map once (sink is fully populated now
+                    // that the entire lookup stream has been drained).
+                    if !ann.colocated_map_built {
+                        if ann.config.flags.check_existing {
+                            let guard = ann.coloc_sink.lock().unwrap();
+                            ann.colocated_map = build_colocated_map_from_sink(&guard);
+                        }
+                        ann.colocated_map_built = true;
+                    }
+
+                    // Take one window's worth of batches from the buffer.
+                    let window_end = ann.window_buffer.len().min(HYDRATION_WINDOW_SIZE);
+                    let window_batches: Vec<RecordBatch> =
+                        ann.window_buffer.drain(..window_end).collect();
+
+                    // Window-based HGVS hydration (like SIFT sliding window).
+                    if let Err(e) = hydrate_window(
+                        &mut ann.transcripts,
+                        &ann.exons,
+                        &mut ann.translations,
+                        &ann.translateable_seq_by_tx,
+                        &mut ann.hgvs_reader,
+                        &mut ann.hydrated_cds_tx_ids,
+                        &window_batches,
+                        ann.config.hgvs_flags,
+                    ) {
+                        let fut = make_cleanup_future(
+                            Arc::clone(&ann.session),
+                            std::mem::take(&mut ann.ephemeral_tables),
+                        );
+                        self.state = StreamState::ErrorCleaningUp(fut, e);
+                        continue;
+                    }
+
+                    // Annotate window.
+                    let projection = ann.config.projection.clone();
+                    match annotate_window(&mut ann, &window_batches, projection.as_deref()) {
+                        Err(e) => {
+                            let fut = make_cleanup_future(
+                                Arc::clone(&ann.session),
+                                std::mem::take(&mut ann.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(fut, e);
+                            continue;
+                        }
+                        Ok(batches) => {
+                            self.state = StreamState::DrainingWindow {
+                                batches,
+                                annotation_state: ann,
+                            };
+                        }
+                    }
+                }
+
+                StreamState::DrainingWindow {
+                    batches,
+                    annotation_state: _,
+                } => {
+                    if let Some(batch) = batches.pop_front() {
+                        return Poll::Ready(Some(Ok(batch)));
+                    }
+                    // Window drained — back to AnnotatingContig for next window
+                    // (or cleanup if window_buffer is empty).
+                    let StreamState::DrainingWindow {
+                        annotation_state: ann,
+                        ..
+                    } = std::mem::replace(&mut self.state, StreamState::Done)
+                    else {
+                        unreachable!()
+                    };
+                    self.state = StreamState::AnnotatingContig(ann);
+                }
+
+                StreamState::CleaningUp(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => {
+                        self.state = StreamState::Done;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Ready(Ok(())) => {
+                        self.state = StreamState::StartContig;
+                    }
+                },
+
+                StreamState::ErrorCleaningUp(fut, _) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(_) => {
+                        // Cleanup done (ignore cleanup errors) — propagate original error.
+                        let StreamState::ErrorCleaningUp(_, original_err) =
+                            std::mem::replace(&mut self.state, StreamState::Done)
+                        else {
+                            unreachable!()
+                        };
+                        return Poll::Ready(Some(Err(original_err)));
+                    }
+                },
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-contig setup: parallel context loading + lookup stream creation
+// ---------------------------------------------------------------------------
+
+/// Register ephemeral tables, load context data, and create the variation
+/// lookup stream — all in preparation for window-based streaming annotation.
+///
+/// Context loading completes before the lookup stream is first polled; the
+/// actual lookup I/O (build + probe) happens lazily on `poll_next`.
+/// Returns `None` if the contig has no variation table (skip).
+async fn prepare_contig_context(
+    session: Arc<SessionContext>,
+    cache: Arc<PartitionedParquetCache>,
+    chrom: String,
+    config: ContigAnnotationConfig,
+    full_schema: SchemaRef,
+) -> Result<Option<ContigReadyState>> {
+    let t_contig = profile_start!();
+    if profiling_enabled() {
+        eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
+    }
+
+    // Derive VCF-only schema.
+    let vcf_field_count = full_schema
+        .fields()
+        .len()
+        .saturating_sub(ANNOTATION_COLUMN_COUNT);
+    let vcf_only_schema = Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
+
+    // 1. Register ALL ephemeral tables upfront (variation + context).
+    let mut ephemeral_tables: Vec<String> = Vec::new();
+
+    let var_table =
+        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "variation", &chrom)
+            .await?;
+    let Some(var_table) = var_table else {
+        if profiling_enabled() {
+            eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (no variation) ------");
+        }
+        return Ok(None);
+    };
+    ephemeral_tables.push(var_table.clone());
+
+    let tx_table =
+        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "transcript", &chrom)
+            .await?;
+    if let Some(ref t) = tx_table {
+        ephemeral_tables.push(t.clone());
+    }
+    let ex_table =
+        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "exon", &chrom).await?;
+    if let Some(ref t) = ex_table {
+        ephemeral_tables.push(t.clone());
+    }
+    let tl_table = crate::partitioned_cache::register_chrom_parquet(
+        &session,
+        &cache,
+        "translation_core",
+        &chrom,
+    )
+    .await?;
+    if let Some(ref t) = tl_table {
+        ephemeral_tables.push(t.clone());
+    }
+    let rg_table =
+        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "regulatory", &chrom)
+            .await?;
+    if let Some(ref t) = rg_table {
+        ephemeral_tables.push(t.clone());
+    }
+    let mt_table =
+        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "motif", &chrom).await?;
+    if let Some(ref t) = mt_table {
+        ephemeral_tables.push(t.clone());
+    }
+
+    // 2. Create lookup stream + load context data.
+    let worklist = MissWorklist::for_chrom(&chrom);
+
+    // Lookup arm: build LookupProvider, create stream (cheap — build+probe
+    // happens on first poll, NOT here).
+    let coloc_sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+    let vcf_schema = session
+        .table(&config.vcf_table)
+        .await?
+        .schema()
+        .as_arrow()
+        .clone();
+    let cache_schema = session.table(&var_table).await?.schema().as_arrow().clone();
+    let mut provider = LookupProvider::new(
+        Arc::clone(&session),
+        config.vcf_table.clone(),
+        var_table.clone(),
+        vcf_schema,
+        cache_schema,
+        config.cache_columns.clone(),
+        config.extended_probes,
+        config.allowed_failed,
+        None, // reference_fasta_path is for HGVS hydration, not lookup
+    )?;
+    provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
+    if config.flags.check_existing {
+        provider.set_colocated_sink(Arc::clone(&coloc_sink));
+    }
+    let session_state = session.state();
+    let plan = provider.scan(&session_state, None, &[], None).await?;
+    let lookup_stream = plan.execute(0, session.task_ctx())?;
+
+    // Context arm: load transcripts, exons, translations, etc.
+    let t_ctx = profile_start!();
+    let tmp_provider = AnnotateProvider::new(
+        Arc::clone(&session),
+        config.vcf_table.clone(),
+        String::new(),
+        AnnotationBackend::Parquet,
+        config.options_json.clone(),
+        vcf_only_schema,
+    );
+
+    let tx = if let Some(ref table) = tx_table {
+        let (tx, seq) = tmp_provider.load_transcripts(table, &worklist).await?;
+        let filtered: Vec<_> = tx
+            .into_iter()
+            .filter(|t| is_vep_transcript(&t.transcript_id, config.merged))
+            .collect();
+        (filtered, seq)
+    } else {
+        (Vec::new(), HashMap::new())
+    };
+    let (tx_vec, translateable_seq) = tx;
+    let tx_ids: HashSet<String> = tx_vec.iter().map(|t| t.transcript_id.clone()).collect();
+
+    let ex = if let Some(ref table) = ex_table {
+        let raw = tmp_provider.load_exons(table, &worklist).await?;
+        raw.into_iter()
+            .filter(|e| tx_ids.contains(&e.transcript_id))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let tl = if let Some(ref table) = tl_table {
+        let raw = tmp_provider.load_translations(table, &worklist).await?;
+        raw.into_iter()
+            .filter(|t| tx_ids.contains(&t.transcript_id))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let rg = if let Some(ref table) = rg_table {
+        tmp_provider
+            .load_regulatory_features(table, &worklist)
+            .await?
+    } else {
+        Vec::new()
+    };
+    let mt = if let Some(ref table) = mt_table {
+        tmp_provider.load_motif_features(table, &worklist).await?
+    } else {
+        Vec::new()
+    };
+    profile_end!(&format!("{chrom}: context_load"), t_ctx);
+
+    Ok(Some(ContigReadyState {
+        lookup_stream,
+        coloc_sink,
+        transcripts: tx_vec,
+        translateable_seq_by_tx: translateable_seq,
+        exons: ex,
+        translations: tl,
+        regulatory: rg,
+        motifs: mt,
+        // TODO: miRNA and structural features are not yet partitioned —
+        // these are rare and handled by the monolithic path only.
+        mirnas: Vec::new(),
+        structural: Vec::new(),
+        ephemeral_tables,
+        chrom,
+        t_contig,
+    }))
+}
+
 #[async_trait]
 impl TableProvider for AnnotateProvider {
     fn as_any(&self) -> &dyn Any {
@@ -4869,193 +5249,98 @@ impl TableProvider for AnnotateProvider {
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let _store = build_store(self.backend, self.cache_source.clone());
-        let cache_table = self.resolve_cache_table_name().await?;
 
-        let cache_schema = self
-            .session
-            .table(&cache_table)
-            .await?
-            .schema()
-            .as_arrow()
-            .clone();
-        let available_cache_columns: HashSet<String> = cache_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-
-        let mut preferred_columns = vec!["consequence_types", "most_severe_consequence"];
-        for &col in CACHE_OUTPUT_COLUMNS {
-            if !preferred_columns.contains(&col) {
-                preferred_columns.push(col);
-            }
-        }
-        let requested_columns: Vec<&str> = preferred_columns
-            .iter()
-            .copied()
-            .filter(|name| available_cache_columns.contains(*name))
-            .collect();
-        let requested_columns_sql = requested_columns.join(",");
-
-        let vcf_table_lit = Self::escaped_sql_literal(&self.vcf_table);
-        let cache_table_lit = Self::escaped_sql_literal(&cache_table);
-        let columns_lit = Self::escaped_sql_literal(&requested_columns_sql);
-        // Extended probes use interval-overlap join to handle VEP-style
-        // indel coordinate encodings. Enabled by default for backward
-        // compatibility. When input is pre-normalized (e.g. bcftools norm),
-        // set "extended_probes":false in options_json for faster equi-join.
-        let extended_probes = self
+        // Check for partitioned per-chromosome cache layout.
+        // Opt-in/out via "partitioned": true/false in options_json.
+        let partitioned_opt = self
             .options_json
             .as_deref()
-            .and_then(|opts| Self::parse_json_bool_option(opts, "extended_probes"))
-            .unwrap_or(true);
-        let lookup_sql = format!(
-            "lookup_variants('{vcf_table_lit}', '{cache_table_lit}', '{columns_lit}', 'exact', {extended_probes})"
-        );
+            .and_then(|opts| Self::parse_json_bool_option(opts, "partitioned"));
+        let partitioned_cache =
+            if partitioned_opt != Some(false) && self.backend == AnnotationBackend::Parquet {
+                PartitionedParquetCache::detect(&self.cache_source)
+            } else {
+                None
+            };
+        // When explicitly requested or auto-detected, use partitioned path.
+        if let Some(ref cache) = partitioned_cache {
+            if profiling_enabled() {
+                eprintln!(
+                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {}",
+                    cache.available_chroms().len(),
+                    self.cache_source
+                );
+            }
 
-        let transcript_pair = self.resolve_transcript_context_tables(&cache_table).await?;
-        let translations_table = self
-            .resolve_optional_context_table("translations_table", &cache_table, "translations")
+            // Determine requested cache columns from one variation parquet.
+            let sample_chrom = &cache.available_chroms()[0];
+            let sample_table = crate::partitioned_cache::register_chrom_parquet(
+                &self.session,
+                cache,
+                "variation",
+                sample_chrom,
+            )
             .await?;
-        let regulatory_table = self
-            .resolve_optional_context_table("regulatory_table", &cache_table, "regulatory_features")
-            .await?;
-        let motif_table = self
-            .resolve_optional_context_table("motif_table", &cache_table, "motif_features")
-            .await?;
-        let mirna_table = self
-            .resolve_optional_context_table("mirna_table", &cache_table, "mirna_features")
-            .await?;
-        let sv_table = self
-            .resolve_optional_context_table("sv_table", &cache_table, "sv_features")
-            .await?;
+            let sample_table = sample_table.ok_or_else(|| {
+                DataFusionError::Execution(
+                    "partitioned cache: no variation parquet for sample chrom".to_string(),
+                )
+            })?;
+            let cache_schema = self
+                .session
+                .table(&sample_table)
+                .await?
+                .schema()
+                .as_arrow()
+                .clone();
+            let available_cache_columns: HashSet<String> = cache_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let mut preferred_columns = vec!["consequence_types", "most_severe_consequence"];
+            for &c in CACHE_OUTPUT_COLUMNS {
+                if !preferred_columns.contains(&c) {
+                    preferred_columns.push(c);
+                }
+            }
+            let requested_columns: Vec<&str> = preferred_columns
+                .iter()
+                .copied()
+                .filter(|name| available_cache_columns.contains(*name))
+                .collect();
 
-        if transcript_pair.is_some()
-            || translations_table.is_some()
-            || regulatory_table.is_some()
-            || motif_table.is_some()
-            || mirna_table.is_some()
-            || sv_table.is_some()
-        {
-            let (tx_table, ex_table) = transcript_pair
-                .as_ref()
-                .map(|(tx, ex)| (Some(tx.as_str()), Some(ex.as_str())))
-                .unwrap_or((None, None));
+            let extended_probes = self
+                .options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_bool_option(opts, "extended_probes"))
+                .unwrap_or(true);
+
+            let translations_sift_table = self
+                .options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_string_option(opts, "translations_sift_table"));
+
+            // Deregister sample table (will be re-registered per contig).
+            crate::partitioned_cache::deregister_table(&self.session, &sample_table).await?;
+
             return self
-                .scan_with_transcript_engine(
+                .scan_with_transcript_engine_partitioned(
                     state,
                     projection,
                     &requested_columns,
                     extended_probes,
-                    &cache_table,
-                    tx_table,
-                    ex_table,
-                    translations_table.as_deref(),
-                    regulatory_table.as_deref(),
-                    motif_table.as_deref(),
-                    mirna_table.as_deref(),
-                    sv_table.as_deref(),
+                    cache,
+                    translations_sift_table.as_deref(),
                 )
                 .await;
         }
 
-        let has_col = |name: &str| requested_columns.contains(&name);
-        let present_checks = [
-            ("variation_name", has_col("variation_name")),
-            ("clin_sig", has_col("clin_sig")),
-            ("AF", has_col("AF")),
-            ("somatic", has_col("somatic")),
-            ("phenotype_or_disease", has_col("phenotype_or_disease")),
-            ("pubmed", has_col("pubmed")),
-        ]
-        .iter()
-        .filter_map(|(name, present)| {
-            if *present {
-                Some(format!("l.`cache_{name}` IS NOT NULL"))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-        let present_condition_sql = if present_checks.is_empty() {
-            "FALSE".to_string()
-        } else {
-            present_checks.join(" OR ")
-        };
-
-        let var_expr = if has_col("variation_name") {
-            "COALESCE(CAST(l.`cache_variation_name` AS VARCHAR), '')"
-        } else {
-            "''"
-        };
-        let clin_expr = if has_col("clin_sig") {
-            "COALESCE(CAST(l.`cache_clin_sig` AS VARCHAR), '')"
-        } else {
-            "''"
-        };
-        let af_expr = if has_col("AF") {
-            "COALESCE(CAST(l.`cache_AF` AS VARCHAR), '')"
-        } else {
-            "''"
-        };
-
-        let csq_expr = format!(
-            "CASE WHEN {present_condition_sql} THEN \
-             CONCAT(COALESCE(CAST(l.`alt` AS VARCHAR), ''), \
-                    '|sequence_variant|MODIFIER|', {var_expr}, '|', {clin_expr}, '|', {af_expr}) \
-             ELSE CAST(NULL AS VARCHAR) END"
-        );
-        let most_severe_expr = format!(
-            "CASE WHEN {present_condition_sql} THEN 'sequence_variant' ELSE CAST(NULL AS VARCHAR) END"
-        );
-
-        let total_fields = self.schema.fields().len();
-        let vcf_fields = self.vcf_field_count();
-        let csq_idx = vcf_fields;
-        let most_severe_idx = vcf_fields + 1;
-        let cache_col_start = vcf_fields + 2;
-        let projected_indices: Vec<usize> = projection
-            .cloned()
-            .unwrap_or_else(|| (0..total_fields).collect());
-
-        let mut projected_exprs = Vec::with_capacity(projected_indices.len());
-
-        for idx in projected_indices {
-            if idx >= total_fields {
-                return Err(DataFusionError::Execution(format!(
-                    "annotate_vep(): projection index {idx} out of bounds for schema with {total_fields} fields"
-                )));
-            }
-
-            if idx < vcf_fields {
-                let name = self.schema.field(idx).name().clone();
-                projected_exprs.push(format!("l.`{name}` AS `{name}`"));
-            } else if idx == csq_idx {
-                projected_exprs.push(format!("{csq_expr} AS `csq`"));
-            } else if idx == most_severe_idx {
-                projected_exprs.push(format!("{most_severe_expr} AS `most_severe_consequence`"));
-            } else if idx >= cache_col_start {
-                let col_name = CACHE_OUTPUT_COLUMNS[idx - cache_col_start];
-                if has_col(col_name) {
-                    projected_exprs.push(format!(
-                        "CAST(l.`cache_{col_name}` AS VARCHAR) AS `{col_name}`"
-                    ));
-                } else {
-                    projected_exprs.push(format!("CAST(NULL AS VARCHAR) AS `{col_name}`"));
-                }
-            }
-        }
-
-        // Fallback path: when transcript/exon context tables are unavailable.
-        let _ = &self.options_json;
-        let query = format!(
-            "SELECT {} FROM {} AS l",
-            projected_exprs.join(", "),
-            lookup_sql
-        );
-
-        let df = self.session.sql(&query).await?;
-        df.create_physical_plan().await
+        Err(DataFusionError::Execution(format!(
+            "annotate_vep(): no partitioned cache detected at '{}'. \
+             Expected a directory with a variation/ subdirectory containing per-chromosome parquet files.",
+            self.cache_source
+        )))
     }
 }
 
