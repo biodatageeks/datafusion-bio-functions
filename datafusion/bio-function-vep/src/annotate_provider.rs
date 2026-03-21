@@ -4875,10 +4875,22 @@ impl Stream for ContigAnnotationStream {
 
                         #[cfg(feature = "kv-cache")]
                         let sift_kv = if use_fjall_sift && config.flags.everything {
-                            config.kv_store.as_ref().and_then(|store| {
-                                crate::kv_cache::SiftKvStore::open(store.database())
+                            // Prefer standalone translation_sift.fjall/ (matches parquet naming),
+                            // fall back to sift keyspace inside variation.fjall/.
+                            let standalone = config.kv_store.as_ref().and_then(|store| {
+                                let var_path = store.root_path();
+                                let parent = var_path.parent()?;
+                                let sift_path = parent.join("translation_sift.fjall");
+                                crate::kv_cache::SiftKvStore::open_path(&sift_path)
                                     .ok()
                                     .flatten()
+                            });
+                            standalone.or_else(|| {
+                                config.kv_store.as_ref().and_then(|store| {
+                                    crate::kv_cache::SiftKvStore::open(store.database())
+                                        .ok()
+                                        .flatten()
+                                })
                             })
                         } else {
                             None

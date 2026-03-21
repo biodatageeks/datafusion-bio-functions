@@ -28,6 +28,22 @@ pub struct SiftKvStore {
 }
 
 impl SiftKvStore {
+    /// Open a standalone SIFT fjall database at the given path.
+    ///
+    /// Used when SIFT predictions are stored in a separate `translation_sift.fjall/`
+    /// directory (matching the parquet naming convention).
+    pub fn open_path(path: impl AsRef<std::path::Path>) -> Result<Option<Self>> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let db = Database::builder(path)
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .map_err(fjall_err)?;
+        Self::open(&db)
+    }
+
     /// Open sift keyspace from an existing fjall database.
     pub fn open(db: &Database) -> Result<Option<Self>> {
         // Only return Some if the keyspace exists (don't create on read).
