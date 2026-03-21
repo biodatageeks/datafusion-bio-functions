@@ -37,6 +37,12 @@ impl KvCacheTableProvider {
         Ok(Self { store, schema })
     }
 
+    /// Wrap an already-opened `VepKvStore` without re-opening the database.
+    pub fn from_store(store: Arc<VepKvStore>) -> Self {
+        let schema = store.schema().clone();
+        Self { store, schema }
+    }
+
     /// Get a reference to the underlying KV store.
     pub fn store(&self) -> &Arc<VepKvStore> {
         &self.store

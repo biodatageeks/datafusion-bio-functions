@@ -2605,6 +2605,7 @@ impl AnnotateProvider {
     /// 3. Load context, build PreparedContext, annotate
     /// 4. Deregister ephemeral tables, free memory
     /// 5. Collect annotated batches
+    #[allow(clippy::too_many_arguments)]
     async fn scan_with_transcript_engine_partitioned(
         &self,
         _state: &dyn Session,
@@ -2613,6 +2614,7 @@ impl AnnotateProvider {
         extended_probes: bool,
         cache: &PartitionedParquetCache,
         translations_sift_table: Option<&str>,
+        #[cfg(feature = "kv-cache")] kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if profiling_enabled() {
             eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned START ======");
@@ -2689,6 +2691,10 @@ impl AnnotateProvider {
             upstream_distance,
             downstream_distance,
             projection: projection.cloned(),
+            #[cfg(feature = "kv-cache")]
+            use_fjall: kv_store.is_some(),
+            #[cfg(feature = "kv-cache")]
+            kv_store,
         };
 
         let exec = ContigAnnotationExec::new(
@@ -4336,6 +4342,12 @@ struct ContigAnnotationConfig {
     upstream_distance: i64,
     downstream_distance: i64,
     projection: Option<Vec<usize>>,
+    /// When true, use fjall KV store for variation lookup + SIFT instead of parquet.
+    #[cfg(feature = "kv-cache")]
+    use_fjall: bool,
+    /// Shared fjall KV store handle (opened once, reused across contigs).
+    #[cfg(feature = "kv-cache")]
+    kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
 }
 
 /// Leaf `ExecutionPlan` that processes contigs one at a time via a state-machine
@@ -4492,6 +4504,9 @@ struct ContigAnnotationState {
     sift_cache: SiftPolyphenCache,
     sift_direct: Option<SiftDirectReader>,
     loaded_sift_windows: HashSet<(String, i64)>,
+    /// Fjall-backed SIFT store for lazy per-transcript lookups (used when use_fjall=true).
+    #[cfg(feature = "kv-cache")]
+    sift_kv: Option<crate::kv_cache::SiftKvStore>,
     // Annotation engine + provider.
     tmp_provider: AnnotateProvider,
     engine: TranscriptConsequenceEngine,
@@ -4713,7 +4728,7 @@ fn annotate_window(
         #[cfg(not(feature = "kv-cache"))]
         let sift_kv: Option<()> = None;
         #[cfg(feature = "kv-cache")]
-        let sift_kv: Option<crate::kv_cache::SiftKvStore> = None;
+        let sift_kv = &ann.sift_kv;
 
         let annotated = ann.tmp_provider.annotate_batch_with_transcript_engine(
             batch,
@@ -4721,6 +4736,9 @@ fn annotate_window(
             &ctx,
             &ann.colocated_map,
             &mut ann.sift_cache,
+            #[cfg(feature = "kv-cache")]
+            sift_kv,
+            #[cfg(not(feature = "kv-cache"))]
             &sift_kv,
         )?;
 
@@ -4743,6 +4761,23 @@ impl Stream for ContigAnnotationStream {
 
                 StreamState::StartContig => {
                     let Some(chrom) = self.contigs.pop_front() else {
+                        // All contigs processed. Deregister the global KV
+                        // table if fjall was used.
+                        #[cfg(feature = "kv-cache")]
+                        if self.config.use_fjall {
+                            let session = Arc::clone(&self.session);
+                            let fut: CleanupFuture = Box::pin(async move {
+                                crate::partitioned_cache::deregister_table(
+                                    &session,
+                                    "__vep_kv_variation",
+                                )
+                                .await
+                                .ok(); // Best-effort cleanup.
+                                Ok(())
+                            });
+                            self.state = StreamState::CleaningUp(fut);
+                            continue;
+                        }
                         self.state = StreamState::Done;
                         return Poll::Ready(None);
                     };
@@ -4805,7 +4840,17 @@ impl Stream for ContigAnnotationStream {
                         } else {
                             None
                         };
-                        let sift_direct: Option<SiftDirectReader> = if config.flags.everything {
+                        // SIFT source: when use_fjall, use SiftKvStore from fjall
+                        // for lazy per-transcript lookups; otherwise use parquet
+                        // SiftDirectReader.
+                        #[cfg(feature = "kv-cache")]
+                        let use_fjall_sift = config.use_fjall;
+                        #[cfg(not(feature = "kv-cache"))]
+                        let use_fjall_sift = false;
+
+                        let sift_direct: Option<SiftDirectReader> = if config.flags.everything
+                            && !use_fjall_sift
+                        {
                             config
                                 .translations_sift_table
                                 .as_deref()
@@ -4828,6 +4873,17 @@ impl Stream for ContigAnnotationStream {
                             None
                         };
 
+                        #[cfg(feature = "kv-cache")]
+                        let sift_kv = if use_fjall_sift && config.flags.everything {
+                            config.kv_store.as_ref().and_then(|store| {
+                                crate::kv_cache::SiftKvStore::open(store.database())
+                                    .ok()
+                                    .flatten()
+                            })
+                        } else {
+                            None
+                        };
+
                         self.state = StreamState::AnnotatingContig(ContigAnnotationState {
                             lookup_stream: Some(ready.lookup_stream),
                             transcripts: ready.transcripts,
@@ -4846,6 +4902,8 @@ impl Stream for ContigAnnotationStream {
                             sift_cache: SiftPolyphenCache::new(),
                             sift_direct,
                             loaded_sift_windows: HashSet::new(),
+                            #[cfg(feature = "kv-cache")]
+                            sift_kv,
                             tmp_provider,
                             engine,
                             window_buffer: Vec::with_capacity(HYDRATION_WINDOW_SIZE),
@@ -5078,16 +5136,46 @@ async fn prepare_contig_context(
     // 1. Register ALL ephemeral tables upfront (variation + context).
     let mut ephemeral_tables: Vec<String> = Vec::new();
 
-    let var_table =
-        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "variation", &chrom)
-            .await?;
-    let Some(var_table) = var_table else {
-        if profiling_enabled() {
-            eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (no variation) ------");
+    // Variation table: either per-chrom parquet or global fjall KV store.
+    #[cfg(feature = "kv-cache")]
+    let use_fjall = config.use_fjall;
+    #[cfg(not(feature = "kv-cache"))]
+    let use_fjall = false;
+
+    let var_table = if use_fjall {
+        #[cfg(feature = "kv-cache")]
+        {
+            // Register the shared fjall KV store as a table (idempotent).
+            let kv_table_name = "__vep_kv_variation".to_string();
+            if session.table_provider(&kv_table_name).await.is_err() {
+                let store = config
+                    .kv_store
+                    .as_ref()
+                    .expect("kv_store must be set when use_fjall=true");
+                let kv_provider = KvCacheTableProvider::from_store(Arc::clone(store));
+                session.register_table(&kv_table_name, Arc::new(kv_provider))?;
+            }
+            // Don't add to ephemeral_tables — the global KV table persists
+            // across contigs and is deregistered after the last contig.
+            kv_table_name
         }
-        return Ok(None);
+        #[cfg(not(feature = "kv-cache"))]
+        {
+            unreachable!("use_fjall requires kv-cache feature")
+        }
+    } else {
+        let var_table =
+            crate::partitioned_cache::register_chrom_parquet(&session, &cache, "variation", &chrom)
+                .await?;
+        let Some(var_table) = var_table else {
+            if profiling_enabled() {
+                eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (no variation) ------");
+            }
+            return Ok(None);
+        };
+        ephemeral_tables.push(var_table.clone());
+        var_table
     };
-    ephemeral_tables.push(var_table.clone());
 
     let tx_table =
         crate::partitioned_cache::register_chrom_parquet(&session, &cache, "transcript", &chrom)
@@ -5250,54 +5338,106 @@ impl TableProvider for AnnotateProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let _store = build_store(self.backend, self.cache_source.clone());
 
+        // Parse use_fjall option — when true, use fjall KV store for variation
+        // lookup + SIFT while keeping context from partitioned parquet.
+        #[cfg(feature = "kv-cache")]
+        let use_fjall = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_bool_option(opts, "use_fjall"))
+            .unwrap_or(false);
+        #[cfg(not(feature = "kv-cache"))]
+        let use_fjall = false;
+
         // Check for partitioned per-chromosome cache layout.
         // Opt-in/out via "partitioned": true/false in options_json.
+        // Both parquet-only and fjall paths require partitioned context parquet.
         let partitioned_opt = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "partitioned"));
-        let partitioned_cache =
-            if partitioned_opt != Some(false) && self.backend == AnnotationBackend::Parquet {
-                PartitionedParquetCache::detect(&self.cache_source)
-            } else {
-                None
-            };
+        let partitioned_cache = if partitioned_opt != Some(false) {
+            PartitionedParquetCache::detect(&self.cache_source)
+        } else {
+            None
+        };
         // When explicitly requested or auto-detected, use partitioned path.
         if let Some(ref cache) = partitioned_cache {
             if profiling_enabled() {
                 eprintln!(
-                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {}",
+                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {}{}",
                     cache.available_chroms().len(),
-                    self.cache_source
+                    self.cache_source,
+                    if use_fjall {
+                        " [fjall variation+sift]"
+                    } else {
+                        ""
+                    },
                 );
             }
 
-            // Determine requested cache columns from one variation parquet.
-            let sample_chrom = &cache.available_chroms()[0];
-            let sample_table = crate::partitioned_cache::register_chrom_parquet(
-                &self.session,
-                cache,
-                "variation",
-                sample_chrom,
-            )
-            .await?;
-            let sample_table = sample_table.ok_or_else(|| {
-                DataFusionError::Execution(
-                    "partitioned cache: no variation parquet for sample chrom".to_string(),
+            // Determine requested cache columns.
+            // When using fjall, get schema from the KV store; otherwise from
+            // a sample variation parquet file.
+            #[cfg(feature = "kv-cache")]
+            let kv_store_arc: Option<Arc<crate::kv_cache::VepKvStore>> = if use_fjall {
+                let fjall_path = std::path::Path::new(&self.cache_source).join("variation.fjall");
+                if !fjall_path.exists() {
+                    return Err(DataFusionError::Execution(format!(
+                        "annotate_vep(): use_fjall=true but no fjall store found at '{}'",
+                        fjall_path.display()
+                    )));
+                }
+                Some(Arc::new(crate::kv_cache::VepKvStore::open(&fjall_path)?))
+            } else {
+                None
+            };
+
+            let (available_cache_columns, sample_table_to_deregister) = if use_fjall {
+                #[cfg(feature = "kv-cache")]
+                {
+                    let store = kv_store_arc.as_ref().unwrap();
+                    let cols: HashSet<String> = store
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect();
+                    (cols, None)
+                }
+                #[cfg(not(feature = "kv-cache"))]
+                {
+                    unreachable!("use_fjall requires kv-cache feature")
+                }
+            } else {
+                let sample_chrom = &cache.available_chroms()[0];
+                let sample_table = crate::partitioned_cache::register_chrom_parquet(
+                    &self.session,
+                    cache,
+                    "variation",
+                    sample_chrom,
                 )
-            })?;
-            let cache_schema = self
-                .session
-                .table(&sample_table)
-                .await?
-                .schema()
-                .as_arrow()
-                .clone();
-            let available_cache_columns: HashSet<String> = cache_schema
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect();
+                .await?;
+                let sample_table = sample_table.ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "partitioned cache: no variation parquet for sample chrom".to_string(),
+                    )
+                })?;
+                let cache_schema = self
+                    .session
+                    .table(&sample_table)
+                    .await?
+                    .schema()
+                    .as_arrow()
+                    .clone();
+                let cols: HashSet<String> = cache_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+                (cols, Some(sample_table))
+            };
+
             let mut preferred_columns = vec!["consequence_types", "most_severe_consequence"];
             for &c in CACHE_OUTPUT_COLUMNS {
                 if !preferred_columns.contains(&c) {
@@ -5322,7 +5462,9 @@ impl TableProvider for AnnotateProvider {
                 .and_then(|opts| Self::parse_json_string_option(opts, "translations_sift_table"));
 
             // Deregister sample table (will be re-registered per contig).
-            crate::partitioned_cache::deregister_table(&self.session, &sample_table).await?;
+            if let Some(ref tbl) = sample_table_to_deregister {
+                crate::partitioned_cache::deregister_table(&self.session, tbl).await?;
+            }
 
             return self
                 .scan_with_transcript_engine_partitioned(
@@ -5332,6 +5474,8 @@ impl TableProvider for AnnotateProvider {
                     extended_probes,
                     cache,
                     translations_sift_table.as_deref(),
+                    #[cfg(feature = "kv-cache")]
+                    kv_store_arc,
                 )
                 .await;
         }
