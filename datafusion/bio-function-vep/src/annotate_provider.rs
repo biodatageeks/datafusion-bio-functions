@@ -4932,10 +4932,21 @@ impl Stream for ContigAnnotationStream {
 
                 StreamState::AnnotatingContig(ann) => {
                     // Pull batches from lookup stream into window buffer.
-                    // VariantLookupExec now buffers matched rows during probe
-                    // and only emits them after probe completes, so the
+                    //
+                    // VariantLookupExec (parquet) buffers matched rows during
+                    // probe and only emits after probe completes, so the
                     // colocated sink is fully populated when the first batch
-                    // arrives here.
+                    // arrives here — windows can be processed mid-stream.
+                    //
+                    // KvLookupExec (fjall) emits immediately, so the colocated
+                    // sink is only complete after the stream is exhausted.
+                    // We must drain the entire stream before processing any
+                    // windows to ensure colocated data is complete.
+                    #[cfg(feature = "kv-cache")]
+                    let fjall_drain = ann.config.use_fjall && ann.config.flags.check_existing;
+                    #[cfg(not(feature = "kv-cache"))]
+                    let fjall_drain = false;
+
                     if !ann.lookup_done {
                         let stream = ann
                             .lookup_stream
@@ -4946,7 +4957,7 @@ impl Stream for ContigAnnotationStream {
                             Poll::Ready(Some(Ok(batch))) => {
                                 ann.contig_rows += batch.num_rows();
                                 ann.window_buffer.push(batch);
-                                if ann.window_buffer.len() < HYDRATION_WINDOW_SIZE {
+                                if fjall_drain || ann.window_buffer.len() < HYDRATION_WINDOW_SIZE {
                                     continue; // Keep filling window.
                                 }
                             }
@@ -4965,12 +4976,10 @@ impl Stream for ContigAnnotationStream {
                                 // memory (COITrees, hash indices, concatenated
                                 // VCF batch) — no longer needed.
                                 ann.lookup_stream = None;
-                                // Also clear the colocated sink — its data has
-                                // been copied into colocated_map already (or
-                                // will be on next loop iteration).
-                                if let Ok(mut guard) = ann.coloc_sink.lock() {
-                                    guard.clear();
-                                }
+                                // NOTE: colocated sink is cleared AFTER the
+                                // colocated map is built (below), not here.
+                                // Clearing here would lose data for backends
+                                // like fjall that emit batches immediately.
                                 profile_end!(
                                     &format!("{}: 1. variation_lookup", ann.chrom),
                                     ann.t_contig,
@@ -5018,8 +5027,10 @@ impl Stream for ContigAnnotationStream {
                     // that the entire lookup stream has been drained).
                     if !ann.colocated_map_built {
                         if ann.config.flags.check_existing {
-                            let guard = ann.coloc_sink.lock().unwrap();
+                            let mut guard = ann.coloc_sink.lock().unwrap();
                             ann.colocated_map = build_colocated_map_from_sink(&guard);
+                            // Clear sink now that data has been copied to the map.
+                            guard.clear();
                         }
                         ann.colocated_map_built = true;
                     }
