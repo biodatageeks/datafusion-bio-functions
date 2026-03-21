@@ -4766,17 +4766,16 @@ impl Stream for ContigAnnotationStream {
                         #[cfg(feature = "kv-cache")]
                         if self.config.use_fjall {
                             let session = Arc::clone(&self.session);
-                            let fut: CleanupFuture = Box::pin(async move {
-                                crate::partitioned_cache::deregister_table(
-                                    &session,
-                                    "__vep_kv_variation",
-                                )
-                                .await
-                                .ok(); // Best-effort cleanup.
-                                Ok(())
+                            tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(async {
+                                    crate::partitioned_cache::deregister_table(
+                                        &session,
+                                        "__vep_kv_variation",
+                                    )
+                                    .await
+                                    .ok();
+                                });
                             });
-                            self.state = StreamState::CleaningUp(fut);
-                            continue;
                         }
                         self.state = StreamState::Done;
                         return Poll::Ready(None);
