@@ -5150,8 +5150,7 @@ impl ExecutionPlan for ContigAnnotationExec {
 /// With ~30 rows/batch: 1000 batches ≈ 30K variants per window.
 const HYDRATION_WINDOW_SIZE: usize = 1000;
 
-type FastaReader =
-    fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
+type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
 
 /// Everything needed to start streaming annotation for a contig.
 /// Produced by `prepare_contig_context()`.
@@ -5485,16 +5484,16 @@ impl Stream for ContigAnnotationStream {
                             config.downstream_distance,
                             config.hgvs_flags.shift_hgvs,
                         );
-                        let hgvs_reader =
-                            if config.hgvs_flags.any() && config.hgvs_flags.shift_hgvs {
-                                config.reference_fasta_path.as_deref().and_then(|path| {
-                                    fasta::io::indexed_reader::Builder::default()
-                                        .build_from_path(path)
-                                        .ok()
-                                })
-                            } else {
-                                None
-                            };
+                        let hgvs_reader = if config.hgvs_flags.any() && config.hgvs_flags.shift_hgvs
+                        {
+                            config.reference_fasta_path.as_deref().and_then(|path| {
+                                fasta::io::indexed_reader::Builder::default()
+                                    .build_from_path(path)
+                                    .ok()
+                            })
+                        } else {
+                            None
+                        };
                         let sift_direct: Option<SiftDirectReader> = if config.flags.everything {
                             config
                                 .translations_sift_table
@@ -5598,17 +5597,13 @@ impl Stream for ContigAnnotationStream {
                             format!("{} rows", ann.contig_rows)
                         );
                         if profiling_enabled() {
-                            eprintln!(
-                                "[VEP_PROFILE] ------ contig {} END ------",
-                                ann.chrom
-                            );
+                            eprintln!("[VEP_PROFILE] ------ contig {} END ------", ann.chrom);
                         }
                         let session = Arc::clone(&ann.session);
                         let tables = std::mem::take(&mut ann.ephemeral_tables);
                         let fut: CleanupFuture = Box::pin(async move {
                             for tbl in &tables {
-                                crate::partitioned_cache::deregister_table(&session, tbl)
-                                    .await?;
+                                crate::partitioned_cache::deregister_table(&session, tbl).await?;
                             }
                             Ok(())
                         });
@@ -5727,10 +5722,9 @@ async fn prepare_contig_context(
     // 1. Register ALL ephemeral tables upfront (variation + context).
     let mut ephemeral_tables: Vec<String> = Vec::new();
 
-    let var_table = crate::partitioned_cache::register_chrom_parquet(
-        &session, &cache, "variation", &chrom,
-    )
-    .await?;
+    let var_table =
+        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "variation", &chrom)
+            .await?;
     let Some(var_table) = var_table else {
         if profiling_enabled() {
             eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (no variation) ------");
@@ -5739,26 +5733,38 @@ async fn prepare_contig_context(
     };
     ephemeral_tables.push(var_table.clone());
 
-    let tx_table = crate::partitioned_cache::register_chrom_parquet(
-        &session, &cache, "transcript", &chrom,
-    ).await?;
-    if let Some(ref t) = tx_table { ephemeral_tables.push(t.clone()); }
-    let ex_table = crate::partitioned_cache::register_chrom_parquet(
-        &session, &cache, "exon", &chrom,
-    ).await?;
-    if let Some(ref t) = ex_table { ephemeral_tables.push(t.clone()); }
+    let tx_table =
+        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "transcript", &chrom)
+            .await?;
+    if let Some(ref t) = tx_table {
+        ephemeral_tables.push(t.clone());
+    }
+    let ex_table =
+        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "exon", &chrom).await?;
+    if let Some(ref t) = ex_table {
+        ephemeral_tables.push(t.clone());
+    }
     let tl_table = crate::partitioned_cache::register_chrom_parquet(
-        &session, &cache, "translation_core", &chrom,
-    ).await?;
-    if let Some(ref t) = tl_table { ephemeral_tables.push(t.clone()); }
-    let rg_table = crate::partitioned_cache::register_chrom_parquet(
-        &session, &cache, "regulatory", &chrom,
-    ).await?;
-    if let Some(ref t) = rg_table { ephemeral_tables.push(t.clone()); }
-    let mt_table = crate::partitioned_cache::register_chrom_parquet(
-        &session, &cache, "motif", &chrom,
-    ).await?;
-    if let Some(ref t) = mt_table { ephemeral_tables.push(t.clone()); }
+        &session,
+        &cache,
+        "translation_core",
+        &chrom,
+    )
+    .await?;
+    if let Some(ref t) = tl_table {
+        ephemeral_tables.push(t.clone());
+    }
+    let rg_table =
+        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "regulatory", &chrom)
+            .await?;
+    if let Some(ref t) = rg_table {
+        ephemeral_tables.push(t.clone());
+    }
+    let mt_table =
+        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "motif", &chrom).await?;
+    if let Some(ref t) = mt_table {
+        ephemeral_tables.push(t.clone());
+    }
 
     // 2. Parallel: create lookup stream + load context data.
     let worklist = MissWorklist::for_chrom(&chrom);
@@ -5832,7 +5838,9 @@ async fn prepare_contig_context(
         Vec::new()
     };
     let rg = if let Some(ref table) = rg_table {
-        tmp_provider.load_regulatory_features(table, &worklist).await?
+        tmp_provider
+            .load_regulatory_features(table, &worklist)
+            .await?
     } else {
         Vec::new()
     };
