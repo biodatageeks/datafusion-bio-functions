@@ -2787,7 +2787,7 @@ impl AnnotateProvider {
             format!(
                 "{} VCF contigs, {} in cache, {} to process",
                 vcf_contigs.len(),
-                cache_chroms.len(),
+                cache.available_chroms().len(),
                 contigs.len()
             )
         );
@@ -5181,7 +5181,9 @@ struct ContigReadyState {
 
 /// Mutable annotation state for window-based streaming within a single contig.
 struct ContigAnnotationState {
-    lookup_stream: SendableRecordBatchStream,
+    /// Dropped after exhaustion to reclaim BuildSide memory (COITrees, hash
+    /// indices, concatenated VCF batch).
+    lookup_stream: Option<SendableRecordBatchStream>,
     // Context data (transcripts/translations mutated by HGVS hydration).
     transcripts: Vec<TranscriptFeature>,
     translateable_seq_by_tx: HashMap<String, String>,
@@ -5539,7 +5541,7 @@ impl Stream for ContigAnnotationStream {
                         };
 
                         self.state = StreamState::AnnotatingContig(ContigAnnotationState {
-                            lookup_stream: ready.lookup_stream,
+                            lookup_stream: Some(ready.lookup_stream),
                             transcripts: ready.transcripts,
                             translateable_seq_by_tx: ready.translateable_seq_by_tx,
                             exons: ready.exons,
@@ -5578,7 +5580,11 @@ impl Stream for ContigAnnotationStream {
                     // colocated sink is fully populated when the first batch
                     // arrives here.
                     if !ann.lookup_done {
-                        match ann.lookup_stream.as_mut().poll_next(cx) {
+                        let stream = ann
+                            .lookup_stream
+                            .as_mut()
+                            .expect("stream alive during lookup");
+                        match stream.as_mut().poll_next(cx) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Some(Ok(batch))) => {
                                 ann.contig_rows += batch.num_rows();
@@ -5598,6 +5604,16 @@ impl Stream for ContigAnnotationStream {
                             }
                             Poll::Ready(None) => {
                                 ann.lookup_done = true;
+                                // Drop the lookup stream to reclaim BuildSide
+                                // memory (COITrees, hash indices, concatenated
+                                // VCF batch) — no longer needed.
+                                ann.lookup_stream = None;
+                                // Also clear the colocated sink — its data has
+                                // been copied into colocated_map already (or
+                                // will be on next loop iteration).
+                                if let Ok(mut guard) = ann.coloc_sink.lock() {
+                                    guard.clear();
+                                }
                                 profile_end!(
                                     &format!("{}: 1. variation_lookup", ann.chrom),
                                     ann.t_contig,
@@ -5616,7 +5632,8 @@ impl Stream for ContigAnnotationStream {
                     };
 
                     if ann.window_buffer.is_empty() {
-                        // No more data — clean up.
+                        // No more data — clean up. Drop heavy state eagerly
+                        // before the async cleanup future runs.
                         profile_end!(
                             &format!("{}: TOTAL", ann.chrom),
                             ann.t_contig,
@@ -5625,6 +5642,13 @@ impl Stream for ContigAnnotationStream {
                         if profiling_enabled() {
                             eprintln!("[VEP_PROFILE] ------ contig {} END ------", ann.chrom);
                         }
+                        // Eagerly reclaim per-contig memory.
+                        ann.colocated_map = HashMap::new();
+                        ann.transcripts = Vec::new();
+                        ann.exons = Vec::new();
+                        ann.translations = Vec::new();
+                        ann.regulatory = Vec::new();
+                        ann.motifs = Vec::new();
                         let fut = make_cleanup_future(
                             Arc::clone(&ann.session),
                             std::mem::take(&mut ann.ephemeral_tables),
@@ -5832,7 +5856,7 @@ async fn prepare_contig_context(
         config.cache_columns.clone(),
         config.extended_probes,
         config.allowed_failed,
-        config.reference_fasta_path.clone(),
+        None, // reference_fasta_path is for HGVS hydration, not lookup
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
     if config.flags.check_existing {
