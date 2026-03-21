@@ -149,6 +149,10 @@ pub const CACHE_OUTPUT_COLUMNS: &[&str] = &[
     "dbsnp_ids",
 ];
 
+/// Number of annotation columns appended after VCF fields by `AnnotateProvider::new`:
+/// `csq` + `most_severe_consequence` + all `CACHE_OUTPUT_COLUMNS`.
+const ANNOTATION_COLUMN_COUNT: usize = 2 + CACHE_OUTPUT_COLUMNS.len();
+
 /// AF column definition: how to read, emit, and name each frequency population.
 struct AfColumn {
     /// Column name in the variation cache parquet (e.g. `"gnomADg_FIN"`).
@@ -1471,7 +1475,7 @@ impl AnnotateProvider {
         self.schema
             .fields()
             .len()
-            .saturating_sub(2 + CACHE_OUTPUT_COLUMNS.len())
+            .saturating_sub(ANNOTATION_COLUMN_COUNT)
     }
 
     fn vcf_field_names(&self) -> Vec<String> {
@@ -2761,11 +2765,17 @@ impl AnnotateProvider {
         // Discover contigs from VCF.
         let t_contigs = profile_start!();
         let vcf_contigs = self.discover_vcf_contigs().await?;
-        let cache_chroms: HashSet<&str> = cache
-            .available_chroms()
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
+        // Build expanded cache chrom set with both bare and chr-prefixed forms
+        // so that VCF "chr1" matches cache "1" and vice versa.
+        let mut cache_chroms: HashSet<String> = HashSet::new();
+        for c in cache.available_chroms() {
+            cache_chroms.insert(c.clone());
+            if let Some(bare) = c.strip_prefix("chr") {
+                cache_chroms.insert(bare.to_string());
+            } else {
+                cache_chroms.insert(format!("chr{c}"));
+            }
+        }
         let contigs: Vec<String> = vcf_contigs
             .iter()
             .filter(|c| cache_chroms.contains(c.as_str()))
@@ -3937,8 +3947,7 @@ impl AnnotateProvider {
             most_builder.append_value(&most_str);
         }
 
-        let mut out_cols =
-            Vec::with_capacity(self.vcf_field_count() + 2 + CACHE_OUTPUT_COLUMNS.len());
+        let mut out_cols = Vec::with_capacity(self.vcf_field_count() + ANNOTATION_COLUMN_COUNT);
         for name in self.vcf_field_names() {
             let idx = schema.index_of(&name).map_err(|_| {
                 DataFusionError::Execution(format!(
@@ -5225,7 +5234,19 @@ enum StreamState {
     },
     /// Deregister ephemeral tables after contig completes.
     CleaningUp(CleanupFuture),
+    /// Deregister ephemeral tables after an error, then propagate the error.
+    ErrorCleaningUp(CleanupFuture, DataFusionError),
     Done,
+}
+
+/// Spawn an async future to deregister ephemeral tables.
+fn make_cleanup_future(session: Arc<SessionContext>, tables: Vec<String>) -> CleanupFuture {
+    Box::pin(async move {
+        for tbl in &tables {
+            crate::partitioned_cache::deregister_table(&session, tbl).await?;
+        }
+        Ok(())
+    })
 }
 
 struct ContigAnnotationStream {
@@ -5467,7 +5488,7 @@ impl Stream for ContigAnnotationStream {
                         let vcf_field_count = full_schema
                             .fields()
                             .len()
-                            .saturating_sub(2 + CACHE_OUTPUT_COLUMNS.len());
+                            .saturating_sub(ANNOTATION_COLUMN_COUNT);
                         let vcf_only_schema =
                             Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
 
@@ -5567,8 +5588,13 @@ impl Stream for ContigAnnotationStream {
                                 }
                             }
                             Poll::Ready(Some(Err(e))) => {
-                                self.state = StreamState::Done;
-                                return Poll::Ready(Some(Err(e)));
+                                let session = Arc::clone(&ann.session);
+                                let tables = ann.ephemeral_tables.clone();
+                                self.state = StreamState::ErrorCleaningUp(
+                                    make_cleanup_future(session, tables),
+                                    e,
+                                );
+                                continue;
                             }
                             Poll::Ready(None) => {
                                 ann.lookup_done = true;
@@ -5599,14 +5625,10 @@ impl Stream for ContigAnnotationStream {
                         if profiling_enabled() {
                             eprintln!("[VEP_PROFILE] ------ contig {} END ------", ann.chrom);
                         }
-                        let session = Arc::clone(&ann.session);
-                        let tables = std::mem::take(&mut ann.ephemeral_tables);
-                        let fut: CleanupFuture = Box::pin(async move {
-                            for tbl in &tables {
-                                crate::partitioned_cache::deregister_table(&session, tbl).await?;
-                            }
-                            Ok(())
-                        });
+                        let fut = make_cleanup_future(
+                            Arc::clone(&ann.session),
+                            std::mem::take(&mut ann.ephemeral_tables),
+                        );
                         self.state = StreamState::CleaningUp(fut);
                         continue;
                     }
@@ -5637,16 +5659,24 @@ impl Stream for ContigAnnotationStream {
                         &window_batches,
                         ann.config.hgvs_flags,
                     ) {
-                        self.state = StreamState::Done;
-                        return Poll::Ready(Some(Err(e)));
+                        let fut = make_cleanup_future(
+                            Arc::clone(&ann.session),
+                            std::mem::take(&mut ann.ephemeral_tables),
+                        );
+                        self.state = StreamState::ErrorCleaningUp(fut, e);
+                        continue;
                     }
 
                     // Annotate window.
                     let projection = ann.config.projection.clone();
                     match annotate_window(&mut ann, &window_batches, projection.as_deref()) {
                         Err(e) => {
-                            self.state = StreamState::Done;
-                            return Poll::Ready(Some(Err(e)));
+                            let fut = make_cleanup_future(
+                                Arc::clone(&ann.session),
+                                std::mem::take(&mut ann.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(fut, e);
+                            continue;
                         }
                         Ok(batches) => {
                             self.state = StreamState::DrainingWindow {
@@ -5686,6 +5716,19 @@ impl Stream for ContigAnnotationStream {
                         self.state = StreamState::StartContig;
                     }
                 },
+
+                StreamState::ErrorCleaningUp(fut, _) => match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(_) => {
+                        // Cleanup done (ignore cleanup errors) — propagate original error.
+                        let StreamState::ErrorCleaningUp(_, original_err) =
+                            std::mem::replace(&mut self.state, StreamState::Done)
+                        else {
+                            unreachable!()
+                        };
+                        return Poll::Ready(Some(Err(original_err)));
+                    }
+                },
             }
         }
     }
@@ -5698,7 +5741,8 @@ impl Stream for ContigAnnotationStream {
 /// Register ephemeral tables, load context data, and create the variation
 /// lookup stream — all in preparation for window-based streaming annotation.
 ///
-/// Context loading runs in parallel with lookup stream setup via `tokio::try_join!`.
+/// Context loading completes before the lookup stream is first polled; the
+/// actual lookup I/O (build + probe) happens lazily on `poll_next`.
 /// Returns `None` if the contig has no variation table (skip).
 async fn prepare_contig_context(
     session: Arc<SessionContext>,
@@ -5716,7 +5760,7 @@ async fn prepare_contig_context(
     let vcf_field_count = full_schema
         .fields()
         .len()
-        .saturating_sub(2 + CACHE_OUTPUT_COLUMNS.len());
+        .saturating_sub(ANNOTATION_COLUMN_COUNT);
     let vcf_only_schema = Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
 
     // 1. Register ALL ephemeral tables upfront (variation + context).
@@ -5766,17 +5810,18 @@ async fn prepare_contig_context(
         ephemeral_tables.push(t.clone());
     }
 
-    // 2. Parallel: create lookup stream + load context data.
+    // 2. Create lookup stream + load context data.
     let worklist = MissWorklist::for_chrom(&chrom);
 
     // Lookup arm: build LookupProvider, create stream (cheap — build+probe
     // happens on first poll, NOT here).
     let coloc_sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
-    let vcf_df = session
+    let vcf_schema = session
         .table(&config.vcf_table)
         .await?
-        .filter(col("chrom").eq(lit(&*chrom)))?;
-    let vcf_schema = vcf_df.schema().as_arrow().clone();
+        .schema()
+        .as_arrow()
+        .clone();
     let cache_schema = session.table(&var_table).await?.schema().as_arrow().clone();
     let mut provider = LookupProvider::new(
         Arc::clone(&session),
@@ -5787,7 +5832,7 @@ async fn prepare_contig_context(
         config.cache_columns.clone(),
         config.extended_probes,
         config.allowed_failed,
-        None,
+        config.reference_fasta_path.clone(),
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
     if config.flags.check_existing {
@@ -5860,6 +5905,8 @@ async fn prepare_contig_context(
         translations: tl,
         regulatory: rg,
         motifs: mt,
+        // TODO: miRNA and structural features are not yet partitioned —
+        // these are rare and handled by the monolithic path only.
         mirnas: Vec::new(),
         structural: Vec::new(),
         ephemeral_tables,
