@@ -2445,4 +2445,166 @@ mod tests {
 
         assert!(err.contains("annotate_vep() backend must be one of"));
     }
+
+    /// VCF table with 10 rows on the same contig for LIMIT tests.
+    fn multi_row_vcf_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let n = 10;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"; n])),
+                Arc::new(Int64Array::from((0..n as i64).map(|i| 100 + i * 10).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(
+                    (0..n as i64).map(|i| 101 + i * 10).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec!["A"; n])),
+                Arc::new(StringArray::from(vec!["G"; n])),
+            ],
+        )
+        .expect("valid multi-row vcf batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid multi-row vcf memtable")
+    }
+
+    /// Variation cache with 10 rows matching multi_row_vcf_table.
+    fn multi_row_cache_batch() -> RecordBatch {
+        use crate::annotate_provider::cache_lookup_column_names;
+
+        let n = 10;
+        let mut fields = vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("failed", DataType::Int64, false),
+        ];
+        let mut columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = vec![
+            Arc::new(StringArray::from(vec!["1"; n])),
+            Arc::new(Int64Array::from((0..n as i64).map(|i| 100 + i * 10).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                (0..n as i64).map(|i| 101 + i * 10).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec!["A/G"; n])),
+            Arc::new(Int64Array::from(vec![0_i64; n])),
+        ];
+        for col in cache_lookup_column_names() {
+            fields.push(Field::new(col, DataType::Utf8, true));
+            columns.push(Arc::new(StringArray::from(vec![None::<&str>; n])));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns).expect("valid multi-row cache batch")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_limit_returns_exact_count() {
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &multi_row_cache_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(multi_row_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', \
+             '{{\"partitioned\":true}}') LIMIT 3"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("annotate_vep with LIMIT")
+            .collect()
+            .await
+            .expect("collect");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "LIMIT 3 should return exactly 3 rows");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_limit_one() {
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &multi_row_cache_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(multi_row_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', \
+             '{{\"partitioned\":true}}') LIMIT 1"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("annotate_vep with LIMIT 1")
+            .collect()
+            .await
+            .expect("collect");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "LIMIT 1 should return exactly 1 row");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_limit_exceeds_total_returns_all() {
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &multi_row_cache_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(multi_row_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', \
+             '{{\"partitioned\":true}}') LIMIT 100"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("annotate_vep with LIMIT 100")
+            .collect()
+            .await
+            .expect("collect");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 10,
+            "LIMIT 100 with 10 input rows should return all 10"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_no_limit_returns_all() {
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &multi_row_cache_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(multi_row_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', \
+             '{{\"partitioned\":true}}')"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("annotate_vep without LIMIT")
+            .collect()
+            .await
+            .expect("collect");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 10, "No LIMIT should return all 10 rows");
+    }
 }
