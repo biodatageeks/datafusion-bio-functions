@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema;
-use datafusion::catalog::TableFunctionImpl;
+use datafusion::catalog::{CatalogProviderList, SchemaProvider, TableFunctionImpl};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Expr;
@@ -18,11 +18,30 @@ use crate::annotation_store::AnnotationBackend;
 /// `annotate_vep(vcf_table, cache_source, backend [, options_json])`.
 pub struct AnnotateFunction {
     session: Arc<SessionContext>,
+    /// Catalog list captured at registration time to avoid acquiring
+    /// SessionState locks during `call()` (planning time).
+    catalog_list: Arc<dyn CatalogProviderList>,
+    /// Default catalog name captured at registration time.
+    default_catalog: String,
+    /// Default schema name captured at registration time.
+    default_schema: String,
 }
 
 impl AnnotateFunction {
     pub fn new(session: Arc<SessionContext>) -> Self {
-        Self { session }
+        // Capture catalog metadata at registration time (before any planner
+        // locks exist) so resolve_schema can look up tables without touching
+        // the SessionState RwLock.
+        let state = session.state();
+        let catalog_list = Arc::clone(state.catalog_list());
+        let default_catalog = state.config_options().catalog.default_catalog.clone();
+        let default_schema = state.config_options().catalog.default_schema.clone();
+        Self {
+            session,
+            catalog_list,
+            default_catalog,
+            default_schema,
+        }
     }
 }
 
@@ -56,7 +75,12 @@ impl TableFunctionImpl for AnnotateFunction {
             None
         };
 
-        let (vcf_schema, _) = resolve_schema(&self.session, &vcf_table)?;
+        let vcf_schema = resolve_schema_from_catalog(
+            &*self.catalog_list,
+            &self.default_catalog,
+            &self.default_schema,
+            &vcf_table,
+        )?;
 
         Ok(Arc::new(AnnotateProvider::new(
             Arc::clone(&self.session),
@@ -86,37 +110,56 @@ fn extract_string_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<String> {
     }
 }
 
-/// Resolve the Arrow schema of a registered table without going through
-/// `session.table()`, which builds a full `LogicalPlan` / `DataFrame` and
-/// acquires `SessionState` locks multiple times — causing deadlocks when
-/// the SQL planner already holds the state lock (e.g., when called from an
-/// external session via vepyr / polars-bio).
+/// Resolve the Arrow schema of a registered table using a pre-captured
+/// `CatalogProviderList`, completely bypassing `SessionContext` and its
+/// `SessionState` RwLock.
 ///
-/// Instead we clone the state once (dropping the lock immediately), resolve
-/// the schema provider, and call only the async `SchemaProvider::table()`
-/// which does not re-acquire the session lock.
-fn resolve_schema(session: &SessionContext, vcf_table: &str) -> Result<(Schema, String)> {
-    let state = session.state();
-    let table_ref = datafusion::common::TableReference::bare(vcf_table);
-    let schema_provider = state.schema_for_ref(table_ref)?;
+/// This is critical for vepyr / polars-bio integration: DataFusion's SQL
+/// planner holds a **write lock** on `SessionState` while resolving table
+/// functions. Any call to `session.state()`, `session.catalog()`, or
+/// `session.table()` from within `TableFunctionImpl::call()` will deadlock
+/// because they all acquire a read lock on the same RwLock.
+///
+/// By capturing the `CatalogProviderList` at registration time (before any
+/// planner locks exist), we can look up tables without touching the session.
+fn resolve_schema_from_catalog(
+    catalog_list: &dyn CatalogProviderList,
+    default_catalog: &str,
+    default_schema: &str,
+    table_name: &str,
+) -> Result<Schema> {
+    let catalog = catalog_list
+        .catalog(default_catalog)
+        .ok_or_else(|| DataFusionError::Plan(format!("Catalog '{default_catalog}' not found")))?;
+    let schema_provider = catalog.schema(default_schema).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Schema '{default_schema}' not found in catalog '{default_catalog}'"
+        ))
+    })?;
 
-    let table_provider = match tokio::runtime::Handle::try_current() {
+    let table_provider = resolve_table_sync(&*schema_provider, table_name)?;
+    Ok(table_provider.schema().as_ref().clone())
+}
+
+/// Run `SchemaProvider::table()` synchronously, handling both tokio-context
+/// and no-tokio-context cases.
+fn resolve_table_sync(
+    schema_provider: &dyn SchemaProvider,
+    table_name: &str,
+) -> Result<Arc<dyn TableProvider>> {
+    let result = match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
-            tokio::task::block_in_place(|| handle.block_on(schema_provider.table(vcf_table)))
+            tokio::task::block_in_place(|| handle.block_on(schema_provider.table(table_name)))
         }
         Err(_) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            rt.block_on(schema_provider.table(vcf_table))
+            rt.block_on(schema_provider.table(table_name))
         }
-    }
-    .map_err(|e| DataFusionError::External(Box::new(e)))?
-    .ok_or_else(|| DataFusionError::Plan(format!("Table '{vcf_table}' not found")))?;
-
-    Ok((
-        table_provider.schema().as_ref().clone(),
-        vcf_table.to_string(),
-    ))
+    };
+    result
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .ok_or_else(|| DataFusionError::Plan(format!("Table '{table_name}' not found")))
 }
 
 #[cfg(test)]
