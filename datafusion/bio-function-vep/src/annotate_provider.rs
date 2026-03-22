@@ -2695,18 +2695,11 @@ impl AnnotateProvider {
             use_fjall: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
             sift_kv_store: kv_store.as_ref().and_then(|store| {
-                // Prefer standalone translation_sift.fjall/ (matches parquet naming),
-                // fall back to sift keyspace inside variation.fjall/.
                 let parent = store.root_path().parent()?;
                 let sift_path = parent.join("translation_sift.fjall");
                 crate::kv_cache::SiftKvStore::open_path(&sift_path)
                     .ok()
                     .flatten()
-                    .or_else(|| {
-                        crate::kv_cache::SiftKvStore::open(store.database())
-                            .ok()
-                            .flatten()
-                    })
             }),
             #[cfg(feature = "kv-cache")]
             kv_store,
