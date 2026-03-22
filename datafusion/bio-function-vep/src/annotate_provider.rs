@@ -6183,16 +6183,14 @@ impl Stream for ContigAnnotationStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskCtx<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            let rows_emitted = self.rows_emitted;
+            let fetch_limit = self.config.fetch_limit;
             match &mut self.state {
                 StreamState::Done => return Poll::Ready(None),
 
                 StreamState::StartContig => {
                     // LIMIT pushdown: stop processing contigs if limit reached.
-                    if self
-                        .config
-                        .fetch_limit
-                        .is_some_and(|limit| self.rows_emitted >= limit)
-                    {
+                    if fetch_limit.is_some_and(|limit| rows_emitted >= limit) {
                         self.state = StreamState::Done;
                         return Poll::Ready(None);
                     }
@@ -6364,7 +6362,16 @@ impl Stream for ContigAnnotationStream {
                     // buffer matched rows internally and only emit after the
                     // input is exhausted, ensuring the colocated sink is fully
                     // populated when the first batch arrives here.
-                    if !ann.lookup_done {
+                    //
+                    // LIMIT pushdown: once we have enough buffered rows to
+                    // satisfy the limit, stop pulling from the lookup stream
+                    // to avoid unnecessary annotation work.
+                    let buffered_rows: usize =
+                        ann.window_buffer.iter().map(|b| b.num_rows()).sum();
+                    let limit_buffered = fetch_limit.is_some_and(|limit| {
+                        rows_emitted + buffered_rows >= limit
+                    });
+                    if !ann.lookup_done && !limit_buffered {
                         let stream = ann
                             .lookup_stream
                             .as_mut()
@@ -6414,9 +6421,13 @@ impl Stream for ContigAnnotationStream {
                         unreachable!()
                     };
 
-                    if ann.window_buffer.is_empty() {
-                        // No more data — clean up. Drop heavy state eagerly
-                        // before the async cleanup future runs.
+                    // LIMIT pushdown: skip remaining windows if limit reached.
+                    let limit_reached =
+                        fetch_limit.is_some_and(|limit| rows_emitted >= limit);
+
+                    if ann.window_buffer.is_empty() || limit_reached {
+                        // No more data (or limit reached) — clean up.
+                        // Drop heavy state eagerly before the async cleanup future runs.
                         profile_end!(
                             &format!("{}: TOTAL", ann.chrom),
                             ann.t_contig,
@@ -6502,8 +6513,8 @@ impl Stream for ContigAnnotationStream {
                 } => {
                     if let Some(batch) = batches.pop_front() {
                         // LIMIT pushdown: truncate or stop if we've reached the limit.
-                        if let Some(limit) = self.config.fetch_limit {
-                            let remaining = limit.saturating_sub(self.rows_emitted);
+                        if let Some(limit) = fetch_limit {
+                            let remaining = limit.saturating_sub(rows_emitted);
                             if remaining == 0 {
                                 self.state = StreamState::Done;
                                 return Poll::Ready(None);
