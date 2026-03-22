@@ -1,4 +1,4 @@
-use crate::physical_planner::BioQueryPlanner;
+use crate::physical_planner::RangesQueryPlanner;
 use crate::physical_planner::IntervalJoinPhysicalOptimizationRule;
 use async_trait::async_trait;
 use datafusion::common::extensions_options;
@@ -34,12 +34,12 @@ impl BioSessionExt for SessionContext {
             .with_config(config)
             .with_runtime_env(runtime)
             .with_default_features()
-            .with_query_planner(Arc::new(BioQueryPlanner))
+            .with_query_planner(Arc::new(RangesQueryPlanner::new()))
             .with_physical_optimizer_rules(rules)
             .build()
             .into();
 
-        info!("Initialized BioQueryPlanner...");
+        info!("Initialized RangesQueryPlanner...");
 
         ctx
     }

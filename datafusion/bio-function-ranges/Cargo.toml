@@ -20,6 +20,7 @@ bio = "3.0.0"
 rust-lapper = "1.1.0"
 superintervals = { path = "superintervals" }
 parking_lot = "0.12.3"
+datafusion-bio-query-planner = { path = "../bio-query-planner" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

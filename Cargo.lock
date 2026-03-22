@@ -1144,6 +1144,7 @@ dependencies = [
  "bio",
  "coitrees",
  "datafusion",
+ "datafusion-bio-query-planner",
  "futures",
  "log",
  "parking_lot",
@@ -1159,6 +1160,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "datafusion",
+ "datafusion-bio-query-planner",
  "futures",
  "log",
  "parquet",
@@ -1192,6 +1194,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "zstd",
+]
+
+[[package]]
+name = "datafusion-bio-query-planner"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "log",
 ]
 
 [[package]]

@@ -1,25 +1,15 @@
 use crate::physical_planner::intervals::{ColIntervals, parse};
 use crate::physical_planner::joins::interval_join::IntervalJoinExec;
 use crate::session_context::{Algorithm, BioConfig};
-use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion::common::{DFSchema, NullEquality, Result};
+use datafusion::common::{NullEquality, Result};
 use datafusion::config::ConfigOptions;
-use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::{Expr, LogicalPlan};
-use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::lit;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode};
-use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use log::info;
 use std::sync::Arc;
-
-#[derive(Default)]
-pub struct BioPhysicalPlanner {
-    planner: DefaultPhysicalPlanner,
-}
 
 #[derive(Debug, Default)]
 pub struct IntervalJoinPhysicalOptimizationRule;
@@ -143,29 +133,4 @@ fn from_nested_loop_join(
     )?;
 
     Ok(Arc::new(new_plan))
-}
-
-#[async_trait]
-impl PhysicalPlanner for BioPhysicalPlanner {
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-        session_state: &SessionState,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let plan = self
-            .planner
-            .create_physical_plan(logical_plan, session_state)
-            .await?;
-        Ok(plan)
-    }
-
-    fn create_physical_expr(
-        &self,
-        expr: &Expr,
-        input_dfschema: &DFSchema,
-        session_state: &SessionState,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        self.planner
-            .create_physical_expr(expr, input_dfschema, session_state)
-    }
 }

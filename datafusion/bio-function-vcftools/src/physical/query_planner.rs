@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use datafusion::execution::context::{QueryPlanner, SessionState};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use datafusion_bio_query_planner::BioQueryPlanner;
 use log::info;
 use std::sync::Arc;
 
@@ -20,7 +20,7 @@ use super::extension_planner::FusedArrayTransformPlanner;
 /// avoiding repeated allocations since both DefaultPhysicalPlanner and
 /// FusedArrayTransformPlanner are stateless.
 pub struct VcfQueryPlanner {
-    physical_planner: DefaultPhysicalPlanner,
+    planner: BioQueryPlanner,
 }
 
 impl std::fmt::Debug for VcfQueryPlanner {
@@ -38,10 +38,10 @@ impl Default for VcfQueryPlanner {
 impl VcfQueryPlanner {
     /// Create a new VcfQueryPlanner with a pre-configured physical planner.
     pub fn new() -> Self {
-        let physical_planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
+        let planner = BioQueryPlanner::with_extension_planners(vec![Arc::new(
             FusedArrayTransformPlanner::new(),
         )]);
-        Self { physical_planner }
+        Self { planner }
     }
 }
 
@@ -55,7 +55,7 @@ impl QueryPlanner for VcfQueryPlanner {
         let display_string = logical_plan.display();
         info!("VcfQueryPlanner: Creating physical plan for logical plan: {display_string}");
 
-        self.physical_planner
+        self.planner
             .create_physical_plan(logical_plan, session_state)
             .await
     }
