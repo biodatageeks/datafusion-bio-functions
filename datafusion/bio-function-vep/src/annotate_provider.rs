@@ -3187,6 +3187,7 @@ impl AnnotateProvider {
         cache: &PartitionedParquetCache,
         translations_sift_table: Option<&str>,
         #[cfg(feature = "kv-cache")] kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
+        fetch_limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if profiling_enabled() {
             eprintln!("[VEP_PROFILE] ====== scan_with_transcript_engine_partitioned START ======");
@@ -3263,6 +3264,7 @@ impl AnnotateProvider {
             upstream_distance,
             downstream_distance,
             projection: projection.cloned(),
+            fetch_limit,
             #[cfg(feature = "kv-cache")]
             use_fjall: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
@@ -5750,6 +5752,8 @@ struct ContigAnnotationConfig {
     upstream_distance: i64,
     downstream_distance: i64,
     projection: Option<Vec<usize>>,
+    /// Maximum number of output rows (LIMIT pushdown).
+    fetch_limit: Option<usize>,
     /// When true, use fjall KV store for variation lookup + SIFT instead of parquet.
     #[cfg(feature = "kv-cache")]
     use_fjall: bool,
@@ -5976,6 +5980,8 @@ struct ContigAnnotationStream {
     cache: Arc<PartitionedParquetCache>,
     config: ContigAnnotationConfig,
     state: StreamState,
+    /// Rows emitted so far (for LIMIT pushdown).
+    rows_emitted: usize,
 }
 
 impl ContigAnnotationStream {
@@ -5995,6 +6001,7 @@ impl ContigAnnotationStream {
             cache,
             config,
             state: StreamState::StartContig,
+            rows_emitted: 0,
         }
     }
 }
@@ -6180,6 +6187,15 @@ impl Stream for ContigAnnotationStream {
                 StreamState::Done => return Poll::Ready(None),
 
                 StreamState::StartContig => {
+                    // LIMIT pushdown: stop processing contigs if limit reached.
+                    if self
+                        .config
+                        .fetch_limit
+                        .is_some_and(|limit| self.rows_emitted >= limit)
+                    {
+                        self.state = StreamState::Done;
+                        return Poll::Ready(None);
+                    }
                     let Some(chrom) = self.contigs.pop_front() else {
                         // All contigs processed. Deregister the global KV
                         // variation table if fjall was used, via async cleanup
@@ -6485,6 +6501,20 @@ impl Stream for ContigAnnotationStream {
                     annotation_state: _,
                 } => {
                     if let Some(batch) = batches.pop_front() {
+                        // LIMIT pushdown: truncate or stop if we've reached the limit.
+                        if let Some(limit) = self.config.fetch_limit {
+                            let remaining = limit.saturating_sub(self.rows_emitted);
+                            if remaining == 0 {
+                                self.state = StreamState::Done;
+                                return Poll::Ready(None);
+                            }
+                            if batch.num_rows() > remaining {
+                                self.rows_emitted += remaining;
+                                self.state = StreamState::Done;
+                                return Poll::Ready(Some(Ok(batch.slice(0, remaining))));
+                            }
+                        }
+                        self.rows_emitted += batch.num_rows();
                         return Poll::Ready(Some(Ok(batch)));
                     }
                     // Window drained — back to AnnotatingContig for next window
@@ -6765,7 +6795,7 @@ impl TableProvider for AnnotateProvider {
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let _store = build_store(self.backend, self.cache_source.clone());
 
@@ -6907,6 +6937,7 @@ impl TableProvider for AnnotateProvider {
                     translations_sift_table.as_deref(),
                     #[cfg(feature = "kv-cache")]
                     kv_store_arc,
+                    limit,
                 )
                 .await;
         }
