@@ -63,17 +63,18 @@ pub struct TranslationKvStore {
 
 impl TranslationKvStore {
     /// Open the translations keyspace from an existing fjall database.
-    /// Returns `None` if the keyspace is empty or doesn't exist.
+    /// Returns `None` if the keyspace doesn't exist or is empty.
     pub fn open(db: &Database) -> Result<Option<Self>> {
-        match db.keyspace(TRANSLATIONS_KEYSPACE, KeyspaceCreateOptions::default) {
-            Ok(ks) => {
-                if ks.is_empty().unwrap_or(true) {
-                    Ok(None)
-                } else {
-                    Ok(Some(Self { ks }))
-                }
-            }
-            Err(_) => Ok(None),
+        if !db.keyspace_exists(TRANSLATIONS_KEYSPACE) {
+            return Ok(None);
+        }
+        let ks = db
+            .keyspace(TRANSLATIONS_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(fjall_err)?;
+        if ks.is_empty().unwrap_or(true) {
+            Ok(None)
+        } else {
+            Ok(Some(Self { ks }))
         }
     }
 
@@ -134,17 +135,18 @@ pub struct ExonKvStore {
 
 impl ExonKvStore {
     /// Open the exons keyspace from an existing fjall database.
-    /// Returns `None` if the keyspace is empty or doesn't exist.
+    /// Returns `None` if the keyspace doesn't exist or is empty.
     pub fn open(db: &Database) -> Result<Option<Self>> {
-        match db.keyspace(EXONS_KEYSPACE, KeyspaceCreateOptions::default) {
-            Ok(ks) => {
-                if ks.is_empty().unwrap_or(true) {
-                    Ok(None)
-                } else {
-                    Ok(Some(Self { ks }))
-                }
-            }
-            Err(_) => Ok(None),
+        if !db.keyspace_exists(EXONS_KEYSPACE) {
+            return Ok(None);
+        }
+        let ks = db
+            .keyspace(EXONS_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(fjall_err)?;
+        if ks.is_empty().unwrap_or(true) {
+            Ok(None)
+        } else {
+            Ok(Some(Self { ks }))
         }
     }
 

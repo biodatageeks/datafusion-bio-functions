@@ -46,18 +46,18 @@ impl SiftKvStore {
     }
 
     /// Open sift keyspace from an existing fjall database.
+    /// Returns `None` if the keyspace doesn't exist or is empty.
     pub fn open(db: &Database) -> Result<Option<Self>> {
-        // Only return Some if the keyspace exists (don't create on read).
-        match db.keyspace(SIFT_KEYSPACE, KeyspaceCreateOptions::default) {
-            Ok(ks) => {
-                // Check if it has any data
-                if ks.is_empty().unwrap_or(true) {
-                    Ok(None)
-                } else {
-                    Ok(Some(Self { sift_ks: ks }))
-                }
-            }
-            Err(_) => Ok(None),
+        if !db.keyspace_exists(SIFT_KEYSPACE) {
+            return Ok(None);
+        }
+        let ks = db
+            .keyspace(SIFT_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(fjall_err)?;
+        if ks.is_empty().unwrap_or(true) {
+            Ok(None)
+        } else {
+            Ok(Some(Self { sift_ks: ks }))
         }
     }
 
