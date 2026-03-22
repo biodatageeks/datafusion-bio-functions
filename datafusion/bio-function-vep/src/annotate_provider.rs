@@ -5172,7 +5172,7 @@ async fn prepare_contig_context(
         {
             // Register the shared fjall KV store as a table (idempotent).
             let kv_table_name = "__vep_kv_variation".to_string();
-            if session.table_provider(&kv_table_name).await.is_err() {
+            if !session.table_exist(&kv_table_name)? {
                 let store = config
                     .kv_store
                     .as_ref()
