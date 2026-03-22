@@ -1206,33 +1206,13 @@ impl Stream for KvLookupStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // When emitting buffered batches (input already exhausted).
-        if self.input_exhausted {
-            return if let Some(batch) = self.matched_batches.pop_front() {
-                Poll::Ready(Some(Ok(batch)))
-            } else {
-                Poll::Ready(None)
-            };
-        }
-
+        // KvLookupExec reads ALL alleles at each position in a single point
+        // lookup (the position entry contains all alleles), so co-located
+        // data for each VCF row is complete immediately — no buffering needed.
         match self.input.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
                 let result = self.process_batch(&batch);
-                if self.colocated_sink.is_some() {
-                    // Buffer matched batches — emit only after input is
-                    // exhausted so the colocated sink is fully populated.
-                    match result {
-                        Ok(b) => {
-                            self.matched_batches.push_back(b);
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
-                        }
-                        Err(e) => Poll::Ready(Some(Err(e))),
-                    }
-                } else {
-                    // No colocated sink — emit immediately (streaming).
-                    Poll::Ready(Some(result))
-                }
+                Poll::Ready(Some(result))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => {
@@ -1240,15 +1220,7 @@ impl Stream for KvLookupStream {
                     self.profile.emit();
                     self.profile_emitted = true;
                 }
-                if !self.matched_batches.is_empty() {
-                    // Input exhausted, colocated sink complete — start
-                    // emitting buffered batches.
-                    self.input_exhausted = true;
-                    let batch = self.matched_batches.pop_front().unwrap();
-                    Poll::Ready(Some(Ok(batch)))
-                } else {
-                    Poll::Ready(None)
-                }
+                Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
         }
