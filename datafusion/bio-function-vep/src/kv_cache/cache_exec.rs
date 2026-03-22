@@ -2,7 +2,7 @@
 //! a fjall KV store per-position for annotation.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -238,6 +238,11 @@ impl ExecutionPlan for KvLookupExec {
 }
 
 /// Streaming implementation that processes VCF batches and probes the KV store.
+///
+/// When a colocated sink is present, batches are buffered during the probe
+/// phase and only emitted after the input stream is exhausted. This ensures
+/// the colocated sink is fully populated before downstream consumers build
+/// the colocated map — matching the buffering behavior of `VariantLookupExec`.
 struct KvLookupStream {
     input: SendableRecordBatchStream,
     store: Arc<VepKvStore>,
@@ -260,6 +265,11 @@ struct KvLookupStream {
     profile_enabled: bool,
     profile_emitted: bool,
     profile: LookupProfile,
+    /// Buffered matched batches (used when colocated sink is present).
+    /// Batches are collected during probe and emitted after input exhaustion.
+    matched_batches: VecDeque<RecordBatch>,
+    /// True once the input stream is exhausted and we're emitting buffered batches.
+    input_exhausted: bool,
 }
 
 /// Column indices within the KV entry's stored columns for co-located fields.
@@ -441,6 +451,8 @@ impl KvLookupStream {
             profile_enabled: std::env::var_os("VEP_KV_PROFILE").is_some(),
             profile_emitted: false,
             profile: LookupProfile::default(),
+            matched_batches: VecDeque::new(),
+            input_exhausted: false,
         }
     }
 
@@ -1194,6 +1206,9 @@ impl Stream for KvLookupStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // KvLookupExec reads ALL alleles at each position in a single point
+        // lookup (the position entry contains all alleles), so co-located
+        // data for each VCF row is complete immediately — no buffering needed.
         match self.input.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
                 let result = self.process_batch(&batch);
@@ -1365,6 +1380,116 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// Empty VCF input should produce zero output rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_kv_lookup_empty_input() {
+        let cache_schema = simple_cache_schema();
+        let cache_dir = test_temp_dir("vep-kv-empty");
+        let store = VepKvStore::create(&cache_dir, cache_schema.clone()).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let reopened_store = Arc::new(VepKvStore::open(&cache_dir).expect("reopen KV store"));
+
+        // Create an empty VCF batch (0 rows).
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let empty_batch = RecordBatch::new_empty(vcf_schema.clone());
+        let vcf_mem = MemTable::try_new(vcf_schema, vec![vec![empty_batch]]).unwrap();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("vcf_empty", Arc::new(vcf_mem)).unwrap();
+        let vcf_plan = ctx
+            .table("vcf_empty")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let exec = KvLookupExec::new(
+            vcf_plan,
+            reopened_store,
+            vec!["variation_name".into()],
+            KvMatchMode::Exact,
+            allele_matches as fn(&str, &str, &str) -> bool,
+            false,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+
+        let task_ctx = ctx.task_ctx();
+        let stream = exec.execute(0, task_ctx).unwrap();
+        let batches: Vec<_> = datafusion::physical_plan::common::collect(stream)
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 0,
+            "Empty VCF input should produce 0 output rows"
+        );
+    }
+
+    /// Verify colocated sink is populated per-row during streaming (not requiring
+    /// a separate buffering pass).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_kv_lookup_colocated_sink_populated_after_stream() {
+        let cache_schema = simple_cache_schema();
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["rs_sink_test"])),
+                Arc::new(StringArray::from(vec!["A/G"])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![0i64])),
+                Arc::new(Int64Array::from(vec![0i64])),
+            ],
+        )
+        .unwrap();
+
+        let entry =
+            serialize_position_entry(&[0], &cache_batch, &[2, 3, 4, 5, 6, 7, 8], 4).unwrap();
+
+        let vcf = simple_vcf_batch("1", 100, 100, "A", "G");
+        let coloc = run_kv_with_colocated_sink(
+            vcf,
+            cache_schema,
+            vec![("1", 100, entry)],
+            vec!["variation_name".into()],
+            false,
+            0,
+        )
+        .await;
+
+        // The sink should have been populated during streaming.
+        assert!(
+            !coloc.is_empty(),
+            "Colocated sink should have entries after stream exhaustion"
+        );
+        let all_names: Vec<&str> = coloc
+            .values()
+            .flat_map(|v| v.entries.iter())
+            .map(|e| e.variation_name.as_str())
+            .collect();
+        assert!(
+            all_names.contains(&"rs_sink_test"),
+            "Colocated sink should contain rs_sink_test entry"
+        );
     }
 
     /// P0: Colocated sink collects entries with correct field values.

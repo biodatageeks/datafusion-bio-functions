@@ -23,24 +23,41 @@ fn fjall_err(e: fjall::Error) -> DataFusionError {
 }
 
 /// Store for SIFT/PolyPhen predictions keyed by transcript_id.
+#[derive(Clone)]
 pub struct SiftKvStore {
     sift_ks: Keyspace,
 }
 
 impl SiftKvStore {
+    /// Open a standalone SIFT fjall database at the given path.
+    ///
+    /// Used when SIFT predictions are stored in a separate `translation_sift.fjall/`
+    /// directory (matching the parquet naming convention).
+    pub fn open_path(path: impl AsRef<std::path::Path>) -> Result<Option<Self>> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let db = Database::builder(path)
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .map_err(fjall_err)?;
+        Self::open(&db)
+    }
+
     /// Open sift keyspace from an existing fjall database.
+    /// Returns `None` if the keyspace doesn't exist or is empty.
     pub fn open(db: &Database) -> Result<Option<Self>> {
-        // Only return Some if the keyspace exists (don't create on read).
-        match db.keyspace(SIFT_KEYSPACE, KeyspaceCreateOptions::default) {
-            Ok(ks) => {
-                // Check if it has any data
-                if ks.is_empty().unwrap_or(true) {
-                    Ok(None)
-                } else {
-                    Ok(Some(Self { sift_ks: ks }))
-                }
-            }
-            Err(_) => Ok(None),
+        if !db.keyspace_exists(SIFT_KEYSPACE) {
+            return Ok(None);
+        }
+        let ks = db
+            .keyspace(SIFT_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(fjall_err)?;
+        if ks.is_empty().unwrap_or(true) {
+            Ok(None)
+        } else {
+            Ok(Some(Self { sift_ks: ks }))
         }
     }
 
@@ -239,5 +256,97 @@ mod tests {
             .unwrap();
 
         assert!(SiftKvStore::open(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_open_path_nonexistent() {
+        let result = SiftKvStore::open_path("/nonexistent/path/to/sift.fjall").unwrap();
+        assert!(result.is_none(), "Non-existent path should return Ok(None)");
+    }
+
+    #[test]
+    fn test_open_path_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write phase: create a standalone SIFT DB and insert predictions.
+        {
+            let db = fjall::Database::builder(dir.path())
+                .cache_size(64 * 1024 * 1024)
+                .open()
+                .unwrap();
+            let store = SiftKvStore::create(&db).unwrap();
+            store.put("ENST00000111111", &make_predictions()).unwrap();
+            db.persist(fjall::PersistMode::SyncAll).unwrap();
+        }
+
+        // Read phase: reopen via open_path and verify data.
+        let store = SiftKvStore::open_path(dir.path())
+            .unwrap()
+            .expect("open_path should return Some for a valid sift DB");
+        let preds = store
+            .get("ENST00000111111")
+            .unwrap()
+            .expect("predictions should be present");
+        assert_eq!(preds.sift.len(), 2);
+        assert_eq!(preds.polyphen.len(), 1);
+        assert_eq!(preds.sift[0].position, 10);
+    }
+
+    #[test]
+    fn test_clone_shares_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+
+        let store = SiftKvStore::create(&db).unwrap();
+        store.put("ENST00000222222", &make_predictions()).unwrap();
+
+        let cloned = store.clone();
+
+        // Both original and clone should see the same data.
+        let from_original = store.get("ENST00000222222").unwrap().unwrap();
+        let from_clone = cloned.get("ENST00000222222").unwrap().unwrap();
+        assert_eq!(from_original.sift.len(), from_clone.sift.len());
+        assert_eq!(from_original.polyphen.len(), from_clone.polyphen.len());
+
+        // Write through clone should be visible from original.
+        let extra = CachedPredictions {
+            sift: vec![CompactPrediction {
+                position: 99,
+                amino_acid: 5,
+                prediction: 1,
+                score: 0.42,
+            }],
+            polyphen: vec![],
+        };
+        cloned.put("ENST00000333333", &extra).unwrap();
+        assert!(store.get("ENST00000333333").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_open_keyspace_not_exists() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a DB without the sift keyspace (just an empty fjall DB).
+        {
+            let _db = fjall::Database::builder(dir.path())
+                .cache_size(64 * 1024 * 1024)
+                .open()
+                .unwrap();
+            // Don't create any keyspaces — just open and close.
+        }
+
+        // Reopen and try to open sift keyspace — should return None.
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+        let result = SiftKvStore::open(&db).unwrap();
+        assert!(
+            result.is_none(),
+            "Opening sift keyspace on DB without it should return None"
+        );
     }
 }

@@ -59,6 +59,9 @@ struct Args {
     reference_fasta_path: Option<PathBuf>,
     /// Use VEP --everything flag (enables all features, 80-field CSQ schema).
     everything: bool,
+    /// Use fjall KV store for variation lookup + SIFT (--use-fjall).
+    /// Cache directory must contain a `variation.fjall/` subdirectory.
+    use_fjall: bool,
 }
 
 fn parse_cli_bool(raw: &str) -> Option<bool> {
@@ -157,6 +160,7 @@ impl Args {
             shift_hgvs,
             reference_fasta_path,
             everything: args.iter().any(|a| a == "--everything"),
+            use_fjall: args.iter().any(|a| a == "--use-fjall"),
         }
     }
 
@@ -210,6 +214,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "(none)".to_string())
     );
     println!("  everything: {}", args.everything);
+    println!("  use_fjall: {}", args.use_fjall);
 
     fs::create_dir_all(&args.work_dir).map_err(io_err)?;
 
@@ -458,6 +463,9 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
         }
         if args.merged {
             entries.push("\"merged\":true".to_string());
+        }
+        if args.use_fjall {
+            entries.push("\"use_fjall\":true".to_string());
         }
         return Ok(Some(format!("{{{}}}", entries.join(","))));
     }
