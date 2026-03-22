@@ -4945,20 +4945,10 @@ impl Stream for ContigAnnotationStream {
                 StreamState::AnnotatingContig(ann) => {
                     // Pull batches from lookup stream into window buffer.
                     //
-                    // VariantLookupExec (parquet) buffers matched rows during
-                    // probe and only emits after probe completes, so the
-                    // colocated sink is fully populated when the first batch
-                    // arrives here — windows can be processed mid-stream.
-                    //
-                    // KvLookupExec (fjall) emits immediately, so the colocated
-                    // sink is only complete after the stream is exhausted.
-                    // We must drain the entire stream before processing any
-                    // windows to ensure colocated data is complete.
-                    #[cfg(feature = "kv-cache")]
-                    let fjall_drain = ann.config.use_fjall && ann.config.flags.check_existing;
-                    #[cfg(not(feature = "kv-cache"))]
-                    let fjall_drain = false;
-
+                    // Both VariantLookupExec (parquet) and KvLookupExec (fjall)
+                    // buffer matched rows internally and only emit after the
+                    // input is exhausted, ensuring the colocated sink is fully
+                    // populated when the first batch arrives here.
                     if !ann.lookup_done {
                         let stream = ann
                             .lookup_stream
@@ -4969,7 +4959,7 @@ impl Stream for ContigAnnotationStream {
                             Poll::Ready(Some(Ok(batch))) => {
                                 ann.contig_rows += batch.num_rows();
                                 ann.window_buffer.push(batch);
-                                if fjall_drain || ann.window_buffer.len() < HYDRATION_WINDOW_SIZE {
+                                if ann.window_buffer.len() < HYDRATION_WINDOW_SIZE {
                                     continue; // Keep filling window.
                                 }
                             }

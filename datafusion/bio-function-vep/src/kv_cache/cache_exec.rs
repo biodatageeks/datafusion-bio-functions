@@ -2,7 +2,7 @@
 //! a fjall KV store per-position for annotation.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -238,6 +238,11 @@ impl ExecutionPlan for KvLookupExec {
 }
 
 /// Streaming implementation that processes VCF batches and probes the KV store.
+///
+/// When a colocated sink is present, batches are buffered during the probe
+/// phase and only emitted after the input stream is exhausted. This ensures
+/// the colocated sink is fully populated before downstream consumers build
+/// the colocated map — matching the buffering behavior of `VariantLookupExec`.
 struct KvLookupStream {
     input: SendableRecordBatchStream,
     store: Arc<VepKvStore>,
@@ -260,6 +265,11 @@ struct KvLookupStream {
     profile_enabled: bool,
     profile_emitted: bool,
     profile: LookupProfile,
+    /// Buffered matched batches (used when colocated sink is present).
+    /// Batches are collected during probe and emitted after input exhaustion.
+    matched_batches: VecDeque<RecordBatch>,
+    /// True once the input stream is exhausted and we're emitting buffered batches.
+    input_exhausted: bool,
 }
 
 /// Column indices within the KV entry's stored columns for co-located fields.
@@ -441,6 +451,8 @@ impl KvLookupStream {
             profile_enabled: std::env::var_os("VEP_KV_PROFILE").is_some(),
             profile_emitted: false,
             profile: LookupProfile::default(),
+            matched_batches: VecDeque::new(),
+            input_exhausted: false,
         }
     }
 
@@ -1194,10 +1206,33 @@ impl Stream for KvLookupStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // When emitting buffered batches (input already exhausted).
+        if self.input_exhausted {
+            return if let Some(batch) = self.matched_batches.pop_front() {
+                Poll::Ready(Some(Ok(batch)))
+            } else {
+                Poll::Ready(None)
+            };
+        }
+
         match self.input.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
                 let result = self.process_batch(&batch);
-                Poll::Ready(Some(result))
+                if self.colocated_sink.is_some() {
+                    // Buffer matched batches — emit only after input is
+                    // exhausted so the colocated sink is fully populated.
+                    match result {
+                        Ok(b) => {
+                            self.matched_batches.push_back(b);
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                        Err(e) => Poll::Ready(Some(Err(e))),
+                    }
+                } else {
+                    // No colocated sink — emit immediately (streaming).
+                    Poll::Ready(Some(result))
+                }
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => {
@@ -1205,7 +1240,15 @@ impl Stream for KvLookupStream {
                     self.profile.emit();
                     self.profile_emitted = true;
                 }
-                Poll::Ready(None)
+                if !self.matched_batches.is_empty() {
+                    // Input exhausted, colocated sink complete — start
+                    // emitting buffered batches.
+                    self.input_exhausted = true;
+                    let batch = self.matched_batches.pop_front().unwrap();
+                    Poll::Ready(Some(Ok(batch)))
+                } else {
+                    Poll::Ready(None)
+                }
             }
             Poll::Pending => Poll::Pending,
         }
