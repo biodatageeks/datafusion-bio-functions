@@ -86,19 +86,34 @@ fn extract_string_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<String> {
     }
 }
 
+/// Resolve the Arrow schema of a registered table without going through
+/// `session.table()`, which builds a full `LogicalPlan` / `DataFrame` and
+/// acquires `SessionState` locks multiple times — causing deadlocks when
+/// the SQL planner already holds the state lock (e.g., when called from an
+/// external session via vepyr / polars-bio).
+///
+/// Instead we clone the state once (dropping the lock immediately), resolve
+/// the schema provider, and call only the async `SchemaProvider::table()`
+/// which does not re-acquire the session lock.
 fn resolve_schema(session: &SessionContext, vcf_table: &str) -> Result<(Schema, String)> {
-    match tokio::runtime::Handle::try_current() {
+    let state = session.state();
+    let table_ref = datafusion::common::TableReference::bare(vcf_table);
+    let schema_provider = state.schema_for_ref(table_ref)?;
+
+    let table_provider = match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| {
-            let vcf = handle.block_on(session.table(vcf_table))?;
-            Ok::<_, DataFusionError>((vcf.schema().as_arrow().clone(), vcf_table.to_string()))
+            handle.block_on(schema_provider.table(vcf_table))
         }),
         Err(_) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let vcf = rt.block_on(session.table(vcf_table))?;
-            Ok((vcf.schema().as_arrow().clone(), vcf_table.to_string()))
+            rt.block_on(schema_provider.table(vcf_table))
         }
     }
+    .map_err(|e| DataFusionError::External(Box::new(e)))?
+    .ok_or_else(|| DataFusionError::Plan(format!("Table '{vcf_table}' not found")))?;
+
+    Ok((table_provider.schema().as_ref().clone(), vcf_table.to_string()))
 }
 
 #[cfg(test)]

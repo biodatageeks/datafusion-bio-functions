@@ -138,30 +138,46 @@ fn extract_bool_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<bool> {
     }
 }
 
-/// Resolve schemas for both tables, handling tokio context.
+/// Resolve schemas for both tables via direct catalog lookup.
+///
+/// Avoids `session.table()` which acquires `SessionState` locks multiple
+/// times and builds unnecessary `LogicalPlan` / `DataFrame` objects —
+/// causing deadlocks when called from an external session (vepyr / polars-bio).
 fn resolve_schemas(
     session: &SessionContext,
     vcf_table: &str,
     cache_table: &str,
 ) -> Result<(Schema, Schema)> {
-    match tokio::runtime::Handle::try_current() {
+    let state = session.state();
+    let vcf_ref = datafusion::common::TableReference::bare(vcf_table);
+    let cache_ref = datafusion::common::TableReference::bare(cache_table);
+    let vcf_schema_provider = state.schema_for_ref(vcf_ref)?;
+    let cache_schema_provider = state.schema_for_ref(cache_ref)?;
+
+    let (vcf_provider, cache_provider) = match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| {
-            let vcf = handle.block_on(session.table(vcf_table))?;
-            let cache = handle.block_on(session.table(cache_table))?;
-            Ok::<_, DataFusionError>((
-                vcf.schema().as_arrow().clone(),
-                cache.schema().as_arrow().clone(),
-            ))
+            let vcf = handle.block_on(vcf_schema_provider.table(vcf_table));
+            let cache = handle.block_on(cache_schema_provider.table(cache_table));
+            Ok::<_, DataFusionError>((vcf, cache))
         }),
         Err(_) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let vcf = rt.block_on(session.table(vcf_table))?;
-            let cache = rt.block_on(session.table(cache_table))?;
-            Ok((
-                vcf.schema().as_arrow().clone(),
-                cache.schema().as_arrow().clone(),
-            ))
+            let vcf = rt.block_on(vcf_schema_provider.table(vcf_table));
+            let cache = rt.block_on(cache_schema_provider.table(cache_table));
+            Ok((vcf, cache))
         }
-    }
+    }?;
+
+    let vcf_provider = vcf_provider
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .ok_or_else(|| DataFusionError::Plan(format!("Table '{vcf_table}' not found")))?;
+    let cache_provider = cache_provider
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .ok_or_else(|| DataFusionError::Plan(format!("Table '{cache_table}' not found")))?;
+
+    Ok((
+        vcf_provider.schema().as_ref().clone(),
+        cache_provider.schema().as_ref().clone(),
+    ))
 }
