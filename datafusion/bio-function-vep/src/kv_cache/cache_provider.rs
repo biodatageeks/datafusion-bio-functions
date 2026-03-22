@@ -83,3 +83,74 @@ impl TableProvider for KvCacheTableProvider {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::prelude::SessionContext;
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+        ]))
+    }
+
+    fn create_test_store(dir: &std::path::Path) -> Arc<VepKvStore> {
+        let schema = test_schema();
+        Arc::new(VepKvStore::create(dir, schema).unwrap())
+    }
+
+    #[test]
+    fn test_from_store_creates_provider_with_correct_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = create_test_store(dir.path());
+        let expected_schema = store.schema().clone();
+
+        let provider = KvCacheTableProvider::from_store(store);
+
+        assert_eq!(provider.schema(), expected_schema);
+    }
+
+    #[test]
+    fn test_store_returns_underlying_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = create_test_store(dir.path());
+        let store_ptr = Arc::as_ptr(&store);
+
+        let provider = KvCacheTableProvider::from_store(store);
+
+        assert_eq!(Arc::as_ptr(provider.store()), store_ptr);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_returns_not_implemented() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = create_test_store(dir.path());
+        let provider = KvCacheTableProvider::from_store(store);
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let result = provider.scan(&state, None, &[], None).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, datafusion::common::DataFusionError::NotImplemented(_)),
+            "Expected NotImplemented error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_table_type_is_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = create_test_store(dir.path());
+        let provider = KvCacheTableProvider::from_store(store);
+
+        assert_eq!(provider.table_type(), TableType::Base);
+    }
+}

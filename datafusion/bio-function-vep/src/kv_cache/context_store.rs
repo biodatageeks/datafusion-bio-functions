@@ -623,6 +623,101 @@ mod tests {
     }
 
     #[test]
+    fn test_open_without_keyspace_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a DB, add an unrelated keyspace, then close.
+        {
+            let db = fjall::Database::builder(dir.path())
+                .cache_size(64 * 1024 * 1024)
+                .open()
+                .unwrap();
+            // Create a dummy keyspace that is NOT "translations" or "exons".
+            let _ks = db
+                .keyspace("dummy", fjall::KeyspaceCreateOptions::default)
+                .unwrap();
+            db.persist(fjall::PersistMode::SyncAll).unwrap();
+        }
+
+        // Reopen and verify translations/exons return None (without creating phantom keyspaces).
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+        assert!(
+            TranslationKvStore::open(&db).unwrap().is_none(),
+            "TranslationKvStore::open should return None when keyspace doesn't exist"
+        );
+        assert!(
+            ExonKvStore::open(&db).unwrap().is_none(),
+            "ExonKvStore::open should return None when keyspace doesn't exist"
+        );
+        // Verify the keyspaces were NOT created as a side effect.
+        assert!(!db.keyspace_exists(TRANSLATIONS_KEYSPACE));
+        assert!(!db.keyspace_exists(EXONS_KEYSPACE));
+    }
+
+    #[test]
+    fn test_translation_get_many_empty_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+        let store = TranslationKvStore::create(&db).unwrap();
+        store.put(&make_translation()).unwrap();
+
+        let result = store.get_many(&[]).unwrap();
+        assert!(
+            result.is_empty(),
+            "get_many with empty input should return empty vec"
+        );
+    }
+
+    #[test]
+    fn test_translation_get_many_all_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+        let store = TranslationKvStore::create(&db).unwrap();
+        store.put(&make_translation()).unwrap();
+
+        let result = store.get_many(&["MISSING1", "MISSING2"]).unwrap();
+        assert!(
+            result.is_empty(),
+            "get_many with all missing IDs should return empty vec"
+        );
+    }
+
+    #[test]
+    fn test_exon_get_many_empty_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+        let store = ExonKvStore::create(&db).unwrap();
+
+        let result = store.get_many(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_exon_get_many_all_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+        let store = ExonKvStore::create(&db).unwrap();
+
+        let result = store.get_many(&["MISSING1", "MISSING2"]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
     fn test_reopen_persistence() {
         let dir = tempfile::tempdir().unwrap();
 

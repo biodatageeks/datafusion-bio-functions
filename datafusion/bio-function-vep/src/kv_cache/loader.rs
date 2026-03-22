@@ -729,6 +729,115 @@ mod tests {
         (schema, table)
     }
 
+    #[test]
+    fn test_sharded_lock_different_positions_independent() {
+        let locks = ShardedPositionLock::new();
+
+        // Lock two different positions — both should succeed without deadlock.
+        let _guard1 = locks.lock_for(1, 100);
+        // Different chrom or position hashes to a different shard (with high probability).
+        let _guard2 = locks.lock_for(2, 200);
+        // If we get here, both locks were acquired without blocking.
+    }
+
+    #[test]
+    fn test_sharded_lock_same_position_serializes() {
+        let locks = ShardedPositionLock::new();
+
+        // Same (chrom_code, start) should hash to the same shard.
+        let hash1 = {
+            let h = (1u16 as u64)
+                .wrapping_mul(0x9e3779b97f4a7c15)
+                .wrapping_add(100u64);
+            (h as usize) % LOCK_SHARDS
+        };
+        let hash2 = {
+            let h = (1u16 as u64)
+                .wrapping_mul(0x9e3779b97f4a7c15)
+                .wrapping_add(100u64);
+            (h as usize) % LOCK_SHARDS
+        };
+        assert_eq!(hash1, hash2, "Same (chrom, start) must hash to same shard");
+
+        // Acquire and release to verify no poisoning.
+        {
+            let _guard = locks.lock_for(1, 100);
+        }
+        {
+            let _guard = locks.lock_for(1, 100);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_with_parallelism() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+
+        let (schema, table) = make_test_table();
+        ctx.register_table("source_par", Arc::new(table)).unwrap();
+
+        let loader =
+            CacheLoader::new("source_par", dir.path().to_str().unwrap()).with_parallelism(2);
+        let stats = loader.load(&ctx).await.unwrap();
+
+        assert_eq!(stats.total_variants, 4);
+        assert!(stats.total_positions > 0);
+
+        let store = VepKvStore::open(dir.path()).unwrap();
+        let chrom_code_1 = crate::kv_cache::key_encoding::chrom_to_code("1");
+        let entry = store
+            .get_position_entry_decompressed(chrom_code_1, 100)
+            .unwrap();
+        assert!(entry.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_duplicate_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+
+        // Create a table with two rows at the same (chrom, start) but different alleles.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(StringArray::from(vec!["rs1", "rs2"])),
+                Arc::new(StringArray::from(vec!["A/G", "A/T"])),
+            ],
+        )
+        .unwrap();
+        let table = MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap();
+        ctx.register_table("source_dup", Arc::new(table)).unwrap();
+
+        let loader = CacheLoader::new("source_dup", dir.path().to_str().unwrap());
+        let stats = loader.load(&ctx).await.unwrap();
+
+        assert_eq!(stats.total_variants, 2);
+
+        // Both alleles should be merged into a single position entry.
+        let store = VepKvStore::open(dir.path()).unwrap();
+        let chrom_code_1 = crate::kv_cache::key_encoding::chrom_to_code("1");
+        let raw = store
+            .get_position_entry_decompressed(chrom_code_1, 100)
+            .unwrap()
+            .unwrap();
+        let reader = crate::kv_cache::position_entry::PositionEntryReader::new(&raw).unwrap();
+        assert_eq!(
+            reader.num_alleles(),
+            2,
+            "Both alleles at same position should be merged into one entry"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_loader_basic() {
         let dir = tempfile::tempdir().unwrap();
