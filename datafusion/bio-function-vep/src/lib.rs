@@ -69,10 +69,10 @@ use crate::allele::{
 use crate::annotate_table_function::AnnotateFunction;
 use crate::table_function::LookupFunction;
 
-/// Test-only convenience: create a session with ranges + VEP functions.
+/// Test-only convenience: create a session with VEP functions.
 #[cfg(test)]
 pub(crate) fn create_vep_session() -> SessionContext {
-    let ctx = datafusion_bio_function_ranges::create_bio_session();
+    let ctx = SessionContext::new();
     register_vep_functions(&ctx);
     ctx
 }
