@@ -10,7 +10,7 @@ All 80 CSQ fields are exposed as **individual top-level Arrow columns** so Arrow
 
 ### VCF input columns (pass-through)
 
-The first columns in the output are pass-through from the input VCF table. The schema depends on the VCF file, but the following 5 columns are **required** by `annotate_vep()`:
+The first columns in the output are pass-through from the input VCF table. The schema depends on the VCF file and the table provider used. The following 5 columns are **required** by `annotate_vep()`:
 
 | Column | Type | Required | Description |
 |--------|------|----------|-------------|
@@ -19,13 +19,18 @@ The first columns in the output are pass-through from the input VCF table. The s
 | `end` | `Int64` | yes | End position (0-based, exclusive) |
 | `ref` | `Utf8` | yes | Reference allele |
 | `alt` | `Utf8` | yes | Alternate allele |
-| `name` | `Utf8` | no | Variant ID (rsID) |
-| `qual` | `Float32` | no | Variant quality score |
-| `filter` | `Utf8` | no | Filter status (PASS, etc.) |
-| `info` | `Utf8` | no | INFO field (key=value pairs) |
-| `format` | `Utf8` | no | FORMAT field (genotype field keys) |
 
-Additional sample genotype columns may be present depending on the VCF file. All VCF columns are passed through unmodified.
+The `datafusion-bio-format-vcf` provider (used by polars-bio) decomposes VCF fields into typed columns. Common additional columns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | `Utf8` | Variant ID (rsID) |
+| `qual` | `Float64` | Variant quality score |
+| `filter` | `Utf8` | Filter status (PASS, etc.) |
+| INFO fields | varies | Decomposed into individual typed columns (e.g., `DP: Int32`) |
+| Sample fields | varies | Decomposed genotype fields (e.g., `GT: Utf8`, `AD: List<Int32>`, `GQ: Int32`) |
+
+All VCF columns are passed through unmodified. The exact schema depends on the VCF file's header.
 
 ### Annotation columns (89 total)
 
