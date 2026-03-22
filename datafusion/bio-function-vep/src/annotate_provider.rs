@@ -56,9 +56,10 @@ macro_rules! profile_end {
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    Array, AsArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, LargeStringArray, ListArray, RecordBatch, StringArray, StringBuilder,
-    StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
+    Array, AsArray, BooleanArray, Float32Array, Float32Builder, Float64Array, Int8Array,
+    Int8Builder, Int16Array, Int32Array, Int64Array, Int64Builder, LargeStringArray, ListArray,
+    ListBuilder, RecordBatch, StringArray, StringBuilder, StringViewArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array, new_null_array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
@@ -91,67 +92,634 @@ use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
     ProteinDomainFeature, RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind,
-    SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequenceEngine, TranscriptFeature,
-    TranslationFeature, VariantInput, is_vep_transcript,
+    SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequence, TranscriptConsequenceEngine,
+    TranscriptFeature, TranslationFeature, VariantInput, is_vep_transcript,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
 };
 
-/// Known variation cache annotation columns exposed as top-level output fields.
-/// All are nullable Utf8. Columns not present in the actual cache emit NULLs.
-pub const CACHE_OUTPUT_COLUMNS: &[&str] = &[
-    // Variant identity
-    "variation_name",
-    // Clinical
-    "clin_sig",
-    "clin_sig_allele",
-    "clinical_impact",
-    "phenotype_or_disease",
-    "pubmed",
-    // Flags
-    "somatic",
-    "minor_allele",
-    "minor_allele_freq",
-    // 1000 Genomes
-    "AF",
-    "AFR",
-    "AMR",
-    "EAS",
-    "EUR",
-    "SAS",
-    // gnomAD exome
-    "gnomADe",
-    "gnomADe_AFR",
-    "gnomADe_AMR",
-    "gnomADe_ASJ",
-    "gnomADe_EAS",
-    "gnomADe_FIN",
-    "gnomADe_NFE",
-    "gnomADe_SAS",
-    "gnomADe_MID",
-    "gnomADe_REMAINING",
-    // gnomAD genome
-    "gnomADg",
-    "gnomADg_AFR",
-    "gnomADg_AMI",
-    "gnomADg_AMR",
-    "gnomADg_ASJ",
-    "gnomADg_EAS",
-    "gnomADg_FIN",
-    "gnomADg_MID",
-    "gnomADg_NFE",
-    "gnomADg_SAS",
-    "gnomADg_REMAINING",
-    // Cross-reference IDs
-    "clinvar_ids",
-    "cosmic_ids",
-    "dbsnp_ids",
-];
+/// Column categories for the 87 non-meta annotation columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnotationCategory {
+    /// Transcript-level fields from the most-severe transcript (42 columns).
+    Transcript,
+    /// Population allele frequency fields, resolved for the matching allele (29 columns).
+    Frequency,
+    /// Variant-level annotation columns from co-located data (9 columns).
+    Variant,
+    /// Cache-only columns not present in the CSQ string (7 columns).
+    CacheOnly,
+}
+
+/// Metadata for a single annotation output column.
+struct AnnotationColumnDef {
+    /// Output column name as it appears in the Arrow schema.
+    name: &'static str,
+    /// Arrow data type for this column.
+    data_type: DataType,
+    /// Which category this column belongs to.
+    category: AnnotationCategory,
+    /// For cache-only/frequency columns: the column name in the variation cache
+    /// parquet (prefixed with `cache_` in the intermediate batch).
+    /// `None` for transcript-level columns populated from engine results.
+    cache_col: Option<&'static str>,
+}
+
+/// Full annotation output column definitions (87 columns, excluding csq and most_severe_consequence).
+///
+/// Order matches the README schema: transcript-level (42), frequency (29), variant-level (9), cache-only (7).
+fn annotation_column_defs() -> Vec<AnnotationColumnDef> {
+    use AnnotationCategory::*;
+    let list_utf8 = || DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+    vec![
+        // ── Transcript-level (42) ──
+        AnnotationColumnDef {
+            name: "Allele",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "Consequence",
+            data_type: list_utf8(),
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "IMPACT",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "SYMBOL",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "Gene",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "Feature_type",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "Feature",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "BIOTYPE",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "EXON",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "INTRON",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "HGVSc",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "HGVSp",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "cDNA_position",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "CDS_position",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "Protein_position",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "Amino_acids",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "Codons",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "Existing_variation",
+            data_type: list_utf8(),
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "DISTANCE",
+            data_type: DataType::Int64,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "STRAND",
+            data_type: DataType::Int8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "FLAGS",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "VARIANT_CLASS",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "SYMBOL_SOURCE",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "HGNC_ID",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "CANONICAL",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "MANE",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "MANE_SELECT",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "MANE_PLUS_CLINICAL",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "TSL",
+            data_type: DataType::Int8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "APPRIS",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "CCDS",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "ENSP",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "SWISSPROT",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "TREMBL",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "UNIPARC",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "UNIPROT_ISOFORM",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "GENE_PHENO",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "SIFT",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "PolyPhen",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "DOMAINS",
+            data_type: list_utf8(),
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "miRNA",
+            data_type: DataType::Utf8,
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "HGVS_OFFSET",
+            data_type: DataType::Int64,
+            category: Transcript,
+            cache_col: None,
+        },
+        // ── Frequency (29) ──
+        AnnotationColumnDef {
+            name: "AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("AF"),
+        },
+        AnnotationColumnDef {
+            name: "AFR_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("AFR"),
+        },
+        AnnotationColumnDef {
+            name: "AMR_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("AMR"),
+        },
+        AnnotationColumnDef {
+            name: "EAS_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("EAS"),
+        },
+        AnnotationColumnDef {
+            name: "EUR_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("EUR"),
+        },
+        AnnotationColumnDef {
+            name: "SAS_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("SAS"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADe_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADe"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADe_AFR_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADe_AFR"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADe_AMR_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADe_AMR"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADe_ASJ_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADe_ASJ"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADe_EAS_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADe_EAS"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADe_FIN_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADe_FIN"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADe_MID_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADe_MID"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADe_NFE_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADe_NFE"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADe_REMAINING_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADe_REMAINING"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADe_SAS_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADe_SAS"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADg_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADg"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADg_AFR_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADg_AFR"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADg_AMI_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADg_AMI"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADg_AMR_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADg_AMR"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADg_ASJ_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADg_ASJ"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADg_EAS_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADg_EAS"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADg_FIN_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADg_FIN"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADg_MID_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADg_MID"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADg_NFE_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADg_NFE"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADg_REMAINING_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADg_REMAINING"),
+        },
+        AnnotationColumnDef {
+            name: "gnomADg_SAS_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: Some("gnomADg_SAS"),
+        },
+        AnnotationColumnDef {
+            name: "MAX_AF",
+            data_type: DataType::Float32,
+            category: Frequency,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "MAX_AF_POPS",
+            data_type: DataType::Utf8,
+            category: Frequency,
+            cache_col: None,
+        },
+        // ── Variant-level (9) ──
+        AnnotationColumnDef {
+            name: "CLIN_SIG",
+            data_type: list_utf8(),
+            category: Variant,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "SOMATIC",
+            data_type: DataType::Utf8,
+            category: Variant,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "PHENO",
+            data_type: DataType::Utf8,
+            category: Variant,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "PUBMED",
+            data_type: list_utf8(),
+            category: Variant,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "MOTIF_NAME",
+            data_type: DataType::Utf8,
+            category: Variant,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "MOTIF_POS",
+            data_type: DataType::Utf8,
+            category: Variant,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "HIGH_INF_POS",
+            data_type: DataType::Utf8,
+            category: Variant,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "MOTIF_SCORE_CHANGE",
+            data_type: DataType::Float32,
+            category: Variant,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "TRANSCRIPTION_FACTORS",
+            data_type: list_utf8(),
+            category: Variant,
+            cache_col: None,
+        },
+        // ── Cache-only (7) ──
+        AnnotationColumnDef {
+            name: "clin_sig_allele",
+            data_type: list_utf8(),
+            category: CacheOnly,
+            cache_col: Some("clin_sig_allele"),
+        },
+        AnnotationColumnDef {
+            name: "clinical_impact",
+            data_type: DataType::Utf8,
+            category: CacheOnly,
+            cache_col: Some("clinical_impact"),
+        },
+        AnnotationColumnDef {
+            name: "minor_allele",
+            data_type: DataType::Utf8,
+            category: CacheOnly,
+            cache_col: Some("minor_allele"),
+        },
+        AnnotationColumnDef {
+            name: "minor_allele_freq",
+            data_type: DataType::Float32,
+            category: CacheOnly,
+            cache_col: Some("minor_allele_freq"),
+        },
+        AnnotationColumnDef {
+            name: "clinvar_ids",
+            data_type: list_utf8(),
+            category: CacheOnly,
+            cache_col: Some("clinvar_ids"),
+        },
+        AnnotationColumnDef {
+            name: "cosmic_ids",
+            data_type: list_utf8(),
+            category: CacheOnly,
+            cache_col: Some("cosmic_ids"),
+        },
+        AnnotationColumnDef {
+            name: "dbsnp_ids",
+            data_type: list_utf8(),
+            category: CacheOnly,
+            cache_col: Some("dbsnp_ids"),
+        },
+    ]
+}
+
+/// Returns the list of cache column names needed for the variation lookup query.
+///
+/// This is the backward-compatible list of column names that the `requested_columns`
+/// logic uses to select columns from the variation cache parquet/fjall store.
+pub fn cache_lookup_column_names() -> Vec<&'static str> {
+    vec![
+        // Variant identity
+        "variation_name",
+        // Clinical
+        "clin_sig",
+        "clin_sig_allele",
+        "clinical_impact",
+        "phenotype_or_disease",
+        "pubmed",
+        // Flags
+        "somatic",
+        "minor_allele",
+        "minor_allele_freq",
+        // 1000 Genomes
+        "AF",
+        "AFR",
+        "AMR",
+        "EAS",
+        "EUR",
+        "SAS",
+        // gnomAD exome
+        "gnomADe",
+        "gnomADe_AFR",
+        "gnomADe_AMR",
+        "gnomADe_ASJ",
+        "gnomADe_EAS",
+        "gnomADe_FIN",
+        "gnomADe_NFE",
+        "gnomADe_SAS",
+        "gnomADe_MID",
+        "gnomADe_REMAINING",
+        // gnomAD genome
+        "gnomADg",
+        "gnomADg_AFR",
+        "gnomADg_AMI",
+        "gnomADg_AMR",
+        "gnomADg_ASJ",
+        "gnomADg_EAS",
+        "gnomADg_FIN",
+        "gnomADg_MID",
+        "gnomADg_NFE",
+        "gnomADg_SAS",
+        "gnomADg_REMAINING",
+        // Cross-reference IDs
+        "clinvar_ids",
+        "cosmic_ids",
+        "dbsnp_ids",
+    ]
+}
 
 /// Number of annotation columns appended after VCF fields by `AnnotateProvider::new`:
-/// `csq` + `most_severe_consequence` + all `CACHE_OUTPUT_COLUMNS`.
-const ANNOTATION_COLUMN_COUNT: usize = 2 + CACHE_OUTPUT_COLUMNS.len();
+/// `csq` + `most_severe_consequence` + 87 structured annotation columns.
+const ANNOTATION_COLUMN_COUNT: usize = 89;
 
 /// AF column definition: how to read, emit, and name each frequency population.
 struct AfColumn {
@@ -1391,8 +1959,12 @@ impl AnnotateProvider {
             DataType::Utf8,
             true,
         )));
-        for &col_name in CACHE_OUTPUT_COLUMNS {
-            fields.push(Arc::new(Field::new(col_name, DataType::Utf8, true)));
+        for col_def in annotation_column_defs() {
+            fields.push(Arc::new(Field::new(
+                col_def.name,
+                col_def.data_type.clone(),
+                true,
+            )));
         }
 
         Self {
@@ -2797,6 +3369,158 @@ impl AnnotateProvider {
         let mut most_builder =
             StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
 
+        // --- Annotation column builders (87 columns) ---
+        // Transcript-level (42)
+        let mut b_allele = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
+        let mut b_consequence = ListBuilder::new(StringBuilder::new());
+        let mut b_impact = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_symbol = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_gene = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
+        let mut b_feature_type =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 12);
+        let mut b_feature = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
+        let mut b_biotype = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
+        let mut b_exon = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_intron = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_hgvsc = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 32);
+        let mut b_hgvsp = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 32);
+        let mut b_cdna_position =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_cds_position =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_protein_position =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_amino_acids =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
+        let mut b_codons = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_existing_variation = ListBuilder::new(StringBuilder::new());
+        let mut b_distance = Int64Builder::with_capacity(batch.num_rows());
+        let mut b_strand = Int8Builder::with_capacity(batch.num_rows());
+        let mut b_flags = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
+        let mut b_variant_class =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_symbol_source =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_hgnc_id = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_canonical = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
+        let mut b_mane = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
+        let mut b_mane_select =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
+        let mut b_mane_plus_clinical =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
+        let mut b_tsl = Int8Builder::with_capacity(batch.num_rows());
+        let mut b_appris = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
+        let mut b_ccds = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 12);
+        let mut b_ensp = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
+        let mut b_swissprot = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 12);
+        let mut b_trembl = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 12);
+        let mut b_uniparc = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 12);
+        let mut b_uniprot_isoform =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 12);
+        let mut b_gene_pheno = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
+        let mut b_sift = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
+        let mut b_polyphen = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
+        let mut b_domains = ListBuilder::new(StringBuilder::new());
+        let mut b_mirna = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
+        let mut b_hgvs_offset = Int64Builder::with_capacity(batch.num_rows());
+        // Frequency (29)
+        let mut b_af: Vec<Float32Builder> = (0..27)
+            .map(|_| Float32Builder::with_capacity(batch.num_rows()))
+            .collect();
+        let mut b_max_af = Float32Builder::with_capacity(batch.num_rows());
+        let mut b_max_af_pops =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        // Variant-level (9)
+        let mut b_clin_sig = ListBuilder::new(StringBuilder::new());
+        let mut b_somatic = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
+        let mut b_pheno = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
+        let mut b_pubmed = ListBuilder::new(StringBuilder::new());
+        let mut b_motif_name = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_motif_pos = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
+        let mut b_high_inf_pos =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
+        let mut b_motif_score_change = Float32Builder::with_capacity(batch.num_rows());
+        let mut b_transcription_factors = ListBuilder::new(StringBuilder::new());
+        // Cache-only (7)
+        let mut b_clin_sig_allele = ListBuilder::new(StringBuilder::new());
+        let mut b_clinical_impact =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
+        let mut b_minor_allele =
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
+        let mut b_minor_allele_freq = Float32Builder::with_capacity(batch.num_rows());
+        let mut b_clinvar_ids = ListBuilder::new(StringBuilder::new());
+        let mut b_cosmic_ids = ListBuilder::new(StringBuilder::new());
+        let mut b_dbsnp_ids = ListBuilder::new(StringBuilder::new());
+
+        /// Append NULL to all 87 annotation column builders.
+        macro_rules! append_null_annotation_row {
+            () => {
+                b_allele.append_null();
+                b_consequence.append(false);
+                b_impact.append_null();
+                b_symbol.append_null();
+                b_gene.append_null();
+                b_feature_type.append_null();
+                b_feature.append_null();
+                b_biotype.append_null();
+                b_exon.append_null();
+                b_intron.append_null();
+                b_hgvsc.append_null();
+                b_hgvsp.append_null();
+                b_cdna_position.append_null();
+                b_cds_position.append_null();
+                b_protein_position.append_null();
+                b_amino_acids.append_null();
+                b_codons.append_null();
+                b_existing_variation.append(false);
+                b_distance.append_null();
+                b_strand.append_null();
+                b_flags.append_null();
+                b_variant_class.append_null();
+                b_symbol_source.append_null();
+                b_hgnc_id.append_null();
+                b_canonical.append_null();
+                b_mane.append_null();
+                b_mane_select.append_null();
+                b_mane_plus_clinical.append_null();
+                b_tsl.append_null();
+                b_appris.append_null();
+                b_ccds.append_null();
+                b_ensp.append_null();
+                b_swissprot.append_null();
+                b_trembl.append_null();
+                b_uniparc.append_null();
+                b_uniprot_isoform.append_null();
+                b_gene_pheno.append_null();
+                b_sift.append_null();
+                b_polyphen.append_null();
+                b_domains.append(false);
+                b_mirna.append_null();
+                b_hgvs_offset.append_null();
+                for af_b in b_af.iter_mut() {
+                    af_b.append_null();
+                }
+                b_max_af.append_null();
+                b_max_af_pops.append_null();
+                b_clin_sig.append(false);
+                b_somatic.append_null();
+                b_pheno.append_null();
+                b_pubmed.append(false);
+                b_motif_name.append_null();
+                b_motif_pos.append_null();
+                b_high_inf_pos.append_null();
+                b_motif_score_change.append_null();
+                b_transcription_factors.append(false);
+                b_clin_sig_allele.append(false);
+                b_clinical_impact.append_null();
+                b_minor_allele.append_null();
+                b_minor_allele_freq.append_null();
+                b_clinvar_ids.append(false);
+                b_cosmic_ids.append(false);
+                b_dbsnp_ids.append(false);
+            };
+        }
+
         // Reusable buffers to avoid per-row/per-CSQ-entry String allocations.
         let mut csq_buf = if skip_csq {
             String::new()
@@ -2809,11 +3533,13 @@ impl AnnotateProvider {
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
                 csq_builder.append_null();
                 most_builder.append_null();
+                append_null_annotation_row!();
                 continue;
             };
             let Some(alt_allele) = string_at(batch.column(alt_idx).as_ref(), row) else {
                 csq_builder.append_null();
                 most_builder.append_null();
+                append_null_annotation_row!();
                 continue;
             };
 
@@ -2821,6 +3547,7 @@ impl AnnotateProvider {
             if alt_allele == "*" {
                 csq_builder.append_null();
                 most_builder.append_null();
+                append_null_annotation_row!();
                 continue;
             }
 
@@ -2910,6 +3637,10 @@ impl AnnotateProvider {
             );
 
             let most_str;
+            // Store assignment results from cache-miss path for annotation column population.
+            let mut row_assignments: Vec<TranscriptConsequence> = Vec::new();
+            // Store the VariantInput for HGVS_OFFSET extraction in annotation columns.
+            let mut row_variant: Option<VariantInput> = None;
             if !skip_csq {
                 csq_buf.clear();
             }
@@ -2943,16 +3674,19 @@ impl AnnotateProvider {
                 let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
                     csq_builder.append_null();
                     most_builder.append_null();
+                    append_null_annotation_row!();
                     continue;
                 };
                 let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
                     csq_builder.append_null();
                     most_builder.append_null();
+                    append_null_annotation_row!();
                     continue;
                 };
                 let Some(ref_allele) = string_at(batch.column(ref_idx).as_ref(), row) else {
                     csq_builder.append_null();
                     most_builder.append_null();
+                    append_null_annotation_row!();
                     continue;
                 };
 
@@ -2960,6 +3694,7 @@ impl AnnotateProvider {
                 if alt_allele == "*" {
                     csq_builder.append_null();
                     most_builder.append_null();
+                    append_null_annotation_row!();
                     continue;
                 }
 
@@ -3008,214 +3743,223 @@ impl AnnotateProvider {
                 }
                 let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
                 most_str = most.as_str().to_string();
+                row_assignments = assignments;
+                row_variant = Some(variant);
 
                 // Build per-transcript CSQ entries into reusable buffer (already cleared above).
                 // Skip the entire CSQ formatting when the csq column is not projected.
                 if !skip_csq {
-                for tc in &assignments {
-                    terms_buf.clear();
-                    for (i, t) in tc.terms.iter().enumerate() {
-                        if i > 0 {
-                            terms_buf.push('&');
+                    for tc in &row_assignments {
+                        terms_buf.clear();
+                        for (i, t) in tc.terms.iter().enumerate() {
+                            if i > 0 {
+                                terms_buf.push('&');
+                            }
+                            terms_buf.push_str(t.as_str());
                         }
-                        terms_buf.push_str(t.as_str());
-                    }
-                    let terms_str = terms_buf.as_str();
-                    let tc_impact = most_severe_term(tc.terms.iter())
-                        .map(|t| impact_label(t.impact()))
-                        .unwrap_or_else(|| impact_label(SoImpact::Modifier));
-                    let feature_type = tc.feature_type.as_str();
-                    let feature = tc.transcript_id.as_deref().unwrap_or("");
-                    // Look up transcript metadata via index (zero-copy).
-                    let tx_opt = tc.transcript_idx.map(|idx| &ctx.transcripts[idx]);
-                    let (symbol, gene, biotype_tx, strand_str, symbol_source, hgnc_id, source) =
-                        if let Some(tx) = tx_opt {
-                            (
-                                tx.gene_symbol.as_deref().unwrap_or(""),
-                                tx.gene_stable_id.as_deref().unwrap_or(""),
-                                tx.biotype.as_str(),
-                                if tx.strand >= 0 { "1" } else { "-1" },
-                                tx.gene_symbol_source.as_deref().unwrap_or(""),
-                                tx.gene_hgnc_id.as_deref().unwrap_or(""),
-                                tx.source.as_deref().unwrap_or(""),
-                            )
-                        } else {
-                            ("", "", "", "", "", "", "")
-                        };
-                    let biotype = tc.biotype_override.as_deref().unwrap_or(biotype_tx);
-                    let exon = tc.exon_str.as_deref().unwrap_or("");
-                    let intron = tc.intron_str.as_deref().unwrap_or("");
-                    let cdna_pos = tc.cdna_position.as_deref().unwrap_or("");
-                    let cds_pos = tc.cds_position.as_deref().unwrap_or("");
-                    let protein_pos = tc.protein_position.as_deref().unwrap_or("");
-                    let amino_acids = tc.amino_acids.as_deref().unwrap_or("");
-                    let codons_str = tc.codons.as_deref().unwrap_or("");
-                    // Write comma separator between CSQ entries.
-                    if !csq_buf.is_empty() {
-                        csq_buf.push(',');
-                    }
-                    let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
-                    let tc_flags = tc.flags.as_deref().unwrap_or("");
-                    let hgvsc = if hgvs_flags.hgvsc {
-                        tc.hgvsc.as_deref().unwrap_or("")
-                    } else {
-                        ""
-                    };
-                    let hgvsp = if hgvs_flags.hgvsp {
-                        tc.hgvsp
-                            .as_deref()
-                            .map(|value| {
-                                Self::format_hgvsp_output(
-                                    value,
-                                    hgvs_flags.remove_hgvsp_version,
-                                    hgvs_flags.no_escape,
-                                    hgvs_flags.hgvsp_use_prediction,
+                        let terms_str = terms_buf.as_str();
+                        let tc_impact = most_severe_term(tc.terms.iter())
+                            .map(|t| impact_label(t.impact()))
+                            .unwrap_or_else(|| impact_label(SoImpact::Modifier));
+                        let feature_type = tc.feature_type.as_str();
+                        let feature = tc.transcript_id.as_deref().unwrap_or("");
+                        // Look up transcript metadata via index (zero-copy).
+                        let tx_opt = tc.transcript_idx.map(|idx| &ctx.transcripts[idx]);
+                        let (symbol, gene, biotype_tx, strand_str, symbol_source, hgnc_id, source) =
+                            if let Some(tx) = tx_opt {
+                                (
+                                    tx.gene_symbol.as_deref().unwrap_or(""),
+                                    tx.gene_stable_id.as_deref().unwrap_or(""),
+                                    tx.biotype.as_str(),
+                                    if tx.strand >= 0 { "1" } else { "-1" },
+                                    tx.gene_symbol_source.as_deref().unwrap_or(""),
+                                    tx.gene_hgnc_id.as_deref().unwrap_or(""),
+                                    tx.source.as_deref().unwrap_or(""),
                                 )
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    let source_val = if merged { source } else { "" };
-
-                    // Batch 1 fields from transcript metadata.
-                    let canonical = tx_opt
-                        .map(|tx| if tx.is_canonical { "YES" } else { "" })
-                        .unwrap_or("");
-                    let tsl_str = tx_opt
-                        .and_then(|tx| tx.tsl)
-                        .map(|v| v.to_string())
-                        .unwrap_or_default();
-                    let mane_select = tx_opt
-                        .and_then(|tx| tx.mane_select.as_deref())
-                        .unwrap_or("");
-                    let mane_plus = tx_opt
-                        .and_then(|tx| tx.mane_plus_clinical.as_deref())
-                        .unwrap_or("");
-                    let ensp = tx_opt
-                        .and_then(|tx| tx.translation_stable_id.as_deref())
-                        .unwrap_or("");
-                    let gene_pheno = tx_opt
-                        .map(|tx| if tx.gene_phenotype { "1" } else { "" })
-                        .unwrap_or("");
-                    let ccds = tx_opt.and_then(|tx| tx.ccds.as_deref()).unwrap_or("");
-                    let swissprot = tx_opt.and_then(|tx| tx.swissprot.as_deref()).unwrap_or("");
-                    let trembl_raw = tx_opt.and_then(|tx| tx.trembl.as_deref()).unwrap_or("");
-                    let trembl = csq_escape(trembl_raw);
-                    let uniparc = tx_opt.and_then(|tx| tx.uniparc.as_deref()).unwrap_or("");
-                    let uniprot_isoform = tx_opt
-                        .and_then(|tx| tx.uniprot_isoform.as_deref())
-                        .unwrap_or("");
-
-                    if flags.everything {
-                        // HGVS_OFFSET: shift_length for the transcript's strand.
-                        // VEP only emits HGVS_OFFSET when HGVSc was actually computed
-                        // for this transcript variant allele. Non-transcript features
-                        // (regulatory, intergenic) never get HGVS_OFFSET.
-                        let hgvs_offset = if hgvs_flags.hgvsc && tc.hgvsc.is_some() {
-                            let tx_strand = tx_opt.map(|tx| tx.strand).unwrap_or(1);
-                            variant
-                                .hgvs_shift_for_strand(tx_strand)
-                                .filter(|s| s.shift_length > 0)
-                                .map(|s| {
-                                    // VEP emits negative HGVS_OFFSET for reverse-strand
-                                    // transcripts (the shift direction is opposite).
-                                    let signed = s.shift_length as i64;
-                                    if tx_strand < 0 {
-                                        (-signed).to_string()
-                                    } else {
-                                        signed.to_string()
-                                    }
+                            } else {
+                                ("", "", "", "", "", "", "")
+                            };
+                        let biotype = tc.biotype_override.as_deref().unwrap_or(biotype_tx);
+                        let exon = tc.exon_str.as_deref().unwrap_or("");
+                        let intron = tc.intron_str.as_deref().unwrap_or("");
+                        let cdna_pos = tc.cdna_position.as_deref().unwrap_or("");
+                        let cds_pos = tc.cds_position.as_deref().unwrap_or("");
+                        let protein_pos = tc.protein_position.as_deref().unwrap_or("");
+                        let amino_acids = tc.amino_acids.as_deref().unwrap_or("");
+                        let codons_str = tc.codons.as_deref().unwrap_or("");
+                        // Write comma separator between CSQ entries.
+                        if !csq_buf.is_empty() {
+                            csq_buf.push(',');
+                        }
+                        let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
+                        let tc_flags = tc.flags.as_deref().unwrap_or("");
+                        let hgvsc = if hgvs_flags.hgvsc {
+                            tc.hgvsc.as_deref().unwrap_or("")
+                        } else {
+                            ""
+                        };
+                        let hgvsp = if hgvs_flags.hgvsp {
+                            tc.hgvsp
+                                .as_deref()
+                                .map(|value| {
+                                    Self::format_hgvsp_output(
+                                        value,
+                                        hgvs_flags.remove_hgvsp_version,
+                                        hgvs_flags.no_escape,
+                                        hgvs_flags.hgvsp_use_prediction,
+                                    )
                                 })
                                 .unwrap_or_default()
                         } else {
                             String::new()
                         };
-                        // MANE generic: VEP emits "MANE_Select" or "MANE_Plus_Clinical"
-                        // depending on the transcript's MANE annotation.
-                        // Traceability:
-                        // - VEP OutputFactory.pm MANE output
-                        //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1548-L1560
-                        let mane = if tx_opt.and_then(|tx| tx.mane_select.as_deref()).is_some() {
-                            "MANE_Select"
-                        } else if tx_opt
-                            .and_then(|tx| tx.mane_plus_clinical.as_deref())
-                            .is_some()
-                        {
-                            "MANE_Plus_Clinical"
-                        } else {
-                            ""
-                        };
-                        // APPRIS: abbreviate principal1→P1, alternative2→A2.
-                        // Traceability:
-                        // - VEP OutputFactory.pm APPRIS output
-                        //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1563-L1570
-                        let appris_str = tx_opt
-                            .and_then(|tx| tx.appris.as_deref())
-                            .map(format_appris)
+                        let source_val = if merged { source } else { "" };
+
+                        // Batch 1 fields from transcript metadata.
+                        let canonical = tx_opt
+                            .map(|tx| if tx.is_canonical { "YES" } else { "" })
+                            .unwrap_or("");
+                        let tsl_str = tx_opt
+                            .and_then(|tx| tx.tsl)
+                            .map(|v| v.to_string())
                             .unwrap_or_default();
-                        // SIFT/PolyPhen: lookup by (protein_position, alt_amino_acid).
-                        // Traceability:
-                        // - VEP OutputFactory.pm SIFT/PolyPhen output
-                        //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799
-                        let (sift_str, polyphen_str) = lookup_sift_polyphen(
-                            tc.transcript_id.as_deref(),
-                            tc.protein_position.as_deref(),
-                            tc.amino_acids.as_deref(),
-                            sift_cache,
-                            #[cfg(feature = "kv-cache")]
-                            sift_kv,
-                            #[cfg(not(feature = "kv-cache"))]
-                            _sift_kv,
-                        );
-                        // DOMAINS: overlapping protein domain features.
-                        // VEP gates DOMAINS on $pre->{coding} which requires
-                        // a valid CDS coordinate mapping. Our cds_position is
-                        // only set when the variant falls within the CDS region.
-                        // Traceability:
-                        // - VEP OutputFactory.pm line 1434: if($self->{domains} && $pre->{coding})
-                        // - VEP BaseVariationFeatureOverlapAllele.pm _bvfo_preds lines 449-471
-                        //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm
-                        let is_coding = tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
-                        let domains = if is_coding {
-                            lookup_domains(
+                        let mane_select = tx_opt
+                            .and_then(|tx| tx.mane_select.as_deref())
+                            .unwrap_or("");
+                        let mane_plus = tx_opt
+                            .and_then(|tx| tx.mane_plus_clinical.as_deref())
+                            .unwrap_or("");
+                        let ensp = tx_opt
+                            .and_then(|tx| tx.translation_stable_id.as_deref())
+                            .unwrap_or("");
+                        let gene_pheno = tx_opt
+                            .map(|tx| if tx.gene_phenotype { "1" } else { "" })
+                            .unwrap_or("");
+                        let ccds = tx_opt.and_then(|tx| tx.ccds.as_deref()).unwrap_or("");
+                        let swissprot = tx_opt.and_then(|tx| tx.swissprot.as_deref()).unwrap_or("");
+                        let trembl_raw = tx_opt.and_then(|tx| tx.trembl.as_deref()).unwrap_or("");
+                        let trembl = csq_escape(trembl_raw);
+                        let uniparc = tx_opt.and_then(|tx| tx.uniparc.as_deref()).unwrap_or("");
+                        let uniprot_isoform = tx_opt
+                            .and_then(|tx| tx.uniprot_isoform.as_deref())
+                            .unwrap_or("");
+
+                        if flags.everything {
+                            // HGVS_OFFSET: shift_length for the transcript's strand.
+                            // VEP only emits HGVS_OFFSET when HGVSc was actually computed
+                            // for this transcript variant allele. Non-transcript features
+                            // (regulatory, intergenic) never get HGVS_OFFSET.
+                            let hgvs_offset = if hgvs_flags.hgvsc && tc.hgvsc.is_some() {
+                                let tx_strand = tx_opt.map(|tx| tx.strand).unwrap_or(1);
+                                row_variant
+                                    .as_ref()
+                                    .unwrap()
+                                    .hgvs_shift_for_strand(tx_strand)
+                                    .filter(|s| s.shift_length > 0)
+                                    .map(|s| {
+                                        // VEP emits negative HGVS_OFFSET for reverse-strand
+                                        // transcripts (the shift direction is opposite).
+                                        let signed = s.shift_length as i64;
+                                        if tx_strand < 0 {
+                                            (-signed).to_string()
+                                        } else {
+                                            signed.to_string()
+                                        }
+                                    })
+                                    .unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            // MANE generic: VEP emits "MANE_Select" or "MANE_Plus_Clinical"
+                            // depending on the transcript's MANE annotation.
+                            // Traceability:
+                            // - VEP OutputFactory.pm MANE output
+                            //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1548-L1560
+                            let mane = if tx_opt.and_then(|tx| tx.mane_select.as_deref()).is_some()
+                            {
+                                "MANE_Select"
+                            } else if tx_opt
+                                .and_then(|tx| tx.mane_plus_clinical.as_deref())
+                                .is_some()
+                            {
+                                "MANE_Plus_Clinical"
+                            } else {
+                                ""
+                            };
+                            // APPRIS: abbreviate principal1→P1, alternative2→A2.
+                            // Traceability:
+                            // - VEP OutputFactory.pm APPRIS output
+                            //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1563-L1570
+                            let appris_str = tx_opt
+                                .and_then(|tx| tx.appris.as_deref())
+                                .map(format_appris)
+                                .unwrap_or_default();
+                            // SIFT/PolyPhen: lookup by (protein_position, alt_amino_acid).
+                            // Traceability:
+                            // - VEP OutputFactory.pm SIFT/PolyPhen output
+                            //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799
+                            let (sift_str, polyphen_str) = lookup_sift_polyphen(
                                 tc.transcript_id.as_deref(),
                                 tc.protein_position.as_deref(),
                                 tc.amino_acids.as_deref(),
-                                ctx,
-                            )
-                        } else {
-                            String::new()
-                        };
-                        // miRNA: ncRNA secondary structure overlap.
-                        let mirna_str = {
-                            let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
-                            // Parse cDNA position range from the "N" or "N-M" string.
-                            let (cs, ce) = tc
-                                .cdna_position
-                                .as_deref()
-                                .and_then(|p| {
-                                    if let Some((a, b)) = p.split_once('-') {
-                                        Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
-                                    } else {
-                                        let v = p.parse::<usize>().ok()?;
-                                        Some((v, v))
-                                    }
-                                })
-                                .unwrap_or((0, 0));
-                            if cs > 0 {
-                                mirna_structure_field(ncrna, biotype, Some(cs), Some(ce))
+                                sift_cache,
+                                #[cfg(feature = "kv-cache")]
+                                sift_kv,
+                                #[cfg(not(feature = "kv-cache"))]
+                                _sift_kv,
+                            );
+                            // DOMAINS: overlapping protein domain features.
+                            // VEP gates DOMAINS on $pre->{coding} which requires
+                            // a valid CDS coordinate mapping. Our cds_position is
+                            // only set when the variant falls within the CDS region.
+                            // Traceability:
+                            // - VEP OutputFactory.pm line 1434: if($self->{domains} && $pre->{coding})
+                            // - VEP BaseVariationFeatureOverlapAllele.pm _bvfo_preds lines 449-471
+                            //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm
+                            let is_coding =
+                                tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
+                            let domains = if is_coding {
+                                lookup_domains(
+                                    tc.transcript_id.as_deref(),
+                                    tc.protein_position.as_deref(),
+                                    tc.amino_acids.as_deref(),
+                                    ctx,
+                                )
                             } else {
                                 String::new()
-                            }
-                        };
-                        // 80-field CSQ: 22 base + 20 Batch 1 + 33 Batch 3 + 5 motif.
-                        // Traceability:
-                        // - VEP Constants.pm CSQ field order for --everything
-                        //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
-                        let _ = write!(
-                            csq_buf,
-                            "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                            };
+                            // miRNA: ncRNA secondary structure overlap.
+                            let mirna_str = {
+                                let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
+                                // Parse cDNA position range from the "N" or "N-M" string.
+                                let (cs, ce) = tc
+                                    .cdna_position
+                                    .as_deref()
+                                    .and_then(|p| {
+                                        if let Some((a, b)) = p.split_once('-') {
+                                            Some((
+                                                a.parse::<usize>().ok()?,
+                                                b.parse::<usize>().ok()?,
+                                            ))
+                                        } else {
+                                            let v = p.parse::<usize>().ok()?;
+                                            Some((v, v))
+                                        }
+                                    })
+                                    .unwrap_or((0, 0));
+                                if cs > 0 {
+                                    mirna_structure_field(ncrna, biotype, Some(cs), Some(ce))
+                                } else {
+                                    String::new()
+                                }
+                            };
+                            // 80-field CSQ: 22 base + 20 Batch 1 + 33 Batch 3 + 5 motif.
+                            // Traceability:
+                            // - VEP Constants.pm CSQ field order for --everything
+                            //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                              {existing_var}|{distance}|{strand_str}|{tc_flags}|\
@@ -3225,12 +3969,12 @@ impl AnnotateProvider {
                              {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
                              {batch3_suffix}|||||"
-                        );
-                    } else {
-                        // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
-                        let _ = write!(
-                            csq_buf,
-                            "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                            );
+                        } else {
+                            // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                              {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
@@ -3238,26 +3982,26 @@ impl AnnotateProvider {
                              {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                              {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                              {batch3_suffix}"
-                        );
+                            );
+                        }
                     }
-                }
-                if csq_buf.is_empty() {
-                    let impact = impact_label(SoImpact::Modifier);
-                    if flags.everything {
-                        let _ = write!(
-                            csq_buf,
-                            "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
+                    if csq_buf.is_empty() {
+                        let impact = impact_label(SoImpact::Modifier);
+                        if flags.everything {
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
                              {variant_class}|||||||||||||||||||||\
                              {batch3_suffix}|||||"
-                        );
-                    } else {
-                        let _ = write!(
-                            csq_buf,
-                            "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
+                            );
+                        } else {
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
                              {variant_class}||||||||||||{batch3_suffix}"
-                        );
+                            );
+                        }
                     }
-                }
                 } // end if !skip_csq (cache-miss CSQ formatting)
             };
 
@@ -3267,8 +4011,587 @@ impl AnnotateProvider {
                 csq_builder.append_value(&csq_buf);
             }
             most_builder.append_value(&most_str);
-        }
 
+            // --- Populate 87 annotation column builders for this row ---
+
+            // Find the most-severe transcript from row_assignments (cache-miss path).
+            // For cache-hit, row_assignments is empty and transcript-level cols are NULL.
+            let most_severe_tc: Option<&TranscriptConsequence> = if !row_assignments.is_empty() {
+                let most_term = SoTerm::from_str(&most_str).unwrap_or(SoTerm::SequenceVariant);
+                row_assignments
+                    .iter()
+                    .find(|tc| tc.terms.contains(&most_term))
+                    .or(row_assignments.first())
+            } else {
+                None
+            };
+
+            // Helper: look up transcript metadata from most-severe TC.
+            let ms_tx_opt = most_severe_tc
+                .and_then(|tc| tc.transcript_idx)
+                .map(|idx| &ctx.transcripts[idx]);
+
+            // -- Transcript-level columns (42) --
+            if let Some(tc) = most_severe_tc {
+                let tx_opt = ms_tx_opt;
+
+                // Allele
+                b_allele.append_value(&vep_allele);
+
+                // Consequence (List<Utf8>)
+                let vals = b_consequence.values();
+                for t in &tc.terms {
+                    vals.append_value(t.as_str());
+                }
+                b_consequence.append(true);
+
+                // IMPACT
+                let tc_impact = most_severe_term(tc.terms.iter())
+                    .map(|t| impact_label(t.impact()))
+                    .unwrap_or_else(|| impact_label(SoImpact::Modifier));
+                b_impact.append_value(tc_impact);
+
+                // SYMBOL, Gene
+                append_opt_str(
+                    &mut b_symbol,
+                    tx_opt.and_then(|tx| tx.gene_symbol.as_deref()),
+                );
+                append_opt_str(
+                    &mut b_gene,
+                    tx_opt.and_then(|tx| tx.gene_stable_id.as_deref()),
+                );
+
+                // Feature_type, Feature
+                let ft_str = tc.feature_type.as_str();
+                append_opt_str(
+                    &mut b_feature_type,
+                    if ft_str.is_empty() {
+                        None
+                    } else {
+                        Some(ft_str)
+                    },
+                );
+                append_opt_str(&mut b_feature, tc.transcript_id.as_deref());
+
+                // BIOTYPE
+                let biotype = tc
+                    .biotype_override
+                    .as_deref()
+                    .unwrap_or(tx_opt.map(|tx| tx.biotype.as_str()).unwrap_or(""));
+                append_opt_str(
+                    &mut b_biotype,
+                    if biotype.is_empty() {
+                        None
+                    } else {
+                        Some(biotype)
+                    },
+                );
+
+                // EXON, INTRON
+                append_opt_str(&mut b_exon, tc.exon_str.as_deref());
+                append_opt_str(&mut b_intron, tc.intron_str.as_deref());
+
+                // HGVSc, HGVSp
+                if hgvs_flags.hgvsc {
+                    append_opt_str(&mut b_hgvsc, tc.hgvsc.as_deref());
+                } else {
+                    b_hgvsc.append_null();
+                }
+                if hgvs_flags.hgvsp {
+                    let hgvsp_val = tc.hgvsp.as_deref().map(|value| {
+                        Self::format_hgvsp_output(
+                            value,
+                            hgvs_flags.remove_hgvsp_version,
+                            hgvs_flags.no_escape,
+                            hgvs_flags.hgvsp_use_prediction,
+                        )
+                    });
+                    match hgvsp_val {
+                        Some(v) if !v.is_empty() => b_hgvsp.append_value(&v),
+                        _ => b_hgvsp.append_null(),
+                    }
+                } else {
+                    b_hgvsp.append_null();
+                }
+
+                // cDNA_position, CDS_position, Protein_position, Amino_acids, Codons
+                append_opt_str(&mut b_cdna_position, tc.cdna_position.as_deref());
+                append_opt_str(&mut b_cds_position, tc.cds_position.as_deref());
+                append_opt_str(&mut b_protein_position, tc.protein_position.as_deref());
+                append_opt_str(&mut b_amino_acids, tc.amino_acids.as_deref());
+                append_opt_str(&mut b_codons, tc.codons.as_deref());
+
+                // Existing_variation (List<Utf8>) — from colocated data
+                if !existing_var.is_empty() {
+                    let vals = b_existing_variation.values();
+                    for v in existing_var.split(',') {
+                        vals.append_value(v.trim());
+                    }
+                    b_existing_variation.append(true);
+                } else {
+                    b_existing_variation.append(false);
+                }
+
+                // DISTANCE (Int64)
+                match tc.distance {
+                    Some(d) => b_distance.append_value(d),
+                    None => b_distance.append_null(),
+                }
+
+                // STRAND (Int8)
+                match tx_opt {
+                    Some(tx) => b_strand.append_value(if tx.strand >= 0 { 1 } else { -1 }),
+                    None => b_strand.append_null(),
+                }
+
+                // FLAGS
+                append_opt_str(&mut b_flags, tc.flags.as_deref());
+
+                // VARIANT_CLASS
+                b_variant_class.append_value(variant_class);
+
+                // SYMBOL_SOURCE, HGNC_ID
+                append_opt_str(
+                    &mut b_symbol_source,
+                    tx_opt.and_then(|tx| tx.gene_symbol_source.as_deref()),
+                );
+                append_opt_str(
+                    &mut b_hgnc_id,
+                    tx_opt.and_then(|tx| tx.gene_hgnc_id.as_deref()),
+                );
+
+                // CANONICAL
+                match tx_opt {
+                    Some(tx) => {
+                        if tx.is_canonical {
+                            b_canonical.append_value("YES");
+                        } else {
+                            b_canonical.append_null();
+                        }
+                    }
+                    None => b_canonical.append_null(),
+                }
+
+                // MANE
+                if flags.everything {
+                    let mane_val = if tx_opt.and_then(|tx| tx.mane_select.as_deref()).is_some() {
+                        Some("MANE_Select")
+                    } else if tx_opt
+                        .and_then(|tx| tx.mane_plus_clinical.as_deref())
+                        .is_some()
+                    {
+                        Some("MANE_Plus_Clinical")
+                    } else {
+                        None
+                    };
+                    append_opt_str(&mut b_mane, mane_val);
+                } else {
+                    b_mane.append_null();
+                }
+
+                // MANE_SELECT, MANE_PLUS_CLINICAL
+                append_opt_str(
+                    &mut b_mane_select,
+                    tx_opt.and_then(|tx| tx.mane_select.as_deref()),
+                );
+                append_opt_str(
+                    &mut b_mane_plus_clinical,
+                    tx_opt.and_then(|tx| tx.mane_plus_clinical.as_deref()),
+                );
+
+                // TSL (Int8)
+                match tx_opt.and_then(|tx| tx.tsl) {
+                    Some(v) => b_tsl.append_value(v as i8),
+                    None => b_tsl.append_null(),
+                }
+
+                // APPRIS
+                if flags.everything {
+                    match tx_opt.and_then(|tx| tx.appris.as_deref()) {
+                        Some(raw) => b_appris.append_value(format_appris(raw)),
+                        None => b_appris.append_null(),
+                    }
+                } else {
+                    b_appris.append_null();
+                }
+
+                // CCDS, ENSP, SWISSPROT, TREMBL, UNIPARC, UNIPROT_ISOFORM
+                append_opt_str(&mut b_ccds, tx_opt.and_then(|tx| tx.ccds.as_deref()));
+                append_opt_str(
+                    &mut b_ensp,
+                    tx_opt.and_then(|tx| tx.translation_stable_id.as_deref()),
+                );
+                append_opt_str(
+                    &mut b_swissprot,
+                    tx_opt.and_then(|tx| tx.swissprot.as_deref()),
+                );
+                append_opt_str(&mut b_trembl, tx_opt.and_then(|tx| tx.trembl.as_deref()));
+                append_opt_str(&mut b_uniparc, tx_opt.and_then(|tx| tx.uniparc.as_deref()));
+                append_opt_str(
+                    &mut b_uniprot_isoform,
+                    tx_opt.and_then(|tx| tx.uniprot_isoform.as_deref()),
+                );
+
+                // GENE_PHENO
+                match tx_opt {
+                    Some(tx) => {
+                        if tx.gene_phenotype {
+                            b_gene_pheno.append_value("1");
+                        } else {
+                            b_gene_pheno.append_null();
+                        }
+                    }
+                    None => b_gene_pheno.append_null(),
+                }
+
+                // SIFT, PolyPhen
+                if flags.everything {
+                    let (sift_str, polyphen_str) = lookup_sift_polyphen(
+                        tc.transcript_id.as_deref(),
+                        tc.protein_position.as_deref(),
+                        tc.amino_acids.as_deref(),
+                        sift_cache,
+                        #[cfg(feature = "kv-cache")]
+                        sift_kv,
+                        #[cfg(not(feature = "kv-cache"))]
+                        _sift_kv,
+                    );
+                    append_opt_str(
+                        &mut b_sift,
+                        if sift_str.is_empty() {
+                            None
+                        } else {
+                            Some(&sift_str)
+                        },
+                    );
+                    append_opt_str(
+                        &mut b_polyphen,
+                        if polyphen_str.is_empty() {
+                            None
+                        } else {
+                            Some(&polyphen_str)
+                        },
+                    );
+                } else {
+                    b_sift.append_null();
+                    b_polyphen.append_null();
+                }
+
+                // DOMAINS (List<Utf8>)
+                if flags.everything {
+                    let is_coding = tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
+                    if is_coding {
+                        let domains_str = lookup_domains(
+                            tc.transcript_id.as_deref(),
+                            tc.protein_position.as_deref(),
+                            tc.amino_acids.as_deref(),
+                            ctx,
+                        );
+                        if !domains_str.is_empty() {
+                            let vals = b_domains.values();
+                            for d in domains_str.split('&') {
+                                vals.append_value(d);
+                            }
+                            b_domains.append(true);
+                        } else {
+                            b_domains.append(false);
+                        }
+                    } else {
+                        b_domains.append(false);
+                    }
+                } else {
+                    b_domains.append(false);
+                }
+
+                // miRNA
+                if flags.everything {
+                    let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
+                    let biotype_for_mirna = tc
+                        .biotype_override
+                        .as_deref()
+                        .unwrap_or(tx_opt.map(|tx| tx.biotype.as_str()).unwrap_or(""));
+                    let (cs, ce) = tc
+                        .cdna_position
+                        .as_deref()
+                        .and_then(|p| {
+                            if let Some((a, b)) = p.split_once('-') {
+                                Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                            } else {
+                                let v = p.parse::<usize>().ok()?;
+                                Some((v, v))
+                            }
+                        })
+                        .unwrap_or((0, 0));
+                    let mirna_val = if cs > 0 {
+                        mirna_structure_field(ncrna, biotype_for_mirna, Some(cs), Some(ce))
+                    } else {
+                        String::new()
+                    };
+                    append_opt_str(
+                        &mut b_mirna,
+                        if mirna_val.is_empty() {
+                            None
+                        } else {
+                            Some(&mirna_val)
+                        },
+                    );
+                } else {
+                    b_mirna.append_null();
+                }
+
+                // HGVS_OFFSET (Int64)
+                if flags.everything && hgvs_flags.hgvsc && tc.hgvsc.is_some() {
+                    let tx_strand = tx_opt.map(|tx| tx.strand).unwrap_or(1);
+                    let offset_val = row_variant
+                        .as_ref()
+                        .and_then(|v| v.hgvs_shift_for_strand(tx_strand))
+                        .filter(|s| s.shift_length > 0)
+                        .map(|s| {
+                            let signed = s.shift_length as i64;
+                            if tx_strand < 0 { -signed } else { signed }
+                        });
+                    match offset_val {
+                        Some(v) => b_hgvs_offset.append_value(v),
+                        None => b_hgvs_offset.append_null(),
+                    }
+                } else {
+                    b_hgvs_offset.append_null();
+                }
+            } else {
+                // Cache-hit path: transcript-level columns are NULL (no engine assignment).
+                b_allele.append_value(&vep_allele);
+                b_consequence.append(false); // NULL list
+                b_impact.append_null();
+                b_symbol.append_null();
+                b_gene.append_null();
+                b_feature_type.append_null();
+                b_feature.append_null();
+                b_biotype.append_null();
+                b_exon.append_null();
+                b_intron.append_null();
+                b_hgvsc.append_null();
+                b_hgvsp.append_null();
+                b_cdna_position.append_null();
+                b_cds_position.append_null();
+                b_protein_position.append_null();
+                b_amino_acids.append_null();
+                b_codons.append_null();
+                // Existing_variation: still from colocated data even for cache-hit
+                if !existing_var.is_empty() {
+                    let vals = b_existing_variation.values();
+                    for v in existing_var.split(',') {
+                        vals.append_value(v.trim());
+                    }
+                    b_existing_variation.append(true);
+                } else {
+                    b_existing_variation.append(false);
+                }
+                b_distance.append_null();
+                b_strand.append_null();
+                b_flags.append_null();
+                b_variant_class.append_value(variant_class);
+                b_symbol_source.append_null();
+                b_hgnc_id.append_null();
+                b_canonical.append_null();
+                b_mane.append_null();
+                b_mane_select.append_null();
+                b_mane_plus_clinical.append_null();
+                b_tsl.append_null();
+                b_appris.append_null();
+                b_ccds.append_null();
+                b_ensp.append_null();
+                b_swissprot.append_null();
+                b_trembl.append_null();
+                b_uniparc.append_null();
+                b_uniprot_isoform.append_null();
+                b_gene_pheno.append_null();
+                b_sift.append_null();
+                b_polyphen.append_null();
+                b_domains.append(false);
+                b_mirna.append_null();
+                b_hgvs_offset.append_null();
+            }
+
+            // -- Frequency columns (29) --
+            // AF columns: parse resolved frequency strings to Float32.
+            for (i, af_val) in frequency_fields.af_values.iter().enumerate() {
+                if i < b_af.len() {
+                    if af_val.is_empty() {
+                        b_af[i].append_null();
+                    } else {
+                        match af_val.parse::<f32>() {
+                            Ok(v) => b_af[i].append_value(v),
+                            Err(_) => b_af[i].append_null(),
+                        }
+                    }
+                }
+            }
+            // Pad any missing AF columns (if frequency_fields has fewer than 27 entries).
+            for i in frequency_fields.af_values.len()..b_af.len() {
+                b_af[i].append_null();
+            }
+            // MAX_AF
+            if frequency_fields.max_af.is_empty() {
+                b_max_af.append_null();
+            } else {
+                match frequency_fields.max_af.parse::<f32>() {
+                    Ok(v) => b_max_af.append_value(v),
+                    Err(_) => b_max_af.append_null(),
+                }
+            }
+            // MAX_AF_POPS
+            append_opt_str(
+                &mut b_max_af_pops,
+                if frequency_fields.max_af_pops.is_empty() {
+                    None
+                } else {
+                    Some(&frequency_fields.max_af_pops)
+                },
+            );
+
+            // -- Variant-level columns (9) --
+            // CLIN_SIG (List<Utf8>)
+            if !variant_fields.clin_sig.is_empty() {
+                let vals = b_clin_sig.values();
+                for v in variant_fields.clin_sig.split(',') {
+                    vals.append_value(v.trim());
+                }
+                b_clin_sig.append(true);
+            } else {
+                b_clin_sig.append(false);
+            }
+            // SOMATIC
+            append_opt_str(
+                &mut b_somatic,
+                if variant_fields.somatic.is_empty() {
+                    None
+                } else {
+                    Some(&variant_fields.somatic)
+                },
+            );
+            // PHENO
+            append_opt_str(
+                &mut b_pheno,
+                if variant_fields.pheno.is_empty() {
+                    None
+                } else {
+                    Some(&variant_fields.pheno)
+                },
+            );
+            // PUBMED (List<Utf8>)
+            if !variant_fields.pubmed.is_empty() {
+                let vals = b_pubmed.values();
+                for v in variant_fields.pubmed.split(',') {
+                    vals.append_value(v.trim());
+                }
+                b_pubmed.append(true);
+            } else {
+                b_pubmed.append(false);
+            }
+            // MOTIF_NAME, MOTIF_POS, HIGH_INF_POS, MOTIF_SCORE_CHANGE, TRANSCRIPTION_FACTORS
+            // These are currently not populated (always NULL) — they require motif feature
+            // consequence data that is not yet exposed in the per-transcript CSQ path.
+            b_motif_name.append_null();
+            b_motif_pos.append_null();
+            b_high_inf_pos.append_null();
+            b_motif_score_change.append_null();
+            b_transcription_factors.append(false);
+
+            // -- Cache-only columns (7) --
+            // Read from the intermediate batch's cache_ columns.
+            // clin_sig_allele (List<Utf8>, semicolon-separated)
+            match schema
+                .index_of("cache_clin_sig_allele")
+                .ok()
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+            {
+                Some(v) if !v.is_empty() => {
+                    let vals = b_clin_sig_allele.values();
+                    for s in v.split(';') {
+                        vals.append_value(s.trim());
+                    }
+                    b_clin_sig_allele.append(true);
+                }
+                _ => b_clin_sig_allele.append(false),
+            }
+            // clinical_impact
+            match schema
+                .index_of("cache_clinical_impact")
+                .ok()
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+            {
+                Some(v) if !v.is_empty() => b_clinical_impact.append_value(&v),
+                _ => b_clinical_impact.append_null(),
+            }
+            // minor_allele
+            match schema
+                .index_of("cache_minor_allele")
+                .ok()
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+            {
+                Some(v) if !v.is_empty() => b_minor_allele.append_value(&v),
+                _ => b_minor_allele.append_null(),
+            }
+            // minor_allele_freq (Float32)
+            match schema
+                .index_of("cache_minor_allele_freq")
+                .ok()
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+            {
+                Some(v) if !v.is_empty() => match v.parse::<f32>() {
+                    Ok(f) => b_minor_allele_freq.append_value(f),
+                    Err(_) => b_minor_allele_freq.append_null(),
+                },
+                _ => b_minor_allele_freq.append_null(),
+            }
+            // clinvar_ids (List<Utf8>)
+            match schema
+                .index_of("cache_clinvar_ids")
+                .ok()
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+            {
+                Some(v) if !v.is_empty() => {
+                    let vals = b_clinvar_ids.values();
+                    for s in v.split(',') {
+                        vals.append_value(s.trim());
+                    }
+                    b_clinvar_ids.append(true);
+                }
+                _ => b_clinvar_ids.append(false),
+            }
+            // cosmic_ids (List<Utf8>)
+            match schema
+                .index_of("cache_cosmic_ids")
+                .ok()
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+            {
+                Some(v) if !v.is_empty() => {
+                    let vals = b_cosmic_ids.values();
+                    for s in v.split(',') {
+                        vals.append_value(s.trim());
+                    }
+                    b_cosmic_ids.append(true);
+                }
+                _ => b_cosmic_ids.append(false),
+            }
+            // dbsnp_ids (List<Utf8>)
+            match schema
+                .index_of("cache_dbsnp_ids")
+                .ok()
+                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+            {
+                Some(v) if !v.is_empty() => {
+                    let vals = b_dbsnp_ids.values();
+                    for s in v.split(',') {
+                        vals.append_value(s.trim());
+                    }
+                    b_dbsnp_ids.append(true);
+                }
+                _ => b_dbsnp_ids.append(false),
+            }
+        } // end per-row loop
+
+        // --- Build output columns ---
         let mut out_cols = Vec::with_capacity(self.vcf_field_count() + ANNOTATION_COLUMN_COUNT);
         for name in self.vcf_field_names() {
             let idx = schema.index_of(&name).map_err(|_| {
@@ -3281,26 +4604,83 @@ impl AnnotateProvider {
         out_cols.push(Arc::new(csq_builder.finish()));
         out_cols.push(Arc::new(most_builder.finish()));
 
-        // Pass through extra cache annotation columns.
-        for &col_name in CACHE_OUTPUT_COLUMNS {
-            let col_name_in_batch = format!("cache_{col_name}");
-            if let Ok(idx) = schema.index_of(&col_name_in_batch) {
-                let col = batch.column(idx);
-                let mut builder =
-                    StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
-                for row in 0..batch.num_rows() {
-                    match string_at(col.as_ref(), row) {
-                        Some(v) => builder.append_value(&v),
-                        None => builder.append_null(),
-                    }
-                }
-                out_cols.push(Arc::new(builder.finish()));
-            } else {
-                out_cols.push(new_null_array(&DataType::Utf8, batch.num_rows()));
-            }
+        // Transcript-level columns (42)
+        out_cols.push(Arc::new(b_allele.finish()));
+        out_cols.push(Arc::new(b_consequence.finish()));
+        out_cols.push(Arc::new(b_impact.finish()));
+        out_cols.push(Arc::new(b_symbol.finish()));
+        out_cols.push(Arc::new(b_gene.finish()));
+        out_cols.push(Arc::new(b_feature_type.finish()));
+        out_cols.push(Arc::new(b_feature.finish()));
+        out_cols.push(Arc::new(b_biotype.finish()));
+        out_cols.push(Arc::new(b_exon.finish()));
+        out_cols.push(Arc::new(b_intron.finish()));
+        out_cols.push(Arc::new(b_hgvsc.finish()));
+        out_cols.push(Arc::new(b_hgvsp.finish()));
+        out_cols.push(Arc::new(b_cdna_position.finish()));
+        out_cols.push(Arc::new(b_cds_position.finish()));
+        out_cols.push(Arc::new(b_protein_position.finish()));
+        out_cols.push(Arc::new(b_amino_acids.finish()));
+        out_cols.push(Arc::new(b_codons.finish()));
+        out_cols.push(Arc::new(b_existing_variation.finish()));
+        out_cols.push(Arc::new(b_distance.finish()));
+        out_cols.push(Arc::new(b_strand.finish()));
+        out_cols.push(Arc::new(b_flags.finish()));
+        out_cols.push(Arc::new(b_variant_class.finish()));
+        out_cols.push(Arc::new(b_symbol_source.finish()));
+        out_cols.push(Arc::new(b_hgnc_id.finish()));
+        out_cols.push(Arc::new(b_canonical.finish()));
+        out_cols.push(Arc::new(b_mane.finish()));
+        out_cols.push(Arc::new(b_mane_select.finish()));
+        out_cols.push(Arc::new(b_mane_plus_clinical.finish()));
+        out_cols.push(Arc::new(b_tsl.finish()));
+        out_cols.push(Arc::new(b_appris.finish()));
+        out_cols.push(Arc::new(b_ccds.finish()));
+        out_cols.push(Arc::new(b_ensp.finish()));
+        out_cols.push(Arc::new(b_swissprot.finish()));
+        out_cols.push(Arc::new(b_trembl.finish()));
+        out_cols.push(Arc::new(b_uniparc.finish()));
+        out_cols.push(Arc::new(b_uniprot_isoform.finish()));
+        out_cols.push(Arc::new(b_gene_pheno.finish()));
+        out_cols.push(Arc::new(b_sift.finish()));
+        out_cols.push(Arc::new(b_polyphen.finish()));
+        out_cols.push(Arc::new(b_domains.finish()));
+        out_cols.push(Arc::new(b_mirna.finish()));
+        out_cols.push(Arc::new(b_hgvs_offset.finish()));
+        // Frequency columns (29)
+        for af_b in b_af.iter_mut() {
+            out_cols.push(Arc::new(af_b.finish()));
         }
+        out_cols.push(Arc::new(b_max_af.finish()));
+        out_cols.push(Arc::new(b_max_af_pops.finish()));
+        // Variant-level columns (9)
+        out_cols.push(Arc::new(b_clin_sig.finish()));
+        out_cols.push(Arc::new(b_somatic.finish()));
+        out_cols.push(Arc::new(b_pheno.finish()));
+        out_cols.push(Arc::new(b_pubmed.finish()));
+        out_cols.push(Arc::new(b_motif_name.finish()));
+        out_cols.push(Arc::new(b_motif_pos.finish()));
+        out_cols.push(Arc::new(b_high_inf_pos.finish()));
+        out_cols.push(Arc::new(b_motif_score_change.finish()));
+        out_cols.push(Arc::new(b_transcription_factors.finish()));
+        // Cache-only columns (7)
+        out_cols.push(Arc::new(b_clin_sig_allele.finish()));
+        out_cols.push(Arc::new(b_clinical_impact.finish()));
+        out_cols.push(Arc::new(b_minor_allele.finish()));
+        out_cols.push(Arc::new(b_minor_allele_freq.finish()));
+        out_cols.push(Arc::new(b_clinvar_ids.finish()));
+        out_cols.push(Arc::new(b_cosmic_ids.finish()));
+        out_cols.push(Arc::new(b_dbsnp_ids.finish()));
 
         Ok(RecordBatch::try_new(self.schema.clone(), out_cols)?)
+    }
+}
+
+/// Append an optional string value to a StringBuilder: non-empty Some → value, else → NULL.
+fn append_opt_str(builder: &mut StringBuilder, val: Option<&str>) {
+    match val {
+        Some(v) if !v.is_empty() => builder.append_value(v),
+        _ => builder.append_null(),
     }
 }
 
@@ -4702,8 +6082,7 @@ fn annotate_window(
     // CSQ is the first annotation column after VCF fields.
     // Skip CSQ assembly when it is not in the projection (default: skip).
     let csq_col_idx = ann.tmp_provider.vcf_field_count();
-    let skip_csq = projection
-        .map_or(true, |indices| !indices.contains(&csq_col_idx));
+    let skip_csq = projection.map_or(true, |indices| !indices.contains(&csq_col_idx));
 
     let sift_enabled = ann.config.flags.everything;
     let mut out = VecDeque::with_capacity(window_batches.len());
@@ -5491,7 +6870,7 @@ impl TableProvider for AnnotateProvider {
             };
 
             let mut preferred_columns = vec!["consequence_types", "most_severe_consequence"];
-            for &c in CACHE_OUTPUT_COLUMNS {
+            for c in cache_lookup_column_names() {
                 if !preferred_columns.contains(&c) {
                     preferred_columns.push(c);
                 }

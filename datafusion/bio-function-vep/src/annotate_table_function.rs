@@ -101,9 +101,9 @@ fn resolve_schema(session: &SessionContext, vcf_table: &str) -> Result<(Schema, 
     let schema_provider = state.schema_for_ref(table_ref)?;
 
     let table_provider = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(schema_provider.table(vcf_table))
-        }),
+        Ok(handle) => {
+            tokio::task::block_in_place(|| handle.block_on(schema_provider.table(vcf_table)))
+        }
         Err(_) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -113,7 +113,10 @@ fn resolve_schema(session: &SessionContext, vcf_table: &str) -> Result<(Schema, 
     .map_err(|e| DataFusionError::External(Box::new(e)))?
     .ok_or_else(|| DataFusionError::Plan(format!("Table '{vcf_table}' not found")))?;
 
-    Ok((table_provider.schema().as_ref().clone(), vcf_table.to_string()))
+    Ok((
+        table_provider.schema().as_ref().clone(),
+        vcf_table.to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -233,7 +236,7 @@ mod tests {
     }
 
     fn cache_batch() -> RecordBatch {
-        use crate::annotate_provider::CACHE_OUTPUT_COLUMNS;
+        use crate::annotate_provider::cache_lookup_column_names;
 
         // Core columns required for the join.
         // Two rows: chrom "1" at pos 100 (matches vcf_table row 1) and
@@ -252,8 +255,8 @@ mod tests {
             Arc::new(StringArray::from(vec!["A/G", "C/T"])),
             Arc::new(Int64Array::from(vec![0, 0])),
         ];
-        // Add all CACHE_OUTPUT_COLUMNS as nullable Utf8.
-        for &col in CACHE_OUTPUT_COLUMNS {
+        // Add all cache lookup columns as nullable Utf8.
+        for col in cache_lookup_column_names() {
             fields.push(Field::new(col, DataType::Utf8, true));
             let val: Option<&str> = match col {
                 "variation_name" => Some("rs100"),
