@@ -1,5 +1,5 @@
-use crate::physical_planner::RangesQueryPlanner;
 use crate::physical_planner::IntervalJoinPhysicalOptimizationRule;
+use crate::physical_planner::RangesQueryPlanner;
 use async_trait::async_trait;
 use datafusion::common::extensions_options;
 use datafusion::config::{ConfigExtension, ConfigField, ConfigOptions};

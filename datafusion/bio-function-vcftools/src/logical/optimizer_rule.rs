@@ -310,11 +310,11 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Result<Option<TraversalResult<'_>>>
                 };
 
                 // Check if this column references a row-identity column
-                if let Expr::Column(col) = &inner_expr {
-                    if child_result.row_identity_columns.contains(col.name()) {
-                        trace!("Row-identity column aliased: {} -> {}", col.name(), alias);
-                        new_row_identity_columns.insert(alias.clone());
-                    }
+                if let Expr::Column(col) = &inner_expr
+                    && child_result.row_identity_columns.contains(col.name())
+                {
+                    trace!("Row-identity column aliased: {} -> {}", col.name(), alias);
+                    new_row_identity_columns.insert(alias.clone());
                 }
 
                 // Resolve the expression against child definitions
@@ -348,10 +348,10 @@ fn traverse_to_unnest(plan: &LogicalPlan) -> Result<Option<TraversalResult<'_>>>
 fn resolve_expr(expr: &Expr, definitions: &HashMap<String, Expr>) -> Result<Expr> {
     expr.clone()
         .transform(|e| {
-            if let Expr::Column(col) = &e {
-                if let Some(definition) = definitions.get(col.name()) {
-                    return Ok(Transformed::yes(definition.clone()));
-                }
+            if let Expr::Column(col) = &e
+                && let Some(definition) = definitions.get(col.name())
+            {
+                return Ok(Transformed::yes(definition.clone()));
             }
             Ok(Transformed::no(e))
         })
@@ -397,12 +397,11 @@ fn find_row_identity_columns(plan: &LogicalPlan) -> HashSet<String> {
                 // the alias is also an identity column
                 let mut new_aliases = Vec::new();
                 for expr in &projection.expr {
-                    if let Expr::Alias(alias) = expr {
-                        if let Expr::Column(col) = alias.expr.as_ref() {
-                            if identity_cols.contains(col.name()) {
-                                new_aliases.push(alias.name.clone());
-                            }
-                        }
+                    if let Expr::Alias(alias) = expr
+                        && let Expr::Column(col) = alias.expr.as_ref()
+                        && identity_cols.contains(col.name())
+                    {
+                        new_aliases.push(alias.name.clone());
                     }
                 }
                 for alias in new_aliases {

@@ -25,12 +25,12 @@ use crate::common::build_element_schema_from_df;
 fn strip_column_qualifiers(expr: &Expr) -> Result<Expr> {
     expr.clone()
         .transform(|e| {
-            if let Expr::Column(col) = &e {
-                if col.relation.is_some() {
-                    // Strip the qualifier, keep only the column name
-                    let unqualified = Column::new_unqualified(col.name());
-                    return Ok(Transformed::yes(Expr::Column(unqualified)));
-                }
+            if let Expr::Column(col) = &e
+                && col.relation.is_some()
+            {
+                // Strip the qualifier, keep only the column name
+                let unqualified = Column::new_unqualified(col.name());
+                return Ok(Transformed::yes(Expr::Column(unqualified)));
             }
             Ok(Transformed::no(e))
         })

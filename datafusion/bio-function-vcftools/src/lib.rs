@@ -60,7 +60,7 @@ pub use logical::optimizer_rule::{
 };
 
 // Re-export physical types
+pub use datafusion_bio_query_planner::BioQueryPlanner;
 pub use physical::extension_planner::FusedArrayTransformPlanner;
 pub use physical::fused_array_transform_exec::FusedArrayTransformExec;
 pub use physical::query_planner::VcfQueryPlanner;
-pub use datafusion_bio_query_planner::BioQueryPlanner;
