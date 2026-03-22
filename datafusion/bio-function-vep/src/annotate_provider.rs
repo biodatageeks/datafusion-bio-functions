@@ -2733,6 +2733,7 @@ impl AnnotateProvider {
         sift_cache: &mut SiftPolyphenCache,
         #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
         #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
+        skip_csq: bool,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
@@ -2788,12 +2789,20 @@ impl AnnotateProvider {
             None
         };
 
-        let mut csq_builder = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 40);
+        let mut csq_builder = if skip_csq {
+            StringBuilder::new()
+        } else {
+            StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 40)
+        };
         let mut most_builder =
             StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
 
         // Reusable buffers to avoid per-row/per-CSQ-entry String allocations.
-        let mut csq_buf = String::with_capacity(4096);
+        let mut csq_buf = if skip_csq {
+            String::new()
+        } else {
+            String::with_capacity(4096)
+        };
         let mut terms_buf = String::with_capacity(128);
 
         for row in 0..batch.num_rows() {
@@ -2901,28 +2910,32 @@ impl AnnotateProvider {
             );
 
             let most_str;
-            csq_buf.clear();
+            if !skip_csq {
+                csq_buf.clear();
+            }
             if let Some(most_val) = &cached_most {
-                use std::fmt::Write;
                 // Cache hit — produce single CSQ entry with empty transcript fields.
-                let csq_val = cached_csq.unwrap_or_default();
-                let impact = SoTerm::from_str(most_val)
-                    .map(|t| impact_label(t.impact()))
-                    .unwrap_or_else(|| impact_label(SoImpact::Modifier));
-                if flags.everything {
-                    let _ = write!(
-                        csq_buf,
-                        "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
-                         {variant_class}|||||||||||||||||||||\
-                         {batch3_suffix}|||||"
-                    );
-                } else {
-                    let _ = write!(
-                        csq_buf,
-                        "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
-                         {variant_class}||||||||||||{batch3_suffix}"
-                    );
-                };
+                if !skip_csq {
+                    use std::fmt::Write;
+                    let csq_val = cached_csq.unwrap_or_default();
+                    let impact = SoTerm::from_str(most_val)
+                        .map(|t| impact_label(t.impact()))
+                        .unwrap_or_else(|| impact_label(SoImpact::Modifier));
+                    if flags.everything {
+                        let _ = write!(
+                            csq_buf,
+                            "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
+                             {variant_class}|||||||||||||||||||||\
+                             {batch3_suffix}|||||"
+                        );
+                    } else {
+                        let _ = write!(
+                            csq_buf,
+                            "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
+                             {variant_class}||||||||||||{batch3_suffix}"
+                        );
+                    };
+                }
                 most_str = most_val.clone();
             } else {
                 use std::fmt::Write;
@@ -2997,6 +3010,8 @@ impl AnnotateProvider {
                 most_str = most.as_str().to_string();
 
                 // Build per-transcript CSQ entries into reusable buffer (already cleared above).
+                // Skip the entire CSQ formatting when the csq column is not projected.
+                if !skip_csq {
                 for tc in &assignments {
                     terms_buf.clear();
                     for (i, t) in tc.terms.iter().enumerate() {
@@ -3243,9 +3258,14 @@ impl AnnotateProvider {
                         );
                     }
                 }
+                } // end if !skip_csq (cache-miss CSQ formatting)
             };
 
-            csq_builder.append_value(&csq_buf);
+            if skip_csq {
+                csq_builder.append_null();
+            } else {
+                csq_builder.append_value(&csq_buf);
+            }
             most_builder.append_value(&most_str);
         }
 
@@ -4679,6 +4699,12 @@ fn annotate_window(
         &ann.structural,
     );
 
+    // CSQ is the first annotation column after VCF fields.
+    // Skip CSQ assembly when it is not in the projection (default: skip).
+    let csq_col_idx = ann.tmp_provider.vcf_field_count();
+    let skip_csq = projection
+        .map_or(true, |indices| !indices.contains(&csq_col_idx));
+
     let sift_enabled = ann.config.flags.everything;
     let mut out = VecDeque::with_capacity(window_batches.len());
 
@@ -4754,6 +4780,7 @@ fn annotate_window(
             sift_kv,
             #[cfg(not(feature = "kv-cache"))]
             &sift_kv,
+            skip_csq,
         )?;
 
         if let Some(indices) = projection {
