@@ -4,241 +4,167 @@ VEP-oriented DataFusion functions and benchmark tooling.
 
 ## `annotate_vep()` Output Schema
 
-The output of `annotate_vep()` consists of **VCF input columns** (pass-through) followed by **annotation columns**.
+The output of `annotate_vep()` consists of **VCF input columns** (pass-through) followed by **annotation columns** (89 columns total).
 
-### Annotation columns
+All 80 CSQ fields are exposed as **individual top-level Arrow columns** so Arrow-native consumers (vepyr, polars-bio) can access structured data without parsing the legacy pipe-delimited CSQ string. Per-transcript fields (Consequence, SYMBOL, Gene, SIFT, etc.) contain values from the **most-severe transcript** for each variant.
+
+### VCF input columns (pass-through)
+
+The first columns in the output are pass-through from the input VCF table. The schema depends on the VCF file, but the following 5 columns are **required** by `annotate_vep()`:
+
+| Column | Type | Required | Description |
+|--------|------|----------|-------------|
+| `chrom` | `Utf8` | yes | Chromosome identifier |
+| `start` | `Int64` | yes | Start position (0-based) |
+| `end` | `Int64` | yes | End position (0-based, exclusive) |
+| `ref` | `Utf8` | yes | Reference allele |
+| `alt` | `Utf8` | yes | Alternate allele |
+| `name` | `Utf8` | no | Variant ID (rsID) |
+| `qual` | `Float32` | no | Variant quality score |
+| `filter` | `Utf8` | no | Filter status (PASS, etc.) |
+| `info` | `Utf8` | no | INFO field (key=value pairs) |
+| `format` | `Utf8` | no | FORMAT field (genotype field keys) |
+
+Additional sample genotype columns may be present depending on the VCF file. All VCF columns are passed through unmodified.
+
+### Annotation columns (89 total)
 
 Appended after VCF columns. Column indices start at `vcf_field_count`.
 
-| # | Column | Type | Nullable | Description |
-|---|--------|------|----------|-------------|
-| 1 | `csq` | `Utf8` | yes | Pipe-delimited CSQ string (VEP legacy format). **Skipped (NULL) by default** — only computed when explicitly included in projection |
-| 2 | `most_severe_consequence` | `Utf8` | yes | SO term for the most severe consequence across all transcripts |
-| 3 | `variation_name` | `Utf8` | yes | dbSNP rsID or known variant identifier |
-| 4 | `clin_sig` | `List<Utf8>` | yes | ClinVar clinical significance (multi-valued, `,`-separated) |
-| 5 | `clin_sig_allele` | `List<Utf8>` | yes | Clinical significance per allele (`;`-separated) |
-| 6 | `clinical_impact` | `Utf8` | yes | Clinical impact assessment |
-| 7 | `phenotype_or_disease` | `Utf8` | yes | Associated phenotype/disease flag |
-| 8 | `pubmed` | `List<Utf8>` | yes | PubMed IDs (multi-valued, `,`-separated) |
-| 9 | `somatic` | `Utf8` | yes | Somatic variant flag |
-| 10 | `minor_allele` | `Utf8` | yes | Minor allele |
-| 11 | `minor_allele_freq` | `Utf8` | yes | Minor allele frequency |
-| 12 | `AF` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | 1000 Genomes global allele frequency |
-| 13 | `AFR` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | 1000 Genomes African population AF |
-| 14 | `AMR` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | 1000 Genomes Ad Mixed American AF |
-| 15 | `EAS` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | 1000 Genomes East Asian AF |
-| 16 | `EUR` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | 1000 Genomes European AF |
-| 17 | `SAS` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | 1000 Genomes South Asian AF |
-| 18 | `gnomADe` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD exome global AF |
-| 19 | `gnomADe_AFR` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD exome African/African American AF |
-| 20 | `gnomADe_AMR` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD exome Latino/Admixed American AF |
-| 21 | `gnomADe_ASJ` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD exome Ashkenazi Jewish AF |
-| 22 | `gnomADe_EAS` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD exome East Asian AF |
-| 23 | `gnomADe_FIN` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD exome Finnish AF |
-| 24 | `gnomADe_NFE` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD exome Non-Finnish European AF |
-| 25 | `gnomADe_SAS` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD exome South Asian AF |
-| 26 | `gnomADe_MID` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD exome Middle Eastern AF |
-| 27 | `gnomADe_REMAINING` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD exome remaining populations AF |
-| 28 | `gnomADg` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD genome global AF |
-| 29 | `gnomADg_AFR` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD genome African/African American AF |
-| 30 | `gnomADg_AMI` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD genome Amish AF |
-| 31 | `gnomADg_AMR` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD genome Latino/Admixed American AF |
-| 32 | `gnomADg_ASJ` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD genome Ashkenazi Jewish AF |
-| 33 | `gnomADg_EAS` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD genome East Asian AF |
-| 34 | `gnomADg_FIN` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD genome Finnish AF |
-| 35 | `gnomADg_MID` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD genome Middle Eastern AF |
-| 36 | `gnomADg_NFE` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD genome Non-Finnish European AF |
-| 37 | `gnomADg_SAS` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD genome South Asian AF |
-| 38 | `gnomADg_REMAINING` | `List<Struct<allele: Utf8, freq: Float32>>` | yes | gnomAD genome remaining populations AF |
-| 39 | `clinvar_ids` | `List<Utf8>` | yes | ClinVar accession IDs (`,`-separated) |
-| 40 | `cosmic_ids` | `List<Utf8>` | yes | COSMIC IDs (`,`-separated) |
-| 41 | `dbsnp_ids` | `List<Utf8>` | yes | dbSNP IDs (`,`-separated) |
+**Meta columns (2):**
 
-**Notes:**
-- AF columns in the source parquet cache store `allele:frequency` pairs (e.g., `"T:0.9301"`, multi-allelic: `"A:0.006,G:0.994"`). The output parses these into structured `List<Struct<allele, freq>>` arrays.
-- Float32 precision (~7.2 significant digits) covers all observed AF values (max 7 decimal places in Ensembl 115).
-- The `csq` column is skipped by default for Arrow-native consumers. It is only assembled when explicitly included in the query projection.
+| # | Column | Type | Description |
+|---|--------|------|-------------|
+| 1 | `csq` | `Utf8` | Legacy pipe-delimited CSQ string. **Skipped (NULL) by default** — only computed when explicitly projected |
+| 2 | `most_severe_consequence` | `Utf8` | SO term for the most severe consequence across all transcripts |
 
-### CSQ sub-fields: default mode (74 fields)
+**Transcript-level columns (42) — from the most-severe transcript (`--everything` mode):**
 
-When `csq` is projected, it contains pipe-delimited fields per transcript. One `csq` value may contain multiple comma-separated transcript entries.
+| # | Column | Type | Source | Description |
+|---|--------|------|--------|-------------|
+| 3 | `Allele` | `Utf8` | engine | Variant allele used to calculate consequence |
+| 4 | `Consequence` | `List<Utf8>` | engine | Consequence types (SO terms, can be multiple per transcript) |
+| 5 | `IMPACT` | `Utf8` | engine | Impact rating: HIGH, MODERATE, LOW, MODIFIER |
+| 6 | `SYMBOL` | `Utf8` | transcript | Gene symbol |
+| 7 | `Gene` | `Utf8` | transcript | Ensembl gene ID |
+| 8 | `Feature_type` | `Utf8` | engine | Transcript, RegulatoryFeature, or MotifFeature |
+| 9 | `Feature` | `Utf8` | engine | Ensembl feature ID (transcript/regulatory/motif) |
+| 10 | `BIOTYPE` | `Utf8` | transcript | Biotype of transcript (protein_coding, lncRNA, etc.) |
+| 11 | `EXON` | `Utf8` | engine | Exon number / total exons |
+| 12 | `INTRON` | `Utf8` | engine | Intron number / total introns |
+| 13 | `HGVSc` | `Utf8` | engine | HGVS coding sequence notation |
+| 14 | `HGVSp` | `Utf8` | engine | HGVS protein sequence notation |
+| 15 | `cDNA_position` | `Utf8` | engine | Position in cDNA |
+| 16 | `CDS_position` | `Utf8` | engine | Position in CDS |
+| 17 | `Protein_position` | `Utf8` | engine | Position in protein |
+| 18 | `Amino_acids` | `Utf8` | engine | Reference/variant amino acids |
+| 19 | `Codons` | `Utf8` | engine | Reference/variant codons |
+| 20 | `Existing_variation` | `List<Utf8>` | cache | Known variant identifiers (rsIDs, COSMIC, etc.) |
+| 21 | `DISTANCE` | `Int64` | engine | Distance to transcript (upstream/downstream) |
+| 22 | `STRAND` | `Int8` | transcript | Strand of feature (1 or -1) |
+| 23 | `FLAGS` | `Utf8` | transcript | Transcript quality flags |
+| 24 | `VARIANT_CLASS` | `Utf8` | engine | SO term variant class (SNV, deletion, insertion, etc.) |
+| 25 | `SYMBOL_SOURCE` | `Utf8` | transcript | Source of gene symbol (HGNC, EntrezGene, etc.) |
+| 26 | `HGNC_ID` | `Utf8` | transcript | HGNC gene identifier |
+| 27 | `CANONICAL` | `Utf8` | transcript | Canonical transcript flag (YES or empty) |
+| 28 | `MANE` | `Utf8` | transcript | MANE transcript type (MANE_Select or MANE_Plus_Clinical) |
+| 29 | `MANE_SELECT` | `Utf8` | transcript | MANE Select transcript ID |
+| 30 | `MANE_PLUS_CLINICAL` | `Utf8` | transcript | MANE Plus Clinical transcript ID |
+| 31 | `TSL` | `Int8` | transcript | Transcript support level (1-5) |
+| 32 | `APPRIS` | `Utf8` | transcript | APPRIS annotation (P1-P5, A1-A2) |
+| 33 | `CCDS` | `Utf8` | transcript | CCDS identifier |
+| 34 | `ENSP` | `Utf8` | transcript | Ensembl protein ID |
+| 35 | `SWISSPROT` | `Utf8` | transcript | UniProtKB/Swiss-Prot ID |
+| 36 | `TREMBL` | `Utf8` | transcript | UniProtKB/TrEMBL ID |
+| 37 | `UNIPARC` | `Utf8` | transcript | UniParc ID |
+| 38 | `UNIPROT_ISOFORM` | `Utf8` | transcript | UniProt isoform |
+| 39 | `GENE_PHENO` | `Utf8` | transcript | Gene has known phenotype association |
+| 40 | `SIFT` | `Utf8` | sift cache | SIFT prediction and score, e.g. `tolerated(0.23)` |
+| 41 | `PolyPhen` | `Utf8` | sift cache | PolyPhen prediction and score, e.g. `benign(0.01)` |
+| 42 | `DOMAINS` | `List<Utf8>` | engine | Overlapping protein domains (`source:id` pairs) |
+| 43 | `miRNA` | `Utf8` | engine | miRNA secondary structure position |
+| 44 | `HGVS_OFFSET` | `Int64` | engine | HGVS offset for indels (signed, strand-aware) |
 
-| # | Field | Description |
-|---|-------|-------------|
-| 1 | Allele | Variant allele used to calculate consequence |
-| 2 | Consequence | Consequence type (SO term) |
-| 3 | IMPACT | Impact rating (HIGH, MODERATE, LOW, MODIFIER) |
-| 4 | SYMBOL | Gene symbol |
-| 5 | Gene | Ensembl gene ID |
-| 6 | Feature_type | Feature type (Transcript, RegulatoryFeature, MotifFeature) |
-| 7 | Feature | Ensembl feature ID |
-| 8 | BIOTYPE | Biotype of transcript |
-| 9 | EXON | Exon number / total exons |
-| 10 | INTRON | Intron number / total introns |
-| 11 | HGVSc | HGVS coding sequence notation |
-| 12 | HGVSp | HGVS protein sequence notation |
-| 13 | cDNA_position | Position in cDNA |
-| 14 | CDS_position | Position in CDS |
-| 15 | Protein_position | Position in protein |
-| 16 | Amino_acids | Reference/variant amino acids |
-| 17 | Codons | Reference/variant codons |
-| 18 | Existing_variation | Known variant identifiers |
-| 19 | DISTANCE | Distance to transcript |
-| 20 | STRAND | Strand of feature (+1/-1) |
-| 21 | FLAGS | Transcript quality flags |
-| 22 | SYMBOL_SOURCE | Source of gene symbol (HGNC, EntrezGene, etc.) |
-| 23 | HGNC_ID | HGNC gene identifier |
-| 24 | MOTIF_NAME | Motif feature name |
-| 25 | MOTIF_POS | Position in motif |
-| 26 | HIGH_INF_POS | High information position in motif |
-| 27 | MOTIF_SCORE_CHANGE | Change in motif score |
-| 28 | TRANSCRIPTION_FACTORS | Transcription factors binding the motif |
-| 29 | SOURCE | Source of transcript (Ensembl, RefSeq — only in --merged) |
-| 30 | VARIANT_CLASS | SO term variant class |
-| 31 | CANONICAL | Canonical transcript flag |
-| 32 | TSL | Transcript support level |
-| 33 | MANE_SELECT | MANE Select transcript ID |
-| 34 | MANE_PLUS_CLINICAL | MANE Plus Clinical transcript ID |
-| 35 | ENSP | Ensembl protein ID |
-| 36 | GENE_PHENO | Gene has known phenotype association |
-| 37 | CCDS | CCDS identifier |
-| 38 | SWISSPROT | UniProtKB/Swiss-Prot ID |
-| 39 | TREMBL | UniProtKB/TrEMBL ID |
-| 40 | UNIPARC | UniParc ID |
-| 41 | UNIPROT_ISOFORM | UniProt isoform |
-| 42 | AF | 1000 Genomes global allele frequency |
-| 43 | AFR_AF | 1000 Genomes African AF |
-| 44 | AMR_AF | 1000 Genomes American AF |
-| 45 | EAS_AF | 1000 Genomes East Asian AF |
-| 46 | EUR_AF | 1000 Genomes European AF |
-| 47 | SAS_AF | 1000 Genomes South Asian AF |
-| 48 | gnomADe_AF | gnomAD exome global AF |
-| 49 | gnomADe_AFR | gnomAD exome African AF |
-| 50 | gnomADe_AMR | gnomAD exome American AF |
-| 51 | gnomADe_ASJ | gnomAD exome Ashkenazi Jewish AF |
-| 52 | gnomADe_EAS | gnomAD exome East Asian AF |
-| 53 | gnomADe_FIN | gnomAD exome Finnish AF |
-| 54 | gnomADe_MID | gnomAD exome Middle Eastern AF |
-| 55 | gnomADe_NFE | gnomAD exome Non-Finnish European AF |
-| 56 | gnomADe_REMAINING | gnomAD exome remaining pops AF |
-| 57 | gnomADe_SAS | gnomAD exome South Asian AF |
-| 58 | gnomADg_AF | gnomAD genome global AF |
-| 59 | gnomADg_AFR | gnomAD genome African AF |
-| 60 | gnomADg_AMI | gnomAD genome Amish AF |
-| 61 | gnomADg_AMR | gnomAD genome American AF |
-| 62 | gnomADg_ASJ | gnomAD genome Ashkenazi Jewish AF |
-| 63 | gnomADg_EAS | gnomAD genome East Asian AF |
-| 64 | gnomADg_FIN | gnomAD genome Finnish AF |
-| 65 | gnomADg_MID | gnomAD genome Middle Eastern AF |
-| 66 | gnomADg_NFE | gnomAD genome Non-Finnish European AF |
-| 67 | gnomADg_REMAINING | gnomAD genome remaining pops AF |
-| 68 | gnomADg_SAS | gnomAD genome South Asian AF |
-| 69 | MAX_AF | Maximum AF across all populations |
-| 70 | MAX_AF_POPS | Population(s) with maximum AF |
-| 71 | CLIN_SIG | ClinVar clinical significance |
-| 72 | SOMATIC | Somatic variant flag |
-| 73 | PHENO | Phenotype/disease association flag |
-| 74 | PUBMED | PubMed IDs |
+**Population frequency columns (29) — resolved for the matching allele:**
 
-### CSQ sub-fields: `--everything` mode (80 fields)
+| # | Column | Type | Source | Description |
+|---|--------|------|--------|-------------|
+| 45 | `AF` | `Float32` | cache | 1000 Genomes global allele frequency |
+| 46 | `AFR_AF` | `Float32` | cache | 1000 Genomes African AF |
+| 47 | `AMR_AF` | `Float32` | cache | 1000 Genomes Ad Mixed American AF |
+| 48 | `EAS_AF` | `Float32` | cache | 1000 Genomes East Asian AF |
+| 49 | `EUR_AF` | `Float32` | cache | 1000 Genomes European AF |
+| 50 | `SAS_AF` | `Float32` | cache | 1000 Genomes South Asian AF |
+| 51 | `gnomADe_AF` | `Float32` | cache | gnomAD exome global AF |
+| 52 | `gnomADe_AFR_AF` | `Float32` | cache | gnomAD exome African/African American AF |
+| 53 | `gnomADe_AMR_AF` | `Float32` | cache | gnomAD exome Latino/Admixed American AF |
+| 54 | `gnomADe_ASJ_AF` | `Float32` | cache | gnomAD exome Ashkenazi Jewish AF |
+| 55 | `gnomADe_EAS_AF` | `Float32` | cache | gnomAD exome East Asian AF |
+| 56 | `gnomADe_FIN_AF` | `Float32` | cache | gnomAD exome Finnish AF |
+| 57 | `gnomADe_MID_AF` | `Float32` | cache | gnomAD exome Middle Eastern AF |
+| 58 | `gnomADe_NFE_AF` | `Float32` | cache | gnomAD exome Non-Finnish European AF |
+| 59 | `gnomADe_REMAINING_AF` | `Float32` | cache | gnomAD exome remaining populations AF |
+| 60 | `gnomADe_SAS_AF` | `Float32` | cache | gnomAD exome South Asian AF |
+| 61 | `gnomADg_AF` | `Float32` | cache | gnomAD genome global AF |
+| 62 | `gnomADg_AFR_AF` | `Float32` | cache | gnomAD genome African/African American AF |
+| 63 | `gnomADg_AMI_AF` | `Float32` | cache | gnomAD genome Amish AF |
+| 64 | `gnomADg_AMR_AF` | `Float32` | cache | gnomAD genome Latino/Admixed American AF |
+| 65 | `gnomADg_ASJ_AF` | `Float32` | cache | gnomAD genome Ashkenazi Jewish AF |
+| 66 | `gnomADg_EAS_AF` | `Float32` | cache | gnomAD genome East Asian AF |
+| 67 | `gnomADg_FIN_AF` | `Float32` | cache | gnomAD genome Finnish AF |
+| 68 | `gnomADg_MID_AF` | `Float32` | cache | gnomAD genome Middle Eastern AF |
+| 69 | `gnomADg_NFE_AF` | `Float32` | cache | gnomAD genome Non-Finnish European AF |
+| 70 | `gnomADg_REMAINING_AF` | `Float32` | cache | gnomAD genome remaining populations AF |
+| 71 | `gnomADg_SAS_AF` | `Float32` | cache | gnomAD genome South Asian AF |
+| 72 | `MAX_AF` | `Float32` | computed | Maximum AF across all populations |
+| 73 | `MAX_AF_POPS` | `Utf8` | computed | Population(s) with maximum AF (`&`-separated if tied) |
 
-Uses 80-field layout when `options_json` contains `"everything": true`. Key differences from default: VARIANT_CLASS moved after FLAGS, SOURCE removed, MANE/APPRIS/SIFT/PolyPhen/DOMAINS/miRNA/HGVS_OFFSET added, gnomAD sub-pops gain `_AF` suffix, MOTIF fields moved to end.
+**Variant-level annotation columns (9) — from variation cache lookup:**
 
-| # | Field | Description |
-|---|-------|-------------|
-| 1 | Allele | Variant allele used to calculate consequence |
-| 2 | Consequence | Consequence type (SO term) |
-| 3 | IMPACT | Impact rating (HIGH, MODERATE, LOW, MODIFIER) |
-| 4 | SYMBOL | Gene symbol |
-| 5 | Gene | Ensembl gene ID |
-| 6 | Feature_type | Feature type |
-| 7 | Feature | Ensembl feature ID |
-| 8 | BIOTYPE | Biotype of transcript |
-| 9 | EXON | Exon number / total exons |
-| 10 | INTRON | Intron number / total introns |
-| 11 | HGVSc | HGVS coding sequence notation |
-| 12 | HGVSp | HGVS protein sequence notation |
-| 13 | cDNA_position | Position in cDNA |
-| 14 | CDS_position | Position in CDS |
-| 15 | Protein_position | Position in protein |
-| 16 | Amino_acids | Reference/variant amino acids |
-| 17 | Codons | Reference/variant codons |
-| 18 | Existing_variation | Known variant identifiers |
-| 19 | DISTANCE | Distance to transcript |
-| 20 | STRAND | Strand of feature |
-| 21 | FLAGS | Transcript quality flags |
-| 22 | VARIANT_CLASS | SO term variant class |
-| 23 | SYMBOL_SOURCE | Source of gene symbol |
-| 24 | HGNC_ID | HGNC gene identifier |
-| 25 | CANONICAL | Canonical transcript flag |
-| 26 | MANE | MANE transcript ID (generic) |
-| 27 | MANE_SELECT | MANE Select transcript ID |
-| 28 | MANE_PLUS_CLINICAL | MANE Plus Clinical transcript ID |
-| 29 | TSL | Transcript support level |
-| 30 | APPRIS | APPRIS annotation |
-| 31 | CCDS | CCDS identifier |
-| 32 | ENSP | Ensembl protein ID |
-| 33 | SWISSPROT | UniProtKB/Swiss-Prot ID |
-| 34 | TREMBL | UniProtKB/TrEMBL ID |
-| 35 | UNIPARC | UniParc ID |
-| 36 | UNIPROT_ISOFORM | UniProt isoform |
-| 37 | GENE_PHENO | Gene has known phenotype association |
-| 38 | SIFT | SIFT prediction and score |
-| 39 | PolyPhen | PolyPhen prediction and score |
-| 40 | DOMAINS | Overlapping protein domains |
-| 41 | miRNA | miRNA secondary structure position |
-| 42 | HGVS_OFFSET | HGVS offset for indels |
-| 43 | AF | 1000 Genomes global AF |
-| 44 | AFR_AF | 1000 Genomes African AF |
-| 45 | AMR_AF | 1000 Genomes American AF |
-| 46 | EAS_AF | 1000 Genomes East Asian AF |
-| 47 | EUR_AF | 1000 Genomes European AF |
-| 48 | SAS_AF | 1000 Genomes South Asian AF |
-| 49 | gnomADe_AF | gnomAD exome global AF |
-| 50 | gnomADe_AFR_AF | gnomAD exome African AF |
-| 51 | gnomADe_AMR_AF | gnomAD exome American AF |
-| 52 | gnomADe_ASJ_AF | gnomAD exome Ashkenazi Jewish AF |
-| 53 | gnomADe_EAS_AF | gnomAD exome East Asian AF |
-| 54 | gnomADe_FIN_AF | gnomAD exome Finnish AF |
-| 55 | gnomADe_MID_AF | gnomAD exome Middle Eastern AF |
-| 56 | gnomADe_NFE_AF | gnomAD exome Non-Finnish European AF |
-| 57 | gnomADe_REMAINING_AF | gnomAD exome remaining pops AF |
-| 58 | gnomADe_SAS_AF | gnomAD exome South Asian AF |
-| 59 | gnomADg_AF | gnomAD genome global AF |
-| 60 | gnomADg_AFR_AF | gnomAD genome African AF |
-| 61 | gnomADg_AMI_AF | gnomAD genome Amish AF |
-| 62 | gnomADg_AMR_AF | gnomAD genome American AF |
-| 63 | gnomADg_ASJ_AF | gnomAD genome Ashkenazi Jewish AF |
-| 64 | gnomADg_EAS_AF | gnomAD genome East Asian AF |
-| 65 | gnomADg_FIN_AF | gnomAD genome Finnish AF |
-| 66 | gnomADg_MID_AF | gnomAD genome Middle Eastern AF |
-| 67 | gnomADg_NFE_AF | gnomAD genome Non-Finnish European AF |
-| 68 | gnomADg_REMAINING_AF | gnomAD genome remaining pops AF |
-| 69 | gnomADg_SAS_AF | gnomAD genome South Asian AF |
-| 70 | MAX_AF | Maximum AF across all populations |
-| 71 | MAX_AF_POPS | Population(s) with maximum AF |
-| 72 | CLIN_SIG | ClinVar clinical significance |
-| 73 | SOMATIC | Somatic variant flag |
-| 74 | PHENO | Phenotype/disease association flag |
-| 75 | PUBMED | PubMed IDs |
-| 76 | MOTIF_NAME | Motif feature name |
-| 77 | MOTIF_POS | Position in motif |
-| 78 | HIGH_INF_POS | High information position in motif |
-| 79 | MOTIF_SCORE_CHANGE | Change in motif score |
-| 80 | TRANSCRIPTION_FACTORS | Transcription factors binding the motif |
+| # | Column | Type | Source | Description |
+|---|--------|------|--------|-------------|
+| 74 | `CLIN_SIG` | `List<Utf8>` | cache | ClinVar clinical significance (multi-valued) |
+| 75 | `SOMATIC` | `Utf8` | cache | Somatic variant flag |
+| 76 | `PHENO` | `Utf8` | cache | Phenotype/disease association flag |
+| 77 | `PUBMED` | `List<Utf8>` | cache | PubMed IDs |
+| 78 | `MOTIF_NAME` | `Utf8` | engine | Motif feature name |
+| 79 | `MOTIF_POS` | `Utf8` | engine | Position in motif |
+| 80 | `HIGH_INF_POS` | `Utf8` | engine | High information position in motif |
+| 81 | `MOTIF_SCORE_CHANGE` | `Float32` | engine | Change in motif score |
+| 82 | `TRANSCRIPTION_FACTORS` | `List<Utf8>` | engine | Transcription factors binding the motif |
+
+**Cache-only columns (7) — not in CSQ, from variation cache:**
+
+| # | Column | Type | Source | Description |
+|---|--------|------|--------|-------------|
+| 83 | `clin_sig_allele` | `List<Utf8>` | cache | Clinical significance per allele (`;`-separated) |
+| 84 | `clinical_impact` | `Utf8` | cache | Clinical impact assessment |
+| 85 | `minor_allele` | `Utf8` | cache | Minor allele |
+| 86 | `minor_allele_freq` | `Float32` | cache | Minor allele frequency |
+| 87 | `clinvar_ids` | `List<Utf8>` | cache | ClinVar accession IDs |
+| 88 | `cosmic_ids` | `List<Utf8>` | cache | COSMIC IDs |
+| 89 | `dbsnp_ids` | `List<Utf8>` | cache | dbSNP IDs |
+
+### Notes
+
+- **Per-transcript fields** (columns 3-44): One variant may overlap multiple transcripts. Top-level columns contain values from the transcript with the **most severe consequence**. The legacy `csq` column (if projected) contains all transcript entries.
+- **AF resolution**: Cache stores `allele:frequency` pairs (e.g., `"T:0.9301"`, multi-allelic: `"A:0.006,G:0.994"`). Top-level AF columns contain the **resolved Float32 frequency** for the matching allele via `extract_af_for_allele()`.
+- **Float32 precision**: ~7.2 significant digits covers all observed AF values (max 7 decimal places in Ensembl 115).
+- **`csq` column**: Skipped by default. Only assembled when explicitly projected. Legacy VEP pipe-delimited format.
+- **`--everything` mode**: Enables all 80 CSQ fields. Without it, 6 fields are absent: MANE, APPRIS, SIFT, PolyPhen, DOMAINS, miRNA, HGVS_OFFSET.
 
 ### VEP flags (`options_json`)
 
 | Flag | Effect | Implied by `everything` |
 |------|--------|------------------------|
-| `everything` | Enables all flags, uses 80-field CSQ layout | - |
+| `everything` | Enables all flags, all 80 CSQ fields populated | - |
 | `check_existing` | Variation lookup in cache | Yes (also implied by any AF flag) |
-| `af` | Global AF in CSQ | Yes |
+| `af` | Global AF | Yes |
 | `af_1kg` | 1000 Genomes AF sub-populations | Yes |
 | `af_gnomade` | gnomAD exome sub-populations | Yes |
 | `af_gnomadg` | gnomAD genome sub-populations | Yes |
-| `max_af` | MAX_AF / MAX_AF_POPS fields | Yes |
-| `pubmed` | PubMed IDs field | Yes |
+| `max_af` | MAX_AF / MAX_AF_POPS | Yes |
+| `pubmed` | PubMed IDs | Yes |
 | `hgvs` | HGVSc / HGVSp notation | Yes |
 
 ## Golden Benchmark: `annotate_vep` vs Ensembl VEP 115
