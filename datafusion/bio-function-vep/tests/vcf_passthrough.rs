@@ -30,10 +30,11 @@ async fn test_vcf_columns_pass_through_annotation() {
     let cache_path = cache_path.to_str().unwrap();
 
     // Read input VCF schema.
+    // None = include ALL INFO/FORMAT fields (Some(vec![]) means include NONE).
     let vcf_provider = VcfTableProvider::new(
         input_vcf.to_string(),
-        Some(vec![]),
-        Some(vec![]),
+        None,
+        None,
         None,
         false,
     )
@@ -78,6 +79,13 @@ async fn test_vcf_columns_pass_through_annotation() {
             .field_with_name(None, "most_severe_consequence")
             .is_ok(),
         "Expected 'most_severe_consequence' column in annotate_vep output"
+    );
+
+    // Verify total column count: input + 89 annotation columns.
+    assert_eq!(
+        output_schema.fields().len(),
+        input_field_names.len() + 89,
+        "Output should have input columns + 89 annotation columns"
     );
 
     // Collect and verify row count.

@@ -43,10 +43,11 @@ async fn test_roundtrip_golden_all_columns() {
     // Set up context and register VCF table.
     let ctx = SessionContext::new();
     register_vep_functions(&ctx);
+    // None = include ALL INFO/FORMAT fields.
     let vcf_provider = VcfTableProvider::new(
         input_vcf.to_string(),
-        Some(vec![]),
-        Some(vec![]),
+        None,
+        None,
         None,
         false,
     )
@@ -81,8 +82,8 @@ async fn test_roundtrip_golden_all_columns() {
     // Read back the output VCF with VcfTableProvider.
     let output_provider = VcfTableProvider::new(
         output_path.display().to_string(),
-        Some(vec![]),
-        Some(vec![]),
+        None,
+        None,
         None,
         false,
     )
@@ -116,14 +117,7 @@ async fn test_roundtrip_golden_all_columns() {
     // Verify the CSQ annotation column made it through as an INFO field.
     // After roundtrip through VcfTableProvider, CSQ should appear as an INFO column
     // named "csq" (lowercase) or "CSQ" (uppercase, depending on the provider's convention).
-    // Debug: print all field names from the roundtrip output
-    let field_names: Vec<&str> = output_schema.fields().iter().map(|f| f.name().as_str()).collect();
-    eprintln!("Roundtrip output schema fields ({}):", field_names.len());
-    for name in &field_names {
-        eprintln!("  {name}");
-    }
-
     let has_csq = output_schema.field_with_name("csq").is_ok()
         || output_schema.field_with_name("CSQ").is_ok();
-    assert!(has_csq, "CSQ annotation field missing from roundtrip output. Fields: {field_names:?}");
+    assert!(has_csq, "CSQ annotation field missing from roundtrip output");
 }
