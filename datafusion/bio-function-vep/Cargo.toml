@@ -74,6 +74,10 @@ required-features = []
 name = "profile_annotation"
 required-features = []
 
+[[example]]
+name = "bench_annotate_vcf"
+required-features = []
+
 [features]
 default = ["kv-cache"]
 kv-cache = ["dep:fjall", "dep:arrow-ipc", "dep:lz4_flex", "dep:zstd", "dep:ahash"]
