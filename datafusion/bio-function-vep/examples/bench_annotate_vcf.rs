@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
     let pb = ProgressBar::new(total_input);
     pb.set_style(
         ProgressStyle::with_template(
-            "  {spinner:.green} {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] ({per_sec}, eta {eta})",
+            "  {spinner:.green} {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] (eta {eta})",
         )
         .unwrap()
         .progress_chars("##-"),
