@@ -169,22 +169,38 @@ fn resolve_schemas_from_catalog(
     vcf_table: &str,
     cache_table: &str,
 ) -> Result<(Schema, Schema)> {
-    let catalog = catalog_list
-        .catalog(default_catalog)
-        .ok_or_else(|| DataFusionError::Plan(format!("Catalog '{default_catalog}' not found")))?;
-    let schema_provider = catalog.schema(default_schema).ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "Schema '{default_schema}' not found in catalog '{default_catalog}'"
-        ))
-    })?;
-
-    let vcf_provider = resolve_table_sync(&*schema_provider, vcf_table)?;
-    let cache_provider = resolve_table_sync(&*schema_provider, cache_table)?;
+    let vcf_provider = resolve_table_ref(catalog_list, default_catalog, default_schema, vcf_table)?;
+    let cache_provider =
+        resolve_table_ref(catalog_list, default_catalog, default_schema, cache_table)?;
 
     Ok((
         vcf_provider.schema().as_ref().clone(),
         cache_provider.schema().as_ref().clone(),
     ))
+}
+
+/// Resolve a table by name, supporting bare, schema-qualified, and fully-qualified references.
+fn resolve_table_ref(
+    catalog_list: &dyn CatalogProviderList,
+    default_catalog: &str,
+    default_schema: &str,
+    table_name: &str,
+) -> Result<Arc<dyn TableProvider>> {
+    let parts: Vec<&str> = table_name.split('.').collect();
+    let (cat_name, schema_name, bare_name) = match parts.len() {
+        3 => (parts[0], parts[1], parts[2]),
+        2 => (default_catalog, parts[0], parts[1]),
+        _ => (default_catalog, default_schema, table_name),
+    };
+    let catalog = catalog_list
+        .catalog(cat_name)
+        .ok_or_else(|| DataFusionError::Plan(format!("Catalog '{cat_name}' not found")))?;
+    let schema_provider = catalog.schema(schema_name).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Schema '{schema_name}' not found in catalog '{cat_name}'"
+        ))
+    })?;
+    resolve_table_sync(&*schema_provider, bare_name)
 }
 
 /// Run `SchemaProvider::table()` synchronously, handling both tokio-context

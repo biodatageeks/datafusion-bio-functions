@@ -6502,12 +6502,14 @@ impl Stream for ContigAnnotationStream {
                         if let Some(limit) = fetch_limit {
                             let remaining = limit.saturating_sub(rows_emitted);
                             if remaining == 0 {
-                                self.state = StreamState::Done;
-                                return Poll::Ready(None);
+                                // Don't emit — fall through to the window-drained
+                                // path below, which transitions to AnnotatingContig.
+                                // The limit_reached check there triggers proper
+                                // cleanup (deregister ephemeral tables).
+                                continue;
                             }
                             if batch.num_rows() > remaining {
                                 self.rows_emitted += remaining;
-                                self.state = StreamState::Done;
                                 return Poll::Ready(Some(Ok(batch.slice(0, remaining))));
                             }
                         }

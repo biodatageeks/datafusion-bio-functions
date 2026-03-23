@@ -173,7 +173,7 @@ pub async fn annotate_to_vcf(
     // 2. Set up progress bar if requested.
     let pb = if config.show_progress {
         let total = ctx
-            .sql(&format!("SELECT COUNT(*) AS n FROM {vcf_table}"))
+            .sql(&format!("SELECT COUNT(*) AS n FROM `{vcf_table}`"))
             .await?
             .collect()
             .await?[0]
