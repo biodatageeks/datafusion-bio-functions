@@ -36,7 +36,6 @@ pub struct AnnotateVcfConfig {
     /// Output compression type.
     pub compression: VcfCompressionType,
     /// Show a progress bar on stderr during annotation + VCF write.
-    /// Note: causes an extra `COUNT(*)` scan before annotation begins.
     pub show_progress: bool,
 }
 
@@ -177,25 +176,12 @@ pub async fn annotate_to_vcf(
         tags
     };
 
-    // 3. Progress bar (optional).
+    // 3. Progress bar (optional) — no COUNT(*) scan, just a spinner with row count.
     let pb = if config.show_progress {
-        let total = ctx
-            .sql(&format!("SELECT COUNT(*) AS n FROM `{vcf_table}`"))
-            .await?
-            .collect()
-            .await?[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<datafusion::arrow::array::Int64Array>()
-            .map(|a| a.value(0) as u64)
-            .unwrap_or(0);
-        let pb = ProgressBar::new(total);
+        let pb = ProgressBar::new_spinner();
         pb.set_style(
-            ProgressStyle::with_template(
-                "  {spinner:.green} {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] (eta {eta})",
-            )
-            .unwrap()
-            .progress_chars("##-"),
+            ProgressStyle::with_template("  {spinner:.green} {pos} rows [{elapsed_precise}]")
+                .unwrap(),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(200));
         pb
