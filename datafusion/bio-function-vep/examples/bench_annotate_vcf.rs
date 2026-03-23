@@ -180,7 +180,9 @@ async fn main() -> Result<()> {
     );
 
     // ── Set up context ──
-    let ctx = SessionContext::new();
+    // Single partition: VcfTableProvider doesn't support multi-partition reads.
+    let config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+    let ctx = SessionContext::new_with_config(config);
     register_vep_functions(&ctx);
     ctx.register_table("vcf", Arc::new(vcf_provider))?;
 
@@ -205,10 +207,6 @@ async fn main() -> Result<()> {
 
     println!("[{:.1}s] Annotation + VCF write complete", annotate_secs);
 
-    // Note: VcfTableProvider may return fewer rows than the input VCF for large
-    // files (known bio-format-vcf reader limitation). For full correctness
-    // benchmarks (all 323K chr1 variants), use annotate_vep_golden_bench which
-    // normalizes the VCF and registers via MemTable.
     println!("\n=== Results ===");
     println!("  rows:       {rows}");
     println!("  time:       {annotate_secs:.2}s");
