@@ -187,14 +187,18 @@ async fn main() -> Result<()> {
     );
 
     // ── Step 2: Annotate + stream to VCF with progress ──
+    // Show the progress bar immediately (at 0%) so the user sees activity
+    // during the variation lookup phase before any batches arrive.
     let pb = ProgressBar::new(total_input);
     pb.set_style(
         ProgressStyle::with_template(
-            "  {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] ({per_sec}, eta {eta})",
+            "  {spinner:.green} {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] ({per_sec}, eta {eta})",
         )
         .unwrap()
         .progress_chars("##-"),
     );
+    pb.set_message("annotating...");
+    pb.enable_steady_tick(std::time::Duration::from_millis(200));
     let pb_cb = pb.clone();
 
     let annotate_config = vcf_sink::AnnotateVcfConfig {
