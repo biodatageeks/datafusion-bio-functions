@@ -55,6 +55,7 @@ pub mod so_terms;
 pub mod table_function;
 pub mod transcript_consequence;
 pub mod variant_lookup_exec;
+pub mod vcf_sink;
 
 pub use config::AnnotationConfig;
 
