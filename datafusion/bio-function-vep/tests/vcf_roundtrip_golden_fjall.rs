@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::Array;
 use datafusion::prelude::*;
-use datafusion_bio_format_vcf::VcfCompressionType;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::{register_vep_functions, vcf_sink};
 
@@ -251,21 +250,17 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
     .unwrap();
     ctx.register_table("vcf", Arc::new(vcf_provider)).unwrap();
 
-    let options = format!(
-        "{{\"partitioned\":true,\"everything\":true,\"extended_probes\":true,\
-         \"use_fjall\":true,\"reference_fasta_path\":\"{ref_fasta}\"}}"
-    );
-    let rows_written = vcf_sink::annotate_to_vcf_with_options(
-        &ctx,
-        "vcf",
-        fjall_cache,
-        "parquet",
-        Some(&options),
-        &output_path,
-        VcfCompressionType::Plain,
-    )
-    .await
-    .unwrap();
+    let config = vcf_sink::AnnotateVcfConfig {
+        everything: true,
+        extended_probes: true,
+        reference_fasta_path: Some(ref_fasta.to_string()),
+        use_fjall: true,
+        ..Default::default()
+    };
+    let rows_written =
+        vcf_sink::annotate_to_vcf(&ctx, "vcf", fjall_cache, "parquet", &output_path, &config)
+            .await
+            .unwrap();
     assert_eq!(rows_written, 1000, "Should write 1000 annotated rows");
 
     // ── Step 2: Read input, output, and golden ──

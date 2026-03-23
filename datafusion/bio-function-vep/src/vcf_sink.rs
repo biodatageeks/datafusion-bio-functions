@@ -107,7 +107,7 @@ pub async fn annotate_to_vcf(
     config: &AnnotateVcfConfig,
 ) -> Result<usize> {
     let options_json = config.to_options_json();
-    annotate_to_vcf_with_options(
+    annotate_to_vcf_inner(
         ctx,
         vcf_table,
         cache_source,
@@ -119,10 +119,7 @@ pub async fn annotate_to_vcf(
     .await
 }
 
-/// Lower-level annotation-to-VCF function that takes a raw options JSON string.
-///
-/// Prefer [`annotate_to_vcf`] with [`AnnotateVcfConfig`] for typed parameters.
-pub async fn annotate_to_vcf_with_options(
+async fn annotate_to_vcf_inner(
     ctx: &SessionContext,
     vcf_table: &str,
     cache_source: &str,
