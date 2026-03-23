@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema;
-use datafusion::catalog::TableFunctionImpl;
+use datafusion::catalog::{CatalogProviderList, SchemaProvider, TableFunctionImpl};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Expr;
@@ -26,11 +26,25 @@ use crate::schema_contract::{COORDINATE_COLUMNS, parse_column_list, validate_req
 /// `lookup_variants(vcf_table, cache_table [, columns [, match_mode [, extended_probes]]])`.
 pub struct LookupFunction {
     session: Arc<SessionContext>,
+    /// Catalog list captured at registration time to avoid acquiring
+    /// SessionState locks during `call()` (planning time).
+    catalog_list: Arc<dyn CatalogProviderList>,
+    default_catalog: String,
+    default_schema: String,
 }
 
 impl LookupFunction {
     pub fn new(session: Arc<SessionContext>) -> Self {
-        Self { session }
+        let state = session.state();
+        let catalog_list = Arc::clone(state.catalog_list());
+        let default_catalog = state.config_options().catalog.default_catalog.clone();
+        let default_schema = state.config_options().catalog.default_schema.clone();
+        Self {
+            session,
+            catalog_list,
+            default_catalog,
+            default_schema,
+        }
     }
 }
 
@@ -53,8 +67,14 @@ impl TableFunctionImpl for LookupFunction {
         let vcf_table = extract_string_arg(&args[0], "vcf_table", "lookup_variants")?;
         let cache_table = extract_string_arg(&args[1], "cache_table", "lookup_variants")?;
 
-        // Resolve schemas first — needed for default column derivation
-        let (vcf_schema, cache_schema) = resolve_schemas(&self.session, &vcf_table, &cache_table)?;
+        // Resolve schemas via pre-captured catalog list (no session state lock).
+        let (vcf_schema, cache_schema) = resolve_schemas_from_catalog(
+            &*self.catalog_list,
+            &self.default_catalog,
+            &self.default_schema,
+            &vcf_table,
+            &cache_table,
+        )?;
 
         // Optional third argument: comma-separated column list.
         // Default: all cache columns except coordinate columns (chrom, start, end)
@@ -138,30 +158,68 @@ fn extract_bool_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<bool> {
     }
 }
 
-/// Resolve schemas for both tables, handling tokio context.
-fn resolve_schemas(
-    session: &SessionContext,
+/// Resolve schemas for both tables using a pre-captured `CatalogProviderList`,
+/// completely bypassing `SessionContext` and its `SessionState` RwLock.
+///
+/// See `annotate_table_function::resolve_schema_from_catalog` for rationale.
+fn resolve_schemas_from_catalog(
+    catalog_list: &dyn CatalogProviderList,
+    default_catalog: &str,
+    default_schema: &str,
     vcf_table: &str,
     cache_table: &str,
 ) -> Result<(Schema, Schema)> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            let vcf = handle.block_on(session.table(vcf_table))?;
-            let cache = handle.block_on(session.table(cache_table))?;
-            Ok::<_, DataFusionError>((
-                vcf.schema().as_arrow().clone(),
-                cache.schema().as_arrow().clone(),
-            ))
-        }),
+    let vcf_provider = resolve_table_ref(catalog_list, default_catalog, default_schema, vcf_table)?;
+    let cache_provider =
+        resolve_table_ref(catalog_list, default_catalog, default_schema, cache_table)?;
+
+    Ok((
+        vcf_provider.schema().as_ref().clone(),
+        cache_provider.schema().as_ref().clone(),
+    ))
+}
+
+/// Resolve a table by name, supporting bare, schema-qualified, and fully-qualified references.
+fn resolve_table_ref(
+    catalog_list: &dyn CatalogProviderList,
+    default_catalog: &str,
+    default_schema: &str,
+    table_name: &str,
+) -> Result<Arc<dyn TableProvider>> {
+    let parts: Vec<&str> = table_name.split('.').collect();
+    let (cat_name, schema_name, bare_name) = match parts.len() {
+        3 => (parts[0], parts[1], parts[2]),
+        2 => (default_catalog, parts[0], parts[1]),
+        _ => (default_catalog, default_schema, table_name),
+    };
+    let catalog = catalog_list
+        .catalog(cat_name)
+        .ok_or_else(|| DataFusionError::Plan(format!("Catalog '{cat_name}' not found")))?;
+    let schema_provider = catalog.schema(schema_name).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Schema '{schema_name}' not found in catalog '{cat_name}'"
+        ))
+    })?;
+    resolve_table_sync(&*schema_provider, bare_name)
+}
+
+/// Run `SchemaProvider::table()` synchronously, handling both tokio-context
+/// and no-tokio-context cases.
+fn resolve_table_sync(
+    schema_provider: &dyn SchemaProvider,
+    table_name: &str,
+) -> Result<Arc<dyn TableProvider>> {
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| handle.block_on(schema_provider.table(table_name)))
+        }
         Err(_) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let vcf = rt.block_on(session.table(vcf_table))?;
-            let cache = rt.block_on(session.table(cache_table))?;
-            Ok((
-                vcf.schema().as_arrow().clone(),
-                cache.schema().as_arrow().clone(),
-            ))
+            rt.block_on(schema_provider.table(table_name))
         }
-    }
+    };
+    result
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .ok_or_else(|| DataFusionError::Plan(format!("Table '{table_name}' not found")))
 }

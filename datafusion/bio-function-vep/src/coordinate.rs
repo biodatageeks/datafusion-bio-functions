@@ -1,7 +1,18 @@
 //! Coordinate system normalization between 0-based half-open and 1-based closed.
 
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion_bio_function_ranges::FilterOp;
+
+/// Overlap semantics for interval joins.
+///
+/// Duplicated from `datafusion_bio_function_ranges::FilterOp` to avoid
+/// a cross-crate dependency that would pull the ranges crate into vepyr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    /// Standard overlap: intervals overlap if they share any position.
+    Weak = 0,
+    /// Strict overlap: boundaries are adjusted inward (start+1, end-1).
+    Strict = 1,
+}
 
 /// Metadata key used to store coordinate system info in Arrow schema.
 const COORDINATE_SYSTEM_METADATA_KEY: &str = "bio.coordinate_system_zero_based";

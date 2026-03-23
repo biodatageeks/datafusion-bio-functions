@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema;
-use datafusion::catalog::TableFunctionImpl;
+use datafusion::catalog::{CatalogProviderList, SchemaProvider, TableFunctionImpl};
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Expr;
@@ -18,11 +18,30 @@ use crate::annotation_store::AnnotationBackend;
 /// `annotate_vep(vcf_table, cache_source, backend [, options_json])`.
 pub struct AnnotateFunction {
     session: Arc<SessionContext>,
+    /// Catalog list captured at registration time to avoid acquiring
+    /// SessionState locks during `call()` (planning time).
+    catalog_list: Arc<dyn CatalogProviderList>,
+    /// Default catalog name captured at registration time.
+    default_catalog: String,
+    /// Default schema name captured at registration time.
+    default_schema: String,
 }
 
 impl AnnotateFunction {
     pub fn new(session: Arc<SessionContext>) -> Self {
-        Self { session }
+        // Capture catalog metadata at registration time (before any planner
+        // locks exist) so resolve_schema can look up tables without touching
+        // the SessionState RwLock.
+        let state = session.state();
+        let catalog_list = Arc::clone(state.catalog_list());
+        let default_catalog = state.config_options().catalog.default_catalog.clone();
+        let default_schema = state.config_options().catalog.default_schema.clone();
+        Self {
+            session,
+            catalog_list,
+            default_catalog,
+            default_schema,
+        }
     }
 }
 
@@ -56,7 +75,12 @@ impl TableFunctionImpl for AnnotateFunction {
             None
         };
 
-        let (vcf_schema, _) = resolve_schema(&self.session, &vcf_table)?;
+        let vcf_schema = resolve_schema_from_catalog(
+            &*self.catalog_list,
+            &self.default_catalog,
+            &self.default_schema,
+            &vcf_table,
+        )?;
 
         Ok(Arc::new(AnnotateProvider::new(
             Arc::clone(&self.session),
@@ -86,24 +110,72 @@ fn extract_string_arg(arg: &Expr, name: &str, fn_name: &str) -> Result<String> {
     }
 }
 
-fn resolve_schema(session: &SessionContext, vcf_table: &str) -> Result<(Schema, String)> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            let vcf = handle.block_on(session.table(vcf_table))?;
-            Ok::<_, DataFusionError>((vcf.schema().as_arrow().clone(), vcf_table.to_string()))
-        }),
+/// Resolve the Arrow schema of a registered table using a pre-captured
+/// `CatalogProviderList`, completely bypassing `SessionContext` and its
+/// `SessionState` RwLock.
+///
+/// This is critical for vepyr / polars-bio integration: DataFusion's SQL
+/// planner holds a **write lock** on `SessionState` while resolving table
+/// functions. Any call to `session.state()`, `session.catalog()`, or
+/// `session.table()` from within `TableFunctionImpl::call()` will deadlock
+/// because they all acquire a read lock on the same RwLock.
+///
+/// By capturing the `CatalogProviderList` at registration time (before any
+/// planner locks exist), we can look up tables without touching the session.
+fn resolve_schema_from_catalog(
+    catalog_list: &dyn CatalogProviderList,
+    default_catalog: &str,
+    default_schema: &str,
+    table_name: &str,
+) -> Result<Schema> {
+    // Support bare names ("vcf"), schema-qualified ("public.vcf"), and
+    // fully-qualified ("datafusion.public.vcf") table references.
+    let parts: Vec<&str> = table_name.split('.').collect();
+    let (cat_name, schema_name, bare_name) = match parts.len() {
+        3 => (parts[0], parts[1], parts[2]),
+        2 => (default_catalog, parts[0], parts[1]),
+        _ => (default_catalog, default_schema, table_name),
+    };
+
+    let catalog = catalog_list
+        .catalog(cat_name)
+        .ok_or_else(|| DataFusionError::Plan(format!("Catalog '{cat_name}' not found")))?;
+    let schema_provider = catalog.schema(schema_name).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Schema '{schema_name}' not found in catalog '{cat_name}'"
+        ))
+    })?;
+
+    let table_provider = resolve_table_sync(&*schema_provider, bare_name)?;
+    Ok(table_provider.schema().as_ref().clone())
+}
+
+/// Run `SchemaProvider::table()` synchronously, handling both tokio-context
+/// and no-tokio-context cases.
+fn resolve_table_sync(
+    schema_provider: &dyn SchemaProvider,
+    table_name: &str,
+) -> Result<Arc<dyn TableProvider>> {
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| handle.block_on(schema_provider.table(table_name)))
+        }
         Err(_) => {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let vcf = rt.block_on(session.table(vcf_table))?;
-            Ok((vcf.schema().as_arrow().clone(), vcf_table.to_string()))
+            rt.block_on(schema_provider.table(table_name))
         }
-    }
+    };
+    result
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .ok_or_else(|| DataFusionError::Plan(format!("Table '{table_name}' not found")))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::create_vep_session;
+    #[cfg(feature = "kv-cache")]
+    use crate::kv_cache::{VepKvStore, position_entry::serialize_position_entry};
     use crate::so_terms::SoTerm;
     use datafusion::arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -195,6 +267,43 @@ mod tests {
         writer.close().expect("close parquet writer");
     }
 
+    #[cfg(feature = "kv-cache")]
+    fn write_batch_to_fjall(tmpdir: &TempDir, batch: &RecordBatch) {
+        let fjall_dir = tmpdir.path().join("variation.fjall");
+        let schema = batch.schema();
+        let store = VepKvStore::create(&fjall_dir, schema.clone()).expect("create fjall cache");
+
+        let chrom_idx = schema.index_of("chrom").expect("chrom column");
+        let start_idx = schema.index_of("start").expect("start column");
+        let allele_idx = schema
+            .index_of("allele_string")
+            .expect("allele_string column");
+        let stored_col_indices: Vec<usize> = (0..schema.fields().len())
+            .filter(|&idx| idx != chrom_idx && idx != start_idx)
+            .collect();
+
+        let chroms = batch
+            .column(chrom_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("chrom must be StringArray");
+        let starts = batch
+            .column(start_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("start must be Int64Array");
+
+        for row in 0..batch.num_rows() {
+            let entry = serialize_position_entry(&[row], batch, &stored_col_indices, allele_idx)
+                .expect("serialize position entry");
+            store
+                .put_position_entry(chroms.value(row), starts.value(row), &entry)
+                .expect("write fjall position entry");
+        }
+
+        store.persist().expect("persist fjall cache");
+    }
+
     fn vcf_table() -> MemTable {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -218,7 +327,7 @@ mod tests {
     }
 
     fn cache_batch() -> RecordBatch {
-        use crate::annotate_provider::CACHE_OUTPUT_COLUMNS;
+        use crate::annotate_provider::cache_lookup_column_names;
 
         // Core columns required for the join.
         // Two rows: chrom "1" at pos 100 (matches vcf_table row 1) and
@@ -237,8 +346,8 @@ mod tests {
             Arc::new(StringArray::from(vec!["A/G", "C/T"])),
             Arc::new(Int64Array::from(vec![0, 0])),
         ];
-        // Add all CACHE_OUTPUT_COLUMNS as nullable Utf8.
-        for &col in CACHE_OUTPUT_COLUMNS {
+        // Add all cache lookup columns as nullable Utf8.
+        for col in cache_lookup_column_names() {
             fields.push(Field::new(col, DataType::Utf8, true));
             let val: Option<&str> = match col {
                 "variation_name" => Some("rs100"),
@@ -2383,5 +2492,209 @@ mod tests {
             .to_string();
 
         assert!(err.contains("annotate_vep() backend must be one of"));
+    }
+
+    /// VCF table with 10 rows on the same contig for LIMIT tests.
+    fn multi_row_vcf_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let n = 10;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"; n])),
+                Arc::new(Int64Array::from(
+                    (0..n as i64).map(|i| 100 + i * 10).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    (0..n as i64).map(|i| 101 + i * 10).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec!["A"; n])),
+                Arc::new(StringArray::from(vec!["G"; n])),
+            ],
+        )
+        .expect("valid multi-row vcf batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid multi-row vcf memtable")
+    }
+
+    /// Variation cache with 10 rows matching multi_row_vcf_table.
+    fn multi_row_cache_batch() -> RecordBatch {
+        use crate::annotate_provider::cache_lookup_column_names;
+
+        let n = 10;
+        let mut fields = vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("failed", DataType::Int64, false),
+        ];
+        let mut columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = vec![
+            Arc::new(StringArray::from(vec!["1"; n])),
+            Arc::new(Int64Array::from(
+                (0..n as i64).map(|i| 100 + i * 10).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                (0..n as i64).map(|i| 101 + i * 10).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec!["A/G"; n])),
+            Arc::new(Int64Array::from(vec![0_i64; n])),
+        ];
+        for col in cache_lookup_column_names() {
+            fields.push(Field::new(col, DataType::Utf8, true));
+            columns.push(Arc::new(StringArray::from(vec![None::<&str>; n])));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns).expect("valid multi-row cache batch")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_limit_returns_exact_count() {
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &multi_row_cache_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(multi_row_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', \
+             '{{\"partitioned\":true}}') LIMIT 3"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("annotate_vep with LIMIT")
+            .collect()
+            .await
+            .expect("collect");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "LIMIT 3 should return exactly 3 rows");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_limit_one() {
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &multi_row_cache_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(multi_row_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', \
+             '{{\"partitioned\":true}}') LIMIT 1"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("annotate_vep with LIMIT 1")
+            .collect()
+            .await
+            .expect("collect");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "LIMIT 1 should return exactly 1 row");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_limit_exceeds_total_returns_all() {
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &multi_row_cache_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(multi_row_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', \
+             '{{\"partitioned\":true}}') LIMIT 100"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("annotate_vep with LIMIT 100")
+            .collect()
+            .await
+            .expect("collect");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 10,
+            "LIMIT 100 with 10 input rows should return all 10"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_no_limit_returns_all() {
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &multi_row_cache_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(multi_row_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', \
+             '{{\"partitioned\":true}}')"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("annotate_vep without LIMIT")
+            .collect()
+            .await
+            .expect("collect");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 10, "No LIMIT should return all 10 rows");
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_limit_with_fjall_releases_lock() {
+        let tmpdir = TempDir::new().expect("create temp dir");
+        let cache_batch = multi_row_cache_batch();
+        write_batch_to_cache(&tmpdir, "variation", &cache_batch);
+        write_batch_to_fjall(&tmpdir, &cache_batch);
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(multi_row_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', \
+             '{{\"partitioned\":true,\"use_fjall\":true}}') LIMIT 3"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("annotate_vep with LIMIT 3 and fjall")
+            .collect()
+            .await
+            .expect("collect");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "LIMIT 3 should return exactly 3 rows");
+
+        let reopen_err = VepKvStore::open(tmpdir.path().join("variation.fjall"))
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            reopen_err.is_none(),
+            "fjall cache should reopen after LIMIT without lingering lock: {}",
+            reopen_err.unwrap_or_default()
+        );
     }
 }
