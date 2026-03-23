@@ -402,23 +402,18 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
     }
 
     // ── Step 6: CSQ vs golden ──
-    let our_csq_name = if output_batch.schema().index_of("CSQ").is_ok() {
-        "CSQ"
-    } else if output_batch.schema().index_of("CSQ").is_ok() {
-        "CSQ"
-    } else {
-        panic!("CSQ not found in fjall output")
-    };
-    let golden_csq_name = if golden_batch.schema().index_of("CSQ").is_ok() {
-        "CSQ"
-    } else if golden_batch.schema().index_of("CSQ").is_ok() {
-        "CSQ"
-    } else {
-        panic!("CSQ not found in golden")
-    };
-
-    let our_csq = output_batch.column(output_batch.schema().index_of(our_csq_name).unwrap());
-    let golden_csq = golden_batch.column(golden_batch.schema().index_of(golden_csq_name).unwrap());
+    let our_csq = output_batch.column(
+        output_batch
+            .schema()
+            .index_of("CSQ")
+            .expect("CSQ not found in fjall output"),
+    );
+    let golden_csq = golden_batch.column(
+        golden_batch
+            .schema()
+            .index_of("CSQ")
+            .expect("CSQ not found in golden"),
+    );
 
     if our_csq.as_ref() == golden_csq.as_ref() {
         eprintln!("[fjall] CSQ: exact match (all 1000 rows identical)");
