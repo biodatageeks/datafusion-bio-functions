@@ -24,7 +24,6 @@ use datafusion::prelude::SessionContext;
 use datafusion_bio_format_vcf::VcfCompressionType;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::{register_vep_functions, vcf_sink};
-use indicatif::{ProgressBar, ProgressStyle};
 
 struct Args {
     input: String,
@@ -151,7 +150,7 @@ async fn main() -> Result<()> {
         eprintln!("  limit:      {n}");
     }
 
-    // ── Step 1: Read VCF ──
+    // ── Read VCF ──
     let t0 = Instant::now();
     let input_path = args.input.clone();
     let vcf_provider = tokio::task::spawn_blocking(move || {
@@ -160,6 +159,11 @@ async fn main() -> Result<()> {
     .await
     .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??;
     let vcf_fields = vcf_provider.schema().fields().len();
+    eprintln!(
+        "\n[{:.1}s] VCF loaded: {} columns",
+        t0.elapsed().as_secs_f64(),
+        vcf_fields
+    );
 
     // Single partition — required for correct annotation pipeline.
     let config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
@@ -167,49 +171,14 @@ async fn main() -> Result<()> {
     register_vep_functions(&ctx);
     ctx.register_table("vcf", Arc::new(vcf_provider))?;
 
-    // Count input rows for progress bar.
-    let total_input = ctx
-        .sql("SELECT COUNT(*) AS n FROM vcf")
-        .await?
-        .collect()
-        .await?[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<datafusion::arrow::array::Int64Array>()
-        .map(|a| a.value(0) as u64)
-        .unwrap_or(0);
-
-    eprintln!(
-        "\n[{:.1}s] VCF: {} columns, {} variants",
-        t0.elapsed().as_secs_f64(),
-        vcf_fields,
-        total_input
-    );
-
-    // ── Step 2: Annotate + stream to VCF with progress ──
-    // Show the progress bar immediately (at 0%) so the user sees activity
-    // during the variation lookup phase before any batches arrive.
-    let pb = ProgressBar::new(total_input);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "  {spinner:.green} {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] (eta {eta})",
-        )
-        .unwrap()
-        .progress_chars("##-"),
-    );
-    pb.set_message("annotating...");
-    pb.enable_steady_tick(std::time::Duration::from_millis(200));
-    let pb_cb = pb.clone();
-
+    // ── Annotate + stream to VCF (with built-in progress bar) ──
     let annotate_config = vcf_sink::AnnotateVcfConfig {
         everything: args.everything,
         extended_probes: args.extended_probes,
         reference_fasta_path: args.reference_fasta.clone(),
         use_fjall: args.backend == "fjall",
         compression: args.compression,
-        on_batch_written: Some(Box::new(move |n, _| {
-            pb_cb.inc(n as u64);
-        })),
+        show_progress: true,
         ..Default::default()
     };
 
@@ -224,7 +193,6 @@ async fn main() -> Result<()> {
         &annotate_config,
     )
     .await?;
-    pb.finish_and_clear();
     let annotate_secs = t_annotate.elapsed().as_secs_f64();
 
     let output_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);

@@ -12,12 +12,10 @@ use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_bio_format_vcf::serializer::batch_to_vcf_lines;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
-
-/// Callback invoked after each batch is written to VCF.
-/// Arguments: (rows_in_batch, total_rows_so_far).
-pub type OnBatchWritten = Box<dyn Fn(usize, usize) + Send + Sync>;
+use indicatif::{ProgressBar, ProgressStyle};
 
 /// Configuration for VCF annotation output.
+#[derive(Debug, Clone, Default)]
 pub struct AnnotateVcfConfig {
     /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
     pub everything: bool,
@@ -37,34 +35,9 @@ pub struct AnnotateVcfConfig {
     pub distance: Option<String>,
     /// Output compression type.
     pub compression: VcfCompressionType,
-    /// Optional callback invoked after each batch is written to VCF.
-    pub on_batch_written: Option<OnBatchWritten>,
-}
-
-impl Default for AnnotateVcfConfig {
-    fn default() -> Self {
-        Self {
-            everything: false,
-            extended_probes: false,
-            reference_fasta_path: None,
-            use_fjall: false,
-            hgvs: false,
-            merged: false,
-            failed: None,
-            distance: None,
-            compression: VcfCompressionType::Plain,
-            on_batch_written: None,
-        }
-    }
-}
-
-impl std::fmt::Debug for AnnotateVcfConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AnnotateVcfConfig")
-            .field("everything", &self.everything)
-            .field("compression", &self.compression)
-            .finish()
-    }
+    /// Show a progress bar on stderr during annotation + VCF write.
+    /// When true, counts input variants and displays an indicatif progress bar.
+    pub show_progress: bool,
 }
 
 impl AnnotateVcfConfig {
@@ -110,21 +83,12 @@ impl AnnotateVcfConfig {
 ///
 /// This function:
 /// 1. Looks up the VCF input table's schema to recover INFO/FORMAT field metadata
-/// 2. Runs `annotate_vep()` via SQL to produce annotated batches
-/// 3. Writes the annotated batches to a VCF file using `VcfLocalWriter`
+/// 2. Optionally counts input rows for a progress bar (`config.show_progress`)
+/// 3. Runs `annotate_vep()` via SQL and streams annotated batches to a VCF file
 ///
 /// All original VCF columns are preserved in the output. The `csq` column from
 /// annotation is added as an INFO field. The 87 typed annotation columns
 /// (Allele, Consequence, SYMBOL, AF, etc.) are NOT written to the VCF.
-///
-/// # Arguments
-///
-/// * `ctx` - Session context with VEP functions registered and VCF table available
-/// * `vcf_table` - Name of the registered VCF table to annotate
-/// * `cache_source` - Path to the VEP cache (parquet directory or fjall store)
-/// * `backend` - Cache backend type: `"parquet"`
-/// * `output_path` - Path to write the output VCF file
-/// * `config` - Annotation and output configuration
 ///
 /// # Returns
 ///
@@ -136,30 +100,6 @@ pub async fn annotate_to_vcf(
     backend: &str,
     output_path: &Path,
     config: &AnnotateVcfConfig,
-) -> Result<usize> {
-    let options_json = config.to_options_json();
-    annotate_to_vcf_inner(
-        ctx,
-        vcf_table,
-        cache_source,
-        backend,
-        Some(&options_json),
-        output_path,
-        config.compression,
-        config.on_batch_written.as_deref(),
-    )
-    .await
-}
-
-async fn annotate_to_vcf_inner(
-    ctx: &SessionContext,
-    vcf_table: &str,
-    cache_source: &str,
-    backend: &str,
-    options_json: Option<&str>,
-    output_path: &Path,
-    compression: VcfCompressionType,
-    on_batch_written: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
 ) -> Result<usize> {
     // 1. Get VCF input schema for field classification (INFO vs FORMAT metadata).
     let vcf_provider = ctx.table_provider(vcf_table).await?;
@@ -187,7 +127,6 @@ async fn annotate_to_vcf_inner(
                 info_fields.push(name.to_string());
             }
             Some("FORMAT") => {
-                // Extract sample name from "{sample}_{format_id}" column naming.
                 if let Some(format_id) = field.metadata().get("bio.vcf.field.format_id") {
                     if name.len() > format_id.len() + 1 && name.ends_with(format_id.as_str()) {
                         let sample = name[..name.len() - format_id.len() - 1].to_string();
@@ -202,7 +141,6 @@ async fn annotate_to_vcf_inner(
         }
     }
 
-    // Fallback: get sample names from schema-level metadata.
     if sample_names.is_empty() {
         if let Some(json) = vcf_schema.metadata().get("bio.vcf.samples") {
             if let Ok(names) = serde_json::from_str::<Vec<String>>(json) {
@@ -214,7 +152,6 @@ async fn annotate_to_vcf_inner(
         sample_names.push("SAMPLE".to_string());
     }
 
-    // Deduplicate format fields to unique FORMAT tags for the VCF header.
     let unique_format_tags: Vec<String> = if sample_names.len() <= 1 {
         format_fields.clone()
     } else {
@@ -230,9 +167,33 @@ async fn annotate_to_vcf_inner(
         tags
     };
 
-    // 2. Build annotation SQL — select only VCF-relevant columns + csq.
-    //    The 87 typed annotation columns (Allele, Consequence, SYMBOL, AF, etc.)
-    //    are Arrow-only and should NOT appear in the VCF output.
+    // 2. Set up progress bar if requested.
+    let pb = if config.show_progress {
+        let total = ctx
+            .sql(&format!("SELECT COUNT(*) AS n FROM {vcf_table}"))
+            .await?
+            .collect()
+            .await?[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .map(|a| a.value(0) as u64)
+            .unwrap_or(0);
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "  {spinner:.green} {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] (eta {eta})",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(200));
+        pb
+    } else {
+        ProgressBar::hidden()
+    };
+
+    // 3. Build annotation SQL — select only VCF-relevant columns + csq.
     let mut select_cols: Vec<String> = Vec::new();
     for name in &core_vcf {
         select_cols.push(format!("`{name}`"));
@@ -240,30 +201,24 @@ async fn annotate_to_vcf_inner(
     for name in &info_fields {
         select_cols.push(format!("`{name}`"));
     }
-    // CSQ must be explicitly projected so it gets computed (skip_csq default).
     select_cols.push("`csq`".to_string());
     for name in &format_fields {
         select_cols.push(format!("`{name}`"));
     }
     let select_list = select_cols.join(", ");
 
-    let opts_clause = options_json
-        .map(|o| format!(", '{}'", o.replace('\'', "''")))
-        .unwrap_or_default();
+    let options_json = config.to_options_json();
+    let opts_clause = format!(", '{}'", options_json.replace('\'', "''"));
     let sql = format!(
         "SELECT {select_list} FROM annotate_vep('{vcf_table}', '{}', '{}'{opts_clause})",
         cache_source.replace('\'', "''"),
         backend.replace('\'', "''"),
     );
 
-    // 3. CSQ is always included as an INFO field in VCF output.
     let mut vcf_info_fields = info_fields;
     vcf_info_fields.push("csq".to_string());
 
     // 4. Build the output schema for the VCF header.
-    //    The annotation output schema loses field metadata, so we merge:
-    //    take the DataFrame schema fields but attach metadata from the
-    //    VCF input schema where available, plus add `csq` with INFO metadata.
     let df = ctx.sql(&sql).await?;
     let df_schema = df.schema();
     let output_fields: Vec<datafusion::arrow::datatypes::Field> = df_schema
@@ -298,14 +253,13 @@ async fn annotate_to_vcf_inner(
         })
         .collect();
 
-    let merged_schema_metadata = vcf_schema.metadata().clone();
     let write_schema = Arc::new(
         datafusion::arrow::datatypes::Schema::new(output_fields)
-            .with_metadata(merged_schema_metadata),
+            .with_metadata(vcf_schema.metadata().clone()),
     );
 
     // 5. Write VCF header, then stream batches directly to file.
-    let mut writer = VcfLocalWriter::with_compression(output_path, compression)?;
+    let mut writer = VcfLocalWriter::with_compression(output_path, config.compression)?;
     writer.write_header(
         &write_schema,
         &vcf_info_fields,
@@ -318,7 +272,6 @@ async fn annotate_to_vcf_inner(
         .get("bio.coordinate_system_zero_based")
         .is_some_and(|v| v == "true");
 
-    // Stream batches one at a time — never holds more than one batch in memory.
     use futures::StreamExt;
     let mut stream = df.execute_stream().await?;
     let mut total_rows = 0;
@@ -331,15 +284,13 @@ async fn annotate_to_vcf_inner(
             &sample_names,
             coordinate_zero_based,
         )?;
-        let n = lines.len();
-        total_rows += n;
+        total_rows += lines.len();
         writer.write_records(&lines)?;
-        if let Some(cb) = on_batch_written {
-            cb(n, total_rows);
-        }
+        pb.inc(lines.len() as u64);
     }
 
     writer.finish()?;
+    pb.finish_and_clear();
 
     Ok(total_rows)
 }
