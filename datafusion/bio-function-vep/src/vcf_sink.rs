@@ -176,12 +176,25 @@ pub async fn annotate_to_vcf(
         tags
     };
 
-    // 3. Progress bar (optional) — no COUNT(*) scan, just a spinner with row count.
+    // 3. Progress bar (optional).
     let pb = if config.show_progress {
-        let pb = ProgressBar::new_spinner();
+        let total = ctx
+            .sql(&format!("SELECT COUNT(*) AS n FROM `{vcf_table}`"))
+            .await?
+            .collect()
+            .await?[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .map(|a| a.value(0) as u64)
+            .unwrap_or(0);
+        let pb = ProgressBar::new(total);
         pb.set_style(
-            ProgressStyle::with_template("  {spinner:.green} {pos} rows [{elapsed_precise}]")
-                .unwrap(),
+            ProgressStyle::with_template(
+                "  {spinner:.green} {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] (eta {eta})",
+            )
+            .unwrap()
+            .progress_chars("##-"),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(200));
         pb
