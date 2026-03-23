@@ -117,12 +117,28 @@ pub async fn annotate_to_vcf(
         tags
     };
 
-    // 2. Build annotation SQL.
+    // 2. Build annotation SQL — select only VCF-relevant columns + csq.
+    //    The 87 typed annotation columns (Allele, Consequence, SYMBOL, AF, etc.)
+    //    are Arrow-only and should NOT appear in the VCF output.
+    let mut select_cols: Vec<String> = Vec::new();
+    for name in &core_vcf {
+        select_cols.push(format!("`{name}`"));
+    }
+    for name in &info_fields {
+        select_cols.push(format!("`{name}`"));
+    }
+    // CSQ must be explicitly projected so it gets computed (skip_csq default).
+    select_cols.push("`csq`".to_string());
+    for name in &format_fields {
+        select_cols.push(format!("`{name}`"));
+    }
+    let select_list = select_cols.join(", ");
+
     let opts_clause = options_json
         .map(|o| format!(", '{}'", o.replace('\'', "''")))
         .unwrap_or_default();
     let sql = format!(
-        "SELECT * FROM annotate_vep('{vcf_table}', '{}', '{}'{opts_clause})",
+        "SELECT {select_list} FROM annotate_vep('{vcf_table}', '{}', '{}'{opts_clause})",
         cache_source.replace('\'', "''"),
         backend.replace('\'', "''"),
     );

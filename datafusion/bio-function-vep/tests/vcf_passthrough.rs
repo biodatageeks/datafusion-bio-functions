@@ -31,13 +31,13 @@ async fn test_vcf_columns_pass_through_annotation() {
 
     // Read input VCF schema.
     // None = include ALL INFO/FORMAT fields (Some(vec![]) means include NONE).
-    let vcf_provider = VcfTableProvider::new(
-        input_vcf.to_string(),
-        None,
-        None,
-        None,
-        false,
-    )
+    // VcfTableProvider::new() uses futures::executor::block_on() internally,
+    // which deadlocks inside a tokio runtime — use spawn_blocking.
+    let input_str = input_vcf.to_string();
+    let vcf_provider = tokio::task::spawn_blocking(move || {
+        VcfTableProvider::new(input_str, None, None, None, false).unwrap()
+    })
+    .await
     .unwrap();
     let input_schema = vcf_provider.schema();
     let input_field_names: Vec<String> = input_schema

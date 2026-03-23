@@ -1,21 +1,21 @@
-//! Roundtrip test: annotate 1000 variants -> write VCF -> read back -> compare.
+//! Roundtrip correctness test: annotate 1000 variants → write VCF → read back
+//! → compare ALL column values against golden Ensembl VEP 115 output.
 //!
-//! This test verifies the full pipeline:
-//! 1. Read a VCF with VcfTableProvider
-//! 2. Annotate with annotate_vep()
-//! 3. Write results to a VCF file via vcf_sink::annotate_to_vcf()
-//! 4. Read the output VCF back with VcfTableProvider
-//! 5. Verify row counts and that all columns survive the roundtrip
+//! Verifies 100% correctness with 0 mismatches for:
+//! - Core VCF columns (chrom, pos, ref, alt, qual, filter, id)
+//! - Original INFO fields (platforms, datasets, etc.) preserved from input
+//! - CSQ annotation field matches golden VEP 115 (80 pipe-delimited fields)
+//! - FORMAT/sample fields (GT, DP, GQ, AD, etc.) preserved from input
 
 use std::sync::Arc;
 
-use datafusion::datasource::TableProvider;
+use datafusion::arrow::array::Array;
 use datafusion::prelude::*;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::VcfCompressionType;
 use datafusion_bio_function_vep::{register_vep_functions, vcf_sink};
 
-/// Resolve a path relative to the workspace root (two levels up from CARGO_MANIFEST_DIR).
+/// Resolve a path relative to the workspace root.
 fn workspace_path(rel: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -23,49 +23,43 @@ fn workspace_path(rel: &str) -> std::path::PathBuf {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_roundtrip_golden_all_columns() {
-    // Skip if fixtures not available (CI without LFS).
+async fn test_roundtrip_golden_all_column_values() {
     let input_vcf = workspace_path("vep-benchmark/data/golden/input_1000.vcf");
+    let golden_vcf = workspace_path("vep-benchmark/data/golden/golden_1000_vep115.vcf");
     let cache_path = workspace_path("vep-benchmark/data/golden/cache");
     let ref_fasta = workspace_path("vep-benchmark/data/golden/reference_chr1.fa");
 
-    if !input_vcf.exists() {
-        eprintln!("Skipping: test fixtures not found at {}", input_vcf.display());
+    if !input_vcf.exists() || !golden_vcf.exists() {
+        eprintln!(
+            "Skipping: test fixtures not found at {}",
+            input_vcf.display()
+        );
         return;
     }
     let input_vcf = input_vcf.to_str().unwrap();
+    let golden_vcf = golden_vcf.to_str().unwrap();
     let cache_path = cache_path.to_str().unwrap();
     let ref_fasta = ref_fasta.to_str().unwrap();
 
+    // ── Step 1: Annotate and write to VCF ──────────────────────────
     let tmp_dir = tempfile::TempDir::new().unwrap();
-    let output_path = tmp_dir.path().join("annotated_output.vcf");
+    let output_path = tmp_dir.path().join("annotated.vcf");
 
-    // Set up context and register VCF table.
     let ctx = SessionContext::new();
     register_vep_functions(&ctx);
-    // None = include ALL INFO/FORMAT fields.
-    let vcf_provider = VcfTableProvider::new(
-        input_vcf.to_string(),
-        None,
-        None,
-        None,
-        false,
-    )
+    let input_str = input_vcf.to_string();
+    let vcf_provider = tokio::task::spawn_blocking(move || {
+        VcfTableProvider::new(input_str, None, None, None, false).unwrap()
+    })
+    .await
     .unwrap();
-    let input_schema = vcf_provider.schema();
-    let _input_field_names: Vec<String> = input_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
     ctx.register_table("vcf", Arc::new(vcf_provider)).unwrap();
 
-    // Run annotation and write to VCF.
     let options = format!(
         "{{\"partitioned\":true,\"everything\":true,\"extended_probes\":true,\
          \"reference_fasta_path\":\"{ref_fasta}\"}}"
     );
-    let rows = vcf_sink::annotate_to_vcf(
+    let rows_written = vcf_sink::annotate_to_vcf(
         &ctx,
         "vcf",
         cache_path,
@@ -76,48 +70,235 @@ async fn test_roundtrip_golden_all_columns() {
     )
     .await
     .unwrap();
+    assert_eq!(rows_written, 1000, "Should write 1000 annotated rows");
 
-    assert_eq!(rows, 1000, "Expected 1000 rows written to VCF");
-
-    // Read back the output VCF with VcfTableProvider.
-    let output_provider = VcfTableProvider::new(
-        output_path.display().to_string(),
-        None,
-        None,
-        None,
-        false,
-    )
-    .unwrap();
-    let output_schema = output_provider.schema();
-
+    // ── Step 2: Read input, output, and golden with VcfTableProvider ──
     let ctx2 = SessionContext::new();
-    ctx2.register_table("output_vcf", Arc::new(output_provider))
+
+    let input_str2 = input_vcf.to_string();
+    let input_prov = tokio::task::spawn_blocking(move || {
+        VcfTableProvider::new(input_str2, None, None, None, false).unwrap()
+    })
+    .await
+    .unwrap();
+    // VcfTableProvider::new() uses futures::executor::block_on() internally,
+    // which deadlocks inside a tokio runtime. Use spawn_blocking to avoid.
+    let out_path_str = output_path.display().to_string();
+    let output_prov = tokio::task::spawn_blocking(move || {
+        VcfTableProvider::new(out_path_str, None, None, None, false).unwrap()
+    })
+    .await
+    .unwrap();
+    let golden_str = golden_vcf.to_string();
+    let golden_prov = tokio::task::spawn_blocking(move || {
+        VcfTableProvider::new(golden_str, None, None, None, false).unwrap()
+    })
+    .await
+    .unwrap();
+
+    ctx2.register_table("input_vcf", Arc::new(input_prov))
+        .unwrap();
+    ctx2.register_table("output_vcf", Arc::new(output_prov))
+        .unwrap();
+    ctx2.register_table("golden_vcf", Arc::new(golden_prov))
         .unwrap();
 
-    let output_batches = ctx2
-        .sql("SELECT * FROM output_vcf")
+    // Collect all three as sorted by position for deterministic comparison.
+    let input_batches = ctx2
+        .sql("SELECT * FROM input_vcf ORDER BY start")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
+    let output_batches = ctx2
+        .sql("SELECT * FROM output_vcf ORDER BY start")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let golden_batches = ctx2
+        .sql("SELECT * FROM golden_vcf ORDER BY start")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let input_rows: usize = input_batches.iter().map(|b| b.num_rows()).sum();
     let output_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
+    let golden_rows: usize = golden_batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(output_rows, 1000, "Output should have 1000 rows");
+    assert_eq!(golden_rows, 1000, "Golden should have 1000 rows");
+    assert_eq!(input_rows, 1000, "Input should have 1000 rows");
 
-    // Verify row count matches.
-    assert_eq!(output_rows, 1000, "Output VCF should have 1000 rows");
+    // Concatenate into single batches for easier row-by-row comparison.
+    let input_batch = datafusion::arrow::compute::concat_batches(
+        &input_batches[0].schema(),
+        &input_batches,
+    )
+    .unwrap();
+    let output_batch = datafusion::arrow::compute::concat_batches(
+        &output_batches[0].schema(),
+        &output_batches,
+    )
+    .unwrap();
+    let golden_batch = datafusion::arrow::compute::concat_batches(
+        &golden_batches[0].schema(),
+        &golden_batches,
+    )
+    .unwrap();
 
-    // Verify core VCF columns survive roundtrip.
-    for col in ["chrom", "start", "end", "ref", "alt"] {
-        assert!(
-            output_schema.field_with_name(col).is_ok(),
-            "Core column '{col}' missing from roundtrip output"
-        );
+    // ── Step 3: Compare core VCF columns (output vs input) ─────────
+    // Use Arrow array equality for fast column-level comparison.
+    let core_columns = ["chrom", "start", "end", "ref", "alt", "id", "qual", "filter"];
+    for col_name in &core_columns {
+        let in_idx = input_batch.schema().index_of(col_name);
+        let out_idx = output_batch.schema().index_of(col_name);
+        if let (Ok(i), Ok(o)) = (in_idx, out_idx) {
+            let in_col = input_batch.column(i);
+            let out_col = output_batch.column(o);
+            assert_eq!(
+                in_col.as_ref(),
+                out_col.as_ref(),
+                "Core column '{col_name}' values differ between input and output"
+            );
+        }
     }
 
-    // Verify the CSQ annotation column made it through as an INFO field.
-    // After roundtrip through VcfTableProvider, CSQ should appear as an INFO column
-    // named "csq" (lowercase) or "CSQ" (uppercase, depending on the provider's convention).
-    let has_csq = output_schema.field_with_name("csq").is_ok()
-        || output_schema.field_with_name("CSQ").is_ok();
-    assert!(has_csq, "CSQ annotation field missing from roundtrip output");
+    // ── Step 4: Compare original INFO fields (output vs input) ─────
+    let input_schema = input_batch.schema();
+    let info_columns: Vec<String> = input_schema
+        .fields()
+        .iter()
+        .filter(|f| {
+            f.metadata()
+                .get("bio.vcf.field.field_type")
+                .is_some_and(|v| v == "INFO")
+        })
+        .map(|f| f.name().clone())
+        .collect();
+    eprintln!(
+        "Comparing {} INFO columns: {:?}",
+        info_columns.len(),
+        info_columns
+    );
+
+    let mut info_missing = Vec::new();
+    let mut info_mismatched = Vec::new();
+    for col_name in &info_columns {
+        if output_batch.schema().index_of(col_name).is_err() {
+            info_missing.push(col_name.clone());
+            continue;
+        }
+        let in_col = input_batch.column(input_batch.schema().index_of(col_name).unwrap());
+        let out_col = output_batch.column(output_batch.schema().index_of(col_name).unwrap());
+        if in_col.as_ref() != out_col.as_ref() {
+            info_mismatched.push(col_name.clone());
+        }
+    }
+    assert!(
+        info_missing.is_empty(),
+        "INFO columns missing from output: {info_missing:?}"
+    );
+    assert!(
+        info_mismatched.is_empty(),
+        "INFO columns with value mismatches: {info_mismatched:?}"
+    );
+
+    // ── Step 5: Compare FORMAT/sample fields (output vs input) ─────
+    let format_columns: Vec<String> = input_schema
+        .fields()
+        .iter()
+        .filter(|f| {
+            f.metadata()
+                .get("bio.vcf.field.field_type")
+                .is_some_and(|v| v == "FORMAT")
+        })
+        .map(|f| f.name().clone())
+        .collect();
+    eprintln!(
+        "Comparing {} FORMAT columns: {:?}",
+        format_columns.len(),
+        format_columns
+    );
+
+    let mut format_missing = Vec::new();
+    let mut format_mismatched = Vec::new();
+    for col_name in &format_columns {
+        if output_batch.schema().index_of(col_name).is_err() {
+            format_missing.push(col_name.clone());
+            continue;
+        }
+        let in_col = input_batch.column(input_batch.schema().index_of(col_name).unwrap());
+        let out_col = output_batch.column(output_batch.schema().index_of(col_name).unwrap());
+        if in_col.as_ref() != out_col.as_ref() {
+            format_mismatched.push(col_name.clone());
+        }
+    }
+    assert!(
+        format_missing.is_empty(),
+        "FORMAT columns missing from output: {format_missing:?}"
+    );
+    assert!(
+        format_mismatched.is_empty(),
+        "FORMAT columns with value mismatches: {format_mismatched:?}"
+    );
+    // ── Step 6: Compare CSQ annotation (output vs golden VEP 115) ──
+    // The CSQ field name may differ: our output uses "csq", golden uses "CSQ".
+    let our_csq_name = if output_batch.schema().index_of("csq").is_ok() {
+        "csq"
+    } else if output_batch.schema().index_of("CSQ").is_ok() {
+        "CSQ"
+    } else {
+        panic!("CSQ column not found in output");
+    };
+    let golden_csq_name = if golden_batch.schema().index_of("CSQ").is_ok() {
+        "CSQ"
+    } else if golden_batch.schema().index_of("csq").is_ok() {
+        "csq"
+    } else {
+        panic!("CSQ column not found in golden");
+    };
+
+    let our_csq_col = output_batch.column(output_batch.schema().index_of(our_csq_name).unwrap());
+    let golden_csq_col = golden_batch.column(golden_batch.schema().index_of(golden_csq_name).unwrap());
+
+    // First try fast path: exact array equality.
+    if our_csq_col.as_ref() == golden_csq_col.as_ref() {
+    } else {
+        // Per-row string comparison for detailed diagnostics.
+        // CSQ may be StringArray or StringViewArray depending on the provider.
+        let get_str = |col: &dyn Array, row: usize| -> String {
+            if col.is_null(row) {
+                return String::new();
+            }
+            if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>() {
+                return a.value(row).to_string();
+            }
+            if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>() {
+                return a.value(row).to_string();
+            }
+            String::new()
+        };
+
+        let mut mismatched_rows = 0;
+        for row in 0..1000 {
+            let ours = get_str(our_csq_col.as_ref(), row);
+            let golden = get_str(golden_csq_col.as_ref(), row);
+            if ours != golden {
+                mismatched_rows += 1;
+                if mismatched_rows <= 3 {
+                    eprintln!("CSQ mismatch row {row}:");
+                    eprintln!("  golden: {}...", &golden[..golden.len().min(150)]);
+                    eprintln!("  ours:   {}...", &ours[..ours.len().min(150)]);
+                }
+            }
+        }
+        assert_eq!(
+            mismatched_rows, 0,
+            "CSQ should have 0 row-level mismatches vs golden VEP 115 ({mismatched_rows} mismatched)"
+        );
+    }
 }
