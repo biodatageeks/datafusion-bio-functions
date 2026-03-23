@@ -162,8 +162,15 @@ async fn main() -> Result<()> {
     }
 
     // ── Read VCF ──
+    // VcfTableProvider::new() uses futures::executor::block_on() internally,
+    // which can deadlock inside a tokio runtime — use spawn_blocking.
     let t0 = Instant::now();
-    let vcf_provider = VcfTableProvider::new(args.input.clone(), None, None, None, false)?;
+    let input_path = args.input.clone();
+    let vcf_provider = tokio::task::spawn_blocking(move || {
+        VcfTableProvider::new(input_path, Some(vec![]), Some(vec![]), None, false)
+    })
+    .await
+    .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??;
     let vcf_schema = vcf_provider.schema();
     let vcf_fields = vcf_schema.fields().len();
     println!(
@@ -197,6 +204,11 @@ async fn main() -> Result<()> {
     let output_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
 
     println!("[{:.1}s] Annotation + VCF write complete", annotate_secs);
+
+    // Note: VcfTableProvider may return fewer rows than the input VCF for large
+    // files (known bio-format-vcf reader limitation). For full correctness
+    // benchmarks (all 323K chr1 variants), use annotate_vep_golden_bench which
+    // normalizes the VCF and registers via MemTable.
     println!("\n=== Results ===");
     println!("  rows:       {rows}");
     println!("  time:       {annotate_secs:.2}s");
