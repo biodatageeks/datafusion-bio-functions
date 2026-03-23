@@ -12,6 +12,13 @@ use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::register_vep_functions;
 
 /// Resolve a path relative to the workspace root (two levels up from CARGO_MANIFEST_DIR).
+/// Check if a file is a Git LFS pointer (not actual content).
+fn is_lfs_pointer(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|s| s.starts_with("version https://git-lfs.github.com"))
+        .unwrap_or(false)
+}
+
 fn workspace_path(rel: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -21,9 +28,9 @@ fn workspace_path(rel: &str) -> std::path::PathBuf {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_vcf_columns_pass_through_annotation() {
     let input_vcf = workspace_path("vep-benchmark/data/golden/input_1000.vcf");
-    if !input_vcf.exists() {
+    if !input_vcf.exists() || is_lfs_pointer(&input_vcf) {
         eprintln!(
-            "Skipping: test fixtures not found at {}",
+            "Skipping: test fixtures not available at {}",
             input_vcf.display()
         );
         return;

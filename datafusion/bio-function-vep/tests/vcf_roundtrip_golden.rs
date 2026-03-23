@@ -14,6 +14,13 @@ use datafusion::prelude::*;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::{register_vep_functions, vcf_sink};
 
+/// Check if a file is a Git LFS pointer (not actual content).
+fn is_lfs_pointer(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|s| s.starts_with("version https://git-lfs.github.com"))
+        .unwrap_or(false)
+}
+
 /// Resolve a path relative to the workspace root.
 fn workspace_path(rel: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -28,7 +35,7 @@ async fn test_roundtrip_golden_all_column_values() {
     let cache_path = workspace_path("vep-benchmark/data/golden/cache");
     let ref_fasta = workspace_path("vep-benchmark/data/golden/reference_chr1.fa");
 
-    if !input_vcf.exists() || !golden_vcf.exists() {
+    if !input_vcf.exists() || !golden_vcf.exists() || is_lfs_pointer(&input_vcf) {
         eprintln!(
             "Skipping: test fixtures not found at {}",
             input_vcf.display()
