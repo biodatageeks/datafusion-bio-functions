@@ -1,7 +1,7 @@
 //! E2E annotation benchmark: read VCF → annotate → write VCF output.
 //!
 //! Exercises the full pipeline including VCF reading, annotation with
-//! transcript engine, and VCF writing via vcf_sink.
+//! transcript engine, and VCF writing via streaming sink with progress bar.
 //!
 //! Usage:
 //!   cargo run --release --features kv-cache --example bench_annotate_vcf -- \
@@ -14,17 +14,6 @@
 //!     [--reference-fasta <path>] \
 //!     [--compression none|gzip|bgzf] \
 //!     [--limit <n>]
-//!
-//! Examples:
-//!   # Parquet backend, default options
-//!   cargo run --release --example bench_annotate_vcf -- \
-//!     --input input.vcf --cache /data/cache --output out.vcf
-//!
-//!   # Fjall backend, --everything, gzip output
-//!   cargo run --release --features kv-cache --example bench_annotate_vcf -- \
-//!     --input input.vcf --cache /data/fjall_cache --output out.vcf.gz \
-//!     --backend fjall --everything --extended-probes \
-//!     --reference-fasta /ref/GRCh38.fa --compression gzip
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,6 +24,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_bio_format_vcf::VcfCompressionType;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::{register_vep_functions, vcf_sink};
+use indicatif::{ProgressBar, ProgressStyle};
 
 struct Args {
     input: String,
@@ -138,18 +128,18 @@ fn parse_args() -> Args {
 async fn main() -> Result<()> {
     let args = parse_args();
 
-    println!("=== bench_annotate_vcf ===");
-    println!("  input:      {}", args.input);
-    println!("  cache:      {}", args.cache);
-    println!("  output:     {}", args.output);
-    println!("  backend:    {}", args.backend);
-    println!("  everything: {}", args.everything);
-    println!("  ext_probes: {}", args.extended_probes);
-    println!(
+    eprintln!("=== bench_annotate_vcf ===");
+    eprintln!("  input:      {}", args.input);
+    eprintln!("  cache:      {}", args.cache);
+    eprintln!("  output:     {}", args.output);
+    eprintln!("  backend:    {}", args.backend);
+    eprintln!("  everything: {}", args.everything);
+    eprintln!("  ext_probes: {}", args.extended_probes);
+    eprintln!(
         "  ref_fasta:  {}",
         args.reference_fasta.as_deref().unwrap_or("(none)")
     );
-    println!(
+    eprintln!(
         "  compress:   {}",
         match args.compression {
             VcfCompressionType::Gzip => "gzip",
@@ -158,68 +148,95 @@ async fn main() -> Result<()> {
         }
     );
     if let Some(n) = args.limit {
-        println!("  limit:      {n}");
+        eprintln!("  limit:      {n}");
     }
 
-    // ── Read VCF ──
-    // VcfTableProvider::new() uses futures::executor::block_on() internally,
-    // which can deadlock inside a tokio runtime — use spawn_blocking.
+    // ── Step 1: Read VCF ──
     let t0 = Instant::now();
     let input_path = args.input.clone();
     let vcf_provider = tokio::task::spawn_blocking(move || {
-        // None = include ALL INFO/FORMAT fields for VCF pass-through.
         VcfTableProvider::new(input_path, None, None, None, false)
     })
     .await
     .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??;
-    let vcf_schema = vcf_provider.schema();
-    let vcf_fields = vcf_schema.fields().len();
-    println!(
-        "\n[{:.1}s] VCF loaded: {} columns",
-        t0.elapsed().as_secs_f64(),
-        vcf_fields
-    );
+    let vcf_fields = vcf_provider.schema().fields().len();
 
-    // ── Set up context ──
-    // Single partition: VcfTableProvider doesn't support multi-partition reads.
+    // Single partition — required for correct annotation pipeline.
     let config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
     register_vep_functions(&ctx);
     ctx.register_table("vcf", Arc::new(vcf_provider))?;
 
-    // ── Build annotation config ──
-    let config = vcf_sink::AnnotateVcfConfig {
+    // Count input rows for progress bar.
+    let total_input = ctx
+        .sql("SELECT COUNT(*) AS n FROM vcf")
+        .await?
+        .collect()
+        .await?[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .map(|a| a.value(0) as u64)
+        .unwrap_or(0);
+
+    eprintln!(
+        "\n[{:.1}s] VCF: {} columns, {} variants",
+        t0.elapsed().as_secs_f64(),
+        vcf_fields,
+        total_input
+    );
+
+    // ── Step 2: Annotate + stream to VCF with progress ──
+    let pb = ProgressBar::new(total_input);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] ({per_sec}, eta {eta})",
+        )
+        .unwrap()
+        .progress_chars("##-"),
+    );
+    let pb_cb = pb.clone();
+
+    let annotate_config = vcf_sink::AnnotateVcfConfig {
         everything: args.everything,
         extended_probes: args.extended_probes,
         reference_fasta_path: args.reference_fasta.clone(),
         use_fjall: args.backend == "fjall",
         compression: args.compression,
+        on_batch_written: Some(Box::new(move |n, _| {
+            pb_cb.inc(n as u64);
+        })),
         ..Default::default()
     };
 
-    // ── Annotate and write VCF ──
     let t_annotate = Instant::now();
     let output_path = std::path::Path::new(&args.output);
-    let rows = vcf_sink::annotate_to_vcf(&ctx, "vcf", &args.cache, "parquet", output_path, &config)
-        .await?;
+    let rows = vcf_sink::annotate_to_vcf(
+        &ctx,
+        "vcf",
+        &args.cache,
+        "parquet",
+        output_path,
+        &annotate_config,
+    )
+    .await?;
+    pb.finish_and_clear();
     let annotate_secs = t_annotate.elapsed().as_secs_f64();
 
     let output_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
 
-    println!("[{:.1}s] Annotation + VCF write complete", annotate_secs);
-
-    println!("\n=== Results ===");
-    println!("  rows:       {rows}");
-    println!("  time:       {annotate_secs:.2}s");
-    println!(
+    eprintln!("\n=== Results ===");
+    eprintln!("  rows:       {rows}");
+    eprintln!("  time:       {annotate_secs:.2}s");
+    eprintln!(
         "  throughput: {:.0} variants/s",
         rows as f64 / annotate_secs
     );
-    println!(
+    eprintln!(
         "  output:     {:.1} MB",
         output_size as f64 / 1024.0 / 1024.0
     );
-    println!(
+    eprintln!(
         "  total:      {:.2}s (including VCF read)",
         t0.elapsed().as_secs_f64()
     );

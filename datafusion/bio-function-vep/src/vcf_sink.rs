@@ -13,8 +13,11 @@ use datafusion::prelude::SessionContext;
 use datafusion_bio_format_vcf::serializer::batch_to_vcf_lines;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 
+/// Callback invoked after each batch is written to VCF.
+/// Arguments: (rows_in_batch, total_rows_so_far).
+pub type OnBatchWritten = Box<dyn Fn(usize, usize) + Send + Sync>;
+
 /// Configuration for VCF annotation output.
-#[derive(Debug, Clone, Default)]
 pub struct AnnotateVcfConfig {
     /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
     pub everything: bool,
@@ -34,6 +37,34 @@ pub struct AnnotateVcfConfig {
     pub distance: Option<String>,
     /// Output compression type.
     pub compression: VcfCompressionType,
+    /// Optional callback invoked after each batch is written to VCF.
+    pub on_batch_written: Option<OnBatchWritten>,
+}
+
+impl Default for AnnotateVcfConfig {
+    fn default() -> Self {
+        Self {
+            everything: false,
+            extended_probes: false,
+            reference_fasta_path: None,
+            use_fjall: false,
+            hgvs: false,
+            merged: false,
+            failed: None,
+            distance: None,
+            compression: VcfCompressionType::Plain,
+            on_batch_written: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for AnnotateVcfConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnnotateVcfConfig")
+            .field("everything", &self.everything)
+            .field("compression", &self.compression)
+            .finish()
+    }
 }
 
 impl AnnotateVcfConfig {
@@ -115,6 +146,7 @@ pub async fn annotate_to_vcf(
         Some(&options_json),
         output_path,
         config.compression,
+        config.on_batch_written.as_deref(),
     )
     .await
 }
@@ -127,6 +159,7 @@ async fn annotate_to_vcf_inner(
     options_json: Option<&str>,
     output_path: &Path,
     compression: VcfCompressionType,
+    on_batch_written: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
 ) -> Result<usize> {
     // 1. Get VCF input schema for field classification (INFO vs FORMAT metadata).
     let vcf_provider = ctx.table_provider(vcf_table).await?;
@@ -298,8 +331,12 @@ async fn annotate_to_vcf_inner(
             &sample_names,
             coordinate_zero_based,
         )?;
-        total_rows += lines.len();
+        let n = lines.len();
+        total_rows += n;
         writer.write_records(&lines)?;
+        if let Some(cb) = on_batch_written {
+            cb(n, total_rows);
+        }
     }
 
     writer.finish()?;

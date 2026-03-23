@@ -33,6 +33,7 @@ datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
 noodles-vcf = { git = "https://github.com/biodatageeks/noodles.git", rev = "9b7b2c5b6531373918302d4c07410e583f1b5b5c" }
 env_logger = "0.11"
 tempfile = "3"
+indicatif = "0.17"
 
 [[example]]
 name = "vcf_batch_stats"
