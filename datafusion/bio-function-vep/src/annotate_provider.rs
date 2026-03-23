@@ -3313,6 +3313,7 @@ impl AnnotateProvider {
         #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
         #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
         skip_csq: bool,
+        skip_typed_cols: bool,
         flags: &VepFlags,
         hgvs_flags: &HgvsFlags,
         merged: bool,
@@ -4000,582 +4001,588 @@ impl AnnotateProvider {
             most_builder.append_value(&most_str);
 
             // --- Populate 87 annotation column builders for this row ---
-
-            // Find the most-severe transcript from row_assignments (cache-miss path).
-            // For cache-hit, row_assignments is empty and transcript-level cols are NULL.
-            let most_severe_tc: Option<&TranscriptConsequence> = if !row_assignments.is_empty() {
-                let most_term = SoTerm::from_str(&most_str).unwrap_or(SoTerm::SequenceVariant);
-                row_assignments
-                    .iter()
-                    .find(|tc| tc.terms.contains(&most_term))
-                    .or(row_assignments.first())
+            // Skip all typed column work when they're not in the projection.
+            if skip_typed_cols {
+                append_null_annotation_row!();
             } else {
-                None
-            };
-
-            // Helper: look up transcript metadata from most-severe TC.
-            let ms_tx_opt = most_severe_tc
-                .and_then(|tc| tc.transcript_idx)
-                .map(|idx| &ctx.transcripts[idx]);
-
-            // -- Transcript-level columns (42) --
-            if let Some(tc) = most_severe_tc {
-                let tx_opt = ms_tx_opt;
-
-                // Allele
-                b_allele.append_value(&vep_allele);
-
-                // Consequence (List<Utf8>)
-                let vals = b_consequence.values();
-                for t in &tc.terms {
-                    vals.append_value(t.as_str());
-                }
-                b_consequence.append(true);
-
-                // IMPACT
-                let tc_impact = most_severe_term(tc.terms.iter())
-                    .map(|t| impact_label(t.impact()))
-                    .unwrap_or_else(|| impact_label(SoImpact::Modifier));
-                b_impact.append_value(tc_impact);
-
-                // SYMBOL, Gene
-                append_opt_str(
-                    &mut b_symbol,
-                    tx_opt.and_then(|tx| tx.gene_symbol.as_deref()),
-                );
-                append_opt_str(
-                    &mut b_gene,
-                    tx_opt.and_then(|tx| tx.gene_stable_id.as_deref()),
-                );
-
-                // Feature_type, Feature
-                let ft_str = tc.feature_type.as_str();
-                append_opt_str(
-                    &mut b_feature_type,
-                    if ft_str.is_empty() {
-                        None
-                    } else {
-                        Some(ft_str)
-                    },
-                );
-                append_opt_str(&mut b_feature, tc.transcript_id.as_deref());
-
-                // BIOTYPE
-                let biotype = tc
-                    .biotype_override
-                    .as_deref()
-                    .unwrap_or(tx_opt.map(|tx| tx.biotype.as_str()).unwrap_or(""));
-                append_opt_str(
-                    &mut b_biotype,
-                    if biotype.is_empty() {
-                        None
-                    } else {
-                        Some(biotype)
-                    },
-                );
-
-                // EXON, INTRON
-                append_opt_str(&mut b_exon, tc.exon_str.as_deref());
-                append_opt_str(&mut b_intron, tc.intron_str.as_deref());
-
-                // HGVSc, HGVSp
-                if hgvs_flags.hgvsc {
-                    append_opt_str(&mut b_hgvsc, tc.hgvsc.as_deref());
+                // Find the most-severe transcript from row_assignments (cache-miss path).
+                // For cache-hit, row_assignments is empty and transcript-level cols are NULL.
+                let most_severe_tc: Option<&TranscriptConsequence> = if !row_assignments.is_empty()
+                {
+                    let most_term = SoTerm::from_str(&most_str).unwrap_or(SoTerm::SequenceVariant);
+                    row_assignments
+                        .iter()
+                        .find(|tc| tc.terms.contains(&most_term))
+                        .or(row_assignments.first())
                 } else {
-                    b_hgvsc.append_null();
-                }
-                if hgvs_flags.hgvsp {
-                    let hgvsp_val = tc.hgvsp.as_deref().map(|value| {
-                        Self::format_hgvsp_output(
-                            value,
-                            hgvs_flags.remove_hgvsp_version,
-                            hgvs_flags.no_escape,
-                            hgvs_flags.hgvsp_use_prediction,
-                        )
-                    });
-                    match hgvsp_val {
-                        Some(v) if !v.is_empty() => b_hgvsp.append_value(&v),
-                        _ => b_hgvsp.append_null(),
+                    None
+                };
+
+                // Helper: look up transcript metadata from most-severe TC.
+                let ms_tx_opt = most_severe_tc
+                    .and_then(|tc| tc.transcript_idx)
+                    .map(|idx| &ctx.transcripts[idx]);
+
+                // -- Transcript-level columns (42) --
+                if let Some(tc) = most_severe_tc {
+                    let tx_opt = ms_tx_opt;
+
+                    // Allele
+                    b_allele.append_value(&vep_allele);
+
+                    // Consequence (List<Utf8>)
+                    let vals = b_consequence.values();
+                    for t in &tc.terms {
+                        vals.append_value(t.as_str());
                     }
-                } else {
-                    b_hgvsp.append_null();
-                }
+                    b_consequence.append(true);
 
-                // cDNA_position, CDS_position, Protein_position, Amino_acids, Codons
-                append_opt_str(&mut b_cdna_position, tc.cdna_position.as_deref());
-                append_opt_str(&mut b_cds_position, tc.cds_position.as_deref());
-                append_opt_str(&mut b_protein_position, tc.protein_position.as_deref());
-                append_opt_str(&mut b_amino_acids, tc.amino_acids.as_deref());
-                append_opt_str(&mut b_codons, tc.codons.as_deref());
+                    // IMPACT
+                    let tc_impact = most_severe_term(tc.terms.iter())
+                        .map(|t| impact_label(t.impact()))
+                        .unwrap_or_else(|| impact_label(SoImpact::Modifier));
+                    b_impact.append_value(tc_impact);
 
-                // Existing_variation (List<Utf8>) — from colocated data
-                if !existing_var.is_empty() {
-                    let vals = b_existing_variation.values();
-                    for v in existing_var.split(',') {
-                        vals.append_value(v.trim());
-                    }
-                    b_existing_variation.append(true);
-                } else {
-                    b_existing_variation.append(false);
-                }
-
-                // DISTANCE (Int64)
-                match tc.distance {
-                    Some(d) => b_distance.append_value(d),
-                    None => b_distance.append_null(),
-                }
-
-                // STRAND (Int8)
-                match tx_opt {
-                    Some(tx) => b_strand.append_value(if tx.strand >= 0 { 1 } else { -1 }),
-                    None => b_strand.append_null(),
-                }
-
-                // FLAGS
-                append_opt_str(&mut b_flags, tc.flags.as_deref());
-
-                // VARIANT_CLASS
-                b_variant_class.append_value(variant_class);
-
-                // SYMBOL_SOURCE, HGNC_ID
-                append_opt_str(
-                    &mut b_symbol_source,
-                    tx_opt.and_then(|tx| tx.gene_symbol_source.as_deref()),
-                );
-                append_opt_str(
-                    &mut b_hgnc_id,
-                    tx_opt.and_then(|tx| tx.gene_hgnc_id.as_deref()),
-                );
-
-                // CANONICAL
-                match tx_opt {
-                    Some(tx) => {
-                        if tx.is_canonical {
-                            b_canonical.append_value("YES");
-                        } else {
-                            b_canonical.append_null();
-                        }
-                    }
-                    None => b_canonical.append_null(),
-                }
-
-                // MANE
-                if flags.everything {
-                    let mane_val = if tx_opt.and_then(|tx| tx.mane_select.as_deref()).is_some() {
-                        Some("MANE_Select")
-                    } else if tx_opt
-                        .and_then(|tx| tx.mane_plus_clinical.as_deref())
-                        .is_some()
-                    {
-                        Some("MANE_Plus_Clinical")
-                    } else {
-                        None
-                    };
-                    append_opt_str(&mut b_mane, mane_val);
-                } else {
-                    b_mane.append_null();
-                }
-
-                // MANE_SELECT, MANE_PLUS_CLINICAL
-                append_opt_str(
-                    &mut b_mane_select,
-                    tx_opt.and_then(|tx| tx.mane_select.as_deref()),
-                );
-                append_opt_str(
-                    &mut b_mane_plus_clinical,
-                    tx_opt.and_then(|tx| tx.mane_plus_clinical.as_deref()),
-                );
-
-                // TSL (Int8)
-                match tx_opt.and_then(|tx| tx.tsl) {
-                    Some(v) => b_tsl.append_value(v as i8),
-                    None => b_tsl.append_null(),
-                }
-
-                // APPRIS
-                if flags.everything {
-                    match tx_opt.and_then(|tx| tx.appris.as_deref()) {
-                        Some(raw) => b_appris.append_value(format_appris(raw)),
-                        None => b_appris.append_null(),
-                    }
-                } else {
-                    b_appris.append_null();
-                }
-
-                // CCDS, ENSP, SWISSPROT, TREMBL, UNIPARC, UNIPROT_ISOFORM
-                append_opt_str(&mut b_ccds, tx_opt.and_then(|tx| tx.ccds.as_deref()));
-                append_opt_str(
-                    &mut b_ensp,
-                    tx_opt.and_then(|tx| tx.translation_stable_id.as_deref()),
-                );
-                append_opt_str(
-                    &mut b_swissprot,
-                    tx_opt.and_then(|tx| tx.swissprot.as_deref()),
-                );
-                append_opt_str(&mut b_trembl, tx_opt.and_then(|tx| tx.trembl.as_deref()));
-                append_opt_str(&mut b_uniparc, tx_opt.and_then(|tx| tx.uniparc.as_deref()));
-                append_opt_str(
-                    &mut b_uniprot_isoform,
-                    tx_opt.and_then(|tx| tx.uniprot_isoform.as_deref()),
-                );
-
-                // GENE_PHENO
-                match tx_opt {
-                    Some(tx) => {
-                        if tx.gene_phenotype {
-                            b_gene_pheno.append_value("1");
-                        } else {
-                            b_gene_pheno.append_null();
-                        }
-                    }
-                    None => b_gene_pheno.append_null(),
-                }
-
-                // SIFT, PolyPhen
-                if flags.everything {
-                    let (sift_str, polyphen_str) = lookup_sift_polyphen(
-                        tc.transcript_id.as_deref(),
-                        tc.protein_position.as_deref(),
-                        tc.amino_acids.as_deref(),
-                        sift_cache,
-                        #[cfg(feature = "kv-cache")]
-                        sift_kv,
-                        #[cfg(not(feature = "kv-cache"))]
-                        _sift_kv,
+                    // SYMBOL, Gene
+                    append_opt_str(
+                        &mut b_symbol,
+                        tx_opt.and_then(|tx| tx.gene_symbol.as_deref()),
                     );
                     append_opt_str(
-                        &mut b_sift,
-                        if sift_str.is_empty() {
+                        &mut b_gene,
+                        tx_opt.and_then(|tx| tx.gene_stable_id.as_deref()),
+                    );
+
+                    // Feature_type, Feature
+                    let ft_str = tc.feature_type.as_str();
+                    append_opt_str(
+                        &mut b_feature_type,
+                        if ft_str.is_empty() {
                             None
                         } else {
-                            Some(&sift_str)
+                            Some(ft_str)
                         },
+                    );
+                    append_opt_str(&mut b_feature, tc.transcript_id.as_deref());
+
+                    // BIOTYPE
+                    let biotype = tc
+                        .biotype_override
+                        .as_deref()
+                        .unwrap_or(tx_opt.map(|tx| tx.biotype.as_str()).unwrap_or(""));
+                    append_opt_str(
+                        &mut b_biotype,
+                        if biotype.is_empty() {
+                            None
+                        } else {
+                            Some(biotype)
+                        },
+                    );
+
+                    // EXON, INTRON
+                    append_opt_str(&mut b_exon, tc.exon_str.as_deref());
+                    append_opt_str(&mut b_intron, tc.intron_str.as_deref());
+
+                    // HGVSc, HGVSp
+                    if hgvs_flags.hgvsc {
+                        append_opt_str(&mut b_hgvsc, tc.hgvsc.as_deref());
+                    } else {
+                        b_hgvsc.append_null();
+                    }
+                    if hgvs_flags.hgvsp {
+                        let hgvsp_val = tc.hgvsp.as_deref().map(|value| {
+                            Self::format_hgvsp_output(
+                                value,
+                                hgvs_flags.remove_hgvsp_version,
+                                hgvs_flags.no_escape,
+                                hgvs_flags.hgvsp_use_prediction,
+                            )
+                        });
+                        match hgvsp_val {
+                            Some(v) if !v.is_empty() => b_hgvsp.append_value(&v),
+                            _ => b_hgvsp.append_null(),
+                        }
+                    } else {
+                        b_hgvsp.append_null();
+                    }
+
+                    // cDNA_position, CDS_position, Protein_position, Amino_acids, Codons
+                    append_opt_str(&mut b_cdna_position, tc.cdna_position.as_deref());
+                    append_opt_str(&mut b_cds_position, tc.cds_position.as_deref());
+                    append_opt_str(&mut b_protein_position, tc.protein_position.as_deref());
+                    append_opt_str(&mut b_amino_acids, tc.amino_acids.as_deref());
+                    append_opt_str(&mut b_codons, tc.codons.as_deref());
+
+                    // Existing_variation (List<Utf8>) — from colocated data
+                    if !existing_var.is_empty() {
+                        let vals = b_existing_variation.values();
+                        for v in existing_var.split(',') {
+                            vals.append_value(v.trim());
+                        }
+                        b_existing_variation.append(true);
+                    } else {
+                        b_existing_variation.append(false);
+                    }
+
+                    // DISTANCE (Int64)
+                    match tc.distance {
+                        Some(d) => b_distance.append_value(d),
+                        None => b_distance.append_null(),
+                    }
+
+                    // STRAND (Int8)
+                    match tx_opt {
+                        Some(tx) => b_strand.append_value(if tx.strand >= 0 { 1 } else { -1 }),
+                        None => b_strand.append_null(),
+                    }
+
+                    // FLAGS
+                    append_opt_str(&mut b_flags, tc.flags.as_deref());
+
+                    // VARIANT_CLASS
+                    b_variant_class.append_value(variant_class);
+
+                    // SYMBOL_SOURCE, HGNC_ID
+                    append_opt_str(
+                        &mut b_symbol_source,
+                        tx_opt.and_then(|tx| tx.gene_symbol_source.as_deref()),
                     );
                     append_opt_str(
-                        &mut b_polyphen,
-                        if polyphen_str.is_empty() {
-                            None
-                        } else {
-                            Some(&polyphen_str)
-                        },
+                        &mut b_hgnc_id,
+                        tx_opt.and_then(|tx| tx.gene_hgnc_id.as_deref()),
                     );
-                } else {
-                    b_sift.append_null();
-                    b_polyphen.append_null();
-                }
 
-                // DOMAINS (List<Utf8>)
-                if flags.everything {
-                    let is_coding = tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
-                    if is_coding {
-                        let domains_str = lookup_domains(
+                    // CANONICAL
+                    match tx_opt {
+                        Some(tx) => {
+                            if tx.is_canonical {
+                                b_canonical.append_value("YES");
+                            } else {
+                                b_canonical.append_null();
+                            }
+                        }
+                        None => b_canonical.append_null(),
+                    }
+
+                    // MANE
+                    if flags.everything {
+                        let mane_val = if tx_opt.and_then(|tx| tx.mane_select.as_deref()).is_some()
+                        {
+                            Some("MANE_Select")
+                        } else if tx_opt
+                            .and_then(|tx| tx.mane_plus_clinical.as_deref())
+                            .is_some()
+                        {
+                            Some("MANE_Plus_Clinical")
+                        } else {
+                            None
+                        };
+                        append_opt_str(&mut b_mane, mane_val);
+                    } else {
+                        b_mane.append_null();
+                    }
+
+                    // MANE_SELECT, MANE_PLUS_CLINICAL
+                    append_opt_str(
+                        &mut b_mane_select,
+                        tx_opt.and_then(|tx| tx.mane_select.as_deref()),
+                    );
+                    append_opt_str(
+                        &mut b_mane_plus_clinical,
+                        tx_opt.and_then(|tx| tx.mane_plus_clinical.as_deref()),
+                    );
+
+                    // TSL (Int8)
+                    match tx_opt.and_then(|tx| tx.tsl) {
+                        Some(v) => b_tsl.append_value(v as i8),
+                        None => b_tsl.append_null(),
+                    }
+
+                    // APPRIS
+                    if flags.everything {
+                        match tx_opt.and_then(|tx| tx.appris.as_deref()) {
+                            Some(raw) => b_appris.append_value(format_appris(raw)),
+                            None => b_appris.append_null(),
+                        }
+                    } else {
+                        b_appris.append_null();
+                    }
+
+                    // CCDS, ENSP, SWISSPROT, TREMBL, UNIPARC, UNIPROT_ISOFORM
+                    append_opt_str(&mut b_ccds, tx_opt.and_then(|tx| tx.ccds.as_deref()));
+                    append_opt_str(
+                        &mut b_ensp,
+                        tx_opt.and_then(|tx| tx.translation_stable_id.as_deref()),
+                    );
+                    append_opt_str(
+                        &mut b_swissprot,
+                        tx_opt.and_then(|tx| tx.swissprot.as_deref()),
+                    );
+                    append_opt_str(&mut b_trembl, tx_opt.and_then(|tx| tx.trembl.as_deref()));
+                    append_opt_str(&mut b_uniparc, tx_opt.and_then(|tx| tx.uniparc.as_deref()));
+                    append_opt_str(
+                        &mut b_uniprot_isoform,
+                        tx_opt.and_then(|tx| tx.uniprot_isoform.as_deref()),
+                    );
+
+                    // GENE_PHENO
+                    match tx_opt {
+                        Some(tx) => {
+                            if tx.gene_phenotype {
+                                b_gene_pheno.append_value("1");
+                            } else {
+                                b_gene_pheno.append_null();
+                            }
+                        }
+                        None => b_gene_pheno.append_null(),
+                    }
+
+                    // SIFT, PolyPhen
+                    if flags.everything {
+                        let (sift_str, polyphen_str) = lookup_sift_polyphen(
                             tc.transcript_id.as_deref(),
                             tc.protein_position.as_deref(),
                             tc.amino_acids.as_deref(),
-                            ctx,
+                            sift_cache,
+                            #[cfg(feature = "kv-cache")]
+                            sift_kv,
+                            #[cfg(not(feature = "kv-cache"))]
+                            _sift_kv,
                         );
-                        if !domains_str.is_empty() {
-                            let vals = b_domains.values();
-                            for d in domains_str.split('&') {
-                                vals.append_value(d);
+                        append_opt_str(
+                            &mut b_sift,
+                            if sift_str.is_empty() {
+                                None
+                            } else {
+                                Some(&sift_str)
+                            },
+                        );
+                        append_opt_str(
+                            &mut b_polyphen,
+                            if polyphen_str.is_empty() {
+                                None
+                            } else {
+                                Some(&polyphen_str)
+                            },
+                        );
+                    } else {
+                        b_sift.append_null();
+                        b_polyphen.append_null();
+                    }
+
+                    // DOMAINS (List<Utf8>)
+                    if flags.everything {
+                        let is_coding = tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
+                        if is_coding {
+                            let domains_str = lookup_domains(
+                                tc.transcript_id.as_deref(),
+                                tc.protein_position.as_deref(),
+                                tc.amino_acids.as_deref(),
+                                ctx,
+                            );
+                            if !domains_str.is_empty() {
+                                let vals = b_domains.values();
+                                for d in domains_str.split('&') {
+                                    vals.append_value(d);
+                                }
+                                b_domains.append(true);
+                            } else {
+                                b_domains.append(false);
                             }
-                            b_domains.append(true);
                         } else {
                             b_domains.append(false);
                         }
                     } else {
                         b_domains.append(false);
                     }
-                } else {
-                    b_domains.append(false);
-                }
 
-                // miRNA
-                if flags.everything {
-                    let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
-                    let biotype_for_mirna = tc
-                        .biotype_override
-                        .as_deref()
-                        .unwrap_or(tx_opt.map(|tx| tx.biotype.as_str()).unwrap_or(""));
-                    let (cs, ce) = tc
-                        .cdna_position
-                        .as_deref()
-                        .and_then(|p| {
-                            if let Some((a, b)) = p.split_once('-') {
-                                Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
-                            } else {
-                                let v = p.parse::<usize>().ok()?;
-                                Some((v, v))
-                            }
-                        })
-                        .unwrap_or((0, 0));
-                    let mirna_val = if cs > 0 {
-                        mirna_structure_field(ncrna, biotype_for_mirna, Some(cs), Some(ce))
-                    } else {
-                        String::new()
-                    };
-                    append_opt_str(
-                        &mut b_mirna,
-                        if mirna_val.is_empty() {
-                            None
+                    // miRNA
+                    if flags.everything {
+                        let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
+                        let biotype_for_mirna = tc
+                            .biotype_override
+                            .as_deref()
+                            .unwrap_or(tx_opt.map(|tx| tx.biotype.as_str()).unwrap_or(""));
+                        let (cs, ce) = tc
+                            .cdna_position
+                            .as_deref()
+                            .and_then(|p| {
+                                if let Some((a, b)) = p.split_once('-') {
+                                    Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                                } else {
+                                    let v = p.parse::<usize>().ok()?;
+                                    Some((v, v))
+                                }
+                            })
+                            .unwrap_or((0, 0));
+                        let mirna_val = if cs > 0 {
+                            mirna_structure_field(ncrna, biotype_for_mirna, Some(cs), Some(ce))
                         } else {
-                            Some(&mirna_val)
-                        },
-                    );
-                } else {
-                    b_mirna.append_null();
-                }
+                            String::new()
+                        };
+                        append_opt_str(
+                            &mut b_mirna,
+                            if mirna_val.is_empty() {
+                                None
+                            } else {
+                                Some(&mirna_val)
+                            },
+                        );
+                    } else {
+                        b_mirna.append_null();
+                    }
 
-                // HGVS_OFFSET (Int64)
-                if flags.everything && hgvs_flags.hgvsc && tc.hgvsc.is_some() {
-                    let tx_strand = tx_opt.map(|tx| tx.strand).unwrap_or(1);
-                    let offset_val = row_variant
-                        .as_ref()
-                        .and_then(|v| v.hgvs_shift_for_strand(tx_strand))
-                        .filter(|s| s.shift_length > 0)
-                        .map(|s| {
-                            let signed = s.shift_length as i64;
-                            if tx_strand < 0 { -signed } else { signed }
-                        });
-                    match offset_val {
-                        Some(v) => b_hgvs_offset.append_value(v),
-                        None => b_hgvs_offset.append_null(),
+                    // HGVS_OFFSET (Int64)
+                    if flags.everything && hgvs_flags.hgvsc && tc.hgvsc.is_some() {
+                        let tx_strand = tx_opt.map(|tx| tx.strand).unwrap_or(1);
+                        let offset_val = row_variant
+                            .as_ref()
+                            .and_then(|v| v.hgvs_shift_for_strand(tx_strand))
+                            .filter(|s| s.shift_length > 0)
+                            .map(|s| {
+                                let signed = s.shift_length as i64;
+                                if tx_strand < 0 { -signed } else { signed }
+                            });
+                        match offset_val {
+                            Some(v) => b_hgvs_offset.append_value(v),
+                            None => b_hgvs_offset.append_null(),
+                        }
+                    } else {
+                        b_hgvs_offset.append_null();
                     }
                 } else {
+                    // Cache-hit path: transcript-level columns are NULL (no engine assignment).
+                    b_allele.append_value(&vep_allele);
+                    b_consequence.append(false); // NULL list
+                    b_impact.append_null();
+                    b_symbol.append_null();
+                    b_gene.append_null();
+                    b_feature_type.append_null();
+                    b_feature.append_null();
+                    b_biotype.append_null();
+                    b_exon.append_null();
+                    b_intron.append_null();
+                    b_hgvsc.append_null();
+                    b_hgvsp.append_null();
+                    b_cdna_position.append_null();
+                    b_cds_position.append_null();
+                    b_protein_position.append_null();
+                    b_amino_acids.append_null();
+                    b_codons.append_null();
+                    // Existing_variation: still from colocated data even for cache-hit
+                    if !existing_var.is_empty() {
+                        let vals = b_existing_variation.values();
+                        for v in existing_var.split(',') {
+                            vals.append_value(v.trim());
+                        }
+                        b_existing_variation.append(true);
+                    } else {
+                        b_existing_variation.append(false);
+                    }
+                    b_distance.append_null();
+                    b_strand.append_null();
+                    b_flags.append_null();
+                    b_variant_class.append_value(variant_class);
+                    b_symbol_source.append_null();
+                    b_hgnc_id.append_null();
+                    b_canonical.append_null();
+                    b_mane.append_null();
+                    b_mane_select.append_null();
+                    b_mane_plus_clinical.append_null();
+                    b_tsl.append_null();
+                    b_appris.append_null();
+                    b_ccds.append_null();
+                    b_ensp.append_null();
+                    b_swissprot.append_null();
+                    b_trembl.append_null();
+                    b_uniparc.append_null();
+                    b_uniprot_isoform.append_null();
+                    b_gene_pheno.append_null();
+                    b_sift.append_null();
+                    b_polyphen.append_null();
+                    b_domains.append(false);
+                    b_mirna.append_null();
                     b_hgvs_offset.append_null();
                 }
-            } else {
-                // Cache-hit path: transcript-level columns are NULL (no engine assignment).
-                b_allele.append_value(&vep_allele);
-                b_consequence.append(false); // NULL list
-                b_impact.append_null();
-                b_symbol.append_null();
-                b_gene.append_null();
-                b_feature_type.append_null();
-                b_feature.append_null();
-                b_biotype.append_null();
-                b_exon.append_null();
-                b_intron.append_null();
-                b_hgvsc.append_null();
-                b_hgvsp.append_null();
-                b_cdna_position.append_null();
-                b_cds_position.append_null();
-                b_protein_position.append_null();
-                b_amino_acids.append_null();
-                b_codons.append_null();
-                // Existing_variation: still from colocated data even for cache-hit
-                if !existing_var.is_empty() {
-                    let vals = b_existing_variation.values();
-                    for v in existing_var.split(',') {
-                        vals.append_value(v.trim());
-                    }
-                    b_existing_variation.append(true);
-                } else {
-                    b_existing_variation.append(false);
-                }
-                b_distance.append_null();
-                b_strand.append_null();
-                b_flags.append_null();
-                b_variant_class.append_value(variant_class);
-                b_symbol_source.append_null();
-                b_hgnc_id.append_null();
-                b_canonical.append_null();
-                b_mane.append_null();
-                b_mane_select.append_null();
-                b_mane_plus_clinical.append_null();
-                b_tsl.append_null();
-                b_appris.append_null();
-                b_ccds.append_null();
-                b_ensp.append_null();
-                b_swissprot.append_null();
-                b_trembl.append_null();
-                b_uniparc.append_null();
-                b_uniprot_isoform.append_null();
-                b_gene_pheno.append_null();
-                b_sift.append_null();
-                b_polyphen.append_null();
-                b_domains.append(false);
-                b_mirna.append_null();
-                b_hgvs_offset.append_null();
-            }
 
-            // -- Frequency columns (29) --
-            // AF columns: parse resolved frequency strings to Float32.
-            for (i, af_val) in frequency_fields.af_values.iter().enumerate() {
-                if i < b_af.len() {
-                    if af_val.is_empty() {
-                        b_af[i].append_null();
-                    } else {
-                        match af_val.parse::<f32>() {
-                            Ok(v) => b_af[i].append_value(v),
-                            Err(_) => b_af[i].append_null(),
+                // -- Frequency columns (29) --
+                // AF columns: parse resolved frequency strings to Float32.
+                for (i, af_val) in frequency_fields.af_values.iter().enumerate() {
+                    if i < b_af.len() {
+                        if af_val.is_empty() {
+                            b_af[i].append_null();
+                        } else {
+                            match af_val.parse::<f32>() {
+                                Ok(v) => b_af[i].append_value(v),
+                                Err(_) => b_af[i].append_null(),
+                            }
                         }
                     }
                 }
-            }
-            // Pad any missing AF columns (if frequency_fields has fewer than 27 entries).
-            for i in frequency_fields.af_values.len()..b_af.len() {
-                b_af[i].append_null();
-            }
-            // MAX_AF
-            if frequency_fields.max_af.is_empty() {
-                b_max_af.append_null();
-            } else {
-                match frequency_fields.max_af.parse::<f32>() {
-                    Ok(v) => b_max_af.append_value(v),
-                    Err(_) => b_max_af.append_null(),
+                // Pad any missing AF columns (if frequency_fields has fewer than 27 entries).
+                for i in frequency_fields.af_values.len()..b_af.len() {
+                    b_af[i].append_null();
                 }
-            }
-            // MAX_AF_POPS
-            append_opt_str(
-                &mut b_max_af_pops,
-                if frequency_fields.max_af_pops.is_empty() {
-                    None
+                // MAX_AF
+                if frequency_fields.max_af.is_empty() {
+                    b_max_af.append_null();
                 } else {
-                    Some(&frequency_fields.max_af_pops)
-                },
-            );
+                    match frequency_fields.max_af.parse::<f32>() {
+                        Ok(v) => b_max_af.append_value(v),
+                        Err(_) => b_max_af.append_null(),
+                    }
+                }
+                // MAX_AF_POPS
+                append_opt_str(
+                    &mut b_max_af_pops,
+                    if frequency_fields.max_af_pops.is_empty() {
+                        None
+                    } else {
+                        Some(&frequency_fields.max_af_pops)
+                    },
+                );
 
-            // -- Variant-level columns (9) --
-            // CLIN_SIG (List<Utf8>)
-            if !variant_fields.clin_sig.is_empty() {
-                let vals = b_clin_sig.values();
-                for v in variant_fields.clin_sig.split(',') {
-                    vals.append_value(v.trim());
-                }
-                b_clin_sig.append(true);
-            } else {
-                b_clin_sig.append(false);
-            }
-            // SOMATIC
-            append_opt_str(
-                &mut b_somatic,
-                if variant_fields.somatic.is_empty() {
-                    None
+                // -- Variant-level columns (9) --
+                // CLIN_SIG (List<Utf8>)
+                if !variant_fields.clin_sig.is_empty() {
+                    let vals = b_clin_sig.values();
+                    for v in variant_fields.clin_sig.split(',') {
+                        vals.append_value(v.trim());
+                    }
+                    b_clin_sig.append(true);
                 } else {
-                    Some(&variant_fields.somatic)
-                },
-            );
-            // PHENO
-            append_opt_str(
-                &mut b_pheno,
-                if variant_fields.pheno.is_empty() {
-                    None
-                } else {
-                    Some(&variant_fields.pheno)
-                },
-            );
-            // PUBMED (List<Utf8>)
-            if !variant_fields.pubmed.is_empty() {
-                let vals = b_pubmed.values();
-                for v in variant_fields.pubmed.split(',') {
-                    vals.append_value(v.trim());
+                    b_clin_sig.append(false);
                 }
-                b_pubmed.append(true);
-            } else {
-                b_pubmed.append(false);
-            }
-            // MOTIF_NAME, MOTIF_POS, HIGH_INF_POS, MOTIF_SCORE_CHANGE, TRANSCRIPTION_FACTORS
-            // These are currently not populated (always NULL) — they require motif feature
-            // consequence data that is not yet exposed in the per-transcript CSQ path.
-            b_motif_name.append_null();
-            b_motif_pos.append_null();
-            b_high_inf_pos.append_null();
-            b_motif_score_change.append_null();
-            b_transcription_factors.append(false);
+                // SOMATIC
+                append_opt_str(
+                    &mut b_somatic,
+                    if variant_fields.somatic.is_empty() {
+                        None
+                    } else {
+                        Some(&variant_fields.somatic)
+                    },
+                );
+                // PHENO
+                append_opt_str(
+                    &mut b_pheno,
+                    if variant_fields.pheno.is_empty() {
+                        None
+                    } else {
+                        Some(&variant_fields.pheno)
+                    },
+                );
+                // PUBMED (List<Utf8>)
+                if !variant_fields.pubmed.is_empty() {
+                    let vals = b_pubmed.values();
+                    for v in variant_fields.pubmed.split(',') {
+                        vals.append_value(v.trim());
+                    }
+                    b_pubmed.append(true);
+                } else {
+                    b_pubmed.append(false);
+                }
+                // MOTIF_NAME, MOTIF_POS, HIGH_INF_POS, MOTIF_SCORE_CHANGE, TRANSCRIPTION_FACTORS
+                // These are currently not populated (always NULL) — they require motif feature
+                // consequence data that is not yet exposed in the per-transcript CSQ path.
+                b_motif_name.append_null();
+                b_motif_pos.append_null();
+                b_high_inf_pos.append_null();
+                b_motif_score_change.append_null();
+                b_transcription_factors.append(false);
 
-            // -- Cache-only columns (7) --
-            // Read from the intermediate batch's cache_ columns.
-            // clin_sig_allele (List<Utf8>, semicolon-separated)
-            match schema
-                .index_of("cache_clin_sig_allele")
-                .ok()
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-            {
-                Some(v) if !v.is_empty() => {
-                    let vals = b_clin_sig_allele.values();
-                    for s in v.split(';') {
-                        vals.append_value(s.trim());
+                // -- Cache-only columns (7) --
+                // Read from the intermediate batch's cache_ columns.
+                // clin_sig_allele (List<Utf8>, semicolon-separated)
+                match schema
+                    .index_of("cache_clin_sig_allele")
+                    .ok()
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                {
+                    Some(v) if !v.is_empty() => {
+                        let vals = b_clin_sig_allele.values();
+                        for s in v.split(';') {
+                            vals.append_value(s.trim());
+                        }
+                        b_clin_sig_allele.append(true);
                     }
-                    b_clin_sig_allele.append(true);
+                    _ => b_clin_sig_allele.append(false),
                 }
-                _ => b_clin_sig_allele.append(false),
-            }
-            // clinical_impact
-            match schema
-                .index_of("cache_clinical_impact")
-                .ok()
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-            {
-                Some(v) if !v.is_empty() => b_clinical_impact.append_value(&v),
-                _ => b_clinical_impact.append_null(),
-            }
-            // minor_allele
-            match schema
-                .index_of("cache_minor_allele")
-                .ok()
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-            {
-                Some(v) if !v.is_empty() => b_minor_allele.append_value(&v),
-                _ => b_minor_allele.append_null(),
-            }
-            // minor_allele_freq (Float32)
-            match schema
-                .index_of("cache_minor_allele_freq")
-                .ok()
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-            {
-                Some(v) if !v.is_empty() => match v.parse::<f32>() {
-                    Ok(f) => b_minor_allele_freq.append_value(f),
-                    Err(_) => b_minor_allele_freq.append_null(),
-                },
-                _ => b_minor_allele_freq.append_null(),
-            }
-            // clinvar_ids (List<Utf8>)
-            match schema
-                .index_of("cache_clinvar_ids")
-                .ok()
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-            {
-                Some(v) if !v.is_empty() => {
-                    let vals = b_clinvar_ids.values();
-                    for s in v.split(',') {
-                        vals.append_value(s.trim());
+                // clinical_impact
+                match schema
+                    .index_of("cache_clinical_impact")
+                    .ok()
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                {
+                    Some(v) if !v.is_empty() => b_clinical_impact.append_value(&v),
+                    _ => b_clinical_impact.append_null(),
+                }
+                // minor_allele
+                match schema
+                    .index_of("cache_minor_allele")
+                    .ok()
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                {
+                    Some(v) if !v.is_empty() => b_minor_allele.append_value(&v),
+                    _ => b_minor_allele.append_null(),
+                }
+                // minor_allele_freq (Float32)
+                match schema
+                    .index_of("cache_minor_allele_freq")
+                    .ok()
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                {
+                    Some(v) if !v.is_empty() => match v.parse::<f32>() {
+                        Ok(f) => b_minor_allele_freq.append_value(f),
+                        Err(_) => b_minor_allele_freq.append_null(),
+                    },
+                    _ => b_minor_allele_freq.append_null(),
+                }
+                // clinvar_ids (List<Utf8>)
+                match schema
+                    .index_of("cache_clinvar_ids")
+                    .ok()
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                {
+                    Some(v) if !v.is_empty() => {
+                        let vals = b_clinvar_ids.values();
+                        for s in v.split(',') {
+                            vals.append_value(s.trim());
+                        }
+                        b_clinvar_ids.append(true);
                     }
-                    b_clinvar_ids.append(true);
+                    _ => b_clinvar_ids.append(false),
                 }
-                _ => b_clinvar_ids.append(false),
-            }
-            // cosmic_ids (List<Utf8>)
-            match schema
-                .index_of("cache_cosmic_ids")
-                .ok()
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-            {
-                Some(v) if !v.is_empty() => {
-                    let vals = b_cosmic_ids.values();
-                    for s in v.split(',') {
-                        vals.append_value(s.trim());
+                // cosmic_ids (List<Utf8>)
+                match schema
+                    .index_of("cache_cosmic_ids")
+                    .ok()
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                {
+                    Some(v) if !v.is_empty() => {
+                        let vals = b_cosmic_ids.values();
+                        for s in v.split(',') {
+                            vals.append_value(s.trim());
+                        }
+                        b_cosmic_ids.append(true);
                     }
-                    b_cosmic_ids.append(true);
+                    _ => b_cosmic_ids.append(false),
                 }
-                _ => b_cosmic_ids.append(false),
-            }
-            // dbsnp_ids (List<Utf8>)
-            match schema
-                .index_of("cache_dbsnp_ids")
-                .ok()
-                .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-            {
-                Some(v) if !v.is_empty() => {
-                    let vals = b_dbsnp_ids.values();
-                    for s in v.split(',') {
-                        vals.append_value(s.trim());
+                // dbsnp_ids (List<Utf8>)
+                match schema
+                    .index_of("cache_dbsnp_ids")
+                    .ok()
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                {
+                    Some(v) if !v.is_empty() => {
+                        let vals = b_dbsnp_ids.values();
+                        for s in v.split(',') {
+                            vals.append_value(s.trim());
+                        }
+                        b_dbsnp_ids.append(true);
                     }
-                    b_dbsnp_ids.append(true);
+                    _ => b_dbsnp_ids.append(false),
                 }
-                _ => b_dbsnp_ids.append(false),
-            }
+            } // end if !skip_typed_cols
         } // end per-row loop
 
         // --- Build output columns ---
@@ -4591,73 +4598,80 @@ impl AnnotateProvider {
         out_cols.push(Arc::new(csq_builder.finish()));
         out_cols.push(Arc::new(most_builder.finish()));
 
-        // Transcript-level columns (42)
-        out_cols.push(Arc::new(b_allele.finish()));
-        out_cols.push(Arc::new(b_consequence.finish()));
-        out_cols.push(Arc::new(b_impact.finish()));
-        out_cols.push(Arc::new(b_symbol.finish()));
-        out_cols.push(Arc::new(b_gene.finish()));
-        out_cols.push(Arc::new(b_feature_type.finish()));
-        out_cols.push(Arc::new(b_feature.finish()));
-        out_cols.push(Arc::new(b_biotype.finish()));
-        out_cols.push(Arc::new(b_exon.finish()));
-        out_cols.push(Arc::new(b_intron.finish()));
-        out_cols.push(Arc::new(b_hgvsc.finish()));
-        out_cols.push(Arc::new(b_hgvsp.finish()));
-        out_cols.push(Arc::new(b_cdna_position.finish()));
-        out_cols.push(Arc::new(b_cds_position.finish()));
-        out_cols.push(Arc::new(b_protein_position.finish()));
-        out_cols.push(Arc::new(b_amino_acids.finish()));
-        out_cols.push(Arc::new(b_codons.finish()));
-        out_cols.push(Arc::new(b_existing_variation.finish()));
-        out_cols.push(Arc::new(b_distance.finish()));
-        out_cols.push(Arc::new(b_strand.finish()));
-        out_cols.push(Arc::new(b_flags.finish()));
-        out_cols.push(Arc::new(b_variant_class.finish()));
-        out_cols.push(Arc::new(b_symbol_source.finish()));
-        out_cols.push(Arc::new(b_hgnc_id.finish()));
-        out_cols.push(Arc::new(b_canonical.finish()));
-        out_cols.push(Arc::new(b_mane.finish()));
-        out_cols.push(Arc::new(b_mane_select.finish()));
-        out_cols.push(Arc::new(b_mane_plus_clinical.finish()));
-        out_cols.push(Arc::new(b_tsl.finish()));
-        out_cols.push(Arc::new(b_appris.finish()));
-        out_cols.push(Arc::new(b_ccds.finish()));
-        out_cols.push(Arc::new(b_ensp.finish()));
-        out_cols.push(Arc::new(b_swissprot.finish()));
-        out_cols.push(Arc::new(b_trembl.finish()));
-        out_cols.push(Arc::new(b_uniparc.finish()));
-        out_cols.push(Arc::new(b_uniprot_isoform.finish()));
-        out_cols.push(Arc::new(b_gene_pheno.finish()));
-        out_cols.push(Arc::new(b_sift.finish()));
-        out_cols.push(Arc::new(b_polyphen.finish()));
-        out_cols.push(Arc::new(b_domains.finish()));
-        out_cols.push(Arc::new(b_mirna.finish()));
-        out_cols.push(Arc::new(b_hgvs_offset.finish()));
-        // Frequency columns (29)
-        for af_b in b_af.iter_mut() {
-            out_cols.push(Arc::new(af_b.finish()));
+        // 87 typed annotation columns — skip building when not projected.
+        if skip_typed_cols {
+            for col_def in annotation_column_defs() {
+                out_cols.push(new_null_array(&col_def.data_type, batch.num_rows()));
+            }
+        } else {
+            // Transcript-level columns (42)
+            out_cols.push(Arc::new(b_allele.finish()));
+            out_cols.push(Arc::new(b_consequence.finish()));
+            out_cols.push(Arc::new(b_impact.finish()));
+            out_cols.push(Arc::new(b_symbol.finish()));
+            out_cols.push(Arc::new(b_gene.finish()));
+            out_cols.push(Arc::new(b_feature_type.finish()));
+            out_cols.push(Arc::new(b_feature.finish()));
+            out_cols.push(Arc::new(b_biotype.finish()));
+            out_cols.push(Arc::new(b_exon.finish()));
+            out_cols.push(Arc::new(b_intron.finish()));
+            out_cols.push(Arc::new(b_hgvsc.finish()));
+            out_cols.push(Arc::new(b_hgvsp.finish()));
+            out_cols.push(Arc::new(b_cdna_position.finish()));
+            out_cols.push(Arc::new(b_cds_position.finish()));
+            out_cols.push(Arc::new(b_protein_position.finish()));
+            out_cols.push(Arc::new(b_amino_acids.finish()));
+            out_cols.push(Arc::new(b_codons.finish()));
+            out_cols.push(Arc::new(b_existing_variation.finish()));
+            out_cols.push(Arc::new(b_distance.finish()));
+            out_cols.push(Arc::new(b_strand.finish()));
+            out_cols.push(Arc::new(b_flags.finish()));
+            out_cols.push(Arc::new(b_variant_class.finish()));
+            out_cols.push(Arc::new(b_symbol_source.finish()));
+            out_cols.push(Arc::new(b_hgnc_id.finish()));
+            out_cols.push(Arc::new(b_canonical.finish()));
+            out_cols.push(Arc::new(b_mane.finish()));
+            out_cols.push(Arc::new(b_mane_select.finish()));
+            out_cols.push(Arc::new(b_mane_plus_clinical.finish()));
+            out_cols.push(Arc::new(b_tsl.finish()));
+            out_cols.push(Arc::new(b_appris.finish()));
+            out_cols.push(Arc::new(b_ccds.finish()));
+            out_cols.push(Arc::new(b_ensp.finish()));
+            out_cols.push(Arc::new(b_swissprot.finish()));
+            out_cols.push(Arc::new(b_trembl.finish()));
+            out_cols.push(Arc::new(b_uniparc.finish()));
+            out_cols.push(Arc::new(b_uniprot_isoform.finish()));
+            out_cols.push(Arc::new(b_gene_pheno.finish()));
+            out_cols.push(Arc::new(b_sift.finish()));
+            out_cols.push(Arc::new(b_polyphen.finish()));
+            out_cols.push(Arc::new(b_domains.finish()));
+            out_cols.push(Arc::new(b_mirna.finish()));
+            out_cols.push(Arc::new(b_hgvs_offset.finish()));
+            // Frequency columns (29)
+            for af_b in b_af.iter_mut() {
+                out_cols.push(Arc::new(af_b.finish()));
+            }
+            out_cols.push(Arc::new(b_max_af.finish()));
+            out_cols.push(Arc::new(b_max_af_pops.finish()));
+            // Variant-level columns (9)
+            out_cols.push(Arc::new(b_clin_sig.finish()));
+            out_cols.push(Arc::new(b_somatic.finish()));
+            out_cols.push(Arc::new(b_pheno.finish()));
+            out_cols.push(Arc::new(b_pubmed.finish()));
+            out_cols.push(Arc::new(b_motif_name.finish()));
+            out_cols.push(Arc::new(b_motif_pos.finish()));
+            out_cols.push(Arc::new(b_high_inf_pos.finish()));
+            out_cols.push(Arc::new(b_motif_score_change.finish()));
+            out_cols.push(Arc::new(b_transcription_factors.finish()));
+            // Cache-only columns (7)
+            out_cols.push(Arc::new(b_clin_sig_allele.finish()));
+            out_cols.push(Arc::new(b_clinical_impact.finish()));
+            out_cols.push(Arc::new(b_minor_allele.finish()));
+            out_cols.push(Arc::new(b_minor_allele_freq.finish()));
+            out_cols.push(Arc::new(b_clinvar_ids.finish()));
+            out_cols.push(Arc::new(b_cosmic_ids.finish()));
+            out_cols.push(Arc::new(b_dbsnp_ids.finish()));
         }
-        out_cols.push(Arc::new(b_max_af.finish()));
-        out_cols.push(Arc::new(b_max_af_pops.finish()));
-        // Variant-level columns (9)
-        out_cols.push(Arc::new(b_clin_sig.finish()));
-        out_cols.push(Arc::new(b_somatic.finish()));
-        out_cols.push(Arc::new(b_pheno.finish()));
-        out_cols.push(Arc::new(b_pubmed.finish()));
-        out_cols.push(Arc::new(b_motif_name.finish()));
-        out_cols.push(Arc::new(b_motif_pos.finish()));
-        out_cols.push(Arc::new(b_high_inf_pos.finish()));
-        out_cols.push(Arc::new(b_motif_score_change.finish()));
-        out_cols.push(Arc::new(b_transcription_factors.finish()));
-        // Cache-only columns (7)
-        out_cols.push(Arc::new(b_clin_sig_allele.finish()));
-        out_cols.push(Arc::new(b_clinical_impact.finish()));
-        out_cols.push(Arc::new(b_minor_allele.finish()));
-        out_cols.push(Arc::new(b_minor_allele_freq.finish()));
-        out_cols.push(Arc::new(b_clinvar_ids.finish()));
-        out_cols.push(Arc::new(b_cosmic_ids.finish()));
-        out_cols.push(Arc::new(b_dbsnp_ids.finish()));
 
         Ok(RecordBatch::try_new(self.schema.clone(), out_cols)?)
     }
@@ -6076,6 +6090,18 @@ fn annotate_window(
     let csq_col_idx = ann.tmp_provider.vcf_field_count();
     let skip_csq = projection.map_or(true, |indices| !indices.contains(&csq_col_idx));
 
+    // The 87 typed annotation columns start at vcf_field_count + 2 (after csq
+    // and most_severe_consequence). Skip building them when none are projected
+    // — this avoids per-row transcript extraction, AF parsing, and List building
+    // for VCF output paths that only need core columns + csq.
+    let typed_cols_start = csq_col_idx + 2;
+    let typed_cols_end = typed_cols_start + annotation_column_defs().len();
+    let skip_typed_cols = projection.map_or(false, |indices| {
+        !indices
+            .iter()
+            .any(|&i| i >= typed_cols_start && i < typed_cols_end)
+    });
+
     let sift_enabled = ann.config.flags.everything;
     let mut out = VecDeque::with_capacity(window_batches.len());
 
@@ -6152,6 +6178,7 @@ fn annotate_window(
             #[cfg(not(feature = "kv-cache"))]
             &sift_kv,
             skip_csq,
+            skip_typed_cols,
             &ann.config.flags,
             &ann.config.hgvs_flags,
             ann.config.merged,
