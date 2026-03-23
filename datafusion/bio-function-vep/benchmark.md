@@ -3,7 +3,7 @@
 ## Environment
 
 - Machine: macOS Darwin 24.6.0 (Apple Silicon)
-- Rust: edition 2024, toolchain 1.88.0
+- Rust: edition 2024, toolchain 1.91.0
 - DataFusion: 52.1.0
 - fjall: 3.1.1
 
