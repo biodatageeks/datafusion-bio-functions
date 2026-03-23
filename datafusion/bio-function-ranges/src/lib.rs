@@ -1,6 +1,8 @@
+pub mod algorithms;
 pub mod array_utils;
 pub mod cluster;
 pub mod complement;
+pub mod config;
 pub mod count_overlaps;
 pub mod filter_op;
 pub mod grouped_stream;
@@ -10,15 +12,16 @@ pub mod nearest;
 pub mod nearest_index;
 pub mod overlap;
 pub mod physical_planner;
-pub mod session_context;
+pub mod session_builder;
 pub mod subtract;
 pub mod table_function;
 
 // Re-export key types
+pub use algorithms::Algorithm;
 pub use cluster::ClusterProvider;
 pub use complement::ComplementProvider;
+pub use config::BioConfig;
 pub use count_overlaps::CountOverlapsProvider;
-pub use datafusion_bio_query_planner::BioQueryPlanner;
 pub use filter_op::FilterOp;
 pub use merge::MergeProvider;
 pub use nearest::NearestProvider;
@@ -26,6 +29,6 @@ pub use overlap::OverlapProvider;
 pub use physical_planner::IntervalJoinPhysicalOptimizationRule;
 pub use physical_planner::RangesQueryPlanner;
 pub use physical_planner::joins::interval_join::IntervalJoinExec;
-pub use session_context::{Algorithm, BioConfig, BioSessionExt, create_bio_session};
+pub use session_builder::{create_ranges_session, create_ranges_session_with_config};
 pub use subtract::SubtractProvider;
 pub use table_function::register_ranges_functions;

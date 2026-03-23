@@ -1122,6 +1122,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-bio-function"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-bio-function-ranges",
+ "datafusion-bio-function-vcftools",
+ "log",
+]
+
+[[package]]
 name = "datafusion-bio-function-pileup"
 version = "0.3.1"
 dependencies = [
@@ -1144,7 +1155,6 @@ dependencies = [
  "bio",
  "coitrees",
  "datafusion",
- "datafusion-bio-query-planner",
  "futures",
  "log",
  "parking_lot",
@@ -1160,7 +1170,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "datafusion",
- "datafusion-bio-query-planner",
  "futures",
  "log",
  "parquet",
@@ -1179,6 +1188,7 @@ dependencies = [
  "coitrees",
  "datafusion",
  "datafusion-bio-format-vcf",
+ "datafusion-bio-function",
  "datafusion-bio-function-ranges",
  "env_logger",
  "fjall",
@@ -1194,15 +1204,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "zstd",
-]
-
-[[package]]
-name = "datafusion-bio-query-planner"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "datafusion",
- "log",
 ]
 
 [[package]]

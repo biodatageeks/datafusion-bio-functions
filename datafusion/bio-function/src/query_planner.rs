@@ -6,10 +6,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use log::info;
 use std::sync::Arc;
 
-/// A composable QueryPlanner built on top of DataFusion's DefaultPhysicalPlanner.
-///
-/// Feature crates can contribute extension planners and share this single
-/// implementation instead of maintaining separate QueryPlanner types.
+/// Query planner for the unified bio context.
 #[derive(Default)]
 pub struct BioQueryPlanner {
     physical_planner: DefaultPhysicalPlanner,
@@ -22,14 +19,6 @@ impl std::fmt::Debug for BioQueryPlanner {
 }
 
 impl BioQueryPlanner {
-    /// Create a planner with no extension planners configured.
-    pub fn new() -> Self {
-        Self {
-            physical_planner: DefaultPhysicalPlanner::default(),
-        }
-    }
-
-    /// Create a planner with extension planners configured.
     pub fn with_extension_planners(
         extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
     ) -> Self {

@@ -17,7 +17,8 @@ This crate provides optimized genomic interval operations as DataFusion extensio
 ## Quick Start
 
 ```rust
-use datafusion_bio_function_ranges::{create_bio_session, register_ranges_functions};
+use datafusion_bio_function::{create_bio_session, BioSessionExt};
+use datafusion_bio_function_ranges::{BioConfig, register_ranges_functions};
 
 // Option 1: Create a fully configured session (recommended)
 let ctx = create_bio_session();
@@ -25,7 +26,6 @@ let ctx = create_bio_session();
 // Option 2: Register functions on an existing bio-configured session
 use datafusion::config::ConfigOptions;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_bio_function_ranges::{BioConfig, BioSessionExt};
 
 let config = SessionConfig::from(ConfigOptions::new())
     .with_option_extension(BioConfig::default())
@@ -47,18 +47,21 @@ use datafusion_bio_function_ranges::register_ranges_functions;
 register_ranges_functions(&ctx);
 ```
 
-### `create_bio_session()`
+### Unified Bio Session (recommended)
 
-Convenience function that creates a `SessionContext` with:
-- Custom query planner for automatic interval join detection
-- Physical optimizer rule that converts hash/nested-loop joins to interval joins
+Use `datafusion-bio-function` to create a `SessionContext` with:
+- interval join optimization (from ranges)
+- fused array transform optimization (from vcftools)
 - `BioConfig` extension for algorithm selection via `SET bio.*` statements
-- All SQL table functions: `coverage()`, `count_overlaps()`, `nearest()`, `overlap()`, `merge()`, `cluster()`, `complement()`, `subtract()`
+
+Then register ranges table functions from this crate.
 
 ```rust
-use datafusion_bio_function_ranges::create_bio_session;
+use datafusion_bio_function::create_bio_session;
+use datafusion_bio_function_ranges::register_ranges_functions;
 
 let ctx = create_bio_session();
+register_ranges_functions(&ctx);
 ```
 
 ## SQL Table Functions
@@ -218,7 +221,7 @@ SELECT * FROM subtract('left_table', 'right_table', 'l_chr', 'l_s', 'l_e', 'r_ch
 
 ## Interval Join (SQL)
 
-When using a bio-configured session (`create_bio_session()` or `BioSessionExt::new_with_bio()`), SQL joins with range overlap conditions are automatically optimized:
+When using a bio-configured session (`datafusion_bio_function::create_bio_session()` or `BioSessionExt::new_with_bio()` from `datafusion-bio-function`), SQL joins with range overlap conditions are automatically optimized:
 
 ```sql
 -- Automatically detected and optimized as interval join
@@ -287,10 +290,10 @@ This crate replaces the `sequila-core` crate from the [sequila-native](https://g
 
 | sequila-native | datafusion-bio-function-ranges |
 |----------------|-------------------------------|
-| `sequila_core::session_context::SeQuiLaSessionExt` | `BioSessionExt` |
+| `sequila_core::session_context::SeQuiLaSessionExt` | `datafusion_bio_function::BioSessionExt` |
 | `sequila_core::session_context::SequilaConfig` | `BioConfig` |
 | `sequila_core::session_context::Algorithm` | `Algorithm` |
-| `SessionContext::new_with_sequila(config)` | `SessionContext::new_with_bio(config)` |
+| `SessionContext::new_with_sequila(config)` | `SessionContext::new_with_bio(config)` (from `datafusion-bio-function`) |
 
 ### Configuration Namespace
 
@@ -317,18 +320,18 @@ let ctx = SessionContext::new_with_sequila(config);
 
 **After (datafusion-bio-function-ranges):**
 ```rust
-use datafusion_bio_function_ranges::{create_bio_session, register_ranges_functions};
+use datafusion_bio_function::{create_bio_session, BioSessionExt};
+use datafusion_bio_function_ranges::{BioConfig, register_ranges_functions};
 
 // Simple: creates context with everything configured
 let ctx = create_bio_session();
+register_ranges_functions(&ctx);
 
 // Or manually:
-use datafusion_bio_function_ranges::{BioConfig, BioSessionExt};
-
 let config = SessionConfig::from(options)
     .with_option_extension(BioConfig::default());
 let ctx = SessionContext::new_with_bio(config);
-register_ranges_functions(&ctx);  // registers coverage() and count_overlaps() UDTFs
+register_ranges_functions(&ctx);  // registers ranges table functions
 ```
 
 ### New SQL Table Functions

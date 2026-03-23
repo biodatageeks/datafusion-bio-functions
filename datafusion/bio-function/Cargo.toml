@@ -1,0 +1,16 @@
+[package]
+name = "datafusion-bio-function"
+version = "0.1.0"
+description = "Unified bio SessionContext wiring for DataFusion bio functions"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+log = { workspace = true }
+datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
+datafusion-bio-function-vcftools = { path = "../bio-function-vcftools" }

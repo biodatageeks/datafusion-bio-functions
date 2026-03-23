@@ -6,7 +6,8 @@ use datafusion::config::ConfigOptions;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
-use datafusion_bio_function_ranges::session_context::{BioConfig, BioSessionExt};
+use datafusion_bio_function::BioSessionExt;
+use datafusion_bio_function_ranges::BioConfig;
 use datafusion_bio_function_vep::register_vep_functions;
 
 fn scalar_to_u64(value: ScalarValue) -> Result<u64> {

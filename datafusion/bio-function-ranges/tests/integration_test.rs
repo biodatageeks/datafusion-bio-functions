@@ -8,9 +8,9 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
-use datafusion_bio_function_ranges::session_context::{Algorithm, BioConfig, BioSessionExt};
 use datafusion_bio_function_ranges::{
-    CountOverlapsProvider, FilterOp, create_bio_session, register_ranges_functions,
+    Algorithm, BioConfig, CountOverlapsProvider, FilterOp, create_ranges_session,
+    create_ranges_session_with_config, register_ranges_functions,
 };
 
 const MERGE_INPUT_PATH: &str = "../../testing/data/merge/input.csv";
@@ -25,12 +25,19 @@ const EXPECTED_COVERAGE_PATH: &str = "../../testing/data/ranges/expected_coverag
 
 #[rstest::fixture]
 fn ctx() -> SessionContext {
-    let config = SessionConfig::from(ConfigOptions::new())
-        .with_option_extension(BioConfig::default())
-        .with_information_schema(true)
-        .with_repartition_joins(false);
+    create_bio_session()
+}
 
-    SessionContext::new_with_bio(config)
+fn create_bio_session() -> SessionContext {
+    let ctx = create_ranges_session();
+    register_ranges_functions(&ctx);
+    ctx
+}
+
+fn create_bio_session_with_config(config: SessionConfig) -> SessionContext {
+    let ctx = create_ranges_session_with_config(config);
+    register_ranges_functions(&ctx);
+    ctx
 }
 
 async fn init_tables(ctx: &SessionContext) -> Result<()> {
@@ -432,9 +439,7 @@ fn create_bio_session_with_target_partitions(target_partitions: usize) -> Sessio
         .with_information_schema(true)
         .with_repartition_joins(false)
         .with_target_partitions(target_partitions);
-    let ctx = SessionContext::new_with_bio(config);
-    register_ranges_functions(&ctx);
-    ctx
+    create_bio_session_with_config(config)
 }
 
 async fn collect_udtf_query_with_partitions(
@@ -1327,8 +1332,7 @@ async fn test_register_count_overlaps_on_existing_context() -> Result<()> {
         .with_option_extension(BioConfig::default())
         .with_information_schema(true)
         .with_repartition_joins(false);
-    let ctx = SessionContext::new_with_bio(config);
-    register_ranges_functions(&ctx);
+    let ctx = create_bio_session_with_config(config);
 
     let reads = format!(
         "CREATE EXTERNAL TABLE reads STORED AS CSV LOCATION '{RANGES_READS_PATH}' OPTIONS ('has_header' 'true')"

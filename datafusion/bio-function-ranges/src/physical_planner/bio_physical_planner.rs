@@ -1,6 +1,7 @@
+use crate::algorithms::Algorithm;
+use crate::config::BioConfig;
 use crate::physical_planner::intervals::{ColIntervals, parse};
 use crate::physical_planner::joins::interval_join::IntervalJoinExec;
-use crate::session_context::{Algorithm, BioConfig};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{NullEquality, Result};
 use datafusion::config::ConfigOptions;
