@@ -356,11 +356,78 @@ cargo run --release --example annotate_vep_golden_bench -- \
 
 This takes significantly longer (~30-60 min for chr1) as Docker VEP processes all 323k variants.
 
+## E2E Annotation Benchmark (`bench_annotate_vcf`)
+
+Full pipeline benchmark: read VCF → annotate with transcript engine → write annotated VCF. Measures end-to-end throughput including I/O.
+
+```bash
+cargo run --release --features kv-cache --example bench_annotate_vcf -- \
+  --input <vcf_path> \
+  --cache <cache_dir> \
+  --output <output.vcf> \
+  [--backend parquet|fjall] \
+  [--everything] \
+  [--extended-probes] \
+  [--reference-fasta <path>] \
+  [--compression none|gzip|bgzf] \
+  [--limit <n>]
+```
+
+### Examples
+
+```bash
+# Parquet backend, --everything, 1000 variants from golden fixtures
+cargo run --release --example bench_annotate_vcf -- \
+  --input vep-benchmark/data/golden/input_1000.vcf \
+  --cache vep-benchmark/data/golden/cache \
+  --output /tmp/annotated.vcf \
+  --everything --extended-probes \
+  --reference-fasta vep-benchmark/data/golden/reference_chr1.fa
+
+# Fjall backend, full chr1 (323K variants), gzip output
+cargo run --release --features kv-cache --example bench_annotate_vcf -- \
+  --input vep-benchmark/data/HG002_chr1.vcf.gz \
+  --cache /data/vep/wgs/fjall/115_GRCh38_vep \
+  --output /tmp/annotated_chr1.vcf.gz \
+  --backend fjall --everything --extended-probes \
+  --reference-fasta /data/vep/Homo_sapiens.GRCh38.dna.primary_assembly.fa \
+  --compression gzip
+
+# Quick smoke test with LIMIT
+cargo run --release --example bench_annotate_vcf -- \
+  --input vep-benchmark/data/golden/input_1000.vcf \
+  --cache vep-benchmark/data/golden/cache \
+  --output /tmp/quick.vcf \
+  --limit 100
+```
+
+### Output
+
+```
+=== bench_annotate_vcf ===
+  input:      vep-benchmark/data/golden/input_1000.vcf
+  cache:      vep-benchmark/data/golden/cache
+  backend:    parquet
+  everything: true
+  ...
+
+[0.7s] Annotation + VCF write complete
+
+=== Results ===
+  rows:       1000
+  time:       0.70s
+  throughput: 1419 variants/s
+  output:     13.1 MB
+  total:      0.71s (including VCF read)
+```
+
 ## Other benchmark examples
 
 | Example | Description |
 |---------|-------------|
-| `bench_annotate` | End-to-end `annotate_vep()` performance benchmark |
+| `bench_annotate_vcf` | E2E pipeline: VCF in → annotate → VCF out (parquet or fjall) |
+| `bench_annotate` | `annotate_vep()` Arrow-level performance (fjall only) |
+| `annotate_vep_golden_bench` | Golden comparison: per-field CSQ accuracy vs Ensembl VEP 115 |
 | `lookup_parquet_bench` | `lookup_variants()` with parquet backend |
 | `lookup_kv_bench` | `lookup_variants()` with fjall KV backend |
 | `bench_fjall_gets` | Raw fjall KV store read throughput |
