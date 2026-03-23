@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::Array;
 use datafusion::prelude::*;
-use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::VcfCompressionType;
+use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::{register_vep_functions, vcf_sink};
 
 /// Resolve a path relative to the workspace root.
@@ -134,25 +134,21 @@ async fn test_roundtrip_golden_all_column_values() {
     assert_eq!(input_rows, 1000, "Input should have 1000 rows");
 
     // Concatenate into single batches for easier row-by-row comparison.
-    let input_batch = datafusion::arrow::compute::concat_batches(
-        &input_batches[0].schema(),
-        &input_batches,
-    )
-    .unwrap();
-    let output_batch = datafusion::arrow::compute::concat_batches(
-        &output_batches[0].schema(),
-        &output_batches,
-    )
-    .unwrap();
-    let golden_batch = datafusion::arrow::compute::concat_batches(
-        &golden_batches[0].schema(),
-        &golden_batches,
-    )
-    .unwrap();
+    let input_batch =
+        datafusion::arrow::compute::concat_batches(&input_batches[0].schema(), &input_batches)
+            .unwrap();
+    let output_batch =
+        datafusion::arrow::compute::concat_batches(&output_batches[0].schema(), &output_batches)
+            .unwrap();
+    let golden_batch =
+        datafusion::arrow::compute::concat_batches(&golden_batches[0].schema(), &golden_batches)
+            .unwrap();
 
     // ── Step 3: Compare core VCF columns (output vs input) ─────────
     // Use Arrow array equality for fast column-level comparison.
-    let core_columns = ["chrom", "start", "end", "ref", "alt", "id", "qual", "filter"];
+    let core_columns = [
+        "chrom", "start", "end", "ref", "alt", "id", "qual", "filter",
+    ];
     for col_name in &core_columns {
         let in_idx = input_batch.schema().index_of(col_name);
         let out_idx = output_batch.schema().index_of(col_name);
@@ -263,7 +259,8 @@ async fn test_roundtrip_golden_all_column_values() {
     };
 
     let our_csq_col = output_batch.column(output_batch.schema().index_of(our_csq_name).unwrap());
-    let golden_csq_col = golden_batch.column(golden_batch.schema().index_of(golden_csq_name).unwrap());
+    let golden_csq_col =
+        golden_batch.column(golden_batch.schema().index_of(golden_csq_name).unwrap());
 
     // First try fast path: exact array equality.
     if our_csq_col.as_ref() == golden_csq_col.as_ref() {
@@ -274,10 +271,16 @@ async fn test_roundtrip_golden_all_column_values() {
             if col.is_null(row) {
                 return String::new();
             }
-            if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>() {
+            if let Some(a) = col
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+            {
                 return a.value(row).to_string();
             }
-            if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>() {
+            if let Some(a) = col
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringViewArray>()
+            {
                 return a.value(row).to_string();
             }
             String::new()

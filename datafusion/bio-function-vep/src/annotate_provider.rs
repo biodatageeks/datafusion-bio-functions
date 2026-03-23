@@ -6366,11 +6366,9 @@ impl Stream for ContigAnnotationStream {
                     // LIMIT pushdown: once we have enough buffered rows to
                     // satisfy the limit, stop pulling from the lookup stream
                     // to avoid unnecessary annotation work.
-                    let buffered_rows: usize =
-                        ann.window_buffer.iter().map(|b| b.num_rows()).sum();
-                    let limit_buffered = fetch_limit.is_some_and(|limit| {
-                        rows_emitted + buffered_rows >= limit
-                    });
+                    let buffered_rows: usize = ann.window_buffer.iter().map(|b| b.num_rows()).sum();
+                    let limit_buffered =
+                        fetch_limit.is_some_and(|limit| rows_emitted + buffered_rows >= limit);
                     if !ann.lookup_done && !limit_buffered {
                         let stream = ann
                             .lookup_stream
@@ -6422,8 +6420,7 @@ impl Stream for ContigAnnotationStream {
                     };
 
                     // LIMIT pushdown: skip remaining windows if limit reached.
-                    let limit_reached =
-                        fetch_limit.is_some_and(|limit| rows_emitted >= limit);
+                    let limit_reached = fetch_limit.is_some_and(|limit| rows_emitted >= limit);
 
                     if ann.window_buffer.is_empty() || limit_reached {
                         // No more data (or limit reached) — clean up.

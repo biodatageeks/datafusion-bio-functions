@@ -2460,7 +2460,9 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(vec!["1"; n])),
-                Arc::new(Int64Array::from((0..n as i64).map(|i| 100 + i * 10).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(
+                    (0..n as i64).map(|i| 100 + i * 10).collect::<Vec<_>>(),
+                )),
                 Arc::new(Int64Array::from(
                     (0..n as i64).map(|i| 101 + i * 10).collect::<Vec<_>>(),
                 )),
@@ -2486,7 +2488,9 @@ mod tests {
         ];
         let mut columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = vec![
             Arc::new(StringArray::from(vec!["1"; n])),
-            Arc::new(Int64Array::from((0..n as i64).map(|i| 100 + i * 10).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                (0..n as i64).map(|i| 100 + i * 10).collect::<Vec<_>>(),
+            )),
             Arc::new(Int64Array::from(
                 (0..n as i64).map(|i| 101 + i * 10).collect::<Vec<_>>(),
             )),

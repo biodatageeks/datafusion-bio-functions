@@ -73,11 +73,8 @@ pub async fn annotate_to_vcf(
             Some("FORMAT") => {
                 // Extract sample name from "{sample}_{format_id}" column naming.
                 if let Some(format_id) = field.metadata().get("bio.vcf.field.format_id") {
-                    if name.len() > format_id.len() + 1
-                        && name.ends_with(format_id.as_str())
-                    {
-                        let sample =
-                            name[..name.len() - format_id.len() - 1].to_string();
+                    if name.len() > format_id.len() + 1 && name.ends_with(format_id.as_str()) {
+                        let sample = name[..name.len() - format_id.len() - 1].to_string();
                         if !sample.is_empty() && !sample_names.contains(&sample) {
                             sample_names.push(sample);
                         }
@@ -181,10 +178,7 @@ pub async fn annotate_to_vcf(
             } else if f.name() == "csq" {
                 // Add INFO metadata for the CSQ annotation field.
                 let mut meta = f.metadata().clone();
-                meta.insert(
-                    "bio.vcf.field.field_type".to_string(),
-                    "INFO".to_string(),
-                );
+                meta.insert("bio.vcf.field.field_type".to_string(), "INFO".to_string());
                 meta.insert(
                     "bio.vcf.field.description".to_string(),
                     "Consequence annotations from annotate_vep".to_string(),

@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::Array;
 use datafusion::prelude::*;
-use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::VcfCompressionType;
+use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::{register_vep_functions, vcf_sink};
 
 /// Resolve a path relative to the workspace root.
@@ -32,9 +32,8 @@ async fn ensure_fjall_variation(parquet_dir: &str, fjall_path: &str) {
     ctx.register_parquet("vep_source", parquet_dir, Default::default())
         .await
         .unwrap();
-    let loader =
-        datafusion_bio_function_vep::kv_cache::CacheLoader::new("vep_source", fjall_path)
-            .with_parallelism(1);
+    let loader = datafusion_bio_function_vep::kv_cache::CacheLoader::new("vep_source", fjall_path)
+        .with_parallelism(1);
     let stats = loader.load(&ctx).await.unwrap();
     eprintln!(
         "  variation fjall: {} variants, {} positions",
@@ -49,10 +48,14 @@ fn ensure_fjall_sift(parquet_path: &str, fjall_path: &str) {
     }
     eprintln!("Building fjall sift cache from {parquet_path}...");
     // Use the load_sift_cache example logic inline.
-    use datafusion::arrow::array::{Float32Array, Int32Array, ListArray, StringArray, StringViewArray};
+    use datafusion::arrow::array::{
+        Float32Array, Int32Array, ListArray, StringArray, StringViewArray,
+    };
     use datafusion::common::DataFusionError;
     use datafusion_bio_function_vep::kv_cache::sift_store::SiftKvStore;
-    use datafusion_bio_function_vep::transcript_consequence::{CachedPredictions, CompactPrediction};
+    use datafusion_bio_function_vep::transcript_consequence::{
+        CachedPredictions, CompactPrediction,
+    };
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let db = fjall::Database::builder(fjall_path)
@@ -81,24 +84,43 @@ fn ensure_fjall_sift(parquet_path: &str, fjall_path: &str) {
         for row in 0..batch.num_rows() {
             let tid_col = batch.column(tid_idx);
             let transcript_id = if let Some(a) = tid_col.as_any().downcast_ref::<StringArray>() {
-                if a.is_null(row) { continue; } else { a.value(row) }
+                if a.is_null(row) {
+                    continue;
+                } else {
+                    a.value(row)
+                }
             } else if let Some(a) = tid_col.as_any().downcast_ref::<StringViewArray>() {
-                if a.is_null(row) { continue; } else { a.value(row) }
+                if a.is_null(row) {
+                    continue;
+                } else {
+                    a.value(row)
+                }
             } else {
                 continue;
             };
 
             let read_preds = |col_idx: Option<usize>| -> Vec<CompactPrediction> {
-                let Some(idx) = col_idx else { return vec![]; };
+                let Some(idx) = col_idx else {
+                    return vec![];
+                };
                 let col = batch.column(idx);
-                if col.is_null(row) { return vec![]; }
-                let Some(list_arr) = col.as_any().downcast_ref::<ListArray>() else { return vec![]; };
+                if col.is_null(row) {
+                    return vec![];
+                }
+                let Some(list_arr) = col.as_any().downcast_ref::<ListArray>() else {
+                    return vec![];
+                };
                 let offsets = list_arr.offsets();
                 let start = offsets[row] as usize;
                 let end = offsets[row + 1] as usize;
-                if start == end { return vec![]; }
+                if start == end {
+                    return vec![];
+                }
                 let values = list_arr.values();
-                let struct_arr = values.as_any().downcast_ref::<datafusion::arrow::array::StructArray>().unwrap();
+                let struct_arr = values
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StructArray>()
+                    .unwrap();
                 let positions = struct_arr.column_by_name("position").unwrap();
                 let amino_acids = struct_arr.column_by_name("amino_acid").unwrap();
                 let predictions = struct_arr.column_by_name("prediction").unwrap();
@@ -111,17 +133,31 @@ fn ensure_fjall_sift(parquet_path: &str, fjall_path: &str) {
                 let score_arr = scores.as_any().downcast_ref::<Float32Array>();
                 let mut out = Vec::with_capacity(end - start);
                 for i in start..end {
-                    let Some(pos) = pos_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) }) else { continue };
-                    let aa = aa_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
-                        .or_else(|| aa_view.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) }));
-                    let pred = pred_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
-                        .or_else(|| pred_view.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) }));
-                    let score = score_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
+                    let Some(pos) =
+                        pos_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+                    else {
+                        continue;
+                    };
+                    let aa = aa_arr
+                        .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+                        .or_else(|| {
+                            aa_view.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+                        });
+                    let pred = pred_arr
+                        .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+                        .or_else(|| {
+                            pred_view
+                                .and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
+                        });
+                    let score =
+                        score_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
                     if let (Some(aa), Some(pred), Some(sc)) = (aa, pred, score) {
                         if let Some(aa_idx) = CompactPrediction::encode_amino_acid(aa) {
                             out.push(CompactPrediction {
-                                position: pos, amino_acid: aa_idx,
-                                prediction: CompactPrediction::encode_prediction(pred), score: sc,
+                                position: pos,
+                                amino_acid: aa_idx,
+                                prediction: CompactPrediction::encode_prediction(pred),
+                                score: sc,
                             });
                         }
                     }
@@ -132,7 +168,9 @@ fn ensure_fjall_sift(parquet_path: &str, fjall_path: &str) {
             let mut preds = CachedPredictions::default();
             preds.sift = read_preds(sift_idx);
             preds.polyphen = read_preds(poly_idx);
-            if preds.sift.is_empty() && preds.polyphen.is_empty() { continue; }
+            if preds.sift.is_empty() && preds.polyphen.is_empty() {
+                continue;
+            }
             preds.sort();
             total += 1;
             sift_store.put(transcript_id, &preds).unwrap();
@@ -144,7 +182,15 @@ fn ensure_fjall_sift(parquet_path: &str, fjall_path: &str) {
 
 /// Create symlinks for context tables if they don't exist.
 fn ensure_context_symlinks(fjall_dir: &std::path::Path, parquet_dir: &std::path::Path) {
-    for dir in ["variation", "transcript", "exon", "translation_core", "translation_sift", "regulatory", "motif"] {
+    for dir in [
+        "variation",
+        "transcript",
+        "exon",
+        "translation_core",
+        "translation_sift",
+        "regulatory",
+        "motif",
+    ] {
         let link = fjall_dir.join(dir);
         if !link.exists() {
             let target = parquet_dir.join(dir);
@@ -178,7 +224,10 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
     )
     .await;
     ensure_fjall_sift(
-        parquet_cache.join("translation_sift/chr1.parquet").to_str().unwrap(),
+        parquet_cache
+            .join("translation_sift/chr1.parquet")
+            .to_str()
+            .unwrap(),
         sift_fjall.to_str().unwrap(),
     );
     ensure_context_symlinks(&fjall_cache, &parquet_cache);
@@ -241,13 +290,34 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
     .await
     .unwrap();
 
-    ctx2.register_table("input_vcf", Arc::new(input_prov)).unwrap();
-    ctx2.register_table("output_vcf", Arc::new(output_prov)).unwrap();
-    ctx2.register_table("golden_vcf", Arc::new(golden_prov)).unwrap();
+    ctx2.register_table("input_vcf", Arc::new(input_prov))
+        .unwrap();
+    ctx2.register_table("output_vcf", Arc::new(output_prov))
+        .unwrap();
+    ctx2.register_table("golden_vcf", Arc::new(golden_prov))
+        .unwrap();
 
-    let input_batches = ctx2.sql("SELECT * FROM input_vcf ORDER BY start").await.unwrap().collect().await.unwrap();
-    let output_batches = ctx2.sql("SELECT * FROM output_vcf ORDER BY start").await.unwrap().collect().await.unwrap();
-    let golden_batches = ctx2.sql("SELECT * FROM golden_vcf ORDER BY start").await.unwrap().collect().await.unwrap();
+    let input_batches = ctx2
+        .sql("SELECT * FROM input_vcf ORDER BY start")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let output_batches = ctx2
+        .sql("SELECT * FROM output_vcf ORDER BY start")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let golden_batches = ctx2
+        .sql("SELECT * FROM golden_vcf ORDER BY start")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 
     let input_rows: usize = input_batches.iter().map(|b| b.num_rows()).sum();
     let output_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
@@ -256,47 +326,99 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
     assert_eq!(golden_rows, 1000);
     assert_eq!(input_rows, 1000);
 
-    let input_batch = datafusion::arrow::compute::concat_batches(&input_batches[0].schema(), &input_batches).unwrap();
-    let output_batch = datafusion::arrow::compute::concat_batches(&output_batches[0].schema(), &output_batches).unwrap();
-    let golden_batch = datafusion::arrow::compute::concat_batches(&golden_batches[0].schema(), &golden_batches).unwrap();
+    let input_batch =
+        datafusion::arrow::compute::concat_batches(&input_batches[0].schema(), &input_batches)
+            .unwrap();
+    let output_batch =
+        datafusion::arrow::compute::concat_batches(&output_batches[0].schema(), &output_batches)
+            .unwrap();
+    let golden_batch =
+        datafusion::arrow::compute::concat_batches(&golden_batches[0].schema(), &golden_batches)
+            .unwrap();
 
     // ── Step 3: Core VCF columns ──
-    for col_name in ["chrom", "start", "end", "ref", "alt", "id", "qual", "filter"] {
-        if let (Ok(i), Ok(o)) = (input_batch.schema().index_of(col_name), output_batch.schema().index_of(col_name)) {
-            assert_eq!(input_batch.column(i).as_ref(), output_batch.column(o).as_ref(),
-                "Core column '{col_name}' differs (fjall backend)");
+    for col_name in [
+        "chrom", "start", "end", "ref", "alt", "id", "qual", "filter",
+    ] {
+        if let (Ok(i), Ok(o)) = (
+            input_batch.schema().index_of(col_name),
+            output_batch.schema().index_of(col_name),
+        ) {
+            assert_eq!(
+                input_batch.column(i).as_ref(),
+                output_batch.column(o).as_ref(),
+                "Core column '{col_name}' differs (fjall backend)"
+            );
         }
     }
 
     // ── Step 4: INFO columns ──
-    let info_columns: Vec<String> = input_batch.schema().fields().iter()
-        .filter(|f| f.metadata().get("bio.vcf.field.field_type").is_some_and(|v| v == "INFO"))
-        .map(|f| f.name().clone()).collect();
+    let info_columns: Vec<String> = input_batch
+        .schema()
+        .fields()
+        .iter()
+        .filter(|f| {
+            f.metadata()
+                .get("bio.vcf.field.field_type")
+                .is_some_and(|v| v == "INFO")
+        })
+        .map(|f| f.name().clone())
+        .collect();
     for col_name in &info_columns {
-        assert!(output_batch.schema().index_of(col_name).is_ok(), "INFO '{col_name}' missing (fjall)");
+        assert!(
+            output_batch.schema().index_of(col_name).is_ok(),
+            "INFO '{col_name}' missing (fjall)"
+        );
         let in_col = input_batch.column(input_batch.schema().index_of(col_name).unwrap());
         let out_col = output_batch.column(output_batch.schema().index_of(col_name).unwrap());
-        assert_eq!(in_col.as_ref(), out_col.as_ref(), "INFO '{col_name}' values differ (fjall)");
+        assert_eq!(
+            in_col.as_ref(),
+            out_col.as_ref(),
+            "INFO '{col_name}' values differ (fjall)"
+        );
     }
 
     // ── Step 5: FORMAT columns ──
-    let format_columns: Vec<String> = input_batch.schema().fields().iter()
-        .filter(|f| f.metadata().get("bio.vcf.field.field_type").is_some_and(|v| v == "FORMAT"))
-        .map(|f| f.name().clone()).collect();
+    let format_columns: Vec<String> = input_batch
+        .schema()
+        .fields()
+        .iter()
+        .filter(|f| {
+            f.metadata()
+                .get("bio.vcf.field.field_type")
+                .is_some_and(|v| v == "FORMAT")
+        })
+        .map(|f| f.name().clone())
+        .collect();
     for col_name in &format_columns {
-        assert!(output_batch.schema().index_of(col_name).is_ok(), "FORMAT '{col_name}' missing (fjall)");
+        assert!(
+            output_batch.schema().index_of(col_name).is_ok(),
+            "FORMAT '{col_name}' missing (fjall)"
+        );
         let in_col = input_batch.column(input_batch.schema().index_of(col_name).unwrap());
         let out_col = output_batch.column(output_batch.schema().index_of(col_name).unwrap());
-        assert_eq!(in_col.as_ref(), out_col.as_ref(), "FORMAT '{col_name}' values differ (fjall)");
+        assert_eq!(
+            in_col.as_ref(),
+            out_col.as_ref(),
+            "FORMAT '{col_name}' values differ (fjall)"
+        );
     }
 
     // ── Step 6: CSQ vs golden ──
-    let our_csq_name = if output_batch.schema().index_of("csq").is_ok() { "csq" }
-        else if output_batch.schema().index_of("CSQ").is_ok() { "CSQ" }
-        else { panic!("CSQ not found in fjall output") };
-    let golden_csq_name = if golden_batch.schema().index_of("CSQ").is_ok() { "CSQ" }
-        else if golden_batch.schema().index_of("csq").is_ok() { "csq" }
-        else { panic!("CSQ not found in golden") };
+    let our_csq_name = if output_batch.schema().index_of("csq").is_ok() {
+        "csq"
+    } else if output_batch.schema().index_of("CSQ").is_ok() {
+        "CSQ"
+    } else {
+        panic!("CSQ not found in fjall output")
+    };
+    let golden_csq_name = if golden_batch.schema().index_of("CSQ").is_ok() {
+        "CSQ"
+    } else if golden_batch.schema().index_of("csq").is_ok() {
+        "csq"
+    } else {
+        panic!("CSQ not found in golden")
+    };
 
     let our_csq = output_batch.column(output_batch.schema().index_of(our_csq_name).unwrap());
     let golden_csq = golden_batch.column(golden_batch.schema().index_of(golden_csq_name).unwrap());
@@ -305,9 +427,21 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
         eprintln!("[fjall] CSQ: exact match (all 1000 rows identical)");
     } else {
         let get_str = |col: &dyn Array, row: usize| -> String {
-            if col.is_null(row) { return String::new(); }
-            if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>() { return a.value(row).to_string(); }
-            if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>() { return a.value(row).to_string(); }
+            if col.is_null(row) {
+                return String::new();
+            }
+            if let Some(a) = col
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+            {
+                return a.value(row).to_string();
+            }
+            if let Some(a) = col
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringViewArray>()
+            {
+                return a.value(row).to_string();
+            }
             String::new()
         };
         let mut mismatched = 0;
@@ -323,10 +457,16 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
                 }
             }
         }
-        assert_eq!(mismatched, 0,
-            "[fjall] CSQ should have 0 mismatches vs golden VEP 115 ({mismatched} mismatched)");
+        assert_eq!(
+            mismatched, 0,
+            "[fjall] CSQ should have 0 mismatches vs golden VEP 115 ({mismatched} mismatched)"
+        );
     }
 
-    eprintln!("[fjall] All checks passed: {} core, {} INFO, {} FORMAT columns + CSQ",
-        8, info_columns.len(), format_columns.len());
+    eprintln!(
+        "[fjall] All checks passed: {} core, {} INFO, {} FORMAT columns + CSQ",
+        8,
+        info_columns.len(),
+        format_columns.len()
+    );
 }

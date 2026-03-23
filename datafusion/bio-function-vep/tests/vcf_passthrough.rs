@@ -22,7 +22,10 @@ fn workspace_path(rel: &str) -> std::path::PathBuf {
 async fn test_vcf_columns_pass_through_annotation() {
     let input_vcf = workspace_path("vep-benchmark/data/golden/input_1000.vcf");
     if !input_vcf.exists() {
-        eprintln!("Skipping: test fixtures not found at {}", input_vcf.display());
+        eprintln!(
+            "Skipping: test fixtures not found at {}",
+            input_vcf.display()
+        );
         return;
     }
     let input_vcf = input_vcf.to_str().unwrap();
