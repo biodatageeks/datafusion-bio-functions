@@ -50,7 +50,6 @@ fn ensure_fjall_sift(parquet_path: &str, fjall_path: &str) {
     use datafusion::arrow::array::{
         Float32Array, Int32Array, ListArray, StringArray, StringViewArray,
     };
-    use datafusion::common::DataFusionError;
     use datafusion_bio_function_vep::kv_cache::sift_store::SiftKvStore;
     use datafusion_bio_function_vep::transcript_consequence::{
         CachedPredictions, CompactPrediction,
@@ -150,23 +149,24 @@ fn ensure_fjall_sift(parquet_path: &str, fjall_path: &str) {
                         });
                     let score =
                         score_arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) });
-                    if let (Some(aa), Some(pred), Some(sc)) = (aa, pred, score) {
-                        if let Some(aa_idx) = CompactPrediction::encode_amino_acid(aa) {
-                            out.push(CompactPrediction {
-                                position: pos,
-                                amino_acid: aa_idx,
-                                prediction: CompactPrediction::encode_prediction(pred),
-                                score: sc,
-                            });
-                        }
+                    if let (Some(aa), Some(pred), Some(sc)) = (aa, pred, score)
+                        && let Some(aa_idx) = CompactPrediction::encode_amino_acid(aa)
+                    {
+                        out.push(CompactPrediction {
+                            position: pos,
+                            amino_acid: aa_idx,
+                            prediction: CompactPrediction::encode_prediction(pred),
+                            score: sc,
+                        });
                     }
                 }
                 out
             };
 
-            let mut preds = CachedPredictions::default();
-            preds.sift = read_preds(sift_idx);
-            preds.polyphen = read_preds(poly_idx);
+            let mut preds = CachedPredictions {
+                sift: read_preds(sift_idx),
+                polyphen: read_preds(poly_idx),
+            };
             if preds.sift.is_empty() && preds.polyphen.is_empty() {
                 continue;
             }
