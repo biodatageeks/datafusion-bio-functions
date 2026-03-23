@@ -1940,6 +1940,11 @@ impl AnnotateProvider {
         options_json: Option<String>,
         vcf_schema: Schema,
     ) -> Self {
+        debug_assert_eq!(
+            annotation_column_defs().len() + 2,
+            ANNOTATION_COLUMN_COUNT,
+            "ANNOTATION_COLUMN_COUNT out of sync with annotation_column_defs()"
+        );
         // Output schema starts with all VCF columns and appends annotation fields.
         let mut fields: Vec<Arc<Field>> = vcf_schema
             .fields()
@@ -3308,6 +3313,10 @@ impl AnnotateProvider {
         #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
         #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
         skip_csq: bool,
+        flags: &VepFlags,
+        hgvs_flags: &HgvsFlags,
+        merged: bool,
+        hgvs_reference_reader: &mut Option<FastaReader>,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
@@ -3338,30 +3347,6 @@ impl AnnotateProvider {
         let variation_name_idx = schema.index_of("cache_variation_name").ok();
         let cached_csq_idx = schema.index_of("cache_consequence_types").ok();
         let cached_most_idx = schema.index_of("cache_most_severe_consequence").ok();
-        let merged = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
-            .unwrap_or(false);
-        let flags = VepFlags::from_options_json(self.options_json.as_deref());
-        let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
-        let mut hgvs_reference_reader = if hgvs_flags.any() && hgvs_flags.shift_hgvs {
-            self.options_json
-                .as_deref()
-                .and_then(|opts| Self::parse_json_string_option(opts, "reference_fasta_path"))
-                .map(|path| {
-                    fasta::io::indexed_reader::Builder::default()
-                        .build_from_path(&path)
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "failed to open indexed reference FASTA '{path}': {e}"
-                            ))
-                        })
-                })
-                .transpose()?
-        } else {
-            None
-        };
 
         let mut csq_builder = if skip_csq {
             StringBuilder::new()
@@ -3601,7 +3586,7 @@ impl AnnotateProvider {
                         data.frequency_fields(
                             &vep_allele,
                             data.frequency_match_output_allele(&vep_allele),
-                            &flags,
+                            flags,
                         ),
                     )
                 } else {
@@ -6167,6 +6152,10 @@ fn annotate_window(
             #[cfg(not(feature = "kv-cache"))]
             &sift_kv,
             skip_csq,
+            &ann.config.flags,
+            &ann.config.hgvs_flags,
+            ann.config.merged,
+            &mut ann.hgvs_reader,
         )?;
 
         if let Some(indices) = projection {

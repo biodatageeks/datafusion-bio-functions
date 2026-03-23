@@ -37,6 +37,8 @@ pub struct AnnotateVcfConfig {
     pub compression: VcfCompressionType,
     /// Show a progress bar on stderr during annotation + VCF write.
     /// When true, counts input variants and displays an indicatif progress bar.
+    /// Note: enabling this causes an extra `COUNT(*)` scan of the input table
+    /// before annotation begins, which adds a small overhead.
     pub show_progress: bool,
 }
 
@@ -87,8 +89,9 @@ impl AnnotateVcfConfig {
 /// 3. Runs `annotate_vep()` via SQL and streams annotated batches to a VCF file
 ///
 /// All original VCF columns are preserved in the output. The `csq` column from
-/// annotation is added as an INFO field. The 87 typed annotation columns
-/// (Allele, Consequence, SYMBOL, AF, etc.) are NOT written to the VCF.
+/// annotation is added as an INFO field. The 87 structured annotation columns
+/// plus `most_severe_consequence` (Allele, Consequence, SYMBOL, AF, etc.) are
+/// NOT written to the VCF.
 ///
 /// # Returns
 ///
