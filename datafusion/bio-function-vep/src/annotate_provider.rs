@@ -6133,9 +6133,10 @@ fn annotate_window(
     );
 
     // CSQ is the first annotation column after VCF fields.
-    // Skip CSQ assembly when it is not in the projection (default: skip).
+    // When there is no projection, all columns are requested, so CSQ must be
+    // preserved. Only skip assembly when a projection exists and excludes it.
     let csq_col_idx = ann.tmp_provider.vcf_field_count();
-    let skip_csq = projection.map_or(true, |indices| !indices.contains(&csq_col_idx));
+    let skip_csq = projection.is_some_and(|indices| !indices.contains(&csq_col_idx));
 
     // The 87 typed annotation columns start at vcf_field_count + 2 (after csq
     // and most_severe_consequence). Skip building them when none are projected

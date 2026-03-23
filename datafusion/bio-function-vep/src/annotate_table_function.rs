@@ -174,6 +174,8 @@ fn resolve_table_sync(
 #[cfg(test)]
 mod tests {
     use crate::create_vep_session;
+    #[cfg(feature = "kv-cache")]
+    use crate::kv_cache::{VepKvStore, position_entry::serialize_position_entry};
     use crate::so_terms::SoTerm;
     use datafusion::arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -183,8 +185,6 @@ mod tests {
     use std::fs::File;
     use std::sync::Arc;
     use tempfile::TempDir;
-    #[cfg(feature = "kv-cache")]
-    use crate::kv_cache::{VepKvStore, position_entry::serialize_position_entry};
 
     /// Write record batches into the partitioned cache layout under
     /// `{tmpdir}/{table_type}/{chrom}.parquet`, grouping rows by the "chrom"
