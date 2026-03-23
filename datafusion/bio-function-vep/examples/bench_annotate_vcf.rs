@@ -167,7 +167,8 @@ async fn main() -> Result<()> {
     let t0 = Instant::now();
     let input_path = args.input.clone();
     let vcf_provider = tokio::task::spawn_blocking(move || {
-        VcfTableProvider::new(input_path, Some(vec![]), Some(vec![]), None, false)
+        // None = include ALL INFO/FORMAT fields for VCF pass-through.
+        VcfTableProvider::new(input_path, None, None, None, false)
     })
     .await
     .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??;
