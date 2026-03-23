@@ -15,9 +15,10 @@ use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// Callback invoked after each batch is written to VCF.
-/// Arguments: (rows_in_batch, total_rows_so_far).
+/// Arguments: (rows_in_batch, total_rows_written_so_far, total_input_rows).
+/// `total_input_rows` is 0 if the count was not computed (show_progress=false).
 /// Used by Python wrappers (vepyr) to drive tqdm progress bars in Jupyter.
-pub type OnBatchWritten = Box<dyn Fn(usize, usize) + Send + Sync>;
+pub type OnBatchWritten = Box<dyn Fn(usize, usize, usize) + Send + Sync>;
 
 /// Configuration for VCF annotation output.
 pub struct AnnotateVcfConfig {
@@ -213,19 +214,24 @@ pub async fn annotate_to_vcf(
         tags
     };
 
-    // 3. Progress bar (optional).
-    let pb = if config.show_progress {
-        let total = ctx
-            .sql(&format!("SELECT COUNT(*) AS n FROM `{vcf_table}`"))
+    // 3. Count input rows (for progress bar and/or callback total).
+    let need_count = config.show_progress || config.on_batch_written.is_some();
+    let total_input: usize = if need_count {
+        ctx.sql(&format!("SELECT COUNT(*) AS n FROM `{vcf_table}`"))
             .await?
             .collect()
             .await?[0]
             .column(0)
             .as_any()
             .downcast_ref::<datafusion::arrow::array::Int64Array>()
-            .map(|a| a.value(0) as u64)
-            .unwrap_or(0);
-        let pb = ProgressBar::new(total);
+            .map(|a| a.value(0) as usize)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let pb = if config.show_progress {
+        let pb = ProgressBar::new(total_input as u64);
         pb.set_style(
             ProgressStyle::with_template(
                 "  {spinner:.green} {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}] (eta {eta})",
@@ -335,7 +341,7 @@ pub async fn annotate_to_vcf(
         writer.write_records(&lines)?;
         pb.inc(lines.len() as u64);
         if let Some(ref cb) = config.on_batch_written {
-            cb(lines.len(), total_rows);
+            cb(lines.len(), total_rows, total_input);
         }
     }
 
