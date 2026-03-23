@@ -1637,7 +1637,7 @@ mod tests {
 
         let cache_path = tmpdir.path().to_str().expect("utf8 path");
         let sql = format!(
-            "SELECT chrom, csq FROM annotate_vep('vcf_data', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+            "SELECT chrom, \"CSQ\" FROM annotate_vep('vcf_data', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
         );
         let df = ctx.sql(&sql).await.expect("projection query should parse");
 
@@ -1675,7 +1675,7 @@ mod tests {
 
         let cache_path = tmpdir.path().to_str().expect("utf8 path");
         let sql = format!(
-            "SELECT chrom, csq, most_severe_consequence \
+            "SELECT chrom, \"CSQ\", most_severe_consequence \
              FROM annotate_vep('vcf_data', '{cache_path}', '{backend}', '{{\"partitioned\":true}}') \
              ORDER BY chrom"
         );
@@ -1742,7 +1742,7 @@ mod tests {
 
         let cache_path = tmpdir.path().to_str().expect("utf8 path");
         let sql = format!(
-            "SELECT csq, most_severe_consequence \
+            "SELECT \"CSQ\", most_severe_consequence \
              FROM annotate_vep( \
                'vcf_data', \
                '{cache_path}', \
@@ -1790,7 +1790,7 @@ mod tests {
 
         let default_batches = ctx
             .sql(&format!(
-                "SELECT csq FROM annotate_vep('vcf_distance', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+                "SELECT \"CSQ\" FROM annotate_vep('vcf_distance', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
             ))
             .await
             .expect("default distance query should parse")
@@ -1811,7 +1811,7 @@ mod tests {
 
         let numeric_batches = ctx
             .sql(&format!(
-                "SELECT csq FROM annotate_vep( \
+                "SELECT \"CSQ\" FROM annotate_vep( \
                    'vcf_distance', \
                    '{cache_path}', \
                    '{backend}', \
@@ -1840,7 +1840,7 @@ mod tests {
 
         let pair_batches = ctx
             .sql(&format!(
-                "SELECT csq FROM annotate_vep( \
+                "SELECT \"CSQ\" FROM annotate_vep( \
                    'vcf_distance', \
                    '{cache_path}', \
                    '{backend}', \
@@ -1888,7 +1888,7 @@ mod tests {
 
         let default_batches = ctx
             .sql(&format!(
-                "SELECT csq FROM annotate_vep('vcf_hgvs', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+                "SELECT \"CSQ\" FROM annotate_vep('vcf_hgvs', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
             ))
             .await
             .expect("default hgvs query should parse")
@@ -1909,7 +1909,7 @@ mod tests {
 
         let missing_fasta_err = ctx
             .sql(&format!(
-                "SELECT csq FROM annotate_vep( \
+                "SELECT \"CSQ\" FROM annotate_vep( \
                    'vcf_hgvs', \
                    '{cache_path}', \
                    '{backend}', \
@@ -1928,7 +1928,7 @@ mod tests {
 
         let hgvs_batches = ctx
             .sql(&format!(
-                "SELECT csq FROM annotate_vep( \
+                "SELECT \"CSQ\" FROM annotate_vep( \
                    'vcf_hgvs', \
                    '{cache_path}', \
                    '{backend}', \
@@ -1955,7 +1955,7 @@ mod tests {
 
         let hgvs_prediction_batches = ctx
             .sql(&format!(
-                "SELECT csq FROM annotate_vep( \
+                "SELECT \"CSQ\" FROM annotate_vep( \
                    'vcf_hgvs', \
                    '{cache_path}', \
                    '{backend}', \
@@ -2005,7 +2005,7 @@ mod tests {
 
         let cache_path = tmpdir.path().to_str().expect("utf8 path");
         let sql = format!(
-            "SELECT csq, most_severe_consequence \
+            "SELECT \"CSQ\", most_severe_consequence \
              FROM annotate_vep('vcf_syn', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
         );
         let df = ctx.sql(&sql).await.expect("query should parse");
@@ -2050,7 +2050,7 @@ mod tests {
 
         let cache_path = tmpdir.path().to_str().expect("utf8 path");
         let sql = format!(
-            "SELECT csq, most_severe_consequence \
+            "SELECT \"CSQ\", most_severe_consequence \
              FROM annotate_vep('vcf_ctx', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
         );
         let batches = ctx
@@ -2116,7 +2116,7 @@ mod tests {
 
         let cache_path = tmpdir.path().to_str().expect("utf8 path");
         let sql = format!(
-            "SELECT csq, most_severe_consequence \
+            "SELECT \"CSQ\", most_severe_consequence \
              FROM annotate_vep( \
                'vcf_reg_dup', \
                '{cache_path}', \
@@ -2168,7 +2168,7 @@ mod tests {
 
         let cache_path = tmpdir.path().to_str().expect("utf8 path");
         let sql = format!(
-            "SELECT csq, most_severe_consequence \
+            "SELECT \"CSQ\", most_severe_consequence \
              FROM annotate_vep('vcf_reg_ser', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
         );
         let batches = ctx
@@ -2235,7 +2235,7 @@ mod tests {
 
         let cache_path = tmpdir.path().to_str().expect("utf8 path");
         let sql = format!(
-            "SELECT csq, most_severe_consequence \
+            "SELECT \"CSQ\", most_severe_consequence \
              FROM annotate_vep('vcf_golden_ctx', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
         );
         let batches = ctx
@@ -2276,7 +2276,7 @@ mod tests {
 
         {
             let sql = format!(
-                "SELECT csq, most_severe_consequence \
+                "SELECT \"CSQ\", most_severe_consequence \
                  FROM annotate_vep('vcf_splice', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
             );
             let batches = ctx
@@ -2314,7 +2314,7 @@ mod tests {
 
         {
             let sql = format!(
-                "SELECT csq, most_severe_consequence \
+                "SELECT \"CSQ\", most_severe_consequence \
                  FROM annotate_vep('vcf_repeat', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
             );
             let batches = ctx
@@ -2359,7 +2359,7 @@ mod tests {
             let cache_path = tmpdir.path().display().to_string();
 
             let sql = format!(
-                "SELECT csq, most_severe_consequence \
+                "SELECT \"CSQ\", most_severe_consequence \
                  FROM annotate_vep('vcf_neg', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
             );
             let df = ctx.sql(&sql).await.expect("query should parse");
@@ -2400,7 +2400,7 @@ mod tests {
             let cache_path = tmpdir.path().display().to_string();
 
             let sql = format!(
-                "SELECT csq, most_severe_consequence \
+                "SELECT \"CSQ\", most_severe_consequence \
                  FROM annotate_vep('vcf_stop_loss', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
             );
             let df = ctx.sql(&sql).await.expect("query should parse");
@@ -2437,7 +2437,7 @@ mod tests {
             let backend = "parquet";
 
             let sql = format!(
-                "SELECT csq FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', '{{\"partitioned\":true}}') \
+                "SELECT \"CSQ\" FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', '{{\"partitioned\":true}}') \
                  ORDER BY chrom"
             );
             let df = ctx.sql(&sql).await.expect("query should parse");

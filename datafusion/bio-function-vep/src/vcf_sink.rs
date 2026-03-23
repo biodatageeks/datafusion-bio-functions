@@ -253,7 +253,7 @@ pub async fn annotate_to_vcf(
     for name in &info_fields {
         select_cols.push(format!("`{name}`"));
     }
-    select_cols.push("`csq`".to_string());
+    select_cols.push("\"CSQ\"".to_string());
     for name in &format_fields {
         select_cols.push(format!("`{name}`"));
     }

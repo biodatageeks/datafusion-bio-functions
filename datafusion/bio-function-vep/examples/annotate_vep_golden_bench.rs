@@ -916,14 +916,14 @@ async fn run_annotate_vep(
 
     let sql = if let Some(opts) = options_json {
         format!(
-            "SELECT chrom, start, ref, alt, csq, most_severe_consequence FROM annotate_vep('sampled_vcf', '{}', '{}', '{}')",
+            "SELECT chrom, start, ref, alt, \"CSQ\", most_severe_consequence FROM annotate_vep('sampled_vcf', '{}', '{}', '{}')",
             sql_literal(cache_source),
             sql_literal(backend),
             sql_literal(opts)
         )
     } else {
         format!(
-            "SELECT chrom, start, ref, alt, csq, most_severe_consequence FROM annotate_vep('sampled_vcf', '{}', '{}')",
+            "SELECT chrom, start, ref, alt, \"CSQ\", most_severe_consequence FROM annotate_vep('sampled_vcf', '{}', '{}')",
             sql_literal(cache_source),
             sql_literal(backend)
         )

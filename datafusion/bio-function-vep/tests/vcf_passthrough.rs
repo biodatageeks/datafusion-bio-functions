@@ -134,7 +134,7 @@ async fn test_vcf_columns_pass_through_annotation() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_projection_including_csq_preserves_values() {
-    let Some((df, _)) = build_test_query("SELECT chrom, start, csq").await else {
+    let Some((df, _)) = build_test_query("SELECT chrom, start, \"CSQ\"").await else {
         return;
     };
 
