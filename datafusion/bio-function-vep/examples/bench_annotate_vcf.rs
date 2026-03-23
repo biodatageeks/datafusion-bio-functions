@@ -177,40 +177,21 @@ async fn main() -> Result<()> {
     register_vep_functions(&ctx);
     ctx.register_table("vcf", Arc::new(vcf_provider))?;
 
-    // ── Build options JSON ──
-    let use_fjall = args.backend == "fjall";
-    let mut opts = serde_json::Map::new();
-    opts.insert("partitioned".into(), serde_json::Value::Bool(true));
-    if args.everything {
-        opts.insert("everything".into(), serde_json::Value::Bool(true));
-    }
-    if args.extended_probes {
-        opts.insert("extended_probes".into(), serde_json::Value::Bool(true));
-    }
-    if use_fjall {
-        opts.insert("use_fjall".into(), serde_json::Value::Bool(true));
-    }
-    if let Some(ref fasta) = args.reference_fasta {
-        opts.insert(
-            "reference_fasta_path".into(),
-            serde_json::Value::String(fasta.clone()),
-        );
-    }
-    let options_json = serde_json::to_string(&serde_json::Value::Object(opts)).unwrap();
+    // ── Build annotation config ──
+    let config = vcf_sink::AnnotateVcfConfig {
+        everything: args.everything,
+        extended_probes: args.extended_probes,
+        reference_fasta_path: args.reference_fasta.clone(),
+        use_fjall: args.backend == "fjall",
+        compression: args.compression,
+        ..Default::default()
+    };
 
     // ── Annotate and write VCF ──
     let t_annotate = Instant::now();
     let output_path = std::path::Path::new(&args.output);
-    let rows = vcf_sink::annotate_to_vcf(
-        &ctx,
-        "vcf",
-        &args.cache,
-        "parquet",
-        Some(&options_json),
-        output_path,
-        args.compression,
-    )
-    .await?;
+    let rows = vcf_sink::annotate_to_vcf(&ctx, "vcf", &args.cache, "parquet", output_path, &config)
+        .await?;
     let annotate_secs = t_annotate.elapsed().as_secs_f64();
 
     let output_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);

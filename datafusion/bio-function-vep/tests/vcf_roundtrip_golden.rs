@@ -59,7 +59,7 @@ async fn test_roundtrip_golden_all_column_values() {
         "{{\"partitioned\":true,\"everything\":true,\"extended_probes\":true,\
          \"reference_fasta_path\":\"{ref_fasta}\"}}"
     );
-    let rows_written = vcf_sink::annotate_to_vcf(
+    let rows_written = vcf_sink::annotate_to_vcf_with_options(
         &ctx,
         "vcf",
         cache_path,

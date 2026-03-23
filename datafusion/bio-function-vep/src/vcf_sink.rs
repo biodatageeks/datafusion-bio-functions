@@ -13,6 +13,68 @@ use datafusion::prelude::SessionContext;
 use datafusion_bio_format_vcf::serializer::batch_to_vcf_lines;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 
+/// Configuration for VCF annotation output.
+#[derive(Debug, Clone, Default)]
+pub struct AnnotateVcfConfig {
+    /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
+    pub everything: bool,
+    /// Use interval-overlap fallback for shifted indels.
+    pub extended_probes: bool,
+    /// Path to indexed reference FASTA (required for `everything` / `hgvs`).
+    pub reference_fasta_path: Option<String>,
+    /// Use fjall KV store for variation lookup + SIFT.
+    pub use_fjall: bool,
+    /// Enable HGVS notation.
+    pub hgvs: bool,
+    /// Use merged Ensembl+RefSeq cache.
+    pub merged: bool,
+    /// Maximum allowed `failed` flag value from cache.
+    pub failed: Option<i64>,
+    /// Upstream/downstream distance for transcript overlap.
+    pub distance: Option<String>,
+    /// Output compression type.
+    pub compression: VcfCompressionType,
+}
+
+impl AnnotateVcfConfig {
+    /// Serialize to JSON options string for annotate_vep() SQL.
+    fn to_options_json(&self) -> String {
+        let mut opts = serde_json::Map::new();
+        opts.insert("partitioned".into(), serde_json::Value::Bool(true));
+        if self.everything {
+            opts.insert("everything".into(), serde_json::Value::Bool(true));
+        }
+        if self.extended_probes {
+            opts.insert("extended_probes".into(), serde_json::Value::Bool(true));
+        }
+        if let Some(ref fasta) = self.reference_fasta_path {
+            opts.insert(
+                "reference_fasta_path".into(),
+                serde_json::Value::String(fasta.clone()),
+            );
+        }
+        if self.use_fjall {
+            opts.insert("use_fjall".into(), serde_json::Value::Bool(true));
+        }
+        if self.hgvs {
+            opts.insert("hgvs".into(), serde_json::Value::Bool(true));
+        }
+        if self.merged {
+            opts.insert("merged".into(), serde_json::Value::Bool(true));
+        }
+        if let Some(failed) = self.failed {
+            opts.insert(
+                "failed".into(),
+                serde_json::Value::Number(serde_json::Number::from(failed)),
+            );
+        }
+        if let Some(ref dist) = self.distance {
+            opts.insert("distance".into(), serde_json::Value::String(dist.clone()));
+        }
+        serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
+    }
+}
+
 /// Annotate variants from a registered VCF table and write results to a VCF file.
 ///
 /// This function:
@@ -21,22 +83,46 @@ use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 /// 3. Writes the annotated batches to a VCF file using `VcfLocalWriter`
 ///
 /// All original VCF columns are preserved in the output. The `csq` column from
-/// annotation is added as an INFO field.
+/// annotation is added as an INFO field. The 87 typed annotation columns
+/// (Allele, Consequence, SYMBOL, AF, etc.) are NOT written to the VCF.
 ///
 /// # Arguments
 ///
 /// * `ctx` - Session context with VEP functions registered and VCF table available
 /// * `vcf_table` - Name of the registered VCF table to annotate
-/// * `cache_source` - Path to the VEP cache (parquet directory or KV store)
-/// * `backend` - Cache backend type: `"parquet"` or `"kv"`
-/// * `options_json` - Optional JSON string with annotation options
+/// * `cache_source` - Path to the VEP cache (parquet directory or fjall store)
+/// * `backend` - Cache backend type: `"parquet"`
 /// * `output_path` - Path to write the output VCF file
-/// * `compression` - Compression type for the output file
+/// * `config` - Annotation and output configuration
 ///
 /// # Returns
 ///
 /// The number of rows written.
 pub async fn annotate_to_vcf(
+    ctx: &SessionContext,
+    vcf_table: &str,
+    cache_source: &str,
+    backend: &str,
+    output_path: &Path,
+    config: &AnnotateVcfConfig,
+) -> Result<usize> {
+    let options_json = config.to_options_json();
+    annotate_to_vcf_with_options(
+        ctx,
+        vcf_table,
+        cache_source,
+        backend,
+        Some(&options_json),
+        output_path,
+        config.compression,
+    )
+    .await
+}
+
+/// Lower-level annotation-to-VCF function that takes a raw options JSON string.
+///
+/// Prefer [`annotate_to_vcf`] with [`AnnotateVcfConfig`] for typed parameters.
+pub async fn annotate_to_vcf_with_options(
     ctx: &SessionContext,
     vcf_table: &str,
     cache_source: &str,
