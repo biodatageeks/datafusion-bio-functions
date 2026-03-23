@@ -169,7 +169,9 @@ async fn main() -> Result<()> {
     .await?;
     let annotate_secs = t_annotate.elapsed().as_secs_f64();
 
-    let output_size = std::fs::metadata(&args.output).map(|m| m.len()).unwrap_or(0);
+    let output_size = std::fs::metadata(&args.output)
+        .map(|m| m.len())
+        .unwrap_or(0);
 
     eprintln!("\n=== Results ===");
     eprintln!("  rows:       {rows}");
