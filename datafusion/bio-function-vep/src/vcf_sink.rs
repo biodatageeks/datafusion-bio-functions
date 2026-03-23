@@ -14,8 +14,12 @@ use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 
+/// Callback invoked after each batch is written to VCF.
+/// Arguments: (rows_in_batch, total_rows_so_far).
+/// Used by Python wrappers (vepyr) to drive tqdm progress bars in Jupyter.
+pub type OnBatchWritten = Box<dyn Fn(usize, usize) + Send + Sync>;
+
 /// Configuration for VCF annotation output.
-#[derive(Debug, Clone, Default)]
 pub struct AnnotateVcfConfig {
     /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
     pub everything: bool,
@@ -35,8 +39,41 @@ pub struct AnnotateVcfConfig {
     pub distance: Option<String>,
     /// Output compression type.
     pub compression: VcfCompressionType,
-    /// Show a progress bar on stderr during annotation + VCF write.
+    /// Show an indicatif progress bar on stderr (for Rust CLI).
+    /// For Python/Jupyter, use `on_batch_written` with tqdm instead.
     pub show_progress: bool,
+    /// Optional callback invoked after each batch is written.
+    /// Used by Python wrappers to drive tqdm progress bars that work in Jupyter.
+    pub on_batch_written: Option<OnBatchWritten>,
+}
+
+impl Default for AnnotateVcfConfig {
+    fn default() -> Self {
+        Self {
+            everything: false,
+            extended_probes: false,
+            reference_fasta_path: None,
+            use_fjall: false,
+            hgvs: false,
+            merged: false,
+            failed: None,
+            distance: None,
+            compression: VcfCompressionType::Plain,
+            show_progress: false,
+            on_batch_written: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for AnnotateVcfConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnnotateVcfConfig")
+            .field("everything", &self.everything)
+            .field("compression", &self.compression)
+            .field("show_progress", &self.show_progress)
+            .field("on_batch_written", &self.on_batch_written.is_some())
+            .finish()
+    }
 }
 
 impl AnnotateVcfConfig {
@@ -297,6 +334,9 @@ pub async fn annotate_to_vcf(
         total_rows += lines.len();
         writer.write_records(&lines)?;
         pb.inc(lines.len() as u64);
+        if let Some(ref cb) = config.on_batch_written {
+            cb(lines.len(), total_rows);
+        }
     }
 
     writer.finish()?;
