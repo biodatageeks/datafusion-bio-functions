@@ -36,7 +36,7 @@ fn write_test_vcf(batches: &[RecordBatch], path: &Path, sample_name: &str) {
         let start_idx = schema.index_of("start").unwrap();
         let ref_idx = schema.index_of("ref").unwrap();
         let alt_idx = schema.index_of("alt").unwrap();
-        let csq_idx = schema.index_of("csq").ok();
+        let csq_idx = schema.index_of("CSQ").ok();
         let gt_idx = schema.index_of("GT").ok();
 
         for row in 0..batch.num_rows() {
@@ -105,7 +105,7 @@ fn make_test_batches() -> Vec<RecordBatch> {
         Field::new("start", DataType::UInt32, false),
         Field::new("ref", DataType::Utf8, false),
         Field::new("alt", DataType::Utf8, false),
-        Field::new("csq", DataType::Utf8, true),
+        Field::new("CSQ", DataType::Utf8, true),
         Field::new("GT", DataType::Utf8, true),
     ]));
 

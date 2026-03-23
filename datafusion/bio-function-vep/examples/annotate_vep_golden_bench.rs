@@ -916,14 +916,14 @@ async fn run_annotate_vep(
 
     let sql = if let Some(opts) = options_json {
         format!(
-            "SELECT chrom, start, ref, alt, csq, most_severe_consequence FROM annotate_vep('sampled_vcf', '{}', '{}', '{}')",
+            "SELECT chrom, start, ref, alt, \"CSQ\", most_severe_consequence FROM annotate_vep('sampled_vcf', '{}', '{}', '{}')",
             sql_literal(cache_source),
             sql_literal(backend),
             sql_literal(opts)
         )
     } else {
         format!(
-            "SELECT chrom, start, ref, alt, csq, most_severe_consequence FROM annotate_vep('sampled_vcf', '{}', '{}')",
+            "SELECT chrom, start, ref, alt, \"CSQ\", most_severe_consequence FROM annotate_vep('sampled_vcf', '{}', '{}')",
             sql_literal(cache_source),
             sql_literal(backend)
         )
@@ -944,7 +944,7 @@ async fn run_annotate_vep(
         let alt_col = batch.column_by_name("alt").ok_or_else(|| {
             DataFusionError::Execution("annotate_vep output missing column alt".to_string())
         })?;
-        let csq_col = batch.column_by_name("csq").ok_or_else(|| {
+        let csq_col = batch.column_by_name("CSQ").ok_or_else(|| {
             DataFusionError::Execution("annotate_vep output missing column csq".to_string())
         })?;
         let most_col = batch

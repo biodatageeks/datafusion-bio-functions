@@ -509,7 +509,7 @@ fn write_vcf_output(
         let alt_idx = schema.index_of("alt").ok();
         let qual_idx = schema.index_of("qual").ok();
         let filter_idx = schema.index_of("filter").ok();
-        let csq_idx = schema.index_of("csq").ok();
+        let csq_idx = schema.index_of("CSQ").ok();
 
         for row in 0..batch.num_rows() {
             let chrom = chrom_idx
