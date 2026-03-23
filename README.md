@@ -774,7 +774,7 @@ cargo doc --no-deps --all-features --open
 
 ## Requirements
 
-- Rust 1.88.0 or later (specified in `rust-toolchain.toml`)
+- Rust 1.91.0 or later (specified in `rust-toolchain.toml`)
 - Git (for building crates with git dependencies)
 
 ## Related Projects
