@@ -5971,6 +5971,12 @@ fn make_cleanup_future(session: Arc<SessionContext>, tables: Vec<String>) -> Cle
     })
 }
 
+fn deregister_tables_sync(session: &SessionContext, tables: &[String]) {
+    for table in tables {
+        let _ = session.deregister_table(table);
+    }
+}
+
 struct ContigAnnotationStream {
     projected_schema: SchemaRef,
     full_schema: SchemaRef,
@@ -6002,6 +6008,47 @@ impl ContigAnnotationStream {
             state: StreamState::StartContig,
             rows_emitted: 0,
         }
+    }
+
+    fn cleanup_registered_tables_on_drop(&mut self) {
+        match &mut self.state {
+            StreamState::AnnotatingContig(ann) => {
+                deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
+                if ann.config.use_fjall {
+                    let _ = ann.session.deregister_table("__vep_kv_variation");
+                }
+                ann.ephemeral_tables.clear();
+            }
+            StreamState::DrainingWindow {
+                annotation_state: ann,
+                ..
+            } => {
+                deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
+                if ann.config.use_fjall {
+                    let _ = ann.session.deregister_table("__vep_kv_variation");
+                }
+                ann.ephemeral_tables.clear();
+            }
+            StreamState::CleaningUp(_) | StreamState::ErrorCleaningUp(_, _) => {
+                if self.config.use_fjall {
+                    let _ = self.session.deregister_table("__vep_kv_variation");
+                }
+            }
+            StreamState::StartContig
+            | StreamState::PreparingContig(_)
+            | StreamState::FinalCleanup(_)
+            | StreamState::Done => {
+                if self.config.use_fjall {
+                    let _ = self.session.deregister_table("__vep_kv_variation");
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ContigAnnotationStream {
+    fn drop(&mut self) {
+        self.cleanup_registered_tables_on_drop();
     }
 }
 

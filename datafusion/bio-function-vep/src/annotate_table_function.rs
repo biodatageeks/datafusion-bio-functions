@@ -183,6 +183,8 @@ mod tests {
     use std::fs::File;
     use std::sync::Arc;
     use tempfile::TempDir;
+    #[cfg(feature = "kv-cache")]
+    use crate::kv_cache::{VepKvStore, position_entry::serialize_position_entry};
 
     /// Write record batches into the partitioned cache layout under
     /// `{tmpdir}/{table_type}/{chrom}.parquet`, grouping rows by the "chrom"
@@ -263,6 +265,43 @@ mod tests {
             ArrowWriter::try_new(file, batch.schema(), None).expect("create parquet writer");
         writer.write(batch).expect("write parquet batch");
         writer.close().expect("close parquet writer");
+    }
+
+    #[cfg(feature = "kv-cache")]
+    fn write_batch_to_fjall(tmpdir: &TempDir, batch: &RecordBatch) {
+        let fjall_dir = tmpdir.path().join("variation.fjall");
+        let schema = batch.schema();
+        let store = VepKvStore::create(&fjall_dir, schema.clone()).expect("create fjall cache");
+
+        let chrom_idx = schema.index_of("chrom").expect("chrom column");
+        let start_idx = schema.index_of("start").expect("start column");
+        let allele_idx = schema
+            .index_of("allele_string")
+            .expect("allele_string column");
+        let stored_col_indices: Vec<usize> = (0..schema.fields().len())
+            .filter(|&idx| idx != chrom_idx && idx != start_idx)
+            .collect();
+
+        let chroms = batch
+            .column(chrom_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("chrom must be StringArray");
+        let starts = batch
+            .column(start_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("start must be Int64Array");
+
+        for row in 0..batch.num_rows() {
+            let entry = serialize_position_entry(&[row], batch, &stored_col_indices, allele_idx)
+                .expect("serialize position entry");
+            store
+                .put_position_entry(chroms.value(row), starts.value(row), &entry)
+                .expect("write fjall position entry");
+        }
+
+        store.persist().expect("persist fjall cache");
     }
 
     fn vcf_table() -> MemTable {
@@ -2619,5 +2658,43 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 10, "No LIMIT should return all 10 rows");
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_limit_with_fjall_releases_lock() {
+        let tmpdir = TempDir::new().expect("create temp dir");
+        let cache_batch = multi_row_cache_batch();
+        write_batch_to_cache(&tmpdir, "variation", &cache_batch);
+        write_batch_to_fjall(&tmpdir, &cache_batch);
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(multi_row_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', \
+             '{{\"partitioned\":true,\"use_fjall\":true}}') LIMIT 3"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("annotate_vep with LIMIT 3 and fjall")
+            .collect()
+            .await
+            .expect("collect");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "LIMIT 3 should return exactly 3 rows");
+
+        let reopen_err = VepKvStore::open(tmpdir.path().join("variation.fjall"))
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            reopen_err.is_none(),
+            "fjall cache should reopen after LIMIT without lingering lock: {}",
+            reopen_err.unwrap_or_default()
+        );
     }
 }
