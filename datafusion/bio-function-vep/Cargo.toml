@@ -10,6 +10,7 @@ edition.workspace = true
 
 [dependencies]
 datafusion.workspace = true
+datafusion-bio-function = { path = "../bio-function" }
 datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
 tokio.workspace = true
 futures.workspace = true

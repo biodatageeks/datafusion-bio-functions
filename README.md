@@ -13,8 +13,10 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 
 | Crate | Description | Status |
 |-------|-------------|--------|
+| **[datafusion-bio-function](datafusion/bio-function)** | Unified bio `SessionContext` setup (`BioSessionExt`, `create_bio_session`) that wires ranges + vcftools optimizations | ✅ |
 | **[datafusion-bio-function-pileup](datafusion/bio-function-pileup)** | Depth-of-coverage (pileup) computation from BAM alignments | ✅ |
 | **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, nearest-neighbor, overlap, merge, cluster, complement, and subtract operations | ✅ |
+| **[datafusion-bio-function-vcftools](datafusion/bio-function-vcftools)** | Fused array transform logical/physical optimization for unnest-transform-array_agg patterns | ✅ |
 | **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via `lookup_variants()` table function with parquet + Fjall KV cache backends | ✅ |
 
 ## Features
@@ -347,7 +349,7 @@ Both schemas include metadata key `bio.coordinate_system_zero_based` (`"true"` o
 Create a bio-configured session and write standard SQL — range overlap joins are automatically optimized:
 
 ```rust
-use datafusion_bio_function_ranges::create_bio_session;
+use datafusion_bio_function::create_bio_session;
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {

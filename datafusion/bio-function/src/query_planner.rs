@@ -6,25 +6,19 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use log::info;
 use std::sync::Arc;
 
-/// A composable QueryPlanner built on top of DataFusion's DefaultPhysicalPlanner.
+/// Query planner for the unified bio context.
 #[derive(Default)]
-pub struct RangesQueryPlanner {
+pub struct BioQueryPlanner {
     physical_planner: DefaultPhysicalPlanner,
 }
 
-impl std::fmt::Debug for RangesQueryPlanner {
+impl std::fmt::Debug for BioQueryPlanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RangesQueryPlanner").finish()
+        f.debug_struct("BioQueryPlanner").finish()
     }
 }
 
-impl RangesQueryPlanner {
-    pub fn new() -> Self {
-        Self {
-            physical_planner: DefaultPhysicalPlanner::default(),
-        }
-    }
-
+impl BioQueryPlanner {
     pub fn with_extension_planners(
         extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
     ) -> Self {
@@ -35,14 +29,14 @@ impl RangesQueryPlanner {
 }
 
 #[async_trait]
-impl QueryPlanner for RangesQueryPlanner {
+impl QueryPlanner for BioQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let display_string = logical_plan.display();
-        info!("RangesQueryPlanner: Creating physical plan for logical plan: {display_string}");
+        info!("BioQueryPlanner: Creating physical plan for logical plan: {display_string}");
         self.physical_planner
             .create_physical_plan(logical_plan, session_state)
             .await

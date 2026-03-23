@@ -72,7 +72,7 @@ use crate::table_function::LookupFunction;
 /// Test-only convenience: create a session with ranges + VEP functions.
 #[cfg(test)]
 pub(crate) fn create_vep_session() -> SessionContext {
-    let ctx = datafusion_bio_function_ranges::create_bio_session();
+    let ctx = datafusion_bio_function::create_bio_session();
     register_vep_functions(&ctx);
     ctx
 }

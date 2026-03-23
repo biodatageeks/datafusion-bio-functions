@@ -1,3 +1,4 @@
+use crate::algorithms::Algorithm;
 use crate::nearest_index::{
     IntervalRecord, NearestIntervalIndex, Position, extract_coitree_position,
 };
@@ -6,7 +7,6 @@ use crate::physical_planner::joins::utils::symmetric_join_output_partitioning;
 use crate::physical_planner::joins::utils::{
     BuildProbeJoinMetrics, OnceAsync, OnceFut, estimate_join_statistics,
 };
-use crate::session_context::Algorithm;
 use ahash::AHashMap;
 use ahash::RandomState;
 use bio::data_structures::interval_tree as rust_bio;
@@ -1558,7 +1558,9 @@ fn evaluate_as_i32(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_context::{Algorithm, BioConfig, BioSessionExt};
+    use crate::algorithms::Algorithm;
+    use crate::config::BioConfig;
+    use crate::session_builder::create_ranges_session_with_config;
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::assert_batches_sorted_eq;
     use datafusion::config::ConfigOptions;
@@ -1626,7 +1628,7 @@ mod tests {
             .with_batch_size(2000)
             .with_target_partitions(1);
 
-        SessionContext::new_with_bio(config)
+        create_ranges_session_with_config(config)
     }
 
     #[tokio::test(flavor = "multi_thread")]

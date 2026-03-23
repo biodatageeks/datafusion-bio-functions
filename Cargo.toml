@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["datafusion/bio-function-pileup", "datafusion/bio-function-ranges", "datafusion/bio-function-vep"]
+members = ["datafusion/bio-function-pileup", "datafusion/bio-function-ranges", "datafusion/bio-function-vep", "datafusion/bio-function-vcftools", "datafusion/bio-function"]
 exclude = ["datafusion/bio-function-ranges/superintervals"]
 
 [workspace.package]
@@ -15,3 +15,7 @@ datafusion = { version = "50.3.0" }
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "rt", "macros"] }
 futures = "0.3.31"
 log = "0.4.27"
+serial_test = "3.1"
+tempfile = "3.15"
+parquet = "56.1"
+async-trait = "0.1.88"
