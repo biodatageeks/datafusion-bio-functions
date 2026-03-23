@@ -158,20 +158,18 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let input_path = std::path::Path::new(&args.input);
-    let output_path = std::path::Path::new(&args.output);
     let t_annotate = Instant::now();
-    let rows = vcf_sink::annotate_vcf_file(
-        input_path,
+    let rows = vcf_sink::annotate_to_vcf(
+        &args.input,
         &args.cache,
         "parquet",
-        output_path,
+        &args.output,
         &annotate_config,
     )
     .await?;
     let annotate_secs = t_annotate.elapsed().as_secs_f64();
 
-    let output_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    let output_size = std::fs::metadata(&args.output).map(|m| m.len()).unwrap_or(0);
 
     eprintln!("\n=== Results ===");
     eprintln!("  rows:       {rows}");

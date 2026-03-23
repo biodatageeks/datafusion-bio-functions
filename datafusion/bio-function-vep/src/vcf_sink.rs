@@ -1,8 +1,7 @@
 //! VCF output sink for annotate_vep() results.
 //!
-//! Provides a helper function to annotate variants and write the results
-//! directly to a VCF file, preserving all original VCF columns (INFO, FORMAT,
-//! sample genotypes) plus the annotation columns added by the pipeline.
+//! Provides [`annotate_to_vcf`] — a single-call function that reads a VCF,
+//! annotates it, and streams results to an output VCF file.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,6 +10,7 @@ use datafusion::common::Result;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_bio_format_vcf::serializer::batch_to_vcf_lines;
+use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -36,14 +36,11 @@ pub struct AnnotateVcfConfig {
     /// Output compression type.
     pub compression: VcfCompressionType,
     /// Show a progress bar on stderr during annotation + VCF write.
-    /// When true, counts input variants and displays an indicatif progress bar.
-    /// Note: enabling this causes an extra `COUNT(*)` scan of the input table
-    /// before annotation begins, which adds a small overhead.
+    /// Note: causes an extra `COUNT(*)` scan before annotation begins.
     pub show_progress: bool,
 }
 
 impl AnnotateVcfConfig {
-    /// Serialize to JSON options string for annotate_vep() SQL.
     fn to_options_json(&self) -> String {
         let mut opts = serde_json::Map::new();
         opts.insert("partitioned".into(), serde_json::Value::Bool(true));
@@ -83,82 +80,42 @@ impl AnnotateVcfConfig {
 
 /// Annotate a VCF file and write results to an output VCF.
 ///
-/// This is the high-level entry point that handles everything:
-/// 1. Reads the input VCF (with all INFO/FORMAT fields)
-/// 2. Registers VEP functions and the VCF table
+/// Handles everything in a single call:
+/// 1. Reads the input VCF (all INFO/FORMAT fields preserved)
+/// 2. Creates a session, registers VEP functions and the VCF table
 /// 3. Runs annotation and streams results to the output VCF
 ///
-/// Callers only need a `SessionContext` — no need to deal with
-/// `VcfTableProvider` or table registration.
-///
-/// # Returns
-///
-/// The number of rows written.
-pub async fn annotate_vcf_file(
-    input_vcf: &Path,
-    cache_source: &str,
-    backend: &str,
-    output_path: &Path,
-    config: &AnnotateVcfConfig,
-) -> Result<usize> {
-    use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
-
-    // Create a single-partition session (required for correct annotation pipeline).
-    let session_config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
-    let ctx = SessionContext::new_with_config(session_config);
-    crate::register_vep_functions(&ctx);
-
-    // Register VCF — use spawn_blocking because VcfTableProvider::new() uses
-    // futures::executor::block_on() which deadlocks inside a tokio runtime.
-    let vcf_path = input_vcf.display().to_string();
-    let vcf_provider = tokio::task::spawn_blocking(move || {
-        VcfTableProvider::new(vcf_path, None, None, None, false)
-    })
-    .await
-    .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??;
-    ctx.register_table("__vepyr_vcf", Arc::new(vcf_provider))?;
-
-    annotate_to_vcf(
-        &ctx,
-        "__vepyr_vcf",
-        cache_source,
-        backend,
-        output_path,
-        config,
-    )
-    .await
-}
-
-/// Annotate variants from a pre-registered VCF table and write results to a VCF file.
-///
-/// Use [`annotate_vcf_file`] for the simpler path that handles VCF reading
-/// and registration automatically.
-///
-/// This function:
-/// 1. Looks up the VCF input table's schema to recover INFO/FORMAT field metadata
-/// 2. Optionally counts input rows for a progress bar (`config.show_progress`)
-/// 3. Runs `annotate_vep()` via SQL and streams annotated batches to a VCF file
-///
-/// All original VCF columns are preserved in the output. The `csq` column from
-/// annotation is added as an INFO field. The 87 structured annotation columns
-/// plus `most_severe_consequence` are NOT written to the VCF.
+/// The 87 structured annotation columns plus `most_severe_consequence`
+/// are NOT written to the VCF — only core VCF columns, original INFO/FORMAT
+/// fields, and the `csq` annotation are included.
 ///
 /// # Returns
 ///
 /// The number of rows written.
 pub async fn annotate_to_vcf(
-    ctx: &SessionContext,
-    vcf_table: &str,
+    input_vcf: &str,
     cache_source: &str,
     backend: &str,
-    output_path: &Path,
+    output_vcf: &str,
     config: &AnnotateVcfConfig,
 ) -> Result<usize> {
-    // 1. Get VCF input schema for field classification (INFO vs FORMAT metadata).
-    let vcf_provider = ctx.table_provider(vcf_table).await?;
-    let vcf_schema = vcf_provider.schema();
+    // 1. Create session and register VCF table.
+    let session_config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+    let ctx = SessionContext::new_with_config(session_config);
+    crate::register_vep_functions(&ctx);
 
-    // Classify columns using "bio.vcf.field.field_type" metadata from the input schema.
+    let vcf_path = input_vcf.to_string();
+    let vcf_provider = tokio::task::spawn_blocking(move || {
+        VcfTableProvider::new(vcf_path, None, None, None, false)
+    })
+    .await
+    .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??;
+
+    let vcf_schema = vcf_provider.schema();
+    ctx.register_table("__vep_vcf", Arc::new(vcf_provider))?;
+    let vcf_table = "__vep_vcf";
+
+    // 2. Classify columns from VCF schema metadata.
     let core_vcf = [
         "chrom", "start", "end", "id", "ref", "alt", "qual", "filter",
     ];
@@ -220,7 +177,7 @@ pub async fn annotate_to_vcf(
         tags
     };
 
-    // 2. Set up progress bar if requested.
+    // 3. Progress bar (optional).
     let pb = if config.show_progress {
         let total = ctx
             .sql(&format!("SELECT COUNT(*) AS n FROM `{vcf_table}`"))
@@ -246,7 +203,7 @@ pub async fn annotate_to_vcf(
         ProgressBar::hidden()
     };
 
-    // 3. Build annotation SQL — select only VCF-relevant columns + csq.
+    // 4. Build annotation SQL — only VCF-relevant columns + csq.
     let mut select_cols: Vec<String> = Vec::new();
     for name in &core_vcf {
         select_cols.push(format!("`{name}`"));
@@ -271,7 +228,7 @@ pub async fn annotate_to_vcf(
     let mut vcf_info_fields = info_fields;
     vcf_info_fields.push("csq".to_string());
 
-    // 4. Build the output schema for the VCF header.
+    // 5. Build output schema with merged metadata for VCF header.
     let df = ctx.sql(&sql).await?;
     let df_schema = df.schema();
     let output_fields: Vec<datafusion::arrow::datatypes::Field> = df_schema
@@ -311,7 +268,8 @@ pub async fn annotate_to_vcf(
             .with_metadata(vcf_schema.metadata().clone()),
     );
 
-    // 5. Write VCF header, then stream batches directly to file.
+    // 6. Stream annotated batches to VCF file.
+    let output_path = Path::new(output_vcf);
     let mut writer = VcfLocalWriter::with_compression(output_path, config.compression)?;
     writer.write_header(
         &write_schema,

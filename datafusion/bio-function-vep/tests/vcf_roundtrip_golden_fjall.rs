@@ -11,7 +11,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::Array;
 use datafusion::prelude::*;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
-use datafusion_bio_function_vep::{register_vep_functions, vcf_sink};
+use datafusion_bio_function_vep::vcf_sink;
 
 /// Check if a file is a Git LFS pointer (not actual content).
 fn is_lfs_pointer(path: &std::path::Path) -> bool {
@@ -247,16 +247,6 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let output_path = tmp_dir.path().join("annotated_fjall.vcf");
 
-    let ctx = SessionContext::new();
-    register_vep_functions(&ctx);
-    let input_str = input_vcf.to_string();
-    let vcf_provider = tokio::task::spawn_blocking(move || {
-        VcfTableProvider::new(input_str, None, None, None, false).unwrap()
-    })
-    .await
-    .unwrap();
-    ctx.register_table("vcf", Arc::new(vcf_provider)).unwrap();
-
     let config = vcf_sink::AnnotateVcfConfig {
         everything: true,
         extended_probes: true,
@@ -264,10 +254,15 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
         use_fjall: true,
         ..Default::default()
     };
-    let rows_written =
-        vcf_sink::annotate_to_vcf(&ctx, "vcf", fjall_cache, "parquet", &output_path, &config)
-            .await
-            .unwrap();
+    let rows_written = vcf_sink::annotate_to_vcf(
+        input_vcf,
+        fjall_cache,
+        "parquet",
+        output_path.to_str().unwrap(),
+        &config,
+    )
+    .await
+    .unwrap();
     assert_eq!(rows_written, 1000, "Should write 1000 annotated rows");
 
     // ── Step 2: Read input, output, and golden ──
