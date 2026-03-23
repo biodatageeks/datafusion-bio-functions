@@ -15,15 +15,11 @@
 //!     [--compression none|gzip|bgzf] \
 //!     [--limit <n>]
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use datafusion::common::Result;
-use datafusion::datasource::TableProvider;
-use datafusion::prelude::SessionContext;
 use datafusion_bio_format_vcf::VcfCompressionType;
-use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
-use datafusion_bio_function_vep::{register_vep_functions, vcf_sink};
+use datafusion_bio_function_vep::vcf_sink;
 
 struct Args {
     input: String,
@@ -150,28 +146,8 @@ async fn main() -> Result<()> {
         eprintln!("  limit:      {n}");
     }
 
-    // ── Read VCF ──
-    let t0 = Instant::now();
-    let input_path = args.input.clone();
-    let vcf_provider = tokio::task::spawn_blocking(move || {
-        VcfTableProvider::new(input_path, None, None, None, false)
-    })
-    .await
-    .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??;
-    let vcf_fields = vcf_provider.schema().fields().len();
-    eprintln!(
-        "\n[{:.1}s] VCF loaded: {} columns",
-        t0.elapsed().as_secs_f64(),
-        vcf_fields
-    );
-
-    // Single partition — required for correct annotation pipeline.
-    let config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
-    let ctx = SessionContext::new_with_config(config);
-    register_vep_functions(&ctx);
-    ctx.register_table("vcf", Arc::new(vcf_provider))?;
-
     // ── Annotate + stream to VCF (with built-in progress bar) ──
+    let t0 = Instant::now();
     let annotate_config = vcf_sink::AnnotateVcfConfig {
         everything: args.everything,
         extended_probes: args.extended_probes,
@@ -182,11 +158,11 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let t_annotate = Instant::now();
+    let input_path = std::path::Path::new(&args.input);
     let output_path = std::path::Path::new(&args.output);
-    let rows = vcf_sink::annotate_to_vcf(
-        &ctx,
-        "vcf",
+    let t_annotate = Instant::now();
+    let rows = vcf_sink::annotate_vcf_file(
+        input_path,
         &args.cache,
         "parquet",
         output_path,

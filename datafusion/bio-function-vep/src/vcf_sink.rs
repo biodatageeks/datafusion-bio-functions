@@ -81,7 +81,58 @@ impl AnnotateVcfConfig {
     }
 }
 
-/// Annotate variants from a registered VCF table and write results to a VCF file.
+/// Annotate a VCF file and write results to an output VCF.
+///
+/// This is the high-level entry point that handles everything:
+/// 1. Reads the input VCF (with all INFO/FORMAT fields)
+/// 2. Registers VEP functions and the VCF table
+/// 3. Runs annotation and streams results to the output VCF
+///
+/// Callers only need a `SessionContext` — no need to deal with
+/// `VcfTableProvider` or table registration.
+///
+/// # Returns
+///
+/// The number of rows written.
+pub async fn annotate_vcf_file(
+    input_vcf: &Path,
+    cache_source: &str,
+    backend: &str,
+    output_path: &Path,
+    config: &AnnotateVcfConfig,
+) -> Result<usize> {
+    use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
+
+    // Create a single-partition session (required for correct annotation pipeline).
+    let session_config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+    let ctx = SessionContext::new_with_config(session_config);
+    crate::register_vep_functions(&ctx);
+
+    // Register VCF — use spawn_blocking because VcfTableProvider::new() uses
+    // futures::executor::block_on() which deadlocks inside a tokio runtime.
+    let vcf_path = input_vcf.display().to_string();
+    let vcf_provider = tokio::task::spawn_blocking(move || {
+        VcfTableProvider::new(vcf_path, None, None, None, false)
+    })
+    .await
+    .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??;
+    ctx.register_table("__vepyr_vcf", Arc::new(vcf_provider))?;
+
+    annotate_to_vcf(
+        &ctx,
+        "__vepyr_vcf",
+        cache_source,
+        backend,
+        output_path,
+        config,
+    )
+    .await
+}
+
+/// Annotate variants from a pre-registered VCF table and write results to a VCF file.
+///
+/// Use [`annotate_vcf_file`] for the simpler path that handles VCF reading
+/// and registration automatically.
 ///
 /// This function:
 /// 1. Looks up the VCF input table's schema to recover INFO/FORMAT field metadata
@@ -90,8 +141,7 @@ impl AnnotateVcfConfig {
 ///
 /// All original VCF columns are preserved in the output. The `csq` column from
 /// annotation is added as an INFO field. The 87 structured annotation columns
-/// plus `most_severe_consequence` (Allele, Consequence, SYMBOL, AF, etc.) are
-/// NOT written to the VCF.
+/// plus `most_severe_consequence` are NOT written to the VCF.
 ///
 /// # Returns
 ///
