@@ -223,44 +223,34 @@ async fn annotate_to_vcf_inner(
         backend.replace('\'', "''"),
     );
 
-    let batches = ctx.sql(&sql).await?.collect().await?;
-
-    // 3. Add CSQ to INFO fields for VCF output (annotation adds a `csq` column).
+    // 3. CSQ is always included as an INFO field in VCF output.
     let mut vcf_info_fields = info_fields;
-    if batches
-        .first()
-        .is_some_and(|b| b.schema().index_of("csq").is_ok())
-    {
-        vcf_info_fields.push("csq".to_string());
-    }
+    vcf_info_fields.push("csq".to_string());
 
-    // 4. Build the output schema reference for the header builder.
-    //    We need the schema that has the field metadata — the annotation output
-    //    schema loses it, so we merge: take the output schema fields but attach
-    //    metadata from the VCF input schema where available, plus add `csq` with
-    //    proper INFO metadata.
-    let output_schema = if let Some(first) = batches.first() {
-        first.schema()
-    } else {
-        vcf_schema.clone()
-    };
-
-    // Build a schema that carries the original VCF metadata on each field.
-    let merged_fields: Vec<_> = output_schema
+    // 4. Build the output schema for the VCF header.
+    //    The annotation output schema loses field metadata, so we merge:
+    //    take the DataFrame schema fields but attach metadata from the
+    //    VCF input schema where available, plus add `csq` with INFO metadata.
+    let df = ctx.sql(&sql).await?;
+    let df_schema = df.schema();
+    let output_fields: Vec<datafusion::arrow::datatypes::Field> = df_schema
         .fields()
         .iter()
-        .map(|f| {
-            if let Ok(input_field) = vcf_schema.field_with_name(f.name()) {
-                // Carry over metadata from the input VCF field.
+        .map(|df_field| {
+            let name = df_field.name();
+            let arrow_field = datafusion::arrow::datatypes::Field::new(
+                name,
+                df_field.data_type().clone(),
+                df_field.is_nullable(),
+            );
+            if let Ok(input_field) = vcf_schema.field_with_name(name) {
                 let mut merged_metadata = input_field.metadata().clone();
-                // The output field metadata takes precedence.
-                for (k, v) in f.metadata() {
+                for (k, v) in arrow_field.metadata() {
                     merged_metadata.insert(k.clone(), v.clone());
                 }
-                f.as_ref().clone().with_metadata(merged_metadata)
-            } else if f.name() == "csq" {
-                // Add INFO metadata for the CSQ annotation field.
-                let mut meta = f.metadata().clone();
+                arrow_field.with_metadata(merged_metadata)
+            } else if name == "csq" {
+                let mut meta = std::collections::HashMap::new();
                 meta.insert("bio.vcf.field.field_type".to_string(), "INFO".to_string());
                 meta.insert(
                     "bio.vcf.field.description".to_string(),
@@ -268,25 +258,20 @@ async fn annotate_to_vcf_inner(
                 );
                 meta.insert("bio.vcf.field.number".to_string(), ".".to_string());
                 meta.insert("bio.vcf.field.type".to_string(), "String".to_string());
-                f.as_ref().clone().with_metadata(meta)
+                arrow_field.with_metadata(meta)
             } else {
-                f.as_ref().clone()
+                arrow_field
             }
         })
         .collect();
 
-    // Merge schema-level metadata from the VCF input (file format, contigs, filters, etc.)
-    let mut merged_schema_metadata = vcf_schema.metadata().clone();
-    for (k, v) in output_schema.metadata() {
-        merged_schema_metadata.insert(k.clone(), v.clone());
-    }
-
+    let merged_schema_metadata = vcf_schema.metadata().clone();
     let write_schema = Arc::new(
-        datafusion::arrow::datatypes::Schema::new(merged_fields)
+        datafusion::arrow::datatypes::Schema::new(output_fields)
             .with_metadata(merged_schema_metadata),
     );
 
-    // 5. Write VCF file.
+    // 5. Write VCF header, then stream batches directly to file.
     let mut writer = VcfLocalWriter::with_compression(output_path, compression)?;
     writer.write_header(
         &write_schema,
@@ -300,10 +285,14 @@ async fn annotate_to_vcf_inner(
         .get("bio.coordinate_system_zero_based")
         .is_some_and(|v| v == "true");
 
+    // Stream batches one at a time — never holds more than one batch in memory.
+    use futures::StreamExt;
+    let mut stream = df.execute_stream().await?;
     let mut total_rows = 0;
-    for batch in &batches {
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result?;
         let lines = batch_to_vcf_lines(
-            batch,
+            &batch,
             &vcf_info_fields,
             &unique_format_tags,
             &sample_names,
