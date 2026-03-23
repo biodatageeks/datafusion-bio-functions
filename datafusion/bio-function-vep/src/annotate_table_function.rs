@@ -1600,10 +1600,10 @@ mod tests {
         let mut csq_values = Vec::new();
         let mut most_values = Vec::new();
         for batch in &batches {
-            assert!(batch.column_by_name("csq").is_some());
+            assert!(batch.column_by_name("CSQ").is_some());
             assert!(batch.column_by_name("most_severe_consequence").is_some());
             csq_values.extend(string_values(
-                batch.column_by_name("csq").expect("csq column exists"),
+                batch.column_by_name("CSQ").expect("csq column exists"),
             ));
             most_values.extend(string_values(
                 batch
@@ -1647,12 +1647,12 @@ mod tests {
         for batch in &batches {
             assert_eq!(batch.num_columns(), 2);
             assert_eq!(batch.schema().field(0).name(), "chrom");
-            assert_eq!(batch.schema().field(1).name(), "csq");
+            assert_eq!(batch.schema().field(1).name(), "CSQ");
         }
         let mut csq_values = Vec::new();
         for batch in &batches {
             csq_values.extend(string_values(
-                batch.column_by_name("csq").expect("csq column exists"),
+                batch.column_by_name("CSQ").expect("csq column exists"),
             ));
         }
         // Both rows have CSQ (intergenic_variant when no context tables).
@@ -1696,7 +1696,7 @@ mod tests {
                 batch.column_by_name("chrom").expect("chrom column exists"),
             ));
             csq.extend(string_values(
-                batch.column_by_name("csq").expect("csq column exists"),
+                batch.column_by_name("CSQ").expect("csq column exists"),
             ));
             most.extend(string_values(
                 batch
@@ -1760,7 +1760,7 @@ mod tests {
         let mut most = Vec::new();
         for batch in &batches {
             csq.extend(string_values(
-                batch.column_by_name("csq").expect("csq column exists"),
+                batch.column_by_name("CSQ").expect("csq column exists"),
             ));
             most.extend(string_values(
                 batch
@@ -1799,7 +1799,7 @@ mod tests {
             .expect("collect default distance annotate_vep");
         let default_csq = string_values(
             default_batches[0]
-                .column_by_name("csq")
+                .column_by_name("CSQ")
                 .expect("default csq column exists"),
         );
         let default_csq0 = default_csq[0]
@@ -1825,7 +1825,7 @@ mod tests {
             .expect("collect numeric distance annotate_vep");
         let numeric_csq = string_values(
             numeric_batches[0]
-                .column_by_name("csq")
+                .column_by_name("CSQ")
                 .expect("numeric csq column exists"),
         );
         let numeric_csq0 = numeric_csq[0]
@@ -1854,7 +1854,7 @@ mod tests {
             .expect("collect pair distance annotate_vep");
         let pair_csq = string_values(
             pair_batches[0]
-                .column_by_name("csq")
+                .column_by_name("CSQ")
                 .expect("pair csq column exists"),
         );
         let pair_csq0 = pair_csq[0].as_ref().expect("pair csq should be present");
@@ -1897,7 +1897,7 @@ mod tests {
             .expect("collect default hgvs annotate_vep");
         let default_csq = string_values(
             default_batches[0]
-                .column_by_name("csq")
+                .column_by_name("CSQ")
                 .expect("default csq column exists"),
         );
         let default_entry = csq_entries(default_csq[0].as_ref().expect("default csq present"))
@@ -1943,7 +1943,7 @@ mod tests {
             .expect("collect hgvs enabled annotate_vep");
         let hgvs_csq = string_values(
             hgvs_batches[0]
-                .column_by_name("csq")
+                .column_by_name("CSQ")
                 .expect("hgvs csq column exists"),
         );
         let hgvs_entry = csq_entries(hgvs_csq[0].as_ref().expect("hgvs csq present"))
@@ -1970,7 +1970,7 @@ mod tests {
             .expect("collect hgvs prediction annotate_vep");
         let hgvs_prediction_csq = string_values(
             hgvs_prediction_batches[0]
-                .column_by_name("csq")
+                .column_by_name("CSQ")
                 .expect("hgvs prediction csq column exists"),
         );
         let hgvs_prediction_entry = csq_entries(
@@ -2014,7 +2014,7 @@ mod tests {
         let mut most = Vec::new();
         for batch in &batches {
             csq.extend(string_values(
-                batch.column_by_name("csq").expect("csq column exists"),
+                batch.column_by_name("CSQ").expect("csq column exists"),
             ));
             most.extend(string_values(
                 batch
@@ -2060,7 +2060,7 @@ mod tests {
             .collect()
             .await
             .expect("collect annotate_vep");
-        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+        let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column exists"));
         let most = string_values(
             batches[0]
                 .column_by_name("most_severe_consequence")
@@ -2089,7 +2089,7 @@ mod tests {
             .expect("collect second annotate_vep");
         let csq2 = string_values(
             batches2[0]
-                .column_by_name("csq")
+                .column_by_name("CSQ")
                 .expect("csq column exists"),
         );
         let csq2_0 = csq2[0].as_ref().expect("csq should be present").to_string();
@@ -2132,7 +2132,7 @@ mod tests {
             .await
             .expect("collect duplicate regulatory annotate_vep");
 
-        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+        let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column exists"));
         let most = string_values(
             batches[0]
                 .column_by_name("most_severe_consequence")
@@ -2179,7 +2179,7 @@ mod tests {
             .await
             .expect("collect regulatory serializer annotate_vep");
 
-        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+        let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column exists"));
         let most = string_values(
             batches[0]
                 .column_by_name("most_severe_consequence")
@@ -2245,7 +2245,7 @@ mod tests {
             .collect()
             .await
             .expect("collect annotate_vep");
-        let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+        let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column exists"));
         let most = string_values(
             batches[0]
                 .column_by_name("most_severe_consequence")
@@ -2286,7 +2286,7 @@ mod tests {
                 .collect()
                 .await
                 .expect("collect annotate_vep");
-            let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+            let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column exists"));
             let most = string_values(
                 batches[0]
                     .column_by_name("most_severe_consequence")
@@ -2324,7 +2324,7 @@ mod tests {
                 .collect()
                 .await
                 .expect("collect annotate_vep");
-            let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+            let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column exists"));
             let most = string_values(
                 batches[0]
                     .column_by_name("most_severe_consequence")
@@ -2364,7 +2364,7 @@ mod tests {
             );
             let df = ctx.sql(&sql).await.expect("query should parse");
             let batches = df.collect().await.expect("collect annotate_vep");
-            let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+            let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column exists"));
             let most = string_values(
                 batches[0]
                     .column_by_name("most_severe_consequence")
@@ -2405,7 +2405,7 @@ mod tests {
             );
             let df = ctx.sql(&sql).await.expect("query should parse");
             let batches = df.collect().await.expect("collect annotate_vep");
-            let csq = string_values(batches[0].column_by_name("csq").expect("csq column exists"));
+            let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column exists"));
             let most = string_values(
                 batches[0]
                     .column_by_name("most_severe_consequence")
@@ -2442,7 +2442,7 @@ mod tests {
             );
             let df = ctx.sql(&sql).await.expect("query should parse");
             let batches = df.collect().await.expect("collect annotate_vep");
-            let csq_values = string_values(batches[0].column_by_name("csq").expect("csq column"));
+            let csq_values = string_values(batches[0].column_by_name("CSQ").expect("csq column"));
 
             for csq_opt in &csq_values {
                 let Some(csq) = csq_opt else { continue };

@@ -96,7 +96,7 @@ async fn test_vcf_columns_pass_through_annotation() {
 
     // Verify annotation columns are added.
     assert!(
-        output_schema.field_with_name(None, "csq").is_ok(),
+        output_schema.field_with_name(None, "CSQ").is_ok(),
         "Expected 'csq' column in annotate_vep output"
     );
     assert!(
@@ -122,7 +122,7 @@ async fn test_vcf_columns_pass_through_annotation() {
     let non_null_csq: usize = batches
         .iter()
         .map(|batch| {
-            let csq_col = batch.column(batch.schema().index_of("csq").unwrap());
+            let csq_col = batch.column(batch.schema().index_of("CSQ").unwrap());
             count_non_null_strings(csq_col.as_ref())
         })
         .sum();
@@ -139,13 +139,13 @@ async fn test_projection_including_csq_preserves_values() {
     };
 
     let schema = df.schema().clone();
-    assert!(schema.field_with_name(None, "csq").is_ok());
+    assert!(schema.field_with_name(None, "CSQ").is_ok());
 
     let batches = df.collect().await.unwrap();
     let non_null_csq: usize = batches
         .iter()
         .map(|batch| {
-            let csq_col = batch.column(batch.schema().index_of("csq").unwrap());
+            let csq_col = batch.column(batch.schema().index_of("CSQ").unwrap());
             count_non_null_strings(csq_col.as_ref())
         })
         .sum();
@@ -164,7 +164,7 @@ async fn test_projection_omitting_csq_skips_column() {
     let schema = df.schema().clone();
     assert!(schema.field_with_name(None, "chrom").is_ok());
     assert!(schema.field_with_name(None, "start").is_ok());
-    assert!(schema.field_with_name(None, "csq").is_err());
+    assert!(schema.field_with_name(None, "CSQ").is_err());
 
     let batches = df.collect().await.unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();

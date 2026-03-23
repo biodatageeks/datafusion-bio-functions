@@ -402,8 +402,8 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
     }
 
     // ── Step 6: CSQ vs golden ──
-    let our_csq_name = if output_batch.schema().index_of("csq").is_ok() {
-        "csq"
+    let our_csq_name = if output_batch.schema().index_of("CSQ").is_ok() {
+        "CSQ"
     } else if output_batch.schema().index_of("CSQ").is_ok() {
         "CSQ"
     } else {
@@ -411,8 +411,8 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
     };
     let golden_csq_name = if golden_batch.schema().index_of("CSQ").is_ok() {
         "CSQ"
-    } else if golden_batch.schema().index_of("csq").is_ok() {
-        "csq"
+    } else if golden_batch.schema().index_of("CSQ").is_ok() {
+        "CSQ"
     } else {
         panic!("CSQ not found in golden")
     };

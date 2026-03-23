@@ -1958,7 +1958,7 @@ impl AnnotateProvider {
             })
             .collect();
 
-        fields.push(Arc::new(Field::new("csq", DataType::Utf8, true)));
+        fields.push(Arc::new(Field::new("CSQ", DataType::Utf8, true)));
         fields.push(Arc::new(Field::new(
             "most_severe_consequence",
             DataType::Utf8,

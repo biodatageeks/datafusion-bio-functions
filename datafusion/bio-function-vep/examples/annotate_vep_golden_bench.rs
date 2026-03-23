@@ -944,7 +944,7 @@ async fn run_annotate_vep(
         let alt_col = batch.column_by_name("alt").ok_or_else(|| {
             DataFusionError::Execution("annotate_vep output missing column alt".to_string())
         })?;
-        let csq_col = batch.column_by_name("csq").ok_or_else(|| {
+        let csq_col = batch.column_by_name("CSQ").ok_or_else(|| {
             DataFusionError::Execution("annotate_vep output missing column csq".to_string())
         })?;
         let most_col = batch

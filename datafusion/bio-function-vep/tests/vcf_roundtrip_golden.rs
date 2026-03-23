@@ -238,9 +238,9 @@ async fn test_roundtrip_golden_all_column_values() {
         "FORMAT columns with value mismatches: {format_mismatched:?}"
     );
     // ── Step 6: Compare CSQ annotation (output vs golden VEP 115) ──
-    // The CSQ field name may differ: our output uses "csq", golden uses "CSQ".
-    let our_csq_name = if output_batch.schema().index_of("csq").is_ok() {
-        "csq"
+    // The CSQ field name may differ: our output uses "CSQ", golden uses "CSQ".
+    let our_csq_name = if output_batch.schema().index_of("CSQ").is_ok() {
+        "CSQ"
     } else if output_batch.schema().index_of("CSQ").is_ok() {
         "CSQ"
     } else {
@@ -248,8 +248,8 @@ async fn test_roundtrip_golden_all_column_values() {
     };
     let golden_csq_name = if golden_batch.schema().index_of("CSQ").is_ok() {
         "CSQ"
-    } else if golden_batch.schema().index_of("csq").is_ok() {
-        "csq"
+    } else if golden_batch.schema().index_of("CSQ").is_ok() {
+        "CSQ"
     } else {
         panic!("CSQ column not found in golden");
     };

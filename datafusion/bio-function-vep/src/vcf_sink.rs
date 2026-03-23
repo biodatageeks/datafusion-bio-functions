@@ -268,7 +268,7 @@ pub async fn annotate_to_vcf(
     );
 
     let mut vcf_info_fields = info_fields;
-    vcf_info_fields.push("csq".to_string());
+    vcf_info_fields.push("CSQ".to_string());
 
     // 5. Build output schema with merged metadata for VCF header.
     let df = ctx.sql(&sql).await?;
@@ -289,7 +289,7 @@ pub async fn annotate_to_vcf(
                     merged_metadata.insert(k.clone(), v.clone());
                 }
                 arrow_field.with_metadata(merged_metadata)
-            } else if name == "csq" {
+            } else if name == "CSQ" {
                 let mut meta = std::collections::HashMap::new();
                 meta.insert("bio.vcf.field.field_type".to_string(), "INFO".to_string());
                 meta.insert(
