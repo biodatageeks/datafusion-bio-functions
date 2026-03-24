@@ -367,7 +367,7 @@ impl FusedArrayTransformStream {
             RecordBatch::try_new(self.schema.clone(), output_columns).map_err(DataFusionError::from);
 
         let t_end = Instant::now();
-        eprintln!(
+        log::debug!(
             "FusedArrayTransformExec::process_batch: num_rows={}, \
              passthrough={:.3}ms, transform={:.3}ms, total={:.3}ms",
             num_rows,
@@ -451,7 +451,7 @@ impl FusedArrayTransformStream {
         unnested_batch = enriched_batch;
         let t_cse_end = Instant::now();
 
-        eprintln!(
+        log::debug!(
             "FusedArrayTransformExec::apply_transforms: total_unnested_rows={}, \
              unnest_build={:.3}ms, cse={:.3}ms (cached {} sub-exprs), batch_cols={}, num_exprs={}",
             total_unnested_rows,
@@ -493,7 +493,7 @@ impl FusedArrayTransformStream {
                     result_array,
                     Some(null_buffer),
                 )?;
-                eprintln!(
+                log::debug!(
                     "  expr[{}] eval={:.3}ms",
                     expr_idx,
                     (Instant::now() - t_eval_start).as_secs_f64() * 1000.0,
@@ -932,7 +932,7 @@ fn apply_physical_cse(
         return Ok((batch, cache));
     }
 
-    eprintln!(
+    log::debug!(
         "  CSE: cached {} shared sub-expressions as columns",
         cache.len()
     );
