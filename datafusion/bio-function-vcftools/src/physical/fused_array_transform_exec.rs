@@ -293,25 +293,39 @@ impl FusedArrayTransformStream {
         // Rows where this maximum length is zero correspond to rows that would produce
         // no output rows after UNNEST + GROUP BY and thus must be dropped to match
         // baseline semantics.
-        let mut row_max_lengths: Vec<usize> = Vec::with_capacity(num_rows);
-        let mut row_mask: Vec<bool> = Vec::with_capacity(num_rows);
+        //
+        // VECTORIZED: use ListArray::offsets() directly instead of per-row extract_list_values()
+        // which creates a sliced ArrayRef per row. Offset arithmetic gives us lengths in O(1).
+        let mut row_max_lengths: Vec<usize> = vec![0; num_rows];
+        let mut row_mask: Vec<bool> = vec![false; num_rows];
 
-        for row_idx in 0..num_rows {
-            let mut max_len = 0_usize;
-
-            for (col_name, array) in &list_arrays {
-                let values_opt =
-                    crate::common::extract_list_values(array.as_ref(), row_idx, col_name)?;
-                if let Some(values) = values_opt {
-                    let len = values.len();
-                    if len > max_len {
-                        max_len = len;
+        for (_col_name, array) in &list_arrays {
+            if let Some(list_arr) = array.as_any().downcast_ref::<ListArray>() {
+                let offsets = list_arr.offsets();
+                for row_idx in 0..num_rows {
+                    if !list_arr.is_null(row_idx) {
+                        let len = (offsets[row_idx + 1] - offsets[row_idx]) as usize;
+                        if len > row_max_lengths[row_idx] {
+                            row_max_lengths[row_idx] = len;
+                        }
+                    }
+                }
+            } else {
+                // Fallback for LargeList/FixedSizeList: per-row extraction
+                for row_idx in 0..num_rows {
+                    let values_opt =
+                        crate::common::extract_list_values(array.as_ref(), row_idx, _col_name)?;
+                    if let Some(values) = values_opt {
+                        let len = values.len();
+                        if len > row_max_lengths[row_idx] {
+                            row_max_lengths[row_idx] = len;
+                        }
                     }
                 }
             }
-
-            row_max_lengths.push(max_len);
-            row_mask.push(max_len > 0);
+        }
+        for row_idx in 0..num_rows {
+            row_mask[row_idx] = row_max_lengths[row_idx] > 0;
         }
 
         let num_output_rows = row_mask.iter().filter(|&&b| b).count();
@@ -657,9 +671,7 @@ fn build_batched_unnest(
             continue;
         }
         let max_len = row_max_lengths[row_idx];
-        for _ in 0..max_len {
-            indices.push(row_idx as u64);
-        }
+        indices.extend(std::iter::repeat(row_idx as u64).take(max_len));
     }
     let indices_array = datafusion::arrow::array::UInt64Array::from(indices);
 
@@ -678,6 +690,9 @@ fn build_batched_unnest(
 ///
 /// For each surviving row, extracts the list values and pads shorter arrays with NULLs.
 /// Uses MutableArrayData for efficient incremental construction.
+///
+/// VECTORIZED: For ListArray (the common case), uses offsets and the flat values buffer
+/// directly with a single MutableArrayData source, avoiding per-row ArrayRef creation.
 fn build_batched_unnest_column(
     array: &dyn Array,
     row_max_lengths: &[usize],
@@ -687,7 +702,37 @@ fn build_batched_unnest_column(
     element_type: &DataType,
     col_name: &str,
 ) -> Result<ArrayRef> {
-    // Collect all row values first to get their ArrayData for MutableArrayData
+    // Fast path for ListArray: use offsets + flat values directly
+    if let Some(list_arr) = array.as_any().downcast_ref::<ListArray>() {
+        let offsets = list_arr.offsets();
+        let flat_values = list_arr.values();
+        let flat_data = flat_values.to_data();
+
+        // Single MutableArrayData over the flat values buffer (index 0) + null source
+        let mut mutable = MutableArrayData::new(vec![&flat_data], true, total_unnested_rows);
+
+        for row_idx in 0..num_rows {
+            if !row_mask[row_idx] {
+                continue;
+            }
+            let max_len = row_max_lengths[row_idx];
+            if list_arr.is_null(row_idx) {
+                mutable.extend_nulls(max_len);
+            } else {
+                let start = offsets[row_idx] as usize;
+                let end = offsets[row_idx + 1] as usize;
+                let values_len = end - start;
+                mutable.extend(0, start, end);
+                if max_len > values_len {
+                    mutable.extend_nulls(max_len - values_len);
+                }
+            }
+        }
+
+        return Ok(datafusion::arrow::array::make_array(mutable.freeze()));
+    }
+
+    // Fallback for LargeList/FixedSizeList: per-row extraction
     let mut row_values: Vec<Option<ArrayRef>> = Vec::new();
     let mut row_lengths: Vec<usize> = Vec::new();
 
@@ -705,12 +750,9 @@ fn build_batched_unnest_column(
         return Ok(datafusion::arrow::array::new_empty_array(element_type));
     }
 
-    // Use MutableArrayData for efficient incremental construction
-    // We need a template array for the data type
     let template = datafusion::arrow::array::new_empty_array(element_type);
     let template_data = template.to_data();
 
-    // Collect all non-None ArrayData refs
     let value_data: Vec<_> = row_values
         .iter()
         .filter_map(|v| v.as_ref().map(|a| a.to_data()))
@@ -722,13 +764,11 @@ fn build_batched_unnest_column(
 
     let mut mutable = MutableArrayData::new(all_data_refs, true, total_unnested_rows);
 
-    // data_idx tracks which non-None value we're on (1-indexed since template is at 0)
     let mut data_idx = 1_usize;
     for (i, values_opt) in row_values.iter().enumerate() {
         let max_len = row_lengths[i];
         match values_opt {
             None => {
-                // NULL list → all-null padding
                 mutable.extend_nulls(max_len);
             }
             Some(values) => {
@@ -1096,5 +1136,113 @@ mod tests {
 
         assert_eq!(result_batch.num_rows(), 2);
         assert_eq!(result_batch.num_columns(), 3); // metadata + 2 outputs
+    }
+
+    /// Test that the vectorized offset-based row_max_lengths computation
+    /// correctly handles null lists and variable-length arrays.
+    #[tokio::test]
+    async fn test_vectorized_row_max_lengths_with_nulls() {
+        // Row 0: values_a=[1.0, 2.0], values_b=[10.0, 20.0, 30.0] → max_len=3
+        // Row 1: values_a=NULL, values_b=[40.0] → max_len=1
+        let mut list_a = ListBuilder::new(Float64Builder::new());
+        list_a.values().append_value(1.0);
+        list_a.values().append_value(2.0);
+        list_a.append(true);
+        list_a.append(false); // NULL
+
+        let mut list_b = ListBuilder::new(Float64Builder::new());
+        list_b.values().append_value(10.0);
+        list_b.values().append_value(20.0);
+        list_b.values().append_value(30.0);
+        list_b.append(true);
+        list_b.values().append_value(40.0);
+        list_b.append(true);
+
+        let metadata = StringArray::from(vec!["m1", "m2"]);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("metadata", DataType::Utf8, false),
+            Field::new("va", DataType::List(Arc::new(Field::new("item", DataType::Float64, true))), true),
+            Field::new("vb", DataType::List(Arc::new(Field::new("item", DataType::Float64, true))), true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(metadata), Arc::new(list_a.finish()), Arc::new(list_b.finish())],
+        ).unwrap();
+
+        let batch_schema = batch.schema();
+        let mem_exec = TestMemoryExec::try_new(&[vec![batch]], batch_schema, None).unwrap();
+
+        let fused = FusedArrayTransformExec::try_new(
+            Arc::new(mem_exec),
+            vec!["va".to_string(), "vb".to_string()],
+            vec!["metadata".to_string()],
+            vec!["va_out".to_string(), "vb_out".to_string()],
+            vec![],
+        ).unwrap();
+
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = fused.execute(0, ctx).unwrap();
+        let result = stream.next().await.unwrap().unwrap();
+
+        // Both rows should survive (both have at least one non-null array)
+        assert_eq!(result.num_rows(), 2);
+
+        // Identity transform: arrays passed through with original lengths (no padding)
+        let va_out = result.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(va_out.value(0).len(), 2); // original [1,2]
+        assert!(va_out.is_null(1)); // NULL list stays NULL
+
+        let vb_out = result.column(2).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(vb_out.value(0).len(), 3); // original [10,20,30]
+        assert_eq!(vb_out.value(1).len(), 1); // original [40]
+    }
+
+    /// Test that the fast-path ListArray unnest column construction
+    /// produces correct values using offsets directly.
+    #[tokio::test]
+    async fn test_vectorized_unnest_column_values() {
+        // Row 0: [10.0, 20.0, 30.0]
+        // Row 1: [40.0, 50.0]
+        let batch = create_test_batch!(
+            vec![1.0, 2.0, 3.0], vec![10.0, 20.0, 30.0],
+            vec![4.0, 5.0], vec![40.0, 50.0]
+        );
+        let schema = batch.schema();
+
+        let mem_exec = TestMemoryExec::try_new(&[vec![batch.clone()]], schema, None).unwrap();
+
+        let fused = FusedArrayTransformExec::try_new(
+            Arc::new(mem_exec),
+            vec!["values_a".to_string()],
+            vec!["metadata".to_string()],
+            vec!["values_a_out".to_string()],
+            vec![],
+        ).unwrap();
+
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = fused.execute(0, ctx).unwrap();
+        let result = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(result.num_rows(), 2);
+
+        // values_a_out should preserve the original values
+        let out = result.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+
+        // Row 0: [1.0, 2.0, 3.0]
+        let row0 = out.value(0);
+        let row0_f64 = row0.as_any().downcast_ref::<datafusion::arrow::array::Float64Array>().unwrap();
+        assert_eq!(row0_f64.len(), 3);
+        assert!((row0_f64.value(0) - 1.0).abs() < 1e-10);
+        assert!((row0_f64.value(1) - 2.0).abs() < 1e-10);
+        assert!((row0_f64.value(2) - 3.0).abs() < 1e-10);
+
+        // Row 1: [4.0, 5.0]
+        let row1 = out.value(1);
+        let row1_f64 = row1.as_any().downcast_ref::<datafusion::arrow::array::Float64Array>().unwrap();
+        assert_eq!(row1_f64.len(), 2);
+        assert!((row1_f64.value(0) - 4.0).abs() < 1e-10);
+        assert!((row1_f64.value(1) - 5.0).abs() < 1e-10);
     }
 }
