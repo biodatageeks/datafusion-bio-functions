@@ -2489,3 +2489,136 @@ async fn test_passthrough_column_in_transform() {
     // Clean up
     disable_fused_array_transform();
 }
+
+/// Test batched evaluation with a large number of rows (100 rows × 200 elements).
+/// Verifies that the batched unnest path produces correct results at scale.
+#[tokio::test]
+#[serial]
+async fn test_batched_large_scale() {
+    let num_rows = 100;
+    let elements_per_row = 200;
+
+    // Build test data: 100 rows, each with 200-element arrays
+    let mut list_builder_a = ListBuilder::new(Float64Builder::new());
+    let mut list_builder_b = ListBuilder::new(Float64Builder::new());
+    let mut metadata_vals: Vec<String> = Vec::with_capacity(num_rows);
+
+    for row in 0..num_rows {
+        for elem in 0..elements_per_row {
+            list_builder_a
+                .values()
+                .append_value((row * elements_per_row + elem) as f64);
+            list_builder_b
+                .values()
+                .append_value(((row * elements_per_row + elem) * 10) as f64);
+        }
+        list_builder_a.append(true);
+        list_builder_b.append(true);
+        metadata_vals.push(format!("row_{row}"));
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("metadata", DataType::Utf8, false),
+        Field::new(
+            "values_a",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        ),
+        Field::new(
+            "values_b",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        ),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(metadata_vals)),
+            Arc::new(list_builder_a.finish()),
+            Arc::new(list_builder_b.finish()),
+        ],
+    )
+    .unwrap();
+
+    let table_opt = MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap();
+    let table_base = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+
+    let sql = "SELECT metadata, \
+               array_agg(va + vb) as sum_ab \
+               FROM ( \
+                 SELECT metadata, ROW_NUMBER() OVER () as rn, \
+                        UNNEST(values_a) as va, UNNEST(values_b) as vb \
+                 FROM test_data \
+               ) sub GROUP BY metadata, rn";
+
+    // Run with optimization
+    let opt_ctx = create_optimized_context().await;
+    opt_ctx
+        .register_table("test_data", Arc::new(table_opt))
+        .unwrap();
+    let opt_results: Vec<RecordBatch> = opt_ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let opt_total_rows: usize = opt_results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(opt_total_rows, num_rows);
+
+    // Run without optimization
+    let base_ctx = create_baseline_context().await;
+    base_ctx
+        .register_table("test_data", Arc::new(table_base))
+        .unwrap();
+    let base_results: Vec<RecordBatch> = base_ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let base_total_rows: usize = base_results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(base_total_rows, num_rows);
+
+    // Verify a few values match between optimized and baseline
+    // Collect into maps by metadata for deterministic comparison
+    use std::collections::HashMap;
+    let collect_to_map = |results: &[RecordBatch]| -> HashMap<String, Vec<f64>> {
+        let mut map = HashMap::new();
+        for batch in results {
+            let meta = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let lists = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                let key = meta.value(i).to_string();
+                let inner = lists.value(i);
+                let vals = inner
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                let v: Vec<f64> = (0..vals.len()).map(|j| vals.value(j)).collect();
+                map.insert(key, v);
+            }
+        }
+        map
+    };
+
+    let opt_map = collect_to_map(&opt_results);
+    let base_map = collect_to_map(&base_results);
+
+    assert_eq!(opt_map.len(), base_map.len());
+    for (key, opt_vals) in &opt_map {
+        let base_vals = base_map.get(key).unwrap_or_else(|| panic!("Missing key: {key}"));
+        assert_eq!(
+            opt_vals.len(),
+            base_vals.len(),
+            "Array length mismatch for {key}"
+        );
+        for (j, (o, b)) in opt_vals.iter().zip(base_vals.iter()).enumerate() {
+            assert!(
+                (o - b).abs() < 1e-10,
+                "Value mismatch at {key}[{j}]: opt={o}, base={b}"
+            );
+        }
+    }
+
+    println!("Large scale batched test passed: {num_rows} rows × {elements_per_row} elements");
+    disable_fused_array_transform();
+}
