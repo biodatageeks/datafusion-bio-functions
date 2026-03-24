@@ -359,7 +359,7 @@ impl FusedArrayTransformStream {
             RecordBatch::try_new(self.schema.clone(), output_columns).map_err(DataFusionError::from);
 
         let t_end = Instant::now();
-        log::debug!(
+        eprintln!(
             "FusedArrayTransformExec::process_batch: num_rows={}, \
              passthrough={:.3}ms, transform={:.3}ms, total={:.3}ms",
             num_rows,
@@ -431,7 +431,7 @@ impl FusedArrayTransformStream {
         )?;
         let t_unnest_end = Instant::now();
 
-        log::debug!(
+        eprintln!(
             "FusedArrayTransformExec::apply_transforms: total_unnested_rows={}, \
              unnest_build={:.3}ms, num_exprs={}",
             total_unnested_rows,
@@ -461,7 +461,7 @@ impl FusedArrayTransformStream {
                     result_array,
                     Some(null_buffer),
                 )?;
-                log::debug!(
+                eprintln!(
                     "  expr[{}] eval={:.3}ms",
                     expr_idx,
                     (t_eval_end - t_eval_start).as_secs_f64() * 1000.0,
