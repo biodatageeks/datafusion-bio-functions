@@ -4007,12 +4007,24 @@ impl AnnotateProvider {
             } else {
                 // Find the most-severe transcript from row_assignments (cache-miss path).
                 // For cache-hit, row_assignments is empty and transcript-level cols are NULL.
+                // When multiple transcripts share the same most-severe term, prefer
+                // the one with a populated gene_symbol (issue #54).
                 let most_severe_tc: Option<&TranscriptConsequence> = if !row_assignments.is_empty()
                 {
                     let most_term = SoTerm::from_str(&most_str).unwrap_or(SoTerm::SequenceVariant);
-                    row_assignments
+                    let candidates: Vec<&TranscriptConsequence> = row_assignments
                         .iter()
-                        .find(|tc| tc.terms.contains(&most_term))
+                        .filter(|tc| tc.terms.contains(&most_term))
+                        .collect();
+                    candidates
+                        .iter()
+                        .find(|tc| {
+                            tc.transcript_idx
+                                .and_then(|idx| ctx.transcripts[idx].gene_symbol.as_ref())
+                                .is_some_and(|s| !s.is_empty())
+                        })
+                        .or(candidates.first())
+                        .copied()
                         .or(row_assignments.first())
                 } else {
                     None
