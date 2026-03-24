@@ -73,40 +73,47 @@ impl ScalarUDFImpl for ListBinaryArithUdf {
         Ok(f64_list_type())
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let lhs_arr = args.args[0].clone().into_array(1)?;
-        let lhs_list = lhs_arr.as_list::<i32>();
-        let lhs_vals = list_values_as_f64(lhs_list)?;
         let op = self.op;
 
-        let result: Float64Array = match &args.args[1] {
-            ColumnarValue::Scalar(_) => {
-                // List op Scalar → broadcast scalar
+        // Detect which arg is the list and which might be scalar
+        let lhs_is_list = matches!(&args.args[0], ColumnarValue::Array(a) if a.as_any().downcast_ref::<ListArray>().is_some());
+        let rhs_is_list = matches!(&args.args[1], ColumnarValue::Array(a) if a.as_any().downcast_ref::<ListArray>().is_some());
+
+        if lhs_is_list {
+            let lhs_arr = args.args[0].clone().into_array(1)?;
+            let lhs_list = lhs_arr.as_list::<i32>();
+            let lhs_vals = list_values_as_f64(lhs_list)?;
+
+            let result: Float64Array = if rhs_is_list {
+                let rhs_arr = args.args[1].clone().into_array(1)?;
+                let rhs_list = rhs_arr.as_list::<i32>();
+                let rhs_vals = list_values_as_f64(rhs_list)?;
+                lhs_vals.iter().zip(rhs_vals.iter())
+                    .map(|(a, b)| match (a, b) {
+                        (Some(a), Some(b)) => Some(op.apply(a, b)),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
                 let scalar = scalar_to_f64(&args.args[1])?;
                 lhs_vals.iter().map(|v| v.map(|x| op.apply(x, scalar))).collect()
-            }
-            ColumnarValue::Array(rhs_arr) => {
-                // Check if rhs is a ListArray
-                if let Some(rhs_list) = rhs_arr.as_any().downcast_ref::<ListArray>() {
-                    let rhs_vals = list_values_as_f64(rhs_list)?;
-                    lhs_vals
-                        .iter()
-                        .zip(rhs_vals.iter())
-                        .map(|(a, b)| match (a, b) {
-                            (Some(a), Some(b)) => Some(op.apply(a, b)),
-                            _ => None,
-                        })
-                        .collect()
-                } else {
-                    // Single-element scalar array
-                    let scalar = scalar_to_f64(&args.args[1])?;
-                    lhs_vals.iter().map(|v| v.map(|x| op.apply(x, scalar))).collect()
-                }
-            }
-        };
-
-        Ok(ColumnarValue::Array(Arc::new(rebuild_f64_list(
-            lhs_list, result,
-        ))))
+            };
+            Ok(ColumnarValue::Array(Arc::new(rebuild_f64_list(lhs_list, result))))
+        } else if rhs_is_list {
+            // Scalar op List → broadcast scalar on left: scalar op list[i]
+            let scalar = scalar_to_f64(&args.args[0])?;
+            let rhs_arr = args.args[1].clone().into_array(1)?;
+            let rhs_list = rhs_arr.as_list::<i32>();
+            let rhs_vals = list_values_as_f64(rhs_list)?;
+            let result: Float64Array = rhs_vals.iter()
+                .map(|v| v.map(|x| op.apply(scalar, x)))
+                .collect();
+            Ok(ColumnarValue::Array(Arc::new(rebuild_f64_list(rhs_list, result))))
+        } else {
+            Err(datafusion::common::DataFusionError::Internal(
+                format!("{}: at least one argument must be a List", op.name()),
+            ))
+        }
     }
 }
 
