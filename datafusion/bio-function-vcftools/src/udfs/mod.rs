@@ -7,6 +7,7 @@ pub mod array_ops;
 pub mod compare;
 pub mod conditional;
 pub mod numeric;
+pub mod vcf_genotype_qc;
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use datafusion::prelude::SessionContext;
 pub use array_ops::{list_index_udf, list_make_array_udf, list_replace_null_udf};
 pub use compare::{list_eq_udf, list_in_udf};
 pub use conditional::{list_case_udf, list_where_udf};
+pub use vcf_genotype_qc::vcf_genotype_qc_udf;
 pub use numeric::{
     list_add_udf, list_clamp_udf, list_div_udf, list_greatest_udf, list_least_udf,
     list_log10_udf, list_mul_udf, list_neg_udf, list_pow10_udf, list_round_udf, list_sqrt_udf,
@@ -53,6 +55,8 @@ pub fn register_list_udfs(ctx: &SessionContext) {
     ctx.register_udf(list_index_udf());
     ctx.register_udf(list_replace_null_udf());
     ctx.register_udf(list_make_array_udf());
+    // Fused genotype QC
+    ctx.register_udf(vcf_genotype_qc_udf());
 }
 
 // ============================================================================
