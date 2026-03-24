@@ -31,6 +31,14 @@ use crate::common::{build_element_schema_from_arrow, extract_list_element_type};
 ///
 /// This operator takes an input with array columns and applies transformations
 /// element-wise, producing output arrays without materializing intermediate unnested rows.
+///
+/// ## Physical-Level CSE
+///
+/// Before evaluating transform expressions, the operator detects common
+/// sub-expression trees across all expressions (by comparing their Display
+/// representation). Common sub-expressions are pre-evaluated once and added
+/// as temporary columns to the batch, so subsequent expression evaluations
+/// reference the cached result instead of recomputing.
 pub struct FusedArrayTransformExec {
     /// Input execution plan
     input: Arc<dyn ExecutionPlan>,
@@ -419,7 +427,7 @@ impl FusedArrayTransformStream {
 
         // Build the single large unnested RecordBatch
         let t_unnest_start = Instant::now();
-        let unnested_batch = build_batched_unnest(
+        let mut unnested_batch = build_batched_unnest(
             list_arrays,
             row_max_lengths,
             row_mask,
@@ -431,23 +439,47 @@ impl FusedArrayTransformStream {
         )?;
         let t_unnest_end = Instant::now();
 
+        // Physical-level CSE: find common sub-expression trees across all
+        // transform expressions, pre-evaluate them, and add as cached columns.
+        // Returns the enriched batch and a cache mapping Display strings to column indices.
+        let t_cse_start = Instant::now();
+        let (enriched_batch, cse_cache) = if self.transform_exprs.len() > 1 {
+            apply_physical_cse(&self.transform_exprs, unnested_batch)?
+        } else {
+            (unnested_batch, std::collections::HashMap::new())
+        };
+        unnested_batch = enriched_batch;
+        let t_cse_end = Instant::now();
+
         eprintln!(
             "FusedArrayTransformExec::apply_transforms: total_unnested_rows={}, \
-             unnest_build={:.3}ms, num_exprs={}",
+             unnest_build={:.3}ms, cse={:.3}ms (cached {} sub-exprs), batch_cols={}, num_exprs={}",
             total_unnested_rows,
             (t_unnest_end - t_unnest_start).as_secs_f64() * 1000.0,
+            (t_cse_end - t_cse_start).as_secs_f64() * 1000.0,
+            cse_cache.len(),
+            unnested_batch.num_columns(),
             self.transform_exprs.len(),
         );
 
-        // Evaluate each transform expression ONCE on the entire unnested batch
-        self.transform_exprs
+        // Rewrite transform expressions to reference cached columns
+        let final_exprs: Vec<Arc<dyn PhysicalExpr>> = if cse_cache.is_empty() {
+            self.transform_exprs.clone()
+        } else {
+            self.transform_exprs
+                .iter()
+                .map(|expr| rewrite_expr_with_cache(expr, &cse_cache))
+                .collect()
+        };
+
+        // Evaluate each final transform expression on the CSE-enriched batch
+        final_exprs
             .iter()
             .enumerate()
             .map(|(expr_idx, expr)| {
                 let t_eval_start = Instant::now();
                 let result = expr.evaluate(&unnested_batch)?;
                 let result_array = result.into_array(unnested_batch.num_rows())?;
-                let t_eval_end = Instant::now();
 
                 // Split the flat result array back into a ListArray using offsets
                 let offset_buffer = OffsetBuffer::new(offsets.clone().into());
@@ -464,7 +496,7 @@ impl FusedArrayTransformStream {
                 eprintln!(
                     "  expr[{}] eval={:.3}ms",
                     expr_idx,
-                    (t_eval_end - t_eval_start).as_secs_f64() * 1000.0,
+                    (Instant::now() - t_eval_start).as_secs_f64() * 1000.0,
                 );
                 Ok(Arc::new(list_array) as ArrayRef)
             })
@@ -771,6 +803,145 @@ fn get_array_element_type(array_col: &str, schema: &SchemaRef) -> Result<DataTyp
     let idx = schema.index_of(array_col)?;
     let field = schema.field(idx);
     extract_list_element_type(field.data_type(), array_col)
+}
+
+/// Collect all sub-expressions from a physical expression tree, with their
+/// Display representation as key. Returns (display_string, expr_arc) pairs.
+fn collect_sub_exprs(
+    expr: &Arc<dyn PhysicalExpr>,
+    out: &mut Vec<(String, Arc<dyn PhysicalExpr>)>,
+) {
+    let display = format!("{expr}");
+    // Only collect non-trivial sub-expressions (not leaf Column refs)
+    if !expr.children().is_empty() {
+        out.push((display, expr.clone()));
+        for child in expr.children() {
+            collect_sub_exprs(&child, out);
+        }
+    }
+}
+
+/// Rewrite a physical expression tree, replacing sub-expressions that match
+/// a cached result with a Column reference to the pre-computed column.
+fn rewrite_expr_with_cache(
+    expr: &Arc<dyn PhysicalExpr>,
+    cache: &std::collections::HashMap<String, usize>, // display_string -> column_index
+) -> Arc<dyn PhysicalExpr> {
+    let display = format!("{expr}");
+    if let Some(&col_idx) = cache.get(&display) {
+        // Replace with a Column reference to the pre-computed column
+        return Arc::new(datafusion::physical_expr::expressions::Column::new(
+            &format!("__cse_{col_idx}"),
+            col_idx,
+        ));
+    }
+
+    // Recursively rewrite children
+    let children = expr.children();
+    if children.is_empty() {
+        return expr.clone();
+    }
+
+    let new_children: Vec<Arc<dyn PhysicalExpr>> = children
+        .iter()
+        .map(|child| rewrite_expr_with_cache(child, cache))
+        .collect();
+
+    expr.clone().with_new_children(new_children).unwrap_or_else(|_| expr.clone())
+}
+
+/// Apply physical-level Common Sub-Expression Elimination.
+///
+/// Walks all transform expression trees, finds sub-expressions that appear
+/// in 2+ different top-level expressions, evaluates them once, adds results
+/// as new columns, and rewrites expressions to reference the cached columns.
+fn apply_physical_cse(
+    transform_exprs: &[Arc<dyn PhysicalExpr>],
+    mut batch: RecordBatch,
+) -> Result<(RecordBatch, std::collections::HashMap<String, usize>)> {
+    use std::collections::HashMap;
+
+    // Step 1: Collect all sub-expressions from each top-level expression,
+    // tracking which top-level expression each sub-expr appears in.
+    let mut sub_expr_sources: HashMap<String, (Arc<dyn PhysicalExpr>, Vec<usize>)> = HashMap::new();
+
+    for (expr_idx, expr) in transform_exprs.iter().enumerate() {
+        let mut sub_exprs = Vec::new();
+        collect_sub_exprs(expr, &mut sub_exprs);
+
+        for (display, sub_expr) in sub_exprs {
+            sub_expr_sources
+                .entry(display)
+                .and_modify(|(_, sources)| {
+                    if !sources.contains(&expr_idx) {
+                        sources.push(expr_idx);
+                    }
+                })
+                .or_insert_with(|| (sub_expr, vec![expr_idx]));
+        }
+    }
+
+    // Step 2: Find sub-expressions that appear in 2+ top-level expressions.
+    // Sort by Display length descending (larger = deeper = should be evaluated first).
+    let mut shared: Vec<(String, Arc<dyn PhysicalExpr>)> = sub_expr_sources
+        .into_iter()
+        .filter(|(_, (_, sources))| sources.len() > 1)
+        .map(|(display, (expr, _))| (display, expr))
+        .collect();
+
+    if shared.is_empty() {
+        return Ok((batch, HashMap::new()));
+    }
+
+    // Sort by display string length ascending (evaluate simpler/inner exprs first)
+    shared.sort_by_key(|(display, _)| display.len());
+
+    // Step 3: Evaluate shared sub-expressions and add as columns.
+    // Use a cache to avoid evaluating sub-expressions of already-cached expressions.
+    let mut cache: HashMap<String, usize> = HashMap::new();
+    let mut new_columns: Vec<ArrayRef> = batch.columns().to_vec();
+    let mut new_fields: Vec<Arc<Field>> = batch.schema().fields().iter().cloned().collect();
+
+    for (display, expr) in &shared {
+        // Skip if this exact expression was already cached
+        if cache.contains_key(display) {
+            continue;
+        }
+
+        // Rewrite the expression to use any already-cached sub-expressions
+        let rewritten = rewrite_expr_with_cache(expr, &cache);
+
+        // Evaluate on current batch (which may have cached columns from prior iterations)
+        let temp_schema = Arc::new(Schema::new(new_fields.clone()));
+        let temp_batch = RecordBatch::try_new(temp_schema, new_columns.clone())?;
+
+        let result = rewritten.evaluate(&temp_batch)?;
+        let result_array = result.into_array(temp_batch.num_rows())?;
+
+        let col_idx = new_fields.len();
+        new_fields.push(Arc::new(Field::new(
+            &format!("__cse_{col_idx}"),
+            result_array.data_type().clone(),
+            true,
+        )));
+        new_columns.push(result_array);
+        cache.insert(display.clone(), col_idx);
+    }
+
+    if cache.is_empty() {
+        return Ok((batch, cache));
+    }
+
+    eprintln!(
+        "  CSE: cached {} shared sub-expressions as columns",
+        cache.len()
+    );
+
+    // Build the enriched batch with cached columns
+    let enriched_schema = Arc::new(Schema::new(new_fields));
+    batch = RecordBatch::try_new(enriched_schema, new_columns)?;
+
+    Ok((batch, cache))
 }
 
 #[cfg(test)]
