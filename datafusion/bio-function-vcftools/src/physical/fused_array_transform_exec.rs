@@ -8,6 +8,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, ListArray, MutableArrayData, RecordBatch,
@@ -18,6 +19,7 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -44,6 +46,8 @@ pub struct FusedArrayTransformExec {
     schema: SchemaRef,
     /// Cached plan properties
     cache: PlanProperties,
+    /// Execution metrics
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl Debug for FusedArrayTransformExec {
@@ -108,6 +112,7 @@ impl FusedArrayTransformExec {
             transform_exprs,
             schema,
             cache,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -184,6 +189,7 @@ impl ExecutionPlan for FusedArrayTransformExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let input_stream = self.input.execute(partition, context)?;
         Ok(Box::pin(FusedArrayTransformStream::new(
             input_stream,
@@ -191,7 +197,12 @@ impl ExecutionPlan for FusedArrayTransformExec {
             self.array_columns.clone(),
             self.passthrough_columns.clone(),
             self.transform_exprs.clone(),
+            baseline_metrics,
         )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 }
 
@@ -202,6 +213,7 @@ struct FusedArrayTransformStream {
     array_columns: Vec<String>,
     passthrough_columns: Vec<String>,
     transform_exprs: Vec<Arc<dyn PhysicalExpr>>,
+    baseline_metrics: BaselineMetrics,
 }
 
 impl FusedArrayTransformStream {
@@ -211,6 +223,7 @@ impl FusedArrayTransformStream {
         array_columns: Vec<String>,
         passthrough_columns: Vec<String>,
         transform_exprs: Vec<Arc<dyn PhysicalExpr>>,
+        baseline_metrics: BaselineMetrics,
     ) -> Self {
         Self {
             input,
@@ -218,11 +231,15 @@ impl FusedArrayTransformStream {
             array_columns,
             passthrough_columns,
             transform_exprs,
+            baseline_metrics,
         }
     }
 
     /// Process a single input batch.
     fn process_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let _timer = self.baseline_metrics.elapsed_compute().timer();
+        let t_start = Instant::now();
+
         let num_rows = batch.num_rows();
         if num_rows == 0 {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
@@ -317,6 +334,8 @@ impl FusedArrayTransformStream {
             output_columns.push(filtered);
         }
 
+        let t_after_passthrough = Instant::now();
+
         // Check if we have expressions to evaluate or do identity transform
         if self.transform_exprs.is_empty() {
             // No transform expressions: identity transform (pass through arrays unchanged)
@@ -335,7 +354,22 @@ impl FusedArrayTransformStream {
             output_columns.extend(transformed);
         }
 
-        RecordBatch::try_new(self.schema.clone(), output_columns).map_err(DataFusionError::from)
+        let t_after_transform = Instant::now();
+        let result =
+            RecordBatch::try_new(self.schema.clone(), output_columns).map_err(DataFusionError::from);
+
+        let t_end = Instant::now();
+        log::debug!(
+            "FusedArrayTransformExec::process_batch: num_rows={}, \
+             passthrough={:.3}ms, transform={:.3}ms, total={:.3}ms",
+            num_rows,
+            (t_after_passthrough - t_start).as_secs_f64() * 1000.0,
+            (t_after_transform - t_after_passthrough).as_secs_f64() * 1000.0,
+            (t_end - t_start).as_secs_f64() * 1000.0,
+        );
+
+        self.baseline_metrics.record_output(result.as_ref().map(|b| b.num_rows()).unwrap_or(0));
+        result
     }
 
     /// Apply transform expressions using batched evaluation.
@@ -384,6 +418,7 @@ impl FusedArrayTransformStream {
         }
 
         // Build the single large unnested RecordBatch
+        let t_unnest_start = Instant::now();
         let unnested_batch = build_batched_unnest(
             list_arrays,
             row_max_lengths,
@@ -394,14 +429,25 @@ impl FusedArrayTransformStream {
             batch,
             &self.passthrough_columns,
         )?;
+        let t_unnest_end = Instant::now();
+
+        log::debug!(
+            "FusedArrayTransformExec::apply_transforms: total_unnested_rows={}, \
+             unnest_build={:.3}ms, num_exprs={}",
+            total_unnested_rows,
+            (t_unnest_end - t_unnest_start).as_secs_f64() * 1000.0,
+            self.transform_exprs.len(),
+        );
 
         // Evaluate each transform expression ONCE on the entire unnested batch
         self.transform_exprs
             .iter()
             .enumerate()
-            .map(|(_expr_idx, expr)| {
+            .map(|(expr_idx, expr)| {
+                let t_eval_start = Instant::now();
                 let result = expr.evaluate(&unnested_batch)?;
                 let result_array = result.into_array(unnested_batch.num_rows())?;
+                let t_eval_end = Instant::now();
 
                 // Split the flat result array back into a ListArray using offsets
                 let offset_buffer = OffsetBuffer::new(offsets.clone().into());
@@ -415,6 +461,11 @@ impl FusedArrayTransformStream {
                     result_array,
                     Some(null_buffer),
                 )?;
+                log::debug!(
+                    "  expr[{}] eval={:.3}ms",
+                    expr_idx,
+                    (t_eval_end - t_eval_start).as_secs_f64() * 1000.0,
+                );
                 Ok(Arc::new(list_array) as ArrayRef)
             })
             .collect()
