@@ -27,6 +27,11 @@ use futures::{Stream, StreamExt, ready};
 
 use crate::common::{build_element_schema_from_arrow, extract_list_element_type};
 
+#[cfg(test)]
+const DEFAULT_UNNEST_ROWS_PER_CHUNK: usize = 4;
+#[cfg(not(test))]
+const DEFAULT_UNNEST_ROWS_PER_CHUNK: usize = 1_000_000;
+
 /// Physical execution plan for fused array transformation.
 ///
 /// This operator takes an input with array columns and applies transformations
@@ -398,8 +403,8 @@ impl FusedArrayTransformStream {
     /// Apply transform expressions using batched evaluation.
     ///
     /// Instead of building a mini-batch per row and evaluating expressions N times,
-    /// this builds ONE large "unnested" RecordBatch for the entire input, evaluates
-    /// each expression once, then splits results back into ListArrays using offsets.
+    /// this builds batched "unnested" RecordBatches, evaluates expressions per chunk,
+    /// then concatenates the flat results back into ListArrays using offsets.
     fn apply_transforms(
         &self,
         batch: &RecordBatch,
@@ -417,6 +422,7 @@ impl FusedArrayTransformStream {
         let mut null_bitmap: Vec<bool> = Vec::with_capacity(num_rows);
         offsets.push(0);
         let mut total_unnested_rows: usize = 0;
+        let mut surviving_rows: Vec<usize> = Vec::with_capacity(num_rows);
 
         for row_idx in 0..num_rows {
             if !row_mask[row_idx] {
@@ -426,6 +432,7 @@ impl FusedArrayTransformStream {
             total_unnested_rows += max_len;
             offsets.push(total_unnested_rows as i32);
             null_bitmap.push(true);
+            surviving_rows.push(row_idx);
         }
 
         if total_unnested_rows == 0 {
@@ -440,83 +447,127 @@ impl FusedArrayTransformStream {
                 .collect();
         }
 
-        // Build the single large unnested RecordBatch
-        let t_unnest_start = Instant::now();
-        let mut unnested_batch = build_batched_unnest(
-            list_arrays,
-            row_max_lengths,
-            row_mask,
-            num_rows,
-            total_unnested_rows,
-            &unnested_schema,
-            batch,
-            &self.passthrough_columns,
-        )?;
-        let t_unnest_end = Instant::now();
+        let target_unnested_rows = chunk_target_unnested_rows();
+        let chunk_ranges =
+            build_chunk_ranges(&surviving_rows, row_max_lengths, target_unnested_rows);
+        let mut total_unnest_build_ms = 0.0_f64;
+        let mut total_cse_ms = 0.0_f64;
+        let mut total_eval_ms = vec![0.0_f64; self.transform_exprs.len()];
+        let mut total_cached_exprs = 0_usize;
+        let mut total_batch_cols = 0_usize;
+        let mut output_value_chunks: Vec<Vec<ArrayRef>> = (0..self.transform_exprs.len())
+            .map(|_| Vec::new())
+            .collect();
 
-        // Physical-level CSE: find common sub-expression trees across all
-        // transform expressions, pre-evaluate them, and add as cached columns.
-        // Returns the enriched batch and a cache mapping Display strings to column indices.
-        let t_cse_start = Instant::now();
-        let (enriched_batch, cse_cache) = if !self.transform_exprs.is_empty() {
-            apply_physical_cse(&self.transform_exprs, unnested_batch)?
-        } else {
-            (unnested_batch, std::collections::HashMap::new())
-        };
-        unnested_batch = enriched_batch;
-        let t_cse_end = Instant::now();
+        for (chunk_idx, range) in chunk_ranges.iter().enumerate() {
+            let chunk_rows = &surviving_rows[range.clone()];
+            let chunk_unnested_rows = chunk_rows
+                .iter()
+                .map(|&row_idx| row_max_lengths[row_idx])
+                .sum::<usize>();
+
+            let chunk_unnest_start = Instant::now();
+            let mut unnested_batch = build_batched_unnest(
+                list_arrays,
+                row_max_lengths,
+                chunk_rows,
+                chunk_unnested_rows,
+                &unnested_schema,
+                batch,
+                &self.passthrough_columns,
+            )?;
+            total_unnest_build_ms += (Instant::now() - chunk_unnest_start).as_secs_f64() * 1000.0;
+
+            let chunk_cse_start = Instant::now();
+            let (enriched_batch, cse_cache) = if !self.transform_exprs.is_empty() {
+                apply_physical_cse(&self.transform_exprs, unnested_batch)?
+            } else {
+                (unnested_batch, std::collections::HashMap::new())
+            };
+            unnested_batch = enriched_batch;
+            total_cse_ms += (Instant::now() - chunk_cse_start).as_secs_f64() * 1000.0;
+            total_cached_exprs += cse_cache.len();
+            total_batch_cols = unnested_batch.num_columns();
+
+            let final_exprs: Vec<Arc<dyn PhysicalExpr>> = if cse_cache.is_empty() {
+                self.transform_exprs.clone()
+            } else {
+                self.transform_exprs
+                    .iter()
+                    .map(|expr| rewrite_expr_with_cache(expr, &cse_cache))
+                    .collect()
+            };
+
+            log::debug!(
+                "FusedArrayTransformExec::apply_transforms chunk[{chunk_idx}]: input_rows={}, \
+                 unnested_rows={}, cse_cached={}, batch_cols={}",
+                chunk_rows.len(),
+                chunk_unnested_rows,
+                cse_cache.len(),
+                unnested_batch.num_columns(),
+            );
+
+            for (expr_idx, expr) in final_exprs.iter().enumerate() {
+                let t_eval_start = Instant::now();
+                let result = expr.evaluate(&unnested_batch)?;
+                let result_array = result.into_array(unnested_batch.num_rows())?;
+                total_eval_ms[expr_idx] += (Instant::now() - t_eval_start).as_secs_f64() * 1000.0;
+                output_value_chunks[expr_idx].push(result_array);
+            }
+        }
 
         log::debug!(
-            "FusedArrayTransformExec::apply_transforms: total_unnested_rows={}, \
-             unnest_build={:.3}ms, cse={:.3}ms (cached {} sub-exprs), batch_cols={}, num_exprs={}",
+            "FusedArrayTransformExec::apply_transforms: total_unnested_rows={}, chunks={}, \
+             target_chunk_rows={}, unnest_build={:.3}ms, cse={:.3}ms (cached {} sub-exprs), \
+             batch_cols={}, num_exprs={}",
             total_unnested_rows,
-            (t_unnest_end - t_unnest_start).as_secs_f64() * 1000.0,
-            (t_cse_end - t_cse_start).as_secs_f64() * 1000.0,
-            cse_cache.len(),
-            unnested_batch.num_columns(),
+            chunk_ranges.len(),
+            target_unnested_rows,
+            total_unnest_build_ms,
+            total_cse_ms,
+            total_cached_exprs,
+            total_batch_cols,
             self.transform_exprs.len(),
         );
-
-        // Rewrite transform expressions to reference cached columns
-        let final_exprs: Vec<Arc<dyn PhysicalExpr>> = if cse_cache.is_empty() {
-            self.transform_exprs.clone()
-        } else {
-            self.transform_exprs
-                .iter()
-                .map(|expr| rewrite_expr_with_cache(expr, &cse_cache))
-                .collect()
-        };
 
         // Materialize list layout buffers once and cheaply clone them for each output array.
         let list_offsets = OffsetBuffer::new(offsets.into());
         let list_nulls = datafusion::arrow::buffer::NullBuffer::from(null_bitmap);
 
-        // Evaluate each final transform expression on the CSE-enriched batch
-        final_exprs
+        output_value_chunks
             .iter()
             .enumerate()
-            .map(|(expr_idx, expr)| {
-                let t_eval_start = Instant::now();
-                let result = expr.evaluate(&unnested_batch)?;
-                let result_array = result.into_array(unnested_batch.num_rows())?;
-
-                // Split the flat result array back into a ListArray using offsets
+            .map(|(expr_idx, chunks)| {
                 let list_field =
-                    Arc::new(Field::new("item", result_array.data_type().clone(), true));
+                    Arc::new(Field::new("item", self.output_value_type(expr_idx)?, true));
+                let values_array = if chunks.is_empty() {
+                    datafusion::arrow::array::new_empty_array(list_field.data_type())
+                } else if chunks.len() == 1 {
+                    chunks[0].clone()
+                } else {
+                    let refs: Vec<&dyn Array> = chunks.iter().map(|a| a.as_ref()).collect();
+                    datafusion::arrow::compute::concat(&refs)?
+                };
                 let list_array = ListArray::try_new(
                     list_field,
                     list_offsets.clone(),
-                    result_array,
+                    values_array,
                     Some(list_nulls.clone()),
                 )?;
-                log::debug!(
-                    "  expr[{}] eval={:.3}ms",
-                    expr_idx,
-                    (Instant::now() - t_eval_start).as_secs_f64() * 1000.0,
-                );
+                log::debug!("  expr[{}] eval={:.3}ms", expr_idx, total_eval_ms[expr_idx],);
                 Ok(Arc::new(list_array) as ArrayRef)
             })
             .collect()
+    }
+
+    fn output_value_type(&self, expr_idx: usize) -> Result<DataType> {
+        let output_field = self.schema.field(self.passthrough_columns.len() + expr_idx);
+        match output_field.data_type() {
+            DataType::List(inner) => Ok(inner.data_type().clone()),
+            other => Err(DataFusionError::Plan(format!(
+                "Expected List type for fused transform output, got {other}"
+            ))),
+        }
     }
 
     /// Build a ListArray from collected value arrays.
@@ -630,16 +681,53 @@ fn build_mini_batch_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
+fn chunk_target_unnested_rows() -> usize {
+    DEFAULT_UNNEST_ROWS_PER_CHUNK
+}
+
+fn build_chunk_ranges(
+    surviving_rows: &[usize],
+    row_max_lengths: &[usize],
+    target_unnested_rows: usize,
+) -> Vec<std::ops::Range<usize>> {
+    if surviving_rows.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut chunk_start = 0_usize;
+    let mut chunk_rows = 0_usize;
+    let mut chunk_unnested_rows = 0_usize;
+
+    for (idx, &row_idx) in surviving_rows.iter().enumerate() {
+        let row_len = row_max_lengths[row_idx].max(1);
+        let would_exceed_target =
+            chunk_rows > 0 && chunk_unnested_rows + row_len > target_unnested_rows;
+
+        if would_exceed_target {
+            ranges.push(chunk_start..idx);
+            chunk_start = idx;
+            chunk_rows = 0;
+            chunk_unnested_rows = 0;
+        }
+
+        chunk_rows += 1;
+        chunk_unnested_rows += row_len;
+    }
+
+    ranges.push(chunk_start..surviving_rows.len());
+    ranges
+}
+
 /// Build a single large unnested RecordBatch for all rows at once.
 ///
-/// Instead of creating one mini-batch per row, this concatenates all rows' array
-/// elements into a single RecordBatch and broadcasts passthrough columns in bulk.
-/// This enables single-pass expression evaluation instead of per-row evaluation.
+/// Instead of creating one mini-batch per row, this concatenates a chunk of rows'
+/// array elements into a single RecordBatch and broadcasts passthrough columns in bulk.
+/// This enables chunked expression evaluation instead of per-row evaluation.
 fn build_batched_unnest(
     list_arrays: &[(&String, ArrayRef)],
     row_max_lengths: &[usize],
-    row_mask: &[bool],
-    num_rows: usize,
+    selected_rows: &[usize],
     total_unnested_rows: usize,
     schema: &SchemaRef,
     batch: &RecordBatch,
@@ -654,8 +742,7 @@ fn build_batched_unnest(
         let unnested_col = build_batched_unnest_column(
             array.as_ref(),
             row_max_lengths,
-            row_mask,
-            num_rows,
+            selected_rows,
             total_unnested_rows,
             element_type,
             col_name,
@@ -668,10 +755,7 @@ fn build_batched_unnest(
 
     // Pre-compute the indices array once: for each surviving row, repeat its index max_len times
     let mut indices: Vec<u64> = Vec::with_capacity(total_unnested_rows);
-    for row_idx in 0..num_rows {
-        if !row_mask[row_idx] {
-            continue;
-        }
+    for &row_idx in selected_rows {
         let max_len = row_max_lengths[row_idx];
         indices.extend(std::iter::repeat(row_idx as u64).take(max_len));
     }
@@ -698,8 +782,7 @@ fn build_batched_unnest(
 fn build_batched_unnest_column(
     array: &dyn Array,
     row_max_lengths: &[usize],
-    row_mask: &[bool],
-    num_rows: usize,
+    selected_rows: &[usize],
     total_unnested_rows: usize,
     element_type: &DataType,
     col_name: &str,
@@ -713,10 +796,7 @@ fn build_batched_unnest_column(
         // Single MutableArrayData over the flat values buffer (index 0) + null source
         let mut mutable = MutableArrayData::new(vec![&flat_data], true, total_unnested_rows);
 
-        for row_idx in 0..num_rows {
-            if !row_mask[row_idx] {
-                continue;
-            }
+        for &row_idx in selected_rows {
             let max_len = row_max_lengths[row_idx];
             if list_arr.is_null(row_idx) {
                 mutable.extend_nulls(max_len);
@@ -738,10 +818,7 @@ fn build_batched_unnest_column(
     let mut row_values: Vec<Option<ArrayRef>> = Vec::new();
     let mut row_lengths: Vec<usize> = Vec::new();
 
-    for row_idx in 0..num_rows {
-        if !row_mask[row_idx] {
-            continue;
-        }
+    for &row_idx in selected_rows {
         let max_len = row_max_lengths[row_idx];
         let values_opt = crate::common::extract_list_values(array, row_idx, col_name)?;
         row_values.push(values_opt);
@@ -1365,5 +1442,16 @@ mod tests {
         assert_eq!(row1_vb.value(0), 40.0);
         assert_eq!(row1_vb.value(1), 50.0);
         assert_eq!(row1_vb.value(2), 60.0);
+    }
+
+    #[test]
+    fn test_build_chunk_ranges_respects_target_rows() {
+        let surviving_rows = vec![0_usize, 1, 2];
+        let row_max_lengths = vec![3_usize, 2, 4];
+        let ranges = build_chunk_ranges(&surviving_rows, &row_max_lengths, 4);
+        assert_eq!(ranges, vec![0..1, 1..2, 2..3]);
+
+        let larger_target = build_chunk_ranges(&surviving_rows, &row_max_lengths, 5);
+        assert_eq!(larger_target, vec![0..2, 2..3]);
     }
 }
