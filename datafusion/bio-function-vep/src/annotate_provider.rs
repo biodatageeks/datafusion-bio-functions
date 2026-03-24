@@ -4007,14 +4007,24 @@ impl AnnotateProvider {
             } else {
                 // Find the most-severe transcript from row_assignments (cache-miss path).
                 // For cache-hit, row_assignments is empty and transcript-level cols are NULL.
-                // When multiple transcripts share the same most-severe term, prefer
-                // the one with a populated gene_symbol (issue #54).
+                //
+                // When multiple transcripts share the same impact level (e.g. all
+                // MODIFIER), prefer one with a populated gene_symbol even if its
+                // exact SO rank is slightly lower. This matches VEP behaviour where
+                // overlapping genes at the same locus may have different consequence
+                // terms within the same impact tier (issue #54).
                 let most_severe_tc: Option<&TranscriptConsequence> = if !row_assignments.is_empty()
                 {
                     let most_term = SoTerm::from_str(&most_str).unwrap_or(SoTerm::SequenceVariant);
+                    let most_impact = most_term.impact();
+                    // Candidates: all transcripts whose most-severe term has the
+                    // same impact level as the variant-level most_severe_consequence.
                     let candidates: Vec<&TranscriptConsequence> = row_assignments
                         .iter()
-                        .filter(|tc| tc.terms.contains(&most_term))
+                        .filter(|tc| {
+                            most_severe_term(tc.terms.iter())
+                                .is_some_and(|t| t.impact() == most_impact)
+                        })
                         .collect();
                     candidates
                         .iter()
