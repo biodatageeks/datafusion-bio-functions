@@ -2622,3 +2622,104 @@ async fn test_batched_large_scale() {
     println!("Large scale batched test passed: {num_rows} rows × {elements_per_row} elements");
     disable_fused_array_transform();
 }
+
+/// Test intra-expression CSE: make_array(f(a), f(b), f(c)) where f() is a shared
+/// computation chain. Without intra-CSE, f() is computed 3× inside the single
+/// make_array expression. With intra-CSE, f()'s shared sub-expressions are
+/// computed once and cached.
+#[tokio::test]
+#[serial]
+async fn test_intra_expression_cse_make_array() {
+    let batch = create_test_data();
+    let schema = batch.schema();
+
+    let table_opt = MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap();
+    let table_base = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+
+    // Query with make_array containing shared sub-expressions:
+    // POWER and SQRT appear inside each of the 3 array elements
+    let sql = r#"
+        WITH indexed AS (
+            SELECT ROW_NUMBER() OVER () as row_idx, metadata, values_a, values_b
+            FROM test_data
+        ),
+        unnested AS (
+            SELECT row_idx, metadata,
+                   unnest(values_a) as va, unnest(values_b) as vb
+            FROM indexed
+        ),
+        transformed AS (
+            SELECT row_idx, metadata, va, vb,
+                   POWER(SQRT(va + vb), 2.0) + 1.0 AS c1,
+                   POWER(SQRT(va + vb), 2.0) + 2.0 AS c2,
+                   POWER(SQRT(va + vb), 2.0) + 3.0 AS c3
+            FROM unnested
+        )
+        SELECT row_idx, metadata,
+               array_agg([c1, c2, c3]) as computed
+        FROM transformed
+        GROUP BY row_idx, metadata
+        ORDER BY row_idx
+    "#;
+
+    // Run with optimization
+    let opt_ctx = create_optimized_context().await;
+    opt_ctx
+        .register_table("test_data", Arc::new(table_opt))
+        .unwrap();
+    let opt_results: Vec<RecordBatch> =
+        opt_ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let opt_total: usize = opt_results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(opt_total, 3);
+
+    // Run without optimization
+    let base_ctx = create_baseline_context().await;
+    base_ctx
+        .register_table("test_data", Arc::new(table_base))
+        .unwrap();
+    let base_results: Vec<RecordBatch> =
+        base_ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let base_total: usize = base_results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(base_total, 3);
+
+    // Compare: both should produce same number of rows
+    assert_eq!(opt_total, base_total);
+
+    // Verify optimized results using pretty_format for visual debugging
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    let opt_str = pretty_format_batches(&opt_results).unwrap().to_string();
+    let base_str = pretty_format_batches(&base_results).unwrap().to_string();
+    assert_eq!(opt_str, base_str, "Optimized and baseline results differ");
+
+    println!("Intra-expression CSE make_array test passed");
+    disable_fused_array_transform();
+}
+
+/// Test that CSE correctly handles expressions with no shared sub-expressions
+/// (should be a no-op, not cause errors).
+#[tokio::test]
+#[serial]
+async fn test_cse_no_shared_subexpressions() {
+    let batch = create_test_data();
+    let schema = batch.schema();
+
+    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+
+    // Simple identity: no shared sub-expressions
+    let sql = "SELECT metadata, \
+               array_agg(va) as out_a, array_agg(vb) as out_b \
+               FROM ( \
+                 SELECT metadata, ROW_NUMBER() OVER () as rn, \
+                        UNNEST(values_a) as va, UNNEST(values_b) as vb \
+                 FROM test_data \
+               ) sub GROUP BY metadata, rn";
+
+    let ctx = create_optimized_context().await;
+    ctx.register_table("test_data", Arc::new(table)).unwrap();
+    let results: Vec<RecordBatch> = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let total: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+
+    println!("CSE no-shared-subexpressions test passed");
+    disable_fused_array_transform();
+}

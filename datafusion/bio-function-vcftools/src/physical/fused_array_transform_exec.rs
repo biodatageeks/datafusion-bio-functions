@@ -853,39 +853,40 @@ fn rewrite_expr_with_cache(
 /// Apply physical-level Common Sub-Expression Elimination.
 ///
 /// Walks all transform expression trees, finds sub-expressions that appear
-/// in 2+ different top-level expressions, evaluates them once, adds results
-/// as new columns, and rewrites expressions to reference the cached columns.
+/// 2+ times (either across different expressions OR within the same expression
+/// tree), evaluates them once, adds results as new columns, and rewrites
+/// expressions to reference the cached columns.
+///
+/// This handles both:
+/// - Cross-expression CSE: e.g., `nc/pw/x` shared between PL and DS outputs
+/// - Intra-expression CSE: e.g., `nc/pw/x` appearing 3× inside `make_array(fp0,fp1,fp2)`
 fn apply_physical_cse(
     transform_exprs: &[Arc<dyn PhysicalExpr>],
     mut batch: RecordBatch,
 ) -> Result<(RecordBatch, std::collections::HashMap<String, usize>)> {
     use std::collections::HashMap;
 
-    // Step 1: Collect all sub-expressions from each top-level expression,
-    // tracking which top-level expression each sub-expr appears in.
-    let mut sub_expr_sources: HashMap<String, (Arc<dyn PhysicalExpr>, Vec<usize>)> = HashMap::new();
+    // Step 1: Collect all sub-expressions from all expression trees,
+    // counting TOTAL occurrences (not unique sources). This catches both
+    // cross-expression and intra-expression duplication.
+    let mut occurrence_count: HashMap<String, (Arc<dyn PhysicalExpr>, usize)> = HashMap::new();
 
-    for (expr_idx, expr) in transform_exprs.iter().enumerate() {
+    for expr in transform_exprs.iter() {
         let mut sub_exprs = Vec::new();
         collect_sub_exprs(expr, &mut sub_exprs);
 
         for (display, sub_expr) in sub_exprs {
-            sub_expr_sources
+            occurrence_count
                 .entry(display)
-                .and_modify(|(_, sources)| {
-                    if !sources.contains(&expr_idx) {
-                        sources.push(expr_idx);
-                    }
-                })
-                .or_insert_with(|| (sub_expr, vec![expr_idx]));
+                .and_modify(|(_, count)| *count += 1)
+                .or_insert_with(|| (sub_expr, 1));
         }
     }
 
-    // Step 2: Find sub-expressions that appear in 2+ top-level expressions.
-    // Sort by Display length descending (larger = deeper = should be evaluated first).
-    let mut shared: Vec<(String, Arc<dyn PhysicalExpr>)> = sub_expr_sources
+    // Step 2: Find sub-expressions that appear 2+ times total.
+    let mut shared: Vec<(String, Arc<dyn PhysicalExpr>)> = occurrence_count
         .into_iter()
-        .filter(|(_, (_, sources))| sources.len() > 1)
+        .filter(|(_, (_, count))| *count > 1)
         .map(|(display, (expr, _))| (display, expr))
         .collect();
 
