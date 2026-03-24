@@ -51,6 +51,7 @@
 pub mod common;
 pub mod logical;
 pub mod physical;
+pub mod udfs;
 
 // Re-export logical types
 pub use logical::fused_array_transform::FusedArrayTransform;
@@ -63,3 +64,6 @@ pub use logical::optimizer_rule::{
 pub use physical::extension_planner::FusedArrayTransformPlanner;
 pub use physical::fused_array_transform_exec::FusedArrayTransformExec;
 pub use physical::query_planner::VcfQueryPlanner;
+
+// Re-export UDF registration
+pub use udfs::register_list_udfs;
