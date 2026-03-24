@@ -750,26 +750,46 @@ fn build_batched_unnest(
         columns.push(unnested_col);
     }
 
-    // Build broadcasted passthrough columns in bulk using a single take() per column
+    // Build broadcasted passthrough columns directly, avoiding a large repeated-index
+    // buffer plus per-column take() gather.
     let input_schema = batch.schema();
-
-    // Pre-compute the indices array once: for each surviving row, repeat its index max_len times
-    let mut indices: Vec<u64> = Vec::with_capacity(total_unnested_rows);
-    for &row_idx in selected_rows {
-        let max_len = row_max_lengths[row_idx];
-        indices.extend(std::iter::repeat(row_idx as u64).take(max_len));
-    }
-    let indices_array = datafusion::arrow::array::UInt64Array::from(indices);
 
     for col_name in passthrough_columns {
         let idx = input_schema.index_of(col_name)?;
         let col = batch.column(idx);
-        let broadcasted =
-            datafusion::arrow::compute::kernels::take::take(col.as_ref(), &indices_array, None)?;
+        let broadcasted = build_repeated_passthrough_column(
+            col.as_ref(),
+            row_max_lengths,
+            selected_rows,
+            total_unnested_rows,
+        )?;
         columns.push(broadcasted);
     }
 
     RecordBatch::try_new(schema.clone(), columns).map_err(DataFusionError::from)
+}
+
+fn build_repeated_passthrough_column(
+    array: &dyn Array,
+    row_max_lengths: &[usize],
+    selected_rows: &[usize],
+    total_unnested_rows: usize,
+) -> Result<ArrayRef> {
+    if selected_rows.is_empty() {
+        return Ok(datafusion::arrow::array::new_empty_array(array.data_type()));
+    }
+
+    let data = array.to_data();
+    let mut mutable = MutableArrayData::new(vec![&data], true, total_unnested_rows);
+
+    for &row_idx in selected_rows {
+        let repeat_count = row_max_lengths[row_idx];
+        for _ in 0..repeat_count {
+            mutable.extend(0, row_idx, row_idx + 1);
+        }
+    }
+
+    Ok(datafusion::arrow::array::make_array(mutable.freeze()))
 }
 
 /// Build a single unnested column by concatenating all rows' array elements.
@@ -1453,5 +1473,25 @@ mod tests {
 
         let larger_target = build_chunk_ranges(&surviving_rows, &row_max_lengths, 5);
         assert_eq!(larger_target, vec![0..2, 2..3]);
+    }
+
+    #[test]
+    fn test_build_repeated_passthrough_column_preserves_nulls() {
+        let metadata = StringArray::from(vec![Some("r0"), None, Some("r2")]);
+        let row_max_lengths = vec![3_usize, 2, 1];
+        let selected_rows = vec![0_usize, 1, 2];
+
+        let repeated =
+            build_repeated_passthrough_column(&metadata, &row_max_lengths, &selected_rows, 6)
+                .unwrap();
+
+        let repeated = repeated.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(repeated.len(), 6);
+        assert_eq!(repeated.value(0), "r0");
+        assert_eq!(repeated.value(1), "r0");
+        assert_eq!(repeated.value(2), "r0");
+        assert!(repeated.is_null(3));
+        assert!(repeated.is_null(4));
+        assert_eq!(repeated.value(5), "r2");
     }
 }
