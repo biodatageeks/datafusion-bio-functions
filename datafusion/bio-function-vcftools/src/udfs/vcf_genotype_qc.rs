@@ -255,26 +255,42 @@ impl ScalarUDFImpl for VcfGenotypeQcUdf {
             gt_list.nulls().cloned(),
         );
 
-        // ---- Output struct ----
-        let out_fields: Vec<Arc<Field>> = vec![
-            Arc::new(Field::new("GT", gt_out_list.data_type().clone(), true)),
-            Arc::new(Field::new("GQ", gq_list.data_type().clone(), true)),
-            Arc::new(Field::new("DP", dp_list.data_type().clone(), true)),
-            Arc::new(Field::new("PL", pl_out_list.data_type().clone(), true)),
-            Arc::new(Field::new("DS", ds_out_list.data_type().clone(), true)),
-        ];
+        // ---- Output struct: preserve input field order + metadata, add DS ----
+        let input_fields = sa.fields();
+        let mut out_fields: Vec<Arc<Field>> = Vec::with_capacity(input_fields.len() + 1);
+        let mut out_columns: Vec<ArrayRef> = Vec::with_capacity(input_fields.len() + 1);
 
-        let out_struct = StructArray::try_new(
-            out_fields.into(),
-            vec![
-                Arc::new(gt_out_list) as ArrayRef,
-                gq_col.clone(),
-                dp_col.clone(),
-                Arc::new(pl_out_list) as ArrayRef,
-                Arc::new(ds_out_list) as ArrayRef,
-            ],
-            sa.nulls().cloned(),
-        )?;
+        for (fi, field) in input_fields.iter().enumerate() {
+            match field.name().as_str() {
+                "GT" => {
+                    // Preserve metadata from input field
+                    out_fields.push(Arc::new(
+                        field.as_ref().clone().with_data_type(gt_out_list.data_type().clone()),
+                    ));
+                    out_columns.push(Arc::new(gt_out_list.clone()));
+                }
+                "PL" => {
+                    out_fields.push(Arc::new(
+                        field.as_ref().clone().with_data_type(pl_out_list.data_type().clone()),
+                    ));
+                    out_columns.push(Arc::new(pl_out_list.clone()));
+                }
+                _ => {
+                    // Passthrough: GQ, DP, or any other field
+                    out_fields.push(field.clone());
+                    out_columns.push(sa.column(fi).clone());
+                }
+            }
+        }
+        // Add DS
+        out_fields.push(Arc::new(Field::new(
+            "DS",
+            ds_out_list.data_type().clone(),
+            true,
+        )));
+        out_columns.push(Arc::new(ds_out_list));
+
+        let out_struct = StructArray::try_new(out_fields.into(), out_columns, sa.nulls().cloned())?;
 
         Ok(ColumnarValue::Array(Arc::new(out_struct)))
     }
