@@ -12,7 +12,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 
-use super::{f64_field, i32_field, scalar_to_utf8, utf8_field};
+use super::{f64_field, i32_field, list_values_as_f64, scalar_to_utf8, utf8_field};
 
 // ============================================================================
 // list_where(List<Bool>, List<T>, List<T>) → List<T>
@@ -63,96 +63,64 @@ impl ScalarUDFImpl for ListWhereUdf {
                 DataFusionError::Internal("list_where: first arg must be List<Bool>".into())
             })?;
 
-        let element_type = true_list.value_type();
+        let true_type = true_list.value_type();
+        let false_type = false_list.value_type();
 
-        let result: ListArray = match element_type {
-            DataType::Int32 => {
-                let t = true_list.values().as_primitive::<Int32Type>();
-                let f = false_list.values().as_primitive::<Int32Type>();
-                let out: Int32Array = (0..mask_flat.len())
-                    .map(|i| {
-                        if mask_flat.is_null(i) {
-                            return None;
-                        }
-                        let src = if mask_flat.value(i) { t } else { f };
-                        if src.is_null(i) {
-                            None
-                        } else {
-                            Some(src.value(i))
-                        }
-                    })
-                    .collect();
-                ListArray::new(
-                    i32_field(),
-                    true_list.offsets().clone(),
-                    Arc::new(out),
-                    true_list.nulls().cloned(),
-                )
-            }
-            DataType::Float64 => {
-                let t = true_list.values().as_primitive::<Float64Type>();
-                let f = false_list.values().as_primitive::<Float64Type>();
-                let out: Float64Array = (0..mask_flat.len())
-                    .map(|i| {
-                        if mask_flat.is_null(i) {
-                            return None;
-                        }
-                        let src = if mask_flat.value(i) { t } else { f };
-                        if src.is_null(i) {
-                            None
-                        } else {
-                            Some(src.value(i))
-                        }
-                    })
-                    .collect();
-                ListArray::new(
-                    f64_field(),
-                    true_list.offsets().clone(),
-                    Arc::new(out),
-                    true_list.nulls().cloned(),
-                )
-            }
-            DataType::Utf8 => {
-                let t = true_list
-                    .values()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                let f = false_list
-                    .values()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                let out: StringArray = (0..mask_flat.len())
-                    .map(|i| {
-                        if mask_flat.is_null(i) {
-                            return None;
-                        }
-                        if mask_flat.value(i) {
-                            if t.is_null(i) {
-                                None
-                            } else {
-                                Some(t.value(i).to_string())
-                            }
-                        } else if f.is_null(i) {
-                            None
-                        } else {
-                            Some(f.value(i).to_string())
-                        }
-                    })
-                    .collect();
-                ListArray::new(
-                    utf8_field(),
-                    true_list.offsets().clone(),
-                    Arc::new(out),
-                    true_list.nulls().cloned(),
-                )
-            }
-            dt => {
-                return Err(DataFusionError::Internal(format!(
-                    "list_where: unsupported element type {dt}"
-                )));
-            }
+        // For mixed numeric types, promote both to Float64
+        let is_numeric = |dt: &DataType| {
+            matches!(dt, DataType::Int32 | DataType::Float32 | DataType::Float64)
+        };
+
+        let result: ListArray = if true_type == DataType::Int32 && false_type == DataType::Int32 {
+            let t = true_list.values().as_primitive::<Int32Type>();
+            let f = false_list.values().as_primitive::<Int32Type>();
+            let out: Int32Array = (0..mask_flat.len())
+                .map(|i| {
+                    if mask_flat.is_null(i) {
+                        return None;
+                    }
+                    let src = if mask_flat.value(i) { t } else { f };
+                    if src.is_null(i) { None } else { Some(src.value(i)) }
+                })
+                .collect();
+            ListArray::new(i32_field(), true_list.offsets().clone(), Arc::new(out), true_list.nulls().cloned())
+        } else if is_numeric(&true_type) && is_numeric(&false_type) {
+            // Promote both to Float64
+            let t = list_values_as_f64(true_list)?;
+            let f = list_values_as_f64(false_list)?;
+            let out: Float64Array = (0..mask_flat.len())
+                .map(|i| {
+                    if mask_flat.is_null(i) {
+                        return None;
+                    }
+                    if mask_flat.value(i) {
+                        if t.is_null(i) { None } else { Some(t.value(i)) }
+                    } else if f.is_null(i) { None } else { Some(f.value(i)) }
+                })
+                .collect();
+            ListArray::new(f64_field(), true_list.offsets().clone(), Arc::new(out), true_list.nulls().cloned())
+        } else if true_type == DataType::Utf8 && false_type == DataType::Utf8 {
+            let t = true_list.values().as_any().downcast_ref::<StringArray>().unwrap();
+            let f = false_list.values().as_any().downcast_ref::<StringArray>().unwrap();
+            let out: StringArray = (0..mask_flat.len())
+                .map(|i| {
+                    if mask_flat.is_null(i) {
+                        return None;
+                    }
+                    if mask_flat.value(i) {
+                        if t.is_null(i) { None } else { Some(t.value(i).to_string()) }
+                    } else if f.is_null(i) {
+                        None
+                    } else {
+                        Some(f.value(i).to_string())
+                    }
+                })
+                .collect();
+            ListArray::new(utf8_field(), true_list.offsets().clone(), Arc::new(out), true_list.nulls().cloned())
+        } else {
+            return Err(DataFusionError::Internal(format!(
+                "list_where: unsupported element types true={true_type}, false={false_type}"
+            )));
         };
 
         Ok(ColumnarValue::Array(Arc::new(result)))
