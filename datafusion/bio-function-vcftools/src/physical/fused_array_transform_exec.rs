@@ -377,8 +377,8 @@ impl FusedArrayTransformStream {
         }
 
         let t_after_transform = Instant::now();
-        let result =
-            RecordBatch::try_new(self.schema.clone(), output_columns).map_err(DataFusionError::from);
+        let result = RecordBatch::try_new(self.schema.clone(), output_columns)
+            .map_err(DataFusionError::from);
 
         let t_end = Instant::now();
         log::debug!(
@@ -390,7 +390,8 @@ impl FusedArrayTransformStream {
             (t_end - t_start).as_secs_f64() * 1000.0,
         );
 
-        self.baseline_metrics.record_output(result.as_ref().map(|b| b.num_rows()).unwrap_or(0));
+        self.baseline_metrics
+            .record_output(result.as_ref().map(|b| b.num_rows()).unwrap_or(0));
         result
     }
 
@@ -486,6 +487,10 @@ impl FusedArrayTransformStream {
                 .collect()
         };
 
+        // Materialize list layout buffers once and cheaply clone them for each output array.
+        let list_offsets = OffsetBuffer::new(offsets.into());
+        let list_nulls = datafusion::arrow::buffer::NullBuffer::from(null_bitmap);
+
         // Evaluate each final transform expression on the CSE-enriched batch
         final_exprs
             .iter()
@@ -496,16 +501,13 @@ impl FusedArrayTransformStream {
                 let result_array = result.into_array(unnested_batch.num_rows())?;
 
                 // Split the flat result array back into a ListArray using offsets
-                let offset_buffer = OffsetBuffer::new(offsets.clone().into());
                 let list_field =
                     Arc::new(Field::new("item", result_array.data_type().clone(), true));
-                let null_buffer =
-                    datafusion::arrow::buffer::NullBuffer::from(null_bitmap.clone());
                 let list_array = ListArray::try_new(
                     list_field,
-                    offset_buffer,
+                    list_offsets.clone(),
                     result_array,
-                    Some(null_buffer),
+                    Some(list_nulls.clone()),
                 )?;
                 log::debug!(
                     "  expr[{}] eval={:.3}ms",
@@ -847,10 +849,7 @@ fn get_array_element_type(array_col: &str, schema: &SchemaRef) -> Result<DataTyp
 
 /// Collect all sub-expressions from a physical expression tree, with their
 /// Display representation as key. Returns (display_string, expr_arc) pairs.
-fn collect_sub_exprs(
-    expr: &Arc<dyn PhysicalExpr>,
-    out: &mut Vec<(String, Arc<dyn PhysicalExpr>)>,
-) {
+fn collect_sub_exprs(expr: &Arc<dyn PhysicalExpr>, out: &mut Vec<(String, Arc<dyn PhysicalExpr>)>) {
     let display = format!("{expr}");
     // Only collect non-trivial sub-expressions (not leaf Column refs)
     if !expr.children().is_empty() {
@@ -887,7 +886,9 @@ fn rewrite_expr_with_cache(
         .map(|child| rewrite_expr_with_cache(child, cache))
         .collect();
 
-    expr.clone().with_new_children(new_children).unwrap_or_else(|_| expr.clone())
+    expr.clone()
+        .with_new_children(new_children)
+        .unwrap_or_else(|_| expr.clone())
 }
 
 /// Apply physical-level Common Sub-Expression Elimination.
@@ -990,6 +991,7 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{Float64Builder, ListBuilder, StringArray};
     use datafusion::arrow::datatypes::{Field, Schema};
+    use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_plan::test::TestMemoryExec;
 
     fn create_test_batch(
@@ -1162,14 +1164,27 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("metadata", DataType::Utf8, false),
-            Field::new("va", DataType::List(Arc::new(Field::new("item", DataType::Float64, true))), true),
-            Field::new("vb", DataType::List(Arc::new(Field::new("item", DataType::Float64, true))), true),
+            Field::new(
+                "va",
+                DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                true,
+            ),
+            Field::new(
+                "vb",
+                DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                true,
+            ),
         ]));
 
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(metadata), Arc::new(list_a.finish()), Arc::new(list_b.finish())],
-        ).unwrap();
+            vec![
+                Arc::new(metadata),
+                Arc::new(list_a.finish()),
+                Arc::new(list_b.finish()),
+            ],
+        )
+        .unwrap();
 
         let batch_schema = batch.schema();
         let mem_exec = TestMemoryExec::try_new(&[vec![batch]], batch_schema, None).unwrap();
@@ -1180,7 +1195,8 @@ mod tests {
             vec!["metadata".to_string()],
             vec!["va_out".to_string(), "vb_out".to_string()],
             vec![],
-        ).unwrap();
+        )
+        .unwrap();
 
         let ctx = Arc::new(TaskContext::default());
         let mut stream = fused.execute(0, ctx).unwrap();
@@ -1190,11 +1206,19 @@ mod tests {
         assert_eq!(result.num_rows(), 2);
 
         // Identity transform: arrays passed through with original lengths (no padding)
-        let va_out = result.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        let va_out = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
         assert_eq!(va_out.value(0).len(), 2); // original [1,2]
         assert!(va_out.is_null(1)); // NULL list stays NULL
 
-        let vb_out = result.column(2).as_any().downcast_ref::<ListArray>().unwrap();
+        let vb_out = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
         assert_eq!(vb_out.value(0).len(), 3); // original [10,20,30]
         assert_eq!(vb_out.value(1).len(), 1); // original [40]
     }
@@ -1206,8 +1230,10 @@ mod tests {
         // Row 0: [10.0, 20.0, 30.0]
         // Row 1: [40.0, 50.0]
         let batch = create_test_batch!(
-            vec![1.0, 2.0, 3.0], vec![10.0, 20.0, 30.0],
-            vec![4.0, 5.0], vec![40.0, 50.0]
+            vec![1.0, 2.0, 3.0],
+            vec![10.0, 20.0, 30.0],
+            vec![4.0, 5.0],
+            vec![40.0, 50.0]
         );
         let schema = batch.schema();
 
@@ -1219,7 +1245,8 @@ mod tests {
             vec!["metadata".to_string()],
             vec!["values_a_out".to_string()],
             vec![],
-        ).unwrap();
+        )
+        .unwrap();
 
         let ctx = Arc::new(TaskContext::default());
         let mut stream = fused.execute(0, ctx).unwrap();
@@ -1228,11 +1255,18 @@ mod tests {
         assert_eq!(result.num_rows(), 2);
 
         // values_a_out should preserve the original values
-        let out = result.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        let out = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
 
         // Row 0: [1.0, 2.0, 3.0]
         let row0 = out.value(0);
-        let row0_f64 = row0.as_any().downcast_ref::<datafusion::arrow::array::Float64Array>().unwrap();
+        let row0_f64 = row0
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
         assert_eq!(row0_f64.len(), 3);
         assert!((row0_f64.value(0) - 1.0).abs() < 1e-10);
         assert!((row0_f64.value(1) - 2.0).abs() < 1e-10);
@@ -1240,9 +1274,96 @@ mod tests {
 
         // Row 1: [4.0, 5.0]
         let row1 = out.value(1);
-        let row1_f64 = row1.as_any().downcast_ref::<datafusion::arrow::array::Float64Array>().unwrap();
+        let row1_f64 = row1
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
         assert_eq!(row1_f64.len(), 2);
         assert!((row1_f64.value(0) - 4.0).abs() < 1e-10);
         assert!((row1_f64.value(1) - 5.0).abs() < 1e-10);
+    }
+
+    /// Test the non-identity transform path, which reconstructs list outputs
+    /// from a single unnested batch, preserving row boundaries and values.
+    #[tokio::test]
+    async fn test_transform_reconstructs_multiple_list_outputs() {
+        let batch = create_test_batch!(
+            vec![1.0, 2.0, 3.0],
+            vec![10.0, 20.0],
+            vec![4.0],
+            vec![40.0, 50.0, 60.0]
+        );
+        let schema = batch.schema();
+
+        let mem_exec = TestMemoryExec::try_new(&[vec![batch]], schema, None).unwrap();
+        let fused = FusedArrayTransformExec::try_new(
+            Arc::new(mem_exec),
+            vec!["values_a".to_string(), "values_b".to_string()],
+            vec!["metadata".to_string()],
+            vec!["values_a_out".to_string(), "values_b_out".to_string()],
+            vec![
+                Arc::new(Column::new("values_a", 0)),
+                Arc::new(Column::new("values_b", 1)),
+            ],
+        )
+        .unwrap();
+
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = fused.execute(0, ctx).unwrap();
+        let result = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_columns(), 3);
+
+        let va_out = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let vb_out = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        let row0_va = va_out.value(0);
+        let row0_va = row0_va
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(row0_va.len(), 3);
+        assert_eq!(row0_va.value(0), 1.0);
+        assert_eq!(row0_va.value(1), 2.0);
+        assert_eq!(row0_va.value(2), 3.0);
+
+        let row1_va = va_out.value(1);
+        let row1_va = row1_va
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(row1_va.len(), 3);
+        assert_eq!(row1_va.value(0), 4.0);
+        assert!(row1_va.is_null(1));
+        assert!(row1_va.is_null(2));
+
+        let row0_vb = vb_out.value(0);
+        let row0_vb = row0_vb
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(row0_vb.len(), 3);
+        assert_eq!(row0_vb.value(0), 10.0);
+        assert_eq!(row0_vb.value(1), 20.0);
+        assert!(row0_vb.is_null(2));
+
+        let row1_vb = vb_out.value(1);
+        let row1_vb = row1_vb
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(row1_vb.len(), 3);
+        assert_eq!(row1_vb.value(0), 40.0);
+        assert_eq!(row1_vb.value(1), 50.0);
+        assert_eq!(row1_vb.value(2), 60.0);
     }
 }
