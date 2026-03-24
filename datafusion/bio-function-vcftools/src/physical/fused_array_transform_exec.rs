@@ -443,7 +443,7 @@ impl FusedArrayTransformStream {
         // transform expressions, pre-evaluate them, and add as cached columns.
         // Returns the enriched batch and a cache mapping Display strings to column indices.
         let t_cse_start = Instant::now();
-        let (enriched_batch, cse_cache) = if self.transform_exprs.len() > 1 {
+        let (enriched_batch, cse_cache) = if !self.transform_exprs.is_empty() {
             apply_physical_cse(&self.transform_exprs, unnested_batch)?
         } else {
             (unnested_batch, std::collections::HashMap::new())
