@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, Float32Array, Int64Array, Int8Array, ListArray, StringArray, StringViewArray,
+    Array, Float32Array, Int8Array, Int64Array, ListArray, StringArray, StringViewArray,
 };
 use datafusion::arrow::compute::concat_batches;
 use datafusion::prelude::*;
@@ -317,9 +317,9 @@ async fn test_arrow_typed_columns_vs_golden_vep115() {
     #[derive(Clone, Copy)]
     enum Cmp {
         Str,
-        TermList,  // "&"-separated in CSQ ↔ List<Utf8> in Arrow (Consequence)
-        AmpList,   // "&"-separated in CSQ ↔ List<Utf8> in Arrow (DOMAINS, TRANSCRIPTION_FACTORS)
-        CsvList,   // raw string in CSQ ↔ List<Utf8> built by comma-split in Arrow
+        TermList, // "&"-separated in CSQ ↔ List<Utf8> in Arrow (Consequence)
+        AmpList,  // "&"-separated in CSQ ↔ List<Utf8> in Arrow (DOMAINS, TRANSCRIPTION_FACTORS)
+        CsvList,  // raw string in CSQ ↔ List<Utf8> built by comma-split in Arrow
         Float,
         StrandI8,
         Int8Str,
@@ -413,7 +413,11 @@ async fn test_arrow_typed_columns_vs_golden_vep115() {
         ("MOTIF_POS", "MOTIF_POS", Cmp::Str),
         ("HIGH_INF_POS", "HIGH_INF_POS", Cmp::Str),
         ("MOTIF_SCORE_CHANGE", "MOTIF_SCORE_CHANGE", Cmp::Float),
-        ("TRANSCRIPTION_FACTORS", "TRANSCRIPTION_FACTORS", Cmp::AmpList),
+        (
+            "TRANSCRIPTION_FACTORS",
+            "TRANSCRIPTION_FACTORS",
+            Cmp::AmpList,
+        ),
     ];
 
     let resolved: Vec<(usize, usize, Cmp, &str)> = columns_under_test
@@ -474,8 +478,8 @@ async fn test_arrow_typed_columns_vs_golden_vep115() {
             let csq_val = entry.get(csq_fi);
             let is_match = match cmp {
                 Cmp::Str => {
-                    let ours = get_str(arrow_batch.column(arrow_idx).as_ref(), row)
-                        .unwrap_or_default();
+                    let ours =
+                        get_str(arrow_batch.column(arrow_idx).as_ref(), row).unwrap_or_default();
                     ours == csq_val || (ours.is_empty() && csq_val.is_empty())
                 }
                 Cmp::TermList | Cmp::AmpList => {
@@ -495,8 +499,7 @@ async fn test_arrow_typed_columns_vs_golden_vep115() {
                     let ours = get_list_str(arrow_batch.column(arrow_idx).as_ref(), row)
                         .unwrap_or_default();
                     let joined = ours.join(",");
-                    joined == csq_val
-                        || (joined.is_empty() && csq_val.is_empty())
+                    joined == csq_val || (joined.is_empty() && csq_val.is_empty())
                 }
                 Cmp::Float => {
                     let ours = get_f32(arrow_batch.column(arrow_idx).as_ref(), row);
@@ -540,32 +543,27 @@ async fn test_arrow_typed_columns_vs_golden_vep115() {
                     let ours_dbg = match cmp {
                         Cmp::Str => get_str(arrow_batch.column(arrow_idx).as_ref(), row)
                             .unwrap_or_else(|| "NULL".to_string()),
-                        Cmp::CsvList => get_list_str(
-                            arrow_batch.column(arrow_idx).as_ref(),
-                            row,
-                        )
-                        .map(|v| v.join(","))
-                        .unwrap_or_else(|| "NULL".to_string()),
-                        Cmp::TermList | Cmp::AmpList => get_list_str(
-                            arrow_batch.column(arrow_idx).as_ref(),
-                            row,
-                        )
-                        .map(|v| v.join("&"))
-                        .unwrap_or_else(|| "NULL".to_string()),
+                        Cmp::CsvList => get_list_str(arrow_batch.column(arrow_idx).as_ref(), row)
+                            .map(|v| v.join(","))
+                            .unwrap_or_else(|| "NULL".to_string()),
+                        Cmp::TermList | Cmp::AmpList => {
+                            get_list_str(arrow_batch.column(arrow_idx).as_ref(), row)
+                                .map(|v| v.join("&"))
+                                .unwrap_or_else(|| "NULL".to_string())
+                        }
                         Cmp::Float => get_f32(arrow_batch.column(arrow_idx).as_ref(), row)
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "NULL".to_string()),
-                        Cmp::StrandI8 | Cmp::Int8Str => get_i8(arrow_batch.column(arrow_idx).as_ref(), row)
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "NULL".to_string()),
+                        Cmp::StrandI8 | Cmp::Int8Str => {
+                            get_i8(arrow_batch.column(arrow_idx).as_ref(), row)
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "NULL".to_string())
+                        }
                         Cmp::Int64Str => get_i64(arrow_batch.column(arrow_idx).as_ref(), row)
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "NULL".to_string()),
                     };
-                    samples.push(format!(
-                        "row {row}: typed='{}' csq='{csq_val}'",
-                        ours_dbg
-                    ));
+                    samples.push(format!("row {row}: typed='{}' csq='{csq_val}'", ours_dbg));
                 }
             }
         }
