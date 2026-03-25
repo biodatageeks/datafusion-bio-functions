@@ -352,6 +352,7 @@ async fn test_arrow_typed_columns_vs_golden_vep115() {
         ("Protein_position", "Protein_position", Cmp::ListStr),
         ("Amino_acids", "Amino_acids", Cmp::ListStr),
         ("Codons", "Codons", Cmp::ListStr),
+        ("Existing_variation", "Existing_variation", Cmp::CsvList),
         ("DISTANCE", "DISTANCE", Cmp::ListI64),
         ("STRAND", "STRAND", Cmp::ListI8),
         ("FLAGS", "FLAGS", Cmp::ListStr),
