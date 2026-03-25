@@ -1,382 +1,311 @@
 # datafusion-bio-function-vep
 
-VEP-oriented DataFusion functions and benchmark tooling.
+Apache DataFusion UDFs for variant effect prediction (VEP) annotation. Provides scalar functions for allele manipulation and table functions for variant lookup and full VEP-style annotation against Ensembl variation caches.
 
-## `annotate_vep()` Output Schema
+## Functions
 
-The output of `annotate_vep()` consists of **VCF input columns** (pass-through) followed by **annotation columns** (89 columns total).
+### Scalar UDFs
 
-All 80 CSQ fields are exposed as **individual top-level Arrow columns** so Arrow-native consumers (vepyr, polars-bio) can access structured data without parsing the legacy pipe-delimited CSQ string. Per-transcript fields (Consequence, SYMBOL, Gene, SIFT, etc.) contain values from the **most-severe transcript** for each variant.
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `match_allele` | `(ref, alt, allele_string) → Boolean` | Check if a VCF variant matches a cache `allele_string` |
+| `match_allele_relaxed` | `(ref, alt, allele_string) → Boolean` | Relaxed allele matching (fallback for shifted indels) |
+| `vep_allele` | `(ref, alt) → Utf8` | Convert VCF REF/ALT to VEP allele format |
+| `vep_norm_start` | `(pos, ref, alt) → Int64` | Normalize variant start position (1-based, Ensembl-style) |
+| `vep_norm_end` | `(pos, ref, alt) → Int64` | Normalize variant end position |
+
+### Table Functions
+
+#### `lookup_variants`
+
+Low-level known-variant lookup via left interval join against a variation cache.
+
+```sql
+SELECT * FROM lookup_variants(
+  'my_vcf_table',
+  'my_variation_cache',
+  'variation_name,clin_sig,AF',   -- columns to return (optional)
+  'exact',                         -- match mode (optional)
+  'true'                           -- extended probes (optional)
+)
+```
+
+#### `annotate_vep`
+
+Full VEP-style annotation: consequence prediction, population frequencies, clinical significance, HGVS notation, SIFT/PolyPhen predictions.
+
+```sql
+SELECT * FROM annotate_vep(
+  'my_vcf_table',
+  '/path/to/cache',
+  'parquet',                                          -- backend: parquet | fjall
+  '{"everything":true,"extended_probes":true,
+    "reference_fasta_path":"/path/to/reference.fa"}'  -- options (optional)
+)
+```
+
+**Options JSON:**
+
+| Flag | Effect | Implied by `everything` |
+|------|--------|------------------------|
+| `everything` | Enable all annotation fields (80 CSQ columns) | — |
+| `check_existing` | Variation lookup in cache | Yes (also implied by any AF flag) |
+| `af` | Global allele frequency | Yes |
+| `af_1kg` | 1000 Genomes sub-population AFs | Yes |
+| `af_gnomade` | gnomAD exome sub-population AFs | Yes |
+| `af_gnomadg` | gnomAD genome sub-population AFs | Yes |
+| `max_af` | MAX_AF / MAX_AF_POPS | Yes |
+| `pubmed` | PubMed IDs | Yes |
+| `hgvs` | HGVSc / HGVSp notation | Yes |
+| `extended_probes` | Interval-overlap fallback for shifted indels | No |
+| `reference_fasta_path` | Indexed FASTA for HGVS genomic shifting | No |
+| `partitioned` | Use per-chromosome partitioned cache | No |
+| `merged` | Use VEP `--merged` Ensembl+RefSeq cache | No |
+
+## Output Modes
+
+`annotate_vep()` is a DataFusion table function that returns a stream of Arrow `RecordBatch`es. This means results can be consumed in two ways:
+
+### Arrow RecordBatch streaming (native)
+
+The default output. Each batch contains the full annotation schema with typed Arrow columns. Arrow-native consumers (polars-bio, DataFusion SQL, PyArrow) can access structured data directly — no string parsing required. Transcript-level fields use `List<T>` types containing values for **all overlapping transcripts**, not just the most-severe pick.
+
+```rust
+let df = ctx.sql("SELECT * FROM annotate_vep(...)").await?;
+let batches: Vec<RecordBatch> = df.collect().await?;
+```
+
+### VCF file output
+
+The `annotate_to_vcf()` function wraps the annotation pipeline to produce a standard VCF file. The 87 structured annotation columns are collapsed into a single `CSQ` INFO field (pipe-delimited, VEP format). Core VCF columns and original INFO/FORMAT fields are preserved.
+
+```rust
+use datafusion_bio_function_vep::vcf_sink::{annotate_to_vcf, AnnotateVcfConfig};
+
+let rows = annotate_to_vcf(
+    "input.vcf.gz",
+    "/path/to/cache",
+    "parquet",
+    "output.vcf",
+    &AnnotateVcfConfig {
+        everything: true,
+        extended_probes: true,
+        reference_fasta_path: Some("/path/to/reference.fa".into()),
+        compression: VcfCompressionType::Gzip,
+        show_progress: true,
+        ..Default::default()
+    },
+).await?;
+```
+
+Supports `Plain`, `Gzip`, and `Bgzf` output compression. An optional `on_batch_written` callback enables progress reporting (used by Python/Jupyter wrappers).
+
+## Arrow Schema
+
+The output of `annotate_vep()` consists of **VCF pass-through columns** followed by **annotation columns** (up to 89 total).
+
+All CSQ fields are exposed as individual top-level Arrow columns. Transcript-level fields use `List<T>` types to carry values for **all overlapping transcripts** per variant (not just the most-severe pick). Scalar columns (`Utf8`, `Float32`) carry a single value per variant.
 
 ### VCF input columns (pass-through)
 
-The first columns in the output are pass-through from the input VCF table. The schema depends on the VCF file and the table provider used. The following 5 columns are **required** by `annotate_vep()`:
-
-| Column | Type | Required | Description |
-|--------|------|----------|-------------|
+| Column | Arrow Type | Required | Description |
+|--------|------------|----------|-------------|
 | `chrom` | `Utf8` | yes | Chromosome identifier |
 | `start` | `Int64` | yes | Start position (0-based) |
 | `end` | `Int64` | yes | End position (0-based, exclusive) |
 | `ref` | `Utf8` | yes | Reference allele |
 | `alt` | `Utf8` | yes | Alternate allele |
 
-The `datafusion-bio-format-vcf` provider (used by polars-bio) decomposes VCF fields into typed columns. Common additional columns:
+Additional VCF columns (`id`, `qual`, `filter`, decomposed INFO/sample fields) are passed through unmodified.
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | `Utf8` | Variant ID (rsID) |
-| `qual` | `Float64` | Variant quality score |
-| `filter` | `Utf8` | Filter status (PASS, etc.) |
-| INFO fields | varies | Decomposed into individual typed columns (e.g., `DP: Int32`) |
-| Sample fields | varies | Decomposed genotype fields (e.g., `GT: Utf8`, `AD: List<Int32>`, `GQ: Int32`) |
+### Meta columns (2)
 
-All VCF columns are passed through unmodified. The exact schema depends on the VCF file's header.
+| Column | Arrow Type | Description |
+|--------|------------|-------------|
+| `csq` | `Utf8` | Legacy pipe-delimited CSQ string (NULL unless explicitly projected) |
+| `most_severe_consequence` | `Utf8` | SO term for the most severe consequence across all transcripts |
 
-### Annotation columns (89 total)
+### Transcript-level columns (42)
 
-Appended after VCF columns. Column indices start at `vcf_field_count`.
+One entry per overlapping transcript. Enabled with `everything: true`.
 
-**Meta columns (2):**
+| Column | Arrow Type | Description |
+|--------|------------|-------------|
+| `Allele` | `Utf8` | Variant allele used to calculate consequence |
+| `Consequence` | `List<Utf8>` | Consequence types (SO terms) |
+| `IMPACT` | `List<Utf8>` | Impact rating: HIGH, MODERATE, LOW, MODIFIER |
+| `SYMBOL` | `List<Utf8>` | Gene symbol |
+| `Gene` | `List<Utf8>` | Ensembl gene ID |
+| `Feature_type` | `List<Utf8>` | Transcript, RegulatoryFeature, or MotifFeature |
+| `Feature` | `List<Utf8>` | Ensembl feature ID |
+| `BIOTYPE` | `List<Utf8>` | Biotype (protein_coding, lncRNA, etc.) |
+| `EXON` | `List<Utf8>` | Exon number / total exons |
+| `INTRON` | `List<Utf8>` | Intron number / total introns |
+| `HGVSc` | `List<Utf8>` | HGVS coding sequence notation |
+| `HGVSp` | `List<Utf8>` | HGVS protein sequence notation |
+| `cDNA_position` | `List<Utf8>` | Position in cDNA |
+| `CDS_position` | `List<Utf8>` | Position in CDS |
+| `Protein_position` | `List<Utf8>` | Position in protein |
+| `Amino_acids` | `List<Utf8>` | Reference/variant amino acids |
+| `Codons` | `List<Utf8>` | Reference/variant codons |
+| `Existing_variation` | `List<Utf8>` | Known variant identifiers (rsIDs, COSMIC, etc.) |
+| `DISTANCE` | `List<Int64>` | Distance to transcript |
+| `STRAND` | `List<Int8>` | Strand of feature (1 or -1) |
+| `FLAGS` | `List<Utf8>` | Transcript quality flags |
+| `VARIANT_CLASS` | `Utf8` | SO variant class (SNV, deletion, insertion, etc.) |
+| `SYMBOL_SOURCE` | `List<Utf8>` | Source of gene symbol (HGNC, EntrezGene, etc.) |
+| `HGNC_ID` | `List<Utf8>` | HGNC gene identifier |
+| `CANONICAL` | `List<Utf8>` | Canonical transcript flag |
+| `MANE` | `List<Utf8>` | MANE transcript type |
+| `MANE_SELECT` | `List<Utf8>` | MANE Select transcript ID |
+| `MANE_PLUS_CLINICAL` | `List<Utf8>` | MANE Plus Clinical transcript ID |
+| `TSL` | `List<Int8>` | Transcript support level (1-5) |
+| `APPRIS` | `List<Utf8>` | APPRIS annotation |
+| `CCDS` | `List<Utf8>` | CCDS identifier |
+| `ENSP` | `List<Utf8>` | Ensembl protein ID |
+| `SWISSPROT` | `List<Utf8>` | UniProtKB/Swiss-Prot ID |
+| `TREMBL` | `List<Utf8>` | UniProtKB/TrEMBL ID |
+| `UNIPARC` | `List<Utf8>` | UniParc ID |
+| `UNIPROT_ISOFORM` | `List<Utf8>` | UniProt isoform |
+| `GENE_PHENO` | `List<Utf8>` | Gene has known phenotype association |
+| `SIFT` | `List<Utf8>` | SIFT prediction and score |
+| `PolyPhen` | `List<Utf8>` | PolyPhen prediction and score |
+| `DOMAINS` | `List<Utf8>` | Overlapping protein domains |
+| `miRNA` | `List<Utf8>` | miRNA secondary structure position |
+| `HGVS_OFFSET` | `List<Int64>` | HGVS offset for indels |
 
-| # | Column | Type | Description |
-|---|--------|------|-------------|
-| 1 | `csq` | `Utf8` | Legacy pipe-delimited CSQ string. **Skipped (NULL) by default** — only computed when explicitly projected |
-| 2 | `most_severe_consequence` | `Utf8` | SO term for the most severe consequence across all transcripts |
+### Population frequency columns (29)
 
-**Transcript-level columns (42) — from the most-severe transcript (`--everything` mode):**
+Resolved for the matching allele. Scalar `Float32` (~7.2 significant digits).
 
-| # | Column | Type | Source | Description |
-|---|--------|------|--------|-------------|
-| 3 | `Allele` | `Utf8` | engine | Variant allele used to calculate consequence |
-| 4 | `Consequence` | `List<Utf8>` | engine | Consequence types (SO terms, can be multiple per transcript) |
-| 5 | `IMPACT` | `Utf8` | engine | Impact rating: HIGH, MODERATE, LOW, MODIFIER |
-| 6 | `SYMBOL` | `Utf8` | transcript | Gene symbol |
-| 7 | `Gene` | `Utf8` | transcript | Ensembl gene ID |
-| 8 | `Feature_type` | `Utf8` | engine | Transcript, RegulatoryFeature, or MotifFeature |
-| 9 | `Feature` | `Utf8` | engine | Ensembl feature ID (transcript/regulatory/motif) |
-| 10 | `BIOTYPE` | `Utf8` | transcript | Biotype of transcript (protein_coding, lncRNA, etc.) |
-| 11 | `EXON` | `Utf8` | engine | Exon number / total exons |
-| 12 | `INTRON` | `Utf8` | engine | Intron number / total introns |
-| 13 | `HGVSc` | `Utf8` | engine | HGVS coding sequence notation |
-| 14 | `HGVSp` | `Utf8` | engine | HGVS protein sequence notation |
-| 15 | `cDNA_position` | `Utf8` | engine | Position in cDNA |
-| 16 | `CDS_position` | `Utf8` | engine | Position in CDS |
-| 17 | `Protein_position` | `Utf8` | engine | Position in protein |
-| 18 | `Amino_acids` | `Utf8` | engine | Reference/variant amino acids |
-| 19 | `Codons` | `Utf8` | engine | Reference/variant codons |
-| 20 | `Existing_variation` | `List<Utf8>` | cache | Known variant identifiers (rsIDs, COSMIC, etc.) |
-| 21 | `DISTANCE` | `Int64` | engine | Distance to transcript (upstream/downstream) |
-| 22 | `STRAND` | `Int8` | transcript | Strand of feature (1 or -1) |
-| 23 | `FLAGS` | `Utf8` | transcript | Transcript quality flags |
-| 24 | `VARIANT_CLASS` | `Utf8` | engine | SO term variant class (SNV, deletion, insertion, etc.) |
-| 25 | `SYMBOL_SOURCE` | `Utf8` | transcript | Source of gene symbol (HGNC, EntrezGene, etc.) |
-| 26 | `HGNC_ID` | `Utf8` | transcript | HGNC gene identifier |
-| 27 | `CANONICAL` | `Utf8` | transcript | Canonical transcript flag (YES or empty) |
-| 28 | `MANE` | `Utf8` | transcript | MANE transcript type (MANE_Select or MANE_Plus_Clinical) |
-| 29 | `MANE_SELECT` | `Utf8` | transcript | MANE Select transcript ID |
-| 30 | `MANE_PLUS_CLINICAL` | `Utf8` | transcript | MANE Plus Clinical transcript ID |
-| 31 | `TSL` | `Int8` | transcript | Transcript support level (1-5) |
-| 32 | `APPRIS` | `Utf8` | transcript | APPRIS annotation (P1-P5, A1-A2) |
-| 33 | `CCDS` | `Utf8` | transcript | CCDS identifier |
-| 34 | `ENSP` | `Utf8` | transcript | Ensembl protein ID |
-| 35 | `SWISSPROT` | `Utf8` | transcript | UniProtKB/Swiss-Prot ID |
-| 36 | `TREMBL` | `Utf8` | transcript | UniProtKB/TrEMBL ID |
-| 37 | `UNIPARC` | `Utf8` | transcript | UniParc ID |
-| 38 | `UNIPROT_ISOFORM` | `Utf8` | transcript | UniProt isoform |
-| 39 | `GENE_PHENO` | `Utf8` | transcript | Gene has known phenotype association |
-| 40 | `SIFT` | `Utf8` | sift cache | SIFT prediction and score, e.g. `tolerated(0.23)` |
-| 41 | `PolyPhen` | `Utf8` | sift cache | PolyPhen prediction and score, e.g. `benign(0.01)` |
-| 42 | `DOMAINS` | `List<Utf8>` | engine | Overlapping protein domains (`source:id` pairs) |
-| 43 | `miRNA` | `Utf8` | engine | miRNA secondary structure position |
-| 44 | `HGVS_OFFSET` | `Int64` | engine | HGVS offset for indels (signed, strand-aware) |
+| Column | Arrow Type | Source | Description |
+|--------|------------|--------|-------------|
+| `AF` | `Float32` | 1000 Genomes | Global allele frequency |
+| `AFR_AF`, `AMR_AF`, `EAS_AF`, `EUR_AF`, `SAS_AF` | `Float32` | 1000 Genomes | Sub-population AFs |
+| `gnomADe_AF` | `Float32` | gnomAD exome | Global exome AF |
+| `gnomADe_{AFR,AMR,ASJ,EAS,FIN,MID,NFE,REMAINING,SAS}_AF` | `Float32` | gnomAD exome | Sub-population exome AFs |
+| `gnomADg_AF` | `Float32` | gnomAD genome | Global genome AF |
+| `gnomADg_{AFR,AMI,AMR,ASJ,EAS,FIN,MID,NFE,REMAINING,SAS}_AF` | `Float32` | gnomAD genome | Sub-population genome AFs |
+| `MAX_AF` | `Float32` | computed | Maximum AF across all populations |
+| `MAX_AF_POPS` | `Utf8` | computed | Population(s) with maximum AF |
 
-**Population frequency columns (29) — resolved for the matching allele:**
+### Variant-level annotation columns (9)
 
-| # | Column | Type | Source | Description |
-|---|--------|------|--------|-------------|
-| 45 | `AF` | `Float32` | cache | 1000 Genomes global allele frequency |
-| 46 | `AFR_AF` | `Float32` | cache | 1000 Genomes African AF |
-| 47 | `AMR_AF` | `Float32` | cache | 1000 Genomes Ad Mixed American AF |
-| 48 | `EAS_AF` | `Float32` | cache | 1000 Genomes East Asian AF |
-| 49 | `EUR_AF` | `Float32` | cache | 1000 Genomes European AF |
-| 50 | `SAS_AF` | `Float32` | cache | 1000 Genomes South Asian AF |
-| 51 | `gnomADe_AF` | `Float32` | cache | gnomAD exome global AF |
-| 52 | `gnomADe_AFR_AF` | `Float32` | cache | gnomAD exome African/African American AF |
-| 53 | `gnomADe_AMR_AF` | `Float32` | cache | gnomAD exome Latino/Admixed American AF |
-| 54 | `gnomADe_ASJ_AF` | `Float32` | cache | gnomAD exome Ashkenazi Jewish AF |
-| 55 | `gnomADe_EAS_AF` | `Float32` | cache | gnomAD exome East Asian AF |
-| 56 | `gnomADe_FIN_AF` | `Float32` | cache | gnomAD exome Finnish AF |
-| 57 | `gnomADe_MID_AF` | `Float32` | cache | gnomAD exome Middle Eastern AF |
-| 58 | `gnomADe_NFE_AF` | `Float32` | cache | gnomAD exome Non-Finnish European AF |
-| 59 | `gnomADe_REMAINING_AF` | `Float32` | cache | gnomAD exome remaining populations AF |
-| 60 | `gnomADe_SAS_AF` | `Float32` | cache | gnomAD exome South Asian AF |
-| 61 | `gnomADg_AF` | `Float32` | cache | gnomAD genome global AF |
-| 62 | `gnomADg_AFR_AF` | `Float32` | cache | gnomAD genome African/African American AF |
-| 63 | `gnomADg_AMI_AF` | `Float32` | cache | gnomAD genome Amish AF |
-| 64 | `gnomADg_AMR_AF` | `Float32` | cache | gnomAD genome Latino/Admixed American AF |
-| 65 | `gnomADg_ASJ_AF` | `Float32` | cache | gnomAD genome Ashkenazi Jewish AF |
-| 66 | `gnomADg_EAS_AF` | `Float32` | cache | gnomAD genome East Asian AF |
-| 67 | `gnomADg_FIN_AF` | `Float32` | cache | gnomAD genome Finnish AF |
-| 68 | `gnomADg_MID_AF` | `Float32` | cache | gnomAD genome Middle Eastern AF |
-| 69 | `gnomADg_NFE_AF` | `Float32` | cache | gnomAD genome Non-Finnish European AF |
-| 70 | `gnomADg_REMAINING_AF` | `Float32` | cache | gnomAD genome remaining populations AF |
-| 71 | `gnomADg_SAS_AF` | `Float32` | cache | gnomAD genome South Asian AF |
-| 72 | `MAX_AF` | `Float32` | computed | Maximum AF across all populations |
-| 73 | `MAX_AF_POPS` | `Utf8` | computed | Population(s) with maximum AF (`&`-separated if tied) |
+| Column | Arrow Type | Description |
+|--------|------------|-------------|
+| `CLIN_SIG` | `List<Utf8>` | ClinVar clinical significance |
+| `SOMATIC` | `Utf8` | Somatic variant flag |
+| `PHENO` | `Utf8` | Phenotype/disease association flag |
+| `PUBMED` | `List<Utf8>` | PubMed IDs |
+| `MOTIF_NAME` | `Utf8` | Motif feature name |
+| `MOTIF_POS` | `Utf8` | Position in motif |
+| `HIGH_INF_POS` | `Utf8` | High information position in motif |
+| `MOTIF_SCORE_CHANGE` | `Float32` | Change in motif score |
+| `TRANSCRIPTION_FACTORS` | `List<Utf8>` | Transcription factors binding the motif |
 
-**Variant-level annotation columns (9) — from variation cache lookup:**
+### Cache-only columns (7)
 
-| # | Column | Type | Source | Description |
-|---|--------|------|--------|-------------|
-| 74 | `CLIN_SIG` | `List<Utf8>` | cache | ClinVar clinical significance (multi-valued) |
-| 75 | `SOMATIC` | `Utf8` | cache | Somatic variant flag |
-| 76 | `PHENO` | `Utf8` | cache | Phenotype/disease association flag |
-| 77 | `PUBMED` | `List<Utf8>` | cache | PubMed IDs |
-| 78 | `MOTIF_NAME` | `Utf8` | engine | Motif feature name |
-| 79 | `MOTIF_POS` | `Utf8` | engine | Position in motif |
-| 80 | `HIGH_INF_POS` | `Utf8` | engine | High information position in motif |
-| 81 | `MOTIF_SCORE_CHANGE` | `Float32` | engine | Change in motif score |
-| 82 | `TRANSCRIPTION_FACTORS` | `List<Utf8>` | engine | Transcription factors binding the motif |
+Additional fields from the variation cache, not present in the CSQ string.
 
-**Cache-only columns (7) — not in CSQ, from variation cache:**
+| Column | Arrow Type | Description |
+|--------|------------|-------------|
+| `clin_sig_allele` | `List<Utf8>` | Clinical significance per allele |
+| `clinical_impact` | `Utf8` | Clinical impact assessment |
+| `minor_allele` | `Utf8` | Minor allele |
+| `minor_allele_freq` | `Float32` | Minor allele frequency |
+| `clinvar_ids` | `List<Utf8>` | ClinVar accession IDs |
+| `cosmic_ids` | `List<Utf8>` | COSMIC IDs |
+| `dbsnp_ids` | `List<Utf8>` | dbSNP IDs |
 
-| # | Column | Type | Source | Description |
-|---|--------|------|--------|-------------|
-| 83 | `clin_sig_allele` | `List<Utf8>` | cache | Clinical significance per allele (`;`-separated) |
-| 84 | `clinical_impact` | `Utf8` | cache | Clinical impact assessment |
-| 85 | `minor_allele` | `Utf8` | cache | Minor allele |
-| 86 | `minor_allele_freq` | `Float32` | cache | Minor allele frequency |
-| 87 | `clinvar_ids` | `List<Utf8>` | cache | ClinVar accession IDs |
-| 88 | `cosmic_ids` | `List<Utf8>` | cache | COSMIC IDs |
-| 89 | `dbsnp_ids` | `List<Utf8>` | cache | dbSNP IDs |
+## Cache Backends
 
-### Notes
+### Parquet (default)
 
-- **Per-transcript fields** (columns 3-44): One variant may overlap multiple transcripts. Top-level columns contain values from the transcript with the **most severe consequence**. The legacy `csq` column (if projected) contains all transcript entries.
-- **AF resolution**: Cache stores `allele:frequency` pairs (e.g., `"T:0.9301"`, multi-allelic: `"A:0.006,G:0.994"`). Top-level AF columns contain the **resolved Float32 frequency** for the matching allele via `extract_af_for_allele()`.
-- **Float32 precision**: ~7.2 significant digits covers all observed AF values (max 7 decimal places in Ensembl 115).
-- **`csq` column**: Skipped by default. Only assembled when explicitly projected. Legacy VEP pipe-delimited format.
-- **`--everything` mode**: Enables all 80 CSQ fields. Without it, 6 fields are absent: MANE, APPRIS, SIFT, PolyPhen, DOMAINS, miRNA, HGVS_OFFSET.
+Ensembl variation cache converted to Parquet format. Supports per-chromosome partitioning.
 
-### VEP flags (`options_json`)
+### Fjall (KV store)
 
-| Flag | Effect | Implied by `everything` |
-|------|--------|------------------------|
-| `everything` | Enables all flags, all 80 CSQ fields populated | - |
-| `check_existing` | Variation lookup in cache | Yes (also implied by any AF flag) |
-| `af` | Global AF | Yes |
-| `af_1kg` | 1000 Genomes AF sub-populations | Yes |
-| `af_gnomade` | gnomAD exome sub-populations | Yes |
-| `af_gnomadg` | gnomAD genome sub-populations | Yes |
-| `max_af` | MAX_AF / MAX_AF_POPS | Yes |
-| `pubmed` | PubMed IDs | Yes |
-| `hgvs` | HGVSc / HGVSp notation | Yes |
+LSM-tree backend using [fjall](https://crates.io/crates/fjall) with zstd compression. Requires the `kv-cache` feature (enabled by default).
 
-## Golden Benchmark: `annotate_vep` vs Ensembl VEP 115
+Configuration via `AnnotationConfig` (session-level):
 
-### Overview
+| Option | Default | Description |
+|--------|---------|-------------|
+| `cache_size_mb` | 1024 | Fjall block cache size |
+| `zstd_level` | 3 | Compression level (1-19) |
+| `dict_size_kb` | 112 | Dictionary size for compression |
 
-The `annotate_vep_golden_bench` example compares our `annotate_vep()` table function against Ensembl VEP 115 on real whole-genome sequencing data (HG002/NA24385, GIAB).
+## Prerequisites
 
-**Pipeline:**
-1. Samples variants from a bgzipped VCF (or uses all rows with `sample_limit=0`).
-2. Decomposes multi-allelic sites into single-alt records.
-3. *(Optional)* Runs Ensembl VEP 115 in Docker to produce golden output.
-4. Runs `annotate_vep(...)` on the same normalized input.
-5. Compares per-variant CSQ strings across 74 fields and writes reports.
+- Ensembl VEP parquet cache files for the target chromosome(s)
+- Context parquet files: transcripts, exons, translations, regulatory, motif features
+- Input VCF (bgzipped + tabix-indexed for large files)
+- *(Optional)* Indexed reference FASTA for HGVS genomic shifting
+- *(Optional)* Docker with Ensembl VEP 115 image for golden benchmark generation
 
-### Latest chr1 results (March 2026)
+## Benchmarks
 
-| Metric | Value |
-|--------|-------|
-| Input variants | 319,349 (323,430 after multi-allelic decomposition) |
-| CSQ entries compared | 2,997,504 |
-| **most_severe accuracy** | **100.00%** (323,430/323,430) |
-| **term_set accuracy** | **100.00%** (323,430/323,430) |
-| Discrepancies (variant-level) | 0 |
-| Perfect CSQ fields (0 mismatches) | 53/74 |
-| Runtime | ~84s |
+### Golden benchmark (`annotate_vep_golden_bench`)
 
-**Per-field accuracy (74 CSQ fields):**
-
-53 fields at 100.00% (0 mismatches): Allele, IMPACT, SYMBOL, Gene, Feature_type, Feature, BIOTYPE, EXON, HGVSc, HGVSp, cDNA_position, Codons, DISTANCE, STRAND, SYMBOL_SOURCE, HGNC_ID, MOTIF_NAME, MOTIF_POS, HIGH_INF_POS, MOTIF_SCORE_CHANGE, TRANSCRIPTION_FACTORS, SOURCE, VARIANT_CLASS, CANONICAL, TSL, MANE_SELECT, MANE_PLUS_CLINICAL, ENSP, GENE_PHENO, CCDS, SWISSPROT, TREMBL, UNIPARC, UNIPROT_ISOFORM, gnomADe_AFR, gnomADe_AMR, gnomADe_ASJ, gnomADe_EAS, gnomADe_FIN, gnomADe_MID, gnomADe_NFE, gnomADe_REMAINING, gnomADe_SAS, gnomADg_AFR, gnomADg_AMI, gnomADg_AMR, gnomADg_ASJ, gnomADg_EAS, gnomADg_FIN, gnomADg_MID, gnomADg_NFE, gnomADg_REMAINING, gnomADg_SAS
-
-21 fields with remaining mismatches:
-
-| Field | Matched | Mismatches | Accuracy | Root cause |
-|-------|---------|------------|----------|------------|
-| Consequence | 2,997,489 | 15 | 100.00% | Deletion at splice_acceptor: VEP has intron_variant, we have PPT |
-| INTRON | 2,997,485 | 19 | 100.00% | Splice-site deletion: VEP suppresses intron number |
-| CDS_position | 2,997,502 | 2 | 100.00% | `?-N` prefix for cds_start_nf edge case |
-| Protein_position | 2,997,502 | 2 | 100.00% | Same `?-N` edge case |
-| Amino_acids | 2,997,461 | 43 | 100.00% | Frameshift boundary amino acid formatting |
-| FLAGS | 2,997,076 | 428 | 99.99% | Sort order: VEP Perl uses non-deterministic hash |
-| Existing_variation | 2,685,888 | 311,616 | 89.60% | Shifted indel co-located matching |
-| AF..SAS_AF (6 fields) | ~2,706,840 | ~290,660 | 90.30% | AF from co-located shifted indels |
-| gnomADe_AF | 2,953,405 | 44,099 | 98.53% | Same co-located AF issue |
-| gnomADg_AF | 2,554,927 | 442,577 | 85.24% | Same co-located AF issue |
-| MAX_AF | 2,553,486 | 444,018 | 85.19% | Derived from above |
-| MAX_AF_POPS | 2,555,419 | 442,085 | 85.25% | Derived from above |
-| CLIN_SIG | 2,991,851 | 5,653 | 99.81% | Co-located metadata for shifted indels |
-| SOMATIC | 2,994,303 | 3,201 | 99.89% | Co-located metadata for shifted indels |
-| PHENO | 2,982,158 | 15,346 | 99.49% | Co-located metadata for shifted indels |
-| PUBMED | 2,989,573 | 7,931 | 99.74% | Co-located metadata for shifted indels |
-
-### Prerequisites
-
-- VEP parquet cache files for the target chromosome (e.g., `115_GRCh38_variation_1.parquet`)
-- Context parquet files: transcripts, exons, translations, regulatory, motif (in the same directory)
-- Input VCF (bgzipped + tabix-indexed)
-- *(Optional, for generating golden standard)* Docker with Ensembl VEP 115 image and cache
-
-### Positional arguments
-
-```
-cargo run --release --example annotate_vep_golden_bench -- \
-  <source_vcf_gz>       # 1: Input VCF (bgzipped)
-  <cache_source>        # 2: Variation cache path (parquet file or fjall directory)
-  <backend>             # 3: "parquet" or "fjall"
-  <sample_limit>        # 4: Number of variants to sample (0 = all)
-  <vep_cache_dir>       # 5: Directory with golden VEP output / Docker VEP cache
-  <local_copy_vcf_gz>   # 6: Local copy path for the input VCF
-  <work_dir>            # 7: Output directory for reports and intermediate files
-  <context_dir>         # 8: Directory with context parquet files (transcripts, exons, etc.)
-  [--steps=ensembl,datafusion]  # Which steps to run (default: both)
-  [--extended-probes]           # Enable interval-overlap fallback for shifted indels
-  [--merged]                    # Use VEP --merged flag for merged Ensembl+RefSeq cache
-```
-
-### Running with a precomputed golden standard
-
-When a golden VEP output file already exists in the work directory, the benchmark reuses it instead of re-running Docker. This is the recommended workflow to avoid the slow Docker VEP step.
-
-**Step 1: Set up the golden file (one-time)**
-
-Output filenames are derived from the source VCF stem. For `HG002_chr1.vcf.gz` with `sample_limit=0`, the golden file must be named `HG002_chr1_0_vep115_golden.vcf` in the work directory.
-
-Create a symlink to a precomputed golden file:
+Compares `annotate_vep()` output against Ensembl VEP 115 on real whole-genome data (HG002/NA24385, GIAB). Validates per-field CSQ accuracy across 74 fields.
 
 ```bash
-mkdir -p /tmp/annotate_vep_golden_bench
-ln -sf /path/to/HG002_chr1_full_vep115_golden.vcf \
-  /tmp/annotate_vep_golden_bench/HG002_chr1_0_vep115_golden.vcf
-```
-
-**Step 2: Run the benchmark (both ensembl parse + datafusion annotation + comparison)**
-
-```bash
+# Full chr1 benchmark (323K variants, ~84s)
 cargo run --release --example annotate_vep_golden_bench -- \
   vep-benchmark/data/HG002_chr1.vcf.gz \
-  /Users/mwiewior/research/data/vep/115_GRCh38_variation_1.parquet \
+  /path/to/115_GRCh38_variation_1.parquet \
   parquet \
   0 \
-  /tmp/vep_golden \
+  /path/to/vep_cache \
   vep-benchmark/data/HG002_chr1.vcf.gz \
   /tmp/annotate_vep_golden_bench \
-  /Users/mwiewior/research/data/vep \
+  /path/to/context_parquets \
   --steps=ensembl,datafusion \
   --extended-probes
-```
 
-The `--steps=ensembl,datafusion` flag is required for comparison. The `ensembl` step parses the golden VEP output (reusing the existing file), and `datafusion` runs our engine. Comparison only runs when both steps are enabled.
-
-**Step 3: Run only our engine (skip golden parsing)**
-
-To iterate on the annotation engine without re-parsing the golden file:
-
-```bash
-cargo run --release --example annotate_vep_golden_bench -- \
-  vep-benchmark/data/HG002_chr1.vcf.gz \
-  /Users/mwiewior/research/data/vep/115_GRCh38_variation_1.parquet \
-  parquet \
-  0 \
-  /tmp/vep_golden \
-  vep-benchmark/data/HG002_chr1.vcf.gz \
-  /tmp/annotate_vep_golden_bench \
-  /Users/mwiewior/research/data/vep \
-  --steps=datafusion \
-  --extended-probes
-```
-
-This skips golden parsing and comparison, only running `annotate_vep()` and printing row counts and timing.
-
-### Output files
-
-All output goes to `<work_dir>` (default: `/tmp/annotate_vep_golden_bench`). Filenames are derived from the source VCF stem (e.g., `HG002_chr1` from `HG002_chr1.vcf.gz`):
-
-| File | Description |
-|------|-------------|
-| `{stem}_{N}.vcf` | Sampled VCF (first N variants, or all if N=0) |
-| `{stem}_{N}_norm.vcf` | Normalized VCF (multi-allelic decomposed) |
-| `{stem}_{N}_vep115_golden.vcf` | Golden VEP 115 output (or symlink to precomputed) |
-| `{stem}_{N}_comparison_report.txt` | Full comparison report with per-field accuracy |
-| `{stem}_{N}_discrepancies.txt` | Per-variant discrepancies (most_severe/term_set mismatches) |
-
-### Benchmark input data
-
-| File | Description |
-|------|-------------|
-| `vep-benchmark/data/HG002_chr22.vcf.gz` | HG002 chr22 variants (default small benchmark) |
-| `vep-benchmark/data/HG002_chr22.vcf.gz.tbi` | Tabix index |
-| `vep-benchmark/data/HG002_chr1.vcf.gz` | HG002 chr1 variants (full benchmark, 319k variants) |
-| `vep-benchmark/data/HG002_chr1.vcf.gz.tbi` | Tabix index |
-
-### Quick chr22 run (1000 variants, ~5s)
-
-```bash
+# Quick chr22 run (1000 variants, ~5s)
 cargo run --release --example annotate_vep_golden_bench -- \
   vep-benchmark/data/HG002_chr22.vcf.gz \
-  /Users/mwiewior/research/data/vep/115_GRCh38_variation_22.parquet \
+  /path/to/115_GRCh38_variation_22.parquet \
   parquet \
   1000 \
-  /tmp/vep_golden \
+  /path/to/vep_cache \
   vep-benchmark/data/HG002_chr22.vcf.gz \
   /tmp/annotate_vep_golden_bench \
-  /Users/mwiewior/research/data/vep \
+  /path/to/context_parquets \
   --steps=ensembl,datafusion
 ```
 
-### Generating a new golden standard (requires Docker)
+**Positional arguments:**
 
-If no golden file exists, the `ensembl` step runs VEP 115 in Docker:
+| # | Argument | Description |
+|---|----------|-------------|
+| 1 | `source_vcf_gz` | Input VCF (bgzipped) |
+| 2 | `cache_source` | Variation cache path (parquet file or fjall directory) |
+| 3 | `backend` | `parquet` or `fjall` |
+| 4 | `sample_limit` | Number of variants to sample (0 = all) |
+| 5 | `vep_cache_dir` | Directory with golden VEP output / Docker VEP cache |
+| 6 | `local_copy_vcf_gz` | Local copy path for the input VCF |
+| 7 | `work_dir` | Output directory for reports and intermediate files |
+| 8 | `context_dir` | Directory with context parquet files |
 
-```bash
-cargo run --release --example annotate_vep_golden_bench -- \
-  vep-benchmark/data/HG002_chr1.vcf.gz \
-  /Users/mwiewior/research/data/vep/115_GRCh38_variation_1.parquet \
-  parquet \
-  0 \
-  /path/to/vep/cache \
-  vep-benchmark/data/HG002_chr1.vcf.gz \
-  /tmp/annotate_vep_golden_bench \
-  /Users/mwiewior/research/data/vep \
-  --steps=ensembl,datafusion \
-  --extended-probes
-```
+**Optional flags:** `--steps=ensembl,datafusion`, `--extended-probes`, `--merged`
 
-This takes significantly longer (~30-60 min for chr1) as Docker VEP processes all 323k variants.
+**Output files** (in `work_dir`, named by VCF stem):
 
-## E2E Annotation Benchmark (`bench_annotate_vcf`)
+| File | Description |
+|------|-------------|
+| `{stem}_{N}.vcf` | Sampled VCF |
+| `{stem}_{N}_norm.vcf` | Normalized VCF (multi-allelic decomposed) |
+| `{stem}_{N}_vep115_golden.vcf` | Golden VEP 115 output |
+| `{stem}_{N}_comparison_report.txt` | Per-field accuracy report |
+| `{stem}_{N}_discrepancies.txt` | Per-variant discrepancies |
 
-Full pipeline benchmark: read VCF → annotate with transcript engine → write annotated VCF. Measures end-to-end throughput including I/O.
+### E2E annotation benchmark (`bench_annotate_vcf`)
 
-```bash
-cargo run --release --features kv-cache --example bench_annotate_vcf -- \
-  --input <vcf_path> \
-  --cache <cache_dir> \
-  --output <output.vcf> \
-  [--backend parquet|fjall] \
-  [--everything] \
-  [--extended-probes] \
-  [--reference-fasta <path>] \
-  [--compression none|gzip|bgzf] \
-  [--limit <n>]
-```
-
-### Examples
+Full pipeline: read VCF, annotate, write annotated VCF. Measures end-to-end throughput.
 
 ```bash
-# Parquet backend, --everything, 1000 variants from golden fixtures
 cargo run --release --example bench_annotate_vcf -- \
   --input vep-benchmark/data/golden/input_1000.vcf \
   --cache vep-benchmark/data/golden/cache \
@@ -384,7 +313,7 @@ cargo run --release --example bench_annotate_vcf -- \
   --everything --extended-probes \
   --reference-fasta vep-benchmark/data/golden/reference_chr1.fa
 
-# Fjall backend, full chr1 (323K variants), gzip output
+# With fjall backend and gzip output
 cargo run --release --features kv-cache --example bench_annotate_vcf -- \
   --input vep-benchmark/data/HG002_chr1.vcf.gz \
   --cache /data/vep/wgs/fjall/115_GRCh38_vep \
@@ -392,48 +321,32 @@ cargo run --release --features kv-cache --example bench_annotate_vcf -- \
   --backend fjall --everything --extended-probes \
   --reference-fasta /data/vep/Homo_sapiens.GRCh38.dna.primary_assembly.fa \
   --compression gzip
-
-# Quick smoke test with LIMIT
-cargo run --release --example bench_annotate_vcf -- \
-  --input vep-benchmark/data/golden/input_1000.vcf \
-  --cache vep-benchmark/data/golden/cache \
-  --output /tmp/quick.vcf \
-  --limit 100
 ```
 
-### Output
+**Options:** `--input`, `--cache`, `--output`, `--backend parquet|fjall`, `--everything`, `--extended-probes`, `--reference-fasta`, `--compression none|gzip|bgzf`, `--limit`
 
-```
-=== bench_annotate_vcf ===
-  input:      vep-benchmark/data/golden/input_1000.vcf
-  cache:      vep-benchmark/data/golden/cache
-  backend:    parquet
-  everything: true
-  ...
+### Other benchmarks
 
-[0.7s] Annotation + VCF write complete
+| Example | Feature | Description |
+|---------|---------|-------------|
+| `bench_annotate` | `kv-cache` | Arrow-level annotation performance (fjall) |
+| `lookup_parquet_bench` | — | `lookup_variants()` with parquet backend |
+| `lookup_kv_bench` | `kv-cache` | `lookup_variants()` with fjall backend |
+| `bench_fjall_gets` | `kv-cache` | Raw fjall KV store read throughput |
+| `bench_sift_queries` | `kv-cache` | SIFT prediction query performance |
 
-=== Results ===
-  rows:       1000
-  time:       0.70s
-  throughput: 1419 variants/s
-  output:     13.1 MB
-  total:      0.71s (including VCF read)
-```
-
-## Other benchmark examples
-
-| Example | Description |
-|---------|-------------|
-| `bench_annotate_vcf` | E2E pipeline: VCF in → annotate → VCF out (parquet or fjall) |
-| `bench_annotate` | `annotate_vep()` Arrow-level performance (fjall only) |
-| `annotate_vep_golden_bench` | Golden comparison: per-field CSQ accuracy vs Ensembl VEP 115 |
-| `lookup_parquet_bench` | `lookup_variants()` with parquet backend |
-| `lookup_kv_bench` | `lookup_variants()` with fjall KV backend |
-| `bench_fjall_gets` | Raw fjall KV store read throughput |
-
-Run with:
+Run any benchmark with:
 
 ```bash
-cargo run --release --example <example_name> -- <args>
+cargo run --release [--features kv-cache] --example <name> -- <args>
 ```
+
+## Cargo features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `kv-cache` | yes | Fjall LSM-tree backend with zstd compression |
+
+## License
+
+Apache 2.0
