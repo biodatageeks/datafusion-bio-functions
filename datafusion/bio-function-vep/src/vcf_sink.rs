@@ -291,9 +291,9 @@ pub async fn annotate_to_vcf(
                 arrow_field.with_metadata(merged_metadata)
             } else if name == "CSQ" {
                 let field_names = if config.everything {
-                    &crate::golden_benchmark::CSQ_FIELD_NAMES_EVERYTHING[..]
+                    crate::golden_benchmark::CSQ_FIELD_NAMES_EVERYTHING
                 } else {
-                    &crate::golden_benchmark::CSQ_FIELD_NAMES[..]
+                    crate::golden_benchmark::CSQ_FIELD_NAMES
                 };
                 let format_list = field_names.join("|");
                 let description = format!(
