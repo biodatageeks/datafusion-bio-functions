@@ -62,16 +62,54 @@ SELECT * FROM annotate_vep(
 | `partitioned` | Use per-chromosome partitioned cache | No |
 | `merged` | Use VEP `--merged` Ensembl+RefSeq cache | No |
 
-## Output Schema
+## Output Modes
+
+`annotate_vep()` is a DataFusion table function that returns a stream of Arrow `RecordBatch`es. This means results can be consumed in two ways:
+
+### Arrow RecordBatch streaming (native)
+
+The default output. Each batch contains the full annotation schema with typed Arrow columns. Arrow-native consumers (polars-bio, DataFusion SQL, PyArrow) can access structured data directly — no string parsing required. Transcript-level fields use `List<T>` types containing values for **all overlapping transcripts**, not just the most-severe pick.
+
+```rust
+let df = ctx.sql("SELECT * FROM annotate_vep(...)").await?;
+let batches: Vec<RecordBatch> = df.collect().await?;
+```
+
+### VCF file output
+
+The `annotate_to_vcf()` function wraps the annotation pipeline to produce a standard VCF file. The 87 structured annotation columns are collapsed into a single `CSQ` INFO field (pipe-delimited, VEP format). Core VCF columns and original INFO/FORMAT fields are preserved.
+
+```rust
+use datafusion_bio_function_vep::vcf_sink::{annotate_to_vcf, AnnotateVcfConfig};
+
+let rows = annotate_to_vcf(
+    "input.vcf.gz",
+    "/path/to/cache",
+    "parquet",
+    "output.vcf",
+    &AnnotateVcfConfig {
+        everything: true,
+        extended_probes: true,
+        reference_fasta_path: Some("/path/to/reference.fa".into()),
+        compression: VcfCompressionType::Gzip,
+        show_progress: true,
+        ..Default::default()
+    },
+).await?;
+```
+
+Supports `Plain`, `Gzip`, and `Bgzf` output compression. An optional `on_batch_written` callback enables progress reporting (used by Python/Jupyter wrappers).
+
+## Arrow Schema
 
 The output of `annotate_vep()` consists of **VCF pass-through columns** followed by **annotation columns** (up to 89 total).
 
-All CSQ fields are exposed as individual top-level Arrow columns. Per-transcript fields contain values from the **most-severe transcript** for each variant.
+All CSQ fields are exposed as individual top-level Arrow columns. Transcript-level fields use `List<T>` types to carry values for **all overlapping transcripts** per variant (not just the most-severe pick). Scalar columns (`Utf8`, `Float32`) carry a single value per variant.
 
 ### VCF input columns (pass-through)
 
-| Column | Type | Required | Description |
-|--------|------|----------|-------------|
+| Column | Arrow Type | Required | Description |
+|--------|------------|----------|-------------|
 | `chrom` | `Utf8` | yes | Chromosome identifier |
 | `start` | `Int64` | yes | Start position (0-based) |
 | `end` | `Int64` | yes | End position (0-based, exclusive) |
@@ -82,79 +120,79 @@ Additional VCF columns (`id`, `qual`, `filter`, decomposed INFO/sample fields) a
 
 ### Meta columns (2)
 
-| Column | Type | Description |
-|--------|------|-------------|
+| Column | Arrow Type | Description |
+|--------|------------|-------------|
 | `csq` | `Utf8` | Legacy pipe-delimited CSQ string (NULL unless explicitly projected) |
 | `most_severe_consequence` | `Utf8` | SO term for the most severe consequence across all transcripts |
 
 ### Transcript-level columns (42)
 
-Values from the transcript with the most severe consequence. Enabled with `everything: true`.
+One entry per overlapping transcript. Enabled with `everything: true`.
 
-| Column | Type | Description |
-|--------|------|-------------|
+| Column | Arrow Type | Description |
+|--------|------------|-------------|
 | `Allele` | `Utf8` | Variant allele used to calculate consequence |
 | `Consequence` | `List<Utf8>` | Consequence types (SO terms) |
-| `IMPACT` | `Utf8` | Impact rating: HIGH, MODERATE, LOW, MODIFIER |
-| `SYMBOL` | `Utf8` | Gene symbol |
-| `Gene` | `Utf8` | Ensembl gene ID |
-| `Feature_type` | `Utf8` | Transcript, RegulatoryFeature, or MotifFeature |
-| `Feature` | `Utf8` | Ensembl feature ID |
-| `BIOTYPE` | `Utf8` | Biotype (protein_coding, lncRNA, etc.) |
-| `EXON` | `Utf8` | Exon number / total exons |
-| `INTRON` | `Utf8` | Intron number / total introns |
-| `HGVSc` | `Utf8` | HGVS coding sequence notation |
-| `HGVSp` | `Utf8` | HGVS protein sequence notation |
-| `cDNA_position` | `Utf8` | Position in cDNA |
-| `CDS_position` | `Utf8` | Position in CDS |
-| `Protein_position` | `Utf8` | Position in protein |
-| `Amino_acids` | `Utf8` | Reference/variant amino acids |
-| `Codons` | `Utf8` | Reference/variant codons |
+| `IMPACT` | `List<Utf8>` | Impact rating: HIGH, MODERATE, LOW, MODIFIER |
+| `SYMBOL` | `List<Utf8>` | Gene symbol |
+| `Gene` | `List<Utf8>` | Ensembl gene ID |
+| `Feature_type` | `List<Utf8>` | Transcript, RegulatoryFeature, or MotifFeature |
+| `Feature` | `List<Utf8>` | Ensembl feature ID |
+| `BIOTYPE` | `List<Utf8>` | Biotype (protein_coding, lncRNA, etc.) |
+| `EXON` | `List<Utf8>` | Exon number / total exons |
+| `INTRON` | `List<Utf8>` | Intron number / total introns |
+| `HGVSc` | `List<Utf8>` | HGVS coding sequence notation |
+| `HGVSp` | `List<Utf8>` | HGVS protein sequence notation |
+| `cDNA_position` | `List<Utf8>` | Position in cDNA |
+| `CDS_position` | `List<Utf8>` | Position in CDS |
+| `Protein_position` | `List<Utf8>` | Position in protein |
+| `Amino_acids` | `List<Utf8>` | Reference/variant amino acids |
+| `Codons` | `List<Utf8>` | Reference/variant codons |
 | `Existing_variation` | `List<Utf8>` | Known variant identifiers (rsIDs, COSMIC, etc.) |
-| `DISTANCE` | `Int64` | Distance to transcript |
-| `STRAND` | `Int8` | Strand of feature (1 or -1) |
-| `FLAGS` | `Utf8` | Transcript quality flags |
+| `DISTANCE` | `List<Int64>` | Distance to transcript |
+| `STRAND` | `List<Int8>` | Strand of feature (1 or -1) |
+| `FLAGS` | `List<Utf8>` | Transcript quality flags |
 | `VARIANT_CLASS` | `Utf8` | SO variant class (SNV, deletion, insertion, etc.) |
-| `SYMBOL_SOURCE` | `Utf8` | Source of gene symbol (HGNC, EntrezGene, etc.) |
-| `HGNC_ID` | `Utf8` | HGNC gene identifier |
-| `CANONICAL` | `Utf8` | Canonical transcript flag |
-| `MANE` | `Utf8` | MANE transcript type |
-| `MANE_SELECT` | `Utf8` | MANE Select transcript ID |
-| `MANE_PLUS_CLINICAL` | `Utf8` | MANE Plus Clinical transcript ID |
-| `TSL` | `Int8` | Transcript support level (1-5) |
-| `APPRIS` | `Utf8` | APPRIS annotation |
-| `CCDS` | `Utf8` | CCDS identifier |
-| `ENSP` | `Utf8` | Ensembl protein ID |
-| `SWISSPROT` | `Utf8` | UniProtKB/Swiss-Prot ID |
-| `TREMBL` | `Utf8` | UniProtKB/TrEMBL ID |
-| `UNIPARC` | `Utf8` | UniParc ID |
-| `UNIPROT_ISOFORM` | `Utf8` | UniProt isoform |
-| `GENE_PHENO` | `Utf8` | Gene has known phenotype association |
-| `SIFT` | `Utf8` | SIFT prediction and score |
-| `PolyPhen` | `Utf8` | PolyPhen prediction and score |
+| `SYMBOL_SOURCE` | `List<Utf8>` | Source of gene symbol (HGNC, EntrezGene, etc.) |
+| `HGNC_ID` | `List<Utf8>` | HGNC gene identifier |
+| `CANONICAL` | `List<Utf8>` | Canonical transcript flag |
+| `MANE` | `List<Utf8>` | MANE transcript type |
+| `MANE_SELECT` | `List<Utf8>` | MANE Select transcript ID |
+| `MANE_PLUS_CLINICAL` | `List<Utf8>` | MANE Plus Clinical transcript ID |
+| `TSL` | `List<Int8>` | Transcript support level (1-5) |
+| `APPRIS` | `List<Utf8>` | APPRIS annotation |
+| `CCDS` | `List<Utf8>` | CCDS identifier |
+| `ENSP` | `List<Utf8>` | Ensembl protein ID |
+| `SWISSPROT` | `List<Utf8>` | UniProtKB/Swiss-Prot ID |
+| `TREMBL` | `List<Utf8>` | UniProtKB/TrEMBL ID |
+| `UNIPARC` | `List<Utf8>` | UniParc ID |
+| `UNIPROT_ISOFORM` | `List<Utf8>` | UniProt isoform |
+| `GENE_PHENO` | `List<Utf8>` | Gene has known phenotype association |
+| `SIFT` | `List<Utf8>` | SIFT prediction and score |
+| `PolyPhen` | `List<Utf8>` | PolyPhen prediction and score |
 | `DOMAINS` | `List<Utf8>` | Overlapping protein domains |
-| `miRNA` | `Utf8` | miRNA secondary structure position |
-| `HGVS_OFFSET` | `Int64` | HGVS offset for indels |
+| `miRNA` | `List<Utf8>` | miRNA secondary structure position |
+| `HGVS_OFFSET` | `List<Int64>` | HGVS offset for indels |
 
 ### Population frequency columns (29)
 
-Resolved for the matching allele. Stored as `Float32` (~7.2 significant digits).
+Resolved for the matching allele. Scalar `Float32` (~7.2 significant digits).
 
-| Column | Source | Description |
-|--------|--------|-------------|
-| `AF` | 1000 Genomes | Global allele frequency |
-| `AFR_AF`, `AMR_AF`, `EAS_AF`, `EUR_AF`, `SAS_AF` | 1000 Genomes | Sub-population AFs |
-| `gnomADe_AF` | gnomAD exome | Global exome AF |
-| `gnomADe_{AFR,AMR,ASJ,EAS,FIN,MID,NFE,REMAINING,SAS}_AF` | gnomAD exome | Sub-population exome AFs |
-| `gnomADg_AF` | gnomAD genome | Global genome AF |
-| `gnomADg_{AFR,AMI,AMR,ASJ,EAS,FIN,MID,NFE,REMAINING,SAS}_AF` | gnomAD genome | Sub-population genome AFs |
-| `MAX_AF` | computed | Maximum AF across all populations |
-| `MAX_AF_POPS` | computed | Population(s) with maximum AF |
+| Column | Arrow Type | Source | Description |
+|--------|------------|--------|-------------|
+| `AF` | `Float32` | 1000 Genomes | Global allele frequency |
+| `AFR_AF`, `AMR_AF`, `EAS_AF`, `EUR_AF`, `SAS_AF` | `Float32` | 1000 Genomes | Sub-population AFs |
+| `gnomADe_AF` | `Float32` | gnomAD exome | Global exome AF |
+| `gnomADe_{AFR,AMR,ASJ,EAS,FIN,MID,NFE,REMAINING,SAS}_AF` | `Float32` | gnomAD exome | Sub-population exome AFs |
+| `gnomADg_AF` | `Float32` | gnomAD genome | Global genome AF |
+| `gnomADg_{AFR,AMI,AMR,ASJ,EAS,FIN,MID,NFE,REMAINING,SAS}_AF` | `Float32` | gnomAD genome | Sub-population genome AFs |
+| `MAX_AF` | `Float32` | computed | Maximum AF across all populations |
+| `MAX_AF_POPS` | `Utf8` | computed | Population(s) with maximum AF |
 
 ### Variant-level annotation columns (9)
 
-| Column | Type | Description |
-|--------|------|-------------|
+| Column | Arrow Type | Description |
+|--------|------------|-------------|
 | `CLIN_SIG` | `List<Utf8>` | ClinVar clinical significance |
 | `SOMATIC` | `Utf8` | Somatic variant flag |
 | `PHENO` | `Utf8` | Phenotype/disease association flag |
@@ -169,8 +207,8 @@ Resolved for the matching allele. Stored as `Float32` (~7.2 significant digits).
 
 Additional fields from the variation cache, not present in the CSQ string.
 
-| Column | Type | Description |
-|--------|------|-------------|
+| Column | Arrow Type | Description |
+|--------|------------|-------------|
 | `clin_sig_allele` | `List<Utf8>` | Clinical significance per allele |
 | `clinical_impact` | `Utf8` | Clinical impact assessment |
 | `minor_allele` | `Utf8` | Minor allele |
