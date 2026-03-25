@@ -68,6 +68,38 @@ async fn test_roundtrip_golden_all_column_values() {
     .unwrap();
     assert_eq!(rows_written, 1000, "Should write 1000 annotated rows");
 
+    // ── Step 1b: Verify CSQ INFO header contains Format: field list ──
+    {
+        let vcf_text = std::fs::read_to_string(&output_path).unwrap();
+        let csq_header = vcf_text
+            .lines()
+            .find(|l| l.starts_with("##INFO=<ID=CSQ,"))
+            .expect("Output VCF must have ##INFO=<ID=CSQ,...> header line");
+        assert!(
+            csq_header.contains("Format: "),
+            "CSQ INFO header must contain 'Format: ' field list, got: {csq_header}"
+        );
+        // Verify field list matches the --everything constant (80 fields).
+        let format_str = csq_header
+            .split("Format: ")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches("\">");
+        let fields: Vec<&str> = format_str.split('|').collect();
+        let expected = datafusion_bio_function_vep::golden_benchmark::CSQ_FIELD_NAMES_EVERYTHING;
+        assert_eq!(
+            fields.len(),
+            expected.len(),
+            "CSQ Format field count mismatch: got {}, expected {}",
+            fields.len(),
+            expected.len()
+        );
+        assert_eq!(
+            fields, expected,
+            "CSQ Format field names/order mismatch"
+        );
+    }
+
     // ── Step 2: Read input, output, and golden with VcfTableProvider ──
     let ctx2 = SessionContext::new();
 
