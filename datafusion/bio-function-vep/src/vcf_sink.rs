@@ -296,9 +296,8 @@ pub async fn annotate_to_vcf(
                     crate::golden_benchmark::CSQ_FIELD_NAMES
                 };
                 let format_list = field_names.join("|");
-                let description = format!(
-                    "Consequence annotations from annotate_vep. Format: {format_list}"
-                );
+                let description =
+                    format!("Consequence annotations from annotate_vep. Format: {format_list}");
                 let mut meta = std::collections::HashMap::new();
                 meta.insert("bio.vcf.field.field_type".to_string(), "INFO".to_string());
                 meta.insert("bio.vcf.field.description".to_string(), description);

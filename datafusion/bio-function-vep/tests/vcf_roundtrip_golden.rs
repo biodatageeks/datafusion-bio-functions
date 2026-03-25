@@ -94,10 +94,7 @@ async fn test_roundtrip_golden_all_column_values() {
             fields.len(),
             expected.len()
         );
-        assert_eq!(
-            fields, expected,
-            "CSQ Format field names/order mismatch"
-        );
+        assert_eq!(fields, expected, "CSQ Format field names/order mismatch");
     }
 
     // ── Step 2: Read input, output, and golden with VcfTableProvider ──
