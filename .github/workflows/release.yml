@@ -31,7 +31,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # PAT with repo scope needed to push to protected master branch.
+          # GITHUB_TOKEN cannot bypass branch protection rules.
+          token: ${{ secrets.RELEASE_PAT }}
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
