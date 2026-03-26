@@ -1532,3 +1532,696 @@ fn string_value(col: &dyn Array, row: usize) -> &str {
         panic!("Expected Utf8, LargeUtf8, or Utf8View column")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // -----------------------------------------------------------------------
+    // Helper: create a test schema and RecordBatch for variation-like data
+    // -----------------------------------------------------------------------
+    fn variation_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("variation_name", DataType::Utf8, true),
+        ]))
+    }
+
+    fn make_batch(
+        chroms: Vec<&str>,
+        starts: Vec<i64>,
+        ends: Vec<i64>,
+        alleles: Vec<&str>,
+        names: Vec<&str>,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            variation_schema(),
+            vec![
+                Arc::new(StringArray::from(chroms)),
+                Arc::new(Int64Array::from(starts)),
+                Arc::new(Int64Array::from(ends)),
+                Arc::new(StringArray::from(alleles)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_entity
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_parse_entity_known() {
+        assert!(matches!(
+            parse_entity("variation"),
+            Some(EnsemblEntityKind::Variation)
+        ));
+        assert!(matches!(
+            parse_entity("transcript"),
+            Some(EnsemblEntityKind::Transcript)
+        ));
+        assert!(matches!(
+            parse_entity("exon"),
+            Some(EnsemblEntityKind::Exon)
+        ));
+        assert!(matches!(
+            parse_entity("translation"),
+            Some(EnsemblEntityKind::Translation)
+        ));
+        assert!(matches!(
+            parse_entity("regulatory"),
+            Some(EnsemblEntityKind::RegulatoryFeature)
+        ));
+        assert!(matches!(
+            parse_entity("motif"),
+            Some(EnsemblEntityKind::MotifFeature)
+        ));
+    }
+
+    #[test]
+    fn test_parse_entity_unknown() {
+        assert!(parse_entity("unknown").is_none());
+        assert!(parse_entity("").is_none());
+        assert!(parse_entity("Variation").is_none()); // case-sensitive
+    }
+
+    // -----------------------------------------------------------------------
+    // entity_subdir
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_entity_subdir() {
+        assert_eq!(entity_subdir(EnsemblEntityKind::Variation), "variation");
+        assert_eq!(entity_subdir(EnsemblEntityKind::Transcript), "transcript");
+        assert_eq!(entity_subdir(EnsemblEntityKind::Exon), "exon");
+        assert_eq!(entity_subdir(EnsemblEntityKind::Translation), "translation");
+        assert_eq!(
+            entity_subdir(EnsemblEntityKind::RegulatoryFeature),
+            "regulatory"
+        );
+        assert_eq!(entity_subdir(EnsemblEntityKind::MotifFeature), "motif");
+    }
+
+    // -----------------------------------------------------------------------
+    // entity_table_name
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_entity_table_name() {
+        assert_eq!(entity_table_name(EnsemblEntityKind::Variation), "var");
+        assert_eq!(entity_table_name(EnsemblEntityKind::Transcript), "tx");
+        assert_eq!(entity_table_name(EnsemblEntityKind::Exon), "exon");
+        assert_eq!(entity_table_name(EnsemblEntityKind::Translation), "tl");
+        assert_eq!(
+            entity_table_name(EnsemblEntityKind::RegulatoryFeature),
+            "reg"
+        );
+        assert_eq!(entity_table_name(EnsemblEntityKind::MotifFeature), "motif");
+    }
+
+    // -----------------------------------------------------------------------
+    // row_group_size
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_row_group_size() {
+        assert_eq!(row_group_size(EnsemblEntityKind::Variation), 100_000);
+        assert_eq!(row_group_size(EnsemblEntityKind::Transcript), 8_000);
+        assert_eq!(row_group_size(EnsemblEntityKind::Exon), 45_000);
+        assert_eq!(row_group_size(EnsemblEntityKind::Translation), 6_000);
+        assert_eq!(row_group_size(EnsemblEntityKind::RegulatoryFeature), 9_000);
+        assert_eq!(row_group_size(EnsemblEntityKind::MotifFeature), 10_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // sort_key
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_sort_key() {
+        assert_eq!(
+            sort_key(EnsemblEntityKind::Exon),
+            &["transcript_id", "start"]
+        );
+        assert_eq!(sort_key(EnsemblEntityKind::Variation), &["chrom", "start"]);
+        assert_eq!(sort_key(EnsemblEntityKind::Transcript), &["chrom", "start"]);
+        assert_eq!(
+            sort_key(EnsemblEntityKind::RegulatoryFeature),
+            &["chrom", "start"]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_rows
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_format_rows() {
+        assert_eq!(format_rows(0), "0");
+        assert_eq!(format_rows(999), "999");
+        assert_eq!(format_rows(1_000), "1.0k");
+        assert_eq!(format_rows(1_500), "1.5k");
+        assert_eq!(format_rows(999_999), "1000.0k");
+        assert_eq!(format_rows(1_000_000), "1.0M");
+        assert_eq!(format_rows(1_170_000_000), "1170.0M");
+    }
+
+    // -----------------------------------------------------------------------
+    // split_chroms
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_split_chroms_with_known_chroms() {
+        let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
+        let chroms = Some(vec![
+            "1".to_string(),
+            "2".to_string(),
+            "MT".to_string(),
+            "GL000220.1".to_string(),
+        ]);
+        let (main, other) = split_chroms(&chroms, &main_set);
+        assert_eq!(main, vec!["1", "2"]);
+        assert_eq!(other, vec!["MT", "GL000220.1"]);
+    }
+
+    #[test]
+    fn test_split_chroms_none_defaults_to_main() {
+        let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
+        let (main, other) = split_chroms(&None, &main_set);
+        assert_eq!(main.len(), MAIN_CHROMS.len());
+        assert!(other.is_empty());
+    }
+
+    #[test]
+    fn test_split_chroms_all_non_canonical() {
+        let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
+        let chroms = Some(vec!["KI270442.1".to_string(), "GL000220.1".to_string()]);
+        let (main, other) = split_chroms(&chroms, &main_set);
+        assert!(main.is_empty());
+        assert_eq!(other.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // chroms_from_schema
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_chroms_from_schema_present() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "bio.vep.chromosomes".to_string(),
+            r#"["1","2","X"]"#.to_string(),
+        );
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("chrom", DataType::Utf8, false)],
+            metadata,
+        ));
+        let chroms = chroms_from_schema(&schema);
+        assert_eq!(
+            chroms,
+            Some(vec!["1".to_string(), "2".to_string(), "X".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_chroms_from_schema_absent() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "chrom",
+            DataType::Utf8,
+            false,
+        )]));
+        assert!(chroms_from_schema(&schema).is_none());
+    }
+
+    #[test]
+    fn test_chroms_from_schema_malformed_json() {
+        let mut metadata = HashMap::new();
+        metadata.insert("bio.vep.chromosomes".to_string(), "not json".to_string());
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("chrom", DataType::Utf8, false)],
+            metadata,
+        ));
+        assert!(chroms_from_schema(&schema).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_query
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_build_query_variation_no_filter() {
+        let q = build_query(EnsemblEntityKind::Variation, "var", None);
+        assert_eq!(q, "SELECT * FROM var ORDER BY chrom, start");
+    }
+
+    #[test]
+    fn test_build_query_variation_with_filter() {
+        let q = build_query(EnsemblEntityKind::Variation, "var", Some("1"));
+        assert_eq!(
+            q,
+            "SELECT * FROM var WHERE chrom = '1' ORDER BY chrom, start"
+        );
+    }
+
+    #[test]
+    fn test_build_query_transcript_dedup() {
+        let q = build_query(EnsemblEntityKind::Transcript, "tx", Some("X"));
+        assert!(q.contains("ROW_NUMBER()"));
+        assert!(q.contains("PARTITION BY stable_id"));
+        assert!(q.contains("WHERE _rn = 1"));
+        assert!(q.contains("ORDER BY chrom, start"));
+        assert!(q.contains("WHERE chrom = 'X'"));
+    }
+
+    #[test]
+    fn test_build_query_exon_dedup() {
+        let q = build_query(EnsemblEntityKind::Exon, "exon", None);
+        assert!(q.contains("PARTITION BY transcript_id, exon_number"));
+        assert!(q.contains("ORDER BY transcript_id, start"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_query_multi_chrom
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_build_query_multi_chrom() {
+        let q = build_query_multi_chrom(EnsemblEntityKind::Variation, "var", &["MT", "GL000220"]);
+        assert!(q.contains("WHERE chrom IN ('MT', 'GL000220')"));
+        assert!(q.contains("ORDER BY chrom, start"));
+    }
+
+    #[test]
+    fn test_build_query_multi_chrom_transcript() {
+        let q = build_query_multi_chrom(EnsemblEntityKind::Transcript, "tx", &["1", "2"]);
+        assert!(q.contains("WHERE chrom IN ('1', '2')"));
+        assert!(q.contains("ROW_NUMBER()"));
+        assert!(q.contains("WHERE _rn = 1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // sorting_columns_for
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_sorting_columns_for_all_present() {
+        let schema = variation_schema();
+        let result = sorting_columns_for(&schema, &["chrom", "start"]);
+        assert!(result.is_some());
+        let cols = result.unwrap();
+        assert_eq!(cols.len(), 2);
+    }
+
+    #[test]
+    fn test_sorting_columns_for_missing_column() {
+        let schema = variation_schema();
+        let result = sorting_columns_for(&schema, &["chrom", "nonexistent"]);
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // project_batch
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_project_batch_subset() {
+        let batch = make_batch(vec!["1"], vec![100], vec![100], vec!["A/G"], vec!["rs1"]);
+        let target = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("allele_string", DataType::Utf8, false),
+        ]));
+        let projected = project_batch(&batch, &target).unwrap();
+        assert_eq!(projected.num_columns(), 2);
+        assert_eq!(projected.num_rows(), 1);
+        assert_eq!(projected.schema().field(0).name(), "chrom");
+        assert_eq!(projected.schema().field(1).name(), "allele_string");
+    }
+
+    #[test]
+    fn test_project_batch_missing_column() {
+        let batch = make_batch(vec!["1"], vec![100], vec![100], vec!["A/G"], vec!["rs1"]);
+        let target = Arc::new(Schema::new(vec![Field::new(
+            "nonexistent",
+            DataType::Utf8,
+            false,
+        )]));
+        assert!(project_batch(&batch, &target).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // string_value
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_string_value_utf8() {
+        let arr = StringArray::from(vec!["hello", "world"]);
+        assert_eq!(string_value(&arr, 0), "hello");
+        assert_eq!(string_value(&arr, 1), "world");
+    }
+
+    #[test]
+    fn test_string_value_large_utf8() {
+        let arr = LargeStringArray::from(vec!["large", "string"]);
+        assert_eq!(string_value(&arr, 0), "large");
+        assert_eq!(string_value(&arr, 1), "string");
+    }
+
+    // -----------------------------------------------------------------------
+    // PositionAccumulator — single batch
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_accumulator_single_batch_single_row() {
+        let batch = make_batch(vec!["1"], vec![100], vec![100], vec!["A/G"], vec!["rs1"]);
+        let schema = batch.schema();
+        let chrom_idx = schema.index_of("chrom").unwrap();
+        let start_idx = schema.index_of("start").unwrap();
+        let allele_idx = schema.index_of("allele_string").unwrap();
+        let col_indices: Vec<usize> = (0..schema.fields().len())
+            .filter(|&i| i != chrom_idx && i != start_idx)
+            .collect();
+
+        let accum = PositionAccumulator::new(1, "1".to_string(), 100, 0, &batch);
+        let (key, value) = accum
+            .finish_entry(&col_indices, allele_idx, &mut None)
+            .unwrap();
+
+        assert_eq!(key.len(), 10); // 2-byte chrom + 8-byte start
+        assert!(!value.is_empty());
+    }
+
+    #[test]
+    fn test_accumulator_single_batch_multiple_rows() {
+        let batch = make_batch(
+            vec!["1", "1"],
+            vec![100, 100],
+            vec![100, 100],
+            vec!["A/G", "A/T"],
+            vec!["rs1", "rs2"],
+        );
+        let schema = batch.schema();
+        let chrom_idx = schema.index_of("chrom").unwrap();
+        let start_idx = schema.index_of("start").unwrap();
+        let allele_idx = schema.index_of("allele_string").unwrap();
+        let col_indices: Vec<usize> = (0..schema.fields().len())
+            .filter(|&i| i != chrom_idx && i != start_idx)
+            .collect();
+
+        let mut accum = PositionAccumulator::new(1, "1".to_string(), 100, 0, &batch);
+        accum.add_row(1, &batch);
+
+        assert_eq!(accum.segments.len(), 1);
+        assert_eq!(accum.segments[0].1.len(), 2);
+
+        let (key, value) = accum
+            .finish_entry(&col_indices, allele_idx, &mut None)
+            .unwrap();
+        assert!(!value.is_empty());
+
+        // Verify the serialized entry has 2 alleles
+        let reader = crate::kv_cache::position_entry::PositionEntryReader::new(&value).unwrap();
+        assert_eq!(reader.num_alleles(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // PositionAccumulator — cross-batch
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_accumulator_cross_batch_preserves_data() {
+        // Create two different batches with the same position
+        let batch1 = make_batch(vec!["1"], vec![100], vec![100], vec!["A/G"], vec!["rs1"]);
+        let batch2 = make_batch(vec!["1"], vec![100], vec![100], vec!["A/T"], vec!["rs2"]);
+
+        let schema = batch1.schema();
+        let chrom_idx = schema.index_of("chrom").unwrap();
+        let start_idx = schema.index_of("start").unwrap();
+        let allele_idx = schema.index_of("allele_string").unwrap();
+        let col_indices: Vec<usize> = (0..schema.fields().len())
+            .filter(|&i| i != chrom_idx && i != start_idx)
+            .collect();
+
+        let mut accum = PositionAccumulator::new(1, "1".to_string(), 100, 0, &batch1);
+        accum.add_row(0, &batch2); // Different batch!
+
+        assert_eq!(
+            accum.segments.len(),
+            2,
+            "Should have 2 segments for 2 batches"
+        );
+
+        let (key, value) = accum
+            .finish_entry(&col_indices, allele_idx, &mut None)
+            .unwrap();
+        assert!(!value.is_empty());
+
+        // Verify both alleles are preserved
+        let reader = crate::kv_cache::position_entry::PositionEntryReader::new(&value).unwrap();
+        assert_eq!(
+            reader.num_alleles(),
+            2,
+            "Cross-batch accumulator must preserve both alleles"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PositionAccumulator — with compression
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_accumulator_with_compression() {
+        let batch = make_batch(vec!["1"], vec![100], vec![100], vec!["A/G"], vec!["rs1"]);
+        let schema = batch.schema();
+        let chrom_idx = schema.index_of("chrom").unwrap();
+        let start_idx = schema.index_of("start").unwrap();
+        let allele_idx = schema.index_of("allele_string").unwrap();
+        let col_indices: Vec<usize> = (0..schema.fields().len())
+            .filter(|&i| i != chrom_idx && i != start_idx)
+            .collect();
+
+        // Without compression
+        let accum_raw = PositionAccumulator::new(1, "1".to_string(), 100, 0, &batch);
+        let (_, raw_value) = accum_raw
+            .finish_entry(&col_indices, allele_idx, &mut None)
+            .unwrap();
+
+        // With compression (no dictionary — plain zstd)
+        let accum_comp = PositionAccumulator::new(1, "1".to_string(), 100, 0, &batch);
+        let mut compressor = Some(zstd::bulk::Compressor::new(3).unwrap());
+        let (_, comp_value) = accum_comp
+            .finish_entry(&col_indices, allele_idx, &mut compressor)
+            .unwrap();
+
+        assert!(!raw_value.is_empty());
+        assert!(!comp_value.is_empty());
+        // Compressed may be larger for tiny payloads, but should be different bytes
+        assert_ne!(raw_value, comp_value);
+    }
+
+    // -----------------------------------------------------------------------
+    // CacheBuilder — builder pattern defaults
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_cache_builder_defaults() {
+        let builder = CacheBuilder::new("/cache", "/output");
+        assert_eq!(builder.cache_root, "/cache");
+        assert_eq!(builder.output_dir, "/output");
+        assert_eq!(builder.partitions, 8);
+        assert!(builder.build_fjall);
+        assert_eq!(builder.zstd_level, 3);
+        assert_eq!(builder.dict_size_kb, 112);
+        assert!(builder.on_progress.is_none());
+    }
+
+    #[test]
+    fn test_cache_builder_with_overrides() {
+        let builder = CacheBuilder::new("/cache", "/output")
+            .with_partitions(4)
+            .with_build_fjall(false)
+            .with_zstd_level(9)
+            .with_dict_size_kb(256);
+        assert_eq!(builder.partitions, 4);
+        assert!(!builder.build_fjall);
+        assert_eq!(builder.zstd_level, 9);
+        assert_eq!(builder.dict_size_kb, 256);
+    }
+
+    #[test]
+    fn test_cache_builder_with_progress() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let builder = CacheBuilder::new("/cache", "/output").with_on_progress(Box::new(
+            move |_entity, _format, _batch, _total, _expected| {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        assert!(builder.on_progress.is_some());
+
+        // Invoke callback to verify it works
+        if let Some(ref cb) = builder.on_progress {
+            cb("variation", "parquet", 100, 100, 0);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_entity — unknown entity returns error
+    // -----------------------------------------------------------------------
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_entity_unknown() {
+        let builder = CacheBuilder::new("/nonexistent", "/nonexistent");
+        let result = builder.build_entity("foobar").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown entity"));
+    }
+
+    // -----------------------------------------------------------------------
+    // MAIN_CHROMS and CHROM_CODE_ORDER consistency
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_main_chroms_in_code_order() {
+        // Every MAIN_CHROMS entry must appear in CHROM_CODE_ORDER
+        for chrom in MAIN_CHROMS {
+            assert!(
+                CHROM_CODE_ORDER.contains(chrom),
+                "{chrom} in MAIN_CHROMS but not in CHROM_CODE_ORDER"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chrom_code_order_is_ascending() {
+        // Verify CHROM_CODE_ORDER produces ascending chrom_codes
+        let codes: Vec<u16> = CHROM_CODE_ORDER.iter().map(|c| chrom_to_code(c)).collect();
+        for i in 1..codes.len() {
+            assert!(
+                codes[i] > codes[i - 1],
+                "CHROM_CODE_ORDER not ascending at index {i}: {} (code {}) should be > {} (code {})",
+                CHROM_CODE_ORDER[i],
+                codes[i],
+                CHROM_CODE_ORDER[i - 1],
+                codes[i - 1]
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // writer_properties
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_writer_properties_variation() {
+        let schema = variation_schema();
+        let props = writer_properties(
+            EnsemblEntityKind::Variation,
+            &schema,
+            &["chrom", "start"],
+            None,
+        );
+        assert_eq!(props.max_row_group_size(), 100_000);
+    }
+
+    #[test]
+    fn test_writer_properties_rg_override() {
+        let schema = variation_schema();
+        let props = writer_properties(
+            EnsemblEntityKind::Variation,
+            &schema,
+            &["chrom", "start"],
+            Some(256),
+        );
+        assert_eq!(props.max_row_group_size(), 256);
+    }
+
+    // -----------------------------------------------------------------------
+    // SiftKvStore::ingest_sorted
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_sift_ingest_sorted_roundtrip() {
+        use crate::transcript_consequence::CompactPrediction;
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+
+        let entries = vec![
+            (
+                "ENST00000111111".to_string(),
+                CachedPredictions {
+                    sift: vec![CompactPrediction {
+                        position: 10,
+                        amino_acid: 1,
+                        prediction: 0,
+                        score: 0.05,
+                    }],
+                    polyphen: vec![],
+                },
+            ),
+            (
+                "ENST00000222222".to_string(),
+                CachedPredictions {
+                    sift: vec![],
+                    polyphen: vec![CompactPrediction {
+                        position: 20,
+                        amino_acid: 2,
+                        prediction: 2,
+                        score: 0.88,
+                    }],
+                },
+            ),
+        ];
+
+        let store = SiftKvStore::ingest_sorted(&db, entries.into_iter()).unwrap();
+
+        let preds1 = store.get("ENST00000111111").unwrap().unwrap();
+        assert_eq!(preds1.sift.len(), 1);
+        assert_eq!(preds1.sift[0].position, 10);
+
+        let preds2 = store.get("ENST00000222222").unwrap().unwrap();
+        assert_eq!(preds2.polyphen.len(), 1);
+        assert!((preds2.polyphen[0].score - 0.88).abs() < f32::EPSILON);
+
+        assert!(store.get("MISSING").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_sift_ingest_sorted_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+
+        let entries: Vec<(String, CachedPredictions)> = vec![];
+        let _store = SiftKvStore::ingest_sorted(&db, entries.into_iter()).unwrap();
+    }
+
+    #[test]
+    fn test_sift_ingest_sorted_persistence() {
+        use crate::transcript_consequence::CompactPrediction;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write phase
+        {
+            let db = fjall::Database::builder(dir.path())
+                .cache_size(64 * 1024 * 1024)
+                .open()
+                .unwrap();
+            let entries = vec![(
+                "ENST00000333333".to_string(),
+                CachedPredictions {
+                    sift: vec![CompactPrediction {
+                        position: 42,
+                        amino_acid: 3,
+                        prediction: 1,
+                        score: 0.5,
+                    }],
+                    polyphen: vec![],
+                },
+            )];
+            SiftKvStore::ingest_sorted(&db, entries.into_iter()).unwrap();
+            db.persist(fjall::PersistMode::SyncAll).unwrap();
+        }
+
+        // Read phase — reopen
+        let store = SiftKvStore::open_path(dir.path())
+            .unwrap()
+            .expect("should find persisted sift data");
+        let preds = store.get("ENST00000333333").unwrap().unwrap();
+        assert_eq!(preds.sift.len(), 1);
+        assert_eq!(preds.sift[0].position, 42);
+    }
+}
