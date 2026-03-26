@@ -1134,18 +1134,12 @@ impl PositionAccumulator {
     }
 
     fn add_row(&mut self, row: usize, batch: &RecordBatch) {
-        // Check if this row belongs to the same RecordBatch as the last segment.
-        // We compare by pointer identity + length since the same batch object
-        // is reused within a single poll_next call.
-        let same_batch = self.segments.last().is_some_and(|(b, _)| {
-            Arc::ptr_eq(&b.schema(), &batch.schema()) && b.num_rows() == batch.num_rows()
-        });
-        if same_batch {
-            self.segments.last_mut().unwrap().1.push(row);
-        } else {
-            // New batch boundary — start a new segment
-            self.segments.push((batch.clone(), vec![row]));
-        }
+        // Always push a new segment per batch reference. The multi-segment
+        // path in `finish_entry` handles merging via take + concat_batches.
+        // This avoids an unreliable same-batch heuristic (DataFusion reuses
+        // the same SchemaRef Arc across all batches in a stream, so pointer
+        // comparison doesn't distinguish distinct batches).
+        self.segments.push((batch.clone(), vec![row]));
     }
 
     fn finish_entry(
@@ -1924,8 +1918,8 @@ mod tests {
         let mut accum = PositionAccumulator::new(1, "1".to_string(), 100, 0, &batch);
         accum.add_row(1, &batch);
 
-        assert_eq!(accum.segments.len(), 1);
-        assert_eq!(accum.segments[0].1.len(), 2);
+        // new() creates one segment, add_row() always pushes another
+        assert_eq!(accum.segments.len(), 2);
 
         let (key, value) = accum
             .finish_entry(&col_indices, allele_idx, &mut None)
