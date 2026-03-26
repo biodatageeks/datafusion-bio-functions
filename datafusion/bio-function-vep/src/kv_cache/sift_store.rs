@@ -87,7 +87,7 @@ impl SiftKvStore {
 
     /// Bulk-load from a sorted-by-transcript_id iterator using fjall ingestion.
     ///
-    /// Input **must** be sorted in ascending `transcript_id` order (panics otherwise).
+    /// Input **must** be sorted in ascending `transcript_id` order (returns `Err` otherwise).
     /// Uses `start_ingestion()` for maximum bulk load speed.
     pub fn ingest_sorted(
         db: &Database,

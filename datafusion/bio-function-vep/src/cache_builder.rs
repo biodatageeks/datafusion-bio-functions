@@ -237,6 +237,8 @@ impl CacheBuilder {
             None
         };
 
+        let fjall_start_time = Instant::now();
+
         // Start ingestion if fjall is active
         let mut ingestion = if let Some(ref state) = fjall_state {
             Some(
@@ -421,7 +423,6 @@ impl CacheBuilder {
 
         // Finalize fjall
         let fjall_stats = if let Some(ref mut ing) = ingestion {
-            let start_time = Instant::now();
             // Take ingestion out to call finish()
             let ingestion = ingestion.take().unwrap();
             ingestion
@@ -448,7 +449,7 @@ impl CacheBuilder {
                 total_variants: fjall_total_variants,
                 total_positions: fjall_total_positions,
                 total_bytes: fjall_total_bytes,
-                elapsed_secs: start_time.elapsed().as_secs_f64(),
+                elapsed_secs: fjall_start_time.elapsed().as_secs_f64(),
             })
         } else {
             None
@@ -898,14 +899,19 @@ impl CacheBuilder {
         let df = ctx.sql(&union_query).await?;
         let mut stream = df.execute_stream().await?;
 
-        // Collect sorted predictions grouped by transcript_id
-        let mut grouped: Vec<(String, CachedPredictions)> = Vec::new();
+        // Open fjall database
+        let db = fjall::Database::builder(&fjall_dir)
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let sift_store = SiftKvStore::create(&db)?;
+
+        // Stream predictions directly into fjall, grouping by transcript_id
+        // on-the-fly (data arrives sorted). Only one transcript is buffered.
         let mut current_transcript: Option<String> = None;
-        let mut current_preds = CachedPredictions {
-            sift: Vec::new(),
-            polyphen: Vec::new(),
-        };
+        let mut current_preds = CachedPredictions::default();
         let mut total_rows = 0usize;
+        let mut transcript_count = 0usize;
 
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
@@ -930,9 +936,12 @@ impl CacheBuilder {
                 }
 
                 if current_transcript.as_deref() != Some(&transcript_id) {
-                    // Flush previous transcript
+                    // Flush previous transcript directly to fjall
                     if let Some(tid) = current_transcript.take() {
-                        grouped.push((tid, std::mem::take(&mut current_preds)));
+                        current_preds.sort();
+                        sift_store.put(&tid, &current_preds)?;
+                        current_preds = CachedPredictions::default();
+                        transcript_count += 1;
                     }
                     current_transcript = Some(transcript_id);
                 }
@@ -948,23 +957,10 @@ impl CacheBuilder {
 
         // Flush last transcript
         if let Some(tid) = current_transcript.take() {
-            grouped.push((tid, current_preds));
+            current_preds.sort();
+            sift_store.put(&tid, &current_preds)?;
+            transcript_count += 1;
         }
-
-        // Sort predictions within each transcript
-        for (_, preds) in &mut grouped {
-            preds.sift.sort_by_key(|p| (p.position, p.amino_acid));
-            preds.polyphen.sort_by_key(|p| (p.position, p.amino_acid));
-        }
-
-        // Ingest into fjall
-        let db = fjall::Database::builder(&fjall_dir)
-            .cache_size(64 * 1024 * 1024)
-            .open()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        let transcript_count = grouped.len();
-        SiftKvStore::ingest_sorted(&db, grouped.into_iter())?;
 
         db.persist(fjall::PersistMode::SyncAll)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -1399,10 +1395,17 @@ fn project_batch(batch: &RecordBatch, target_schema: &SchemaRef) -> Result<Recor
 }
 
 fn chroms_from_schema(schema: &SchemaRef) -> Option<Vec<String>> {
-    schema
+    let result = schema
         .metadata()
         .get("bio.vep.chromosomes")
-        .and_then(|json| serde_json::from_str(json).ok())
+        .and_then(|json| serde_json::from_str(json).ok());
+    if result.is_none() {
+        info!(
+            "Schema metadata key 'bio.vep.chromosomes' not found; \
+             falling back to default MAIN_CHROMS list"
+        );
+    }
+    result
 }
 
 fn format_rows(n: usize) -> String {
