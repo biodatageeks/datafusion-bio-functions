@@ -272,24 +272,31 @@ impl CacheBuilder {
         let mut fjall_total_variants = 0u64;
         let mut fjall_total_bytes = 0u64;
 
-        // Process chromosomes in chrom_code order for fjall,
-        // write parquet for each.
-        let ordered_chroms = self.ordered_chrom_list(&main_chroms, &other_chroms);
+        // Process main chromosomes in chrom_code order (each gets its own parquet file),
+        // then all non-main contigs together as other.parquet.
+        let mut chrom_batches: Vec<(&str, String, String)> = Vec::new(); // (label, query, output)
+        for chrom in CHROM_CODE_ORDER {
+            if main_chroms.iter().any(|c| c == chrom) {
+                let ctx_query = build_query(kind, table_name, Some(chrom));
+                let out = format!("{}/variation/chr{chrom}.parquet", self.output_dir);
+                chrom_batches.push((chrom, ctx_query, out));
+            }
+        }
+        if !other_chroms.is_empty() {
+            let refs: Vec<&str> = other_chroms.iter().map(|s| s.as_str()).collect();
+            let query = build_query_multi_chrom(kind, table_name, &refs);
+            let out = format!("{}/variation/other.parquet", self.output_dir);
+            chrom_batches.push(("other", query, out));
+        }
 
-        for chrom in &ordered_chroms {
+        for (chrom_label, query, output_file) in &chrom_batches {
             let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
-            let query = build_query(kind, table_name, Some(chrom));
-            let output_file = format!(
-                "{}/variation/{}.parquet",
-                self.output_dir,
-                chrom_file_name(chrom)
-            );
 
-            let df = ctx.sql(&query).await?;
+            let df = ctx.sql(query).await?;
             let mut stream = df.execute_stream().await?;
             let schema = stream.schema();
             let sk = sort_key(kind);
-            let mut writer = create_writer(&output_file, &schema, kind, sk, None)?;
+            let mut writer = create_writer(output_file, &schema, kind, sk, None)?;
 
             // Column indices for fjall (cached per chrom since schema is constant)
             let fjall_col_info = fjall_state.as_ref().map(|state| {
@@ -304,6 +311,11 @@ impl CacheBuilder {
 
             let mut chrom_rows = 0usize;
             let mut total_parquet_rows = parquet_results.iter().map(|(_, r)| *r).sum::<usize>();
+
+            // Skip fjall ingestion for "other" contigs — hashed chrom codes
+            // don't have a deterministic order compatible with start_ingestion().
+            // Non-canonical contigs fall back to parquet-based annotation.
+            let is_main_chrom = *chrom_label != "other";
 
             // Accumulator for grouping adjacent rows with same (chrom, start)
             let mut accum: Option<PositionAccumulator> = None;
@@ -330,79 +342,81 @@ impl CacheBuilder {
                 }
 
                 // Feed fjall ingestion
-                if let (
-                    Some(ing),
-                    Some((chrom_col_idx, start_col_idx, allele_col_idx, col_indices)),
-                ) = (&mut ingestion, &fjall_col_info)
-                {
-                    let starts = batch.column(*start_col_idx).as_primitive::<Int64Type>();
+                if is_main_chrom {
+                    if let (
+                        Some(ing),
+                        Some((chrom_col_idx, start_col_idx, allele_col_idx, col_indices)),
+                    ) = (&mut ingestion, &fjall_col_info)
+                    {
+                        let starts = batch.column(*start_col_idx).as_primitive::<Int64Type>();
+                        let chrom_col = batch.column(*chrom_col_idx);
 
-                    for row in 0..batch.num_rows() {
-                        let start = starts.value(row);
-                        let chrom_code = chrom_to_code(chrom);
+                        for row in 0..batch.num_rows() {
+                            let start = starts.value(row);
+                            let row_chrom = string_value(chrom_col.as_ref(), row);
+                            let chrom_code = chrom_to_code(row_chrom);
 
-                        let should_flush = accum
-                            .as_ref()
-                            .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
+                            let should_flush = accum
+                                .as_ref()
+                                .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
 
-                        if should_flush {
-                            let a = accum.take().unwrap();
-                            let (key, value) =
-                                a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
-                            ing.write(&key, &value)
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                            fjall_total_positions += 1;
-                            fjall_total_bytes += value.len() as u64;
-                        }
+                            if should_flush {
+                                let a = accum.take().unwrap();
+                                let (key, value) =
+                                    a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
+                                ing.write(&key, &value)
+                                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                                fjall_total_positions += 1;
+                                fjall_total_bytes += value.len() as u64;
+                            }
 
-                        fjall_total_variants += 1;
+                            fjall_total_variants += 1;
 
-                        match &mut accum {
-                            Some(a) => a.add_row(row, &batch),
-                            None => {
-                                accum = Some(PositionAccumulator::new(
-                                    chrom_code,
-                                    chrom.to_string(),
-                                    start,
-                                    row,
-                                    &batch,
-                                ));
+                            match &mut accum {
+                                Some(a) => a.add_row(row, &batch),
+                                None => {
+                                    accum = Some(PositionAccumulator::new(
+                                        chrom_code,
+                                        row_chrom.to_string(),
+                                        start,
+                                        row,
+                                        &batch,
+                                    ));
+                                }
                             }
                         }
                     }
-                }
+                } // is_main_chrom
             }
             writer.close().map_err(|e| {
                 DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
             })?;
 
             if chrom_rows > 0 {
-                parquet_results.push((output_file, chrom_rows));
-                info!(
-                    "variation: {} {} rows",
-                    chrom_file_name(chrom),
-                    format_rows(chrom_rows)
-                );
+                parquet_results.push((output_file.clone(), chrom_rows));
+                info!("variation: {chrom_label} {} rows", format_rows(chrom_rows));
             }
 
-            // Flush accumulated fjall positions for this chrom
-            // (the last position in the chrom won't have been flushed by key-change)
-            if let (Some(ing), Some((_, _, allele_col_idx, col_indices))) =
-                (&mut ingestion, &fjall_col_info)
-            {
-                if let Some(a) = accum.take() {
-                    let (key, value) =
-                        a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
-                    ing.write(&key, &value)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    fjall_total_positions += 1;
-                    fjall_total_bytes += value.len() as u64;
-                }
+            // Flush accumulated fjall positions for this chrom batch
+            // (the last position won't have been flushed by key-change)
+            if is_main_chrom {
+                if let (Some(ing), Some((_, _, allele_col_idx, col_indices))) =
+                    (&mut ingestion, &fjall_col_info)
+                {
+                    if let Some(a) = accum.take() {
+                        let (key, value) =
+                            a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
+                        ing.write(&key, &value)
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                        fjall_total_positions += 1;
+                        fjall_total_bytes += value.len() as u64;
+                    }
 
-                if let Some(ref cb) = self.on_progress {
-                    cb("variation", "fjall", 0, fjall_total_positions as usize, 0);
+                    if let Some(ref cb) = self.on_progress {
+                        cb("variation", "fjall", 0, fjall_total_positions as usize, 0);
+                    }
                 }
-            }
+            } // is_main_chrom (flush)
         }
 
         // Finalize fjall
@@ -766,7 +780,7 @@ impl CacheBuilder {
         let df = df.select_columns(&cols.iter().map(|c| c.name()).collect::<Vec<_>>())?;
         let deduped = df.collect().await?;
 
-        if deduped.is_empty() || deduped.iter().any(|b| b.num_rows() == 0) {
+        if deduped.is_empty() || deduped.iter().all(|b| b.num_rows() == 0) {
             return Ok((None, None));
         }
 
@@ -1096,21 +1110,6 @@ impl CacheBuilder {
         print_progress(subdir, total_rows, elapsed);
         Ok(all_results)
     }
-
-    /// Return chromosome list in the order needed for fjall ingestion
-    /// (chrom_code ascending), followed by any "other" contigs sorted.
-    fn ordered_chrom_list(&self, main_chroms: &[String], other_chroms: &[String]) -> Vec<String> {
-        let main_set: HashSet<&str> = main_chroms.iter().map(|s| s.as_str()).collect();
-        let mut ordered: Vec<String> = CHROM_CODE_ORDER
-            .iter()
-            .filter(|c| main_set.contains(**c))
-            .map(|s| s.to_string())
-            .collect();
-        let mut others_sorted = other_chroms.to_vec();
-        others_sorted.sort();
-        ordered.extend(others_sorted);
-        ordered
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,12 +1117,14 @@ impl CacheBuilder {
 // ---------------------------------------------------------------------------
 
 /// Accumulates rows for a single genomic position during sorted streaming.
+/// Handles rows spanning multiple record batches by storing (batch, row_indices) pairs.
 struct PositionAccumulator {
     chrom_code: u16,
     chrom: String,
     start: i64,
-    rows: Vec<usize>,
-    batch: RecordBatch,
+    /// Each entry is a (batch, row_indices) pair. A new entry is added when
+    /// the stream advances to a new RecordBatch while the position key stays the same.
+    segments: Vec<(RecordBatch, Vec<usize>)>,
 }
 
 impl PositionAccumulator {
@@ -1132,25 +1133,23 @@ impl PositionAccumulator {
             chrom_code,
             chrom,
             start,
-            rows: vec![row],
-            batch: batch.clone(),
+            segments: vec![(batch.clone(), vec![row])],
         }
     }
 
     fn add_row(&mut self, row: usize, batch: &RecordBatch) {
-        // If the batch changed, we need to merge — but within a single stream batch
-        // this won't happen. For simplicity, we only accumulate within one batch.
-        // Cross-batch accumulation would need storing columns. Since data is sorted,
-        // adjacent same-key rows are typically in the same batch.
-        if !Arc::ptr_eq(&self.batch.schema(), &batch.schema())
-            || self.batch.num_rows() != batch.num_rows()
-        {
-            // Different batch — shouldn't happen for adjacent sorted rows in practice,
-            // but handle gracefully by treating as same batch (rows index into current batch).
-            self.batch = batch.clone();
-            self.rows.clear();
+        // Check if this row belongs to the same RecordBatch as the last segment.
+        // We compare by pointer identity + length since the same batch object
+        // is reused within a single poll_next call.
+        let same_batch = self.segments.last().is_some_and(|(b, _)| {
+            Arc::ptr_eq(&b.schema(), &batch.schema()) && b.num_rows() == batch.num_rows()
+        });
+        if same_batch {
+            self.segments.last_mut().unwrap().1.push(row);
+        } else {
+            // New batch boundary — start a new segment
+            self.segments.push((batch.clone(), vec![row]));
         }
-        self.rows.push(row);
     }
 
     fn finish_entry(
@@ -1160,8 +1159,30 @@ impl PositionAccumulator {
         compressor: &mut Option<zstd::bulk::Compressor<'_>>,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let key = encode_position_key(&self.chrom, self.start);
-        let raw_value =
-            serialize_position_entry(&self.rows, &self.batch, col_indices, allele_col_idx)?;
+
+        // If all rows are in one batch (common case), serialize directly.
+        // Otherwise, merge segments by slicing each batch to its rows and concatenating.
+        let raw_value = if self.segments.len() == 1 {
+            let (batch, rows) = &self.segments[0];
+            serialize_position_entry(rows, batch, col_indices, allele_col_idx)?
+        } else {
+            // Collect all rows across batch boundaries into a single batch
+            let mut all_batches: Vec<RecordBatch> = Vec::new();
+            for (batch, rows) in &self.segments {
+                let indices: Vec<u32> = rows.iter().map(|&r| r as u32).collect();
+                let idx_array = datafusion::arrow::array::UInt32Array::from(indices);
+                let taken = datafusion::arrow::compute::take_record_batch(batch, &idx_array)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                all_batches.push(taken);
+            }
+            let merged = datafusion::arrow::compute::concat_batches(
+                &all_batches[0].schema(),
+                all_batches.iter(),
+            )
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let row_indices: Vec<usize> = (0..merged.num_rows()).collect();
+            serialize_position_entry(&row_indices, &merged, col_indices, allele_col_idx)?
+        };
 
         let value = if let Some(comp) = compressor {
             comp.compress(&raw_value)
@@ -1493,14 +1514,6 @@ fn split_chroms(
             (main, other)
         }
         None => (MAIN_CHROMS.iter().map(|s| s.to_string()).collect(), vec![]),
-    }
-}
-
-fn chrom_file_name(chrom: &str) -> String {
-    if MAIN_CHROMS.contains(&chrom) {
-        format!("chr{chrom}")
-    } else {
-        "other".to_string()
     }
 }
 
