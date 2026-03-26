@@ -1,0 +1,1518 @@
+//! Cache builder: converts raw Ensembl VEP cache to parquet + fjall.
+//!
+//! Ported from vepyr `convert.rs` and extended with:
+//! - Fjall dual-sink for `variation` (single pass via `start_ingestion()`)
+//! - Fjall second pass for `translation_sift` (re-sorted by `transcript_id`)
+//! - Progress callback for driving tqdm bars in Python wrappers
+
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
+
+use datafusion::arrow::array::{
+    Array, AsArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+};
+use datafusion::arrow::datatypes::{DataType, Int64Type, SchemaRef};
+use datafusion::common::{DataFusionError, Result};
+use datafusion::parquet::arrow::ArrowWriter;
+use datafusion::parquet::basic::Compression;
+use datafusion::parquet::file::properties::WriterProperties;
+use datafusion::parquet::format::SortingColumn;
+use datafusion::parquet::schema::types::ColumnPath;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use futures::StreamExt;
+use log::info;
+
+use datafusion_bio_format_ensembl_cache::{
+    EnsemblCacheOptions, EnsemblCacheTableProvider, EnsemblEntityKind,
+};
+
+use crate::annotate_provider::read_compact_predictions;
+use crate::kv_cache::LoadStats;
+use crate::kv_cache::key_encoding::{chrom_to_code, encode_position_key};
+use crate::kv_cache::kv_store::VepKvStore;
+use crate::kv_cache::position_entry::serialize_position_entry;
+use crate::kv_cache::sift_store::SiftKvStore;
+use crate::transcript_consequence::CachedPredictions;
+
+/// Progress callback: `(entity, format, batch_rows, total_rows, total_expected)`.
+///
+/// - `entity`: "variation", "transcript", "exon", etc.
+/// - `format`: "parquet" or "fjall"
+/// - `batch_rows`: rows processed in this batch
+/// - `total_rows`: cumulative rows processed so far for this (entity, format)
+/// - `total_expected`: total rows expected (0 if unknown)
+pub type OnProgress = Box<dyn Fn(&str, &str, usize, usize, usize) + Send + Sync>;
+
+/// Main chromosomes that get their own parquet file.
+const MAIN_CHROMS: &[&str] = &[
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
+    "18", "19", "20", "21", "22", "X", "Y",
+];
+
+/// Chromosomes in fjall key encoding order (chrom_code ascending).
+const CHROM_CODE_ORDER: &[&str] = &[
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
+    "18", "19", "20", "21", "22", "X", "Y", "MT",
+];
+
+/// Statistics returned after building one entity.
+#[derive(Debug, Clone)]
+pub struct EntityStats {
+    pub entity: String,
+    pub parquet_files: Vec<(String, usize)>,
+    pub fjall_stats: Option<LoadStats>,
+}
+
+/// Builder for converting Ensembl VEP cache to parquet and fjall.
+pub struct CacheBuilder {
+    cache_root: String,
+    output_dir: String,
+    partitions: usize,
+    build_fjall: bool,
+    zstd_level: i32,
+    dict_size_kb: u32,
+    on_progress: Option<Arc<OnProgress>>,
+}
+
+impl CacheBuilder {
+    pub fn new(cache_root: impl Into<String>, output_dir: impl Into<String>) -> Self {
+        Self {
+            cache_root: cache_root.into(),
+            output_dir: output_dir.into(),
+            partitions: 8,
+            build_fjall: true,
+            zstd_level: 3,
+            dict_size_kb: 112,
+            on_progress: None,
+        }
+    }
+
+    pub fn with_partitions(mut self, n: usize) -> Self {
+        self.partitions = n;
+        self
+    }
+
+    pub fn with_build_fjall(mut self, enabled: bool) -> Self {
+        self.build_fjall = enabled;
+        self
+    }
+
+    pub fn with_zstd_level(mut self, level: i32) -> Self {
+        self.zstd_level = level;
+        self
+    }
+
+    pub fn with_dict_size_kb(mut self, size: u32) -> Self {
+        self.dict_size_kb = size;
+        self
+    }
+
+    pub fn with_on_progress(mut self, cb: OnProgress) -> Self {
+        self.on_progress = Some(Arc::new(cb));
+        self
+    }
+
+    /// Build all entities (parquet + optional fjall).
+    pub async fn build_all(&self) -> Result<Vec<EntityStats>> {
+        let entities = [
+            "variation",
+            "transcript",
+            "exon",
+            "translation",
+            "regulatory",
+            "motif",
+        ];
+        let mut results = Vec::new();
+        for entity in entities {
+            match self.build_entity(entity).await {
+                Ok(stats) => results.extend(stats),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("No source files discovered") || msg.contains("skipped") {
+                        info!("{entity}: skipped (no source files)");
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Build a single entity. Returns one or more EntityStats (translation splits into two).
+    pub async fn build_entity(&self, entity: &str) -> Result<Vec<EntityStats>> {
+        let kind = parse_entity(entity)
+            .ok_or_else(|| DataFusionError::Execution(format!("Unknown entity: {entity}")))?;
+
+        // Create output directories
+        let subdir = entity_subdir(kind);
+        let entity_dir = format!("{}/{}", self.output_dir, subdir);
+        std::fs::create_dir_all(&entity_dir).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to create dir {entity_dir}: {e}"))
+        })?;
+
+        if kind == EnsemblEntityKind::Translation {
+            std::fs::create_dir_all(format!("{}/translation_core", self.output_dir))
+                .map_err(|e| DataFusionError::Execution(format!("Failed to create dir: {e}")))?;
+            std::fs::create_dir_all(format!("{}/translation_sift", self.output_dir))
+                .map_err(|e| DataFusionError::Execution(format!("Failed to create dir: {e}")))?;
+        }
+
+        if kind == EnsemblEntityKind::Variation {
+            return self.build_variation().await;
+        }
+
+        if kind == EnsemblEntityKind::Translation {
+            return self.build_translation().await;
+        }
+
+        // All other entities: parquet only
+        let results = self.build_parquet_entity(kind).await?;
+        Ok(vec![EntityStats {
+            entity: subdir.to_string(),
+            parquet_files: results,
+            fjall_stats: None,
+        }])
+    }
+
+    /// Build variation: parquet + optional fjall in a single pass per chromosome.
+    async fn build_variation(&self) -> Result<Vec<EntityStats>> {
+        let kind = EnsemblEntityKind::Variation;
+        let table_name = "var";
+
+        // Discover chromosomes from schema metadata
+        let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let provider_schema = {
+            let table = init_ctx.table(table_name).await?;
+            table.schema().inner().clone()
+        };
+        let chroms = chroms_from_schema(&provider_schema);
+        drop(init_ctx);
+
+        let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
+        let (main_chroms, other_chroms) = split_chroms(&chroms, &main_set);
+
+        info!(
+            "variation: {} main chroms, {} other contigs",
+            main_chroms.len(),
+            other_chroms.len()
+        );
+
+        let mut parquet_results: Vec<(String, usize)> = Vec::new();
+
+        // --- Fjall setup ---
+        let fjall_state = if self.build_fjall {
+            let fjall_dir = format!("{}/variation.fjall", self.output_dir);
+            if Path::new(&fjall_dir).exists() {
+                info!("variation.fjall already exists, skipping fjall build");
+                None
+            } else {
+                // We need a schema for the VepKvStore — get it from a probe query
+                let probe_ctx =
+                    make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+                let probe_df = probe_ctx
+                    .sql(&format!("SELECT * FROM {table_name} LIMIT 0"))
+                    .await?;
+                let schema: SchemaRef = Arc::new(probe_df.schema().as_arrow().clone());
+                drop(probe_ctx);
+
+                let store = VepKvStore::create(Path::new(&fjall_dir), schema.clone())?;
+
+                // Train zstd dictionary from sample
+                let dict = self
+                    .train_variation_dict(&store, &schema, kind, table_name)
+                    .await?;
+
+                Some(FjallVariationState {
+                    store,
+                    schema,
+                    dict,
+                    fjall_dir,
+                })
+            }
+        } else {
+            None
+        };
+
+        // Start ingestion if fjall is active
+        let mut ingestion = if let Some(ref state) = fjall_state {
+            Some(
+                state
+                    .store
+                    .data_partition()
+                    .start_ingestion()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
+            )
+        } else {
+            None
+        };
+
+        let mut compressor = if let Some(ref state) = fjall_state {
+            if let Some(ref dict) = state.dict {
+                Some(
+                    zstd::bulk::Compressor::with_dictionary(self.zstd_level, dict).map_err(
+                        |e| {
+                            DataFusionError::Execution(format!(
+                                "failed to create zstd compressor: {e}"
+                            ))
+                        },
+                    )?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut fjall_total_positions = 0u64;
+        let mut fjall_total_variants = 0u64;
+        let mut fjall_total_bytes = 0u64;
+
+        // Process chromosomes in chrom_code order for fjall,
+        // write parquet for each.
+        let ordered_chroms = self.ordered_chrom_list(&main_chroms, &other_chroms);
+
+        for chrom in &ordered_chroms {
+            let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+            let query = build_query(kind, table_name, Some(chrom));
+            let output_file = format!(
+                "{}/variation/{}.parquet",
+                self.output_dir,
+                chrom_file_name(chrom)
+            );
+
+            let df = ctx.sql(&query).await?;
+            let mut stream = df.execute_stream().await?;
+            let schema = stream.schema();
+            let sk = sort_key(kind);
+            let mut writer = create_writer(&output_file, &schema, kind, sk, None)?;
+
+            // Column indices for fjall (cached per chrom since schema is constant)
+            let fjall_col_info = fjall_state.as_ref().map(|state| {
+                let chrom_col_idx = state.schema.index_of("chrom").unwrap();
+                let start_col_idx = state.schema.index_of("start").unwrap();
+                let allele_col_idx = state.schema.index_of("allele_string").unwrap();
+                let col_indices: Vec<usize> = (0..state.schema.fields().len())
+                    .filter(|&i| i != chrom_col_idx && i != start_col_idx)
+                    .collect();
+                (chrom_col_idx, start_col_idx, allele_col_idx, col_indices)
+            });
+
+            let mut chrom_rows = 0usize;
+            let mut total_parquet_rows = parquet_results.iter().map(|(_, r)| *r).sum::<usize>();
+
+            // Accumulator for grouping adjacent rows with same (chrom, start)
+            let mut accum: Option<PositionAccumulator> = None;
+
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+
+                // Write to parquet
+                writer.write(&batch)?;
+                chrom_rows += batch.num_rows();
+                total_parquet_rows += batch.num_rows();
+
+                if let Some(ref cb) = self.on_progress {
+                    cb(
+                        "variation",
+                        "parquet",
+                        batch.num_rows(),
+                        total_parquet_rows,
+                        0,
+                    );
+                }
+
+                // Feed fjall ingestion
+                if let (
+                    Some(ing),
+                    Some((chrom_col_idx, start_col_idx, allele_col_idx, col_indices)),
+                ) = (&mut ingestion, &fjall_col_info)
+                {
+                    let starts = batch.column(*start_col_idx).as_primitive::<Int64Type>();
+
+                    for row in 0..batch.num_rows() {
+                        let start = starts.value(row);
+                        let chrom_code = chrom_to_code(chrom);
+
+                        let should_flush = accum
+                            .as_ref()
+                            .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
+
+                        if should_flush {
+                            let a = accum.take().unwrap();
+                            let (key, value) =
+                                a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
+                            ing.write(&key, &value)
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            fjall_total_positions += 1;
+                            fjall_total_bytes += value.len() as u64;
+                        }
+
+                        fjall_total_variants += 1;
+
+                        match &mut accum {
+                            Some(a) => a.add_row(row, &batch),
+                            None => {
+                                accum = Some(PositionAccumulator::new(
+                                    chrom_code,
+                                    chrom.to_string(),
+                                    start,
+                                    row,
+                                    &batch,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            writer.close().map_err(|e| {
+                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+            })?;
+
+            if chrom_rows > 0 {
+                parquet_results.push((output_file, chrom_rows));
+                info!(
+                    "variation: {} {} rows",
+                    chrom_file_name(chrom),
+                    format_rows(chrom_rows)
+                );
+            }
+
+            // Flush accumulated fjall positions for this chrom
+            // (the last position in the chrom won't have been flushed by key-change)
+            if let (Some(ing), Some((_, _, allele_col_idx, col_indices))) =
+                (&mut ingestion, &fjall_col_info)
+            {
+                if let Some(a) = accum.take() {
+                    let (key, value) =
+                        a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
+                    ing.write(&key, &value)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    fjall_total_positions += 1;
+                    fjall_total_bytes += value.len() as u64;
+                }
+
+                if let Some(ref cb) = self.on_progress {
+                    cb("variation", "fjall", 0, fjall_total_positions as usize, 0);
+                }
+            }
+        }
+
+        // Finalize fjall
+        let fjall_stats = if let Some(ref mut ing) = ingestion {
+            let start_time = Instant::now();
+            // Take ingestion out to call finish()
+            let ingestion = ingestion.take().unwrap();
+            ingestion
+                .finish()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            if let Some(ref state) = fjall_state {
+                state.store.persist()?;
+
+                info!("Running major compaction on variation.fjall...");
+                let compact_start = Instant::now();
+                state
+                    .store
+                    .data_partition()
+                    .major_compact()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                info!(
+                    "Major compaction completed in {:.1}s",
+                    compact_start.elapsed().as_secs_f64()
+                );
+            }
+
+            Some(LoadStats {
+                total_variants: fjall_total_variants,
+                total_positions: fjall_total_positions,
+                total_bytes: fjall_total_bytes,
+                elapsed_secs: start_time.elapsed().as_secs_f64(),
+            })
+        } else {
+            None
+        };
+
+        Ok(vec![EntityStats {
+            entity: "variation".to_string(),
+            parquet_files: parquet_results,
+            fjall_stats,
+        }])
+    }
+
+    /// Train zstd dictionary from a sample of variation data.
+    async fn train_variation_dict(
+        &self,
+        store: &VepKvStore,
+        schema: &SchemaRef,
+        kind: EnsemblEntityKind,
+        table_name: &str,
+    ) -> Result<Option<Arc<Vec<u8>>>> {
+        let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let sample_df = ctx
+            .sql(&format!("SELECT * FROM {table_name} LIMIT 10000"))
+            .await?;
+        let batches = sample_df.collect().await?;
+
+        let chrom_col_idx = schema.index_of("chrom")?;
+        let start_col_idx = schema.index_of("start")?;
+        let allele_col_idx = schema.index_of("allele_string")?;
+        let col_indices: Vec<usize> = (0..schema.fields().len())
+            .filter(|&i| i != chrom_col_idx && i != start_col_idx)
+            .collect();
+
+        let mut samples: Vec<Vec<u8>> = Vec::new();
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let chrom_col = batch.column(chrom_col_idx);
+            let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
+
+            let mut groups: HashMap<(String, i64), Vec<usize>> = HashMap::new();
+            for row in 0..batch.num_rows() {
+                let chrom = string_value(chrom_col.as_ref(), row);
+                let start = starts.value(row);
+                groups
+                    .entry((chrom.to_string(), start))
+                    .or_default()
+                    .push(row);
+            }
+
+            for rows in groups.values() {
+                let value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+                samples.push(value);
+            }
+        }
+
+        let min_training_samples = 100;
+        if samples.len() < min_training_samples {
+            info!(
+                "only {} sample entries, skipping dictionary training (need >= {})",
+                samples.len(),
+                min_training_samples
+            );
+            return Ok(None);
+        }
+
+        let max_samples = 10_000.min(samples.len());
+        let sample_refs: Vec<&[u8]> = samples[..max_samples]
+            .iter()
+            .map(|v| v.as_slice())
+            .collect();
+
+        let dict_size = self.dict_size_kb as usize * 1024;
+        match zstd::dict::from_continuous(
+            &sample_refs.concat(),
+            &sample_refs.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            dict_size,
+        ) {
+            Ok(dict) => {
+                info!(
+                    "zstd dict trained: {} samples, dict {} bytes",
+                    max_samples,
+                    dict.len()
+                );
+                store.store_dict(&dict)?;
+                store.store_zstd_level(self.zstd_level)?;
+                Ok(Some(Arc::new(dict)))
+            }
+            Err(e) => {
+                info!("zstd dict training failed (falling back to uncompressed): {e}");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Build translation: split into core + sift parquet, then fjall for sift.
+    async fn build_translation(&self) -> Result<Vec<EntityStats>> {
+        let table_name = "tl";
+        let kind = EnsemblEntityKind::Translation;
+
+        // Discover chroms
+        let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let provider_schema = {
+            let table = init_ctx.table(table_name).await?;
+            table.schema().inner().clone()
+        };
+        let chroms = chroms_from_schema(&provider_schema);
+        drop(init_ctx);
+
+        let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
+        let (main_chroms, other_chroms) = split_chroms(&chroms, &main_set);
+
+        let mut core_results: Vec<(String, usize)> = Vec::new();
+        let mut sift_results: Vec<(String, usize)> = Vec::new();
+
+        // Process each main chromosome
+        for chrom in &main_chroms {
+            let (core_res, sift_res) = self
+                .build_translation_chrom(chrom, kind, table_name)
+                .await?;
+            if let Some(r) = core_res {
+                core_results.push(r);
+            }
+            if let Some(r) = sift_res {
+                sift_results.push(r);
+            }
+        }
+
+        // Process other contigs
+        if !other_chroms.is_empty() {
+            let (core_res, sift_res) = self
+                .build_translation_multi_chrom(&other_chroms, kind, table_name)
+                .await?;
+            if let Some(r) = core_res {
+                core_results.push(r);
+            }
+            if let Some(r) = sift_res {
+                sift_results.push(r);
+            }
+        }
+
+        // Build fjall for translation_sift (second pass, re-sorted by transcript_id)
+        let sift_fjall_stats = if self.build_fjall && !sift_results.is_empty() {
+            self.build_sift_fjall(&sift_results).await?
+        } else {
+            None
+        };
+
+        Ok(vec![
+            EntityStats {
+                entity: "translation_core".to_string(),
+                parquet_files: core_results,
+                fjall_stats: None,
+            },
+            EntityStats {
+                entity: "translation_sift".to_string(),
+                parquet_files: sift_results,
+                fjall_stats: sift_fjall_stats,
+            },
+        ])
+    }
+
+    async fn build_translation_chrom(
+        &self,
+        chrom: &str,
+        kind: EnsemblEntityKind,
+        table_name: &str,
+    ) -> Result<(Option<(String, usize)>, Option<(String, usize)>)> {
+        let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+
+        let dedup_query = format!(
+            "SELECT * FROM (\
+                SELECT *, ROW_NUMBER() OVER (\
+                    PARTITION BY transcript_id \
+                    ORDER BY cdna_coding_start NULLS LAST\
+                ) AS _rn \
+                FROM {table_name} WHERE chrom = '{chrom}'\
+            ) WHERE _rn = 1"
+        );
+        let df = ctx.sql(&dedup_query).await?;
+        let schema = df.schema().clone();
+        let cols: Vec<_> = schema
+            .columns()
+            .into_iter()
+            .filter(|c| c.name() != "_rn")
+            .collect();
+        let df = df.select_columns(&cols.iter().map(|c| c.name()).collect::<Vec<_>>())?;
+        let deduped = df.collect().await?;
+
+        if deduped.is_empty() || deduped.iter().all(|b| b.num_rows() == 0) {
+            return Ok((None, None));
+        }
+
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(deduped[0].schema(), vec![deduped])?;
+        let split_ctx = SessionContext::new();
+        split_ctx.register_table("_tl_deduped", Arc::new(mem_table))?;
+
+        // translation_core
+        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(false);
+        let core_select = core_schema
+            .fields()
+            .iter()
+            .map(|f| format!("\"{}\"", f.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let core_file = format!("{}/translation_core/chr{chrom}.parquet", self.output_dir);
+        let core_query = format!("SELECT {core_select} FROM _tl_deduped ORDER BY transcript_id");
+
+        let mut w = create_writer(&core_file, &core_schema, kind, &["transcript_id"], None)?;
+        let core_df = split_ctx.sql(&core_query).await?;
+        let mut stream = core_df.execute_stream().await?;
+        let mut core_rows = 0usize;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let batch = project_batch(&batch, &core_schema)?;
+            core_rows += batch.num_rows();
+            w.write(&batch)?;
+
+            if let Some(ref cb) = self.on_progress {
+                cb(
+                    "translation_core",
+                    "parquet",
+                    batch.num_rows(),
+                    core_rows,
+                    0,
+                );
+            }
+        }
+        w.close().map_err(|e| {
+            DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+        })?;
+
+        // translation_sift
+        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(false);
+        let sift_select = sift_schema
+            .fields()
+            .iter()
+            .map(|f| format!("\"{}\"", f.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sift_file = format!("{}/translation_sift/chr{chrom}.parquet", self.output_dir);
+        let sift_query = format!("SELECT {sift_select} FROM _tl_deduped ORDER BY chrom, start");
+
+        let mut w = create_writer(
+            &sift_file,
+            &sift_schema,
+            kind,
+            &["chrom", "start"],
+            Some(256),
+        )?;
+        let sift_df = split_ctx.sql(&sift_query).await?;
+        let mut stream = sift_df.execute_stream().await?;
+        let mut sift_rows = 0usize;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let batch = project_batch(&batch, &sift_schema)?;
+            sift_rows += batch.num_rows();
+            w.write(&batch)?;
+
+            if let Some(ref cb) = self.on_progress {
+                cb(
+                    "translation_sift",
+                    "parquet",
+                    batch.num_rows(),
+                    sift_rows,
+                    0,
+                );
+            }
+        }
+        w.close().map_err(|e| {
+            DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+        })?;
+
+        info!(
+            "translation: chr{chrom} core={} sift={}",
+            format_rows(core_rows),
+            format_rows(sift_rows)
+        );
+
+        let core_result = if core_rows > 0 {
+            Some((core_file, core_rows))
+        } else {
+            None
+        };
+        let sift_result = if sift_rows > 0 {
+            Some((sift_file, sift_rows))
+        } else {
+            None
+        };
+        Ok((core_result, sift_result))
+    }
+
+    async fn build_translation_multi_chrom(
+        &self,
+        other_chroms: &[String],
+        kind: EnsemblEntityKind,
+        table_name: &str,
+    ) -> Result<(Option<(String, usize)>, Option<(String, usize)>)> {
+        let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let in_list = other_chroms
+            .iter()
+            .map(|c| format!("'{c}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dedup_query = format!(
+            "SELECT * FROM (\
+                SELECT *, ROW_NUMBER() OVER (\
+                    PARTITION BY transcript_id \
+                    ORDER BY cdna_coding_start NULLS LAST\
+                ) AS _rn \
+                FROM {table_name} WHERE chrom IN ({in_list})\
+            ) WHERE _rn = 1"
+        );
+        let df = ctx.sql(&dedup_query).await?;
+        let schema = df.schema().clone();
+        let cols: Vec<_> = schema
+            .columns()
+            .into_iter()
+            .filter(|c| c.name() != "_rn")
+            .collect();
+        let df = df.select_columns(&cols.iter().map(|c| c.name()).collect::<Vec<_>>())?;
+        let deduped = df.collect().await?;
+
+        if deduped.is_empty() || deduped.iter().any(|b| b.num_rows() == 0) {
+            return Ok((None, None));
+        }
+
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(deduped[0].schema(), vec![deduped])?;
+        let split_ctx = SessionContext::new();
+        split_ctx.register_table("_tl_deduped", Arc::new(mem_table))?;
+
+        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(false);
+        let core_select = core_schema
+            .fields()
+            .iter()
+            .map(|f| format!("\"{}\"", f.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let core_file = format!("{}/translation_core/other.parquet", self.output_dir);
+        let mut w = create_writer(&core_file, &core_schema, kind, &["transcript_id"], None)?;
+        let core_rows = stream_to_writer_with_progress(
+            &split_ctx,
+            &format!("SELECT {core_select} FROM _tl_deduped ORDER BY transcript_id"),
+            &mut w,
+            false,
+            self.on_progress.as_deref(),
+            "translation_core",
+        )
+        .await?;
+        w.close().map_err(|e| {
+            DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+        })?;
+
+        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(false);
+        let sift_select = sift_schema
+            .fields()
+            .iter()
+            .map(|f| format!("\"{}\"", f.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sift_file = format!("{}/translation_sift/other.parquet", self.output_dir);
+        let mut w = create_writer(
+            &sift_file,
+            &sift_schema,
+            kind,
+            &["chrom", "start"],
+            Some(256),
+        )?;
+        let sift_rows = stream_to_writer_with_progress(
+            &split_ctx,
+            &format!("SELECT {sift_select} FROM _tl_deduped ORDER BY chrom, start"),
+            &mut w,
+            false,
+            self.on_progress.as_deref(),
+            "translation_sift",
+        )
+        .await?;
+        w.close().map_err(|e| {
+            DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+        })?;
+
+        info!(
+            "translation: other ({} contigs) core={} sift={}",
+            other_chroms.len(),
+            format_rows(core_rows),
+            format_rows(sift_rows)
+        );
+
+        let core_result = if core_rows > 0 {
+            Some((core_file, core_rows))
+        } else {
+            None
+        };
+        let sift_result = if sift_rows > 0 {
+            Some((sift_file, sift_rows))
+        } else {
+            None
+        };
+        Ok((core_result, sift_result))
+    }
+
+    /// Build fjall for translation_sift: re-read parquet sorted by transcript_id,
+    /// parse predictions, and ingest into SiftKvStore.
+    async fn build_sift_fjall(
+        &self,
+        sift_parquet_files: &[(String, usize)],
+    ) -> Result<Option<LoadStats>> {
+        let fjall_dir = format!("{}/translation_sift.fjall", self.output_dir);
+        if Path::new(&fjall_dir).exists() {
+            info!("translation_sift.fjall already exists, skipping");
+            return Ok(None);
+        }
+
+        let start_time = Instant::now();
+
+        // Register all sift parquet files as a single table
+        let ctx = SessionContext::new();
+        let parquet_paths: Vec<&str> = sift_parquet_files.iter().map(|(p, _)| p.as_str()).collect();
+
+        // Register each parquet file and UNION ALL them
+        for (i, path) in parquet_paths.iter().enumerate() {
+            ctx.register_parquet(&format!("_sift_{i}"), path, Default::default())
+                .await?;
+        }
+
+        let union_query = if parquet_paths.len() == 1 {
+            "SELECT * FROM _sift_0 ORDER BY transcript_id".to_string()
+        } else {
+            let unions: Vec<String> = (0..parquet_paths.len())
+                .map(|i| format!("SELECT * FROM _sift_{i}"))
+                .collect();
+            format!(
+                "SELECT * FROM ({}) ORDER BY transcript_id",
+                unions.join(" UNION ALL ")
+            )
+        };
+
+        let df = ctx.sql(&union_query).await?;
+        let mut stream = df.execute_stream().await?;
+
+        // Collect sorted predictions grouped by transcript_id
+        let mut grouped: Vec<(String, CachedPredictions)> = Vec::new();
+        let mut current_transcript: Option<String> = None;
+        let mut current_preds = CachedPredictions {
+            sift: Vec::new(),
+            polyphen: Vec::new(),
+        };
+        let mut total_rows = 0usize;
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let schema = batch.schema();
+            let tid_idx = schema.index_of("transcript_id")?;
+            let sift_idx = schema.index_of("sift_predictions").ok();
+            let poly_idx = schema.index_of("polyphen_predictions").ok();
+
+            for row in 0..batch.num_rows() {
+                let transcript_id = string_value(batch.column(tid_idx).as_ref(), row).to_string();
+
+                let mut row_preds = CachedPredictions::default();
+                if let Some(idx) = sift_idx {
+                    row_preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+                if let Some(idx) = poly_idx {
+                    row_preds.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+
+                if current_transcript.as_deref() != Some(&transcript_id) {
+                    // Flush previous transcript
+                    if let Some(tid) = current_transcript.take() {
+                        grouped.push((tid, std::mem::take(&mut current_preds)));
+                    }
+                    current_transcript = Some(transcript_id);
+                }
+                current_preds.sift.extend(row_preds.sift);
+                current_preds.polyphen.extend(row_preds.polyphen);
+                total_rows += 1;
+            }
+
+            if let Some(ref cb) = self.on_progress {
+                cb("translation_sift", "fjall", batch.num_rows(), total_rows, 0);
+            }
+        }
+
+        // Flush last transcript
+        if let Some(tid) = current_transcript.take() {
+            grouped.push((tid, current_preds));
+        }
+
+        // Sort predictions within each transcript
+        for (_, preds) in &mut grouped {
+            preds.sift.sort_by_key(|p| (p.position, p.amino_acid));
+            preds.polyphen.sort_by_key(|p| (p.position, p.amino_acid));
+        }
+
+        // Ingest into fjall
+        let db = fjall::Database::builder(&fjall_dir)
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let transcript_count = grouped.len();
+        SiftKvStore::ingest_sorted(&db, grouped.into_iter())?;
+
+        db.persist(fjall::PersistMode::SyncAll)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let elapsed = start_time.elapsed().as_secs_f64();
+        info!(
+            "translation_sift.fjall: {} transcripts from {} rows in {:.1}s",
+            transcript_count, total_rows, elapsed
+        );
+
+        Ok(Some(LoadStats {
+            total_variants: total_rows as u64,
+            total_positions: transcript_count as u64,
+            total_bytes: 0, // fjall manages its own storage
+            elapsed_secs: elapsed,
+        }))
+    }
+
+    /// Build a parquet-only entity (transcript, exon, regulatory, motif).
+    async fn build_parquet_entity(&self, kind: EnsemblEntityKind) -> Result<Vec<(String, usize)>> {
+        let table_name = entity_table_name(kind);
+        let subdir = entity_subdir(kind);
+        let needs_rn_drop = matches!(
+            kind,
+            EnsemblEntityKind::Transcript | EnsemblEntityKind::Exon
+        );
+
+        // Discover chroms
+        let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let provider_schema = {
+            let table = init_ctx.table(table_name).await?;
+            table.schema().inner().clone()
+        };
+        let chroms = chroms_from_schema(&provider_schema);
+        drop(init_ctx);
+
+        let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
+        let (main_chroms, other_chroms) = split_chroms(&chroms, &main_set);
+
+        info!(
+            "{subdir}: {} main chroms, {} other contigs",
+            main_chroms.len(),
+            other_chroms.len()
+        );
+
+        let mut all_results = Vec::new();
+        let global_start = Instant::now();
+        let mut total_rows: usize = 0;
+
+        for chrom in &main_chroms {
+            let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+            let query = build_query(kind, table_name, Some(chrom));
+            let output_file = format!("{}/{subdir}/chr{chrom}.parquet", self.output_dir);
+
+            let df = ctx.sql(&query).await?;
+            let df = if needs_rn_drop {
+                let schema = df.schema().clone();
+                let cols: Vec<_> = schema
+                    .columns()
+                    .into_iter()
+                    .filter(|c| c.name() != "_rn")
+                    .collect();
+                df.select_columns(&cols.iter().map(|c| c.name()).collect::<Vec<_>>())?
+            } else {
+                df
+            };
+            let mut stream = df.execute_stream().await?;
+            let schema = stream.schema();
+            let sk = sort_key(kind);
+            let mut writer = create_writer(&output_file, &schema, kind, sk, None)?;
+
+            let mut chrom_rows = 0usize;
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                chrom_rows += batch.num_rows();
+                total_rows += batch.num_rows();
+                writer.write(&batch)?;
+
+                if let Some(ref cb) = self.on_progress {
+                    cb(subdir, "parquet", batch.num_rows(), total_rows, 0);
+                }
+            }
+            writer.close().map_err(|e| {
+                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+            })?;
+
+            if chrom_rows > 0 {
+                all_results.push((output_file, chrom_rows));
+            }
+        }
+
+        // Process remaining contigs as "other.parquet"
+        if !other_chroms.is_empty() {
+            let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+            let other_refs: Vec<&str> = other_chroms.iter().map(|s| s.as_str()).collect();
+            let query = build_query_multi_chrom(kind, table_name, &other_refs);
+            let output_file = format!("{}/{subdir}/other.parquet", self.output_dir);
+
+            let df = ctx.sql(&query).await?;
+            let df = if needs_rn_drop {
+                let schema = df.schema().clone();
+                let cols: Vec<_> = schema
+                    .columns()
+                    .into_iter()
+                    .filter(|c| c.name() != "_rn")
+                    .collect();
+                df.select_columns(&cols.iter().map(|c| c.name()).collect::<Vec<_>>())?
+            } else {
+                df
+            };
+            let mut stream = df.execute_stream().await?;
+            let schema = stream.schema();
+            let sk = sort_key(kind);
+            let mut writer = create_writer(&output_file, &schema, kind, sk, None)?;
+
+            let mut other_rows = 0usize;
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                other_rows += batch.num_rows();
+                total_rows += batch.num_rows();
+                writer.write(&batch)?;
+
+                if let Some(ref cb) = self.on_progress {
+                    cb(subdir, "parquet", batch.num_rows(), total_rows, 0);
+                }
+            }
+            writer.close().map_err(|e| {
+                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+            })?;
+
+            if other_rows > 0 {
+                all_results.push((output_file, other_rows));
+            }
+        }
+
+        let elapsed = global_start.elapsed().as_secs_f64();
+        print_progress(subdir, total_rows, elapsed);
+        Ok(all_results)
+    }
+
+    /// Return chromosome list in the order needed for fjall ingestion
+    /// (chrom_code ascending), followed by any "other" contigs sorted.
+    fn ordered_chrom_list(&self, main_chroms: &[String], other_chroms: &[String]) -> Vec<String> {
+        let main_set: HashSet<&str> = main_chroms.iter().map(|s| s.as_str()).collect();
+        let mut ordered: Vec<String> = CHROM_CODE_ORDER
+            .iter()
+            .filter(|c| main_set.contains(**c))
+            .map(|s| s.to_string())
+            .collect();
+        let mut others_sorted = other_chroms.to_vec();
+        others_sorted.sort();
+        ordered.extend(others_sorted);
+        ordered
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Position accumulator for fjall dual-sink
+// ---------------------------------------------------------------------------
+
+/// Accumulates rows for a single genomic position during sorted streaming.
+struct PositionAccumulator {
+    chrom_code: u16,
+    chrom: String,
+    start: i64,
+    rows: Vec<usize>,
+    batch: RecordBatch,
+}
+
+impl PositionAccumulator {
+    fn new(chrom_code: u16, chrom: String, start: i64, row: usize, batch: &RecordBatch) -> Self {
+        Self {
+            chrom_code,
+            chrom,
+            start,
+            rows: vec![row],
+            batch: batch.clone(),
+        }
+    }
+
+    fn add_row(&mut self, row: usize, batch: &RecordBatch) {
+        // If the batch changed, we need to merge — but within a single stream batch
+        // this won't happen. For simplicity, we only accumulate within one batch.
+        // Cross-batch accumulation would need storing columns. Since data is sorted,
+        // adjacent same-key rows are typically in the same batch.
+        if !Arc::ptr_eq(&self.batch.schema(), &batch.schema())
+            || self.batch.num_rows() != batch.num_rows()
+        {
+            // Different batch — shouldn't happen for adjacent sorted rows in practice,
+            // but handle gracefully by treating as same batch (rows index into current batch).
+            self.batch = batch.clone();
+            self.rows.clear();
+        }
+        self.rows.push(row);
+    }
+
+    fn finish_entry(
+        self,
+        col_indices: &[usize],
+        allele_col_idx: usize,
+        compressor: &mut Option<zstd::bulk::Compressor<'_>>,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let key = encode_position_key(&self.chrom, self.start);
+        let raw_value =
+            serialize_position_entry(&self.rows, &self.batch, col_indices, allele_col_idx)?;
+
+        let value = if let Some(comp) = compressor {
+            comp.compress(&raw_value)
+                .map_err(|e| DataFusionError::Execution(format!("zstd compression failed: {e}")))?
+        } else {
+            raw_value
+        };
+
+        Ok((key, value))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fjall state for variation dual-sink
+// ---------------------------------------------------------------------------
+
+struct FjallVariationState {
+    store: VepKvStore,
+    schema: SchemaRef,
+    dict: Option<Arc<Vec<u8>>>,
+    #[allow(dead_code)]
+    fjall_dir: String,
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions (ported from vepyr convert.rs)
+// ---------------------------------------------------------------------------
+
+fn parse_entity(name: &str) -> Option<EnsemblEntityKind> {
+    match name {
+        "variation" => Some(EnsemblEntityKind::Variation),
+        "transcript" => Some(EnsemblEntityKind::Transcript),
+        "exon" => Some(EnsemblEntityKind::Exon),
+        "translation" => Some(EnsemblEntityKind::Translation),
+        "regulatory" => Some(EnsemblEntityKind::RegulatoryFeature),
+        "motif" => Some(EnsemblEntityKind::MotifFeature),
+        _ => None,
+    }
+}
+
+fn entity_subdir(kind: EnsemblEntityKind) -> &'static str {
+    match kind {
+        EnsemblEntityKind::Variation => "variation",
+        EnsemblEntityKind::Transcript => "transcript",
+        EnsemblEntityKind::Exon => "exon",
+        EnsemblEntityKind::Translation => "translation",
+        EnsemblEntityKind::RegulatoryFeature => "regulatory",
+        EnsemblEntityKind::MotifFeature => "motif",
+    }
+}
+
+fn entity_table_name(kind: EnsemblEntityKind) -> &'static str {
+    match kind {
+        EnsemblEntityKind::Variation => "var",
+        EnsemblEntityKind::Transcript => "tx",
+        EnsemblEntityKind::Exon => "exon",
+        EnsemblEntityKind::Translation => "tl",
+        EnsemblEntityKind::RegulatoryFeature => "reg",
+        EnsemblEntityKind::MotifFeature => "motif",
+    }
+}
+
+fn row_group_size(kind: EnsemblEntityKind) -> usize {
+    match kind {
+        EnsemblEntityKind::Variation => 100_000,
+        EnsemblEntityKind::Transcript => 8_000,
+        EnsemblEntityKind::Exon => 45_000,
+        EnsemblEntityKind::Translation => 6_000,
+        EnsemblEntityKind::RegulatoryFeature => 9_000,
+        EnsemblEntityKind::MotifFeature => 10_000,
+    }
+}
+
+fn sort_key(kind: EnsemblEntityKind) -> &'static [&'static str] {
+    match kind {
+        EnsemblEntityKind::Exon => &["transcript_id", "start"],
+        _ => &["chrom", "start"],
+    }
+}
+
+fn sorting_columns_for(schema: &SchemaRef, sort_columns: &[&str]) -> Option<Vec<SortingColumn>> {
+    let cols: Vec<SortingColumn> = sort_columns
+        .iter()
+        .filter_map(|name| {
+            schema
+                .column_with_name(name)
+                .map(|(idx, _)| SortingColumn::new(idx as i32, false, false))
+        })
+        .collect();
+    if cols.len() == sort_columns.len() {
+        Some(cols)
+    } else {
+        None
+    }
+}
+
+fn writer_properties(
+    kind: EnsemblEntityKind,
+    schema: &SchemaRef,
+    sort_columns: &[&str],
+    rg_size_override: Option<usize>,
+) -> WriterProperties {
+    let rg_size = rg_size_override.unwrap_or_else(|| row_group_size(kind));
+    let sorting = sorting_columns_for(schema, sort_columns);
+
+    let mut builder = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .set_max_row_group_size(rg_size)
+        .set_sorting_columns(sorting);
+
+    if matches!(
+        kind,
+        EnsemblEntityKind::Translation | EnsemblEntityKind::Exon
+    ) {
+        builder = builder.set_column_bloom_filter_enabled(ColumnPath::from("transcript_id"), true);
+    }
+
+    builder.build()
+}
+
+fn build_query(kind: EnsemblEntityKind, table_name: &str, chrom_filter: Option<&str>) -> String {
+    let where_clause = chrom_filter
+        .map(|c| format!(" WHERE chrom = '{c}'"))
+        .unwrap_or_default();
+
+    match kind {
+        EnsemblEntityKind::Transcript => {
+            format!(
+                "SELECT * FROM (\
+                    SELECT *, ROW_NUMBER() OVER (\
+                        PARTITION BY stable_id \
+                        ORDER BY cds_start NULLS LAST\
+                    ) AS _rn \
+                    FROM {table_name}{where_clause}\
+                ) WHERE _rn = 1 \
+                ORDER BY chrom, start"
+            )
+        }
+        EnsemblEntityKind::Translation => unreachable!("use build_translation() instead"),
+        EnsemblEntityKind::Exon => {
+            format!(
+                "SELECT * FROM (\
+                    SELECT *, ROW_NUMBER() OVER (\
+                        PARTITION BY transcript_id, exon_number \
+                        ORDER BY stable_id NULLS LAST\
+                    ) AS _rn \
+                    FROM {table_name}{where_clause}\
+                ) WHERE _rn = 1 \
+                ORDER BY transcript_id, start"
+            )
+        }
+        _ => {
+            format!("SELECT * FROM {table_name}{where_clause} ORDER BY chrom, start")
+        }
+    }
+}
+
+fn build_query_multi_chrom(kind: EnsemblEntityKind, table_name: &str, chroms: &[&str]) -> String {
+    let list = chroms
+        .iter()
+        .map(|c| format!("'{c}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let where_clause = format!(" WHERE chrom IN ({list})");
+
+    match kind {
+        EnsemblEntityKind::Transcript => {
+            format!(
+                "SELECT * FROM (\
+                    SELECT *, ROW_NUMBER() OVER (\
+                        PARTITION BY stable_id \
+                        ORDER BY cds_start NULLS LAST\
+                    ) AS _rn \
+                    FROM {table_name}{where_clause}\
+                ) WHERE _rn = 1 \
+                ORDER BY chrom, start"
+            )
+        }
+        EnsemblEntityKind::Translation => unreachable!(),
+        EnsemblEntityKind::Exon => {
+            format!(
+                "SELECT * FROM (\
+                    SELECT *, ROW_NUMBER() OVER (\
+                        PARTITION BY transcript_id, exon_number \
+                        ORDER BY stable_id NULLS LAST\
+                    ) AS _rn \
+                    FROM {table_name}{where_clause}\
+                ) WHERE _rn = 1 \
+                ORDER BY transcript_id, start"
+            )
+        }
+        _ => {
+            format!("SELECT * FROM {table_name}{where_clause} ORDER BY chrom, start")
+        }
+    }
+}
+
+fn project_batch(batch: &RecordBatch, target_schema: &SchemaRef) -> Result<RecordBatch> {
+    let source_schema = batch.schema();
+    let mut columns = Vec::with_capacity(target_schema.fields().len());
+    for field in target_schema.fields() {
+        let (idx, _) = source_schema
+            .column_with_name(field.name())
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Column '{}' not found in source batch",
+                    field.name()
+                ))
+            })?;
+        columns.push(batch.column(idx).clone());
+    }
+    RecordBatch::try_new(target_schema.clone(), columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+fn chroms_from_schema(schema: &SchemaRef) -> Option<Vec<String>> {
+    schema
+        .metadata()
+        .get("bio.vep.chromosomes")
+        .and_then(|json| serde_json::from_str(json).ok())
+}
+
+fn format_rows(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{n}")
+    }
+}
+
+fn print_progress(label: &str, rows: usize, elapsed: f64) {
+    let rate = if elapsed > 0.0 {
+        format!("{}/s", format_rows((rows as f64 / elapsed) as usize))
+    } else {
+        "? rows/s".to_string()
+    };
+    eprintln!(
+        "  {label}: {} rows [{:.1}s, {rate}]",
+        format_rows(rows),
+        elapsed
+    );
+}
+
+fn make_ctx_and_register(
+    cache_root: &str,
+    kind: EnsemblEntityKind,
+    table_name: &str,
+    partitions: usize,
+) -> Result<SessionContext> {
+    let config = SessionConfig::new().with_target_partitions(partitions);
+    let ctx = SessionContext::new_with_config(config);
+    let mut options = EnsemblCacheOptions::new(cache_root);
+    options.target_partitions = Some(partitions);
+    options.max_storable_partitions = Some(2);
+    let provider = EnsemblCacheTableProvider::for_entity(kind, options)?;
+    ctx.register_table(table_name, provider)?;
+    Ok(ctx)
+}
+
+fn create_writer(
+    path: &str,
+    schema: &SchemaRef,
+    kind: EnsemblEntityKind,
+    sort_cols: &[&str],
+    rg_override: Option<usize>,
+) -> Result<ArrowWriter<File>> {
+    let props = writer_properties(kind, schema, sort_cols, rg_override);
+    let file = File::create(path)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to create file {path}: {e}")))?;
+    ArrowWriter::try_new(file, schema.clone(), Some(props))
+        .map_err(|e| DataFusionError::Execution(format!("Failed to create ArrowWriter: {e}")))
+}
+
+async fn stream_to_writer_with_progress(
+    ctx: &SessionContext,
+    query: &str,
+    writer: &mut ArrowWriter<File>,
+    needs_rn_drop: bool,
+    on_progress: Option<&OnProgress>,
+    entity: &str,
+) -> Result<usize> {
+    let df = ctx.sql(query).await?;
+    let df = if needs_rn_drop {
+        let schema = df.schema().clone();
+        let cols: Vec<_> = schema
+            .columns()
+            .into_iter()
+            .filter(|c| c.name() != "_rn")
+            .collect();
+        df.select_columns(&cols.iter().map(|c| c.name()).collect::<Vec<_>>())?
+    } else {
+        df
+    };
+    let mut stream = df.execute_stream().await?;
+    let mut rows = 0usize;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        rows += batch.num_rows();
+        writer.write(&batch)?;
+
+        if let Some(cb) = on_progress {
+            cb(entity, "parquet", batch.num_rows(), rows, 0);
+        }
+    }
+    Ok(rows)
+}
+
+fn split_chroms(
+    chroms: &Option<Vec<String>>,
+    main_set: &HashSet<&str>,
+) -> (Vec<String>, Vec<String>) {
+    match chroms {
+        Some(all) => {
+            let main: Vec<String> = all
+                .iter()
+                .filter(|c| main_set.contains(c.as_str()))
+                .cloned()
+                .collect();
+            let other: Vec<String> = all
+                .iter()
+                .filter(|c| !main_set.contains(c.as_str()))
+                .cloned()
+                .collect();
+            (main, other)
+        }
+        None => (MAIN_CHROMS.iter().map(|s| s.to_string()).collect(), vec![]),
+    }
+}
+
+fn chrom_file_name(chrom: &str) -> String {
+    if MAIN_CHROMS.contains(&chrom) {
+        format!("chr{chrom}")
+    } else {
+        "other".to_string()
+    }
+}
+
+/// Extract a string value from a Utf8, LargeUtf8, or Utf8View array.
+fn string_value(col: &dyn Array, row: usize) -> &str {
+    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+        arr.value(row)
+    } else if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+        arr.value(row)
+    } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+        arr.value(row)
+    } else {
+        panic!("Expected Utf8, LargeUtf8, or Utf8View column")
+    }
+}

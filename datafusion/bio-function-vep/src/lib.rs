@@ -41,6 +41,8 @@ pub mod allele;
 pub mod annotate_provider;
 pub mod annotate_table_function;
 pub mod annotation_store;
+#[cfg(feature = "cache-builder")]
+pub mod cache_builder;
 pub mod config;
 pub mod coordinate;
 pub mod golden_benchmark;

@@ -16,5 +16,5 @@ pub mod sift_store;
 pub use cache_provider::KvCacheTableProvider;
 pub use context_store::{ExonKvStore, TranslationKvStore};
 pub use kv_store::VepKvStore;
-pub use loader::CacheLoader;
+pub use loader::{CacheLoader, LoadStats};
 pub use sift_store::SiftKvStore;

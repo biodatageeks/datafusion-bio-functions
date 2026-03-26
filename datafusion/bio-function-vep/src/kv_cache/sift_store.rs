@@ -85,6 +85,26 @@ impl SiftKvStore {
         Ok(())
     }
 
+    /// Bulk-load from a sorted-by-transcript_id iterator using fjall ingestion.
+    ///
+    /// Input **must** be sorted in ascending `transcript_id` order (panics otherwise).
+    /// Uses `start_ingestion()` for maximum bulk load speed.
+    pub fn ingest_sorted(
+        db: &Database,
+        sorted_iter: impl Iterator<Item = (String, CachedPredictions)>,
+    ) -> Result<Self> {
+        let store = Self::create(db)?;
+        let mut ingestion = store.sift_ks.start_ingestion().map_err(fjall_err)?;
+        for (transcript_id, preds) in sorted_iter {
+            let value = serialize_predictions(&preds);
+            ingestion
+                .write(transcript_id.as_bytes(), value)
+                .map_err(fjall_err)?;
+        }
+        ingestion.finish().map_err(fjall_err)?;
+        Ok(store)
+    }
+
     /// Retrieve predictions for a transcript. Returns None on miss.
     pub fn get(&self, transcript_id: &str) -> Result<Option<CachedPredictions>> {
         let Some(raw) = self

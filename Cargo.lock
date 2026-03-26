@@ -1105,6 +1105,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-bio-format-ensembl-cache"
+version = "0.1.0"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=e92ff6fa169d611d67e280551cd3e1a037254093#e92ff6fa169d611d67e280551cd3e1a037254093"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-bio-format-core 0.6.0",
+ "datafusion-execution",
+ "flate2",
+ "log",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "datafusion-bio-format-vcf"
 version = "0.6.0"
 source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=e92ff6fa169d611d67e280551cd3e1a037254093#e92ff6fa169d611d67e280551cd3e1a037254093"
@@ -1174,6 +1189,7 @@ dependencies = [
  "async-trait",
  "coitrees",
  "datafusion",
+ "datafusion-bio-format-ensembl-cache",
  "datafusion-bio-format-vcf",
  "datafusion-bio-function-ranges",
  "env_logger",
