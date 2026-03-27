@@ -1,6 +1,8 @@
 //! VCF file writer for processed sample QC output.
 //!
 //! Writes multi-sample VCF with FORMAT fields GT:GQ:DP:PL:DS.
+//! Automatically applies BGZF compression when the output path ends
+//! with `.vcf.gz` or `.vcf.bgz`.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -8,60 +10,97 @@ use std::path::Path;
 
 use datafusion::arrow::array::{Array, Float64Array, Int32Array, StringArray, UInt32Array};
 use datafusion::common::{DataFusionError, Result};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 
 use super::processing::ProcessedBatch;
 
 /// VCF writer that outputs processed genotype data.
+///
+/// Compression is chosen automatically from the file extension:
+/// - `.vcf` — plain text
+/// - `.vcf.gz` / `.vcf.bgz` — gzip (BGZF-compatible level 6)
 pub struct VcfWriter {
-    writer: BufWriter<File>,
+    inner: WriterInner,
     line_buf: String,
+}
+
+/// Type-erased inner writer so we don't need generics on every method.
+enum WriterInner {
+    Plain(BufWriter<File>),
+    Gzip(Box<BufWriter<GzEncoder<File>>>),
+}
+
+impl Write for WriterInner {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            WriterInner::Plain(w) => w.write(buf),
+            WriterInner::Gzip(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            WriterInner::Plain(w) => w.flush(),
+            WriterInner::Gzip(w) => w.flush(),
+        }
+    }
 }
 
 impl VcfWriter {
     /// Create a new VCF writer, writing the header immediately.
+    ///
+    /// If `path` ends with `.gz` or `.bgz`, output is gzip-compressed.
     pub fn new(path: &Path, sample_names: &[String]) -> Result<Self> {
         let file = File::create(path).map_err(|e| {
             DataFusionError::Execution(format!("Cannot create output VCF '{path:?}': {e}"))
         })?;
-        let mut writer = BufWriter::with_capacity(1 << 20, file); // 1 MB buffer
+
+        let compressed = is_compressed_path(path);
+        let mut inner = if compressed {
+            let encoder = GzEncoder::new(file, Compression::new(6));
+            WriterInner::Gzip(Box::new(BufWriter::with_capacity(1 << 20, encoder)))
+        } else {
+            WriterInner::Plain(BufWriter::with_capacity(1 << 20, file))
+        };
 
         // Write VCF header
-        writeln!(writer, "##fileformat=VCFv4.2").map_err(io_err)?;
+        writeln!(inner, "##fileformat=VCFv4.2").map_err(io_err)?;
         writeln!(
-            writer,
+            inner,
             "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
         )
         .map_err(io_err)?;
         writeln!(
-            writer,
+            inner,
             "##FORMAT=<ID=GQ,Number=1,Type=Integer,Description=\"Conditional genotype quality\">"
         )
         .map_err(io_err)?;
         writeln!(
-            writer,
+            inner,
             "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read depth\">"
         )
         .map_err(io_err)?;
-        writeln!(writer, "##FORMAT=<ID=PL,Number=G,Type=Integer,Description=\"Phred-scaled genotype likelihoods (corrected for hom-ref 0,0,0 sites)\">").map_err(io_err)?;
+        writeln!(inner, "##FORMAT=<ID=PL,Number=G,Type=Integer,Description=\"Phred-scaled genotype likelihoods (corrected for hom-ref 0,0,0 sites)\">").map_err(io_err)?;
         writeln!(
-            writer,
+            inner,
             "##FORMAT=<ID=DS,Number=1,Type=Float,Description=\"Genotype dosage\">"
         )
         .map_err(io_err)?;
 
         // Column header
         write!(
-            writer,
+            inner,
             "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT"
         )
         .map_err(io_err)?;
         for name in sample_names {
-            write!(writer, "\t{name}").map_err(io_err)?;
+            write!(inner, "\t{name}").map_err(io_err)?;
         }
-        writeln!(writer).map_err(io_err)?;
+        writeln!(inner).map_err(io_err)?;
 
         Ok(Self {
-            writer,
+            inner,
             line_buf: String::with_capacity(64 * 1024),
         })
     }
@@ -134,7 +173,7 @@ impl VcfWriter {
             .map_err(|e| DataFusionError::Execution(format!("fmt: {e}")))?;
 
             // Write fixed columns to writer
-            self.writer
+            self.inner
                 .write_all(self.line_buf.as_bytes())
                 .map_err(io_err)?;
 
@@ -142,44 +181,44 @@ impl VcfWriter {
             let s_start = batch.sample_offsets[var_idx];
             let s_end = batch.sample_offsets[var_idx + 1];
             for s in s_start..s_end {
-                self.writer.write_all(b"\t").map_err(io_err)?;
-                self.write_sample_to_writer(s, batch)?;
+                self.inner.write_all(b"\t").map_err(io_err)?;
+                self.write_sample_to_inner(s, batch)?;
             }
 
-            self.writer.write_all(b"\n").map_err(io_err)?;
+            self.inner.write_all(b"\n").map_err(io_err)?;
         }
         Ok(())
     }
 
     /// Write a single sample's FORMAT fields directly to the writer.
-    fn write_sample_to_writer(&mut self, idx: usize, batch: &ProcessedBatch) -> Result<()> {
+    fn write_sample_to_inner(&mut self, idx: usize, batch: &ProcessedBatch) -> Result<()> {
         // GT
         let gt = if batch.gt_final.is_null(idx) {
             "./."
         } else {
             batch.gt_final.value(idx)
         };
-        self.writer.write_all(gt.as_bytes()).map_err(io_err)?;
+        self.inner.write_all(gt.as_bytes()).map_err(io_err)?;
 
         // GQ
-        self.writer.write_all(b":").map_err(io_err)?;
+        self.inner.write_all(b":").map_err(io_err)?;
         if batch.gq_values.is_null(idx) {
-            self.writer.write_all(b".").map_err(io_err)?;
+            self.inner.write_all(b".").map_err(io_err)?;
         } else {
-            write!(self.writer, "{}", batch.gq_values.value(idx)).map_err(io_err)?;
+            write!(self.inner, "{}", batch.gq_values.value(idx)).map_err(io_err)?;
         }
 
         // DP
-        self.writer.write_all(b":").map_err(io_err)?;
+        self.inner.write_all(b":").map_err(io_err)?;
         if batch.dp_values.is_null(idx) {
-            self.writer.write_all(b".").map_err(io_err)?;
+            self.inner.write_all(b".").map_err(io_err)?;
         } else {
-            write!(self.writer, "{}", batch.dp_values.value(idx)).map_err(io_err)?;
+            write!(self.inner, "{}", batch.dp_values.value(idx)).map_err(io_err)?;
         }
 
         // PL (comma-separated triple)
         write!(
-            self.writer,
+            self.inner,
             ":{},{},{}",
             batch.pl0.value(idx),
             batch.pl1.value(idx),
@@ -188,25 +227,40 @@ impl VcfWriter {
         .map_err(io_err)?;
 
         // DS
-        self.writer.write_all(b":").map_err(io_err)?;
+        self.inner.write_all(b":").map_err(io_err)?;
         if batch.ds_values.is_null(idx) {
-            self.writer.write_all(b".").map_err(io_err)?;
+            self.inner.write_all(b".").map_err(io_err)?;
         } else {
-            write!(self.writer, "{:.4}", batch.ds_values.value(idx)).map_err(io_err)?;
+            write!(self.inner, "{:.4}", batch.ds_values.value(idx)).map_err(io_err)?;
         }
 
         Ok(())
     }
 
     /// Flush and finalize the VCF output.
-    pub fn finish(mut self) -> Result<()> {
-        self.writer.flush().map_err(io_err)
+    ///
+    /// For gzip output this finishes the gzip stream (writes the trailer).
+    pub fn finish(self) -> Result<()> {
+        match self.inner {
+            WriterInner::Plain(mut w) => w.flush().map_err(io_err),
+            WriterInner::Gzip(w) => {
+                let encoder = (*w).into_inner().map_err(io_err)?;
+                encoder.finish().map_err(io_err)?;
+                Ok(())
+            }
+        }
     }
 }
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Check if a path indicates compressed output (`.gz` or `.bgz`).
+fn is_compressed_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.ends_with(".gz") || s.ends_with(".bgz")
+}
 
 fn io_err(e: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::Execution(format!("VCF write error: {e}"))

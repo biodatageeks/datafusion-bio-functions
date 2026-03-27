@@ -536,6 +536,57 @@ fn test_vcf_writer_produces_valid_output() {
     assert!(pl0 <= 1, "Corrected PL0 should be ~0, got {pl0}");
 }
 
+#[test]
+fn test_vcf_writer_gzip_output() {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let variants = make_test_data();
+    let batch = build_test_batch(&variants);
+    let config = QcConfig::default();
+
+    let processed = processing::process_batch(&batch, &config).unwrap().unwrap();
+
+    let tmp = TempDir::new().unwrap();
+    let output_path = tmp.path().join("test.vcf.gz");
+
+    let sample_names = vec![
+        "SAMPLE_0".to_string(),
+        "SAMPLE_1".to_string(),
+        "SAMPLE_2".to_string(),
+    ];
+
+    let mut writer = datafusion_bio_function_vcftools::sample_qc::writer::VcfWriter::new(
+        &output_path,
+        &sample_names,
+    )
+    .unwrap();
+    writer.write_batch(&processed).unwrap();
+    writer.finish().unwrap();
+
+    // Verify it's valid gzip by decompressing
+    let compressed = fs::read(&output_path).unwrap();
+    assert!(
+        compressed[0] == 0x1f && compressed[1] == 0x8b,
+        "File should start with gzip magic bytes"
+    );
+
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut content = String::new();
+    decoder.read_to_string(&mut content).unwrap();
+
+    let lines: Vec<&str> = content.lines().collect();
+    assert!(lines[0].starts_with("##fileformat=VCFv4.2"));
+    let header_line = lines.iter().find(|l| l.starts_with("#CHROM")).unwrap();
+    assert!(header_line.contains("SAMPLE_0"));
+
+    let data_lines: Vec<&&str> = lines
+        .iter()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .collect();
+    assert_eq!(data_lines.len(), 3, "Should have 3 passing variants");
+}
+
 // ============================================================================
 // End-to-end TVF test via SQL
 // ============================================================================
@@ -654,11 +705,7 @@ async fn test_tvf_sample_names_from_file() {
 
     // Write a sample names file
     let samples_file = tmp.path().join("samples.txt");
-    fs::write(
-        &samples_file,
-        "# comment line\nHG02679\nNA19920\nHG00609\n",
-    )
-    .unwrap();
+    fs::write(&samples_file, "# comment line\nHG02679\nNA19920\nHG00609\n").unwrap();
 
     let output_path = tmp.path().join("file_samples.vcf");
     let output_str = output_path.to_str().unwrap();
