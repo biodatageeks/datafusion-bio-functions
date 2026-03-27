@@ -48,6 +48,7 @@ impl BioSessionExt for SessionContext {
 
         ctx.add_optimizer_rule(Arc::new(FusedArrayTransformOptimizerRule::new()));
         enable_fused_array_transform();
+        register_sample_qc_function(&ctx);
 
         info!("Initialized unified Bio session context...");
 
