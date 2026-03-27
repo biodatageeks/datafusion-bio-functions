@@ -3,13 +3,15 @@
 //! Operates directly on flat value arrays from List columns, avoiding
 //! UNNEST/GROUP BY materialization entirely.
 
+use std::sync::OnceLock;
+
 use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Float32Array, Float32Builder, Float64Array, Int32Array,
     ListArray, RecordBatch, StringArray, StringBuilder, StructArray,
 };
 use datafusion::arrow::buffer::{BooleanBuffer, NullBuffer};
 use datafusion::arrow::compute;
-use datafusion::arrow::datatypes::{DataType, Float64Type};
+use datafusion::arrow::datatypes::{DataType, Float64Type, Int32Type};
 use datafusion::common::{DataFusionError, Result};
 
 use super::QcConfig;
@@ -42,10 +44,29 @@ pub struct ProcessedBatch {
     pub ds_values: Float32Array,
 }
 
+// ============================================================================
+// Lookup table for 10^(-PL/10) — avoids 3× powf() per sample (fix #6)
+// ============================================================================
+
+/// Pre-computed `10^(-i/10)` for PL values 0..=255.
+/// Index 255 maps to 0.0 (sentinel for "no information").
+fn pl_likelihood_table() -> &'static [f64; 256] {
+    static TABLE: OnceLock<[f64; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = [0.0f64; 256];
+        for (i, entry) in t.iter_mut().enumerate().take(255) {
+            *entry = 10.0_f64.powf(-(i as f64) / 10.0);
+        }
+        // t[255] = 0.0 already from initialization
+        t
+    })
+}
+
+// ============================================================================
+// Pre-extracted PL data
+// ============================================================================
+
 /// Pre-extracted PL data for O(1) access per sample.
-///
-/// Avoids the per-sample `ListArray::value()` allocation and the
-/// linear variant-index search that the old `extract_pl_triple` used.
 struct PlFlatData {
     pl0: Vec<i32>,
     pl1: Vec<i32>,
@@ -55,9 +76,6 @@ struct PlFlatData {
 
 impl PlFlatData {
     /// Pre-extract all PL triples from a filtered `List<List<Int32>>` in one pass.
-    ///
-    /// Indexes directly into the inner ListArray's flat values buffer using
-    /// offsets — no per-sample `ArrayRef` allocation.
     fn extract(pl_filtered: &ListArray, total_samples: usize) -> Result<Self> {
         let mut pl0 = Vec::with_capacity(total_samples);
         let mut pl1 = Vec::with_capacity(total_samples);
@@ -66,7 +84,6 @@ impl PlFlatData {
 
         let inner_lists = pl_filtered.values();
         let Some(inner_list) = inner_lists.as_any().downcast_ref::<ListArray>() else {
-            // No valid PL structure — mark all invalid
             pl0.resize(total_samples, 0);
             pl1.resize(total_samples, 0);
             pl2.resize(total_samples, 0);
@@ -81,8 +98,6 @@ impl PlFlatData {
 
         let flat_values = inner_list.values();
         let inner_offsets = inner_list.offsets();
-
-        // Downcast flat values ONCE (not per sample)
         let as_i32 = flat_values.as_any().downcast_ref::<Int32Array>();
         let as_f64 = flat_values.as_any().downcast_ref::<Float64Array>();
 
@@ -155,12 +170,87 @@ impl PlFlatData {
         })
     }
 
-    /// Get pre-extracted PL triple at flat sample index. O(1).
     #[inline]
     fn get(&self, idx: usize) -> (i32, i32, i32, bool) {
         (self.pl0[idx], self.pl1[idx], self.pl2[idx], self.valid[idx])
     }
 }
+
+// ============================================================================
+// GQ/DP flat accessor — avoids f64 cast (fix #8)
+// ============================================================================
+
+/// Flat accessor for GQ or DP values, keeping native Int32 when possible.
+enum FlatNumeric {
+    I32(Int32Array),
+    F64(Float64Array),
+}
+
+impl FlatNumeric {
+    fn from_list(list: &ListArray) -> Result<Self> {
+        let values = list.values();
+        if let Some(arr) = values.as_any().downcast_ref::<Int32Array>() {
+            return Ok(Self::I32(arr.clone()));
+        }
+        if let Some(arr) = values.as_any().downcast_ref::<Float64Array>() {
+            return Ok(Self::F64(arr.clone()));
+        }
+        // Try casting to Int32 first (cheaper), fall back to Float64
+        if let Ok(casted) = compute::cast(values, &DataType::Int32) {
+            return Ok(Self::I32(casted.as_primitive::<Int32Type>().clone()));
+        }
+        let casted = compute::cast(values, &DataType::Float64)?;
+        Ok(Self::F64(casted.as_primitive::<Float64Type>().clone()))
+    }
+
+    #[inline]
+    fn is_null(&self, i: usize) -> bool {
+        match self {
+            Self::I32(a) => a.is_null(i),
+            Self::F64(a) => a.is_null(i),
+        }
+    }
+
+    /// Get value as i32 (for output). No-op for Int32, truncates Float64.
+    #[inline]
+    fn value_i32(&self, i: usize) -> i32 {
+        match self {
+            Self::I32(a) => a.value(i),
+            Self::F64(a) => a.value(i) as i32,
+        }
+    }
+
+    /// Compare value >= threshold (threshold is f64 from config).
+    #[inline]
+    fn gte(&self, i: usize, threshold: f64) -> bool {
+        match self {
+            Self::I32(a) => a.value(i) as f64 >= threshold,
+            Self::F64(a) => a.value(i) >= threshold,
+        }
+    }
+
+    /// Compare value <= threshold.
+    #[inline]
+    fn lte(&self, i: usize, threshold: f64) -> bool {
+        match self {
+            Self::I32(a) => (a.value(i) as f64) <= threshold,
+            Self::F64(a) => a.value(i) <= threshold,
+        }
+    }
+
+    /// Get value as f64 (for averaging).
+    #[inline]
+    fn value_f64(&self, i: usize) -> f64 {
+        match self {
+            Self::I32(a) => a.value(i) as f64,
+            Self::F64(a) => a.value(i),
+        }
+    }
+}
+
+// ============================================================================
+// Main processing function
+// ============================================================================
 
 /// Process a RecordBatch through site filtering and sample QC.
 ///
@@ -181,9 +271,9 @@ pub fn process_batch(batch: &RecordBatch, config: &QcConfig) -> Result<Option<Pr
     let dp_list = get_struct_list_field(genotypes, "DP")?;
     let pl_list = get_struct_list_field(genotypes, "PL")?;
 
-    // ---- Site filtering ----
-    let avg_gq = list_avg_f64(&gq_list)?;
-    let avg_dp = list_avg_f64(&dp_list)?;
+    // ---- Site filtering (fix #3: native Int32 averaging) ----
+    let avg_gq = list_avg(&gq_list)?;
+    let avg_dp = list_avg(&dp_list)?;
     let site_mask = compute_site_mask(&qual_col, &avg_gq, &avg_dp, config)?;
 
     let n_passing = site_mask.iter().filter(|v| *v == Some(true)).count();
@@ -191,36 +281,62 @@ pub fn process_batch(batch: &RecordBatch, config: &QcConfig) -> Result<Option<Pr
         return Ok(None);
     }
 
-    // ---- Filter site-level columns ----
-    let chrom = filter_col(batch, "chrom", &site_mask)?;
-    let start = filter_col(batch, "start", &site_mask)?;
-    let id = filter_col(batch, "id", &site_mask)?;
-    let ref_allele = filter_col(batch, "ref", &site_mask)?;
-    let alt = filter_col(batch, "alt", &site_mask)?;
-    let qual = compute::filter(
-        batch
-            .column_by_name("qual")
-            .ok_or_else(|| DataFusionError::Execution("Missing 'qual' column".into()))?,
-        &site_mask,
-    )?;
-    let filter_col_arr = filter_col(batch, "filter", &site_mask)?;
+    // ---- Fix #4: skip filtering when ALL variants pass ----
+    let all_pass = n_passing == n_rows;
 
-    // ---- Filter genotype list arrays ----
-    let gt_filtered = filter_list(&gt_list, &site_mask)?;
-    let gq_filtered = filter_list(&gq_list, &site_mask)?;
-    let dp_filtered = filter_list(&dp_list, &site_mask)?;
-    let pl_filtered = filter_list(&pl_list, &site_mask)?;
+    let (chrom, start, id, ref_allele, alt, qual, filter_col_arr) = if all_pass {
+        (
+            get_col(batch, "chrom")?,
+            get_col(batch, "start")?,
+            get_col(batch, "id")?,
+            get_col(batch, "ref")?,
+            get_col(batch, "alt")?,
+            get_col(batch, "qual")?,
+            get_col(batch, "filter")?,
+        )
+    } else {
+        (
+            filter_col(batch, "chrom", &site_mask)?,
+            filter_col(batch, "start", &site_mask)?,
+            filter_col(batch, "id", &site_mask)?,
+            filter_col(batch, "ref", &site_mask)?,
+            filter_col(batch, "alt", &site_mask)?,
+            filter_col(batch, "qual", &site_mask)?,
+            filter_col(batch, "filter", &site_mask)?,
+        )
+    };
 
-    // ---- Compute sample offsets from GT list (all lists share same offsets) ----
+    let gt_filtered = if all_pass {
+        gt_list
+    } else {
+        filter_list(&gt_list, &site_mask)?
+    };
+    let gq_filtered = if all_pass {
+        gq_list
+    } else {
+        filter_list(&gq_list, &site_mask)?
+    };
+    let dp_filtered = if all_pass {
+        dp_list
+    } else {
+        filter_list(&dp_list, &site_mask)?
+    };
+    let pl_filtered = if all_pass {
+        pl_list
+    } else {
+        filter_list(&pl_list, &site_mask)?
+    };
+
+    // ---- Compute sample offsets ----
     let sample_offsets = compute_offsets(&gt_filtered);
     let total_samples = *sample_offsets.last().unwrap_or(&0);
 
-    // ---- Extract flat value arrays ----
+    // ---- Extract flat value arrays (fix #8: keep native Int32 for GQ/DP) ----
     let flat_gt = get_flat_string_values(&gt_filtered)?;
-    let flat_gq = get_flat_f64_values(&gq_filtered)?;
-    let flat_dp = get_flat_f64_values(&dp_filtered)?;
+    let flat_gq = FlatNumeric::from_list(&gq_filtered)?;
+    let flat_dp = FlatNumeric::from_list(&dp_filtered)?;
 
-    // ---- Pre-extract ALL PL triples in one pass (fix #2: no per-sample allocation) ----
+    // ---- Pre-extract PL triples ----
     let pl_data = PlFlatData::extract(&pl_filtered, total_samples)?;
 
     // ---- Allocate output buffers ----
@@ -234,7 +350,7 @@ pub fn process_batch(batch: &RecordBatch, config: &QcConfig) -> Result<Option<Pr
     let mut pl2_out = Vec::with_capacity(total_samples);
     let mut ds_builder = Float32Builder::with_capacity(total_samples);
 
-    // ---- Process samples: variant-major loop (fix #1: no linear variant search) ----
+    // ---- Process samples: variant-major loop ----
     for var_idx in 0..n_passing {
         let s_start = sample_offsets[var_idx];
         let s_end = sample_offsets[var_idx + 1];
@@ -248,46 +364,40 @@ pub fn process_batch(batch: &RecordBatch, config: &QcConfig) -> Result<Option<Pr
             };
             let gt_norm = normalize_gt(gt_raw);
 
-            // ---- GQ / DP values ----
-            let gq_val = if flat_gq.is_null(i) {
-                None
-            } else {
-                Some(flat_gq.value(i))
-            };
-            let dp_val = if flat_dp.is_null(i) {
-                None
-            } else {
-                Some(flat_dp.value(i))
-            };
+            // ---- GQ / DP: native Int32 comparison (fix #8) ----
+            let gq_present = !flat_gq.is_null(i);
+            let dp_present = !flat_dp.is_null(i);
 
-            // ---- Sample quality ----
-            let is_good = gq_val.is_some_and(|g| g >= config.sample_gq_min)
-                && dp_val.is_some_and(|d| d >= config.sample_dp_min && d <= config.sample_dp_max);
+            let is_good = gq_present
+                && flat_gq.gte(i, config.sample_gq_min)
+                && dp_present
+                && flat_dp.gte(i, config.sample_dp_min)
+                && flat_dp.lte(i, config.sample_dp_max);
 
             let gt_final = if is_good { gt_norm } else { "./." };
             gt_builder.append_value(gt_final);
 
-            // ---- GQ / DP output (preserve originals) ----
-            if let Some(g) = gq_val {
-                gq_out.push(g as i32);
+            // ---- GQ / DP output: direct i32, no f64 round-trip ----
+            if gq_present {
+                gq_out.push(flat_gq.value_i32(i));
                 gq_null.push(true);
             } else {
                 gq_out.push(0);
                 gq_null.push(false);
             }
-            if let Some(d) = dp_val {
-                dp_out.push(d as i32);
+            if dp_present {
+                dp_out.push(flat_dp.value_i32(i));
                 dp_null.push(true);
             } else {
                 dp_out.push(0);
                 dp_null.push(false);
             }
 
-            // ---- PL extraction: O(1) from pre-extracted flat data ----
+            // ---- PL extraction: O(1) ----
             let (raw_pl0, raw_pl1, raw_pl2, pl_valid) = pl_data.get(i);
 
             let is_hom_ref = matches!(gt_raw, Some("0/0" | "0|0" | "0"));
-            let gq_sufficient = gq_val.is_some_and(|g| g >= config.sample_gq_min);
+            let gq_sufficient = gq_present && flat_gq.gte(i, config.sample_gq_min);
 
             let needs_correction = is_hom_ref
                 && pl_valid
@@ -297,7 +407,7 @@ pub fn process_batch(batch: &RecordBatch, config: &QcConfig) -> Result<Option<Pr
                 && gq_sufficient;
 
             let (final_pl0, final_pl1, final_pl2) = if needs_correction {
-                correct_pl(gq_val.unwrap_or(0.0))
+                correct_pl(flat_gq.value_f64(i))
             } else {
                 (raw_pl0, raw_pl1, raw_pl2)
             };
@@ -306,7 +416,7 @@ pub fn process_batch(batch: &RecordBatch, config: &QcConfig) -> Result<Option<Pr
             pl1_out.push(final_pl1);
             pl2_out.push(final_pl2);
 
-            // ---- DS (dosage) ----
+            // ---- DS: lookup table instead of powf (fix #6) ----
             if pl_valid && gq_sufficient {
                 let ds = compute_dosage(final_pl0, final_pl1, final_pl2);
                 match ds {
@@ -352,7 +462,6 @@ pub fn process_batch(batch: &RecordBatch, config: &QcConfig) -> Result<Option<Pr
 // Helper functions
 // ============================================================================
 
-/// Get the `genotypes` struct column from a batch.
 fn get_genotypes_struct(batch: &RecordBatch) -> Result<&StructArray> {
     let col = batch
         .column_by_name("genotypes")
@@ -362,7 +471,6 @@ fn get_genotypes_struct(batch: &RecordBatch) -> Result<&StructArray> {
         .ok_or_else(|| DataFusionError::Execution("'genotypes' is not a Struct".into()))
 }
 
-/// Get a List field from a StructArray.
 fn get_struct_list_field(s: &StructArray, name: &str) -> Result<ListArray> {
     let col = s
         .column_by_name(name)
@@ -373,7 +481,6 @@ fn get_struct_list_field(s: &StructArray, name: &str) -> Result<ListArray> {
         .ok_or_else(|| DataFusionError::Execution(format!("genotypes.'{name}' is not a List")))
 }
 
-/// Get a column as Float64Array (with casting if needed).
 fn get_column_f64(batch: &RecordBatch, name: &str) -> Result<Float64Array> {
     let col = batch
         .column_by_name(name)
@@ -385,49 +492,91 @@ fn get_column_f64(batch: &RecordBatch, name: &str) -> Result<Float64Array> {
     Ok(casted.as_primitive::<Float64Type>().clone())
 }
 
-/// Compute per-variant average of a List<numeric> column, returning Float64Array.
-fn list_avg_f64(list: &ListArray) -> Result<Float64Array> {
+/// Get a column by name (no filtering).
+fn get_col(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
+    batch
+        .column_by_name(name)
+        .cloned()
+        .ok_or_else(|| DataFusionError::Execution(format!("Missing '{name}' column")))
+}
+
+/// Compute per-variant average of a List<numeric> column.
+///
+/// Handles Int32 natively (sum as i64) to avoid f64 cast overhead (fix #3).
+fn list_avg(list: &ListArray) -> Result<Float64Array> {
     let offsets = list.offsets();
     let values = list.values();
-    let f64_values = if values.data_type() == &DataType::Float64 {
-        values.as_primitive::<Float64Type>().clone()
-    } else {
-        let casted = compute::cast(values, &DataType::Float64)?;
-        casted.as_primitive::<Float64Type>().clone()
-    };
-
     let n = list.len();
     let mut avgs = Vec::with_capacity(n);
     let mut nulls = Vec::with_capacity(n);
 
-    for i in 0..n {
-        if list.is_null(i) {
-            avgs.push(0.0);
-            nulls.push(false);
-            continue;
-        }
-        let start = offsets[i] as usize;
-        let end = offsets[i + 1] as usize;
-        let len = end - start;
-        if len == 0 {
-            avgs.push(0.0);
-            nulls.push(false);
-            continue;
-        }
-        let mut sum = 0.0;
-        let mut count = 0usize;
-        for j in start..end {
-            if !f64_values.is_null(j) {
-                sum += f64_values.value(j);
-                count += 1;
+    // Int32 fast path: sum as i64, divide once
+    if let Some(i32_values) = values.as_any().downcast_ref::<Int32Array>() {
+        for i in 0..n {
+            if list.is_null(i) {
+                avgs.push(0.0);
+                nulls.push(false);
+                continue;
+            }
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            if end == start {
+                avgs.push(0.0);
+                nulls.push(false);
+                continue;
+            }
+            let mut sum = 0i64;
+            let mut count = 0usize;
+            for j in start..end {
+                if !i32_values.is_null(j) {
+                    sum += i32_values.value(j) as i64;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                avgs.push(sum as f64 / count as f64);
+                nulls.push(true);
+            } else {
+                avgs.push(0.0);
+                nulls.push(false);
             }
         }
-        if count > 0 {
-            avgs.push(sum / count as f64);
-            nulls.push(true);
+    } else {
+        // Float64 path (fallback)
+        let f64_values = if values.data_type() == &DataType::Float64 {
+            values.as_primitive::<Float64Type>().clone()
         } else {
-            avgs.push(0.0);
-            nulls.push(false);
+            let casted = compute::cast(values, &DataType::Float64)?;
+            casted.as_primitive::<Float64Type>().clone()
+        };
+        for i in 0..n {
+            if list.is_null(i) {
+                avgs.push(0.0);
+                nulls.push(false);
+                continue;
+            }
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            if end == start {
+                avgs.push(0.0);
+                nulls.push(false);
+                continue;
+            }
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for j in start..end {
+                if !f64_values.is_null(j) {
+                    sum += f64_values.value(j);
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                avgs.push(sum / count as f64);
+                nulls.push(true);
+            } else {
+                avgs.push(0.0);
+                nulls.push(false);
+            }
         }
     }
 
@@ -436,7 +585,6 @@ fn list_avg_f64(list: &ListArray) -> Result<Float64Array> {
     Ok(Float64Array::new(values_buf.into_parts().1, Some(null_buf)))
 }
 
-/// Compute the site-level filter mask.
 fn compute_site_mask(
     qual: &Float64Array,
     avg_gq: &Float64Array,
@@ -458,7 +606,6 @@ fn compute_site_mask(
     Ok(BooleanArray::from(mask))
 }
 
-/// Filter a column from a batch by a boolean mask.
 fn filter_col(batch: &RecordBatch, name: &str, mask: &BooleanArray) -> Result<ArrayRef> {
     let col = batch
         .column_by_name(name)
@@ -467,7 +614,6 @@ fn filter_col(batch: &RecordBatch, name: &str, mask: &BooleanArray) -> Result<Ar
         .map_err(|e| DataFusionError::Execution(format!("filter {name}: {e}")))
 }
 
-/// Filter a ListArray by a boolean mask.
 fn filter_list(list: &ListArray, mask: &BooleanArray) -> Result<ListArray> {
     let filtered = compute::filter(list, mask)?;
     filtered
@@ -477,20 +623,17 @@ fn filter_list(list: &ListArray, mask: &BooleanArray) -> Result<ListArray> {
         .ok_or_else(|| DataFusionError::Execution("filter_list: downcast failed".into()))
 }
 
-/// Compute sample offsets from a filtered ListArray.
 fn compute_offsets(list: &ListArray) -> Vec<usize> {
     let offsets = list.offsets();
     let base = offsets[0] as usize;
     offsets.iter().map(|o| *o as usize - base).collect()
 }
 
-/// Get flat string values from a List<Utf8> or List<LargeUtf8>.
 fn get_flat_string_values(list: &ListArray) -> Result<StringArray> {
     let values = list.values();
     if let Some(s) = values.as_any().downcast_ref::<StringArray>() {
         return Ok(s.clone());
     }
-    // Try casting from other string types
     let casted = compute::cast(values, &DataType::Utf8)?;
     casted
         .as_any()
@@ -499,17 +642,6 @@ fn get_flat_string_values(list: &ListArray) -> Result<StringArray> {
         .ok_or_else(|| DataFusionError::Execution("Cannot get string values from GT list".into()))
 }
 
-/// Get flat f64 values from a List<numeric>.
-fn get_flat_f64_values(list: &ListArray) -> Result<Float64Array> {
-    let values = list.values();
-    if let Some(f) = values.as_any().downcast_ref::<Float64Array>() {
-        return Ok(f.clone());
-    }
-    let casted = compute::cast(values, &DataType::Float64)?;
-    Ok(casted.as_primitive::<Float64Type>().clone())
-}
-
-/// Normalize a genotype string: haploid shorthand to diploid.
 #[inline]
 fn normalize_gt(gt: Option<&str>) -> &'static str {
     match gt {
@@ -531,9 +663,6 @@ fn normalize_gt(gt: Option<&str>) -> &'static str {
     }
 }
 
-/// Correct PL values for homozygous-reference sites with all-zero PLs.
-///
-/// Implements the quadratic correction from GQ.
 #[inline]
 fn correct_pl(gq: f64) -> (i32, i32, i32) {
     let p_wrong = 10.0_f64.powf(-gq / 10.0);
@@ -550,26 +679,15 @@ fn correct_pl(gq: f64) -> (i32, i32, i32) {
     (pl0, pl1, pl2)
 }
 
-/// Compute dosage from final PL values.
+/// Compute dosage from final PL values using a lookup table (fix #6).
 ///
-/// Returns `None` if the total likelihood is zero.
+/// Avoids 3× `powf()` per sample by indexing into a pre-computed table.
 #[inline]
 fn compute_dosage(pl0: i32, pl1: i32, pl2: i32) -> Option<f32> {
-    let l_ref = if pl0 < 255 {
-        10.0_f64.powf(-pl0 as f64 / 10.0)
-    } else {
-        0.0
-    };
-    let l_het = if pl1 < 255 {
-        10.0_f64.powf(-pl1 as f64 / 10.0)
-    } else {
-        0.0
-    };
-    let l_alt = if pl2 < 255 {
-        10.0_f64.powf(-pl2 as f64 / 10.0)
-    } else {
-        0.0
-    };
+    let table = pl_likelihood_table();
+    let l_ref = table[pl0.clamp(0, 255) as usize];
+    let l_het = table[pl1.clamp(0, 255) as usize];
+    let l_alt = table[pl2.clamp(0, 255) as usize];
     let total = l_ref + l_het + l_alt;
     if total > 0.0 {
         Some(((l_het + 2.0 * l_alt) / total) as f32)
@@ -625,5 +743,14 @@ mod tests {
         assert!(ds > 1.99);
 
         assert!(compute_dosage(255, 255, 255).is_none());
+    }
+
+    #[test]
+    fn test_pl_likelihood_table() {
+        let table = pl_likelihood_table();
+        assert!((table[0] - 1.0).abs() < 1e-10);
+        assert!((table[10] - 0.1).abs() < 1e-10);
+        assert!((table[20] - 0.01).abs() < 1e-10);
+        assert_eq!(table[255], 0.0);
     }
 }

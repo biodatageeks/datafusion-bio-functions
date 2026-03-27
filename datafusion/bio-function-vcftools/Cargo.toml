@@ -15,6 +15,7 @@ futures = { workspace = true }
 log = { workspace = true }
 async-trait = { workspace = true }
 noodles-bgzf = "0.36"
+itoa = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

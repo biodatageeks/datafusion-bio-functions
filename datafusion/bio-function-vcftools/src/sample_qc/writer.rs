@@ -4,6 +4,7 @@
 //! Automatically applies BGZF compression when the output path ends
 //! with `.vcf.gz` or `.vcf.bgz`, producing tabix-indexable output.
 
+use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -20,10 +21,11 @@ use super::processing::ProcessedBatch;
 /// - `.vcf.gz` / `.vcf.bgz` — BGZF (tabix-indexable blocked gzip)
 pub struct VcfWriter {
     inner: WriterInner,
-    line_buf: String,
+    /// Reusable buffer for entire variant lines. Avoids per-field write_all
+    /// syscalls — a single write_all per variant instead of ~10 per sample.
+    line_buf: Vec<u8>,
 }
 
-/// Type-erased inner writer.
 enum WriterInner {
     Plain(BufWriter<File>),
     Bgzf(Box<noodles_bgzf::Writer<File>>),
@@ -47,9 +49,6 @@ impl Write for WriterInner {
 
 impl VcfWriter {
     /// Create a new VCF writer, writing the header immediately.
-    ///
-    /// If `path` ends with `.gz` or `.bgz`, output uses BGZF compression
-    /// (blocked gzip compatible with `tabix` indexing).
     pub fn new(path: &Path, sample_names: &[String]) -> Result<Self> {
         let file = File::create(path).map_err(|e| {
             DataFusionError::Execution(format!("Cannot create output VCF '{path:?}': {e}"))
@@ -62,7 +61,6 @@ impl VcfWriter {
             WriterInner::Plain(BufWriter::with_capacity(1 << 20, file))
         };
 
-        // Write VCF header
         writeln!(inner, "##fileformat=VCFv4.2").map_err(io_err)?;
         writeln!(
             inner,
@@ -86,7 +84,6 @@ impl VcfWriter {
         )
         .map_err(io_err)?;
 
-        // Column header
         write!(
             inner,
             "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT"
@@ -99,11 +96,14 @@ impl VcfWriter {
 
         Ok(Self {
             inner,
-            line_buf: String::with_capacity(64 * 1024),
+            line_buf: Vec::with_capacity(128 * 1024),
         })
     }
 
     /// Write all variants from a processed batch.
+    ///
+    /// Buffers each entire variant line into `line_buf` before a single
+    /// `write_all` call, avoiding ~10 syscalls per sample (fix #5).
     pub fn write_batch(&mut self, batch: &ProcessedBatch) -> Result<()> {
         let chrom = downcast_string(&batch.chrom)?;
         let start = downcast_u32_or_i32(&batch.start)?;
@@ -113,29 +113,26 @@ impl VcfWriter {
         let qual = downcast_f64(&batch.qual)?;
         let filter = downcast_string(&batch.filter)?;
 
+        // Scratch buffer for itoa — avoids per-integer format!() allocation
+        let mut itoa_buf = itoa::Buffer::new();
+
         #[allow(clippy::needless_range_loop)]
         for var_idx in 0..batch.n_variants {
             self.line_buf.clear();
 
-            // CHROM
+            // ---- Fixed columns ----
             let chrom_val = if chrom.is_null(var_idx) {
                 "."
             } else {
                 chrom.value(var_idx)
             };
-
-            // POS (1-based from 0-based start)
             let pos = start[var_idx] + 1;
-
-            // ID
             let id_val = if id.is_null(var_idx) {
                 "."
             } else {
                 let v = id.value(var_idx);
                 if v.is_empty() { "." } else { v }
             };
-
-            // REF, ALT
             let ref_val = if ref_allele.is_null(var_idx) {
                 "."
             } else {
@@ -146,15 +143,11 @@ impl VcfWriter {
             } else {
                 alt.value(var_idx)
             };
-
-            // QUAL
             let qual_str = if qual.is_null(var_idx) {
                 ".".to_string()
             } else {
                 format_qual(qual.value(var_idx))
             };
-
-            // FILTER
             let filter_val = if filter.is_null(var_idx) {
                 "."
             } else {
@@ -162,91 +155,106 @@ impl VcfWriter {
                 if v.is_empty() { "." } else { v }
             };
 
-            // Write fixed columns
-            use std::fmt::Write as FmtWrite;
-            write!(
-                self.line_buf,
-                "{chrom_val}\t{pos}\t{id_val}\t{ref_val}\t{alt_val}\t{qual_str}\t{filter_val}\t.\tGT:GQ:DP:PL:DS"
-            )
-            .map_err(|e| DataFusionError::Execution(format!("fmt: {e}")))?;
+            self.line_buf.extend_from_slice(chrom_val.as_bytes());
+            self.line_buf.push(b'\t');
+            self.line_buf
+                .extend_from_slice(itoa_buf.format(pos).as_bytes());
+            self.line_buf.push(b'\t');
+            self.line_buf.extend_from_slice(id_val.as_bytes());
+            self.line_buf.push(b'\t');
+            self.line_buf.extend_from_slice(ref_val.as_bytes());
+            self.line_buf.push(b'\t');
+            self.line_buf.extend_from_slice(alt_val.as_bytes());
+            self.line_buf.push(b'\t');
+            self.line_buf.extend_from_slice(qual_str.as_bytes());
+            self.line_buf.push(b'\t');
+            self.line_buf.extend_from_slice(filter_val.as_bytes());
+            self.line_buf.extend_from_slice(b"\t.\tGT:GQ:DP:PL:DS");
 
-            // Write fixed columns to writer
-            self.inner
-                .write_all(self.line_buf.as_bytes())
-                .map_err(io_err)?;
-
-            // Write per-sample columns directly to writer
+            // ---- Per-sample columns: format into line_buf ----
             let s_start = batch.sample_offsets[var_idx];
             let s_end = batch.sample_offsets[var_idx + 1];
             for s in s_start..s_end {
-                self.inner.write_all(b"\t").map_err(io_err)?;
-                self.write_sample_to_inner(s, batch)?;
+                self.line_buf.push(b'\t');
+
+                // GT
+                let gt = if batch.gt_final.is_null(s) {
+                    "./."
+                } else {
+                    batch.gt_final.value(s)
+                };
+                self.line_buf.extend_from_slice(gt.as_bytes());
+
+                // :GQ
+                self.line_buf.push(b':');
+                if batch.gq_values.is_null(s) {
+                    self.line_buf.push(b'.');
+                } else {
+                    self.line_buf
+                        .extend_from_slice(itoa_buf.format(batch.gq_values.value(s)).as_bytes());
+                }
+
+                // :DP
+                self.line_buf.push(b':');
+                if batch.dp_values.is_null(s) {
+                    self.line_buf.push(b'.');
+                } else {
+                    self.line_buf
+                        .extend_from_slice(itoa_buf.format(batch.dp_values.value(s)).as_bytes());
+                }
+
+                // :PL0,PL1,PL2
+                self.line_buf.push(b':');
+                self.line_buf
+                    .extend_from_slice(itoa_buf.format(batch.pl0.value(s)).as_bytes());
+                self.line_buf.push(b',');
+                self.line_buf
+                    .extend_from_slice(itoa_buf.format(batch.pl1.value(s)).as_bytes());
+                self.line_buf.push(b',');
+                self.line_buf
+                    .extend_from_slice(itoa_buf.format(batch.pl2.value(s)).as_bytes());
+
+                // :DS
+                self.line_buf.push(b':');
+                if batch.ds_values.is_null(s) {
+                    self.line_buf.push(b'.');
+                } else {
+                    // Use write! for float formatting into the byte buffer via a wrapper
+                    let before = self.line_buf.len();
+                    write!(
+                        BufToVec(&mut self.line_buf),
+                        "{:.4}",
+                        batch.ds_values.value(s)
+                    )
+                    .map_err(|e| DataFusionError::Execution(format!("fmt: {e}")))?;
+                    let _ = before; // suppress unused
+                }
             }
 
-            self.inner.write_all(b"\n").map_err(io_err)?;
+            self.line_buf.push(b'\n');
+
+            // ---- Single write_all per variant line ----
+            self.inner.write_all(&self.line_buf).map_err(io_err)?;
         }
-        Ok(())
-    }
-
-    /// Write a single sample's FORMAT fields directly to the writer.
-    fn write_sample_to_inner(&mut self, idx: usize, batch: &ProcessedBatch) -> Result<()> {
-        // GT
-        let gt = if batch.gt_final.is_null(idx) {
-            "./."
-        } else {
-            batch.gt_final.value(idx)
-        };
-        self.inner.write_all(gt.as_bytes()).map_err(io_err)?;
-
-        // GQ
-        self.inner.write_all(b":").map_err(io_err)?;
-        if batch.gq_values.is_null(idx) {
-            self.inner.write_all(b".").map_err(io_err)?;
-        } else {
-            write!(self.inner, "{}", batch.gq_values.value(idx)).map_err(io_err)?;
-        }
-
-        // DP
-        self.inner.write_all(b":").map_err(io_err)?;
-        if batch.dp_values.is_null(idx) {
-            self.inner.write_all(b".").map_err(io_err)?;
-        } else {
-            write!(self.inner, "{}", batch.dp_values.value(idx)).map_err(io_err)?;
-        }
-
-        // PL (comma-separated triple)
-        write!(
-            self.inner,
-            ":{},{},{}",
-            batch.pl0.value(idx),
-            batch.pl1.value(idx),
-            batch.pl2.value(idx)
-        )
-        .map_err(io_err)?;
-
-        // DS
-        self.inner.write_all(b":").map_err(io_err)?;
-        if batch.ds_values.is_null(idx) {
-            self.inner.write_all(b".").map_err(io_err)?;
-        } else {
-            write!(self.inner, "{:.4}", batch.ds_values.value(idx)).map_err(io_err)?;
-        }
-
         Ok(())
     }
 
     /// Flush and finalize the VCF output.
-    ///
-    /// For BGZF output this writes the empty EOF block required by the spec.
     pub fn finish(self) -> Result<()> {
         match self.inner {
             WriterInner::Plain(mut w) => w.flush().map_err(io_err),
-            WriterInner::Bgzf(mut w) => {
-                // noodles_bgzf::Writer::finish() flushes pending data and
-                // writes the BGZF EOF marker block.
-                w.try_finish().map_err(io_err)
-            }
+            WriterInner::Bgzf(mut w) => w.try_finish().map_err(io_err),
         }
+    }
+}
+
+/// Thin wrapper to use `write!` with a `Vec<u8>`.
+struct BufToVec<'a>(&'a mut Vec<u8>);
+
+impl std::fmt::Write for BufToVec<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.extend_from_slice(s.as_bytes());
+        Ok(())
     }
 }
 
@@ -254,7 +262,6 @@ impl VcfWriter {
 // Helpers
 // ============================================================================
 
-/// Check if a path indicates compressed output (`.gz` or `.bgz`).
 fn is_compressed_path(path: &Path) -> bool {
     let s = path.to_string_lossy();
     s.ends_with(".gz") || s.ends_with(".bgz")
@@ -272,7 +279,6 @@ fn format_qual(q: f64) -> String {
     }
 }
 
-/// Downcast an ArrayRef to StringArray (handling Utf8, LargeUtf8, Utf8View).
 fn downcast_string(arr: &dyn Array) -> Result<StringArray> {
     if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
         return Ok(s.clone());
@@ -287,7 +293,6 @@ fn downcast_string(arr: &dyn Array) -> Result<StringArray> {
         .ok_or_else(|| DataFusionError::Execution("Cannot cast to StringArray".into()))
 }
 
-/// Downcast to a Vec<u32> from UInt32 or Int32/Int64 arrays.
 fn downcast_u32_or_i32(arr: &dyn Array) -> Result<Vec<u32>> {
     if let Some(u) = arr.as_any().downcast_ref::<UInt32Array>() {
         return Ok((0..u.len()).map(|i| u.value(i)).collect());
@@ -308,7 +313,6 @@ fn downcast_u32_or_i32(arr: &dyn Array) -> Result<Vec<u32>> {
     ))
 }
 
-/// Downcast to Float64Array.
 fn downcast_f64(arr: &dyn Array) -> Result<Float64Array> {
     if let Some(f) = arr.as_any().downcast_ref::<Float64Array>() {
         return Ok(f.clone());

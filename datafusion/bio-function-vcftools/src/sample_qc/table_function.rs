@@ -422,9 +422,7 @@ fn is_sample_file_path(s: &str) -> bool {
 /// Blank lines and lines starting with `#` are skipped.
 fn read_sample_names_file(path: &str) -> Result<Vec<String>> {
     let content = std::fs::read_to_string(path).map_err(|e| {
-        DataFusionError::Execution(format!(
-            "Cannot read sample names file '{path}': {e}"
-        ))
+        DataFusionError::Execution(format!("Cannot read sample names file '{path}': {e}"))
     })?;
     let names: Vec<String> = content
         .lines()
