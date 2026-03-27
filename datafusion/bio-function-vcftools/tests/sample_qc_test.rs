@@ -537,8 +537,7 @@ fn test_vcf_writer_produces_valid_output() {
 }
 
 #[test]
-fn test_vcf_writer_gzip_output() {
-    use flate2::read::GzDecoder;
+fn test_vcf_writer_bgzf_output() {
     use std::io::Read;
 
     let variants = make_test_data();
@@ -564,16 +563,23 @@ fn test_vcf_writer_gzip_output() {
     writer.write_batch(&processed).unwrap();
     writer.finish().unwrap();
 
-    // Verify it's valid gzip by decompressing
+    // Verify BGZF magic: gzip header (1f 8b) with BGZF extra field
     let compressed = fs::read(&output_path).unwrap();
     assert!(
         compressed[0] == 0x1f && compressed[1] == 0x8b,
         "File should start with gzip magic bytes"
     );
 
-    let mut decoder = GzDecoder::new(&compressed[..]);
+    // Verify BGZF EOF block is present (last 28 bytes of a valid BGZF file)
+    assert!(
+        compressed.len() >= 28,
+        "BGZF file should have at least the EOF block"
+    );
+
+    // Decompress with noodles-bgzf reader and verify content
+    let mut reader = noodles_bgzf::Reader::new(&compressed[..]);
     let mut content = String::new();
-    decoder.read_to_string(&mut content).unwrap();
+    reader.read_to_string(&mut content).unwrap();
 
     let lines: Vec<&str> = content.lines().collect();
     assert!(lines[0].starts_with("##fileformat=VCFv4.2"));

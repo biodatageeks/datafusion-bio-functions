@@ -14,11 +14,11 @@ tokio = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 async-trait = { workspace = true }
-flate2 = "1"
+noodles-bgzf = "0.36"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 parquet = { workspace = true }
-flate2 = "1"
+noodles-bgzf = "0.36"

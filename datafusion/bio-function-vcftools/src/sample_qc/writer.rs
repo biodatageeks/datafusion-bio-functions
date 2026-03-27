@@ -2,7 +2,7 @@
 //!
 //! Writes multi-sample VCF with FORMAT fields GT:GQ:DP:PL:DS.
 //! Automatically applies BGZF compression when the output path ends
-//! with `.vcf.gz` or `.vcf.bgz`.
+//! with `.vcf.gz` or `.vcf.bgz`, producing tabix-indexable output.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -10,8 +10,6 @@ use std::path::Path;
 
 use datafusion::arrow::array::{Array, Float64Array, Int32Array, StringArray, UInt32Array};
 use datafusion::common::{DataFusionError, Result};
-use flate2::Compression;
-use flate2::write::GzEncoder;
 
 use super::processing::ProcessedBatch;
 
@@ -19,30 +17,30 @@ use super::processing::ProcessedBatch;
 ///
 /// Compression is chosen automatically from the file extension:
 /// - `.vcf` — plain text
-/// - `.vcf.gz` / `.vcf.bgz` — gzip (BGZF-compatible level 6)
+/// - `.vcf.gz` / `.vcf.bgz` — BGZF (tabix-indexable blocked gzip)
 pub struct VcfWriter {
     inner: WriterInner,
     line_buf: String,
 }
 
-/// Type-erased inner writer so we don't need generics on every method.
+/// Type-erased inner writer.
 enum WriterInner {
     Plain(BufWriter<File>),
-    Gzip(Box<BufWriter<GzEncoder<File>>>),
+    Bgzf(Box<noodles_bgzf::Writer<File>>),
 }
 
 impl Write for WriterInner {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             WriterInner::Plain(w) => w.write(buf),
-            WriterInner::Gzip(w) => w.write(buf),
+            WriterInner::Bgzf(w) => w.write(buf),
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             WriterInner::Plain(w) => w.flush(),
-            WriterInner::Gzip(w) => w.flush(),
+            WriterInner::Bgzf(w) => w.flush(),
         }
     }
 }
@@ -50,7 +48,8 @@ impl Write for WriterInner {
 impl VcfWriter {
     /// Create a new VCF writer, writing the header immediately.
     ///
-    /// If `path` ends with `.gz` or `.bgz`, output is gzip-compressed.
+    /// If `path` ends with `.gz` or `.bgz`, output uses BGZF compression
+    /// (blocked gzip compatible with `tabix` indexing).
     pub fn new(path: &Path, sample_names: &[String]) -> Result<Self> {
         let file = File::create(path).map_err(|e| {
             DataFusionError::Execution(format!("Cannot create output VCF '{path:?}': {e}"))
@@ -58,8 +57,7 @@ impl VcfWriter {
 
         let compressed = is_compressed_path(path);
         let mut inner = if compressed {
-            let encoder = GzEncoder::new(file, Compression::new(6));
-            WriterInner::Gzip(Box::new(BufWriter::with_capacity(1 << 20, encoder)))
+            WriterInner::Bgzf(Box::new(noodles_bgzf::Writer::new(file)))
         } else {
             WriterInner::Plain(BufWriter::with_capacity(1 << 20, file))
         };
@@ -239,14 +237,14 @@ impl VcfWriter {
 
     /// Flush and finalize the VCF output.
     ///
-    /// For gzip output this finishes the gzip stream (writes the trailer).
+    /// For BGZF output this writes the empty EOF block required by the spec.
     pub fn finish(self) -> Result<()> {
         match self.inner {
             WriterInner::Plain(mut w) => w.flush().map_err(io_err),
-            WriterInner::Gzip(w) => {
-                let encoder = (*w).into_inner().map_err(io_err)?;
-                encoder.finish().map_err(io_err)?;
-                Ok(())
+            WriterInner::Bgzf(mut w) => {
+                // noodles_bgzf::Writer::finish() flushes pending data and
+                // writes the BGZF EOF marker block.
+                w.try_finish().map_err(io_err)
             }
         }
     }
