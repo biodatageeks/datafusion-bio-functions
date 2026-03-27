@@ -51,6 +51,7 @@
 pub mod common;
 pub mod logical;
 pub mod physical;
+pub mod sample_qc;
 
 // Re-export logical types
 pub use logical::fused_array_transform::FusedArrayTransform;
@@ -63,3 +64,6 @@ pub use logical::optimizer_rule::{
 pub use physical::extension_planner::FusedArrayTransformPlanner;
 pub use physical::fused_array_transform_exec::FusedArrayTransformExec;
 pub use physical::query_planner::VcfQueryPlanner;
+
+// Re-export sample QC types
+pub use sample_qc::{QcConfig, register_sample_qc_function};

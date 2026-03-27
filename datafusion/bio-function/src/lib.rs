@@ -8,6 +8,7 @@ use datafusion_bio_function_ranges::physical_planner::IntervalJoinPhysicalOptimi
 use datafusion_bio_function_ranges::{BioConfig, register_ranges_functions};
 use datafusion_bio_function_vcftools::{
     FusedArrayTransformOptimizerRule, FusedArrayTransformPlanner, enable_fused_array_transform,
+    register_sample_qc_function,
 };
 use log::info;
 use std::sync::Arc;
@@ -63,5 +64,6 @@ pub fn create_bio_session() -> SessionContext {
         .with_repartition_joins(false);
     let ctx = SessionContext::new_with_bio(config);
     register_ranges_functions(&ctx);
+    register_sample_qc_function(&ctx);
     ctx
 }
