@@ -1272,16 +1272,8 @@ mod tests {
     use datafusion::datasource::MemTable;
     use std::collections::HashMap as StdHashMap;
     use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn test_temp_dir(prefix: &str) -> std::path::PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX_EPOCH")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("{prefix}-{}-{now}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        path
+    fn test_temp_dir(_prefix: &str) -> tempfile::TempDir {
+        tempfile::tempdir().expect("create temp dir")
     }
 
     /// Create a KV store, a VCF MemTable input, execute KvLookupExec with a
@@ -1295,14 +1287,15 @@ mod tests {
         allowed_failed: i64,
     ) -> StdHashMap<ColocatedKey, ColocatedSinkValue> {
         let cache_dir = test_temp_dir("vep-kv-coloc");
-        let store = VepKvStore::create(&cache_dir, cache_schema).unwrap();
+        let store = VepKvStore::create(cache_dir.path(), cache_schema).unwrap();
         for (chrom, start, entry) in &entries {
             store.put_position_entry(chrom, *start, entry).unwrap();
         }
         store.persist().unwrap();
         drop(store);
 
-        let reopened_store = Arc::new(VepKvStore::open(&cache_dir).expect("reopen KV store"));
+        let reopened_store =
+            Arc::new(VepKvStore::open(cache_dir.path()).expect("reopen KV store"));
 
         let vcf_schema = vcf_batch.schema();
         let vcf_mem = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
@@ -1342,9 +1335,7 @@ mod tests {
 
         let guard = sink.lock().unwrap();
         guard.clone()
-
-        // Cleanup
-        // let _ = std::fs::remove_dir_all(&cache_dir);
+        // cache_dir dropped here → temp directory cleaned up
     }
 
     fn simple_cache_schema() -> Arc<Schema> {
@@ -1387,11 +1378,12 @@ mod tests {
     async fn test_kv_lookup_empty_input() {
         let cache_schema = simple_cache_schema();
         let cache_dir = test_temp_dir("vep-kv-empty");
-        let store = VepKvStore::create(&cache_dir, cache_schema.clone()).unwrap();
+        let store = VepKvStore::create(cache_dir.path(), cache_schema.clone()).unwrap();
         store.persist().unwrap();
         drop(store);
 
-        let reopened_store = Arc::new(VepKvStore::open(&cache_dir).expect("reopen KV store"));
+        let reopened_store =
+            Arc::new(VepKvStore::open(cache_dir.path()).expect("reopen KV store"));
 
         // Create an empty VCF batch (0 rows).
         let vcf_schema = Arc::new(Schema::new(vec![

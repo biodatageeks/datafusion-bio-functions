@@ -295,6 +295,14 @@ impl CacheBuilder {
             let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
 
             let df = ctx.sql(query).await?;
+            if log::log_enabled!(log::Level::Debug) {
+                let plan = df.clone().create_physical_plan().await?;
+                log::debug!(
+                    "[{chrom_label}] physical plan:\n{}",
+                    datafusion::physical_plan::displayable(plan.as_ref())
+                        .indent(true)
+                );
+            }
             let mut stream = df.execute_stream().await?;
             let schema = stream.schema();
             let sk = sort_key(kind);
