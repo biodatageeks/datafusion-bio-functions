@@ -274,60 +274,88 @@ impl CacheBuilder {
         let mut fjall_total_variants = 0u64;
         let mut fjall_total_bytes = 0u64;
 
-        // Process main chromosomes in chrom_code order (each gets its own parquet file),
-        // then all non-main contigs together as other.parquet.
-        let mut chrom_batches: Vec<(&str, String, String)> = Vec::new(); // (label, query, output)
+        // Column indices for fjall (cached once since schema is constant)
+        let fjall_col_info = fjall_state.as_ref().map(|state| {
+            let chrom_col_idx = state.schema.index_of("chrom").unwrap();
+            let start_col_idx = state.schema.index_of("start").unwrap();
+            let allele_col_idx = state.schema.index_of("allele_string").unwrap();
+            let col_indices: Vec<usize> = (0..state.schema.fields().len())
+                .filter(|&i| i != chrom_col_idx && i != start_col_idx)
+                .collect();
+            (chrom_col_idx, start_col_idx, allele_col_idx, col_indices)
+        });
+
+        // Build a unified processing list: main chroms (in chrom_code order)
+        // then non-main contigs (sorted by hash-based chrom_code for ascending
+        // fjall keys). Main chroms get individual parquet files; other contigs
+        // share other.parquet. All contigs feed fjall.
+        //
+        // Each entry: (chrom, output_path, is_other)
+        let mut chrom_batches: Vec<(String, String, bool)> = Vec::new();
         for chrom in CHROM_CODE_ORDER {
             if main_chroms.iter().any(|c| c == chrom) {
-                let ctx_query = build_query(kind, table_name, Some(chrom));
                 let out = format!("{}/variation/chr{chrom}.parquet", self.output_dir);
-                chrom_batches.push((chrom, ctx_query, out));
+                chrom_batches.push((chrom.to_string(), out, false));
             }
         }
-        if !other_chroms.is_empty() {
-            let refs: Vec<&str> = other_chroms.iter().map(|s| s.as_str()).collect();
-            let query = build_query_multi_chrom(kind, table_name, &refs);
-            let out = format!("{}/variation/other.parquet", self.output_dir);
-            chrom_batches.push(("other", query, out));
+
+        // Sort non-main contigs by chrom_code for ascending fjall key order
+        let mut sorted_other = other_chroms.clone();
+        sorted_other.sort_by_key(|c| chrom_to_code(c));
+        if !sorted_other.is_empty() {
+            use crate::kv_cache::key_encoding::validate_non_canonical_contigs;
+            let refs: Vec<&str> = sorted_other.iter().map(|s| s.as_str()).collect();
+            validate_non_canonical_contigs(&refs);
+
+            let other_out = format!("{}/variation/other.parquet", self.output_dir);
+            info!(
+                "variation: {} non-main contigs → other.parquet + fjall",
+                sorted_other.len()
+            );
+            for chrom in &sorted_other {
+                chrom_batches.push((chrom.clone(), other_out.clone(), true));
+            }
         }
 
-        for (chrom_label, query, output_file) in &chrom_batches {
-            let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let mut accum: Option<PositionAccumulator> = None;
+        let mut total_parquet_rows: usize = 0;
 
-            let df = ctx.sql(query).await?;
+        // Shared writer for other.parquet (opened lazily)
+        let mut other_writer: Option<ArrowWriter<File>> = None;
+        let mut other_total_rows = 0usize;
+
+        for (chrom, output_file, is_other) in &chrom_batches {
+            let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+            let query = build_query(kind, table_name, Some(chrom));
+
+            let df = ctx.sql(&query).await?;
             let plan = df.create_physical_plan().await?;
-            info!(
-                "variation: [{chrom_label}] physical plan ({} output partitions):\n{}",
-                plan.properties().partitioning.partition_count(),
-                datafusion::physical_plan::displayable(plan.as_ref())
-                    .indent(true)
-            );
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "variation: [{chrom}] physical plan ({} partitions):\n{}",
+                    plan.properties().partitioning.partition_count(),
+                    datafusion::physical_plan::displayable(plan.as_ref())
+                        .indent(true)
+                );
+            }
             let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
             let schema = stream.schema();
             let sk = sort_key(kind);
-            let mut writer = create_writer(output_file, &schema, kind, sk, None)?;
 
-            // Column indices for fjall (cached per chrom since schema is constant)
-            let fjall_col_info = fjall_state.as_ref().map(|state| {
-                let chrom_col_idx = state.schema.index_of("chrom").unwrap();
-                let start_col_idx = state.schema.index_of("start").unwrap();
-                let allele_col_idx = state.schema.index_of("allele_string").unwrap();
-                let col_indices: Vec<usize> = (0..state.schema.fields().len())
-                    .filter(|&i| i != chrom_col_idx && i != start_col_idx)
-                    .collect();
-                (chrom_col_idx, start_col_idx, allele_col_idx, col_indices)
-            });
+            // For main chroms: create a new writer per chrom.
+            // For other contigs: use shared other_writer (opened lazily).
+            let mut main_writer: Option<ArrowWriter<File>> = None;
+            let writer = if *is_other {
+                if other_writer.is_none() {
+                    other_writer = Some(create_writer(output_file, &schema, kind, sk, None)?);
+                }
+                other_writer.as_mut().unwrap()
+            } else {
+                main_writer = Some(create_writer(output_file, &schema, kind, sk, None)?);
+                main_writer.as_mut().unwrap()
+            };
 
             let mut chrom_rows = 0usize;
-            let mut total_parquet_rows = parquet_results.iter().map(|(_, r)| *r).sum::<usize>();
-
-            // Skip fjall ingestion for "other" contigs — hashed chrom codes
-            // don't have a deterministic order compatible with start_ingestion().
-            // Non-canonical contigs fall back to parquet-based annotation.
-            let is_main_chrom = *chrom_label != "other";
-
-            // Accumulator for grouping adjacent rows with same (chrom, start)
-            let mut accum: Option<PositionAccumulator> = None;
 
             while let Some(batch_result) = stream.next().await {
                 let batch = batch_result?;
@@ -335,97 +363,106 @@ impl CacheBuilder {
                     continue;
                 }
 
-                // Write to parquet
                 writer.write(&batch)?;
                 chrom_rows += batch.num_rows();
                 total_parquet_rows += batch.num_rows();
 
                 if let Some(ref cb) = self.on_progress {
-                    cb(
-                        "variation",
-                        "parquet",
-                        batch.num_rows(),
-                        total_parquet_rows,
-                        0,
-                    );
+                    cb("variation", "parquet", batch.num_rows(), total_parquet_rows, 0);
                 }
 
-                // Feed fjall ingestion
-                if is_main_chrom {
-                    if let (
-                        Some(ing),
-                        Some((chrom_col_idx, start_col_idx, allele_col_idx, col_indices)),
-                    ) = (&mut ingestion, &fjall_col_info)
-                    {
-                        let starts = batch.column(*start_col_idx).as_primitive::<Int64Type>();
-                        let chrom_col = batch.column(*chrom_col_idx);
+                // Feed fjall ingestion (all contigs, not just main chroms)
+                if let (
+                    Some(ing),
+                    Some((chrom_col_idx, start_col_idx, allele_col_idx, col_indices)),
+                ) = (&mut ingestion, &fjall_col_info)
+                {
+                    let starts = batch.column(*start_col_idx).as_primitive::<Int64Type>();
+                    let chrom_col = batch.column(*chrom_col_idx);
 
-                        for row in 0..batch.num_rows() {
-                            let start = starts.value(row);
-                            let row_chrom = string_value(chrom_col.as_ref(), row);
-                            let chrom_code = chrom_to_code(row_chrom);
+                    for row in 0..batch.num_rows() {
+                        let start = starts.value(row);
+                        let row_chrom = string_value(chrom_col.as_ref(), row);
+                        let chrom_code = chrom_to_code(row_chrom);
 
-                            let should_flush = accum
-                                .as_ref()
-                                .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
+                        let should_flush = accum
+                            .as_ref()
+                            .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
 
-                            if should_flush {
-                                let a = accum.take().unwrap();
-                                let (key, value) =
-                                    a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
-                                ing.write(&key, &value)
-                                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                                fjall_total_positions += 1;
-                                fjall_total_bytes += value.len() as u64;
-                            }
+                        if should_flush {
+                            let a = accum.take().unwrap();
+                            let (key, value) =
+                                a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
+                            ing.write(&key, &value)
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            fjall_total_positions += 1;
+                            fjall_total_bytes += value.len() as u64;
+                        }
 
-                            fjall_total_variants += 1;
+                        fjall_total_variants += 1;
 
-                            match &mut accum {
-                                Some(a) => a.add_row(row, &batch),
-                                None => {
-                                    accum = Some(PositionAccumulator::new(
-                                        chrom_code,
-                                        row_chrom.to_string(),
-                                        start,
-                                        row,
-                                        &batch,
-                                    ));
-                                }
+                        match &mut accum {
+                            Some(a) => a.add_row(row, &batch),
+                            None => {
+                                accum = Some(PositionAccumulator::new(
+                                    chrom_code,
+                                    row_chrom.to_string(),
+                                    start,
+                                    row,
+                                    &batch,
+                                ));
                             }
                         }
                     }
-                } // is_main_chrom
+                }
             }
-            writer.close().map_err(|e| {
+
+            // Flush fjall accumulator between chromosomes
+            if let (Some(ing), Some((_, _, allele_col_idx, col_indices))) =
+                (&mut ingestion, &fjall_col_info)
+            {
+                if let Some(a) = accum.take() {
+                    let (key, value) =
+                        a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
+                    ing.write(&key, &value)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    fjall_total_positions += 1;
+                    fjall_total_bytes += value.len() as u64;
+                }
+                if let Some(ref cb) = self.on_progress {
+                    cb("variation", "fjall", 0, fjall_total_positions as usize, 0);
+                }
+            }
+
+            // Close main-chrom writer; other_writer stays open across contigs
+            if let Some(w) = main_writer {
+                w.close().map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+                })?;
+            }
+
+            if *is_other {
+                other_total_rows += chrom_rows;
+            } else if chrom_rows > 0 {
+                parquet_results.push((output_file.clone(), chrom_rows));
+                info!("variation: {chrom} {} rows", format_rows(chrom_rows));
+            }
+        }
+
+        // Close shared other.parquet writer
+        if let Some(w) = other_writer {
+            w.close().map_err(|e| {
                 DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
             })?;
-
-            if chrom_rows > 0 {
-                parquet_results.push((output_file.clone(), chrom_rows));
-                info!("variation: {chrom_label} {} rows", format_rows(chrom_rows));
-            }
-
-            // Flush accumulated fjall positions for this chrom batch
-            // (the last position won't have been flushed by key-change)
-            if is_main_chrom {
-                if let (Some(ing), Some((_, _, allele_col_idx, col_indices))) =
-                    (&mut ingestion, &fjall_col_info)
-                {
-                    if let Some(a) = accum.take() {
-                        let (key, value) =
-                            a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
-                        ing.write(&key, &value)
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                        fjall_total_positions += 1;
-                        fjall_total_bytes += value.len() as u64;
-                    }
-
-                    if let Some(ref cb) = self.on_progress {
-                        cb("variation", "fjall", 0, fjall_total_positions as usize, 0);
-                    }
-                }
-            } // is_main_chrom (flush)
+        }
+        if other_total_rows > 0 {
+            let other_out = format!("{}/variation/other.parquet", self.output_dir);
+            parquet_results.push((other_out, other_total_rows));
+            info!(
+                "variation: other {} rows ({} contigs)",
+                format_rows(other_total_rows),
+                sorted_other.len()
+            );
         }
 
         // Finalize fjall
@@ -2238,6 +2275,36 @@ mod tests {
             return;
         }
 
+        // Check chr1 file size and bgzf block count
+        let chr1_file = std::path::Path::new(cache_root).join("1/all_vars.gz");
+        if chr1_file.exists() {
+            let file_size = std::fs::metadata(&chr1_file).unwrap().len();
+            eprintln!(
+                "chr1 all_vars.gz: {:.1} MB ({file_size} bytes)",
+                file_size as f64 / 1_048_576.0
+            );
+            // Count bgzf blocks
+            let mut f = std::fs::File::open(&chr1_file).unwrap();
+            let mut header = [0u8; 18];
+            let mut block_count = 0u64;
+            let mut pos = 0u64;
+            use std::io::Read;
+            use std::io::Seek;
+            while pos + 28 <= file_size {
+                f.seek(std::io::SeekFrom::Start(pos)).unwrap();
+                if f.read_exact(&mut header).is_err() {
+                    break;
+                }
+                if header[0] != 0x1f || header[1] != 0x8b {
+                    break;
+                }
+                let bsize = u16::from_le_bytes([header[16], header[17]]) as u64 + 1;
+                block_count += 1;
+                pos += bsize;
+            }
+            eprintln!("chr1 bgzf blocks: {block_count}");
+        }
+
         let partitions = 8;
         let ctx = make_ctx_and_register(
             cache_root,
@@ -2264,13 +2331,25 @@ mod tests {
             "should not have CoalescePartitionsExec"
         );
 
-        // Execute and verify rows come out
+        // Extract partition count from the EnsemblCacheExec in the plan
+        eprintln!("Top-level output partitions: {}", plan.properties().partitioning.partition_count());
+
+        // Execute and track thread IDs
+        let thread_ids: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let tid_clone = thread_ids.clone();
+
         let mut stream =
             datafusion::physical_plan::execute_stream(plan, ctx.task_ctx()).unwrap();
         let mut total_rows = 0usize;
         let mut prev_start: Option<i64> = None;
+        let mut batch_count = 0usize;
         while let Some(batch) = stream.next().await {
             let batch = batch.unwrap();
+            {
+                let tid = std::thread::current().id();
+                tid_clone.lock().unwrap().insert(tid);
+            }
             let starts = batch
                 .column_by_name("start")
                 .unwrap()
@@ -2288,8 +2367,161 @@ mod tests {
                 prev_start = Some(s);
             }
             total_rows += batch.num_rows();
+            batch_count += 1;
+            if batch_count <= 3 || batch_count % 1000 == 0 {
+                eprintln!("  batch {batch_count}: {} rows, last_start={:?}", batch.num_rows(), prev_start);
+            }
         }
-        eprintln!("Total chr1 rows: {total_rows}");
+        let unique_consumer_threads = thread_ids.lock().unwrap().len();
+        eprintln!("Total chr1 rows: {total_rows} in {batch_count} batches");
+        eprintln!("Unique consumer thread IDs: {unique_consumer_threads}");
         assert!(total_rows > 100_000, "expected substantial row count for chr1, got {total_rows}");
+    }
+
+    // -----------------------------------------------------------------------
+    // other-chroms sorting and fjall key ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_other_chroms_sorted_by_chrom_code() {
+        let mut contigs = vec![
+            "GL000220.1".to_string(),
+            "HG1012_PATCH".to_string(),
+            "KI270733.1".to_string(),
+        ];
+        contigs.sort_by_key(|c| chrom_to_code(c));
+
+        // Verify codes are ascending
+        let codes: Vec<u16> = contigs.iter().map(|c| chrom_to_code(c)).collect();
+        for w in codes.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "chrom codes not ascending: {} (code {}) > {} (code {})",
+                contigs[0],
+                w[0],
+                contigs[1],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_other_chroms_after_main_chroms_in_chrom_code() {
+        // All main chrom codes (1-25) must be less than non-canonical codes (>= 26)
+        let main_max = CHROM_CODE_ORDER
+            .iter()
+            .map(|c| chrom_to_code(c))
+            .max()
+            .unwrap();
+        let non_canonical_code = chrom_to_code("GL000220.1");
+        assert!(
+            non_canonical_code > main_max,
+            "non-canonical code {non_canonical_code} should be > main max {main_max}"
+        );
+    }
+
+    #[test]
+    fn test_chrom_batches_ordering_main_then_other() {
+        // Simulate the batch building logic
+        let main_chroms = vec!["1".to_string(), "22".to_string(), "X".to_string()];
+        let other_chroms = vec![
+            "GL000220.1".to_string(),
+            "HG1012_PATCH".to_string(),
+        ];
+
+        let mut batches: Vec<(String, bool)> = Vec::new();
+        for chrom in CHROM_CODE_ORDER {
+            if main_chroms.iter().any(|c| c == chrom) {
+                batches.push((chrom.to_string(), false));
+            }
+        }
+        let mut sorted_other = other_chroms;
+        sorted_other.sort_by_key(|c| chrom_to_code(c));
+        for chrom in &sorted_other {
+            batches.push((chrom.clone(), true));
+        }
+
+        // Verify all main chroms come first
+        let main_end = batches.iter().position(|(_, is_other)| *is_other);
+        if let Some(idx) = main_end {
+            assert!(
+                batches[..idx].iter().all(|(_, is_other)| !is_other),
+                "all entries before first other should be main chroms"
+            );
+            assert!(
+                batches[idx..].iter().all(|(_, is_other)| *is_other),
+                "all entries after first other should be other chroms"
+            );
+        }
+
+        // Verify chrom_codes are globally ascending
+        let codes: Vec<u16> = batches.iter().map(|(c, _)| chrom_to_code(c)).collect();
+        for w in codes.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "chrom codes not strictly ascending: {} >= {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_query_single_chrom_for_other() {
+        // Verify that per-contig queries use single WHERE chrom = '...'
+        // instead of massive IN clause
+        let q = build_query(EnsemblEntityKind::Variation, "var", Some("GL000220.1"));
+        assert_eq!(
+            q,
+            "SELECT * FROM var WHERE chrom = 'GL000220.1' ORDER BY chrom, start"
+        );
+        // Should NOT contain IN clause
+        assert!(!q.contains("IN ("));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // requires real VEP cache
+    async fn test_real_cache_chroms_from_schema() {
+        let cache_root = "/Users/mwiewior/research/data/vep/homo_sapiens/115_GRCh38";
+        if !std::path::Path::new(cache_root).exists() {
+            return;
+        }
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            1,
+        )
+        .unwrap();
+        let table = ctx.table("var").await.unwrap();
+        let schema = table.schema().inner().clone();
+        let chroms = chroms_from_schema(&schema);
+        eprintln!("chroms_from_schema: {:?}", chroms.as_ref().map(|c| c.len()));
+        if let Some(ref all) = chroms {
+            let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
+            let main_count = all.iter().filter(|c| main_set.contains(c.as_str())).count();
+            let other_count = all.len() - main_count;
+            eprintln!("main: {main_count}, other: {other_count}");
+            eprintln!("first 10: {:?}", &all[..all.len().min(10)]);
+            eprintln!("contains MT: {}", all.iter().any(|c| c == "MT"));
+        } else {
+            eprintln!("WARNING: chroms_from_schema returned None!");
+            eprintln!("Schema metadata keys: {:?}", schema.metadata().keys().collect::<Vec<_>>());
+        }
+        assert!(chroms.is_some(), "chroms_from_schema should not be None for real VEP cache");
+        let all = chroms.unwrap();
+        assert!(all.len() > 25, "expected >25 chroms, got {}", all.len());
+    }
+
+    #[test]
+    fn test_mt_included_in_main_chrom_code_order() {
+        // MT is in CHROM_CODE_ORDER but not in MAIN_CHROMS — verify it's
+        // processed via the main chrom loop (it has a canonical code)
+        assert!(CHROM_CODE_ORDER.contains(&"MT"));
+        assert!(!MAIN_CHROMS.contains(&"MT"));
+        // MT gets processed in the main loop IF present in the discovered chroms.
+        // Its code (25) is less than NON_CANONICAL_START (26), so fjall ordering
+        // is correct: main codes 1-25 < non-canonical codes >= 26.
+        assert!(chrom_to_code("MT") < 26);
     }
 }
