@@ -1442,7 +1442,6 @@ fn make_ctx_and_register(
     let ctx = SessionContext::new_with_config(config);
     let mut options = EnsemblCacheOptions::new(cache_root);
     options.target_partitions = Some(partitions);
-    options.max_storable_partitions = Some(2);
     let provider = EnsemblCacheTableProvider::for_entity(kind, options)?;
     ctx.register_table(table_name, provider)?;
     Ok(ctx)
@@ -2224,5 +2223,73 @@ mod tests {
         let preds = store.get("ENST00000333333").unwrap().unwrap();
         assert_eq!(preds.sift.len(), 1);
         assert_eq!(preds.sift[0].position, 42);
+    }
+
+    /// Verify that the variation query against a real tabix VEP cache
+    /// produces a parallel plan with SortPreservingMergeExec.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // requires real VEP cache at well-known path
+    async fn test_tabix_variation_plan_is_parallel() {
+        use datafusion::physical_plan::displayable;
+
+        let cache_root = "/Users/mwiewior/research/data/vep/homo_sapiens/115_GRCh38";
+        if !std::path::Path::new(cache_root).exists() {
+            eprintln!("Skipping: VEP cache not found at {cache_root}");
+            return;
+        }
+
+        let partitions = 8;
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            partitions,
+        )
+        .unwrap();
+
+        let query = "SELECT * FROM var WHERE chrom = '1' ORDER BY chrom, start";
+        let df = ctx.sql(query).await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let plan_str =
+            format!("{}", displayable(plan.as_ref()).indent(true));
+        eprintln!("Plan:\n{plan_str}");
+
+        assert!(
+            plan_str.contains("SortPreservingMergeExec"),
+            "expected SortPreservingMergeExec for tabix parallel plan"
+        );
+        assert!(
+            !plan_str.contains("CoalescePartitionsExec"),
+            "should not have CoalescePartitionsExec"
+        );
+
+        // Execute and verify rows come out
+        let mut stream =
+            datafusion::physical_plan::execute_stream(plan, ctx.task_ctx()).unwrap();
+        let mut total_rows = 0usize;
+        let mut prev_start: Option<i64> = None;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let starts = batch
+                .column_by_name("start")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .unwrap();
+            for i in 0..starts.len() {
+                let s = starts.value(i);
+                if let Some(prev) = prev_start {
+                    assert!(
+                        s >= prev,
+                        "rows not sorted: {s} < {prev}"
+                    );
+                }
+                prev_start = Some(s);
+            }
+            total_rows += batch.num_rows();
+        }
+        eprintln!("Total chr1 rows: {total_rows}");
+        assert!(total_rows > 100_000, "expected substantial row count for chr1, got {total_rows}");
     }
 }
