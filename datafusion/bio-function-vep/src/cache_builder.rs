@@ -342,14 +342,12 @@ impl CacheBuilder {
 
             let df = ctx.sql(&query).await?;
             let plan = df.create_physical_plan().await?;
-            if log::log_enabled!(log::Level::Debug) {
-                log::debug!(
-                    "variation: [{chrom}] physical plan ({} partitions):\n{}",
-                    plan.properties().partitioning.partition_count(),
-                    datafusion::physical_plan::displayable(plan.as_ref())
-                        .indent(true)
-                );
-            }
+            info!(
+                "variation: [{chrom}] physical plan ({} output partitions):\n{}",
+                plan.properties().partitioning.partition_count(),
+                datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(true)
+            );
             let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
             let schema = stream.schema();
             let sk = sort_key(kind);
