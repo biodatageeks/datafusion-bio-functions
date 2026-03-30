@@ -299,19 +299,31 @@ impl CacheBuilder {
             }
         }
 
-        // Sort non-main contigs by chrom_code for ascending fjall key order
+        // Register non-canonical contigs with collision-free sequential codes,
+        // then sort by the assigned code for ascending fjall key order.
+        if !other_chroms.is_empty() {
+            use crate::kv_cache::key_encoding::register_non_canonical_contigs;
+
+            let refs: Vec<&str> = other_chroms.iter().map(|s| s.as_str()).collect();
+            let mapping = register_non_canonical_contigs(&refs);
+
+            // Store the mapping in fjall for read-time lookup
+            if let Some(ref state) = fjall_state {
+                state.store.store_contig_codes(&mapping)?;
+            }
+
+            info!(
+                "variation: {} non-main contigs registered ({} codes) → other.parquet + fjall",
+                other_chroms.len(),
+                mapping.len()
+            );
+        }
+
+        // Now sort other_chroms by their (collision-free) code
         let mut sorted_other = other_chroms.clone();
         sorted_other.sort_by_key(|c| chrom_to_code(c));
         if !sorted_other.is_empty() {
-            use crate::kv_cache::key_encoding::validate_non_canonical_contigs;
-            let refs: Vec<&str> = sorted_other.iter().map(|s| s.as_str()).collect();
-            validate_non_canonical_contigs(&refs);
-
             let other_out = format!("{}/variation/other.parquet", self.output_dir);
-            info!(
-                "variation: {} non-main contigs → other.parquet + fjall",
-                sorted_other.len()
-            );
             for chrom in &sorted_other {
                 chrom_batches.push((chrom.clone(), other_out.clone(), true));
             }

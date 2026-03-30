@@ -6,7 +6,7 @@
 //! All variants at the same `(chrom, start)` are merged into a single entry.
 
 use ahash::AHashMap;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, RwLock};
 
 /// Canonical chromosome order: 1-22, X, Y, MT.
 /// Maps chromosome name (without "chr" prefix) to a 2-byte big-endian code.
@@ -34,23 +34,53 @@ const CHROM_NAMES: &[&str] = &[
 /// Non-canonical range starts at 26 to avoid colliding with MT.
 const NON_CANONICAL_START: u16 = 26;
 
+/// Global registry for non-canonical contig → code mappings.
+///
+/// Populated at cache-build time via [`register_non_canonical_contigs`] and
+/// at cache-open time via [`load_non_canonical_registry`]. Lookup is O(1)
+/// via the RwLock read path.
+static NON_CANONICAL_REGISTRY: LazyLock<RwLock<AHashMap<String, u16>>> =
+    LazyLock::new(|| RwLock::new(AHashMap::new()));
+
+/// Reverse mapping: code → contig name for non-canonical contigs.
+static NON_CANONICAL_CODE_TO_NAME: LazyLock<RwLock<AHashMap<u16, String>>> =
+    LazyLock::new(|| RwLock::new(AHashMap::new()));
+
 /// Map a chromosome name (with or without "chr" prefix) to its 2-byte code.
 ///
 /// Canonical chromosomes (1-22, X, Y, MT) get codes 0x0001..0x0019.
-/// Non-canonical contigs get deterministic codes >= 0x8000.
+/// Non-canonical contigs are looked up in the registry (populated at build/open time).
+/// Falls back to FNV-1a hash if the registry has not been populated.
 pub fn chrom_to_code(chrom: &str) -> u16 {
     let chrom_bare = chrom.strip_prefix("chr").unwrap_or(chrom);
-    CHROM_TO_CODE
-        .get(chrom_bare)
-        .copied()
-        .unwrap_or_else(|| non_canonical_code(chrom_bare))
+    if let Some(&code) = CHROM_TO_CODE.get(chrom_bare) {
+        return code;
+    }
+    // Check the non-canonical registry
+    if let Ok(reg) = NON_CANONICAL_REGISTRY.read() {
+        if let Some(&code) = reg.get(chrom_bare) {
+            return code;
+        }
+    }
+    // Fallback: FNV-1a hash (used before registry is populated, e.g. during
+    // initial schema discovery or if the cache was built without a registry)
+    fnv1a_code(chrom_bare)
 }
 
 /// Map a 2-byte chromosome code back to its name.
 ///
-/// Returns `None` for non-canonical codes.
-pub fn code_to_chrom(code: u16) -> Option<&'static str> {
-    CODE_TO_CHROM.get(&code).copied()
+/// Returns `None` for codes not found in either the canonical or
+/// non-canonical registry.
+pub fn code_to_chrom(code: u16) -> Option<String> {
+    if let Some(&name) = CODE_TO_CHROM.get(&code) {
+        return Some(name.to_string());
+    }
+    if let Ok(reg) = NON_CANONICAL_CODE_TO_NAME.read() {
+        if let Some(name) = reg.get(&code) {
+            return Some(name.clone());
+        }
+    }
+    None
 }
 
 /// Encode a position key: `[2B chrom_code BE][8B start BE]` = 10 bytes.
@@ -70,10 +100,7 @@ pub fn decode_position_key(key: &[u8]) -> (String, i64) {
     let code = u16::from_be_bytes([key[0], key[1]]);
     let start = i64::from_be_bytes(key[2..10].try_into().unwrap());
 
-    let chrom = CODE_TO_CHROM
-        .get(&code)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("unk_{code:04x}"));
+    let chrom = code_to_chrom(code).unwrap_or_else(|| format!("unk_{code:04x}"));
 
     (chrom, start)
 }
@@ -87,11 +114,82 @@ pub fn encode_position_key_buf(chrom_code: u16, start: i64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&start.to_be_bytes());
 }
 
-/// Deterministic code for non-canonical chromosomes.
-/// Uses FNV-1a hash to assign stable codes in the range
-/// `NON_CANONICAL_START..=u16::MAX` (65510 possible values).
-/// Lock-free — safe for the hot read path.
-fn non_canonical_code(chrom: &str) -> u16 {
+/// Register non-canonical contigs with collision-free sequential codes.
+///
+/// Contigs are sorted lexicographically and assigned codes starting from
+/// [`NON_CANONICAL_START`] (26). This guarantees no collisions and produces
+/// a deterministic mapping for the same input set.
+///
+/// Returns the mapping as a `Vec<(String, u16)>` for persistence.
+///
+/// # Panics
+///
+/// Panics if there are more non-canonical contigs than fit in the u16 range
+/// (65,510 slots), which is practically impossible.
+pub fn register_non_canonical_contigs(contigs: &[&str]) -> Vec<(String, u16)> {
+    let mut non_canonical: Vec<&str> = contigs
+        .iter()
+        .copied()
+        .filter(|c| !CHROM_TO_CODE.contains_key(c))
+        .collect();
+    non_canonical.sort();
+    non_canonical.dedup();
+
+    assert!(
+        non_canonical.len() <= (u16::MAX - NON_CANONICAL_START + 1) as usize,
+        "too many non-canonical contigs: {} (max {})",
+        non_canonical.len(),
+        u16::MAX - NON_CANONICAL_START + 1
+    );
+
+    let mapping: Vec<(String, u16)> = non_canonical
+        .iter()
+        .enumerate()
+        .map(|(i, &name)| (name.to_string(), NON_CANONICAL_START + i as u16))
+        .collect();
+
+    // Populate the global registry
+    let mut reg = NON_CANONICAL_REGISTRY.write().unwrap();
+    reg.clear();
+    let mut rev = NON_CANONICAL_CODE_TO_NAME.write().unwrap();
+    rev.clear();
+    for (name, code) in &mapping {
+        reg.insert(name.clone(), *code);
+        rev.insert(*code, name.clone());
+    }
+
+    mapping
+}
+
+/// Load a previously persisted contig→code mapping into the global registry.
+///
+/// Called at cache-open time from `VepKvStore::open()`.
+pub fn load_non_canonical_registry(mapping: &[(String, u16)]) {
+    let mut reg = NON_CANONICAL_REGISTRY.write().unwrap();
+    reg.clear();
+    let mut rev = NON_CANONICAL_CODE_TO_NAME.write().unwrap();
+    rev.clear();
+    for (name, code) in mapping {
+        reg.insert(name.clone(), *code);
+        rev.insert(*code, name.clone());
+    }
+}
+
+/// Serialize a contig→code mapping to JSON bytes for storage in fjall meta.
+pub fn serialize_contig_codes(mapping: &[(String, u16)]) -> Vec<u8> {
+    serde_json::to_vec(mapping).expect("contig codes should be JSON-serializable")
+}
+
+/// Deserialize a contig→code mapping from JSON bytes.
+pub fn deserialize_contig_codes(bytes: &[u8]) -> Option<Vec<(String, u16)>> {
+    serde_json::from_slice(bytes).ok()
+}
+
+/// FNV-1a hash for non-canonical chromosomes (legacy fallback).
+///
+/// Used when the registry has not been populated (e.g. caches built before
+/// the registry was introduced). May produce collisions with large contig sets.
+fn fnv1a_code(chrom: &str) -> u16 {
     let mut hash: u32 = 0x811c_9dc5;
     for b in chrom.bytes() {
         hash ^= b as u32;
@@ -99,30 +197,6 @@ fn non_canonical_code(chrom: &str) -> u16 {
     }
     let range = (u16::MAX as u32) - (NON_CANONICAL_START as u32) + 1;
     NON_CANONICAL_START + (hash % range) as u16
-}
-
-/// Validate that a set of non-canonical contig names has no hash collisions.
-///
-/// Call this during cache creation after collecting all contig names.
-/// Panics if two different names map to the same code.
-pub fn validate_non_canonical_contigs(contigs: &[&str]) {
-    let mut seen: AHashMap<u16, &str> = AHashMap::new();
-    for &contig in contigs {
-        if CHROM_TO_CODE.get(contig).is_some() {
-            continue; // canonical — skip
-        }
-        let code = non_canonical_code(contig);
-        if let Some(&existing) = seen.get(&code) {
-            if existing != contig {
-                panic!(
-                    "non-canonical contig hash collision: '{}' and '{}' both map to code {}",
-                    existing, contig, code
-                );
-            }
-        } else {
-            seen.insert(code, contig);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -193,7 +267,7 @@ mod tests {
         for chrom in CHROM_NAMES.iter().chain(&["X", "Y", "MT"]) {
             let code = chrom_to_code(chrom);
             let decoded = code_to_chrom(code).unwrap();
-            assert_eq!(&decoded, chrom, "roundtrip failed for {chrom}");
+            assert_eq!(decoded, *chrom, "roundtrip failed for {chrom}");
         }
     }
 
@@ -215,27 +289,93 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_non_canonical_contigs_no_collision() {
-        // Should not panic for distinct contigs.
-        validate_non_canonical_contigs(&["GL000220.1", "KI270733.1", "chrUn_gl000220"]);
+    fn test_register_non_canonical_contigs_no_collisions() {
+        let contigs = vec!["LRG_1278", "LRG_8", "GL000220.1", "KI270733.1"];
+        let mapping = register_non_canonical_contigs(&contigs);
+
+        // All codes must be unique
+        let codes: Vec<u16> = mapping.iter().map(|(_, c)| *c).collect();
+        let unique: std::collections::HashSet<u16> = codes.iter().copied().collect();
+        assert_eq!(codes.len(), unique.len(), "codes must be unique");
+
+        // All codes >= NON_CANONICAL_START
+        assert!(codes.iter().all(|&c| c >= NON_CANONICAL_START));
+
+        // Codes are sequential (sorted input)
+        let mut sorted_names: Vec<&str> = contigs.iter().copied().collect();
+        sorted_names.sort();
+        sorted_names.dedup();
+        for (i, (name, code)) in mapping.iter().enumerate() {
+            assert_eq!(*code, NON_CANONICAL_START + i as u16);
+            assert_eq!(name, sorted_names[i]);
+        }
     }
 
     #[test]
-    #[should_panic(expected = "hash collision")]
-    fn test_validate_non_canonical_contigs_detects_collision() {
-        // Brute-force find two strings that collide.
-        let mut codes: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
-        let mut colliders = None;
-        for i in 0..100_000u32 {
-            let name = format!("contig_{i}");
-            let code = non_canonical_code(&name);
-            if let Some(existing) = codes.get(&code) {
-                colliders = Some((existing.clone(), name));
-                break;
-            }
-            codes.insert(code, name);
+    fn test_register_solves_real_collision() {
+        // LRG_1278 and LRG_8 collide under FNV-1a
+        assert_eq!(fnv1a_code("LRG_1278"), fnv1a_code("LRG_8"));
+
+        // After registration, they get distinct codes
+        let mapping = register_non_canonical_contigs(&["LRG_1278", "LRG_8"]);
+        let code_1278 = mapping.iter().find(|(n, _)| n == "LRG_1278").unwrap().1;
+        let code_8 = mapping.iter().find(|(n, _)| n == "LRG_8").unwrap().1;
+        assert_ne!(code_1278, code_8);
+
+        // chrom_to_code() now returns registry codes
+        assert_eq!(chrom_to_code("LRG_1278"), code_1278);
+        assert_eq!(chrom_to_code("LRG_8"), code_8);
+    }
+
+    #[test]
+    fn test_register_skips_canonical_contigs() {
+        let mapping = register_non_canonical_contigs(&["1", "GL000220.1", "X"]);
+        // Only GL000220.1 should be in the mapping
+        assert_eq!(mapping.len(), 1);
+        assert_eq!(mapping[0].0, "GL000220.1");
+    }
+
+    #[test]
+    fn test_register_deduplicates() {
+        let mapping =
+            register_non_canonical_contigs(&["GL000220.1", "GL000220.1", "KI270733.1"]);
+        assert_eq!(mapping.len(), 2);
+    }
+
+    #[test]
+    fn test_load_registry_roundtrip() {
+        let contigs = vec!["LRG_1278", "LRG_8", "GL000220.1"];
+        let mapping = register_non_canonical_contigs(&contigs);
+
+        // Serialize and deserialize
+        let bytes = serialize_contig_codes(&mapping);
+        let loaded = deserialize_contig_codes(&bytes).unwrap();
+        assert_eq!(mapping, loaded);
+
+        // Load into registry and verify
+        load_non_canonical_registry(&loaded);
+        for (name, code) in &loaded {
+            assert_eq!(chrom_to_code(name), *code);
+            assert_eq!(code_to_chrom(*code).unwrap(), *name);
         }
-        let (a, b) = colliders.expect("no collision found in 100K contigs — increase range");
-        validate_non_canonical_contigs(&[&a, &b]);
+    }
+
+    #[test]
+    fn test_sequential_codes_are_ascending() {
+        let contigs = vec!["ZZZ", "AAA", "MMM"];
+        let mapping = register_non_canonical_contigs(&contigs);
+        // Sorted lexicographically: AAA, MMM, ZZZ
+        let codes: Vec<u16> = mapping.iter().map(|(_, c)| *c).collect();
+        for w in codes.windows(2) {
+            assert!(w[0] < w[1], "codes must be strictly ascending");
+        }
+    }
+
+    #[test]
+    fn test_code_to_chrom_non_canonical_after_register() {
+        register_non_canonical_contigs(&["HG1012_PATCH"]);
+        let code = chrom_to_code("HG1012_PATCH");
+        let name = code_to_chrom(code).unwrap();
+        assert_eq!(name, "HG1012_PATCH");
     }
 }
