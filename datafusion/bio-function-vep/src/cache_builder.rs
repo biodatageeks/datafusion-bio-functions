@@ -1799,7 +1799,7 @@ impl PositionAccumulator {
 }
 
 /// Number of positions to buffer before parallel serialize+compress.
-const PARALLEL_FLUSH_BATCH: usize = 10_000;
+const PARALLEL_FLUSH_BATCH: usize = 100_000;
 
 /// Serialize and compress a batch of position accumulators in parallel,
 /// then write the results to fjall in order (preserving ascending key order).
