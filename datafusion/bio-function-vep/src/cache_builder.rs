@@ -888,27 +888,56 @@ impl CacheBuilder {
 
         let store = VepKvStore::create(Path::new(&fjall_dir), schema.clone())?;
 
-        // Register non-canonical contigs from the parquet files
-        let non_canonical: Vec<String> = parquet_files
-            .iter()
-            .filter_map(|(_, path)| {
+        // Register non-canonical contigs by scanning the actual chrom column
+        // values from other.parquet (filenames only give us "other", not the
+        // individual contig names inside).
+        {
+            let mut all_contigs: HashSet<String> = HashSet::new();
+            for (_, path) in &parquet_files {
                 let stem = Path::new(path)
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or_default();
                 let chrom = stem.strip_prefix("chr").unwrap_or(stem);
-                if chrom == "other" || CHROM_TO_CODE_SET.contains(&chrom) {
-                    None // skip canonical and "other" (handled separately)
-                } else {
-                    Some(chrom.to_string())
+                if chrom != "other" && !CHROM_TO_CODE_SET.contains(&chrom) {
+                    all_contigs.insert(chrom.to_string());
                 }
-            })
-            .collect();
-        if !non_canonical.is_empty() {
-            let refs: Vec<&str> = non_canonical.iter().map(|s| s.as_str()).collect();
-            let mapping =
-                crate::kv_cache::key_encoding::register_non_canonical_contigs(&refs);
-            store.store_contig_codes(&mapping)?;
+            }
+            // Scan other.parquet for distinct chrom values
+            let other_path = parquet_files
+                .iter()
+                .find(|(code, _)| *code == u16::MAX)
+                .map(|(_, p)| p.clone());
+            if let Some(ref other_path) = other_path {
+                read_ctx
+                    .register_parquet("_other_scan", other_path, Default::default())
+                    .await?;
+                let distinct_df = read_ctx
+                    .sql("SELECT DISTINCT chrom FROM _other_scan")
+                    .await?;
+                let batches = distinct_df.collect().await?;
+                read_ctx.deregister_table("_other_scan")?;
+                for batch in &batches {
+                    let chrom_col = batch.column(0);
+                    for row in 0..batch.num_rows() {
+                        let chrom = string_value(chrom_col.as_ref(), row);
+                        if !CHROM_TO_CODE_SET.contains(&chrom) {
+                            all_contigs.insert(chrom.to_string());
+                        }
+                    }
+                }
+            }
+
+            if !all_contigs.is_empty() {
+                let refs: Vec<&str> = all_contigs.iter().map(|s| s.as_str()).collect();
+                let mapping =
+                    crate::kv_cache::key_encoding::register_non_canonical_contigs(&refs);
+                store.store_contig_codes(&mapping)?;
+                info!(
+                    "variation: registered {} non-canonical contigs for fjall rebuild",
+                    mapping.len()
+                );
+            }
         }
 
         // Train dict from sample
