@@ -73,6 +73,7 @@ pub struct CacheBuilder {
     output_dir: String,
     partitions: usize,
     build_fjall: bool,
+    overwrite: bool,
     zstd_level: i32,
     dict_size_kb: u32,
     on_progress: Option<Arc<OnProgress>>,
@@ -85,6 +86,7 @@ impl CacheBuilder {
             output_dir: output_dir.into(),
             partitions: 8,
             build_fjall: true,
+            overwrite: false,
             zstd_level: 3,
             dict_size_kb: 112,
             on_progress: None,
@@ -98,6 +100,11 @@ impl CacheBuilder {
 
     pub fn with_build_fjall(mut self, enabled: bool) -> Self {
         self.build_fjall = enabled;
+        self
+    }
+
+    pub fn with_overwrite(mut self, overwrite: bool) -> Self {
+        self.overwrite = overwrite;
         self
     }
 
@@ -144,6 +151,12 @@ impl CacheBuilder {
     }
 
     /// Build a single entity. Returns one or more EntityStats (translation splits into two).
+    ///
+    /// When `overwrite` is false (default), skips entities whose output
+    /// already exists:
+    /// - For parquet-only entities: skips if the parquet directory contains `.parquet` files
+    /// - For variation: skips parquet if files exist, skips fjall if `variation.fjall` exists
+    /// - For translation: skips parquet if files exist, skips sift fjall if `translation_sift.fjall` exists
     pub async fn build_entity(&self, entity: &str) -> Result<Vec<EntityStats>> {
         let kind = parse_entity(entity)
             .ok_or_else(|| DataFusionError::Execution(format!("Unknown entity: {entity}")))?;
@@ -160,6 +173,20 @@ impl CacheBuilder {
                 .map_err(|e| DataFusionError::Execution(format!("Failed to create dir: {e}")))?;
             std::fs::create_dir_all(format!("{}/translation_sift", self.output_dir))
                 .map_err(|e| DataFusionError::Execution(format!("Failed to create dir: {e}")))?;
+        }
+
+        // Skip if all outputs exist (unless overwrite is set).
+        // Variation and translation have partial-skip logic in their
+        // own build methods (e.g. parquet exists but fjall missing).
+        if !self.overwrite && kind != EnsemblEntityKind::Variation && kind != EnsemblEntityKind::Translation {
+            if dir_has_parquet_files(&entity_dir) {
+                info!("{entity}: parquet already exists, skipping (use overwrite to rebuild)");
+                return Ok(vec![EntityStats {
+                    entity: subdir.to_string(),
+                    parquet_files: vec![],
+                    fjall_stats: None,
+                }]);
+            }
         }
 
         if kind == EnsemblEntityKind::Variation {
@@ -179,10 +206,37 @@ impl CacheBuilder {
         }])
     }
 
-    /// Build variation: parquet + optional fjall in a single pass per chromosome.
+    /// Build variation: parquet + optional fjall.
+    ///
+    /// When parquet files already exist and fjall is missing, reads from the
+    /// existing parquet files to populate fjall without re-parsing the source.
     async fn build_variation(&self) -> Result<Vec<EntityStats>> {
         let kind = EnsemblEntityKind::Variation;
         let table_name = "var";
+        let parquet_dir = format!("{}/variation", self.output_dir);
+        let parquet_exists = dir_has_parquet_files(&parquet_dir);
+        let fjall_dir_path = format!("{}/variation.fjall", self.output_dir);
+        let fjall_exists = Path::new(&fjall_dir_path).exists();
+
+        if !self.overwrite {
+            let need_parquet = !parquet_exists;
+            let need_fjall = self.build_fjall && !fjall_exists;
+
+            if !need_parquet && !need_fjall {
+                info!("variation: all outputs exist, skipping (use overwrite to rebuild)");
+                return Ok(vec![EntityStats {
+                    entity: "variation".to_string(),
+                    parquet_files: vec![],
+                    fjall_stats: None,
+                }]);
+            }
+
+            // Parquet exists but fjall missing → rebuild fjall from parquet
+            if !need_parquet && need_fjall {
+                info!("variation: parquet exists, building fjall from existing parquet files");
+                return self.build_variation_fjall_from_parquet().await;
+            }
+        }
 
         // Discover chromosomes from schema metadata
         let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
@@ -207,8 +261,8 @@ impl CacheBuilder {
         // --- Fjall setup ---
         let fjall_state = if self.build_fjall {
             let fjall_dir = format!("{}/variation.fjall", self.output_dir);
-            if Path::new(&fjall_dir).exists() {
-                info!("variation.fjall already exists, skipping fjall build");
+            if Path::new(&fjall_dir).exists() && !self.overwrite {
+                info!("variation.fjall already exists, skipping fjall build (use overwrite to rebuild)");
                 None
             } else {
                 // We need a schema for the VepKvStore — get it from a probe query
@@ -775,10 +829,327 @@ impl CacheBuilder {
         }
     }
 
+    /// Build variation fjall from existing parquet files.
+    ///
+    /// Reads chr*.parquet and other.parquet in chrom_code order and feeds fjall.
+    async fn build_variation_fjall_from_parquet(&self) -> Result<Vec<EntityStats>> {
+        let parquet_dir = format!("{}/variation", self.output_dir);
+        let fjall_dir = format!("{}/variation.fjall", self.output_dir);
+
+        // Discover parquet files and sort in chrom_code order
+        let mut parquet_files: Vec<(u16, String)> = Vec::new();
+        for entry in std::fs::read_dir(&parquet_dir).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to read dir {parquet_dir}: {e}"))
+        })? {
+            let entry = entry.map_err(|e| {
+                DataFusionError::Execution(format!("Failed to read dir entry: {e}"))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            // chr1.parquet → "1", other.parquet → sort last
+            let chrom = stem.strip_prefix("chr").unwrap_or(stem);
+            let code = if chrom == "other" {
+                u16::MAX
+            } else {
+                chrom_to_code(chrom)
+            };
+            parquet_files.push((code, path.to_string_lossy().to_string()));
+        }
+        parquet_files.sort_by_key(|(code, _)| *code);
+
+        if parquet_files.is_empty() {
+            return Err(DataFusionError::Execution(
+                "No parquet files found for variation fjall rebuild".to_string(),
+            ));
+        }
+
+        info!(
+            "variation: rebuilding fjall from {} parquet files",
+            parquet_files.len()
+        );
+
+        // Create fjall store
+        let read_ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(1),
+        );
+        // Probe schema from first file
+        read_ctx
+            .register_parquet("_probe", &parquet_files[0].1, Default::default())
+            .await?;
+        let probe_df = read_ctx.sql("SELECT * FROM _probe LIMIT 0").await?;
+        let schema: SchemaRef = Arc::new(probe_df.schema().as_arrow().clone());
+        read_ctx.deregister_table("_probe")?;
+
+        let store = VepKvStore::create(Path::new(&fjall_dir), schema.clone())?;
+
+        // Register non-canonical contigs from the parquet files
+        let non_canonical: Vec<String> = parquet_files
+            .iter()
+            .filter_map(|(_, path)| {
+                let stem = Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                let chrom = stem.strip_prefix("chr").unwrap_or(stem);
+                if chrom == "other" || CHROM_TO_CODE_SET.contains(&chrom) {
+                    None // skip canonical and "other" (handled separately)
+                } else {
+                    Some(chrom.to_string())
+                }
+            })
+            .collect();
+        if !non_canonical.is_empty() {
+            let refs: Vec<&str> = non_canonical.iter().map(|s| s.as_str()).collect();
+            let mapping =
+                crate::kv_cache::key_encoding::register_non_canonical_contigs(&refs);
+            store.store_contig_codes(&mapping)?;
+        }
+
+        // Train dict from sample
+        let dict = {
+            read_ctx
+                .register_parquet("_sample", &parquet_files[0].1, Default::default())
+                .await?;
+            let sample_df = read_ctx.sql("SELECT * FROM _sample LIMIT 10000").await?;
+            let batches = sample_df.collect().await?;
+            read_ctx.deregister_table("_sample")?;
+            self.train_dict_from_batches(&store, &schema, &batches)
+                .await?
+        };
+
+        let mut compressor = dict.as_ref().map(|d| {
+            zstd::bulk::Compressor::with_dictionary(self.zstd_level, d)
+                .expect("create zstd compressor")
+        });
+
+        // Start ingestion
+        let mut ing = store
+            .data_partition()
+            .start_ingestion()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let chrom_col_idx = schema.index_of("chrom")?;
+        let start_col_idx = schema.index_of("start")?;
+        let allele_col_idx = schema.index_of("allele_string")?;
+        let col_indices: Vec<usize> = (0..schema.fields().len())
+            .filter(|&i| i != chrom_col_idx && i != start_col_idx)
+            .collect();
+
+        let mut accum: Option<PositionAccumulator> = None;
+        let mut total_positions = 0u64;
+        let mut total_variants = 0u64;
+        let mut total_bytes = 0u64;
+        let start_time = Instant::now();
+
+        for (_, parquet_path) in &parquet_files {
+            read_ctx
+                .register_parquet("_part", parquet_path, Default::default())
+                .await?;
+            let batches = read_ctx
+                .sql("SELECT * FROM _part ORDER BY chrom, start")
+                .await?
+                .collect()
+                .await?;
+            read_ctx.deregister_table("_part")?;
+
+            for batch in &batches {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
+                let chrom_col = batch.column(chrom_col_idx);
+
+                for row in 0..batch.num_rows() {
+                    let start = starts.value(row);
+                    let row_chrom = string_value(chrom_col.as_ref(), row);
+                    let chrom_code = chrom_to_code(row_chrom);
+
+                    let should_flush = accum
+                        .as_ref()
+                        .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
+
+                    if should_flush {
+                        let a = accum.take().unwrap();
+                        let (key, value) =
+                            a.finish_entry(&col_indices, allele_col_idx, &mut compressor)?;
+                        ing.write(&key, &value)
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                        total_positions += 1;
+                        total_bytes += value.len() as u64;
+                    }
+
+                    total_variants += 1;
+
+                    match &mut accum {
+                        Some(a) => a.add_row(row, batch),
+                        None => {
+                            accum = Some(PositionAccumulator::new(
+                                chrom_code,
+                                row_chrom.to_string(),
+                                start,
+                                row,
+                                batch,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Flush between files
+            if let Some(a) = accum.take() {
+                let (key, value) =
+                    a.finish_entry(&col_indices, allele_col_idx, &mut compressor)?;
+                ing.write(&key, &value)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                total_positions += 1;
+                total_bytes += value.len() as u64;
+            }
+        }
+
+        ing.finish()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        store.persist()?;
+
+        info!(
+            "Running major compaction on variation.fjall...",
+        );
+        let compact_start = Instant::now();
+        store
+            .data_partition()
+            .major_compact()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        info!(
+            "Major compaction completed in {:.1}s",
+            compact_start.elapsed().as_secs_f64()
+        );
+
+        let elapsed = start_time.elapsed().as_secs_f64();
+        info!(
+            "variation.fjall rebuilt: {} positions, {} variants, {:.1} MB in {:.1}s",
+            total_positions,
+            total_variants,
+            total_bytes as f64 / 1_048_576.0,
+            elapsed
+        );
+
+        Ok(vec![EntityStats {
+            entity: "variation".to_string(),
+            parquet_files: vec![],
+            fjall_stats: Some(LoadStats {
+                total_variants,
+                total_positions,
+                total_bytes,
+                elapsed_secs: elapsed,
+            }),
+        }])
+    }
+
+    /// Train zstd dictionary from pre-collected batches.
+    async fn train_dict_from_batches(
+        &self,
+        store: &VepKvStore,
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<Option<Arc<Vec<u8>>>> {
+        let chrom_col_idx = schema.index_of("chrom")?;
+        let start_col_idx = schema.index_of("start")?;
+        let allele_col_idx = schema.index_of("allele_string")?;
+        let col_indices: Vec<usize> = (0..schema.fields().len())
+            .filter(|&i| i != chrom_col_idx && i != start_col_idx)
+            .collect();
+
+        let mut samples: Vec<Vec<u8>> = Vec::new();
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let chrom_col = batch.column(chrom_col_idx);
+            let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
+
+            let mut groups: HashMap<(String, i64), Vec<usize>> = HashMap::new();
+            for row in 0..batch.num_rows() {
+                let chrom = string_value(chrom_col.as_ref(), row);
+                let start = starts.value(row);
+                groups
+                    .entry((chrom.to_string(), start))
+                    .or_default()
+                    .push(row);
+            }
+
+            for rows in groups.values() {
+                let value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
+                samples.push(value);
+            }
+        }
+
+        let min_training_samples = 100;
+        if samples.len() < min_training_samples {
+            info!(
+                "only {} sample entries, skipping dictionary training (need >= {})",
+                samples.len(),
+                min_training_samples
+            );
+            return Ok(None);
+        }
+
+        let max_samples = 10_000.min(samples.len());
+        let sample_refs: Vec<&[u8]> = samples[..max_samples]
+            .iter()
+            .map(|v| v.as_slice())
+            .collect();
+
+        let dict_size = self.dict_size_kb as usize * 1024;
+        match zstd::dict::from_continuous(
+            &sample_refs.concat(),
+            &sample_refs.iter().map(|s| s.len()).collect::<Vec<_>>(),
+            dict_size,
+        ) {
+            Ok(dict) => {
+                info!(
+                    "zstd dict trained: {} samples, dict {} bytes",
+                    max_samples,
+                    dict.len()
+                );
+                store.store_dict(&dict)?;
+                store.store_zstd_level(self.zstd_level)?;
+                Ok(Some(Arc::new(dict)))
+            }
+            Err(e) => {
+                info!("zstd dict training failed (falling back to uncompressed): {e}");
+                Ok(None)
+            }
+        }
+    }
+
     /// Build translation: split into core + sift parquet, then fjall for sift.
     async fn build_translation(&self) -> Result<Vec<EntityStats>> {
         let table_name = "tl";
         let kind = EnsemblEntityKind::Translation;
+
+        // Skip if all outputs exist
+        if !self.overwrite {
+            let core_exists =
+                dir_has_parquet_files(&format!("{}/translation_core", self.output_dir));
+            let sift_parquet_exists =
+                dir_has_parquet_files(&format!("{}/translation_sift", self.output_dir));
+            let sift_fjall_exists =
+                Path::new(&format!("{}/translation_sift.fjall", self.output_dir)).exists();
+
+            if core_exists && sift_parquet_exists && (sift_fjall_exists || !self.build_fjall) {
+                info!("translation: all outputs exist, skipping (use overwrite to rebuild)");
+                return Ok(vec![EntityStats {
+                    entity: "translation".to_string(),
+                    parquet_files: vec![],
+                    fjall_stats: None,
+                }]);
+            }
+        }
 
         // Discover chroms
         let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
@@ -1096,8 +1467,8 @@ impl CacheBuilder {
         sift_parquet_files: &[(String, usize)],
     ) -> Result<Option<LoadStats>> {
         let fjall_dir = format!("{}/translation_sift.fjall", self.output_dir);
-        if Path::new(&fjall_dir).exists() {
-            info!("translation_sift.fjall already exists, skipping");
+        if Path::new(&fjall_dir).exists() && !self.overwrite {
+            info!("translation_sift.fjall already exists, skipping (use overwrite to rebuild)");
             return Ok(None);
         }
 
@@ -1673,6 +2044,28 @@ fn extract_multi_partition_inner(
     } else {
         None
     }
+}
+
+/// Set of canonical chromosome names for quick lookup.
+const CHROM_TO_CODE_SET: &[&str] = &[
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
+    "18", "19", "20", "21", "22", "X", "Y", "MT",
+];
+
+/// Check if a directory contains at least one `.parquet` file.
+fn dir_has_parquet_files(dir: &str) -> bool {
+    Path::new(dir).is_dir()
+        && std::fs::read_dir(dir)
+            .ok()
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        == Some("parquet")
+                })
+            })
+            .unwrap_or(false)
 }
 
 fn make_ctx_and_register(
