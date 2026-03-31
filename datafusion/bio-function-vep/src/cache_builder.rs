@@ -3217,4 +3217,148 @@ mod tests {
         eprintln!("Inner plan: {} partitions", n);
         assert!(n > 1, "inner plan should have >1 partitions, got {n}");
     }
+
+    // -----------------------------------------------------------------------
+    // dir_has_parquet_files
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dir_has_parquet_files_with_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chr1.parquet"), b"PAR1").unwrap();
+        assert!(dir_has_parquet_files(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_dir_has_parquet_files_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!dir_has_parquet_files(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_dir_has_parquet_files_nonexistent() {
+        assert!(!dir_has_parquet_files("/nonexistent/path"));
+    }
+
+    #[test]
+    fn test_dir_has_parquet_files_only_non_parquet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.csv"), b"a,b").unwrap();
+        assert!(!dir_has_parquet_files(dir.path().to_str().unwrap()));
+    }
+
+    // -----------------------------------------------------------------------
+    // overwrite flag
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_builder_overwrite_default_false() {
+        let builder = CacheBuilder::new("/cache", "/output");
+        assert!(!builder.overwrite);
+    }
+
+    #[test]
+    fn test_builder_with_overwrite() {
+        let builder = CacheBuilder::new("/cache", "/output").with_overwrite(true);
+        assert!(builder.overwrite);
+    }
+
+    // -----------------------------------------------------------------------
+    // skip logic integration
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_entity_skips_existing_parquet() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().to_str().unwrap();
+
+        // Create a fake parquet file for transcript
+        let transcript_dir = dir.path().join("transcript");
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(transcript_dir.join("chr1.parquet"), b"PAR1").unwrap();
+
+        let builder = CacheBuilder::new("/nonexistent_cache", output);
+        // Should skip because parquet exists and overwrite=false
+        let result = builder.build_entity("transcript").await;
+        // Will succeed (skip) even though cache doesn't exist
+        assert!(result.is_ok());
+        let stats = result.unwrap();
+        assert_eq!(stats[0].entity, "transcript");
+        assert!(stats[0].parquet_files.is_empty(), "should return empty (skipped)");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_entity_does_not_skip_with_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().to_str().unwrap();
+
+        // Create a fake parquet file for transcript
+        let transcript_dir = dir.path().join("transcript");
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(transcript_dir.join("chr1.parquet"), b"PAR1").unwrap();
+
+        let builder = CacheBuilder::new("/nonexistent_cache", output).with_overwrite(true);
+        // Should NOT skip because overwrite=true — will fail because cache doesn't exist
+        let result = builder.build_entity("transcript").await;
+        assert!(result.is_err(), "should fail (not skip) with overwrite=true");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_variation_skips_when_both_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().to_str().unwrap();
+
+        // Create fake variation parquet + fjall
+        let var_dir = dir.path().join("variation");
+        std::fs::create_dir_all(&var_dir).unwrap();
+        std::fs::write(var_dir.join("chr1.parquet"), b"PAR1").unwrap();
+        let fjall_dir = dir.path().join("variation.fjall");
+        std::fs::create_dir_all(&fjall_dir).unwrap();
+
+        let builder = CacheBuilder::new("/nonexistent_cache", output);
+        let result = builder.build_entity("variation").await;
+        assert!(result.is_ok());
+        let stats = result.unwrap();
+        assert!(stats[0].parquet_files.is_empty(), "should skip");
+        assert!(stats[0].fjall_stats.is_none(), "should skip fjall too");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_variation_rebuilds_fjall_when_parquet_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().to_str().unwrap();
+
+        // Create fake variation parquet but NO fjall
+        let var_dir = dir.path().join("variation");
+        std::fs::create_dir_all(&var_dir).unwrap();
+        std::fs::write(var_dir.join("chr1.parquet"), b"PAR1").unwrap();
+
+        let builder = CacheBuilder::new("/nonexistent_cache", output);
+        let result = builder.build_entity("variation").await;
+        // Will try to rebuild fjall from parquet but fail because the
+        // parquet file is not a real parquet file
+        assert!(result.is_err(), "should attempt fjall rebuild and fail on fake parquet");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_translation_skips_when_all_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().to_str().unwrap();
+
+        // Create all translation outputs
+        let core_dir = dir.path().join("translation_core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        std::fs::write(core_dir.join("chr1.parquet"), b"PAR1").unwrap();
+        let sift_dir = dir.path().join("translation_sift");
+        std::fs::create_dir_all(&sift_dir).unwrap();
+        std::fs::write(sift_dir.join("chr1.parquet"), b"PAR1").unwrap();
+        let fjall_dir = dir.path().join("translation_sift.fjall");
+        std::fs::create_dir_all(&fjall_dir).unwrap();
+
+        let builder = CacheBuilder::new("/nonexistent_cache", output);
+        let result = builder.build_entity("translation").await;
+        assert!(result.is_ok());
+        let stats = result.unwrap();
+        assert!(stats[0].parquet_files.is_empty(), "should skip");
+    }
 }
