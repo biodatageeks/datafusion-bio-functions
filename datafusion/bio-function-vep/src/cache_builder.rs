@@ -440,7 +440,9 @@ impl CacheBuilder {
                 );
 
                 // Phase 2: Read temp parquet files in partition order → final parquet + fjall
-                let read_ctx = SessionContext::new();
+                // Use target_partitions=1 to preserve row order within each file.
+                let read_config = SessionConfig::new().with_target_partitions(1);
+                let read_ctx = SessionContext::new_with_config(read_config);
                 for (_, part_file, _) in &part_files {
                     read_ctx
                         .register_parquet("_part", part_file, Default::default())
