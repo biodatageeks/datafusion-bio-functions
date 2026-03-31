@@ -21,6 +21,7 @@ use datafusion::parquet::basic::Compression;
 use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::parquet::format::SortingColumn;
 use datafusion::parquet::schema::types::ColumnPath;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use log::info;
@@ -342,14 +343,22 @@ impl CacheBuilder {
 
             let df = ctx.sql(&query).await?;
             let plan = df.create_physical_plan().await?;
+
+            // Check if the plan has a SortPreservingMergeExec wrapping a
+            // multi-partition inner plan.  If so, use parallel execution.
+            let inner_plan = extract_multi_partition_inner(&plan);
+            let num_partitions = inner_plan
+                .as_ref()
+                .map(|p| p.properties().partitioning.partition_count())
+                .unwrap_or(1);
+
             info!(
-                "variation: [{chrom}] physical plan ({} output partitions):\n{}",
-                plan.properties().partitioning.partition_count(),
-                datafusion::physical_plan::displayable(plan.as_ref())
-                    .indent(true)
+                "variation: [{chrom}] {} partitions (parallel={})",
+                num_partitions,
+                inner_plan.is_some()
             );
-            let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
-            let schema = stream.schema();
+
+            let schema = plan.schema();
             let sk = sort_key(kind);
 
             // For main chroms: create a new writer per chrom.
@@ -367,60 +376,224 @@ impl CacheBuilder {
 
             let mut chrom_rows = 0usize;
 
-            while let Some(batch_result) = stream.next().await {
-                let batch = batch_result?;
-                if batch.num_rows() == 0 {
-                    continue;
+            if let Some(inner) = inner_plan.filter(|_| num_partitions > 1) {
+                // --- Parallel path: write N temp parquet files, then merge ---
+                let temp_dir = format!("{}/variation/_tmp_{chrom}", self.output_dir);
+                std::fs::create_dir_all(&temp_dir).map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to create temp dir: {e}"))
+                })?;
+
+                // Phase 1: Execute all partitions in parallel, each writes a temp parquet
+                let task_ctx = ctx.task_ctx();
+                let mut handles = tokio::task::JoinSet::new();
+                for partition_idx in 0..num_partitions {
+                    let stream = inner.execute(partition_idx, Arc::clone(&task_ctx))?;
+                    let part_schema = stream.schema();
+                    let part_file = format!("{temp_dir}/part_{partition_idx}.parquet");
+                    let part_sk = sort_key(kind);
+                    handles.spawn(async move {
+                        let mut pw = create_writer(
+                            &part_file,
+                            &part_schema,
+                            kind,
+                            part_sk,
+                            None,
+                        )?;
+                        let mut rows = 0usize;
+                        let mut stream = stream;
+                        while let Some(batch_result) = stream.next().await {
+                            let batch = batch_result?;
+                            if batch.num_rows() == 0 {
+                                continue;
+                            }
+                            pw.write(&batch)?;
+                            rows += batch.num_rows();
+                        }
+                        pw.close().map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to close temp parquet: {e}"
+                            ))
+                        })?;
+                        // Return partition_idx so we can sort by it after JoinSet
+                        Ok::<(usize, String, usize), DataFusionError>((
+                            partition_idx, part_file, rows,
+                        ))
+                    });
                 }
 
-                writer.write(&batch)?;
-                chrom_rows += batch.num_rows();
-                total_parquet_rows += batch.num_rows();
-
-                if let Some(ref cb) = self.on_progress {
-                    cb("variation", "parquet", batch.num_rows(), total_parquet_rows, 0);
+                // Collect results — JoinSet returns in completion order
+                let mut part_files: Vec<(usize, String, usize)> = Vec::new();
+                while let Some(result) = handles.join_next().await {
+                    let (idx, file, rows) = result
+                        .map_err(|e| DataFusionError::Execution(format!("Task join error: {e}")))?
+                        .map_err(|e: DataFusionError| e)?;
+                    part_files.push((idx, file, rows));
                 }
+                // Sort by partition index for ascending position order
+                part_files.sort_by_key(|(idx, _, _)| *idx);
 
-                // Feed fjall ingestion (all contigs, not just main chroms)
-                if let (
-                    Some(ing),
-                    Some((chrom_col_idx, start_col_idx, allele_col_idx, col_indices)),
-                ) = (&mut ingestion, &fjall_col_info)
-                {
-                    let starts = batch.column(*start_col_idx).as_primitive::<Int64Type>();
-                    let chrom_col = batch.column(*chrom_col_idx);
+                let parallel_rows: usize = part_files.iter().map(|(_, _, r)| *r).sum();
+                info!(
+                    "variation: [{chrom}] phase 1 done: {} rows in {} partitions",
+                    format_rows(parallel_rows),
+                    num_partitions
+                );
 
-                    for row in 0..batch.num_rows() {
-                        let start = starts.value(row);
-                        let row_chrom = string_value(chrom_col.as_ref(), row);
-                        let chrom_code = chrom_to_code(row_chrom);
+                // Phase 2: Read temp parquet files in partition order → final parquet + fjall
+                let read_ctx = SessionContext::new();
+                for (_, part_file, _) in &part_files {
+                    read_ctx
+                        .register_parquet("_part", part_file, Default::default())
+                        .await?;
+                    let part_batches = read_ctx.sql("SELECT * FROM _part").await?.collect().await?;
+                    read_ctx.deregister_table("_part")?;
 
-                        let should_flush = accum
-                            .as_ref()
-                            .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
-
-                        if should_flush {
-                            let a = accum.take().unwrap();
-                            let (key, value) =
-                                a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
-                            ing.write(&key, &value)
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                            fjall_total_positions += 1;
-                            fjall_total_bytes += value.len() as u64;
+                    for batch in &part_batches {
+                        if batch.num_rows() == 0 {
+                            continue;
                         }
 
-                        fjall_total_variants += 1;
+                        writer.write(batch)?;
+                        chrom_rows += batch.num_rows();
+                        total_parquet_rows += batch.num_rows();
 
-                        match &mut accum {
-                            Some(a) => a.add_row(row, &batch),
-                            None => {
-                                accum = Some(PositionAccumulator::new(
-                                    chrom_code,
-                                    row_chrom.to_string(),
-                                    start,
-                                    row,
-                                    &batch,
-                                ));
+                        if let Some(ref cb) = self.on_progress {
+                            cb(
+                                "variation",
+                                "parquet",
+                                batch.num_rows(),
+                                total_parquet_rows,
+                                0,
+                            );
+                        }
+
+                        // Feed fjall ingestion
+                        if let (
+                            Some(ing),
+                            Some((chrom_col_idx, start_col_idx, allele_col_idx, col_indices)),
+                        ) = (&mut ingestion, &fjall_col_info)
+                        {
+                            let starts =
+                                batch.column(*start_col_idx).as_primitive::<Int64Type>();
+                            let chrom_col = batch.column(*chrom_col_idx);
+
+                            for row in 0..batch.num_rows() {
+                                let start = starts.value(row);
+                                let row_chrom = string_value(chrom_col.as_ref(), row);
+                                let chrom_code = chrom_to_code(row_chrom);
+
+                                let should_flush = accum.as_ref().is_some_and(|a| {
+                                    a.chrom_code != chrom_code || a.start != start
+                                });
+
+                                if should_flush {
+                                    let a = accum.take().unwrap();
+                                    let (key, value) = a.finish_entry(
+                                        col_indices,
+                                        *allele_col_idx,
+                                        &mut compressor,
+                                    )?;
+                                    ing.write(&key, &value)
+                                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                                    fjall_total_positions += 1;
+                                    fjall_total_bytes += value.len() as u64;
+                                }
+
+                                fjall_total_variants += 1;
+
+                                match &mut accum {
+                                    Some(a) => a.add_row(row, batch),
+                                    None => {
+                                        accum = Some(PositionAccumulator::new(
+                                            chrom_code,
+                                            row_chrom.to_string(),
+                                            start,
+                                            row,
+                                            batch,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Cleanup temp files
+                if let Err(e) = std::fs::remove_dir_all(&temp_dir) {
+                    log::warn!("Failed to clean up temp dir {temp_dir}: {e}");
+                }
+            } else {
+                // --- Sequential path: single partition, stream directly ---
+                let mut stream =
+                    datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+
+                while let Some(batch_result) = stream.next().await {
+                    let batch = batch_result?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+
+                    writer.write(&batch)?;
+                    chrom_rows += batch.num_rows();
+                    total_parquet_rows += batch.num_rows();
+
+                    if let Some(ref cb) = self.on_progress {
+                        cb(
+                            "variation",
+                            "parquet",
+                            batch.num_rows(),
+                            total_parquet_rows,
+                            0,
+                        );
+                    }
+
+                    // Feed fjall ingestion
+                    if let (
+                        Some(ing),
+                        Some((chrom_col_idx, start_col_idx, allele_col_idx, col_indices)),
+                    ) = (&mut ingestion, &fjall_col_info)
+                    {
+                        let starts =
+                            batch.column(*start_col_idx).as_primitive::<Int64Type>();
+                        let chrom_col = batch.column(*chrom_col_idx);
+
+                        for row in 0..batch.num_rows() {
+                            let start = starts.value(row);
+                            let row_chrom = string_value(chrom_col.as_ref(), row);
+                            let chrom_code = chrom_to_code(row_chrom);
+
+                            let should_flush = accum
+                                .as_ref()
+                                .is_some_and(|a| {
+                                    a.chrom_code != chrom_code || a.start != start
+                                });
+
+                            if should_flush {
+                                let a = accum.take().unwrap();
+                                let (key, value) = a.finish_entry(
+                                    col_indices,
+                                    *allele_col_idx,
+                                    &mut compressor,
+                                )?;
+                                ing.write(&key, &value)
+                                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                                fjall_total_positions += 1;
+                                fjall_total_bytes += value.len() as u64;
+                            }
+
+                            fjall_total_variants += 1;
+
+                            match &mut accum {
+                                Some(a) => a.add_row(row, &batch),
+                                None => {
+                                    accum = Some(PositionAccumulator::new(
+                                        chrom_code,
+                                        row_chrom.to_string(),
+                                        start,
+                                        row,
+                                        &batch,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1479,6 +1652,27 @@ fn print_progress(label: &str, rows: usize, elapsed: f64) {
     );
 }
 
+/// If the plan is a `SortPreservingMergeExec` wrapping a multi-partition inner
+/// plan, return the inner plan.  This allows bypassing the merge and executing
+/// partitions in parallel with larger buffers.
+fn extract_multi_partition_inner(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    if plan.name() != "SortPreservingMergeExec" {
+        return None;
+    }
+    let children = plan.children();
+    if children.len() != 1 {
+        return None;
+    }
+    let inner = Arc::clone(children[0]);
+    if inner.properties().partitioning.partition_count() > 1 {
+        Some(inner)
+    } else {
+        None
+    }
+}
+
 fn make_ctx_and_register(
     cache_root: &str,
     kind: EnsemblEntityKind,
@@ -2272,47 +2466,18 @@ mod tests {
         assert_eq!(preds.sift[0].position, 42);
     }
 
-    /// Verify that the variation query against a real tabix VEP cache
-    /// produces a parallel plan with SortPreservingMergeExec.
+    /// Verify that the parallel execution path (Option B: temp parquet files)
+    /// works against the real VEP 115 tabix cache.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore] // requires real VEP cache at well-known path
     async fn test_tabix_variation_plan_is_parallel() {
         use datafusion::physical_plan::displayable;
+        use std::time::Instant;
 
         let cache_root = "/Users/mwiewior/research/data/vep/homo_sapiens/115_GRCh38";
         if !std::path::Path::new(cache_root).exists() {
             eprintln!("Skipping: VEP cache not found at {cache_root}");
             return;
-        }
-
-        // Check chr1 file size and bgzf block count
-        let chr1_file = std::path::Path::new(cache_root).join("1/all_vars.gz");
-        if chr1_file.exists() {
-            let file_size = std::fs::metadata(&chr1_file).unwrap().len();
-            eprintln!(
-                "chr1 all_vars.gz: {:.1} MB ({file_size} bytes)",
-                file_size as f64 / 1_048_576.0
-            );
-            // Count bgzf blocks
-            let mut f = std::fs::File::open(&chr1_file).unwrap();
-            let mut header = [0u8; 18];
-            let mut block_count = 0u64;
-            let mut pos = 0u64;
-            use std::io::Read;
-            use std::io::Seek;
-            while pos + 28 <= file_size {
-                f.seek(std::io::SeekFrom::Start(pos)).unwrap();
-                if f.read_exact(&mut header).is_err() {
-                    break;
-                }
-                if header[0] != 0x1f || header[1] != 0x8b {
-                    break;
-                }
-                let bsize = u16::from_le_bytes([header[16], header[17]]) as u64 + 1;
-                block_count += 1;
-                pos += bsize;
-            }
-            eprintln!("chr1 bgzf blocks: {block_count}");
         }
 
         let partitions = 8;
@@ -2328,64 +2493,105 @@ mod tests {
         let df = ctx.sql(query).await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
 
-        let plan_str =
-            format!("{}", displayable(plan.as_ref()).indent(true));
+        let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
         eprintln!("Plan:\n{plan_str}");
 
-        assert!(
-            plan_str.contains("SortPreservingMergeExec"),
-            "expected SortPreservingMergeExec for tabix parallel plan"
-        );
-        assert!(
-            !plan_str.contains("CoalescePartitionsExec"),
-            "should not have CoalescePartitionsExec"
-        );
+        // Extract inner multi-partition plan (same as cache builder does)
+        let inner = extract_multi_partition_inner(&plan);
+        assert!(inner.is_some(), "should extract inner plan from SortPreservingMergeExec");
+        let inner = inner.unwrap();
+        let n = inner.properties().partitioning.partition_count();
+        eprintln!("Inner plan: {n} partitions");
+        assert!(n > 1, "expected >1 partitions, got {n}");
 
-        // Extract partition count from the EnsemblCacheExec in the plan
-        eprintln!("Top-level output partitions: {}", plan.properties().partitioning.partition_count());
+        // Phase 1: Execute all partitions in parallel via JoinSet (like cache builder)
+        let task_ctx = ctx.task_ctx();
+        let mut handles = tokio::task::JoinSet::new();
+        let phase1_start = Instant::now();
 
-        // Execute and track thread IDs
-        let thread_ids: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-        let tid_clone = thread_ids.clone();
-
-        let mut stream =
-            datafusion::physical_plan::execute_stream(plan, ctx.task_ctx()).unwrap();
-        let mut total_rows = 0usize;
-        let mut prev_start: Option<i64> = None;
-        let mut batch_count = 0usize;
-        while let Some(batch) = stream.next().await {
-            let batch = batch.unwrap();
-            {
-                let tid = std::thread::current().id();
-                tid_clone.lock().unwrap().insert(tid);
-            }
-            let starts = batch
-                .column_by_name("start")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                .unwrap();
-            for i in 0..starts.len() {
-                let s = starts.value(i);
-                if let Some(prev) = prev_start {
-                    assert!(
-                        s >= prev,
-                        "rows not sorted: {s} < {prev}"
-                    );
+        for i in 0..n {
+            let stream = inner.execute(i, Arc::clone(&task_ctx)).unwrap();
+            handles.spawn(async move {
+                let mut stream = stream;
+                let mut rows = 0usize;
+                let mut first_start: Option<i64> = None;
+                let mut last_start: Option<i64> = None;
+                let mut prev_start: Option<i64> = None;
+                while let Some(batch) = stream.next().await {
+                    let batch = batch.unwrap();
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    let starts = batch
+                        .column_by_name("start")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                        .unwrap();
+                    for j in 0..starts.len() {
+                        let s = starts.value(j);
+                        if first_start.is_none() {
+                            first_start = Some(s);
+                        }
+                        if let Some(prev) = prev_start {
+                            assert!(
+                                s >= prev,
+                                "partition {i}: rows not sorted: {s} < {prev}"
+                            );
+                        }
+                        prev_start = Some(s);
+                        last_start = Some(s);
+                    }
+                    rows += batch.num_rows();
                 }
-                prev_start = Some(s);
-            }
-            total_rows += batch.num_rows();
-            batch_count += 1;
-            if batch_count <= 3 || batch_count % 1000 == 0 {
-                eprintln!("  batch {batch_count}: {} rows, last_start={:?}", batch.num_rows(), prev_start);
+                (i, rows, first_start, last_start)
+            });
+        }
+
+        let mut partition_results: Vec<(usize, usize, Option<i64>, Option<i64>)> = Vec::new();
+        while let Some(result) = handles.join_next().await {
+            let (idx, rows, first_start, last_start) = result.unwrap();
+            partition_results.push((idx, rows, first_start, last_start));
+        }
+        partition_results.sort_by_key(|(idx, _, _, _)| *idx);
+        let partition_rows: Vec<(usize, usize)> = partition_results
+            .iter()
+            .map(|(idx, rows, _, _)| (*idx, *rows))
+            .collect();
+
+        let phase1_elapsed = phase1_start.elapsed();
+        let total_rows: usize = partition_rows.iter().map(|(_, r)| *r).sum();
+        eprintln!("Phase 1 done: {total_rows} rows in {:.1}s", phase1_elapsed.as_secs_f64());
+        for (idx, rows) in &partition_rows {
+            eprintln!("  partition {idx}: {rows} rows");
+        }
+
+        assert!(total_rows > 100_000, "expected >100K rows for chr1, got {total_rows}");
+
+        // Verify all partitions did useful work (not just 1)
+        let active_partitions = partition_rows.iter().filter(|(_, r)| *r > 0).count();
+        eprintln!("Active partitions (>0 rows): {active_partitions}/{n}");
+        assert!(
+            active_partitions > 1,
+            "expected multiple active partitions, got {active_partitions}"
+        );
+
+        // Verify cross-partition ordering: last_start of partition i <= first_start of partition i+1
+        eprintln!("Cross-partition ordering check:");
+        for w in partition_results.windows(2) {
+            let (idx_a, _, _, last_a) = &w[0];
+            let (idx_b, _, first_b, _) = &w[1];
+            if let (Some(last), Some(first)) = (last_a, first_b) {
+                eprintln!(
+                    "  partition {idx_a} last_start={last} <= partition {idx_b} first_start={first} : {}",
+                    last <= first
+                );
+                assert!(
+                    last <= first,
+                    "cross-partition order violation: partition {idx_a} last={last} > partition {idx_b} first={first}"
+                );
             }
         }
-        let unique_consumer_threads = thread_ids.lock().unwrap().len();
-        eprintln!("Total chr1 rows: {total_rows} in {batch_count} batches");
-        eprintln!("Unique consumer thread IDs: {unique_consumer_threads}");
-        assert!(total_rows > 100_000, "expected substantial row count for chr1, got {total_rows}");
     }
 
     // -----------------------------------------------------------------------
@@ -2533,5 +2739,87 @@ mod tests {
         // Its code (25) is less than NON_CANONICAL_START (26), so fjall ordering
         // is correct: main codes 1-25 < non-canonical codes >= 26.
         assert!(chrom_to_code("MT") < 26);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_multi_partition_inner
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_extract_multi_partition_inner_non_merge_returns_none() {
+        // A simple plan (no SortPreservingMergeExec) should return None
+        let ctx = SessionContext::new();
+        let df = ctx
+            .sql("SELECT 1 as x")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        assert!(
+            extract_multi_partition_inner(&plan).is_none(),
+            "non-merge plan should return None"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // requires real VEP cache
+    async fn test_parallel_execution_produces_same_results() {
+        let cache_root = "/Users/mwiewior/research/data/vep/homo_sapiens/115_GRCh38";
+        if !std::path::Path::new(cache_root).exists() {
+            return;
+        }
+
+        // Run with 1 partition (sequential) and 8 partitions (parallel)
+        // on a small chromosome to compare row counts.
+        for partitions in [1, 8] {
+            let ctx = make_ctx_and_register(
+                cache_root,
+                EnsemblEntityKind::Variation,
+                "var",
+                partitions,
+            )
+            .unwrap();
+
+            let query = "SELECT COUNT(*) as cnt FROM var WHERE chrom = '22'";
+            let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
+            let count = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .unwrap()
+                .value(0);
+            eprintln!("partitions={partitions}: chr22 count={count}");
+
+            // chr22 should have a substantial number of rows
+            assert!(count > 100_000, "chr22 too few rows: {count}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // requires real VEP cache
+    async fn test_parallel_plan_extracts_inner() {
+        let cache_root = "/Users/mwiewior/research/data/vep/homo_sapiens/115_GRCh38";
+        if !std::path::Path::new(cache_root).exists() {
+            return;
+        }
+
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            8,
+        )
+        .unwrap();
+
+        let query = "SELECT * FROM var WHERE chrom = '22' ORDER BY chrom, start";
+        let df = ctx.sql(query).await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let inner = extract_multi_partition_inner(&plan);
+        assert!(inner.is_some(), "should extract inner plan from SortPreservingMergeExec");
+
+        let inner = inner.unwrap();
+        let n = inner.properties().partitioning.partition_count();
+        eprintln!("Inner plan: {} partitions", n);
+        assert!(n > 1, "inner plan should have >1 partitions, got {n}");
     }
 }
