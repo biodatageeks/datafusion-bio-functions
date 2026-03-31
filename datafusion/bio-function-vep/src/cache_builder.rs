@@ -936,94 +936,133 @@ impl CacheBuilder {
             .filter(|&i| i != chrom_col_idx && i != start_col_idx)
             .collect();
 
-        let mut accum: Option<PositionAccumulator> = None;
-        let mut pending: Vec<PositionAccumulator> = Vec::with_capacity(PARALLEL_FLUSH_BATCH);
         let mut total_positions = 0u64;
         let mut total_variants = 0u64;
         let mut total_bytes = 0u64;
         let start_time = Instant::now();
 
-        for (_, parquet_path) in &parquet_files {
-            read_ctx
-                .register_parquet("_part", parquet_path, Default::default())
-                .await?;
-            let df = read_ctx.sql("SELECT * FROM _part").await?;
-            let mut stream = df.execute_stream().await?;
-            read_ctx.deregister_table("_part")?;
+        // Pipeline: producer reads parquet + builds accumulators,
+        // consumer does parallel serialize+compress + fjall write.
+        // Channel depth 2 allows one batch being compressed while next is built.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<PositionAccumulator>, u64)>(2);
 
-            while let Some(batch_result) = stream.next().await {
-                let batch = batch_result?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
-                let chrom_col = batch.column(chrom_col_idx);
+        let col_indices_clone = col_indices.clone();
+        let parquet_file_list: Vec<String> =
+            parquet_files.iter().map(|(_, p)| p.clone()).collect();
 
-                for row in 0..batch.num_rows() {
-                    let start = starts.value(row);
-                    let row_chrom = string_value(chrom_col.as_ref(), row);
-                    let chrom_code = chrom_to_code(row_chrom);
+        // Producer: reads parquet files, iterates rows, sends position batches
+        let producer = std::thread::spawn(move || -> Result<()> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| DataFusionError::Execution(format!("tokio runtime: {e}")))?;
 
-                    let should_flush = accum
-                        .as_ref()
-                        .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
+            rt.block_on(async {
+                let read_config = SessionConfig::new().with_target_partitions(1);
+                let read_ctx = SessionContext::new_with_config(read_config);
 
-                    if should_flush {
-                        pending.push(accum.take().unwrap());
-                        if pending.len() >= PARALLEL_FLUSH_BATCH {
-                            flush_positions_parallel(
-                                &mut pending,
-                                &col_indices,
-                                allele_col_idx,
-                                &dict,
-                                self.zstd_level,
-                                &mut |k, v| {
-                                    ing.write(k, v)
-                                        .map_err(|e| DataFusionError::External(Box::new(e)))
-                                },
-                                &mut total_positions,
-                                &mut total_bytes,
-                            )?;
+                let mut accum: Option<PositionAccumulator> = None;
+                let mut pending: Vec<PositionAccumulator> =
+                    Vec::with_capacity(PARALLEL_FLUSH_BATCH);
+                let mut variants_in_batch = 0u64;
+
+                for parquet_path in &parquet_file_list {
+                    read_ctx
+                        .register_parquet("_part", parquet_path, Default::default())
+                        .await?;
+                    let df = read_ctx.sql("SELECT * FROM _part").await?;
+                    let mut stream = df.execute_stream().await?;
+                    read_ctx.deregister_table("_part")?;
+
+                    while let Some(batch_result) = stream.next().await {
+                        let batch = batch_result?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        let starts =
+                            batch.column(start_col_idx).as_primitive::<Int64Type>();
+                        let chrom_col = batch.column(chrom_col_idx);
+
+                        for row in 0..batch.num_rows() {
+                            let start = starts.value(row);
+                            let row_chrom = string_value(chrom_col.as_ref(), row);
+                            let chrom_code = chrom_to_code(row_chrom);
+
+                            let should_flush = accum
+                                .as_ref()
+                                .is_some_and(|a| {
+                                    a.chrom_code != chrom_code || a.start != start
+                                });
+
+                            if should_flush {
+                                pending.push(accum.take().unwrap());
+                                if pending.len() >= PARALLEL_FLUSH_BATCH {
+                                    let batch_to_send = std::mem::replace(
+                                        &mut pending,
+                                        Vec::with_capacity(PARALLEL_FLUSH_BATCH),
+                                    );
+                                    if tx.send((batch_to_send, variants_in_batch)).is_err() {
+                                        return Ok(()); // consumer dropped
+                                    }
+                                    variants_in_batch = 0;
+                                }
+                            }
+
+                            variants_in_batch += 1;
+
+                            match &mut accum {
+                                Some(a) => a.add_row(row, &batch),
+                                None => {
+                                    accum = Some(PositionAccumulator::new(
+                                        chrom_code,
+                                        row_chrom.to_string(),
+                                        start,
+                                        row,
+                                        &batch,
+                                    ));
+                                }
+                            }
                         }
                     }
 
-                    total_variants += 1;
-
-                    match &mut accum {
-                        Some(a) => a.add_row(row, &batch),
-                        None => {
-                            accum = Some(PositionAccumulator::new(
-                                chrom_code,
-                                row_chrom.to_string(),
-                                start,
-                                row,
-                                &batch,
-                            ));
-                        }
+                    // Flush remaining accumulator between files
+                    if let Some(a) = accum.take() {
+                        pending.push(a);
                     }
                 }
-            }
 
-            // Flush remaining accumulator between files
-            if let Some(a) = accum.take() {
-                pending.push(a);
-            }
+                // Send final batch
+                if !pending.is_empty() {
+                    let _ = tx.send((pending, variants_in_batch));
+                }
+
+                Ok(())
+            })
+        });
+
+        // Consumer: parallel serialize+compress + fjall write
+        while let Ok((mut batch, batch_variants)) = rx.recv() {
+            total_variants += batch_variants;
+            flush_positions_parallel(
+                &mut batch,
+                &col_indices_clone,
+                allele_col_idx,
+                &dict,
+                self.zstd_level,
+                &mut |k, v| {
+                    ing.write(k, v)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))
+                },
+                &mut total_positions,
+                &mut total_bytes,
+            )?;
         }
 
-        // Flush any remaining positions
-        flush_positions_parallel(
-            &mut pending,
-            &col_indices,
-            allele_col_idx,
-            &dict,
-            self.zstd_level,
-            &mut |k, v| {
-                ing.write(k, v)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))
-            },
-            &mut total_positions,
-            &mut total_bytes,
-        )?;
+        // Wait for producer to finish and propagate errors
+        producer
+            .join()
+            .expect("producer thread panicked")
+            .map_err(|e| DataFusionError::Execution(format!("producer error: {e}")))?;
 
         ing.finish()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
