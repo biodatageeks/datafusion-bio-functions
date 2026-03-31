@@ -951,14 +951,14 @@ impl CacheBuilder {
             read_ctx
                 .register_parquet("_part", parquet_path, Default::default())
                 .await?;
-            let batches = read_ctx
-                .sql("SELECT * FROM _part ORDER BY chrom, start")
-                .await?
-                .collect()
-                .await?;
+            // No ORDER BY — parquet files are already sorted by (chrom, start).
+            // Stream instead of collect to avoid materializing entire file in memory.
+            let df = read_ctx.sql("SELECT * FROM _part").await?;
+            let mut stream = df.execute_stream().await?;
             read_ctx.deregister_table("_part")?;
 
-            for batch in &batches {
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
                 if batch.num_rows() == 0 {
                     continue;
                 }
@@ -987,14 +987,14 @@ impl CacheBuilder {
                     total_variants += 1;
 
                     match &mut accum {
-                        Some(a) => a.add_row(row, batch),
+                        Some(a) => a.add_row(row, &batch),
                         None => {
                             accum = Some(PositionAccumulator::new(
                                 chrom_code,
                                 row_chrom.to_string(),
                                 start,
                                 row,
-                                batch,
+                                &batch,
                             ));
                         }
                     }
