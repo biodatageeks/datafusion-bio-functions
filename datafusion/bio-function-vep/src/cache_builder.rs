@@ -947,18 +947,23 @@ impl CacheBuilder {
         let mut total_bytes = 0u64;
         let start_time = Instant::now();
 
+        let mut time_parquet_read = std::time::Duration::ZERO;
+        let mut time_serialize_compress = std::time::Duration::ZERO;
+        let mut time_fjall_write = std::time::Duration::ZERO;
+
         for (_, parquet_path) in &parquet_files {
             read_ctx
                 .register_parquet("_part", parquet_path, Default::default())
                 .await?;
-            // No ORDER BY — parquet files are already sorted by (chrom, start).
-            // Stream instead of collect to avoid materializing entire file in memory.
             let df = read_ctx.sql("SELECT * FROM _part").await?;
             let mut stream = df.execute_stream().await?;
             read_ctx.deregister_table("_part")?;
 
             while let Some(batch_result) = stream.next().await {
+                let t0 = Instant::now();
                 let batch = batch_result?;
+                time_parquet_read += t0.elapsed();
+
                 if batch.num_rows() == 0 {
                     continue;
                 }
@@ -975,11 +980,17 @@ impl CacheBuilder {
                         .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
 
                     if should_flush {
+                        let t1 = Instant::now();
                         let a = accum.take().unwrap();
                         let (key, value) =
                             a.finish_entry(&col_indices, allele_col_idx, &mut compressor)?;
+                        time_serialize_compress += t1.elapsed();
+
+                        let t2 = Instant::now();
                         ing.write(&key, &value)
                             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                        time_fjall_write += t2.elapsed();
+
                         total_positions += 1;
                         total_bytes += value.len() as u64;
                     }
@@ -1015,6 +1026,27 @@ impl CacheBuilder {
         ing.finish()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         store.persist()?;
+
+        let total_accounted = time_parquet_read + time_serialize_compress + time_fjall_write;
+        let total_wall = start_time.elapsed();
+        let time_other = total_wall.saturating_sub(total_accounted);
+        info!(
+            "variation.fjall timing breakdown:\n\
+             \x20 parquet read:         {:.1}s ({:.0}%)\n\
+             \x20 serialize+compress:   {:.1}s ({:.0}%)\n\
+             \x20 fjall write:          {:.1}s ({:.0}%)\n\
+             \x20 other (row iteration):{:.1}s ({:.0}%)\n\
+             \x20 total:                {:.1}s",
+            time_parquet_read.as_secs_f64(),
+            100.0 * time_parquet_read.as_secs_f64() / total_wall.as_secs_f64(),
+            time_serialize_compress.as_secs_f64(),
+            100.0 * time_serialize_compress.as_secs_f64() / total_wall.as_secs_f64(),
+            time_fjall_write.as_secs_f64(),
+            100.0 * time_fjall_write.as_secs_f64() / total_wall.as_secs_f64(),
+            time_other.as_secs_f64(),
+            100.0 * time_other.as_secs_f64() / total_wall.as_secs_f64(),
+            total_wall.as_secs_f64(),
+        );
 
         info!(
             "Running major compaction on variation.fjall...",
