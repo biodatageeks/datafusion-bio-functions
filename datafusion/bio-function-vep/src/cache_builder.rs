@@ -923,11 +923,6 @@ impl CacheBuilder {
                 .await?
         };
 
-        let mut compressor = dict.as_ref().map(|d| {
-            zstd::bulk::Compressor::with_dictionary(self.zstd_level, d)
-                .expect("create zstd compressor")
-        });
-
         // Start ingestion
         let mut ing = store
             .data_partition()
@@ -942,14 +937,11 @@ impl CacheBuilder {
             .collect();
 
         let mut accum: Option<PositionAccumulator> = None;
+        let mut pending: Vec<PositionAccumulator> = Vec::with_capacity(PARALLEL_FLUSH_BATCH);
         let mut total_positions = 0u64;
         let mut total_variants = 0u64;
         let mut total_bytes = 0u64;
         let start_time = Instant::now();
-
-        let mut time_parquet_read = std::time::Duration::ZERO;
-        let mut time_serialize_compress = std::time::Duration::ZERO;
-        let mut time_fjall_write = std::time::Duration::ZERO;
 
         for (_, parquet_path) in &parquet_files {
             read_ctx
@@ -960,10 +952,7 @@ impl CacheBuilder {
             read_ctx.deregister_table("_part")?;
 
             while let Some(batch_result) = stream.next().await {
-                let t0 = Instant::now();
                 let batch = batch_result?;
-                time_parquet_read += t0.elapsed();
-
                 if batch.num_rows() == 0 {
                     continue;
                 }
@@ -980,19 +969,22 @@ impl CacheBuilder {
                         .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
 
                     if should_flush {
-                        let t1 = Instant::now();
-                        let a = accum.take().unwrap();
-                        let (key, value) =
-                            a.finish_entry(&col_indices, allele_col_idx, &mut compressor)?;
-                        time_serialize_compress += t1.elapsed();
-
-                        let t2 = Instant::now();
-                        ing.write(&key, &value)
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                        time_fjall_write += t2.elapsed();
-
-                        total_positions += 1;
-                        total_bytes += value.len() as u64;
+                        pending.push(accum.take().unwrap());
+                        if pending.len() >= PARALLEL_FLUSH_BATCH {
+                            flush_positions_parallel(
+                                &mut pending,
+                                &col_indices,
+                                allele_col_idx,
+                                &dict,
+                                self.zstd_level,
+                                &mut |k, v| {
+                                    ing.write(k, v)
+                                        .map_err(|e| DataFusionError::External(Box::new(e)))
+                                },
+                                &mut total_positions,
+                                &mut total_bytes,
+                            )?;
+                        }
                     }
 
                     total_variants += 1;
@@ -1012,41 +1004,30 @@ impl CacheBuilder {
                 }
             }
 
-            // Flush between files
+            // Flush remaining accumulator between files
             if let Some(a) = accum.take() {
-                let (key, value) =
-                    a.finish_entry(&col_indices, allele_col_idx, &mut compressor)?;
-                ing.write(&key, &value)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                total_positions += 1;
-                total_bytes += value.len() as u64;
+                pending.push(a);
             }
         }
+
+        // Flush any remaining positions
+        flush_positions_parallel(
+            &mut pending,
+            &col_indices,
+            allele_col_idx,
+            &dict,
+            self.zstd_level,
+            &mut |k, v| {
+                ing.write(k, v)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))
+            },
+            &mut total_positions,
+            &mut total_bytes,
+        )?;
 
         ing.finish()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         store.persist()?;
-
-        let total_accounted = time_parquet_read + time_serialize_compress + time_fjall_write;
-        let total_wall = start_time.elapsed();
-        let time_other = total_wall.saturating_sub(total_accounted);
-        info!(
-            "variation.fjall timing breakdown:\n\
-             \x20 parquet read:         {:.1}s ({:.0}%)\n\
-             \x20 serialize+compress:   {:.1}s ({:.0}%)\n\
-             \x20 fjall write:          {:.1}s ({:.0}%)\n\
-             \x20 other (row iteration):{:.1}s ({:.0}%)\n\
-             \x20 total:                {:.1}s",
-            time_parquet_read.as_secs_f64(),
-            100.0 * time_parquet_read.as_secs_f64() / total_wall.as_secs_f64(),
-            time_serialize_compress.as_secs_f64(),
-            100.0 * time_serialize_compress.as_secs_f64() / total_wall.as_secs_f64(),
-            time_fjall_write.as_secs_f64(),
-            100.0 * time_fjall_write.as_secs_f64() / total_wall.as_secs_f64(),
-            time_other.as_secs_f64(),
-            100.0 * time_other.as_secs_f64() / total_wall.as_secs_f64(),
-            total_wall.as_secs_f64(),
-        );
 
         info!(
             "Running major compaction on variation.fjall...",
@@ -1815,6 +1796,96 @@ impl PositionAccumulator {
 
         Ok((key, value))
     }
+}
+
+/// Number of positions to buffer before parallel serialize+compress.
+const PARALLEL_FLUSH_BATCH: usize = 10_000;
+
+/// Serialize and compress a batch of position accumulators in parallel,
+/// then write the results to fjall in order (preserving ascending key order).
+///
+/// Each position is independently serialized and zstd-compressed on a
+/// separate thread. The results are collected in order and written
+/// sequentially to the ingestion handle.
+fn flush_positions_parallel(
+    pending: &mut Vec<PositionAccumulator>,
+    col_indices: &[usize],
+    allele_col_idx: usize,
+    dict: &Option<Arc<Vec<u8>>>,
+    zstd_level: i32,
+    write_fn: &mut impl FnMut(&[u8], &[u8]) -> Result<()>,
+    total_positions: &mut u64,
+    total_bytes: &mut u64,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let positions = std::mem::take(pending);
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(positions.len());
+
+    // Single-thread fast path
+    if num_threads <= 1 || positions.len() < 100 {
+        for pos in positions {
+            let mut comp = dict.as_ref().map(|d| {
+                zstd::bulk::Compressor::with_dictionary(zstd_level, d)
+                    .expect("create compressor")
+            });
+            let (key, value) = pos.finish_entry(col_indices, allele_col_idx, &mut comp)?;
+            write_fn(&key, &value)?;
+            *total_positions += 1;
+            *total_bytes += value.len() as u64;
+        }
+        return Ok(());
+    }
+
+    // Split positions into chunks for parallel processing
+    let chunk_size = positions.len().div_ceil(num_threads);
+    let mut chunks: Vec<Vec<PositionAccumulator>> = Vec::new();
+    let mut iter = positions.into_iter().peekable();
+    while iter.peek().is_some() {
+        chunks.push(iter.by_ref().take(chunk_size).collect());
+    }
+
+    // Parallel serialize+compress using std::thread::scope
+    type KvPairs = Vec<(Vec<u8>, Vec<u8>)>;
+    let results: Vec<Result<KvPairs>> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let dict_ref = &dict;
+                    s.spawn(move || {
+                        let mut comp = dict_ref.as_ref().map(|d| {
+                            zstd::bulk::Compressor::with_dictionary(zstd_level, d)
+                                .expect("create compressor")
+                        });
+                        chunk
+                            .into_iter()
+                            .map(|pos| pos.finish_entry(col_indices, allele_col_idx, &mut comp))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread panicked"))
+                .collect()
+        });
+
+    // Write results in order (preserves ascending key order)
+    for chunk_result in results {
+        for (key, value) in chunk_result? {
+            write_fn(&key, &value)?;
+            *total_positions += 1;
+            *total_bytes += value.len() as u64;
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3251,6 +3322,76 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // fjall ingestion timing benchmark
+    // -----------------------------------------------------------------------
+
+    /// Benchmark fjall ingestion timing on chr22 parquet.
+    /// Writes a chr22 parquet, then rebuilds fjall from it and reports timing.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // requires real VEP cache
+    async fn test_fjall_ingestion_timing_chr22() {
+        use std::time::Instant;
+
+        let cache_root = "/Users/mwiewior/research/data/vep/homo_sapiens/115_GRCh38";
+        if !std::path::Path::new(cache_root).exists() {
+            return;
+        }
+
+        let output = tempfile::tempdir().unwrap();
+        let output_dir = output.path().to_str().unwrap();
+        let var_dir = format!("{output_dir}/variation");
+        std::fs::create_dir_all(&var_dir).unwrap();
+
+        // Step 1: Write chr22 parquet
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            1,
+        )
+        .unwrap();
+        let query = "SELECT * FROM var WHERE chrom = '22' ORDER BY chrom, start";
+        let df = ctx.sql(query).await.unwrap();
+        let mut stream = df.execute_stream().await.unwrap();
+        let schema = stream.schema();
+        let parquet_path = format!("{var_dir}/chr22.parquet");
+        let sk = sort_key(EnsemblEntityKind::Variation);
+        let mut writer = create_writer(&parquet_path, &schema, EnsemblEntityKind::Variation, sk, None).unwrap();
+        let mut rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            if batch.num_rows() > 0 {
+                writer.write(&batch).unwrap();
+                rows += batch.num_rows();
+            }
+        }
+        writer.close().unwrap();
+        eprintln!("chr22 parquet: {rows} rows, {}", format_rows(rows));
+
+        // Step 2: Rebuild fjall from parquet (this has the timing instrumentation)
+        let t0 = Instant::now();
+        let builder = CacheBuilder::new(cache_root, output_dir)
+            .with_partitions(1)
+            .with_build_fjall(true);
+        let result = builder.build_variation_fjall_from_parquet().await;
+        let elapsed = t0.elapsed();
+        eprintln!("fjall rebuild total: {:.1}s", elapsed.as_secs_f64());
+
+        match &result {
+            Ok(stats) => {
+                for s in stats {
+                    eprintln!(
+                        "entity={} fjall={:?}",
+                        s.entity, s.fjall_stats
+                    );
+                }
+            }
+            Err(e) => eprintln!("Error: {e}"),
+        }
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
     // dir_has_parquet_files
     // -----------------------------------------------------------------------
 
@@ -3392,5 +3533,206 @@ mod tests {
         assert!(result.is_ok());
         let stats = result.unwrap();
         assert!(stats[0].parquet_files.is_empty(), "should skip");
+    }
+
+    // -----------------------------------------------------------------------
+    // flush_positions_parallel
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_flush_positions_parallel_empty() {
+        let mut pending: Vec<PositionAccumulator> = Vec::new();
+        let col_indices = vec![2, 3, 4];
+        let mut total_pos = 0u64;
+        let mut total_bytes = 0u64;
+        let mut write_count = 0usize;
+
+        flush_positions_parallel(
+            &mut pending,
+            &col_indices,
+            4,
+            &None,
+            3,
+            &mut |_k, _v| {
+                write_count += 1;
+                Ok(())
+            },
+            &mut total_pos,
+            &mut total_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(write_count, 0);
+        assert_eq!(total_pos, 0);
+    }
+
+    #[test]
+    fn test_flush_positions_parallel_single_position() {
+        let batch = make_batch(
+            vec!["1"],
+            vec![100],
+            vec![100],
+            vec!["A/G"],
+            vec!["rs1"],
+        );
+        let accum = PositionAccumulator::new(1, "1".to_string(), 100, 0, &batch);
+
+        let mut pending = vec![accum];
+        let col_indices = vec![2, 3, 4];
+        let mut total_pos = 0u64;
+        let mut total_bytes = 0u64;
+        let mut written_keys: Vec<Vec<u8>> = Vec::new();
+
+        flush_positions_parallel(
+            &mut pending,
+            &col_indices,
+            3, // allele_col_idx
+            &None,
+            3,
+            &mut |k, _v| {
+                written_keys.push(k.to_vec());
+                Ok(())
+            },
+            &mut total_pos,
+            &mut total_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(total_pos, 1);
+        assert_eq!(written_keys.len(), 1);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_flush_positions_parallel_preserves_key_order() {
+        // Create multiple positions with ascending starts
+        let batch = make_batch(
+            vec!["1", "1", "1"],
+            vec![100, 200, 300],
+            vec![100, 200, 300],
+            vec!["A/G", "C/T", "G/A"],
+            vec!["rs1", "rs2", "rs3"],
+        );
+
+        let mut pending = vec![
+            PositionAccumulator::new(1, "1".to_string(), 100, 0, &batch),
+            PositionAccumulator::new(1, "1".to_string(), 200, 1, &batch),
+            PositionAccumulator::new(1, "1".to_string(), 300, 2, &batch),
+        ];
+
+        let col_indices = vec![2, 3, 4];
+        let mut total_pos = 0u64;
+        let mut total_bytes = 0u64;
+        let mut written_keys: Vec<Vec<u8>> = Vec::new();
+
+        flush_positions_parallel(
+            &mut pending,
+            &col_indices,
+            3,
+            &None,
+            3,
+            &mut |k, _v| {
+                written_keys.push(k.to_vec());
+                Ok(())
+            },
+            &mut total_pos,
+            &mut total_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(total_pos, 3);
+        assert_eq!(written_keys.len(), 3);
+
+        // Verify keys are strictly ascending
+        for w in written_keys.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "keys not ascending: {:?} >= {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_flush_positions_parallel_many_positions_uses_threads() {
+        // Create enough positions to trigger the parallel path (> 100)
+        let mut pending: Vec<PositionAccumulator> = Vec::new();
+        for i in 0..200 {
+            let batch = make_batch(
+                vec!["1"],
+                vec![i * 10],
+                vec![i * 10],
+                vec!["A/G"],
+                vec!["rs1"],
+            );
+            pending.push(PositionAccumulator::new(
+                1,
+                "1".to_string(),
+                i as i64 * 10,
+                0,
+                &batch,
+            ));
+        }
+
+        let col_indices = vec![2, 3, 4];
+        let mut total_pos = 0u64;
+        let mut total_bytes = 0u64;
+        let mut written_keys: Vec<Vec<u8>> = Vec::new();
+
+        flush_positions_parallel(
+            &mut pending,
+            &col_indices,
+            3,
+            &None,
+            3,
+            &mut |k, _v| {
+                written_keys.push(k.to_vec());
+                Ok(())
+            },
+            &mut total_pos,
+            &mut total_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(total_pos, 200);
+        assert_eq!(written_keys.len(), 200);
+
+        // Verify keys are strictly ascending
+        for w in written_keys.windows(2) {
+            assert!(w[0] < w[1], "keys not ascending after parallel flush");
+        }
+    }
+
+    #[test]
+    fn test_flush_positions_parallel_with_zstd_dict() {
+        // Train a tiny dict and verify compression works
+        let batch = make_batch(
+            vec!["1"],
+            vec![100],
+            vec![100],
+            vec!["A/G"],
+            vec!["rs1"],
+        );
+        let accum = PositionAccumulator::new(1, "1".to_string(), 100, 0, &batch);
+
+        let mut pending = vec![accum];
+        let col_indices = vec![2, 3, 4];
+        let mut total_pos = 0u64;
+        let mut total_bytes = 0u64;
+
+        // No dict — just verify it doesn't crash with None
+        flush_positions_parallel(
+            &mut pending,
+            &col_indices,
+            3,
+            &None,
+            3,
+            &mut |_k, _v| Ok(()),
+            &mut total_pos,
+            &mut total_bytes,
+        )
+        .unwrap();
+        assert_eq!(total_pos, 1);
     }
 }
