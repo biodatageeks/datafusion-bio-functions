@@ -1294,8 +1294,7 @@ mod tests {
         store.persist().unwrap();
         drop(store);
 
-        let reopened_store =
-            Arc::new(VepKvStore::open(cache_dir.path()).expect("reopen KV store"));
+        let reopened_store = Arc::new(VepKvStore::open(cache_dir.path()).expect("reopen KV store"));
 
         let vcf_schema = vcf_batch.schema();
         let vcf_mem = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
@@ -1382,8 +1381,7 @@ mod tests {
         store.persist().unwrap();
         drop(store);
 
-        let reopened_store =
-            Arc::new(VepKvStore::open(cache_dir.path()).expect("reopen KV store"));
+        let reopened_store = Arc::new(VepKvStore::open(cache_dir.path()).expect("reopen KV store"));
 
         // Create an empty VCF batch (0 rows).
         let vcf_schema = Arc::new(Schema::new(vec![

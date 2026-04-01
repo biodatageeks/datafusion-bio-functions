@@ -337,8 +337,7 @@ mod tests {
 
     #[test]
     fn test_register_deduplicates() {
-        let mapping =
-            register_non_canonical_contigs(&["GL000220.1", "GL000220.1", "KI270733.1"]);
+        let mapping = register_non_canonical_contigs(&["GL000220.1", "GL000220.1", "KI270733.1"]);
         assert_eq!(mapping.len(), 2);
     }
 

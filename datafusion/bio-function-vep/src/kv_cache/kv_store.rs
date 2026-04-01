@@ -156,9 +156,7 @@ impl VepKvStore {
 
         // Load non-canonical contig→code registry if present.
         if let Some(raw) = meta.get(CONTIG_CODES_KEY).map_err(fjall_err)? {
-            if let Some(mapping) =
-                super::key_encoding::deserialize_contig_codes(&raw)
-            {
+            if let Some(mapping) = super::key_encoding::deserialize_contig_codes(&raw) {
                 super::key_encoding::load_non_canonical_registry(&mapping);
             }
         }

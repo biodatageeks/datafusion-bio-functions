@@ -180,7 +180,10 @@ impl CacheBuilder {
         // Skip if all outputs exist (unless overwrite is set).
         // Variation and translation have partial-skip logic in their
         // own build methods (e.g. parquet exists but fjall missing).
-        if !self.overwrite && kind != EnsemblEntityKind::Variation && kind != EnsemblEntityKind::Translation {
+        if !self.overwrite
+            && kind != EnsemblEntityKind::Variation
+            && kind != EnsemblEntityKind::Translation
+        {
             let entity_dir = format!("{}/{}", self.output_dir, subdir);
             if dir_has_parquet_files(&entity_dir) {
                 info!("{entity}: parquet already exists, skipping (use overwrite to rebuild)");
@@ -347,13 +350,7 @@ impl CacheBuilder {
                     let part_file = format!("{temp_dir}/part_{partition_idx}.parquet");
                     let part_sk = sort_key(kind);
                     handles.spawn(async move {
-                        let mut pw = create_writer(
-                            &part_file,
-                            &part_schema,
-                            kind,
-                            part_sk,
-                            None,
-                        )?;
+                        let mut pw = create_writer(&part_file, &part_schema, kind, part_sk, None)?;
                         let mut rows = 0usize;
                         let mut stream = stream;
                         while let Some(batch_result) = stream.next().await {
@@ -365,13 +362,13 @@ impl CacheBuilder {
                             rows += batch.num_rows();
                         }
                         pw.close().map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to close temp parquet: {e}"
-                            ))
+                            DataFusionError::Execution(format!("Failed to close temp parquet: {e}"))
                         })?;
                         // Return partition_idx so we can sort by it after JoinSet
                         Ok::<(usize, String, usize), DataFusionError>((
-                            partition_idx, part_file, rows,
+                            partition_idx,
+                            part_file,
+                            rows,
                         ))
                     });
                 }
@@ -406,19 +403,16 @@ impl CacheBuilder {
                     let _ = empty_writer.close();
                 }
 
+                use parquet::file::properties::WriterProperties;
                 use parquet::file::reader::FileReader;
                 use parquet::file::serialized_reader::SerializedFileReader;
                 use parquet::file::writer::SerializedFileWriter;
-                use parquet::file::properties::WriterProperties;
 
                 let first_reader = SerializedFileReader::try_from(
-                    File::open(&part_files[0].1).map_err(|e| {
-                        DataFusionError::Execution(format!("open part file: {e}"))
-                    })?,
+                    File::open(&part_files[0].1)
+                        .map_err(|e| DataFusionError::Execution(format!("open part file: {e}")))?,
                 )
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("read part parquet: {e}"))
-                })?;
+                .map_err(|e| DataFusionError::Execution(format!("read part parquet: {e}")))?;
                 let parquet_schema = first_reader.metadata().file_metadata().schema().clone();
                 let props = WriterProperties::builder()
                     .set_compression(parquet::basic::Compression::ZSTD(
@@ -430,22 +424,18 @@ impl CacheBuilder {
                 let out_file = File::create(output_file).map_err(|e| {
                     DataFusionError::Execution(format!("create merged parquet: {e}"))
                 })?;
-                let mut merged_writer = SerializedFileWriter::new(
-                    out_file,
-                    Arc::new(parquet_schema),
-                    Arc::new(props),
-                )
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("create parquet writer: {e}"))
-                })?;
+                let mut merged_writer =
+                    SerializedFileWriter::new(out_file, Arc::new(parquet_schema), Arc::new(props))
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!("create parquet writer: {e}"))
+                        })?;
 
                 use parquet::column::writer::ColumnCloseResult;
                 use parquet::format::{ColumnIndex, OffsetIndex};
 
                 for (_, part_file, part_rows) in &part_files {
-                    let src_file = File::open(part_file).map_err(|e| {
-                        DataFusionError::Execution(format!("open part file: {e}"))
-                    })?;
+                    let src_file = File::open(part_file)
+                        .map_err(|e| DataFusionError::Execution(format!("open part file: {e}")))?;
                     let reader = SerializedFileReader::try_from(src_file).map_err(|e| {
                         DataFusionError::Execution(format!("read part parquet: {e}"))
                     })?;
@@ -453,17 +443,14 @@ impl CacheBuilder {
                     let meta = reader.metadata();
                     for rg_idx in 0..meta.num_row_groups() {
                         let rg_meta = meta.row_group(rg_idx);
-                        let mut rg_writer = merged_writer
-                            .next_row_group()
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!("create row group: {e}"))
-                            })?;
+                        let mut rg_writer = merged_writer.next_row_group().map_err(|e| {
+                            DataFusionError::Execution(format!("create row group: {e}"))
+                        })?;
 
                         // Re-open the file for each row group so append_column
                         // can read column data via ChunkReader.
-                        let chunk_reader = File::open(part_file).map_err(|e| {
-                            DataFusionError::Execution(format!("open part: {e}"))
-                        })?;
+                        let chunk_reader = File::open(part_file)
+                            .map_err(|e| DataFusionError::Execution(format!("open part: {e}")))?;
 
                         for col_idx in 0..rg_meta.num_columns() {
                             let col_meta = rg_meta.column(col_idx).clone();
@@ -479,9 +466,7 @@ impl CacheBuilder {
                             rg_writer
                                 .append_column(&chunk_reader, close_result)
                                 .map_err(|e| {
-                                    DataFusionError::Execution(format!(
-                                        "append column chunk: {e}"
-                                    ))
+                                    DataFusionError::Execution(format!("append column chunk: {e}"))
                                 })?;
                         }
 
@@ -511,8 +496,7 @@ impl CacheBuilder {
                 // (main_writer was already taken above)
             } else {
                 // --- Sequential path: single partition, stream directly ---
-                let mut stream =
-                    datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+                let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
 
                 while let Some(batch_result) = stream.next().await {
                     let batch = batch_result?;
@@ -591,7 +575,6 @@ impl CacheBuilder {
         }])
     }
 
-
     /// Build variation fjall from existing parquet files.
     ///
     /// Reads chr*.parquet and other.parquet in chrom_code order and feeds fjall.
@@ -638,9 +621,8 @@ impl CacheBuilder {
         );
 
         // Create fjall store
-        let read_ctx = SessionContext::new_with_config(
-            SessionConfig::new().with_target_partitions(1),
-        );
+        let read_ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
         // Probe schema from first file
         read_ctx
             .register_parquet("_probe", &parquet_files[0].1, Default::default())
@@ -693,8 +675,7 @@ impl CacheBuilder {
 
             if !all_contigs.is_empty() {
                 let refs: Vec<&str> = all_contigs.iter().map(|s| s.as_str()).collect();
-                let mapping =
-                    crate::kv_cache::key_encoding::register_non_canonical_contigs(&refs);
+                let mapping = crate::kv_cache::key_encoding::register_non_canonical_contigs(&refs);
                 store.store_contig_codes(&mapping)?;
                 info!(
                     "variation: registered {} non-canonical contigs for fjall rebuild",
@@ -736,8 +717,7 @@ impl CacheBuilder {
 
             // Pipeline: producer reads parquet + builds accumulators,
             // consumer does parallel serialize+compress + fjall write.
-            let (tx, rx) =
-                std::sync::mpsc::sync_channel::<(Vec<PositionAccumulator>, u64)>(2);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<PositionAccumulator>, u64)>(2);
 
             let col_indices_clone = col_indices.clone();
             let parquet_path_clone = parquet_path.clone();
@@ -778,8 +758,7 @@ impl CacheBuilder {
                         if batch.num_rows() == 0 {
                             continue;
                         }
-                        let starts =
-                            batch.column(start_col_idx_c).as_primitive::<Int64Type>();
+                        let starts = batch.column(start_col_idx_c).as_primitive::<Int64Type>();
                         let chrom_col = batch.column(chrom_col_idx_c);
 
                         for row in 0..batch.num_rows() {
@@ -789,9 +768,7 @@ impl CacheBuilder {
 
                             let should_flush = accum
                                 .as_ref()
-                                .is_some_and(|a| {
-                                    a.chrom_code != chrom_code || a.start != start
-                                });
+                                .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
 
                             if should_flush {
                                 pending.push(accum.take().unwrap());
@@ -800,8 +777,7 @@ impl CacheBuilder {
                                         &mut pending,
                                         Vec::with_capacity(PARALLEL_FLUSH_BATCH),
                                     );
-                                    if tx.send((batch_to_send, variants_in_batch)).is_err()
-                                    {
+                                    if tx.send((batch_to_send, variants_in_batch)).is_err() {
                                         return Ok(()); // consumer dropped
                                     }
                                     variants_in_batch = 0;
@@ -861,9 +837,7 @@ impl CacheBuilder {
             producer
                 .join()
                 .expect("producer thread panicked")
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("producer error: {e}"))
-                })?;
+                .map_err(|e| DataFusionError::Execution(format!("producer error: {e}")))?;
 
             // Finish this ingestion session
             ing.finish()
@@ -1704,8 +1678,7 @@ fn flush_positions_parallel(
     if num_threads <= 1 || positions.len() < 100 {
         for pos in positions {
             let mut comp = dict.as_ref().map(|d| {
-                zstd::bulk::Compressor::with_dictionary(zstd_level, d)
-                    .expect("create compressor")
+                zstd::bulk::Compressor::with_dictionary(zstd_level, d).expect("create compressor")
             });
             let (key, value) = pos.finish_entry(col_indices, allele_col_idx, &mut comp)?;
             write_fn(&key, &value)?;
@@ -1726,28 +1699,28 @@ fn flush_positions_parallel(
     // Parallel serialize+compress using std::thread::scope
     type KvPairs = Vec<(Vec<u8>, Vec<u8>)>;
     let results: Vec<Result<KvPairs>> = std::thread::scope(|s| {
-            let handles: Vec<_> = chunks
-                .into_iter()
-                .map(|chunk| {
-                    let dict_ref = &dict;
-                    s.spawn(move || {
-                        let mut comp = dict_ref.as_ref().map(|d| {
-                            zstd::bulk::Compressor::with_dictionary(zstd_level, d)
-                                .expect("create compressor")
-                        });
-                        chunk
-                            .into_iter()
-                            .map(|pos| pos.finish_entry(col_indices, allele_col_idx, &mut comp))
-                            .collect::<Result<Vec<_>>>()
-                    })
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                let dict_ref = &dict;
+                s.spawn(move || {
+                    let mut comp = dict_ref.as_ref().map(|d| {
+                        zstd::bulk::Compressor::with_dictionary(zstd_level, d)
+                            .expect("create compressor")
+                    });
+                    chunk
+                        .into_iter()
+                        .map(|pos| pos.finish_entry(col_indices, allele_col_idx, &mut comp))
+                        .collect::<Result<Vec<_>>>()
                 })
-                .collect();
+            })
+            .collect();
 
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("thread panicked"))
-                .collect()
-        });
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect()
+    });
 
     // Write results in order (preserves ascending key order)
     for chunk_result in results {
@@ -1992,9 +1965,7 @@ fn print_progress(label: &str, rows: usize, elapsed: f64) {
 /// If the plan is a `SortPreservingMergeExec` wrapping a multi-partition inner
 /// plan, return the inner plan.  This allows bypassing the merge and executing
 /// partitions in parallel with larger buffers.
-fn extract_multi_partition_inner(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Option<Arc<dyn ExecutionPlan>> {
+fn extract_multi_partition_inner(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     if plan.name() != "SortPreservingMergeExec" {
         return None;
     }
@@ -2022,12 +1993,9 @@ fn dir_has_parquet_files(dir: &str) -> bool {
         && std::fs::read_dir(dir)
             .ok()
             .map(|entries| {
-                entries.flatten().any(|e| {
-                    e.path()
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        == Some("parquet")
-                })
+                entries
+                    .flatten()
+                    .any(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("parquet"))
             })
             .unwrap_or(false)
 }
@@ -2840,13 +2808,9 @@ mod tests {
         }
 
         let partitions = 8;
-        let ctx = make_ctx_and_register(
-            cache_root,
-            EnsemblEntityKind::Variation,
-            "var",
-            partitions,
-        )
-        .unwrap();
+        let ctx =
+            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", partitions)
+                .unwrap();
 
         let query = "SELECT * FROM var WHERE chrom = '1' ORDER BY chrom, start";
         let df = ctx.sql(query).await.unwrap();
@@ -2857,7 +2821,10 @@ mod tests {
 
         // Extract inner multi-partition plan (same as cache builder does)
         let inner = extract_multi_partition_inner(&plan);
-        assert!(inner.is_some(), "should extract inner plan from SortPreservingMergeExec");
+        assert!(
+            inner.is_some(),
+            "should extract inner plan from SortPreservingMergeExec"
+        );
         let inner = inner.unwrap();
         let n = inner.properties().partitioning.partition_count();
         eprintln!("Inner plan: {n} partitions");
@@ -2893,10 +2860,7 @@ mod tests {
                             first_start = Some(s);
                         }
                         if let Some(prev) = prev_start {
-                            assert!(
-                                s >= prev,
-                                "partition {i}: rows not sorted: {s} < {prev}"
-                            );
+                            assert!(s >= prev, "partition {i}: rows not sorted: {s} < {prev}");
                         }
                         prev_start = Some(s);
                         last_start = Some(s);
@@ -2920,12 +2884,18 @@ mod tests {
 
         let phase1_elapsed = phase1_start.elapsed();
         let total_rows: usize = partition_rows.iter().map(|(_, r)| *r).sum();
-        eprintln!("Phase 1 done: {total_rows} rows in {:.1}s", phase1_elapsed.as_secs_f64());
+        eprintln!(
+            "Phase 1 done: {total_rows} rows in {:.1}s",
+            phase1_elapsed.as_secs_f64()
+        );
         for (idx, rows) in &partition_rows {
             eprintln!("  partition {idx}: {rows} rows");
         }
 
-        assert!(total_rows > 100_000, "expected >100K rows for chr1, got {total_rows}");
+        assert!(
+            total_rows > 100_000,
+            "expected >100K rows for chr1, got {total_rows}"
+        );
 
         // Verify all partitions did useful work (not just 1)
         let active_partitions = partition_rows.iter().filter(|(_, r)| *r > 0).count();
@@ -2999,10 +2969,7 @@ mod tests {
     fn test_chrom_batches_ordering_main_then_other() {
         // Simulate the batch building logic
         let main_chroms = vec!["1".to_string(), "22".to_string(), "X".to_string()];
-        let other_chroms = vec![
-            "GL000220.1".to_string(),
-            "HG1012_PATCH".to_string(),
-        ];
+        let other_chroms = vec!["GL000220.1".to_string(), "HG1012_PATCH".to_string()];
 
         let mut batches: Vec<(String, bool)> = Vec::new();
         for chrom in CHROM_CODE_ORDER {
@@ -3061,13 +3028,8 @@ mod tests {
         if !std::path::Path::new(cache_root).exists() {
             return;
         }
-        let ctx = make_ctx_and_register(
-            cache_root,
-            EnsemblEntityKind::Variation,
-            "var",
-            1,
-        )
-        .unwrap();
+        let ctx =
+            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", 1).unwrap();
         let table = ctx.table("var").await.unwrap();
         let schema = table.schema().inner().clone();
         let chroms = chroms_from_schema(&schema);
@@ -3081,9 +3043,15 @@ mod tests {
             eprintln!("contains MT: {}", all.iter().any(|c| c == "MT"));
         } else {
             eprintln!("WARNING: chroms_from_schema returned None!");
-            eprintln!("Schema metadata keys: {:?}", schema.metadata().keys().collect::<Vec<_>>());
+            eprintln!(
+                "Schema metadata keys: {:?}",
+                schema.metadata().keys().collect::<Vec<_>>()
+            );
         }
-        assert!(chroms.is_some(), "chroms_from_schema should not be None for real VEP cache");
+        assert!(
+            chroms.is_some(),
+            "chroms_from_schema should not be None for real VEP cache"
+        );
         let all = chroms.unwrap();
         assert!(all.len() > 25, "expected >25 chroms, got {}", all.len());
     }
@@ -3107,10 +3075,7 @@ mod tests {
     async fn test_extract_multi_partition_inner_non_merge_returns_none() {
         // A simple plan (no SortPreservingMergeExec) should return None
         let ctx = SessionContext::new();
-        let df = ctx
-            .sql("SELECT 1 as x")
-            .await
-            .unwrap();
+        let df = ctx.sql("SELECT 1 as x").await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
         assert!(
             extract_multi_partition_inner(&plan).is_none(),
@@ -3129,13 +3094,9 @@ mod tests {
         // Run with 1 partition (sequential) and 8 partitions (parallel)
         // on a small chromosome to compare row counts.
         for partitions in [1, 8] {
-            let ctx = make_ctx_and_register(
-                cache_root,
-                EnsemblEntityKind::Variation,
-                "var",
-                partitions,
-            )
-            .unwrap();
+            let ctx =
+                make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", partitions)
+                    .unwrap();
 
             let query = "SELECT COUNT(*) as cnt FROM var WHERE chrom = '22'";
             let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
@@ -3160,20 +3121,18 @@ mod tests {
             return;
         }
 
-        let ctx = make_ctx_and_register(
-            cache_root,
-            EnsemblEntityKind::Variation,
-            "var",
-            8,
-        )
-        .unwrap();
+        let ctx =
+            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", 8).unwrap();
 
         let query = "SELECT * FROM var WHERE chrom = '22' ORDER BY chrom, start";
         let df = ctx.sql(query).await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
 
         let inner = extract_multi_partition_inner(&plan);
-        assert!(inner.is_some(), "should extract inner plan from SortPreservingMergeExec");
+        assert!(
+            inner.is_some(),
+            "should extract inner plan from SortPreservingMergeExec"
+        );
 
         let inner = inner.unwrap();
         let n = inner.properties().partitioning.partition_count();
@@ -3203,20 +3162,22 @@ mod tests {
         std::fs::create_dir_all(&var_dir).unwrap();
 
         // Step 1: Write chr22 parquet
-        let ctx = make_ctx_and_register(
-            cache_root,
-            EnsemblEntityKind::Variation,
-            "var",
-            1,
-        )
-        .unwrap();
+        let ctx =
+            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", 1).unwrap();
         let query = "SELECT * FROM var WHERE chrom = '22' ORDER BY chrom, start";
         let df = ctx.sql(query).await.unwrap();
         let mut stream = df.execute_stream().await.unwrap();
         let schema = stream.schema();
         let parquet_path = format!("{var_dir}/chr22.parquet");
         let sk = sort_key(EnsemblEntityKind::Variation);
-        let mut writer = create_writer(&parquet_path, &schema, EnsemblEntityKind::Variation, sk, None).unwrap();
+        let mut writer = create_writer(
+            &parquet_path,
+            &schema,
+            EnsemblEntityKind::Variation,
+            sk,
+            None,
+        )
+        .unwrap();
         let mut rows = 0usize;
         while let Some(batch) = stream.next().await {
             let batch = batch.unwrap();
@@ -3240,10 +3201,7 @@ mod tests {
         match &result {
             Ok(stats) => {
                 for s in stats {
-                    eprintln!(
-                        "entity={} fjall={:?}",
-                        s.entity, s.fjall_stats
-                    );
+                    eprintln!("entity={} fjall={:?}", s.entity, s.fjall_stats);
                 }
             }
             Err(e) => eprintln!("Error: {e}"),
@@ -3317,7 +3275,10 @@ mod tests {
         assert!(result.is_ok());
         let stats = result.unwrap();
         assert_eq!(stats[0].entity, "transcript");
-        assert!(stats[0].parquet_files.is_empty(), "should return empty (skipped)");
+        assert!(
+            stats[0].parquet_files.is_empty(),
+            "should return empty (skipped)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3333,7 +3294,10 @@ mod tests {
         let builder = CacheBuilder::new("/nonexistent_cache", output).with_overwrite(true);
         // Should NOT skip because overwrite=true — will fail because cache doesn't exist
         let result = builder.build_entity("transcript").await;
-        assert!(result.is_err(), "should fail (not skip) with overwrite=true");
+        assert!(
+            result.is_err(),
+            "should fail (not skip) with overwrite=true"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3370,7 +3334,10 @@ mod tests {
         let result = builder.build_entity("variation").await;
         // Will try to rebuild fjall from parquet but fail because the
         // parquet file is not a real parquet file
-        assert!(result.is_err(), "should attempt fjall rebuild and fail on fake parquet");
+        assert!(
+            result.is_err(),
+            "should attempt fjall rebuild and fail on fake parquet"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3429,13 +3396,7 @@ mod tests {
 
     #[test]
     fn test_flush_positions_parallel_single_position() {
-        let batch = make_batch(
-            vec!["1"],
-            vec![100],
-            vec![100],
-            vec!["A/G"],
-            vec!["rs1"],
-        );
+        let batch = make_batch(vec!["1"], vec![100], vec![100], vec!["A/G"], vec!["rs1"]);
         let accum = PositionAccumulator::new(1, "1".to_string(), 100, 0, &batch);
 
         let mut pending = vec![accum];
@@ -3508,12 +3469,7 @@ mod tests {
 
         // Verify keys are strictly ascending
         for w in written_keys.windows(2) {
-            assert!(
-                w[0] < w[1],
-                "keys not ascending: {:?} >= {:?}",
-                w[0],
-                w[1]
-            );
+            assert!(w[0] < w[1], "keys not ascending: {:?} >= {:?}", w[0], w[1]);
         }
     }
 
@@ -3571,13 +3527,7 @@ mod tests {
     #[test]
     fn test_flush_positions_parallel_with_zstd_dict() {
         // Train a tiny dict and verify compression works
-        let batch = make_batch(
-            vec!["1"],
-            vec![100],
-            vec![100],
-            vec!["A/G"],
-            vec!["rs1"],
-        );
+        let batch = make_batch(vec!["1"], vec![100], vec![100], vec!["A/G"], vec!["rs1"]);
         let accum = PositionAccumulator::new(1, "1".to_string(), 100, 0, &batch);
 
         let mut pending = vec![accum];
@@ -3637,11 +3587,11 @@ mod tests {
 
     #[test]
     fn test_zero_copy_merge_preserves_all_rows() {
+        use parquet::column::writer::ColumnCloseResult;
+        use parquet::file::properties::WriterProperties;
         use parquet::file::reader::FileReader;
         use parquet::file::serialized_reader::SerializedFileReader;
         use parquet::file::writer::SerializedFileWriter;
-        use parquet::file::properties::WriterProperties;
-        use parquet::column::writer::ColumnCloseResult;
 
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path();
@@ -3684,19 +3634,15 @@ mod tests {
         // Merge using zero-copy append_column
         let merged_path = format!("{}/merged.parquet", dir_path.display());
 
-        let first_reader = SerializedFileReader::try_from(
-            File::open(&part_files[0]).unwrap(),
-        ).unwrap();
+        let first_reader =
+            SerializedFileReader::try_from(File::open(&part_files[0]).unwrap()).unwrap();
         let parquet_schema = first_reader.metadata().file_metadata().schema().clone();
         drop(first_reader);
 
         let props = WriterProperties::builder().build();
         let out_file = File::create(&merged_path).unwrap();
-        let mut merged_writer = SerializedFileWriter::new(
-            out_file,
-            Arc::new(parquet_schema),
-            Arc::new(props),
-        ).unwrap();
+        let mut merged_writer =
+            SerializedFileWriter::new(out_file, Arc::new(parquet_schema), Arc::new(props)).unwrap();
 
         for part_file in &part_files {
             let src_file = File::open(part_file).unwrap();
@@ -3718,7 +3664,9 @@ mod tests {
                         column_index: None,
                         offset_index: None,
                     };
-                    rg_writer.append_column(&chunk_reader, close_result).unwrap();
+                    rg_writer
+                        .append_column(&chunk_reader, close_result)
+                        .unwrap();
                 }
                 rg_writer.close().unwrap();
             }
@@ -3757,11 +3705,11 @@ mod tests {
     #[test]
     fn test_zero_copy_merge_multiple_row_groups() {
         use parquet::arrow::ArrowWriter;
+        use parquet::column::writer::ColumnCloseResult;
+        use parquet::file::properties::WriterProperties;
         use parquet::file::reader::FileReader;
         use parquet::file::serialized_reader::SerializedFileReader;
         use parquet::file::writer::SerializedFileWriter;
-        use parquet::file::properties::WriterProperties;
-        use parquet::column::writer::ColumnCloseResult;
 
         let dir = tempfile::tempdir().unwrap();
 
@@ -3784,9 +3732,7 @@ mod tests {
         w.close().unwrap();
 
         // Verify source has multiple row groups
-        let src_reader = SerializedFileReader::try_from(
-            File::open(&src_path).unwrap(),
-        ).unwrap();
+        let src_reader = SerializedFileReader::try_from(File::open(&src_path).unwrap()).unwrap();
         let num_rg = src_reader.metadata().num_row_groups();
         assert!(num_rg > 1, "expected multiple row groups, got {num_rg}");
         let src_total: i64 = (0..num_rg)
@@ -3797,9 +3743,7 @@ mod tests {
         // Merge into a new file
         let merged_path = format!("{}/merged.parquet", dir.path().display());
 
-        let reader = SerializedFileReader::try_from(
-            File::open(&src_path).unwrap(),
-        ).unwrap();
+        let reader = SerializedFileReader::try_from(File::open(&src_path).unwrap()).unwrap();
         let schema = reader.metadata().file_metadata().schema().clone();
         let meta = reader.metadata().clone();
         drop(reader);
@@ -3809,7 +3753,8 @@ mod tests {
             out_file,
             Arc::new(schema),
             Arc::new(WriterProperties::builder().build()),
-        ).unwrap();
+        )
+        .unwrap();
 
         for rg_idx in 0..meta.num_row_groups() {
             let rg_meta = meta.row_group(rg_idx);
@@ -3826,7 +3771,9 @@ mod tests {
                     column_index: None,
                     offset_index: None,
                 };
-                rg_writer.append_column(&chunk_reader, close_result).unwrap();
+                rg_writer
+                    .append_column(&chunk_reader, close_result)
+                    .unwrap();
             }
             rg_writer.close().unwrap();
         }
