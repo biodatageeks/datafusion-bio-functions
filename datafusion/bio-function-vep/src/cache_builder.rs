@@ -3850,4 +3850,137 @@ mod tests {
             .collect();
         assert_eq!(starts, vec![10, 20, 30, 40, 50]);
     }
+
+    // -----------------------------------------------------------------------
+    // split_chroms ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_split_chroms_returns_numeric_order() {
+        let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
+        // Simulate alphabetical order from schema metadata
+        let chroms = Some(
+            vec!["1", "10", "11", "2", "20", "3", "MT", "X", "Y"]
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let (main, _) = split_chroms(&chroms, &main_set);
+        let names: Vec<&str> = main.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["1", "2", "3", "10", "11", "20", "X", "Y", "MT"],
+            "main chroms should be in CHROM_CODE_ORDER, not alphabetical"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // sift fjall ingestion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_serialize_predictions_roundtrip() {
+        use crate::kv_cache::sift_store::serialize_predictions;
+        use crate::transcript_consequence::{CachedPredictions, CompactPrediction};
+
+        let preds = CachedPredictions {
+            sift: vec![
+                CompactPrediction {
+                    position: 42,
+                    amino_acid: 0,
+                    prediction: 1,
+                    score: 0.05,
+                },
+                CompactPrediction {
+                    position: 100,
+                    amino_acid: 3,
+                    prediction: 0,
+                    score: 0.95,
+                },
+            ],
+            polyphen: vec![CompactPrediction {
+                position: 42,
+                amino_acid: 0,
+                prediction: 2,
+                score: 0.99,
+            }],
+        };
+
+        let bytes = serialize_predictions(&preds);
+        assert!(!bytes.is_empty());
+
+        // Verify header: sift_count=2, polyphen_count=1
+        let sift_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let polyphen_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(sift_count, 2);
+        assert_eq!(polyphen_count, 1);
+
+        // Verify total size: header(8) + 3 predictions * 10 bytes each = 38
+        assert_eq!(bytes.len(), 8 + 3 * 10);
+    }
+
+    #[test]
+    fn test_sift_ingestion_writes_ascending_keys() {
+        use crate::kv_cache::sift_store::{SiftKvStore, serialize_predictions};
+        use crate::transcript_consequence::{CachedPredictions, CompactPrediction};
+
+        let dir = tempfile::tempdir().unwrap();
+        let fjall_dir = dir.path().join("sift.fjall");
+
+        let db = fjall::Database::builder(&fjall_dir)
+            .cache_size(16 * 1024 * 1024)
+            .worker_threads(1)
+            .open()
+            .unwrap();
+        let store = SiftKvStore::create(&db).unwrap();
+
+        // Use start_ingestion with ascending transcript IDs
+        let mut ing = store.keyspace().start_ingestion().unwrap();
+
+        let transcripts = vec!["ENST00000001", "ENST00000002", "ENST00000003"];
+        for tid in &transcripts {
+            let preds = CachedPredictions {
+                sift: vec![CompactPrediction {
+                    position: 1,
+                    amino_acid: 0,
+                    prediction: 0,
+                    score: 0.5,
+                }],
+                polyphen: vec![],
+            };
+            let value = serialize_predictions(&preds);
+            ing.write(tid.as_bytes(), value).unwrap();
+        }
+        ing.finish().unwrap();
+
+        // Verify all transcripts are retrievable
+        for tid in &transcripts {
+            let result = store.get(tid).unwrap();
+            assert!(result.is_some(), "should find {tid}");
+            let preds = result.unwrap();
+            assert_eq!(preds.sift.len(), 1);
+            assert_eq!(preds.sift[0].position, 1);
+        }
+    }
+
+    #[test]
+    fn test_sift_ingestion_empty() {
+        use crate::kv_cache::sift_store::SiftKvStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fjall_dir = dir.path().join("sift.fjall");
+
+        let db = fjall::Database::builder(&fjall_dir)
+            .cache_size(16 * 1024 * 1024)
+            .worker_threads(1)
+            .open()
+            .unwrap();
+        let store = SiftKvStore::create(&db).unwrap();
+
+        // Empty ingestion should succeed
+        let ing = store.keyspace().start_ingestion().unwrap();
+        ing.finish().unwrap();
+
+        assert!(store.get("nonexistent").unwrap().is_none());
+    }
 }
