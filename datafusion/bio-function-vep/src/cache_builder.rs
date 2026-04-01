@@ -50,7 +50,7 @@ pub type OnProgress = Box<dyn Fn(&str, &str, usize, usize, usize) + Send + Sync>
 /// Main chromosomes that get their own parquet file.
 const MAIN_CHROMS: &[&str] = &[
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
-    "18", "19", "20", "21", "22", "X", "Y",
+    "18", "19", "20", "21", "22", "X", "Y", "MT",
 ];
 
 /// Chromosomes in fjall key encoding order (chrom_code ascending).
@@ -2548,8 +2548,8 @@ mod tests {
             "GL000220.1".to_string(),
         ]);
         let (main, other) = split_chroms(&chroms, &main_set);
-        assert_eq!(main, vec!["1", "2"]);
-        assert_eq!(other, vec!["MT", "GL000220.1"]);
+        assert_eq!(main, vec!["1", "2", "MT"]);
+        assert_eq!(other, vec!["GL000220.1"]);
     }
 
     #[test]
@@ -3336,12 +3336,11 @@ mod tests {
     }
 
     #[test]
-    fn test_mt_included_in_main_chrom_code_order() {
-        // MT is in CHROM_CODE_ORDER but not in MAIN_CHROMS — verify it's
-        // processed via the main chrom loop (it has a canonical code)
+    fn test_mt_included_in_main_chroms() {
+        // MT is in both MAIN_CHROMS and CHROM_CODE_ORDER — gets its own
+        // chrMT.parquet file and is processed in the main chrom loop.
+        assert!(MAIN_CHROMS.contains(&"MT"));
         assert!(CHROM_CODE_ORDER.contains(&"MT"));
-        assert!(!MAIN_CHROMS.contains(&"MT"));
-        // MT gets processed in the main loop IF present in the discovered chroms.
         // Its code (25) is less than NON_CANONICAL_START (26), so fjall ordering
         // is correct: main codes 1-25 < non-canonical codes >= 26.
         assert!(chrom_to_code("MT") < 26);
