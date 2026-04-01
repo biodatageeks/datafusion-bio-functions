@@ -1100,26 +1100,39 @@ impl CacheBuilder {
                     DataFusionError::Execution(format!("producer error: {e}"))
                 })?;
 
-            // Finish this ingestion session and compact
+            // Finish this ingestion session
             ing.finish()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            store
-                .data_partition()
-                .major_compact()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             let stem = Path::new(parquet_path)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("?");
-            info!(
-                "variation.fjall: {stem} ingested + compacted in {:.1}s ({}/{} files, {} positions so far)",
-                file_start.elapsed().as_secs_f64(),
-                file_idx + 1,
-                parquet_files.len(),
-                total_positions,
-            );
+
+            // Major compact every 4 files to keep disk usage bounded
+            // without the overhead of compacting after every single file.
+            let compact_interval = 4;
+            if (file_idx + 1) % compact_interval == 0 || file_idx + 1 == parquet_files.len() {
+                store
+                    .data_partition()
+                    .major_compact()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                info!(
+                    "variation.fjall: {stem} ingested + compacted in {:.1}s ({}/{} files, {} positions)",
+                    file_start.elapsed().as_secs_f64(),
+                    file_idx + 1,
+                    parquet_files.len(),
+                    total_positions,
+                );
+            } else {
+                info!(
+                    "variation.fjall: {stem} ingested in {:.1}s ({}/{} files, {} positions)",
+                    file_start.elapsed().as_secs_f64(),
+                    file_idx + 1,
+                    parquet_files.len(),
+                    total_positions,
+                );
+            }
         }
 
         store.persist()?;
