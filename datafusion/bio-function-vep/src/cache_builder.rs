@@ -952,12 +952,6 @@ impl CacheBuilder {
                 .await?
         };
 
-        // Start ingestion
-        let mut ing = store
-            .data_partition()
-            .start_ingestion()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
         let chrom_col_idx = schema.index_of("chrom")?;
         let start_col_idx = schema.index_of("start")?;
         let allele_col_idx = schema.index_of("allele_string")?;
@@ -970,34 +964,47 @@ impl CacheBuilder {
         let mut total_bytes = 0u64;
         let start_time = Instant::now();
 
-        // Pipeline: producer reads parquet + builds accumulators,
-        // consumer does parallel serialize+compress + fjall write.
-        // Channel depth 2 allows one batch being compressed while next is built.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<PositionAccumulator>, u64)>(2);
+        // Process each parquet file as a separate ingestion session.
+        // After each session: finish() + major_compact() to reclaim disk space.
+        // This bounds peak disk usage to ~1 chromosome's uncompacted SSTs
+        // instead of accumulating all chromosomes before compacting.
+        for (file_idx, (_, parquet_path)) in parquet_files.iter().enumerate() {
+            let file_start = Instant::now();
 
-        let col_indices_clone = col_indices.clone();
-        let parquet_file_list: Vec<String> =
-            parquet_files.iter().map(|(_, p)| p.clone()).collect();
+            // Pipeline: producer reads parquet + builds accumulators,
+            // consumer does parallel serialize+compress + fjall write.
+            let (tx, rx) =
+                std::sync::mpsc::sync_channel::<(Vec<PositionAccumulator>, u64)>(2);
 
-        // Producer: reads parquet files, iterates rows, sends position batches
-        let producer = std::thread::spawn(move || -> Result<()> {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| DataFusionError::Execution(format!("tokio runtime: {e}")))?;
+            let col_indices_clone = col_indices.clone();
+            let parquet_path_clone = parquet_path.clone();
+            let chrom_col_idx_c = chrom_col_idx;
+            let start_col_idx_c = start_col_idx;
 
-            rt.block_on(async {
-                let read_config = SessionConfig::new().with_target_partitions(1);
-                let read_ctx = SessionContext::new_with_config(read_config);
+            // Start a new ingestion session for this file
+            let mut ing = store
+                .data_partition()
+                .start_ingestion()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let mut accum: Option<PositionAccumulator> = None;
-                let mut pending: Vec<PositionAccumulator> =
-                    Vec::with_capacity(PARALLEL_FLUSH_BATCH);
-                let mut variants_in_batch = 0u64;
+            // Producer: reads one parquet file, iterates rows, sends position batches
+            let producer = std::thread::spawn(move || -> Result<()> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| DataFusionError::Execution(format!("tokio runtime: {e}")))?;
 
-                for parquet_path in &parquet_file_list {
+                rt.block_on(async {
+                    let read_config = SessionConfig::new().with_target_partitions(1);
+                    let read_ctx = SessionContext::new_with_config(read_config);
+
+                    let mut accum: Option<PositionAccumulator> = None;
+                    let mut pending: Vec<PositionAccumulator> =
+                        Vec::with_capacity(PARALLEL_FLUSH_BATCH);
+                    let mut variants_in_batch = 0u64;
+
                     read_ctx
-                        .register_parquet("_part", parquet_path, Default::default())
+                        .register_parquet("_part", &parquet_path_clone, Default::default())
                         .await?;
                     let df = read_ctx.sql("SELECT * FROM _part").await?;
                     let mut stream = df.execute_stream().await?;
@@ -1009,8 +1016,8 @@ impl CacheBuilder {
                             continue;
                         }
                         let starts =
-                            batch.column(start_col_idx).as_primitive::<Int64Type>();
-                        let chrom_col = batch.column(chrom_col_idx);
+                            batch.column(start_col_idx_c).as_primitive::<Int64Type>();
+                        let chrom_col = batch.column(chrom_col_idx_c);
 
                         for row in 0..batch.num_rows() {
                             let start = starts.value(row);
@@ -1030,7 +1037,8 @@ impl CacheBuilder {
                                         &mut pending,
                                         Vec::with_capacity(PARALLEL_FLUSH_BATCH),
                                     );
-                                    if tx.send((batch_to_send, variants_in_batch)).is_err() {
+                                    if tx.send((batch_to_send, variants_in_batch)).is_err()
+                                    {
                                         return Ok(()); // consumer dropped
                                     }
                                     variants_in_batch = 0;
@@ -1054,61 +1062,67 @@ impl CacheBuilder {
                         }
                     }
 
-                    // Flush remaining accumulator between files
+                    // Flush remaining accumulator
                     if let Some(a) = accum.take() {
                         pending.push(a);
                     }
-                }
+                    if !pending.is_empty() {
+                        let _ = tx.send((pending, variants_in_batch));
+                    }
 
-                // Send final batch
-                if !pending.is_empty() {
-                    let _ = tx.send((pending, variants_in_batch));
-                }
+                    Ok(())
+                })
+            });
 
-                Ok(())
-            })
-        });
+            // Consumer: parallel serialize+compress + fjall write
+            while let Ok((mut batch, batch_variants)) = rx.recv() {
+                total_variants += batch_variants;
+                flush_positions_parallel(
+                    &mut batch,
+                    &col_indices_clone,
+                    allele_col_idx,
+                    &dict,
+                    self.zstd_level,
+                    &mut |k, v| {
+                        ing.write(k, v)
+                            .map_err(|e| DataFusionError::External(Box::new(e)))
+                    },
+                    &mut total_positions,
+                    &mut total_bytes,
+                )?;
+            }
 
-        // Consumer: parallel serialize+compress + fjall write
-        while let Ok((mut batch, batch_variants)) = rx.recv() {
-            total_variants += batch_variants;
-            flush_positions_parallel(
-                &mut batch,
-                &col_indices_clone,
-                allele_col_idx,
-                &dict,
-                self.zstd_level,
-                &mut |k, v| {
-                    ing.write(k, v)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))
-                },
-                &mut total_positions,
-                &mut total_bytes,
-            )?;
+            // Wait for producer to finish
+            producer
+                .join()
+                .expect("producer thread panicked")
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("producer error: {e}"))
+                })?;
+
+            // Finish this ingestion session and compact
+            ing.finish()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            store
+                .data_partition()
+                .major_compact()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let stem = Path::new(parquet_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?");
+            info!(
+                "variation.fjall: {stem} ingested + compacted in {:.1}s ({}/{} files, {} positions so far)",
+                file_start.elapsed().as_secs_f64(),
+                file_idx + 1,
+                parquet_files.len(),
+                total_positions,
+            );
         }
 
-        // Wait for producer to finish and propagate errors
-        producer
-            .join()
-            .expect("producer thread panicked")
-            .map_err(|e| DataFusionError::Execution(format!("producer error: {e}")))?;
-
-        ing.finish()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
         store.persist()?;
-
-        info!(
-            "Running major compaction on variation.fjall...",
-        );
-        let compact_start = Instant::now();
-        store
-            .data_partition()
-            .major_compact()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        info!(
-            "Major compaction completed in {:.1}s",
-            compact_start.elapsed().as_secs_f64()
-        );
 
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(
