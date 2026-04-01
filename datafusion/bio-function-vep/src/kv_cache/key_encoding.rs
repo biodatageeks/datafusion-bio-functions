@@ -123,7 +123,7 @@ pub fn encode_position_key_buf(chrom_code: u16, start: i64, buf: &mut Vec<u8>) {
 /// Register non-canonical contigs with collision-free sequential codes.
 ///
 /// Contigs are sorted lexicographically and assigned codes starting from
-/// [`NON_CANONICAL_START`] (26). This guarantees no collisions and produces
+/// `NON_CANONICAL_START` (26). This guarantees no collisions and produces
 /// a deterministic mapping for the same input set.
 ///
 /// Returns the mapping as a `Vec<(String, u16)>` for persistence.
