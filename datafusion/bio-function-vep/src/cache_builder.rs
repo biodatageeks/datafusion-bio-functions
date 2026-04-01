@@ -1124,6 +1124,19 @@ impl CacheBuilder {
 
         store.persist()?;
 
+        // Final compaction merges all per-file L1 runs into a single sorted run,
+        // eliminating overlap between chromosome SSTs and reducing total size.
+        info!("Running final major compaction on variation.fjall...");
+        let compact_start = Instant::now();
+        store
+            .data_partition()
+            .major_compact()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        info!(
+            "Final compaction completed in {:.1}s",
+            compact_start.elapsed().as_secs_f64()
+        );
+
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(
             "variation.fjall rebuilt: {} positions, {} variants, {:.1} MB in {:.1}s",
