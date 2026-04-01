@@ -391,42 +391,121 @@ impl CacheBuilder {
                     num_partitions
                 );
 
-                // Phase 2: Read temp parquet files in partition order → final parquet
-                // Use target_partitions=1 to preserve row order within each file.
-                let read_config = SessionConfig::new().with_target_partitions(1);
-                let read_ctx = SessionContext::new_with_config(read_config);
-                for (_, part_file, _) in &part_files {
-                    read_ctx
-                        .register_parquet("_part", part_file, Default::default())
-                        .await?;
-                    let part_batches = read_ctx.sql("SELECT * FROM _part").await?.collect().await?;
-                    read_ctx.deregister_table("_part")?;
+                // Phase 2: Merge temp parquet files by appending row groups
+                // (no decompression/recompression — just copies raw bytes).
+                //
+                // Close the main writer first (it wrote nothing yet), then
+                // concatenate row groups from each partition file into the
+                // final output file.
+                {
+                    // Drop the empty ArrowWriter so we can overwrite the file
+                    let empty_writer = main_writer.take().unwrap();
+                    let _ = empty_writer.close();
+                }
 
-                    for batch in &part_batches {
-                        if batch.num_rows() == 0 {
-                            continue;
+                use parquet::file::reader::FileReader;
+                use parquet::file::serialized_reader::SerializedFileReader;
+                use parquet::file::writer::SerializedFileWriter;
+                use parquet::file::properties::WriterProperties;
+
+                let first_reader = SerializedFileReader::try_from(
+                    File::open(&part_files[0].1).map_err(|e| {
+                        DataFusionError::Execution(format!("open part file: {e}"))
+                    })?,
+                )
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("read part parquet: {e}"))
+                })?;
+                let parquet_schema = first_reader.metadata().file_metadata().schema().clone();
+                let props = WriterProperties::builder()
+                    .set_compression(parquet::basic::Compression::ZSTD(
+                        parquet::basic::ZstdLevel::try_new(3).unwrap(),
+                    ))
+                    .build();
+                drop(first_reader);
+
+                let out_file = File::create(output_file).map_err(|e| {
+                    DataFusionError::Execution(format!("create merged parquet: {e}"))
+                })?;
+                let mut merged_writer = SerializedFileWriter::new(
+                    out_file,
+                    Arc::new(parquet_schema),
+                    Arc::new(props),
+                )
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("create parquet writer: {e}"))
+                })?;
+
+                use parquet::column::writer::ColumnCloseResult;
+                use parquet::format::{ColumnIndex, OffsetIndex};
+
+                for (_, part_file, part_rows) in &part_files {
+                    let src_file = File::open(part_file).map_err(|e| {
+                        DataFusionError::Execution(format!("open part file: {e}"))
+                    })?;
+                    let reader = SerializedFileReader::try_from(src_file).map_err(|e| {
+                        DataFusionError::Execution(format!("read part parquet: {e}"))
+                    })?;
+
+                    let meta = reader.metadata();
+                    for rg_idx in 0..meta.num_row_groups() {
+                        let rg_meta = meta.row_group(rg_idx);
+                        let mut rg_writer = merged_writer
+                            .next_row_group()
+                            .map_err(|e| {
+                                DataFusionError::Execution(format!("create row group: {e}"))
+                            })?;
+
+                        // Re-open the file for each row group so append_column
+                        // can read column data via ChunkReader.
+                        let chunk_reader = File::open(part_file).map_err(|e| {
+                            DataFusionError::Execution(format!("open part: {e}"))
+                        })?;
+
+                        for col_idx in 0..rg_meta.num_columns() {
+                            let col_meta = rg_meta.column(col_idx).clone();
+                            let close_result = ColumnCloseResult {
+                                bytes_written: col_meta.compressed_size() as u64,
+                                rows_written: rg_meta.num_rows() as u64,
+                                metadata: col_meta,
+                                bloom_filter: None,
+                                column_index: None,
+                                offset_index: None,
+                            };
+
+                            rg_writer
+                                .append_column(&chunk_reader, close_result)
+                                .map_err(|e| {
+                                    DataFusionError::Execution(format!(
+                                        "append column chunk: {e}"
+                                    ))
+                                })?;
                         }
 
-                        writer.write(batch)?;
-                        chrom_rows += batch.num_rows();
-                        total_parquet_rows += batch.num_rows();
-
-                        if let Some(ref cb) = self.on_progress {
-                            cb(
-                                "variation",
-                                "parquet",
-                                batch.num_rows(),
-                                total_parquet_rows,
-                                0,
-                            );
-                        }
+                        rg_writer.close().map_err(|e| {
+                            DataFusionError::Execution(format!("close row group: {e}"))
+                        })?;
                     }
+
+                    chrom_rows += part_rows;
+                    total_parquet_rows += part_rows;
+                }
+
+                merged_writer.close().map_err(|e| {
+                    DataFusionError::Execution(format!("close merged parquet: {e}"))
+                })?;
+
+                if let Some(ref cb) = self.on_progress {
+                    cb("variation", "parquet", chrom_rows, total_parquet_rows, 0);
                 }
 
                 // Cleanup temp files
                 if let Err(e) = std::fs::remove_dir_all(&temp_dir) {
                     log::warn!("Failed to clean up temp dir {temp_dir}: {e}");
                 }
+
+                // Prevent the outer close from running on the taken writer
+                // (main_writer was already taken above)
             } else {
                 // --- Sequential path: single partition, stream directly ---
                 let mut stream =
