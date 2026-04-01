@@ -1366,18 +1366,12 @@ impl CacheBuilder {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let sift_store = SiftKvStore::create(&db)?;
 
-        // Stream predictions into fjall using start_ingestion() (fast bulk API).
-        // Read each parquet file sequentially — no UNION ALL + ORDER BY which
-        // materializes 5GB+ in memory.
-        // Data is sorted by transcript_id within each file, and transcript IDs
-        // don't repeat across chromosomes, so keys are globally ascending.
+        // Stream predictions into fjall, reading each parquet file sequentially.
+        // No UNION ALL + ORDER BY which materializes 5GB+ in memory.
+        // Uses insert() (not start_ingestion) because transcript IDs are not
+        // globally ascending across chromosome files.
         let read_ctx =
             SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-
-        let mut ingestion = sift_store
-            .keyspace()
-            .start_ingestion()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let mut current_transcript: Option<String> = None;
         let mut current_preds = CachedPredictions::default();
@@ -1417,14 +1411,9 @@ impl CacheBuilder {
                     }
 
                     if current_transcript.as_deref() != Some(&transcript_id) {
-                        // Flush previous transcript to fjall via ingestion
                         if let Some(tid) = current_transcript.take() {
                             current_preds.sort();
-                            let value =
-                                crate::kv_cache::sift_store::serialize_predictions(&current_preds);
-                            ingestion
-                                .write(tid.as_bytes(), value)
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            sift_store.put(&tid, &current_preds)?;
                             current_preds = CachedPredictions::default();
                             transcript_count += 1;
                         }
@@ -1444,16 +1433,9 @@ impl CacheBuilder {
         // Flush last transcript
         if let Some(tid) = current_transcript.take() {
             current_preds.sort();
-            let value = crate::kv_cache::sift_store::serialize_predictions(&current_preds);
-            ingestion
-                .write(tid.as_bytes(), value)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            sift_store.put(&tid, &current_preds)?;
             transcript_count += 1;
         }
-
-        ingestion
-            .finish()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         db.persist(fjall::PersistMode::SyncAll)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
