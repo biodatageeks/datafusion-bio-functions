@@ -34,11 +34,17 @@ const CHROM_NAMES: &[&str] = &[
 /// Non-canonical range starts at 26 to avoid colliding with MT.
 const NON_CANONICAL_START: u16 = 26;
 
-/// Global registry for non-canonical contig → code mappings.
+/// Process-global registry for non-canonical contig → code mappings.
 ///
 /// Populated at cache-build time via [`register_non_canonical_contigs`] and
 /// at cache-open time via [`load_non_canonical_registry`]. Lookup is O(1)
 /// via the RwLock read path.
+///
+/// **Limitation:** This is process-global, not per-store. Opening multiple
+/// caches with different contig sets in the same process will overwrite each
+/// other's mappings. In practice this is fine because `build_cache` and VEP
+/// annotation operate on a single cache at a time. If multi-cache support is
+/// needed, this should be refactored to per-store scoping.
 static NON_CANONICAL_REGISTRY: LazyLock<RwLock<AHashMap<String, u16>>> =
     LazyLock::new(|| RwLock::new(AHashMap::new()));
 

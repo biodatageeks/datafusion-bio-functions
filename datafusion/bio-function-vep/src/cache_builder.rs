@@ -620,6 +620,14 @@ impl CacheBuilder {
             parquet_files.len()
         );
 
+        // Remove existing fjall DB before rebuilding to avoid stale keys
+        if Path::new(&fjall_dir).exists() {
+            std::fs::remove_dir_all(&fjall_dir).map_err(|e| {
+                DataFusionError::Execution(format!("Failed to remove existing {fjall_dir}: {e}"))
+            })?;
+            info!("variation.fjall: removed existing DB for clean rebuild");
+        }
+
         // Create fjall store
         let read_ctx =
             SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
@@ -1360,6 +1368,14 @@ impl CacheBuilder {
 
         let df = ctx.sql(&union_query).await?;
         let mut stream = df.execute_stream().await?;
+
+        // Remove existing fjall DB before rebuilding to avoid stale keys
+        if Path::new(&fjall_dir).exists() {
+            std::fs::remove_dir_all(&fjall_dir).map_err(|e| {
+                DataFusionError::Execution(format!("Failed to remove existing {fjall_dir}: {e}"))
+            })?;
+            info!("translation_sift.fjall: removed existing DB for clean rebuild");
+        }
 
         // Open fjall database
         let db = fjall::Database::builder(&fjall_dir)
