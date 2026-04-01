@@ -161,24 +161,27 @@ impl CacheBuilder {
         let kind = parse_entity(entity)
             .ok_or_else(|| DataFusionError::Execution(format!("Unknown entity: {entity}")))?;
 
-        // Create output directories
+        // Create output directories.
+        // Translation outputs to translation_core/ and translation_sift/,
+        // not translation/ — so skip creating the base subdir for it.
         let subdir = entity_subdir(kind);
-        let entity_dir = format!("{}/{}", self.output_dir, subdir);
-        std::fs::create_dir_all(&entity_dir).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to create dir {entity_dir}: {e}"))
-        })?;
-
         if kind == EnsemblEntityKind::Translation {
             std::fs::create_dir_all(format!("{}/translation_core", self.output_dir))
                 .map_err(|e| DataFusionError::Execution(format!("Failed to create dir: {e}")))?;
             std::fs::create_dir_all(format!("{}/translation_sift", self.output_dir))
                 .map_err(|e| DataFusionError::Execution(format!("Failed to create dir: {e}")))?;
+        } else {
+            let entity_dir = format!("{}/{}", self.output_dir, subdir);
+            std::fs::create_dir_all(&entity_dir).map_err(|e| {
+                DataFusionError::Execution(format!("Failed to create dir {entity_dir}: {e}"))
+            })?;
         }
 
         // Skip if all outputs exist (unless overwrite is set).
         // Variation and translation have partial-skip logic in their
         // own build methods (e.g. parquet exists but fjall missing).
         if !self.overwrite && kind != EnsemblEntityKind::Variation && kind != EnsemblEntityKind::Translation {
+            let entity_dir = format!("{}/{}", self.output_dir, subdir);
             if dir_has_parquet_files(&entity_dir) {
                 info!("{entity}: parquet already exists, skipping (use overwrite to rebuild)");
                 return Ok(vec![EntityStats {
