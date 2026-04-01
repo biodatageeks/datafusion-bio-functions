@@ -77,6 +77,11 @@ impl SiftKvStore {
         Ok(Self { sift_ks })
     }
 
+    /// Access the underlying keyspace (e.g. for compaction).
+    pub fn keyspace(&self) -> &Keyspace {
+        &self.sift_ks
+    }
+
     /// Store predictions for a transcript.
     pub fn put(&self, transcript_id: &str, preds: &CachedPredictions) -> Result<()> {
         let value = serialize_predictions(preds);

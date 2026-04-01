@@ -1452,6 +1452,17 @@ impl CacheBuilder {
         db.persist(fjall::PersistMode::SyncAll)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+        info!("Running major compaction on translation_sift.fjall...");
+        let compact_start = Instant::now();
+        sift_store
+            .keyspace()
+            .major_compact()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        info!(
+            "Major compaction completed in {:.1}s",
+            compact_start.elapsed().as_secs_f64()
+        );
+
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(
             "translation_sift.fjall: {} transcripts from {} rows in {:.1}s",
