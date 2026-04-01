@@ -187,6 +187,7 @@ impl VepKvStore {
         let db = Database::builder(&root_path)
             .cache_size(1024 * 1024 * 1024) // Decision 7: 1 GB block cache
             .manual_journal_persist(true)
+            .worker_threads(1) // single background worker during bulk ingestion
             .open()
             .map_err(fjall_err)?;
 

@@ -40,6 +40,7 @@ impl SiftKvStore {
         }
         let db = Database::builder(path)
             .cache_size(64 * 1024 * 1024)
+            .worker_threads(1)
             .open()
             .map_err(fjall_err)?;
         Self::open(&db)

@@ -1118,7 +1118,9 @@ impl CacheBuilder {
 
         let mem_table =
             datafusion::datasource::MemTable::try_new(deduped[0].schema(), vec![deduped])?;
-        let split_ctx = SessionContext::new();
+        let split_ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(self.partitions),
+        );
         split_ctx.register_table("_tl_deduped", Arc::new(mem_table))?;
 
         // translation_core
@@ -1259,7 +1261,9 @@ impl CacheBuilder {
 
         let mem_table =
             datafusion::datasource::MemTable::try_new(deduped[0].schema(), vec![deduped])?;
-        let split_ctx = SessionContext::new();
+        let split_ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(self.partitions),
+        );
         split_ctx.register_table("_tl_deduped", Arc::new(mem_table))?;
 
         let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(false);
@@ -1384,6 +1388,7 @@ impl CacheBuilder {
         // Open fjall database
         let db = fjall::Database::builder(&fjall_dir)
             .cache_size(64 * 1024 * 1024)
+            .worker_threads(1) // single background worker during bulk ingestion
             .open()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let sift_store = SiftKvStore::create(&db)?;
