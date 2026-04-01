@@ -3590,4 +3590,257 @@ mod tests {
         .unwrap();
         assert_eq!(total_pos, 1);
     }
+
+    // -----------------------------------------------------------------------
+    // zero-copy parquet merge
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a parquet file from batches.
+    fn write_parquet(path: &str, batches: &[RecordBatch]) -> usize {
+        let schema = batches[0].schema();
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        let mut total = 0;
+        for batch in batches {
+            writer.write(batch).unwrap();
+            total += batch.num_rows();
+        }
+        writer.close().unwrap();
+        total
+    }
+
+    /// Helper: read a parquet file and return all rows as batches.
+    fn read_parquet(path: &str) -> Vec<RecordBatch> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let file = File::open(path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        reader.collect::<std::result::Result<Vec<_>, _>>().unwrap()
+    }
+
+    /// Helper: count total rows in a parquet file.
+    fn count_parquet_rows(path: &str) -> usize {
+        read_parquet(path).iter().map(|b| b.num_rows()).sum()
+    }
+
+    #[test]
+    fn test_zero_copy_merge_preserves_all_rows() {
+        use parquet::file::reader::FileReader;
+        use parquet::file::serialized_reader::SerializedFileReader;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::file::properties::WriterProperties;
+        use parquet::column::writer::ColumnCloseResult;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Create 3 partition parquet files with different data
+        let batches: Vec<Vec<RecordBatch>> = vec![
+            vec![make_batch(
+                vec!["1", "1", "1"],
+                vec![100, 200, 300],
+                vec![100, 200, 300],
+                vec!["A/G", "C/T", "G/A"],
+                vec!["rs1", "rs2", "rs3"],
+            )],
+            vec![make_batch(
+                vec!["1", "1"],
+                vec![400, 500],
+                vec![400, 500],
+                vec!["T/C", "A/T"],
+                vec!["rs4", "rs5"],
+            )],
+            vec![make_batch(
+                vec!["1", "1", "1", "1"],
+                vec![600, 700, 800, 900],
+                vec![600, 700, 800, 900],
+                vec!["C/G", "G/T", "A/C", "T/A"],
+                vec!["rs6", "rs7", "rs8", "rs9"],
+            )],
+        ];
+
+        let mut part_files = Vec::new();
+        let mut total_source_rows = 0;
+        for (i, batch_set) in batches.iter().enumerate() {
+            let path = format!("{}/part_{i}.parquet", dir_path.display());
+            let rows = write_parquet(&path, batch_set);
+            total_source_rows += rows;
+            part_files.push(path);
+        }
+        assert_eq!(total_source_rows, 9);
+
+        // Merge using zero-copy append_column
+        let merged_path = format!("{}/merged.parquet", dir_path.display());
+
+        let first_reader = SerializedFileReader::try_from(
+            File::open(&part_files[0]).unwrap(),
+        ).unwrap();
+        let parquet_schema = first_reader.metadata().file_metadata().schema().clone();
+        drop(first_reader);
+
+        let props = WriterProperties::builder().build();
+        let out_file = File::create(&merged_path).unwrap();
+        let mut merged_writer = SerializedFileWriter::new(
+            out_file,
+            Arc::new(parquet_schema),
+            Arc::new(props),
+        ).unwrap();
+
+        for part_file in &part_files {
+            let src_file = File::open(part_file).unwrap();
+            let reader = SerializedFileReader::try_from(src_file).unwrap();
+            let meta = reader.metadata();
+
+            for rg_idx in 0..meta.num_row_groups() {
+                let rg_meta = meta.row_group(rg_idx);
+                let mut rg_writer = merged_writer.next_row_group().unwrap();
+
+                let chunk_reader = File::open(part_file).unwrap();
+                for col_idx in 0..rg_meta.num_columns() {
+                    let col_meta = rg_meta.column(col_idx).clone();
+                    let close_result = ColumnCloseResult {
+                        bytes_written: col_meta.compressed_size() as u64,
+                        rows_written: rg_meta.num_rows() as u64,
+                        metadata: col_meta,
+                        bloom_filter: None,
+                        column_index: None,
+                        offset_index: None,
+                    };
+                    rg_writer.append_column(&chunk_reader, close_result).unwrap();
+                }
+                rg_writer.close().unwrap();
+            }
+        }
+        merged_writer.close().unwrap();
+
+        // Verify: merged file has same total rows
+        let merged_rows = count_parquet_rows(&merged_path);
+        assert_eq!(
+            merged_rows, total_source_rows,
+            "merged file should have {total_source_rows} rows, got {merged_rows}"
+        );
+
+        // Verify: data content matches
+        let merged_batches = read_parquet(&merged_path);
+        let all_starts: Vec<i64> = merged_batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("start")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(
+            all_starts,
+            vec![100, 200, 300, 400, 500, 600, 700, 800, 900],
+            "merged data should preserve order and values"
+        );
+    }
+
+    #[test]
+    fn test_zero_copy_merge_multiple_row_groups() {
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::reader::FileReader;
+        use parquet::file::serialized_reader::SerializedFileReader;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::file::properties::WriterProperties;
+        use parquet::column::writer::ColumnCloseResult;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a parquet file with small max_row_group_size to force multiple row groups
+        let batch = make_batch(
+            vec!["1", "1", "1", "1", "1"],
+            vec![10, 20, 30, 40, 50],
+            vec![10, 20, 30, 40, 50],
+            vec!["A/G", "C/T", "G/A", "T/C", "A/T"],
+            vec!["rs1", "rs2", "rs3", "rs4", "rs5"],
+        );
+
+        let src_path = format!("{}/src.parquet", dir.path().display());
+        let file = File::create(&src_path).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(2) // 2 rows per row group
+            .build();
+        let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        // Verify source has multiple row groups
+        let src_reader = SerializedFileReader::try_from(
+            File::open(&src_path).unwrap(),
+        ).unwrap();
+        let num_rg = src_reader.metadata().num_row_groups();
+        assert!(num_rg > 1, "expected multiple row groups, got {num_rg}");
+        let src_total: i64 = (0..num_rg)
+            .map(|i| src_reader.metadata().row_group(i).num_rows())
+            .sum();
+        drop(src_reader);
+
+        // Merge into a new file
+        let merged_path = format!("{}/merged.parquet", dir.path().display());
+
+        let reader = SerializedFileReader::try_from(
+            File::open(&src_path).unwrap(),
+        ).unwrap();
+        let schema = reader.metadata().file_metadata().schema().clone();
+        let meta = reader.metadata().clone();
+        drop(reader);
+
+        let out_file = File::create(&merged_path).unwrap();
+        let mut merged = SerializedFileWriter::new(
+            out_file,
+            Arc::new(schema),
+            Arc::new(WriterProperties::builder().build()),
+        ).unwrap();
+
+        for rg_idx in 0..meta.num_row_groups() {
+            let rg_meta = meta.row_group(rg_idx);
+            let mut rg_writer = merged.next_row_group().unwrap();
+            let chunk_reader = File::open(&src_path).unwrap();
+
+            for col_idx in 0..rg_meta.num_columns() {
+                let col_meta = rg_meta.column(col_idx).clone();
+                let close_result = ColumnCloseResult {
+                    bytes_written: col_meta.compressed_size() as u64,
+                    rows_written: rg_meta.num_rows() as u64,
+                    metadata: col_meta,
+                    bloom_filter: None,
+                    column_index: None,
+                    offset_index: None,
+                };
+                rg_writer.append_column(&chunk_reader, close_result).unwrap();
+            }
+            rg_writer.close().unwrap();
+        }
+        merged.close().unwrap();
+
+        // Verify all rows preserved
+        let merged_rows = count_parquet_rows(&merged_path);
+        assert_eq!(merged_rows, src_total as usize);
+
+        // Verify data
+        let merged_batches = read_parquet(&merged_path);
+        let starts: Vec<i64> = merged_batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("start")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(starts, vec![10, 20, 30, 40, 50]);
+    }
 }
