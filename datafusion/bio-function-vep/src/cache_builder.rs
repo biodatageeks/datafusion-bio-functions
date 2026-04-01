@@ -400,7 +400,11 @@ impl CacheBuilder {
                 {
                     // Drop the empty ArrowWriter so we can overwrite the file
                     let empty_writer = main_writer.take().unwrap();
-                    let _ = empty_writer.close();
+                    empty_writer.close().map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to close empty parquet writer: {e}"
+                        ))
+                    })?;
                 }
 
                 use parquet::file::properties::WriterProperties;
@@ -416,7 +420,7 @@ impl CacheBuilder {
                 let parquet_schema = first_reader.metadata().file_metadata().schema().clone();
                 let props = WriterProperties::builder()
                     .set_compression(parquet::basic::Compression::ZSTD(
-                        parquet::basic::ZstdLevel::try_new(3).unwrap(),
+                        parquet::basic::ZstdLevel::try_new(self.zstd_level).unwrap_or_default(),
                     ))
                     .build();
                 drop(first_reader);
@@ -1971,7 +1975,7 @@ fn print_progress(label: &str, rows: usize, elapsed: f64) {
     } else {
         "? rows/s".to_string()
     };
-    eprintln!(
+    info!(
         "  {label}: {} rows [{:.1}s, {rate}]",
         format_rows(rows),
         elapsed
@@ -2994,7 +2998,7 @@ mod tests {
             }
         }
         let mut sorted_other = other_chroms;
-        sorted_other.sort_by_key(|c| chrom_to_code(c));
+        sorted_other.sort(); // matches production code (lexicographic = code order for registered contigs)
         for chrom in &sorted_other {
             batches.push((chrom.clone(), true));
         }
