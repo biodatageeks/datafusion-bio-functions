@@ -258,88 +258,6 @@ impl CacheBuilder {
 
         let mut parquet_results: Vec<(String, usize)> = Vec::new();
 
-        // --- Fjall setup ---
-        let fjall_state = if self.build_fjall {
-            let fjall_dir = format!("{}/variation.fjall", self.output_dir);
-            if Path::new(&fjall_dir).exists() && !self.overwrite {
-                info!("variation.fjall already exists, skipping fjall build (use overwrite to rebuild)");
-                None
-            } else {
-                // We need a schema for the VepKvStore — get it from a probe query
-                let probe_ctx =
-                    make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
-                let probe_df = probe_ctx
-                    .sql(&format!("SELECT * FROM {table_name} LIMIT 0"))
-                    .await?;
-                let schema: SchemaRef = Arc::new(probe_df.schema().as_arrow().clone());
-                drop(probe_ctx);
-
-                let store = VepKvStore::create(Path::new(&fjall_dir), schema.clone())?;
-
-                // Train zstd dictionary from sample
-                let dict = self
-                    .train_variation_dict(&store, &schema, kind, table_name)
-                    .await?;
-
-                Some(FjallVariationState {
-                    store,
-                    schema,
-                    dict,
-                    fjall_dir,
-                })
-            }
-        } else {
-            None
-        };
-
-        let fjall_start_time = Instant::now();
-
-        // Start ingestion if fjall is active
-        let mut ingestion = if let Some(ref state) = fjall_state {
-            Some(
-                state
-                    .store
-                    .data_partition()
-                    .start_ingestion()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
-            )
-        } else {
-            None
-        };
-
-        let mut compressor = if let Some(ref state) = fjall_state {
-            if let Some(ref dict) = state.dict {
-                Some(
-                    zstd::bulk::Compressor::with_dictionary(self.zstd_level, dict).map_err(
-                        |e| {
-                            DataFusionError::Execution(format!(
-                                "failed to create zstd compressor: {e}"
-                            ))
-                        },
-                    )?,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let mut fjall_total_positions = 0u64;
-        let mut fjall_total_variants = 0u64;
-        let mut fjall_total_bytes = 0u64;
-
-        // Column indices for fjall (cached once since schema is constant)
-        let fjall_col_info = fjall_state.as_ref().map(|state| {
-            let chrom_col_idx = state.schema.index_of("chrom").unwrap();
-            let start_col_idx = state.schema.index_of("start").unwrap();
-            let allele_col_idx = state.schema.index_of("allele_string").unwrap();
-            let col_indices: Vec<usize> = (0..state.schema.fields().len())
-                .filter(|&i| i != chrom_col_idx && i != start_col_idx)
-                .collect();
-            (chrom_col_idx, start_col_idx, allele_col_idx, col_indices)
-        });
-
         // Build a unified processing list: main chroms (in chrom_code order)
         // then non-main contigs (sorted by hash-based chrom_code for ascending
         // fjall keys). Main chroms get individual parquet files; other contigs
@@ -354,29 +272,10 @@ impl CacheBuilder {
             }
         }
 
-        // Register non-canonical contigs with collision-free sequential codes,
-        // then sort by the assigned code for ascending fjall key order.
-        if !other_chroms.is_empty() {
-            use crate::kv_cache::key_encoding::register_non_canonical_contigs;
-
-            let refs: Vec<&str> = other_chroms.iter().map(|s| s.as_str()).collect();
-            let mapping = register_non_canonical_contigs(&refs);
-
-            // Store the mapping in fjall for read-time lookup
-            if let Some(ref state) = fjall_state {
-                state.store.store_contig_codes(&mapping)?;
-            }
-
-            info!(
-                "variation: {} non-main contigs registered ({} codes) → other.parquet + fjall",
-                other_chroms.len(),
-                mapping.len()
-            );
-        }
-
-        // Now sort other_chroms by their (collision-free) code
+        // Sort other_chroms alphabetically for deterministic other.parquet output.
+        // Fjall key ordering is handled later by build_variation_fjall_from_parquet().
         let mut sorted_other = other_chroms.clone();
-        sorted_other.sort_by_key(|c| chrom_to_code(c));
+        sorted_other.sort();
         if !sorted_other.is_empty() {
             let other_out = format!("{}/variation/other.parquet", self.output_dir);
             for chrom in &sorted_other {
@@ -384,7 +283,6 @@ impl CacheBuilder {
             }
         }
 
-        let mut accum: Option<PositionAccumulator> = None;
         let mut total_parquet_rows: usize = 0;
 
         // Shared writer for other.parquet (opened lazily)
@@ -493,7 +391,7 @@ impl CacheBuilder {
                     num_partitions
                 );
 
-                // Phase 2: Read temp parquet files in partition order → final parquet + fjall
+                // Phase 2: Read temp parquet files in partition order → final parquet
                 // Use target_partitions=1 to preserve row order within each file.
                 let read_config = SessionConfig::new().with_target_partitions(1);
                 let read_ctx = SessionContext::new_with_config(read_config);
@@ -521,55 +419,6 @@ impl CacheBuilder {
                                 total_parquet_rows,
                                 0,
                             );
-                        }
-
-                        // Feed fjall ingestion
-                        if let (
-                            Some(ing),
-                            Some((chrom_col_idx, start_col_idx, allele_col_idx, col_indices)),
-                        ) = (&mut ingestion, &fjall_col_info)
-                        {
-                            let starts =
-                                batch.column(*start_col_idx).as_primitive::<Int64Type>();
-                            let chrom_col = batch.column(*chrom_col_idx);
-
-                            for row in 0..batch.num_rows() {
-                                let start = starts.value(row);
-                                let row_chrom = string_value(chrom_col.as_ref(), row);
-                                let chrom_code = chrom_to_code(row_chrom);
-
-                                let should_flush = accum.as_ref().is_some_and(|a| {
-                                    a.chrom_code != chrom_code || a.start != start
-                                });
-
-                                if should_flush {
-                                    let a = accum.take().unwrap();
-                                    let (key, value) = a.finish_entry(
-                                        col_indices,
-                                        *allele_col_idx,
-                                        &mut compressor,
-                                    )?;
-                                    ing.write(&key, &value)
-                                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                                    fjall_total_positions += 1;
-                                    fjall_total_bytes += value.len() as u64;
-                                }
-
-                                fjall_total_variants += 1;
-
-                                match &mut accum {
-                                    Some(a) => a.add_row(row, batch),
-                                    None => {
-                                        accum = Some(PositionAccumulator::new(
-                                            chrom_code,
-                                            row_chrom.to_string(),
-                                            start,
-                                            row,
-                                            batch,
-                                        ));
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -602,74 +451,6 @@ impl CacheBuilder {
                             0,
                         );
                     }
-
-                    // Feed fjall ingestion
-                    if let (
-                        Some(ing),
-                        Some((chrom_col_idx, start_col_idx, allele_col_idx, col_indices)),
-                    ) = (&mut ingestion, &fjall_col_info)
-                    {
-                        let starts =
-                            batch.column(*start_col_idx).as_primitive::<Int64Type>();
-                        let chrom_col = batch.column(*chrom_col_idx);
-
-                        for row in 0..batch.num_rows() {
-                            let start = starts.value(row);
-                            let row_chrom = string_value(chrom_col.as_ref(), row);
-                            let chrom_code = chrom_to_code(row_chrom);
-
-                            let should_flush = accum
-                                .as_ref()
-                                .is_some_and(|a| {
-                                    a.chrom_code != chrom_code || a.start != start
-                                });
-
-                            if should_flush {
-                                let a = accum.take().unwrap();
-                                let (key, value) = a.finish_entry(
-                                    col_indices,
-                                    *allele_col_idx,
-                                    &mut compressor,
-                                )?;
-                                ing.write(&key, &value)
-                                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                                fjall_total_positions += 1;
-                                fjall_total_bytes += value.len() as u64;
-                            }
-
-                            fjall_total_variants += 1;
-
-                            match &mut accum {
-                                Some(a) => a.add_row(row, &batch),
-                                None => {
-                                    accum = Some(PositionAccumulator::new(
-                                        chrom_code,
-                                        row_chrom.to_string(),
-                                        start,
-                                        row,
-                                        &batch,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Flush fjall accumulator between chromosomes
-            if let (Some(ing), Some((_, _, allele_col_idx, col_indices))) =
-                (&mut ingestion, &fjall_col_info)
-            {
-                if let Some(a) = accum.take() {
-                    let (key, value) =
-                        a.finish_entry(col_indices, *allele_col_idx, &mut compressor)?;
-                    ing.write(&key, &value)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    fjall_total_positions += 1;
-                    fjall_total_bytes += value.len() as u64;
-                }
-                if let Some(ref cb) = self.on_progress {
-                    cb("variation", "fjall", 0, fjall_total_positions as usize, 0);
                 }
             }
 
@@ -704,36 +485,19 @@ impl CacheBuilder {
             );
         }
 
-        // Finalize fjall
-        let fjall_stats = if let Some(ref mut ing) = ingestion {
-            // Take ingestion out to call finish()
-            let ingestion = ingestion.take().unwrap();
-            ingestion
-                .finish()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            if let Some(ref state) = fjall_state {
-                state.store.persist()?;
-
-                info!("Running major compaction on variation.fjall...");
-                let compact_start = Instant::now();
-                state
-                    .store
-                    .data_partition()
-                    .major_compact()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                info!(
-                    "Major compaction completed in {:.1}s",
-                    compact_start.elapsed().as_secs_f64()
-                );
+        // Phase 2: Build fjall from the parquet files we just wrote.
+        // This uses the optimized pipelined path with parallel compression.
+        let fjall_stats = if self.build_fjall {
+            let fjall_dir = format!("{}/variation.fjall", self.output_dir);
+            let fjall_exists = Path::new(&fjall_dir).exists();
+            if fjall_exists && !self.overwrite {
+                info!("variation.fjall already exists, skipping (use overwrite to rebuild)");
+                None
+            } else {
+                info!("variation: parquet complete, building fjall from parquet files...");
+                let fjall_result = self.build_variation_fjall_from_parquet().await?;
+                fjall_result.into_iter().next().and_then(|s| s.fjall_stats)
             }
-
-            Some(LoadStats {
-                total_variants: fjall_total_variants,
-                total_positions: fjall_total_positions,
-                total_bytes: fjall_total_bytes,
-                elapsed_secs: fjall_start_time.elapsed().as_secs_f64(),
-            })
         } else {
             None
         };
@@ -745,89 +509,6 @@ impl CacheBuilder {
         }])
     }
 
-    /// Train zstd dictionary from a sample of variation data.
-    async fn train_variation_dict(
-        &self,
-        store: &VepKvStore,
-        schema: &SchemaRef,
-        kind: EnsemblEntityKind,
-        table_name: &str,
-    ) -> Result<Option<Arc<Vec<u8>>>> {
-        let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
-        let sample_df = ctx
-            .sql(&format!("SELECT * FROM {table_name} LIMIT 10000"))
-            .await?;
-        let batches = sample_df.collect().await?;
-
-        let chrom_col_idx = schema.index_of("chrom")?;
-        let start_col_idx = schema.index_of("start")?;
-        let allele_col_idx = schema.index_of("allele_string")?;
-        let col_indices: Vec<usize> = (0..schema.fields().len())
-            .filter(|&i| i != chrom_col_idx && i != start_col_idx)
-            .collect();
-
-        let mut samples: Vec<Vec<u8>> = Vec::new();
-        for batch in &batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let chrom_col = batch.column(chrom_col_idx);
-            let starts = batch.column(start_col_idx).as_primitive::<Int64Type>();
-
-            let mut groups: HashMap<(String, i64), Vec<usize>> = HashMap::new();
-            for row in 0..batch.num_rows() {
-                let chrom = string_value(chrom_col.as_ref(), row);
-                let start = starts.value(row);
-                groups
-                    .entry((chrom.to_string(), start))
-                    .or_default()
-                    .push(row);
-            }
-
-            for rows in groups.values() {
-                let value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
-                samples.push(value);
-            }
-        }
-
-        let min_training_samples = 100;
-        if samples.len() < min_training_samples {
-            info!(
-                "only {} sample entries, skipping dictionary training (need >= {})",
-                samples.len(),
-                min_training_samples
-            );
-            return Ok(None);
-        }
-
-        let max_samples = 10_000.min(samples.len());
-        let sample_refs: Vec<&[u8]> = samples[..max_samples]
-            .iter()
-            .map(|v| v.as_slice())
-            .collect();
-
-        let dict_size = self.dict_size_kb as usize * 1024;
-        match zstd::dict::from_continuous(
-            &sample_refs.concat(),
-            &sample_refs.iter().map(|s| s.len()).collect::<Vec<_>>(),
-            dict_size,
-        ) {
-            Ok(dict) => {
-                info!(
-                    "zstd dict trained: {} samples, dict {} bytes",
-                    max_samples,
-                    dict.len()
-                );
-                store.store_dict(&dict)?;
-                store.store_zstd_level(self.zstd_level)?;
-                Ok(Some(Arc::new(dict)))
-            }
-            Err(e) => {
-                info!("zstd dict training failed (falling back to uncompressed): {e}");
-                Ok(None)
-            }
-        }
-    }
 
     /// Build variation fjall from existing parquet files.
     ///
@@ -1994,18 +1675,6 @@ fn flush_positions_parallel(
     }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Fjall state for variation dual-sink
-// ---------------------------------------------------------------------------
-
-struct FjallVariationState {
-    store: VepKvStore,
-    schema: SchemaRef,
-    dict: Option<Arc<Vec<u8>>>,
-    #[allow(dead_code)]
-    fjall_dir: String,
 }
 
 // ---------------------------------------------------------------------------
