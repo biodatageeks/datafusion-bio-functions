@@ -328,7 +328,7 @@ impl CacheBuilder {
 
             let mut chrom_rows = 0usize;
 
-            if let Some(inner) = inner_plan.filter(|_| num_partitions > 1) {
+            if let Some(inner) = inner_plan.filter(|_| num_partitions > 1 && !is_other) {
                 // --- Parallel path: write N temp parquet files, then merge ---
                 let temp_dir = format!("{}/variation/_tmp_{chrom}", self.output_dir);
                 std::fs::create_dir_all(&temp_dir).map_err(|e| {
