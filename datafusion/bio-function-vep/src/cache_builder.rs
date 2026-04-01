@@ -835,6 +835,7 @@ impl CacheBuilder {
             });
 
             // Consumer: parallel serialize+compress + fjall write
+            let max_threads = self.partitions;
             while let Ok((mut batch, batch_variants)) = rx.recv() {
                 total_variants += batch_variants;
                 flush_positions_parallel(
@@ -843,6 +844,7 @@ impl CacheBuilder {
                     allele_col_idx,
                     &dict,
                     self.zstd_level,
+                    max_threads,
                     &mut |k, v| {
                         ing.write(k, v)
                             .map_err(|e| DataFusionError::External(Box::new(e)))
@@ -1356,7 +1358,9 @@ impl CacheBuilder {
         let start_time = Instant::now();
 
         // Register all sift parquet files as a single table
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(self.partitions),
+        );
         let parquet_paths: Vec<&str> = sift_parquet_files.iter().map(|(p, _)| p.as_str()).collect();
 
         // Register each parquet file and UNION ALL them
@@ -1681,6 +1685,7 @@ fn flush_positions_parallel(
     allele_col_idx: usize,
     dict: &Option<Arc<Vec<u8>>>,
     zstd_level: i32,
+    max_threads: usize,
     write_fn: &mut impl FnMut(&[u8], &[u8]) -> Result<()>,
     total_positions: &mut u64,
     total_bytes: &mut u64,
@@ -1690,10 +1695,7 @@ fn flush_positions_parallel(
     }
 
     let positions = std::mem::take(pending);
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(positions.len());
+    let num_threads = max_threads.min(positions.len());
 
     // Single-thread fast path
     if num_threads <= 1 || positions.len() < 100 {
@@ -3408,6 +3410,7 @@ mod tests {
             4,
             &None,
             3,
+            4,
             &mut |_k, _v| {
                 write_count += 1;
                 Ok(())
@@ -3444,6 +3447,7 @@ mod tests {
             3, // allele_col_idx
             &None,
             3,
+            4,
             &mut |k, _v| {
                 written_keys.push(k.to_vec());
                 Ok(())
@@ -3486,6 +3490,7 @@ mod tests {
             3,
             &None,
             3,
+            4,
             &mut |k, _v| {
                 written_keys.push(k.to_vec());
                 Ok(())
@@ -3541,6 +3546,7 @@ mod tests {
             3,
             &None,
             3,
+            4,
             &mut |k, _v| {
                 written_keys.push(k.to_vec());
                 Ok(())
@@ -3583,6 +3589,7 @@ mod tests {
             3,
             &None,
             3,
+            4,
             &mut |_k, _v| Ok(()),
             &mut total_pos,
             &mut total_bytes,
