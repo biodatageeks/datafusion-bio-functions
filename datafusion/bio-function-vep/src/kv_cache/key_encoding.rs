@@ -302,7 +302,7 @@ mod tests {
         assert!(codes.iter().all(|&c| c >= NON_CANONICAL_START));
 
         // Codes are sequential (sorted input)
-        let mut sorted_names: Vec<&str> = contigs.iter().copied().collect();
+        let mut sorted_names: Vec<&str> = contigs.to_vec();
         sorted_names.sort();
         sorted_names.dedup();
         for (i, (name, code)) in mapping.iter().enumerate() {

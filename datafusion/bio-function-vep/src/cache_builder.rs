@@ -3488,7 +3488,7 @@ mod tests {
             pending.push(PositionAccumulator::new(
                 1,
                 "1".to_string(),
-                i as i64 * 10,
+                i * 10,
                 0,
                 &batch,
             ));
