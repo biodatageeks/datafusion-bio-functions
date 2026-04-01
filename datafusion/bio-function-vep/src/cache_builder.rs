@@ -2108,11 +2108,19 @@ fn split_chroms(
 ) -> (Vec<String>, Vec<String>) {
     match chroms {
         Some(all) => {
-            let main: Vec<String> = all
+            // Collect main chroms, then sort by CHROM_CODE_ORDER (numeric: 1,2,...,22,X,Y,MT)
+            // instead of leaving them in schema metadata order (alphabetical: 1,10,11,...).
+            let mut main: Vec<String> = all
                 .iter()
                 .filter(|c| main_set.contains(c.as_str()))
                 .cloned()
                 .collect();
+            main.sort_by_key(|c| {
+                CHROM_CODE_ORDER
+                    .iter()
+                    .position(|&x| x == c.as_str())
+                    .unwrap_or(usize::MAX)
+            });
             let other: Vec<String> = all
                 .iter()
                 .filter(|c| !main_set.contains(c.as_str()))
