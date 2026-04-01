@@ -124,7 +124,7 @@ impl SiftKvStore {
     }
 }
 
-fn serialize_predictions(preds: &CachedPredictions) -> Vec<u8> {
+pub(crate) fn serialize_predictions(preds: &CachedPredictions) -> Vec<u8> {
     let sift_count = preds.sift.len() as u32;
     let polyphen_count = preds.polyphen.len() as u32;
     let mut buf = Vec::with_capacity(8 + (sift_count + polyphen_count) as usize * 10);

@@ -1350,33 +1350,6 @@ impl CacheBuilder {
 
         let start_time = Instant::now();
 
-        // Register all sift parquet files as a single table
-        let ctx = SessionContext::new_with_config(
-            SessionConfig::new().with_target_partitions(self.partitions),
-        );
-        let parquet_paths: Vec<&str> = sift_parquet_files.iter().map(|(p, _)| p.as_str()).collect();
-
-        // Register each parquet file and UNION ALL them
-        for (i, path) in parquet_paths.iter().enumerate() {
-            ctx.register_parquet(&format!("_sift_{i}"), path, Default::default())
-                .await?;
-        }
-
-        let union_query = if parquet_paths.len() == 1 {
-            "SELECT * FROM _sift_0 ORDER BY transcript_id".to_string()
-        } else {
-            let unions: Vec<String> = (0..parquet_paths.len())
-                .map(|i| format!("SELECT * FROM _sift_{i}"))
-                .collect();
-            format!(
-                "SELECT * FROM ({}) ORDER BY transcript_id",
-                unions.join(" UNION ALL ")
-            )
-        };
-
-        let df = ctx.sql(&union_query).await?;
-        let mut stream = df.execute_stream().await?;
-
         // Remove existing fjall DB before rebuilding to avoid stale keys
         if Path::new(&fjall_dir).exists() {
             std::fs::remove_dir_all(&fjall_dir).map_err(|e| {
@@ -1393,61 +1366,94 @@ impl CacheBuilder {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let sift_store = SiftKvStore::create(&db)?;
 
-        // Stream predictions directly into fjall, grouping by transcript_id
-        // on-the-fly (data arrives sorted). Only one transcript is buffered.
+        // Stream predictions into fjall using start_ingestion() (fast bulk API).
+        // Read each parquet file sequentially — no UNION ALL + ORDER BY which
+        // materializes 5GB+ in memory.
+        // Data is sorted by transcript_id within each file, and transcript IDs
+        // don't repeat across chromosomes, so keys are globally ascending.
+        let read_ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+
+        let mut ingestion = sift_store
+            .keyspace()
+            .start_ingestion()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
         let mut current_transcript: Option<String> = None;
         let mut current_preds = CachedPredictions::default();
         let mut total_rows = 0usize;
         let mut transcript_count = 0usize;
 
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
-            if batch.num_rows() == 0 {
-                continue;
-            }
+        for (parquet_path, _) in sift_parquet_files {
+            read_ctx
+                .register_parquet("_sift", parquet_path, Default::default())
+                .await?;
+            let df = read_ctx.sql("SELECT * FROM _sift").await?;
+            let mut stream = df.execute_stream().await?;
+            read_ctx.deregister_table("_sift")?;
 
-            let schema = batch.schema();
-            let tid_idx = schema.index_of("transcript_id")?;
-            let sift_idx = schema.index_of("sift_predictions").ok();
-            let poly_idx = schema.index_of("polyphen_predictions").ok();
-
-            for row in 0..batch.num_rows() {
-                let transcript_id = string_value(batch.column(tid_idx).as_ref(), row).to_string();
-
-                let mut row_preds = CachedPredictions::default();
-                if let Some(idx) = sift_idx {
-                    row_preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
-                }
-                if let Some(idx) = poly_idx {
-                    row_preds.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                if batch.num_rows() == 0 {
+                    continue;
                 }
 
-                if current_transcript.as_deref() != Some(&transcript_id) {
-                    // Flush previous transcript directly to fjall
-                    if let Some(tid) = current_transcript.take() {
-                        current_preds.sort();
-                        sift_store.put(&tid, &current_preds)?;
-                        current_preds = CachedPredictions::default();
-                        transcript_count += 1;
+                let schema = batch.schema();
+                let tid_idx = schema.index_of("transcript_id")?;
+                let sift_idx = schema.index_of("sift_predictions").ok();
+                let poly_idx = schema.index_of("polyphen_predictions").ok();
+
+                for row in 0..batch.num_rows() {
+                    let transcript_id =
+                        string_value(batch.column(tid_idx).as_ref(), row).to_string();
+
+                    let mut row_preds = CachedPredictions::default();
+                    if let Some(idx) = sift_idx {
+                        row_preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
                     }
-                    current_transcript = Some(transcript_id);
-                }
-                current_preds.sift.extend(row_preds.sift);
-                current_preds.polyphen.extend(row_preds.polyphen);
-                total_rows += 1;
-            }
+                    if let Some(idx) = poly_idx {
+                        row_preds.polyphen =
+                            read_compact_predictions(batch.column(idx).as_ref(), row);
+                    }
 
-            if let Some(ref cb) = self.on_progress {
-                cb("translation_sift", "fjall", batch.num_rows(), total_rows, 0);
+                    if current_transcript.as_deref() != Some(&transcript_id) {
+                        // Flush previous transcript to fjall via ingestion
+                        if let Some(tid) = current_transcript.take() {
+                            current_preds.sort();
+                            let value =
+                                crate::kv_cache::sift_store::serialize_predictions(&current_preds);
+                            ingestion
+                                .write(tid.as_bytes(), value)
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                            current_preds = CachedPredictions::default();
+                            transcript_count += 1;
+                        }
+                        current_transcript = Some(transcript_id);
+                    }
+                    current_preds.sift.extend(row_preds.sift);
+                    current_preds.polyphen.extend(row_preds.polyphen);
+                    total_rows += 1;
+                }
+
+                if let Some(ref cb) = self.on_progress {
+                    cb("translation_sift", "fjall", batch.num_rows(), total_rows, 0);
+                }
             }
         }
 
         // Flush last transcript
         if let Some(tid) = current_transcript.take() {
             current_preds.sort();
-            sift_store.put(&tid, &current_preds)?;
+            let value = crate::kv_cache::sift_store::serialize_predictions(&current_preds);
+            ingestion
+                .write(tid.as_bytes(), value)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
             transcript_count += 1;
         }
+
+        ingestion
+            .finish()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         db.persist(fjall::PersistMode::SyncAll)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
