@@ -1378,6 +1378,10 @@ impl CacheBuilder {
         let mut total_rows = 0usize;
         let mut transcript_count = 0usize;
 
+        let mut time_parquet_read = std::time::Duration::ZERO;
+        let mut time_read_predictions = std::time::Duration::ZERO;
+        let mut time_serialize_write = std::time::Duration::ZERO;
+
         for (parquet_path, _) in sift_parquet_files {
             read_ctx
                 .register_parquet("_sift", parquet_path, Default::default())
@@ -1387,7 +1391,10 @@ impl CacheBuilder {
             read_ctx.deregister_table("_sift")?;
 
             while let Some(batch_result) = stream.next().await {
+                let t0 = Instant::now();
                 let batch = batch_result?;
+                time_parquet_read += t0.elapsed();
+
                 if batch.num_rows() == 0 {
                     continue;
                 }
@@ -1401,6 +1408,7 @@ impl CacheBuilder {
                     let transcript_id =
                         string_value(batch.column(tid_idx).as_ref(), row).to_string();
 
+                    let t1 = Instant::now();
                     let mut row_preds = CachedPredictions::default();
                     if let Some(idx) = sift_idx {
                         row_preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
@@ -1409,11 +1417,14 @@ impl CacheBuilder {
                         row_preds.polyphen =
                             read_compact_predictions(batch.column(idx).as_ref(), row);
                     }
+                    time_read_predictions += t1.elapsed();
 
                     if current_transcript.as_deref() != Some(&transcript_id) {
                         if let Some(tid) = current_transcript.take() {
+                            let t2 = Instant::now();
                             current_preds.sort();
                             sift_store.put(&tid, &current_preds)?;
+                            time_serialize_write += t2.elapsed();
                             current_preds = CachedPredictions::default();
                             transcript_count += 1;
                         }
@@ -1432,10 +1443,33 @@ impl CacheBuilder {
 
         // Flush last transcript
         if let Some(tid) = current_transcript.take() {
+            let t2 = Instant::now();
             current_preds.sort();
             sift_store.put(&tid, &current_preds)?;
+            time_serialize_write += t2.elapsed();
             transcript_count += 1;
         }
+
+        let total_wall = start_time.elapsed();
+        let time_other = total_wall
+            .saturating_sub(time_parquet_read + time_read_predictions + time_serialize_write);
+        info!(
+            "translation_sift.fjall timing breakdown:\n\
+             \x20 parquet read:         {:.1}s ({:.0}%)\n\
+             \x20 read_predictions:     {:.1}s ({:.0}%)\n\
+             \x20 serialize+write:      {:.1}s ({:.0}%)\n\
+             \x20 other (row iteration):{:.1}s ({:.0}%)\n\
+             \x20 total:                {:.1}s",
+            time_parquet_read.as_secs_f64(),
+            100.0 * time_parquet_read.as_secs_f64() / total_wall.as_secs_f64(),
+            time_read_predictions.as_secs_f64(),
+            100.0 * time_read_predictions.as_secs_f64() / total_wall.as_secs_f64(),
+            time_serialize_write.as_secs_f64(),
+            100.0 * time_serialize_write.as_secs_f64() / total_wall.as_secs_f64(),
+            time_other.as_secs_f64(),
+            100.0 * time_other.as_secs_f64() / total_wall.as_secs_f64(),
+            total_wall.as_secs_f64(),
+        );
 
         db.persist(fjall::PersistMode::SyncAll)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
