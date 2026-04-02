@@ -15,6 +15,7 @@ const SCHEMA_KEY: &[u8] = b"schema";
 const FORMAT_VERSION_KEY: &[u8] = b"format_version";
 const ZSTD_DICT_KEY: &[u8] = b"zstd_dict";
 const ZSTD_LEVEL_KEY: &[u8] = b"zstd_level";
+const CONTIG_CODES_KEY: &[u8] = b"contig_codes";
 const MIN_DECOMPRESS_CAPACITY: usize = 4 * 1024;
 const MAX_DECOMPRESSED_ENTRY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
@@ -153,6 +154,13 @@ impl VepKvStore {
             .map_err(fjall_err)?
             .map(|raw| Arc::new(raw.to_vec()));
 
+        // Load non-canonical contig→code registry if present.
+        if let Some(raw) = meta.get(CONTIG_CODES_KEY).map_err(fjall_err)? {
+            if let Some(mapping) = super::key_encoding::deserialize_contig_codes(&raw) {
+                super::key_encoding::load_non_canonical_registry(&mapping);
+            }
+        }
+
         Ok(Self {
             root_path,
             db,
@@ -179,6 +187,7 @@ impl VepKvStore {
         let db = Database::builder(&root_path)
             .cache_size(1024 * 1024 * 1024) // Decision 7: 1 GB block cache
             .manual_journal_persist(true)
+            .worker_threads(1) // single background worker during bulk ingestion
             .open()
             .map_err(fjall_err)?;
 
@@ -286,6 +295,15 @@ impl VepKvStore {
     pub fn store_dict(&self, dict_bytes: &[u8]) -> Result<()> {
         self.meta
             .insert(ZSTD_DICT_KEY, dict_bytes)
+            .map_err(fjall_err)?;
+        Ok(())
+    }
+
+    /// Store non-canonical contig→code mapping in fjall metadata.
+    pub fn store_contig_codes(&self, mapping: &[(String, u16)]) -> Result<()> {
+        let bytes = super::key_encoding::serialize_contig_codes(mapping);
+        self.meta
+            .insert(CONTIG_CODES_KEY, &bytes)
             .map_err(fjall_err)?;
         Ok(())
     }

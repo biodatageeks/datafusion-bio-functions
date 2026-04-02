@@ -40,6 +40,7 @@ impl SiftKvStore {
         }
         let db = Database::builder(path)
             .cache_size(64 * 1024 * 1024)
+            .worker_threads(1)
             .open()
             .map_err(fjall_err)?;
         Self::open(&db)
@@ -76,6 +77,11 @@ impl SiftKvStore {
         Ok(Self { sift_ks })
     }
 
+    /// Access the underlying keyspace (e.g. for compaction).
+    pub fn keyspace(&self) -> &Keyspace {
+        &self.sift_ks
+    }
+
     /// Store predictions for a transcript.
     pub fn put(&self, transcript_id: &str, preds: &CachedPredictions) -> Result<()> {
         let value = serialize_predictions(preds);
@@ -83,6 +89,26 @@ impl SiftKvStore {
             .insert(transcript_id.as_bytes(), value)
             .map_err(fjall_err)?;
         Ok(())
+    }
+
+    /// Bulk-load from a sorted-by-transcript_id iterator using fjall ingestion.
+    ///
+    /// Input **must** be sorted in ascending `transcript_id` order (returns `Err` otherwise).
+    /// Uses `start_ingestion()` for maximum bulk load speed.
+    pub fn ingest_sorted(
+        db: &Database,
+        sorted_iter: impl Iterator<Item = (String, CachedPredictions)>,
+    ) -> Result<Self> {
+        let store = Self::create(db)?;
+        let mut ingestion = store.sift_ks.start_ingestion().map_err(fjall_err)?;
+        for (transcript_id, preds) in sorted_iter {
+            let value = serialize_predictions(&preds);
+            ingestion
+                .write(transcript_id.as_bytes(), value)
+                .map_err(fjall_err)?;
+        }
+        ingestion.finish().map_err(fjall_err)?;
+        Ok(store)
     }
 
     /// Retrieve predictions for a transcript. Returns None on miss.
@@ -98,7 +124,7 @@ impl SiftKvStore {
     }
 }
 
-fn serialize_predictions(preds: &CachedPredictions) -> Vec<u8> {
+pub(crate) fn serialize_predictions(preds: &CachedPredictions) -> Vec<u8> {
     let sift_count = preds.sift.len() as u32;
     let polyphen_count = preds.polyphen.len() as u32;
     let mut buf = Vec::with_capacity(8 + (sift_count + polyphen_count) as usize * 10);

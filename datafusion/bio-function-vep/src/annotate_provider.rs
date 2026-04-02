@@ -4873,7 +4873,7 @@ fn read_mirna_regions(batch: &RecordBatch, col_idx: usize, row: usize) -> Option
 
 /// Read predictions directly into CompactPrediction without intermediate String allocations.
 /// Reads `&str` from Arrow arrays and encodes amino acid/prediction as u8 in-place.
-fn read_compact_predictions(col: &dyn Array, row: usize) -> Vec<CompactPrediction> {
+pub(crate) fn read_compact_predictions(col: &dyn Array, row: usize) -> Vec<CompactPrediction> {
     if col.is_null(row) {
         return Vec::new();
     }
