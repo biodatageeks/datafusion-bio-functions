@@ -1433,6 +1433,15 @@ impl CacheBuilder {
             compact_start.elapsed().as_secs_f64()
         );
 
+        info!("translation_sift.fjall: closing database...");
+        let close_start = Instant::now();
+        drop(sift_store);
+        drop(db);
+        info!(
+            "translation_sift.fjall: database closed in {:.1}s",
+            close_start.elapsed().as_secs_f64()
+        );
+
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(
             "translation_sift.fjall: {} transcripts from {} rows in {:.1}s",
