@@ -1361,7 +1361,8 @@ impl CacheBuilder {
         // Open fjall database
         let db = fjall::Database::builder(&fjall_dir)
             .cache_size(64 * 1024 * 1024)
-            .worker_threads(1) // single background worker during bulk ingestion
+            .worker_threads(1)
+            .manual_journal_persist(true) // batch journal writes, persist manually at end
             .open()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let sift_store = SiftKvStore::create(&db)?;
@@ -1419,9 +1420,6 @@ impl CacheBuilder {
             }
         }
 
-        db.persist(fjall::PersistMode::SyncAll)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
         info!("Running major compaction on translation_sift.fjall...");
         let compact_start = Instant::now();
         sift_store
@@ -1432,6 +1430,9 @@ impl CacheBuilder {
             "Major compaction completed in {:.1}s",
             compact_start.elapsed().as_secs_f64()
         );
+
+        db.persist(fjall::PersistMode::SyncAll)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         info!("translation_sift.fjall: closing database...");
         let close_start = Instant::now();
