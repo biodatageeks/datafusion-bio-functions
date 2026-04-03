@@ -2183,11 +2183,16 @@ mod tests {
         let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column"));
         let csq0 = csq[0].as_ref().expect("csq should be present");
         let entries = csq_entries(csq0);
+        // 74 = number of pipe-delimited CSQ FORMAT fields per entry.
         let feature_ids: Vec<&str> = entries
             .iter()
             .filter(|f| f.len() == 74 && f[5] == "Transcript")
             .map(|f| f[6])
             .collect();
+        assert!(
+            !feature_ids.is_empty(),
+            "expected at least one Transcript CSQ entry"
+        );
         assert_eq!(
             feature_ids,
             vec!["ENST00000100000", "ENST00000500000", "ENST00000900000"],
@@ -2237,11 +2242,16 @@ mod tests {
         let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column"));
         let csq0 = csq[0].as_ref().expect("csq should be present");
         let entries = csq_entries(csq0);
+        // 74 = number of pipe-delimited CSQ FORMAT fields per entry.
         let feature_types: Vec<&str> = entries
             .iter()
             .filter(|f| f.len() == 74)
             .map(|f| f[5])
             .collect();
+        assert!(
+            !feature_types.is_empty(),
+            "expected at least one CSQ entry with 74 fields"
+        );
 
         // Transcript entries must come before RegulatoryFeature entries,
         // which must come before MotifFeature entries.
@@ -2269,6 +2279,7 @@ mod tests {
         assert!(seen_motif, "expected at least one MotifFeature entry");
 
         // Regulatory entries should be sorted by stable_id.
+        // 74 = number of pipe-delimited CSQ FORMAT fields per entry.
         let reg_ids: Vec<&str> = entries
             .iter()
             .filter(|f| f.len() == 74 && f[5] == "RegulatoryFeature")

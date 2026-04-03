@@ -1425,9 +1425,8 @@ impl CacheBuilder {
             "translation_sift.fjall: ingesting {} transcripts from {} rows via sorted bulk load...",
             transcript_count, total_rows
         );
+        // sorted_preds is consumed by ingest_sorted; memory freed before compaction.
         let sift_store = SiftKvStore::ingest_sorted(&db, sorted_preds.into_iter())?;
-        // Free the BTreeMap memory before compaction.
-        // (sorted_preds already moved into ingest_sorted)
 
         info!("Running major compaction on translation_sift.fjall...");
         let compact_start = Instant::now();
