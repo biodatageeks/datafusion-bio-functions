@@ -3730,44 +3730,39 @@ impl AnnotateProvider {
                 row_assignments = assignments;
                 row_variant = Some(variant);
 
+                // Build VEP-compatible sorted permutation index.
+                // Used by both CSQ serialization and typed annotation columns
+                // so the Nth CSQ entry matches the Nth typed column element.
+                //
+                // Sort order: Transcript → Regulatory → Motif → Intergenic,
+                // then lexicographically by feature stable_id within each
+                // group. See ensembl-variation VariationFeature.pm lines 855-864.
+                //
+                // Source arrays are pre-sorted by feature ID in
+                // PreparedContext, so transcript_idx order equals
+                // lexicographic transcript_id order. We compare
+                // integer indices instead of heap-allocated strings.
+                // Non-transcript features (regulatory, motif) are
+                // already emitted in ID order by collect_overlapping_indices.
+                sorted_indices.clear();
+                sorted_indices.extend(0..row_assignments.len());
+                if row_assignments.len() > 1 {
+                    sorted_indices.sort_unstable_by(|&i, &j| {
+                        let a = &row_assignments[i];
+                        let b = &row_assignments[j];
+                        a.feature_type
+                            .rank()
+                            .cmp(&b.feature_type.rank())
+                            .then_with(|| match (a.transcript_idx, b.transcript_idx) {
+                                (Some(ai), Some(bj)) => ai.cmp(&bj),
+                                _ => i.cmp(&j),
+                            })
+                    });
+                }
+
                 // Build per-transcript CSQ entries into reusable buffer (already cleared above).
                 // Skip the entire CSQ formatting when the csq column is not projected.
                 if !skip_csq {
-                    // Match VEP CSQ ordering: Transcript → Regulatory →
-                    // Motif → Intergenic, then lexicographically by feature
-                    // stable_id within each group. See ensembl-variation
-                    // VariationFeature.pm lines 855-864.
-                    //
-                    // Source arrays are pre-sorted by feature ID in
-                    // PreparedContext, so transcript_idx order equals
-                    // lexicographic transcript_id order. We compare
-                    // integer indices instead of heap-allocated strings.
-                    // Non-transcript features (regulatory, motif) are
-                    // already emitted in ID order by collect_overlapping_indices.
-                    sorted_indices.clear();
-                    sorted_indices.extend(0..row_assignments.len());
-                    if row_assignments.len() > 1 {
-                        sorted_indices.sort_unstable_by(|&i, &j| {
-                            let a = &row_assignments[i];
-                            let b = &row_assignments[j];
-                            a.feature_type
-                                .rank()
-                                .cmp(&b.feature_type.rank())
-                                .then_with(|| {
-                                    // Transcript entries have transcript_idx;
-                                    // index order = transcript_id order because
-                                    // the source array is pre-sorted.
-                                    // Non-transcript entries (idx=None) are
-                                    // already in the correct order from
-                                    // collect_overlapping_indices, so use a
-                                    // stable fallback preserving their position.
-                                    match (a.transcript_idx, b.transcript_idx) {
-                                        (Some(ai), Some(bj)) => ai.cmp(&bj),
-                                        _ => i.cmp(&j),
-                                    }
-                                })
-                        });
-                    }
                     for &si in &sorted_indices {
                         let tc = &row_assignments[si];
                         terms_buf.clear();
@@ -4054,10 +4049,11 @@ impl AnnotateProvider {
                 }
 
                 if !row_assignments.is_empty() {
-                    // Cache-miss: iterate all consequence entries in the
-                    // engine's native order. CSQ ordering is handled
-                    // separately above for VEP string parity.
-                    for tc in &row_assignments {
+                    // Cache-miss: iterate consequence entries in the same
+                    // sorted order used for CSQ serialization so that the
+                    // Nth typed column element matches the Nth CSQ entry.
+                    for &si in &sorted_indices {
+                        let tc = &row_assignments[si];
                         let tx_opt = tc.transcript_idx.map(|idx| &ctx.transcripts[idx]);
 
                         // Consequence: "&"-joined terms for this transcript
