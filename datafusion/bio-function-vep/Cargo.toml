@@ -26,7 +26,7 @@ noodles-core = "0.16"
 noodles-fasta = "0.49"
 parquet = { version = "56", features = ["arrow"] }
 datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "7ccaa58" }
-datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "9e9d873", optional = true }
+datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "c7cad33b50235bd9a460f103a2ae7a41653f9ad3", optional = true }
 indicatif = "0.18.4"
 
 [dev-dependencies]
