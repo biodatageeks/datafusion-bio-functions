@@ -3738,26 +3738,15 @@ impl AnnotateProvider {
                     // stable_id within each group. See ensembl-variation
                     // VariationFeature.pm lines 855-864.
                     //
-                    // O(n) is-sorted check first: most variants (>99.9%)
-                    // come out of COITree already in VEP order, so the
-                    // sort is only needed for a handful of cases.
-                    let needs_sort = row_assignments.len() > 1
-                        && !row_assignments.windows(2).all(|w| {
-                            let ord = w[0]
-                                .feature_type
-                                .rank()
-                                .cmp(&w[1].feature_type.rank())
-                                .then_with(|| {
-                                    w[0].transcript_id
-                                        .as_deref()
-                                        .unwrap_or("")
-                                        .cmp(w[1].transcript_id.as_deref().unwrap_or(""))
-                                });
-                            ord.is_le()
-                        });
-                    if needs_sort {
-                        sorted_indices.clear();
-                        sorted_indices.extend(0..row_assignments.len());
+                    // ~85% of multi-transcript variants come out of COITree
+                    // in non-VEP order, so sorting is almost always needed.
+                    // We sort a lightweight index (8 bytes) instead of the
+                    // full TranscriptConsequence structs (~352 bytes).
+                    // The sorted_indices vec is allocated once outside the
+                    // row loop and reused across all rows.
+                    sorted_indices.clear();
+                    sorted_indices.extend(0..row_assignments.len());
+                    if row_assignments.len() > 1 {
                         sorted_indices.sort_unstable_by(|&i, &j| {
                             let a = &row_assignments[i];
                             let b = &row_assignments[j];
@@ -3772,9 +3761,7 @@ impl AnnotateProvider {
                                 })
                         });
                     }
-                    let iter_len = row_assignments.len();
-                    for pos in 0..iter_len {
-                        let si = if needs_sort { sorted_indices[pos] } else { pos };
+                    for &si in &sorted_indices {
                         let tc = &row_assignments[si];
                         terms_buf.clear();
                         for (i, t) in tc.terms.iter().enumerate() {
