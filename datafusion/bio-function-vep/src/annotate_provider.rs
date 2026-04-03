@@ -3509,6 +3509,9 @@ impl AnnotateProvider {
             String::with_capacity(4096)
         };
         let mut terms_buf = String::with_capacity(128);
+        // Reusable permutation index for VEP-compatible CSQ ordering.
+        // Allocated once, reused across all rows in the batch.
+        let mut sorted_indices: Vec<usize> = Vec::new();
 
         for row in 0..batch.num_rows() {
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
@@ -3620,11 +3623,6 @@ impl AnnotateProvider {
             let most_str;
             // Store assignment results from cache-miss path for annotation column population.
             let mut row_assignments: Vec<TranscriptConsequence> = Vec::new();
-            // Sorted permutation index into `row_assignments`, used only for
-            // CSQ serialization. Sorting indices (8 bytes each) instead of fat
-            // `TranscriptConsequence` structs (~352 bytes) avoids O(n log n)
-            // memcpy of heap-owning fields.
-            let mut sorted_indices: Vec<usize> = Vec::new();
             // Store the VariantInput for HGVS_OFFSET extraction in annotation columns.
             let mut row_variant: Option<VariantInput> = None;
             if !skip_csq {
@@ -3739,22 +3737,44 @@ impl AnnotateProvider {
                     // Motif → Intergenic, then lexicographically by feature
                     // stable_id within each group. See ensembl-variation
                     // VariationFeature.pm lines 855-864.
-                    sorted_indices.clear();
-                    sorted_indices.extend(0..row_assignments.len());
-                    sorted_indices.sort_unstable_by(|&i, &j| {
-                        let a = &row_assignments[i];
-                        let b = &row_assignments[j];
-                        a.feature_type
-                            .rank()
-                            .cmp(&b.feature_type.rank())
-                            .then_with(|| {
-                                a.transcript_id
-                                    .as_deref()
-                                    .unwrap_or("")
-                                    .cmp(b.transcript_id.as_deref().unwrap_or(""))
-                            })
-                    });
-                    for &si in &sorted_indices {
+                    //
+                    // O(n) is-sorted check first: most variants (>99.9%)
+                    // come out of COITree already in VEP order, so the
+                    // sort is only needed for a handful of cases.
+                    let needs_sort = row_assignments.len() > 1
+                        && !row_assignments.windows(2).all(|w| {
+                            let ord = w[0]
+                                .feature_type
+                                .rank()
+                                .cmp(&w[1].feature_type.rank())
+                                .then_with(|| {
+                                    w[0].transcript_id
+                                        .as_deref()
+                                        .unwrap_or("")
+                                        .cmp(w[1].transcript_id.as_deref().unwrap_or(""))
+                                });
+                            ord.is_le()
+                        });
+                    if needs_sort {
+                        sorted_indices.clear();
+                        sorted_indices.extend(0..row_assignments.len());
+                        sorted_indices.sort_unstable_by(|&i, &j| {
+                            let a = &row_assignments[i];
+                            let b = &row_assignments[j];
+                            a.feature_type
+                                .rank()
+                                .cmp(&b.feature_type.rank())
+                                .then_with(|| {
+                                    a.transcript_id
+                                        .as_deref()
+                                        .unwrap_or("")
+                                        .cmp(b.transcript_id.as_deref().unwrap_or(""))
+                                })
+                        });
+                    }
+                    let iter_len = row_assignments.len();
+                    for pos in 0..iter_len {
+                        let si = if needs_sort { sorted_indices[pos] } else { pos };
                         let tc = &row_assignments[si];
                         terms_buf.clear();
                         for (i, t) in tc.terms.iter().enumerate() {
