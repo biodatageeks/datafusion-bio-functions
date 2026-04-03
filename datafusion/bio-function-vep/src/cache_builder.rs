@@ -5,7 +5,7 @@
 //! - Fjall second pass for `translation_sift` (re-sorted by `transcript_id`)
 //! - Progress callback for driving tqdm bars in Python wrappers
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -1365,17 +1365,19 @@ impl CacheBuilder {
             .manual_journal_persist(true) // batch journal writes, persist manually at end
             .open()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let sift_store = SiftKvStore::create(&db)?;
-
-        // Stream predictions into fjall, reading each parquet file sequentially.
-        // No UNION ALL + ORDER BY which materializes 5GB+ in memory.
-        // Uses insert() (not start_ingestion) because transcript IDs are not
-        // globally ascending across chromosome files.
+        // Collect all SIFT/PolyPhen predictions into a BTreeMap keyed by
+        // transcript_id.  BTreeMap gives us deduplication and ascending key
+        // order so we can feed ingest_sorted() which uses fjall's bulk
+        // ingestion path (start_ingestion/finish).  The previous approach
+        // used insert() per transcript which accumulated everything in the
+        // memtable + journal; with manual_journal_persist the journal grew
+        // to ~10 GB and rotate_memtable_and_wait() deadlocked on the
+        // single worker thread.
         let read_ctx =
             SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
 
         let mut total_rows = 0usize;
-        let mut transcript_count = 0usize;
+        let mut sorted_preds: BTreeMap<String, CachedPredictions> = BTreeMap::new();
 
         for (parquet_path, _) in sift_parquet_files {
             read_ctx
@@ -1397,10 +1399,9 @@ impl CacheBuilder {
                 let poly_idx = schema.index_of("polyphen_predictions").ok();
 
                 for row in 0..batch.num_rows() {
-                    let transcript_id = string_value(batch.column(tid_idx).as_ref(), row);
+                    let transcript_id =
+                        string_value(batch.column(tid_idx).as_ref(), row).to_string();
 
-                    // Each row is one transcript (deduped upstream), so
-                    // read predictions and write directly — no accumulator.
                     let mut preds = CachedPredictions::default();
                     if let Some(idx) = sift_idx {
                         preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
@@ -1409,8 +1410,7 @@ impl CacheBuilder {
                         preds.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
                     }
                     preds.sort();
-                    sift_store.put(transcript_id, &preds)?;
-                    transcript_count += 1;
+                    sorted_preds.insert(transcript_id, preds);
                     total_rows += 1;
                 }
 
@@ -1419,6 +1419,14 @@ impl CacheBuilder {
                 }
             }
         }
+
+        let transcript_count = sorted_preds.len();
+        info!(
+            "translation_sift.fjall: ingesting {} transcripts from {} rows via sorted bulk load...",
+            transcript_count, total_rows
+        );
+        // sorted_preds is consumed by ingest_sorted; memory freed before compaction.
+        let sift_store = SiftKvStore::ingest_sorted(&db, sorted_preds.into_iter())?;
 
         info!("Running major compaction on translation_sift.fjall...");
         let compact_start = Instant::now();

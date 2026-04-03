@@ -2096,6 +2096,203 @@ mod tests {
         assert_eq!(csq0, csq2_0, "CSQ should be deterministic across runs");
     }
 
+    // Verifies that CSQ entries are sorted lexicographically by Feature ID
+    // within each Feature_type group, matching Ensembl VEP behaviour.
+    // See: https://github.com/biodatageeks/datafusion-bio-functions/issues/83
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_csq_entries_sorted_by_feature_id_within_feature_type() {
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &context_cache_batch());
+
+        // Three transcripts overlapping position 155 on chr 1, deliberately
+        // supplied in non-lexicographic order (C > A > B).
+        let tx_schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("strand", DataType::Int64, false),
+            Field::new("biotype", DataType::Utf8, false),
+            Field::new("cds_start", DataType::Int64, true),
+            Field::new("cds_end", DataType::Int64, true),
+        ]));
+        let tx_batch = RecordBatch::try_new(
+            tx_schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "ENST00000900000",
+                    "ENST00000100000",
+                    "ENST00000500000",
+                ])),
+                Arc::new(StringArray::from(vec!["1", "1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(Int64Array::from(vec![250, 250, 250])),
+                Arc::new(Int64Array::from(vec![1, 1, 1])),
+                Arc::new(StringArray::from(vec![
+                    "protein_coding",
+                    "protein_coding",
+                    "protein_coding",
+                ])),
+                Arc::new(Int64Array::from(vec![120, 120, 120])),
+                Arc::new(Int64Array::from(vec![240, 240, 240])),
+            ],
+        )
+        .expect("valid multi-transcript batch");
+        write_batch_to_cache(&tmpdir, "transcript", &tx_batch);
+
+        // Exons for all three transcripts.
+        let exon_schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("exon_number", DataType::Int64, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]));
+        let exon_batch = RecordBatch::try_new(
+            exon_schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "ENST00000900000",
+                    "ENST00000100000",
+                    "ENST00000500000",
+                ])),
+                Arc::new(Int64Array::from(vec![1, 1, 1])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(Int64Array::from(vec![250, 250, 250])),
+            ],
+        )
+        .expect("valid multi-exon batch");
+        write_batch_to_chrom(&tmpdir, "exon", "1", &exon_batch);
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_sort", Arc::new(context_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT \"CSQ\" \
+             FROM annotate_vep('vcf_sort', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("query should parse")
+            .collect()
+            .await
+            .expect("collect annotate_vep");
+        let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column"));
+        let csq0 = csq[0].as_ref().expect("csq should be present");
+        let entries = csq_entries(csq0);
+        // 74 = number of pipe-delimited CSQ FORMAT fields per entry.
+        let feature_ids: Vec<&str> = entries
+            .iter()
+            .filter(|f| f.len() == 74 && f[5] == "Transcript")
+            .map(|f| f[6])
+            .collect();
+        assert!(
+            !feature_ids.is_empty(),
+            "expected at least one Transcript CSQ entry"
+        );
+        assert_eq!(
+            feature_ids,
+            vec!["ENST00000100000", "ENST00000500000", "ENST00000900000"],
+            "CSQ transcript entries must be sorted lexicographically by Feature ID"
+        );
+    }
+
+    // Verifies that CSQ entries are grouped by Feature type in VEP order
+    // (Transcript → RegulatoryFeature → MotifFeature) and sorted within
+    // each group by feature ID.
+    // See: https://github.com/biodatageeks/datafusion-bio-functions/issues/83
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_csq_entries_grouped_by_feature_type_then_sorted_by_id() {
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &context_cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &context_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &context_exons_batch());
+
+        // Two regulatory features in reverse order.
+        write_batch_to_cache(
+            &tmpdir,
+            "regulatory",
+            &regulatory_feature_batch(&[
+                ("ENSR_BBB", "1", 150, 160, Some("promoter")),
+                ("ENSR_AAA", "1", 150, 160, Some("enhancer")),
+            ]),
+        );
+        write_batch_to_cache(&tmpdir, "motif", &context_motif_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_group", Arc::new(context_vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT \"CSQ\" \
+             FROM annotate_vep('vcf_group', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("query should parse")
+            .collect()
+            .await
+            .expect("collect annotate_vep");
+        let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column"));
+        let csq0 = csq[0].as_ref().expect("csq should be present");
+        let entries = csq_entries(csq0);
+        // 74 = number of pipe-delimited CSQ FORMAT fields per entry.
+        let feature_types: Vec<&str> = entries
+            .iter()
+            .filter(|f| f.len() == 74)
+            .map(|f| f[5])
+            .collect();
+        assert!(
+            !feature_types.is_empty(),
+            "expected at least one CSQ entry with 74 fields"
+        );
+
+        // Transcript entries must come before RegulatoryFeature entries,
+        // which must come before MotifFeature entries.
+        let mut seen_reg = false;
+        let mut seen_motif = false;
+        for ft in &feature_types {
+            match *ft {
+                "Transcript" => {
+                    assert!(
+                        !seen_reg && !seen_motif,
+                        "Transcript must appear before Regulatory and Motif"
+                    );
+                }
+                "RegulatoryFeature" => {
+                    assert!(!seen_motif, "RegulatoryFeature must appear before Motif");
+                    seen_reg = true;
+                }
+                "MotifFeature" => {
+                    seen_motif = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(seen_reg, "expected at least one RegulatoryFeature entry");
+        assert!(seen_motif, "expected at least one MotifFeature entry");
+
+        // Regulatory entries should be sorted by stable_id.
+        // 74 = number of pipe-delimited CSQ FORMAT fields per entry.
+        let reg_ids: Vec<&str> = entries
+            .iter()
+            .filter(|f| f.len() == 74 && f[5] == "RegulatoryFeature")
+            .map(|f| f[6])
+            .collect();
+        let mut sorted_reg = reg_ids.clone();
+        sorted_reg.sort();
+        assert_eq!(
+            reg_ids, sorted_reg,
+            "Regulatory CSQ entries must be sorted by stable_id"
+        );
+    }
+
     // Mirrors the cache-backed regulatory source coverage from:
     // - https://github.com/Ensembl/ensembl-vep/blob/release/115/t/AnnotationSource_Cache_RegFeat.t#L166-L205
     #[tokio::test(flavor = "multi_thread")]
