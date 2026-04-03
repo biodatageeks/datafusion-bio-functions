@@ -1420,6 +1420,18 @@ impl CacheBuilder {
             }
         }
 
+        // Flush the memtable to an SST file before compaction.
+        // Without this, all data stays in the memtable/journal because
+        // insert() (unlike start_ingestion/finish) does not rotate
+        // memtables automatically.  major_compact() only merges existing
+        // SST files, so it's a no-op when the memtable hasn't been
+        // flushed — leaving the entire dataset in the journal (~10 GB).
+        info!("Rotating memtable to SST for translation_sift.fjall...");
+        sift_store
+            .keyspace()
+            .rotate_memtable_and_wait()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
         info!("Running major compaction on translation_sift.fjall...");
         let compact_start = Instant::now();
         sift_store
