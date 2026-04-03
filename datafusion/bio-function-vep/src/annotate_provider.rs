@@ -3620,9 +3620,10 @@ impl AnnotateProvider {
             let most_str;
             // Store assignment results from cache-miss path for annotation column population.
             let mut row_assignments: Vec<TranscriptConsequence> = Vec::new();
-            // Sorted permutation index into `row_assignments`.  Sorting indices
-            // (8 bytes each) instead of fat `TranscriptConsequence` structs
-            // (~352 bytes) avoids O(n log n) memcpy of heap-owning fields.
+            // Sorted permutation index into `row_assignments`, used only for
+            // CSQ serialization. Sorting indices (8 bytes each) instead of fat
+            // `TranscriptConsequence` structs (~352 bytes) avoids O(n log n)
+            // memcpy of heap-owning fields.
             let mut sorted_indices: Vec<usize> = Vec::new();
             // Store the VariantInput for HGVS_OFFSET extraction in annotation columns.
             let mut row_variant: Option<VariantInput> = None;
@@ -3729,33 +3730,30 @@ impl AnnotateProvider {
                 let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
                 most_str = most.as_str().to_string();
                 row_assignments = assignments;
-                // Build a sorted permutation index to match VEP ordering:
-                // first by feature-type group (Transcript → Regulatory →
-                // Motif → Intergenic), then lexicographically by feature
-                // stable_id within each group.  We sort lightweight indices
-                // (8 bytes) instead of the full TranscriptConsequence structs
-                // (~352 bytes) to avoid expensive memcpy of heap-owning fields.
-                // See ensembl-variation VariationFeature.pm lines 855-864.
-                sorted_indices.clear();
-                sorted_indices.extend(0..row_assignments.len());
-                sorted_indices.sort_unstable_by(|&i, &j| {
-                    let a = &row_assignments[i];
-                    let b = &row_assignments[j];
-                    a.feature_type
-                        .rank()
-                        .cmp(&b.feature_type.rank())
-                        .then_with(|| {
-                            a.transcript_id
-                                .as_deref()
-                                .unwrap_or("")
-                                .cmp(b.transcript_id.as_deref().unwrap_or(""))
-                        })
-                });
                 row_variant = Some(variant);
 
                 // Build per-transcript CSQ entries into reusable buffer (already cleared above).
                 // Skip the entire CSQ formatting when the csq column is not projected.
                 if !skip_csq {
+                    // Match VEP CSQ ordering: Transcript → Regulatory →
+                    // Motif → Intergenic, then lexicographically by feature
+                    // stable_id within each group. See ensembl-variation
+                    // VariationFeature.pm lines 855-864.
+                    sorted_indices.clear();
+                    sorted_indices.extend(0..row_assignments.len());
+                    sorted_indices.sort_unstable_by(|&i, &j| {
+                        let a = &row_assignments[i];
+                        let b = &row_assignments[j];
+                        a.feature_type
+                            .rank()
+                            .cmp(&b.feature_type.rank())
+                            .then_with(|| {
+                                a.transcript_id
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .cmp(b.transcript_id.as_deref().unwrap_or(""))
+                            })
+                    });
                     for &si in &sorted_indices {
                         let tc = &row_assignments[si];
                         terms_buf.clear();
@@ -4042,9 +4040,10 @@ impl AnnotateProvider {
                 }
 
                 if !row_assignments.is_empty() {
-                    // Cache-miss: iterate ALL transcripts in sorted order
-                    for &si in &sorted_indices {
-                        let tc = &row_assignments[si];
+                    // Cache-miss: iterate all consequence entries in the
+                    // engine's native order. CSQ ordering is handled
+                    // separately above for VEP string parity.
+                    for tc in &row_assignments {
                         let tx_opt = tc.transcript_idx.map(|idx| &ctx.transcripts[idx]);
 
                         // Consequence: "&"-joined terms for this transcript
