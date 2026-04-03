@@ -3725,6 +3725,21 @@ impl AnnotateProvider {
                 let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
                 most_str = most.as_str().to_string();
                 row_assignments = assignments;
+                // Sort CSQ entries to match VEP ordering: first by feature-type
+                // group (Transcript → Regulatory → Motif → Intergenic), then
+                // lexicographically by feature stable_id within each group.
+                // See ensembl-variation VariationFeature.pm lines 855-864.
+                row_assignments.sort_by(|a, b| {
+                    a.feature_type
+                        .rank()
+                        .cmp(&b.feature_type.rank())
+                        .then_with(|| {
+                            a.transcript_id
+                                .as_deref()
+                                .unwrap_or("")
+                                .cmp(b.transcript_id.as_deref().unwrap_or(""))
+                        })
+                });
                 row_variant = Some(variant);
 
                 // Build per-transcript CSQ entries into reusable buffer (already cleared above).

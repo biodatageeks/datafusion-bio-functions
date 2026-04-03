@@ -490,6 +490,18 @@ impl FeatureType {
             FeatureType::None => "",
         }
     }
+
+    /// VEP-compatible feature-type rank matching the hard-coded concat order
+    /// in `ensembl-variation/.../VariationFeature.pm` (lines 855-864):
+    /// Transcript → RegulatoryFeature → MotifFeature → Intergenic.
+    pub fn rank(&self) -> u8 {
+        match self {
+            FeatureType::Transcript => 0,
+            FeatureType::RegulatoryFeature => 1,
+            FeatureType::MotifFeature => 2,
+            FeatureType::None => 3,
+        }
+    }
 }
 
 /// Pre-built indexes over context features, constructed once and reused
@@ -8449,5 +8461,82 @@ mod tests {
         let cds = b"ATGNNN"; // ATG = M, NNN = X
         let pep = translate_protein_from_cds(cds).unwrap();
         assert_eq!(pep, vec!['M', 'X']);
+    }
+
+    #[test]
+    fn feature_type_rank_matches_vep_concat_order() {
+        assert!(FeatureType::Transcript.rank() < FeatureType::RegulatoryFeature.rank());
+        assert!(FeatureType::RegulatoryFeature.rank() < FeatureType::MotifFeature.rank());
+        assert!(FeatureType::MotifFeature.rank() < FeatureType::None.rank());
+    }
+
+    #[test]
+    fn transcript_consequences_sort_by_feature_type_then_id() {
+        let mut tcs = vec![
+            TranscriptConsequence {
+                transcript_id: Some("motif_001".to_string()),
+                feature_type: FeatureType::MotifFeature,
+                terms: vec![SoTerm::TfBindingSiteVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_id: Some("ENST00000900000".to_string()),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::MissenseVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_id: Some("ENSR00000000002".to_string()),
+                feature_type: FeatureType::RegulatoryFeature,
+                terms: vec![SoTerm::RegulatoryRegionVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_id: Some("ENST00000100000".to_string()),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::SynonymousVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_id: Some("ENSR00000000001".to_string()),
+                feature_type: FeatureType::RegulatoryFeature,
+                terms: vec![SoTerm::RegulatoryRegionVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_id: None,
+                feature_type: FeatureType::None,
+                terms: vec![SoTerm::IntergenicVariant],
+                ..Default::default()
+            },
+        ];
+
+        tcs.sort_by(|a, b| {
+            a.feature_type
+                .rank()
+                .cmp(&b.feature_type.rank())
+                .then_with(|| {
+                    a.transcript_id
+                        .as_deref()
+                        .unwrap_or("")
+                        .cmp(b.transcript_id.as_deref().unwrap_or(""))
+                })
+        });
+
+        let ids: Vec<&str> = tcs
+            .iter()
+            .map(|tc| tc.transcript_id.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "ENST00000100000",
+                "ENST00000900000",
+                "ENSR00000000001",
+                "ENSR00000000002",
+                "motif_001",
+                "",
+            ]
+        );
     }
 }
