@@ -901,6 +901,12 @@ impl CacheBuilder {
             compact_start.elapsed().as_secs_f64()
         );
 
+        // Skip fjall's Drop which deadlocks when background worker threads are busy
+        // compacting — the bounded(1000) flume channel fills up, send() blocks while
+        // the worker is still in compact(). All data is persisted and compacted above.
+        // See: https://github.com/biodatageeks/datafusion-bio-functions/issues/86
+        std::mem::forget(store);
+
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(
             "variation.fjall rebuilt: {} positions, {} variants, {:.1} MB in {:.1}s",
@@ -1434,14 +1440,12 @@ impl CacheBuilder {
         db.persist(fjall::PersistMode::SyncAll)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        info!("translation_sift.fjall: closing database...");
-        let close_start = Instant::now();
-        drop(sift_store);
-        drop(db);
-        info!(
-            "translation_sift.fjall: database closed in {:.1}s",
-            close_start.elapsed().as_secs_f64()
-        );
+        // Skip fjall's Drop which deadlocks when background worker threads are busy
+        // compacting — the bounded(1000) flume channel fills up, send() blocks while
+        // the worker is still in compact(). All data is persisted above.
+        // See: https://github.com/biodatageeks/datafusion-bio-functions/issues/86
+        std::mem::forget(sift_store);
+        std::mem::forget(db);
 
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(
