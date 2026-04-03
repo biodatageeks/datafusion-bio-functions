@@ -3620,6 +3620,10 @@ impl AnnotateProvider {
             let most_str;
             // Store assignment results from cache-miss path for annotation column population.
             let mut row_assignments: Vec<TranscriptConsequence> = Vec::new();
+            // Sorted permutation index into `row_assignments`.  Sorting indices
+            // (8 bytes each) instead of fat `TranscriptConsequence` structs
+            // (~352 bytes) avoids O(n log n) memcpy of heap-owning fields.
+            let mut sorted_indices: Vec<usize> = Vec::new();
             // Store the VariantInput for HGVS_OFFSET extraction in annotation columns.
             let mut row_variant: Option<VariantInput> = None;
             if !skip_csq {
@@ -3725,11 +3729,18 @@ impl AnnotateProvider {
                 let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
                 most_str = most.as_str().to_string();
                 row_assignments = assignments;
-                // Sort CSQ entries to match VEP ordering: first by feature-type
-                // group (Transcript → Regulatory → Motif → Intergenic), then
-                // lexicographically by feature stable_id within each group.
+                // Build a sorted permutation index to match VEP ordering:
+                // first by feature-type group (Transcript → Regulatory →
+                // Motif → Intergenic), then lexicographically by feature
+                // stable_id within each group.  We sort lightweight indices
+                // (8 bytes) instead of the full TranscriptConsequence structs
+                // (~352 bytes) to avoid expensive memcpy of heap-owning fields.
                 // See ensembl-variation VariationFeature.pm lines 855-864.
-                row_assignments.sort_by(|a, b| {
+                sorted_indices.clear();
+                sorted_indices.extend(0..row_assignments.len());
+                sorted_indices.sort_unstable_by(|&i, &j| {
+                    let a = &row_assignments[i];
+                    let b = &row_assignments[j];
                     a.feature_type
                         .rank()
                         .cmp(&b.feature_type.rank())
@@ -3745,7 +3756,8 @@ impl AnnotateProvider {
                 // Build per-transcript CSQ entries into reusable buffer (already cleared above).
                 // Skip the entire CSQ formatting when the csq column is not projected.
                 if !skip_csq {
-                    for tc in &row_assignments {
+                    for &si in &sorted_indices {
+                        let tc = &row_assignments[si];
                         terms_buf.clear();
                         for (i, t) in tc.terms.iter().enumerate() {
                             if i > 0 {
@@ -4030,8 +4042,9 @@ impl AnnotateProvider {
                 }
 
                 if !row_assignments.is_empty() {
-                    // Cache-miss: iterate ALL transcripts
-                    for tc in &row_assignments {
+                    // Cache-miss: iterate ALL transcripts in sorted order
+                    for &si in &sorted_indices {
+                        let tc = &row_assignments[si];
                         let tx_opt = tc.transcript_idx.map(|idx| &ctx.transcripts[idx]);
 
                         // Consequence: "&"-joined terms for this transcript
