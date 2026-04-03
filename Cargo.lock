@@ -1106,8 +1106,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-format-core"
-version = "1.0.0"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=9e9d873#9e9d873008f846f4c8346a9a7b0efc294f710119"
+version = "1.1.0"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=c7cad33b50235bd9a460f103a2ae7a41653f9ad3#c7cad33b50235bd9a460f103a2ae7a41653f9ad3"
 dependencies = [
  "async-compression",
  "bytes",
@@ -1128,12 +1128,12 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-format-ensembl-cache"
-version = "1.0.0"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=9e9d873#9e9d873008f846f4c8346a9a7b0efc294f710119"
+version = "1.1.0"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=c7cad33b50235bd9a460f103a2ae7a41653f9ad3#c7cad33b50235bd9a460f103a2ae7a41653f9ad3"
 dependencies = [
  "async-trait",
  "datafusion",
- "datafusion-bio-format-core 1.0.0 (git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=9e9d873)",
+ "datafusion-bio-format-core 1.1.0",
  "datafusion-execution",
  "flate2",
  "log",
@@ -1154,7 +1154,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "datafusion",
- "datafusion-bio-format-core 1.0.0 (git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=7ccaa58)",
+ "datafusion-bio-format-core 1.0.0",
  "datafusion-execution",
  "env_logger",
  "flate2",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-function-pileup"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-function-ranges"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "ahash",
  "async-trait",
@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-function-vep"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ahash",
  "arrow-ipc",
@@ -4747,7 +4747,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "superintervals"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "aligned-vec",
  "serde",
