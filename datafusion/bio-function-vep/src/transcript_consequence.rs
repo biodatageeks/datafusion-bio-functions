@@ -526,18 +526,24 @@ struct PreparedFeatureIndex<'a, T> {
 }
 
 impl<'a, T> PreparedFeatureIndex<'a, T> {
-    fn new<FChrom, FStart, FEnd>(
+    fn new<FChrom, FStart, FEnd, FId>(
         features: &'a [T],
         chrom_of: FChrom,
         start_of: FStart,
         end_of: FEnd,
+        id_of: FId,
     ) -> Self
     where
         FChrom: Fn(&T) -> &str,
         FStart: Fn(&T) -> i64,
         FEnd: Fn(&T) -> i64,
+        FId: Fn(&T) -> &str,
     {
-        let feature_refs: Vec<&T> = features.iter().collect();
+        // Sort by feature ID so that source-index order equals lexicographic
+        // ID order.  `collect_overlapping_indices` sorts returned indices with
+        // `sort_unstable()`, which then yields VEP-compatible order for free.
+        let mut feature_refs: Vec<&T> = features.iter().collect();
+        feature_refs.sort_unstable_by(|a, b| id_of(a).cmp(id_of(b)));
         let mut chrom_intervals: HashMap<String, Vec<Interval<usize>>> = HashMap::new();
         for (idx, feature) in feature_refs.iter().enumerate() {
             let chrom = normalize_chrom(chrom_of(feature)).to_string();
@@ -612,7 +618,12 @@ impl<'a> PreparedContext<'a> {
             .iter()
             .map(|t| (t.transcript_id.as_str(), t))
             .collect();
-        let tx_refs: Vec<&TranscriptFeature> = transcripts.iter().collect();
+        // Sort transcripts by transcript_id so that source-array index order
+        // equals lexicographic feature-ID order.  The downstream CSQ sort can
+        // then compare lightweight `transcript_idx` integers instead of heap-
+        // allocated transcript_id strings.
+        let mut tx_refs: Vec<&TranscriptFeature> = transcripts.iter().collect();
+        tx_refs.sort_unstable_by(|a, b| a.transcript_id.cmp(&b.transcript_id));
 
         // Build per-chromosome COITree for fast interval overlap queries.
         let mut chrom_intervals: HashMap<String, Vec<Interval<usize>>> = HashMap::new();
@@ -630,12 +641,34 @@ impl<'a> PreparedContext<'a> {
                 (chrom, tree)
             })
             .collect();
-        let regulatory_index =
-            PreparedFeatureIndex::new(regulatory, |r| &r.chrom, |r| r.start, |r| r.end);
-        let motif_index = PreparedFeatureIndex::new(motifs, |m| &m.chrom, |m| m.start, |m| m.end);
-        let mirna_index = PreparedFeatureIndex::new(mirnas, |m| &m.chrom, |m| m.start, |m| m.end);
-        let structural_index =
-            PreparedFeatureIndex::new(structural, |s| &s.chrom, |s| s.start, |s| s.end);
+        let regulatory_index = PreparedFeatureIndex::new(
+            regulatory,
+            |r| &r.chrom,
+            |r| r.start,
+            |r| r.end,
+            |r| r.feature_id.as_str(),
+        );
+        let motif_index = PreparedFeatureIndex::new(
+            motifs,
+            |m| &m.chrom,
+            |m| m.start,
+            |m| m.end,
+            |m| m.motif_id.as_str(),
+        );
+        let mirna_index = PreparedFeatureIndex::new(
+            mirnas,
+            |m| &m.chrom,
+            |m| m.start,
+            |m| m.end,
+            |m| m.mirna_id.as_str(),
+        );
+        let structural_index = PreparedFeatureIndex::new(
+            structural,
+            |s| &s.chrom,
+            |s| s.start,
+            |s| s.end,
+            |s| s.feature_id.as_str(),
+        );
 
         Self {
             exons_by_tx,
@@ -5402,7 +5435,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_context_preserves_regulatory_source_order() {
+    fn prepared_context_sorts_regulatory_by_feature_id() {
         let engine = TranscriptConsequenceEngine::default();
         let regulatory_features = vec![
             regulatory("ENSR22_B", "chr22", 150, 250),
@@ -5418,7 +5451,8 @@ mod tests {
             .map(|tc| tc.transcript_id.as_deref().unwrap_or(""))
             .collect();
 
-        assert_eq!(ids, vec!["ENSR22_B", "ENSR22_A"]);
+        // Features are pre-sorted by feature_id for VEP-compatible ordering.
+        assert_eq!(ids, vec!["ENSR22_A", "ENSR22_B"]);
     }
 
     #[test]

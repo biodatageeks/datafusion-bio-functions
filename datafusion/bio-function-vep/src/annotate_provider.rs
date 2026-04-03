@@ -3738,12 +3738,12 @@ impl AnnotateProvider {
                     // stable_id within each group. See ensembl-variation
                     // VariationFeature.pm lines 855-864.
                     //
-                    // ~85% of multi-transcript variants come out of COITree
-                    // in non-VEP order, so sorting is almost always needed.
-                    // We sort a lightweight index (8 bytes) instead of the
-                    // full TranscriptConsequence structs (~352 bytes).
-                    // The sorted_indices vec is allocated once outside the
-                    // row loop and reused across all rows.
+                    // Source arrays are pre-sorted by feature ID in
+                    // PreparedContext, so transcript_idx order equals
+                    // lexicographic transcript_id order. We compare
+                    // integer indices instead of heap-allocated strings.
+                    // Non-transcript features (regulatory, motif) are
+                    // already emitted in ID order by collect_overlapping_indices.
                     sorted_indices.clear();
                     sorted_indices.extend(0..row_assignments.len());
                     if row_assignments.len() > 1 {
@@ -3754,10 +3754,17 @@ impl AnnotateProvider {
                                 .rank()
                                 .cmp(&b.feature_type.rank())
                                 .then_with(|| {
-                                    a.transcript_id
-                                        .as_deref()
-                                        .unwrap_or("")
-                                        .cmp(b.transcript_id.as_deref().unwrap_or(""))
+                                    // Transcript entries have transcript_idx;
+                                    // index order = transcript_id order because
+                                    // the source array is pre-sorted.
+                                    // Non-transcript entries (idx=None) are
+                                    // already in the correct order from
+                                    // collect_overlapping_indices, so use a
+                                    // stable fallback preserving their position.
+                                    match (a.transcript_idx, b.transcript_idx) {
+                                        (Some(ai), Some(bj)) => ai.cmp(&bj),
+                                        _ => i.cmp(&j),
+                                    }
                                 })
                         });
                     }
