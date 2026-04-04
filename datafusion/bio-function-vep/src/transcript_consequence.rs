@@ -2713,30 +2713,43 @@ fn is_stop_codon(allele: &str) -> bool {
 }
 
 /// Check if an indel near the stop codon preserves the stop codon in the
-/// mutated CDS. Builds a mutated CDS by applying the variant and checks
-/// if the last 3 bases still form a stop codon.
+/// mutated sequence. Implements VEP's exact `_ins_del_stop_altered` logic:
+/// concatenate translateable (CDS) + 3' UTR, apply the mutation at the
+/// variant's CDS position, then check whether the codon at the *original*
+/// stop position still translates to `*`.
 ///
-/// This mirrors `mutated_cds_first3` which checks start codon preservation.
+/// This is critical for deletions that span the CDS/UTR boundary: after
+/// deleting bases from the stop codon region, 3' UTR bases shift into the
+/// stop position and may form a new stop codon (stop_retained).
+///
+/// Traceability:
+/// - `_ins_del_stop_altered`:
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1382-L1433>
+/// - `stop_retained_variant = !_ins_del_stop_altered`:
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1354-L1370>
 fn mutated_cds_stop_preserved(
     cds_seq: &str,
     variant: &VariantInput,
     tx: &TranscriptFeature,
 ) -> bool {
-    let cds_bytes = cds_seq.as_bytes();
-    let cds_start = tx.cds_start.unwrap_or(0);
-    let cds_end = tx.cds_end.unwrap_or(0);
+    let cds_start_genomic = tx.cds_start.unwrap_or(0);
+    let cds_end_genomic = tx.cds_end.unwrap_or(0);
 
     let ref_allele = normalize_allele_seq(&variant.ref_allele);
     let alt_allele = normalize_allele_seq(&variant.alt_allele);
 
-    // Map variant genomic position to CDS index
+    // Map variant genomic position to 0-based CDS index
     let var_start_genomic = if tx.strand >= 0 {
         variant.start
     } else {
         variant.end
     };
 
-    let cds_origin = if tx.strand >= 0 { cds_start } else { cds_end };
+    let cds_origin = if tx.strand >= 0 {
+        cds_start_genomic
+    } else {
+        cds_end_genomic
+    };
     let cds_idx = if tx.strand >= 0 {
         (var_start_genomic - cds_origin) as usize
     } else {
@@ -2747,36 +2760,50 @@ fn mutated_cds_stop_preserved(
         return false;
     }
 
-    // Build mutated CDS: replace ref with alt at cds_idx
+    // VEP step 1: concatenate translateable (CDS) + 3' UTR
+    let utr_seq = three_prime_utr_seq(tx).unwrap_or_default();
+    let translateable_len = cds_seq.len();
+    let mut combined = Vec::with_capacity(translateable_len + utr_seq.len());
+    combined.extend_from_slice(cds_seq.as_bytes());
+    combined.extend_from_slice(utr_seq.as_bytes());
+
+    // VEP step 2: apply mutation — substr($combined, $cds_idx, $ref_len) = $alt
     let ref_len = ref_allele.len();
-    let end_idx = cds_idx.saturating_add(ref_len).min(cds_seq.len());
+    let end_idx = cds_idx.saturating_add(ref_len).min(combined.len());
 
-    let mut mutated = Vec::with_capacity(cds_seq.len());
-    mutated.extend_from_slice(&cds_bytes[..cds_idx]);
-    if !alt_allele.is_empty() {
-        let alt_bytes = if tx.strand >= 0 {
-            alt_allele.to_ascii_uppercase().into_bytes()
-        } else {
-            reverse_complement(&alt_allele)
-                .unwrap_or_default()
-                .to_ascii_uppercase()
-                .into_bytes()
-        };
-        mutated.extend_from_slice(&alt_bytes);
-    }
-    if end_idx < cds_seq.len() {
-        mutated.extend_from_slice(&cds_bytes[end_idx..]);
-    }
-
-    // Check if last 3 bases of mutated CDS form a stop codon
-    if mutated.len() >= 3 {
-        let last3 = std::str::from_utf8(&mutated[mutated.len() - 3..])
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        is_stop_codon(&last3)
+    let alt_bytes = if alt_allele.is_empty() {
+        Vec::new()
+    } else if tx.strand >= 0 {
+        alt_allele.to_ascii_uppercase().into_bytes()
     } else {
-        false
+        reverse_complement(&alt_allele)
+            .unwrap_or_default()
+            .to_ascii_uppercase()
+            .into_bytes()
+    };
+
+    let mut mutated = Vec::with_capacity(combined.len());
+    mutated.extend_from_slice(&combined[..cds_idx]);
+    mutated.extend_from_slice(&alt_bytes);
+    if end_idx < combined.len() {
+        mutated.extend_from_slice(&combined[end_idx..]);
     }
+
+    // VEP step 3: if mutated is shorter than translateable → stop altered
+    if mutated.len() < translateable_len {
+        return false;
+    }
+
+    // VEP step 4: extract codon at original stop position and translate
+    // Original stop codon starts at translateable_len - 3
+    let stop_pos = translateable_len.saturating_sub(3);
+    if stop_pos + 3 > mutated.len() {
+        return false;
+    }
+    let codon_at_stop = std::str::from_utf8(&mutated[stop_pos..stop_pos + 3])
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    is_stop_codon(&codon_at_stop)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -9143,6 +9170,141 @@ mod tests {
             c.stop_retained,
             "Deletion near stop with shifted index should be stop_retained. Got: stop_retained={}, stop_lost={}",
             c.stop_retained, c.stop_lost
+        );
+    }
+
+    // ── Issue #90: CDS/UTR boundary deletion stop_retained (VEP _ins_del_stop_altered) ──
+
+    #[test]
+    fn deletion_spanning_cds_utr_boundary_preserves_stop_via_utr_shift() {
+        // Simulates chr8:9030032 TAAC>T: deletion of 3 bases starting in
+        // the stop codon and extending into 3' UTR.
+        // CDS: ATG GCT TAA (M A *) — 9 bases, stop at positions 1006-1008
+        // 3' UTR: CAACAG...
+        // Full cDNA: ATGGCTTAACAACAG...
+        // Deletion: "AAC" at genomic 1007-1009 (last 2 CDS + first UTR base)
+        // After deletion in CDS+UTR: ATG GCT T|AACAG... → stop at "TAA" preserved
+        //
+        // Without UTR, mutated CDS = "ATGGCTT" (7 bases) — no stop codon.
+        // With UTR concatenation (VEP's logic), the codon at original stop
+        // position (index 6) in mutated "ATGGCTTAACAG..." = "TAA" → stop retained.
+        let cds = "ATGGCTTAA"; // 9 bases, stop codon at end
+        let utr = "CAACAGTTTT"; // 3' UTR
+        let full_cdna = format!("{}{}", cds, utr);
+        let cds_len = cds.len();
+        // Transcript: genomic 1000-1018, CDS 1000-1008, exon covers all
+        let tx_end = 1000 + full_cdna.len() as i64 - 1;
+        let cds_end_pos = 1000 + cds_len as i64 - 1; // 1008
+        let mut t = tx(
+            "T1",
+            "8",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(cds_end_pos),
+        );
+        // Set cdna_coding_end and cdna_seq so three_prime_utr_seq() works
+        t.cdna_coding_end = Some(cds_len); // 9
+        t.cdna_seq = Some(full_cdna);
+
+        let result = mutated_cds_stop_preserved(cds, &var("8", 1007, 1009, "AAC", "-"), &t);
+        assert!(
+            result,
+            "Deletion spanning CDS/UTR boundary should be stop_retained when UTR bases form stop"
+        );
+    }
+
+    #[test]
+    fn deletion_spanning_cds_utr_boundary_loses_stop_when_utr_no_stop() {
+        // Same scenario but UTR doesn't form a stop codon after shift.
+        // CDS: ATG GCT TAA (9 bases)
+        // 3' UTR: GGGCCCAAA
+        // Delete "AAG" at 1007-1009 (CDS indices 7-8 + first UTR base)
+        // Mutated CDS+UTR: "ATGGCTT" + "GGCCCAAA" = "ATGGCTTGGCCCAAA"
+        // Codon at original stop pos 6: "TGG" → Trp, not stop → stop_lost
+        let cds = "ATGGCTTAA";
+        let utr = "GGGCCCAAA";
+        let full_cdna = format!("{}{}", cds, utr);
+        let cds_len = cds.len();
+        let tx_end = 1000 + full_cdna.len() as i64 - 1;
+        let cds_end_pos = 1000 + cds_len as i64 - 1;
+        let mut t = tx(
+            "T1",
+            "8",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(cds_end_pos),
+        );
+        t.cdna_coding_end = Some(cds_len);
+        t.cdna_seq = Some(full_cdna);
+
+        let result = mutated_cds_stop_preserved(cds, &var("8", 1007, 1009, "AAG", "-"), &t);
+        assert!(
+            !result,
+            "Deletion spanning CDS/UTR boundary should be stop_lost when UTR bases don't form stop"
+        );
+    }
+
+    #[test]
+    fn mutated_cds_stop_preserved_deletion_shortens_below_original_returns_false() {
+        // VEP's _ins_del_stop_altered: if mutated sequence is shorter than
+        // the original translateable → stop IS altered (returns false here).
+        // CDS: ATG GCT AAA TGA (12 bases), delete "AAA" → 9 bases
+        // Original stop at index 9, mutated is only 9 bytes → can't check → false.
+        let cds = "ATGGCTAAATGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+
+        let result = mutated_cds_stop_preserved(cds, &var("22", 1006, 1008, "AAA", "-"), &t);
+        assert!(
+            !result,
+            "Without UTR, deletion making mutated shorter than CDS should return false (stop altered)"
+        );
+    }
+
+    #[test]
+    fn mutated_cds_stop_preserved_insertion_near_stop_retains_stop() {
+        // CDS: ATG GCT TAA (9 bases), insert "GCT" at position 1005 (between pos 5 and 6)
+        // Mutated: ATG GCT GCT TAA (12 bases)
+        // Original stop at index 6 (9-3), mutated codon at index 6 = "GCT" ≠ stop → false
+        // Wait — VEP checks codon at translateable_len - 3 = 6, which is "GCT" → not stop
+        // Let's instead insert 3 bases right before the stop: position 1005
+        // CDS indices: 0=A,1=T,2=G,3=G,4=C,5=T,6=T,7=A,8=A
+        // Insert "TAA" at cds_idx=5 → mutated = ATGGCTTAATAA (12 bytes)
+        // Original stop pos = 9-3 = 6, codon at 6 = "TAA" → stop preserved!
+        let cds = "ATGGCTTAA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+
+        let result = mutated_cds_stop_preserved(cds, &var("22", 1006, 1005, "-", "TAA"), &t);
+        assert!(
+            result,
+            "Insertion that preserves stop codon at original position should return true"
         );
     }
 }
