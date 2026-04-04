@@ -2481,7 +2481,12 @@ impl AnnotateProvider {
             }
         }
 
-        backfill_missing_hgnc_ids(&mut out, &refseq_ids);
+        let hgnc_backfill = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_bool_option(opts, "hgnc_backfill"))
+            .unwrap_or(false);
+        backfill_missing_hgnc_ids(&mut out, &refseq_ids, hgnc_backfill);
         Ok((out, translateable_seq_by_tx))
     }
 
@@ -4818,7 +4823,26 @@ fn normalize_source_label(source: &str) -> Option<String> {
 /// separately. RefSeq rows often lack promoted `gene_hgnc_id`, while the paired
 /// Ensembl row carries both `refseq_id` and `gene_hgnc_id`. This reconstructs
 /// the VEP-visible merged transcript state without heuristics.
-fn backfill_missing_hgnc_ids(transcripts: &mut [TranscriptFeature], refseq_ids: &[Option<String>]) {
+///
+/// When `hgnc_backfill` is `false` (default), the symbol-based fallback is
+/// restricted to transcripts whose `gene_symbol_source` is `"HGNC"`.  VEP
+/// derives `HGNC_ID` from each transcript's gene `display_xref`, which is a
+/// per-gene-object attribute.  Transcripts of the same gene symbol can have
+/// different symbol sources (e.g. LINC03025 has both HGNC and EntrezGene
+/// transcripts); VEP only emits `HGNC_ID` for those whose gene object carries
+/// the HGNC `display_xref`.  The cache's per-transcript `gene_hgnc_id` column
+/// reflects this correctly, so the symbol fallback must only fill gaps for
+/// HGNC-source transcripts.  Setting `hgnc_backfill` to `true` restores the
+/// previous behaviour which populates `HGNC_ID` for all transcripts where a
+/// unique mapping can be inferred — arguably more complete but not
+/// VEP-compatible.
+///
+/// See <https://github.com/biodatageeks/datafusion-bio-functions/issues/92>.
+fn backfill_missing_hgnc_ids(
+    transcripts: &mut [TranscriptFeature],
+    refseq_ids: &[Option<String>],
+    hgnc_backfill: bool,
+) {
     let mut refseq_gene_hgnc_by_id: HashMap<String, (Option<String>, String)> = HashMap::new();
     let mut symbol_to_hgnc_ids: HashMap<String, HashSet<String>> = HashMap::new();
 
@@ -4862,9 +4886,23 @@ fn backfill_missing_hgnc_ids(transcripts: &mut [TranscriptFeature], refseq_ids: 
                 continue;
             }
         }
-        if let Some(symbol) = tx.gene_symbol.as_deref() {
-            if let Some(hgnc_id) = unique_hgnc_by_symbol.get(symbol) {
-                tx.gene_hgnc_id = Some(hgnc_id.clone());
+        // Symbol-based fallback: only apply when hgnc_backfill is enabled or
+        // the transcript's gene_symbol_source is "HGNC".  VEP derives HGNC_ID
+        // from each transcript's gene `display_xref`; genes whose
+        // SYMBOL_SOURCE is RFAM, EntrezGene, or absent may or may not carry
+        // an HGNC `display_xref`, and the cache's per-transcript
+        // `gene_hgnc_id` column already reflects that correctly.  The symbol
+        // fallback must only fill gaps for HGNC-source transcripts where the
+        // cache is incomplete (issue #92).
+        let source_is_hgnc = tx
+            .gene_symbol_source
+            .as_deref()
+            .is_some_and(|s| s == "HGNC");
+        if hgnc_backfill || source_is_hgnc {
+            if let Some(symbol) = tx.gene_symbol.as_deref() {
+                if let Some(hgnc_id) = unique_hgnc_by_symbol.get(symbol) {
+                    tx.gene_hgnc_id = Some(hgnc_id.clone());
+                }
             }
         }
     }
@@ -7346,5 +7384,209 @@ mod tests {
         let signed = shift_length as i64;
         let value = if tx_strand < 0 { -signed } else { signed };
         assert_eq!(value, 3);
+    }
+
+    // ── backfill_missing_hgnc_ids ─────────────────────────────────────
+
+    /// Minimal `TranscriptFeature` for backfill tests.
+    fn make_tx(
+        id: &str,
+        symbol: Option<&str>,
+        symbol_source: Option<&str>,
+        hgnc_id: Option<&str>,
+    ) -> TranscriptFeature {
+        TranscriptFeature {
+            transcript_id: id.to_string(),
+            chrom: "chr2".to_string(),
+            start: 1,
+            end: 100,
+            strand: 1,
+            biotype: "snoRNA".to_string(),
+            cds_start: None,
+            cds_end: None,
+            cdna_coding_start: None,
+            cdna_coding_end: None,
+            cdna_mapper_segments: Vec::new(),
+            mature_mirna_regions: Vec::new(),
+            gene_stable_id: None,
+            gene_symbol: symbol.map(|s| s.to_string()),
+            gene_symbol_source: symbol_source.map(|s| s.to_string()),
+            gene_hgnc_id: hgnc_id.map(|s| s.to_string()),
+            source: None,
+            bam_edit_status: None,
+            has_non_polya_rna_edit: false,
+            spliced_seq: None,
+            cdna_seq: None,
+            version: None,
+            cds_start_nf: false,
+            cds_end_nf: false,
+            flags_str: None,
+            is_canonical: false,
+            tsl: None,
+            mane_select: None,
+            mane_plus_clinical: None,
+            translation_stable_id: None,
+            gene_phenotype: false,
+            ccds: None,
+            swissprot: None,
+            trembl: None,
+            uniparc: None,
+            uniprot_isoform: None,
+            appris: None,
+            ncrna_structure: None,
+        }
+    }
+
+    /// Issue #92 — SNORA75 (snoRNA, SYMBOL_SOURCE=RFAM): VEP leaves HGNC_ID
+    /// empty, vepyr was backfilling it.  With `hgnc_backfill=false` (default)
+    /// the symbol-based fallback must be skipped for non-HGNC-source transcripts.
+    #[test]
+    fn test_backfill_hgnc_rfam_source_suppressed_by_default() {
+        // Ensembl transcript with HGNC source carries the HGNC_ID.
+        let tx_hgnc = make_tx(
+            "ENST00000999999",
+            Some("SNORA75"),
+            Some("HGNC"),
+            Some("HGNC:32661"),
+        );
+        // RFAM snoRNA transcript — same gene symbol, no HGNC_ID.
+        let tx_rfam = make_tx("ENST00000391278", Some("SNORA75"), Some("RFAM"), None);
+
+        let mut transcripts = vec![tx_hgnc, tx_rfam];
+        let refseq_ids = vec![None, None];
+
+        // Default: hgnc_backfill = false → RFAM transcript stays empty.
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
+        assert_eq!(
+            transcripts[0].gene_hgnc_id.as_deref(),
+            Some("HGNC:32661"),
+            "HGNC-source transcript should keep its HGNC_ID"
+        );
+        assert_eq!(
+            transcripts[1].gene_hgnc_id, None,
+            "RFAM-source transcript should NOT get HGNC_ID when hgnc_backfill=false"
+        );
+    }
+
+    /// When `hgnc_backfill=true`, RFAM-source transcripts DO get the HGNC_ID
+    /// via the symbol fallback (the "improvement" behaviour from before issue #92).
+    #[test]
+    fn test_backfill_hgnc_rfam_source_filled_when_enabled() {
+        let tx_hgnc = make_tx(
+            "ENST00000999999",
+            Some("SNORA75"),
+            Some("HGNC"),
+            Some("HGNC:32661"),
+        );
+        let tx_rfam = make_tx("ENST00000391278", Some("SNORA75"), Some("RFAM"), None);
+
+        let mut transcripts = vec![tx_hgnc, tx_rfam];
+        let refseq_ids = vec![None, None];
+
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, true);
+        assert_eq!(
+            transcripts[1].gene_hgnc_id.as_deref(),
+            Some("HGNC:32661"),
+            "RFAM-source transcript SHOULD get HGNC_ID when hgnc_backfill=true"
+        );
+    }
+
+    /// Issue #92 — LINC03025 (lncRNA, SYMBOL_SOURCE absent): VEP leaves
+    /// HGNC_ID empty.  With `hgnc_backfill=false` the fallback must be skipped.
+    #[test]
+    fn test_backfill_hgnc_empty_source_suppressed_by_default() {
+        let tx_hgnc = make_tx(
+            "ENST00000888888",
+            Some("LINC03025"),
+            Some("HGNC"),
+            Some("HGNC:56158"),
+        );
+        // lncRNA transcript — same gene symbol, no symbol source, no HGNC_ID.
+        let tx_no_source = make_tx("ENST00000777777", Some("LINC03025"), None, None);
+
+        let mut transcripts = vec![tx_hgnc, tx_no_source];
+        let refseq_ids = vec![None, None];
+
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
+        assert_eq!(
+            transcripts[1].gene_hgnc_id, None,
+            "Transcript with no SYMBOL_SOURCE should NOT get HGNC_ID when hgnc_backfill=false"
+        );
+    }
+
+    /// HGNC-source transcripts still get backfilled even with `hgnc_backfill=false`.
+    #[test]
+    fn test_backfill_hgnc_source_always_filled() {
+        let tx_with = make_tx(
+            "ENST00000111111",
+            Some("BRCA1"),
+            Some("HGNC"),
+            Some("HGNC:1100"),
+        );
+        let tx_without = make_tx("ENST00000222222", Some("BRCA1"), Some("HGNC"), None);
+
+        let mut transcripts = vec![tx_with, tx_without];
+        let refseq_ids = vec![None, None];
+
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
+        assert_eq!(
+            transcripts[1].gene_hgnc_id.as_deref(),
+            Some("HGNC:1100"),
+            "HGNC-source transcript without HGNC_ID should still get backfilled"
+        );
+    }
+
+    /// EntrezGene-source transcripts are NOT backfilled with `hgnc_backfill=false`.
+    /// VEP derives HGNC_ID from the gene's display_xref; EntrezGene transcripts
+    /// may or may not carry it depending on the gene object, and the cache
+    /// reflects this accurately (LINC03025 has both HGNC and EntrezGene
+    /// transcripts with different HGNC_ID status).
+    #[test]
+    fn test_backfill_hgnc_entrezgene_source_not_filled_by_default() {
+        let tx_hgnc = make_tx(
+            "ENST00000619971",
+            Some("LINC03025"),
+            Some("HGNC"),
+            Some("HGNC:56158"),
+        );
+        let tx_entrez = make_tx(
+            "ENST00000414223",
+            Some("LINC03025"),
+            Some("EntrezGene"),
+            None,
+        );
+
+        let mut transcripts = vec![tx_hgnc, tx_entrez];
+        let refseq_ids = vec![None, None];
+
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
+        assert_eq!(
+            transcripts[1].gene_hgnc_id, None,
+            "EntrezGene-source transcript should NOT get HGNC_ID when hgnc_backfill=false"
+        );
+    }
+
+    /// RefSeq ID-based backfill still works regardless of `hgnc_backfill` flag.
+    #[test]
+    fn test_backfill_refseq_id_mapping_unaffected() {
+        // Ensembl transcript with refseq_id and HGNC_ID.
+        let tx_ensembl = make_tx(
+            "ENST00000333333",
+            Some("TP53"),
+            Some("HGNC"),
+            Some("HGNC:11998"),
+        );
+        // RefSeq transcript that should be linked via refseq_id.
+        let tx_refseq = make_tx("NM_000546", Some("TP53"), Some("EntrezGene"), None);
+
+        let mut transcripts = vec![tx_ensembl, tx_refseq];
+        let refseq_ids = vec![Some("NM_000546".to_string()), None];
+
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
+        assert_eq!(
+            transcripts[1].gene_hgnc_id.as_deref(),
+            Some("HGNC:11998"),
+            "RefSeq ID-based mapping should work regardless of hgnc_backfill flag"
+        );
     }
 }
