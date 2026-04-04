@@ -1243,6 +1243,8 @@ impl TranscriptConsequenceEngine {
         );
         let mut matched_regulatory = false;
         let mut seen_feature_ids: HashSet<&str> = HashSet::new();
+        let is_deletion =
+            variant.ref_allele.len() > variant.alt_allele.len() || variant.alt_allele == "-";
         for idx in regulatory_hits {
             let r = ctx.regulatory_index.features[idx];
             if !feature_overlaps(variant, r.start, r.end) {
@@ -1253,6 +1255,10 @@ impl TranscriptConsequenceEngine {
             }
             matched_regulatory = true;
             let mut terms: BTreeSet<SoTerm> = sv_terms.clone();
+            // VEP: feature_ablation requires complete_overlap_feature AND deletion.
+            if is_deletion && variant.start <= r.start && variant.end >= r.end {
+                terms.insert(SoTerm::RegulatoryRegionAblation);
+            }
             terms.insert(SoTerm::RegulatoryRegionVariant);
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
@@ -1807,10 +1813,25 @@ impl TranscriptConsequenceEngine {
         if self.overlaps_stop_codon(variant, tx) {
             if is_stop_codon(&variant.ref_allele) && is_stop_codon(&variant.alt_allele) {
                 terms.insert(SoTerm::StopRetainedVariant);
-            } else if !is_stop_codon(&variant.ref_allele) && is_stop_codon(&variant.alt_allele) {
-                terms.insert(SoTerm::StopGained);
             } else {
-                terms.insert(SoTerm::StopLost);
+                let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
+                let is_indel = ref_len != alt_len;
+                // Sequence-based check for indels: build mutated CDS last
+                // 3 bases and see if the stop codon is preserved. Mirrors
+                // the start codon logic at lines 1779-1789.
+                if is_indel && cds_seq.is_some_and(|s| s.len() >= 3) {
+                    let cds = cds_seq.unwrap();
+                    if mutated_cds_stop_preserved(cds, variant, tx) {
+                        terms.insert(SoTerm::StopRetainedVariant);
+                    } else {
+                        terms.insert(SoTerm::StopLost);
+                    }
+                } else if !is_stop_codon(&variant.ref_allele) && is_stop_codon(&variant.alt_allele)
+                {
+                    terms.insert(SoTerm::StopGained);
+                } else {
+                    terms.insert(SoTerm::StopLost);
+                }
             }
         }
     }
@@ -2691,6 +2712,73 @@ fn is_stop_codon(allele: &str) -> bool {
     )
 }
 
+/// Check if an indel near the stop codon preserves the stop codon in the
+/// mutated CDS. Builds a mutated CDS by applying the variant and checks
+/// if the last 3 bases still form a stop codon.
+///
+/// This mirrors `mutated_cds_first3` which checks start codon preservation.
+fn mutated_cds_stop_preserved(
+    cds_seq: &str,
+    variant: &VariantInput,
+    tx: &TranscriptFeature,
+) -> bool {
+    let cds_bytes = cds_seq.as_bytes();
+    let cds_start = tx.cds_start.unwrap_or(0);
+    let cds_end = tx.cds_end.unwrap_or(0);
+
+    let ref_allele = normalize_allele_seq(&variant.ref_allele);
+    let alt_allele = normalize_allele_seq(&variant.alt_allele);
+
+    // Map variant genomic position to CDS index
+    let var_start_genomic = if tx.strand >= 0 {
+        variant.start
+    } else {
+        variant.end
+    };
+
+    let cds_origin = if tx.strand >= 0 { cds_start } else { cds_end };
+    let cds_idx = if tx.strand >= 0 {
+        (var_start_genomic - cds_origin) as usize
+    } else {
+        (cds_origin - var_start_genomic) as usize
+    };
+
+    if cds_idx > cds_seq.len() {
+        return false;
+    }
+
+    // Build mutated CDS: replace ref with alt at cds_idx
+    let ref_len = ref_allele.len();
+    let end_idx = cds_idx.saturating_add(ref_len).min(cds_seq.len());
+
+    let mut mutated = Vec::with_capacity(cds_seq.len());
+    mutated.extend_from_slice(&cds_bytes[..cds_idx]);
+    if !alt_allele.is_empty() {
+        let alt_bytes = if tx.strand >= 0 {
+            alt_allele.to_ascii_uppercase().into_bytes()
+        } else {
+            reverse_complement(&alt_allele)
+                .unwrap_or_default()
+                .to_ascii_uppercase()
+                .into_bytes()
+        };
+        mutated.extend_from_slice(&alt_bytes);
+    }
+    if end_idx < cds_seq.len() {
+        mutated.extend_from_slice(&cds_bytes[end_idx..]);
+    }
+
+    // Check if last 3 bases of mutated CDS form a stop codon
+    if mutated.len() >= 3 {
+        let last3 = std::str::from_utf8(&mutated[mutated.len() - 3..])
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        is_stop_codon(&last3)
+    } else {
+        false
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct CodingClassification {
     synonymous: bool,
@@ -3379,6 +3467,22 @@ fn classify_insertion(
             if idx_diff == codon_diff {
                 class.stop_retained = true;
             }
+        }
+    }
+
+    // VEP ref_eq_alt_sequence: if the ref amino acid at the insertion
+    // codon matches the first amino acid of the alt translation at that
+    // position, and the alt translation contains a stop codon, VEP
+    // considers the stop as retained. This handles insertions that
+    // introduce a premature stop within the inserted sequence (e.g.
+    // L/LG*AX where the insertion creates an in-frame stop).
+    //
+    // Traceability: VariationEffect.pm line 1353:
+    // return 1 if ($ref_pep eq substr($alt_pep, 0, 1) && $alt_pep =~ /\*/)
+    if !class.stop_retained && codon_at < old_aas.len() {
+        let ref_aa = old_aas[codon_at];
+        if ref_aa != '*' && new_aas.get(codon_at) == Some(&ref_aa) && new_aas.contains(&'*') {
+            class.stop_retained = true;
         }
     }
 
