@@ -1859,9 +1859,14 @@ impl TranscriptConsequenceEngine {
     }
 
     /// Traceability:
-    /// - Ensembl Variation `TranscriptVariationAllele::start_lost()`
-    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L83-L120>
+    /// - Ensembl Variation `_overlaps_start_codon()`:
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L965-L985>
+    /// - cds_start_NF gate at line 975:
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L975>
     fn overlaps_start_codon(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
+        if tx.cds_start_nf {
+            return false;
+        }
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
             return false;
         };
