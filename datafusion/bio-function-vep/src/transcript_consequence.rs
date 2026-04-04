@@ -3101,7 +3101,7 @@ fn classify_coding_change(
             // change, and the variant must be near the stop codon (within
             // 3 codons upstream of the original stop position).
             let near_stop = end_idx >= stop_nt_start.saturating_sub(9) && start_idx <= stop_nt_end;
-            if near_stop && idx_diff == len_diff / 3 {
+            if near_stop && len_diff % 3 == 0 && idx_diff == len_diff / 3 {
                 class.stop_retained = true;
             }
         }
@@ -3480,7 +3480,7 @@ fn classify_insertion(
         // For insertions near the stop codon where the stop index shifts
         // by the inserted codon count: the stop codon itself is preserved
         // but the index moved due to inserted amino acids.
-        if !class.stop_retained && near_stop {
+        if !class.stop_retained && near_stop && alt_len.is_multiple_of(3) {
             let idx_diff = new_stop_idx as i64 - old_stop_idx as i64;
             let codon_diff = alt_len as i64 / 3;
             if idx_diff == codon_diff {
