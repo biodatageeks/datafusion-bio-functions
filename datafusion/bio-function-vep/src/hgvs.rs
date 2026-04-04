@@ -218,6 +218,19 @@ pub fn format_hgvsc(
         )
         .map(|(_, alt)| alt)?;
         apply_shifted_insertion_duplication(tx, &shifted_feature_alt, shift, &mut notation);
+        // If the dup range extends outside the transcript's genomic
+        // span (before first exon or after last exon), VEP keeps the
+        // original insertion notation. This happens when HGVS 3' shift
+        // pushes an insertion through a repeat past the transcript
+        // start/end. Intronic dups (between exons) are valid.
+        if notation.kind == "dup" {
+            let span_start = tx_exons.iter().map(|e| e.start).min().unwrap_or(0);
+            let span_end = tx_exons.iter().map(|e| e.end).max().unwrap_or(0);
+            if notation.start < span_start || notation.end > span_end {
+                notation =
+                    hgvs_variant_notation(&feature_ref, &feature_alt, variant_start, variant_end)?;
+            }
+        }
     }
     if notation.kind != "dup" {
         clip_alleles(&mut notation, tx.strand);
@@ -1410,6 +1423,27 @@ fn try_peptide_dup_at(
         notation.kind = "dup".to_string();
         notation.end = check_start.saturating_sub(1);
         notation.start = check_start.saturating_sub(alt_len);
+
+        // 3' walk: slide the dup window rightward through identical
+        // residues to reach the 3'-most position per HGVS nomenclature.
+        //
+        // Traceability: VEP's `_check_for_peptide_duplication()` performs
+        // this walk internally; vepyr's original code only found the
+        // leftmost (5') match.
+        // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2410
+        let ref_chars: Vec<char> = ref_translation.chars().collect();
+        while notation.end < ref_chars.len() {
+            let first = ref_chars.get(notation.start.wrapping_sub(1)).copied();
+            let next = ref_chars.get(notation.end).copied();
+            match (first, next) {
+                (Some(f), Some(n)) if f == n => {
+                    notation.start += 1;
+                    notation.end += 1;
+                }
+                _ => break,
+            }
+        }
+
         true
     } else {
         false
@@ -1985,9 +2019,10 @@ mod tests {
             start_lost: false,
             stop_lost: false,
         };
+        // 3' walk shifts dup from Ala2 to Ala3 (rightmost A in "MAA*")
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
-            Some("ENSPHGVS000001.1:p.Ala2dup".to_string())
+            Some("ENSPHGVS000001.1:p.Ala3dup".to_string())
         );
     }
 
@@ -2844,11 +2879,12 @@ mod tests {
         };
         // ref = "MAKLKL*". At start=5: test_new_start = 5-2-1 = 2.
         // upstream = ref[..4] = "MAKL". upstream[2..4] = "KL". Match!
+        // 3' walk shifts KL(3-4) → KL(5-6) (rightmost repeat)
         let result = check_for_peptide_duplication(&mut notation, "MAKLKL*");
         assert!(result);
         assert_eq!(notation.kind, "dup");
-        assert_eq!(notation.start, 3); // 5 - 2
-        assert_eq!(notation.end, 4); // 5 - 1
+        assert_eq!(notation.start, 5);
+        assert_eq!(notation.end, 6);
     }
 
     // ---------------------------------------------------------------
@@ -3079,5 +3115,156 @@ mod tests {
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ala2Ter".into())
         );
+    }
+
+    // ── try_peptide_dup_at 3' shift tests (issue #89) ───────────────────
+
+    #[test]
+    fn peptide_dup_single_residue_shifts_3prime() {
+        // Ref: MAAAEEEEK — E at positions 5,6,7,8 (1-based)
+        // Insert "E" at check_start=6 → upstream="MAAAE"
+        // test_new_start = 6-1-1 = 4, test_seq = upstream[4..5] = "E" ✓
+        // Initial dup at start=5, end=5
+        // 3' walk: E(5)==E(6)→6,6; E(6)==E(7)→7,7; E(7)==E(8)→8,8; E(8)==K(9)→stop
+        let mut notation = ProteinHgvsNotation {
+            start: 6,
+            end: 6,
+            ref_allele: String::new(),
+            alt_allele: "E".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "ins".into(),
+        };
+        let result = try_peptide_dup_at(&mut notation, "MAAAEEEEK", 6);
+        assert!(result);
+        assert_eq!(notation.kind, "dup");
+        assert_eq!(notation.start, 8);
+        assert_eq!(notation.end, 8);
+    }
+
+    #[test]
+    fn peptide_dup_single_residue_no_shift_needed() {
+        // Ref: MAEK — E at position 3 only, followed by K
+        // check_start=4: upstream="MAE", test_new_start=4-1-1=2, test_seq="E" ✓
+        // Initial dup at start=3, end=3
+        // 3' walk: E(3)==K(4)→stop
+        let mut notation = ProteinHgvsNotation {
+            start: 4,
+            end: 4,
+            ref_allele: String::new(),
+            alt_allele: "E".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "ins".into(),
+        };
+        let result = try_peptide_dup_at(&mut notation, "MAEK", 4);
+        assert!(result);
+        assert_eq!(notation.kind, "dup");
+        assert_eq!(notation.start, 3);
+        assert_eq!(notation.end, 3);
+    }
+
+    #[test]
+    fn peptide_dup_multi_residue_shifts_3prime() {
+        // Ref: MPAPAPAD — "PA" repeats at 2-3, 4-5, 6-7
+        // Insert "PA" at check_start=4: upstream="MPA"
+        // test_new_start = 4-2-1 = 1, test_seq = upstream[1..3] = "PA" ✓
+        // Initial dup at start=2, end=3
+        // 3' walk: P(2)==P(4)→3,4; A(3)==A(5)→4,5; P(4)==P(6)→5,6; A(5)==A(7)→6,7; P(6)==D(8)→stop
+        let mut notation = ProteinHgvsNotation {
+            start: 4,
+            end: 5,
+            ref_allele: String::new(),
+            alt_allele: "PA".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "ins".into(),
+        };
+        let result = try_peptide_dup_at(&mut notation, "MPAPAPAD", 4);
+        assert!(result);
+        assert_eq!(notation.kind, "dup");
+        assert_eq!(notation.start, 6);
+        assert_eq!(notation.end, 7);
+    }
+
+    #[test]
+    fn peptide_dup_shift_stops_at_ref_end() {
+        // Ref: MAAEE — E at positions 4,5
+        // check_start=5: upstream="MAAE", test_new_start=5-1-1=3, test_seq="E" ✓
+        // Initial dup at start=4, end=4
+        // 3' walk: E(4)==E(5)→5,5; E(5)==? (end of ref)→stop
+        let mut notation = ProteinHgvsNotation {
+            start: 5,
+            end: 5,
+            ref_allele: String::new(),
+            alt_allele: "E".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "ins".into(),
+        };
+        let result = try_peptide_dup_at(&mut notation, "MAAEE", 5);
+        assert!(result);
+        assert_eq!(notation.kind, "dup");
+        assert_eq!(notation.start, 5);
+        assert_eq!(notation.end, 5);
+    }
+
+    #[test]
+    fn peptide_dup_issue89_example_glu25_to_glu28() {
+        // Issue #89 example: p.Glu25dup → p.Glu28dup (shift +3)
+        // Ref has E at positions 25,26,27,28 then K at 29.
+        let mut ref_translation = "M".repeat(24);
+        ref_translation.push_str("EEEEK"); // pos 25-28: E, 29: K
+        // check_start=26: upstream includes pos 25 (E), test confirms dup at 25
+        // 3' walk: E(25)==E(26)→26; E(26)==E(27)→27; E(27)==E(28)→28; E(28)==K(29)→stop
+        let mut notation = ProteinHgvsNotation {
+            start: 26,
+            end: 26,
+            ref_allele: String::new(),
+            alt_allele: "E".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "ins".into(),
+        };
+        let result = try_peptide_dup_at(&mut notation, &ref_translation, 26);
+        assert!(result);
+        assert_eq!(notation.kind, "dup");
+        assert_eq!(notation.start, 28);
+        assert_eq!(notation.end, 28);
+    }
+
+    #[test]
+    fn peptide_dup_via_check_for_peptide_duplication() {
+        // Test the full check_for_peptide_duplication flow with 3' shift.
+        // Ref: MAAAEEEEK — E at 5,6,7,8
+        // Insertion "E" at position 6 → dup detected and 3' shifted to 8.
+        let mut notation = ProteinHgvsNotation {
+            start: 6,
+            end: 6,
+            ref_allele: String::new(),
+            alt_allele: "E".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "ins".into(),
+        };
+        let result = check_for_peptide_duplication(&mut notation, "MAAAEEEEK");
+        assert!(result);
+        assert_eq!(notation.kind, "dup");
+        assert_eq!(notation.start, 8);
+        assert_eq!(notation.end, 8);
+    }
+
+    // ── HGVSc dup boundary revert tests (issue #88 remaining) ──────────
+
+    #[test]
+    fn dup_range_before_transcript_span_is_detected() {
+        let exon = make_exon(); // 90..140
+        let exons = vec![&exon];
+        let span_start = exons.iter().map(|e| e.start).min().unwrap();
+        let span_end = exons.iter().map(|e| e.end).max().unwrap();
+        // Dup range 85..89 is before exon span start 90
+        assert!(85 < span_start);
+        // Dup range 95..100 is within exon span
+        assert!(95 >= span_start && 100 <= span_end);
     }
 }
