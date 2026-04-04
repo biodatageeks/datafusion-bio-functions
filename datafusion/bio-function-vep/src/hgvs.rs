@@ -1444,6 +1444,12 @@ fn try_peptide_dup_at(
             }
         }
 
+        // Update alt_allele to the amino acids at the shifted positions
+        // so that format_hgvsp_notation shows the correct residue names.
+        if let Some(slice) = ref_chars.get(notation.start.wrapping_sub(1)..notation.end) {
+            notation.alt_allele = slice.iter().collect();
+        }
+
         true
     } else {
         false
