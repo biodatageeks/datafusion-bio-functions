@@ -2922,26 +2922,31 @@ fn classify_coding_change(
     let new_aas = translate_protein_from_cds(&mutated)?;
     let mut class = CodingClassification::default();
 
-    // Start codon logic: only fire when old AA is Met. For cds_start_NF
-    // transcripts (first AA != Met), VEP's _overlaps_start_codon returns 0
-    // early, skipping start_lost/start_retained entirely. The
-    // old_aas.first() == 'M' guard mirrors this behavior.
+    // Start codon logic: gate on cds_start_nf flag. VEP's
+    // _overlaps_start_codon returns 0 for cds_start_NF transcripts,
+    // blocking both start_lost and start_retained_variant.
     //
-    // start_lost and start_retained are mutually exclusive in VEP:
-    // start_retained returns !_ins_del_start_altered() (or !_snp_start_altered
-    // for SNPs), while start_lost requires the start to be altered.
+    // start_lost and start_retained CAN co-fire for the same allele:
+    // - start_retained = !_snp_start_altered(): checks if mutated codon
+    //   is ATG (nucleotide-level). Fires when new AA is Met.
+    // - start_lost: peptide-level check at translation_start==1. Fires
+    //   when AA at position 1 changed (even if new codon is ATG).
+    // Example: V→M at non-standard start codon (GTG→ATG) fires both.
     //
     // Traceability:
     // - _overlaps_start_codon cds_start_NF gate:
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L975>
-    // - start_lost predicate:
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L851>
-    // - start_retained_variant predicate:
-    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L947>
-    if start_idx < 3 && old_aas.first() == Some(&'M') {
+    // - start_lost peptide check:
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L872-L882>
+    // - _snp_start_altered (checks mutated codon == "ATG"):
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L992-L1026>
+    // - start_retained_variant = !_snp_start_altered for SNPs:
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L958>
+    if start_idx < 3 && !tx.cds_start_nf {
         if new_aas.first() == Some(&'M') {
             class.start_retained = true;
-        } else {
+        }
+        if old_aas.first() != new_aas.first() {
             class.start_lost = true;
         }
     }
@@ -3303,10 +3308,11 @@ fn classify_insertion(
     // Traceability:
     // - _overlaps_start_codon overlap gate:
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L965-L985>
-    if cds_idx < 2 && old_aas.first() == Some(&'M') {
+    if cds_idx < 2 && !tx.cds_start_nf {
         if new_aas.first() == Some(&'M') {
             class.start_retained = true;
-        } else {
+        }
+        if old_aas.first() != new_aas.first() {
             class.start_lost = true;
         }
     }
@@ -8279,51 +8285,112 @@ mod tests {
         );
     }
 
-    // ---- C2b: cds_start_NF transcripts — VEP skips start codon logic ----
-    // VEP's _overlaps_start_codon (VariationEffect.pm:975) returns 0 early
-    // for cds_start_NF transcripts. Our proxy: old_aas.first() != 'M' means
-    // we skip start_lost/start_retained entirely, matching VEP behavior.
+    // ---- C2b: non-standard start codons — start_lost and start_retained co-fire ----
+    // For transcripts WITHOUT cds_start_NF that have a non-Met first AA
+    // (non-standard start codon like GTG or ATT), VEP's start_lost and
+    // start_retained can co-fire: start_lost because the AA changed
+    // (peptide-level), start_retained because the new codon is ATG
+    // (nucleotide-level via _snp_start_altered).
+
+    /// Helper: classify_snv but with cds_start_nf flag set on the transcript.
+    fn classify_snv_cds_start_nf(
+        cds_seq: &str,
+        variant_pos: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+    ) -> Option<CodingClassification> {
+        let cds_len = cds_seq.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let mut t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        t.cds_start_nf = true;
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
+        let v = var("22", variant_pos, variant_pos, ref_allele, alt_allele);
+        classify_coding_change(&t, &exons_ref, Some(&tr), &v)
+    }
 
     #[test]
-    fn snv_at_position1_non_met_start_no_start_terms() {
+    fn snv_val_to_met_at_position1_emits_start_lost_and_retained() {
         // Issue #84, C2b: chr11:124214755 G>A, AA=V/M
-        // cds_start_NF transcript — first AA is Val, not Met.
-        // VEP skips start codon logic entirely for cds_start_NF.
+        // Non-standard start codon (GTG), transcript does NOT have cds_start_NF.
+        // VEP: start_lost (AA changed) & start_retained (new codon is ATG).
         //
         // CDS: GTG GCT GAA TGA (Val Ala Glu Stop)
         // SNV at pos 1000 (cds_idx=0): G→A changes GTG→ATG (Val→Met)
         let cds = "GTGGCTGAATGA";
         let c = classify_snv(cds, 1000, "G", "A").unwrap();
         assert!(
-            !c.start_lost,
-            "cds_start_NF (non-Met start): should NOT emit start_lost"
+            c.start_lost,
+            "V→M at position 1: should emit start_lost (AA changed)"
         );
         assert!(
-            !c.start_retained,
-            "cds_start_NF (non-Met start): should NOT emit start_retained"
+            c.start_retained,
+            "V→M at position 1: should emit start_retained (new codon is ATG)"
         );
-        assert!(c.missense, "Should classify as missense_variant instead");
     }
 
     #[test]
-    fn snv_at_position1_ile_to_met_no_start_terms() {
+    fn snv_ile_to_met_at_position1_emits_start_lost_and_retained() {
         // Issue #84, C2b: chr14:94366696 T>C, AA=I/M
-        // cds_start_NF transcript — first AA is Ile, not Met.
-        // VEP skips start codon logic entirely.
+        // Non-standard start codon (ATT), transcript does NOT have cds_start_NF.
+        // VEP: start_lost & start_retained (HIGH impact).
         //
         // CDS: ATT GCT GAA TGA (Ile Ala Glu Stop)
         // SNV at pos 1002 (cds_idx=2): T→G changes ATT→ATG (Ile→Met)
         let cds = "ATTGCTGAATGA";
         let c = classify_snv(cds, 1002, "T", "G").unwrap();
         assert!(
-            !c.start_lost,
-            "cds_start_NF (Ile start): should NOT emit start_lost"
+            c.start_lost,
+            "I→M at position 1: should emit start_lost (AA changed)"
         );
         assert!(
-            !c.start_retained,
-            "cds_start_NF (Ile start): should NOT emit start_retained"
+            c.start_retained,
+            "I→M at position 1: should emit start_retained (new codon is ATG)"
         );
-        assert!(c.missense, "Should classify as missense_variant instead");
+    }
+
+    #[test]
+    fn snv_val_to_leu_at_position1_emits_start_lost_only() {
+        // Non-standard start codon, V→L: start_lost (AA changed),
+        // no start_retained (new codon is not ATG).
+        //
+        // CDS: GTG GCT GAA TGA. SNV at pos 1000: G→C (GTG→CTG, Val→Leu)
+        let cds = "GTGGCTGAATGA";
+        let c = classify_snv(cds, 1000, "G", "C").unwrap();
+        assert!(c.start_lost, "V→L at position 1: should emit start_lost");
+        assert!(
+            !c.start_retained,
+            "V→L at position 1: new codon is not ATG, no start_retained"
+        );
+    }
+
+    #[test]
+    fn cds_start_nf_val_to_met_skips_start_codon_logic() {
+        // cds_start_NF transcript: VEP's _overlaps_start_codon returns 0,
+        // so neither start_lost nor start_retained fires.
+        //
+        // CDS: GTG GCT GAA TGA. SNV at pos 1000: G→A (GTG→ATG, Val→Met)
+        let cds = "GTGGCTGAATGA";
+        let c = classify_snv_cds_start_nf(cds, 1000, "G", "A").unwrap();
+        assert!(!c.start_lost, "cds_start_NF: should NOT emit start_lost");
+        assert!(
+            !c.start_retained,
+            "cds_start_NF: should NOT emit start_retained"
+        );
+        assert!(
+            c.missense,
+            "cds_start_NF: should classify as missense_variant"
+        );
     }
 
     // ---- C2a: deletion at start codon should NOT co-emit start_retained ----
