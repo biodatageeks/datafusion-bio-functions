@@ -1764,22 +1764,10 @@ impl TranscriptConsequenceEngine {
                     // Build a simple mutated CDS by applying the indel
                     // at the variant's position relative to CDS start.
                     let mutated_first3 = mutated_cds_first3(cds, variant, tx, cds_start);
-                    // Check if the deletion is at the CDS start boundary.
-                    // VEP uses full transcript context (including UTR) for its
-                    // mutation, so a boundary deletion might preserve ATG via
-                    // UTR base sliding in. Emit both terms.
-                    let at_cds_start_boundary = if tx.strand >= 0 {
-                        variant.start <= tx.cds_start.unwrap_or(0)
-                    } else {
-                        variant.end >= tx.cds_end.unwrap_or(0)
-                    };
                     if mutated_first3.as_deref() == Some("ATG") {
                         terms.insert(SoTerm::StartRetainedVariant);
                     } else {
                         terms.insert(SoTerm::StartLost);
-                        if ref_len > alt_len && at_cds_start_boundary {
-                            terms.insert(SoTerm::StartRetainedVariant);
-                        }
                     }
                 } else if is_indel {
                     // No CDS sequence: fall back to position-based check.
@@ -2927,17 +2915,19 @@ fn classify_coding_change(
     let new_aas = translate_protein_from_cds(&mutated)?;
     let mut class = CodingClassification::default();
 
-    if start_idx < 3 && old_aas.first() == Some(&'M') {
-        if new_aas.first() == Some(&'M') {
-            class.start_retained = true;
+    if start_idx < 3 {
+        if old_aas.first() == Some(&'M') {
+            if new_aas.first() == Some(&'M') {
+                class.start_retained = true;
+            } else {
+                class.start_lost = true;
+            }
         } else {
+            // cds_start_NF transcripts: the annotated first AA is not Met.
+            // VEP still evaluates start codon consequences based on position
+            // overlap, not amino acid identity (VariationEffect.pm:851).
             class.start_lost = true;
-            // VEP constructs the mutated CDS from the full transcript
-            // (including UTR context). A deletion at CDS index 0 allows
-            // the 5'UTR base to "slide in", potentially preserving ATG.
-            // Since we lack UTR context, emit both start_lost and
-            // start_retained for boundary deletions (start_idx == 0).
-            if start_idx == 0 && ref_len > alt_len {
+            if new_aas.first() == Some(&'M') {
                 class.start_retained = true;
             }
         }
@@ -3292,8 +3282,10 @@ fn classify_insertion(
         class.protein_position_end = Some(pep_a);
     }
 
-    // Start codon check
-    if cds_idx < 3 && old_aas.first() == Some(&'M') {
+    // Start codon check — use cds_idx < 2 because an insertion anchored
+    // at position 2 (0-based last base of codon 1) inserts AFTER the start
+    // codon and does not overlap it per VEP's _overlaps_start_codon gate.
+    if cds_idx < 2 && old_aas.first() == Some(&'M') {
         if new_aas.first() == Some(&'M') {
             class.start_retained = true;
         } else {
@@ -8213,16 +8205,141 @@ mod tests {
         let mut terms = BTreeSet::new();
         if engine.overlaps_start_codon(&v, &t) {
             engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, None);
-            // Boundary deletion touching start codon should emit start_lost.
+            // Boundary deletion touching start codon should emit start_lost
+            // only — VEP does not co-emit start_retained for boundary
+            // deletions (verified against GIAB HG002 benchmark).
             assert!(
                 terms.contains(&SoTerm::StartLost),
                 "Boundary deletion should emit start_lost. Got: {:?}",
                 terms
             );
-            // Additionally, for boundary deletions at CDS start, start_retained
-            // may also be emitted (VEP co-emits both when UTR context could
-            // preserve ATG via base sliding).
+            assert!(
+                !terms.contains(&SoTerm::StartRetainedVariant),
+                "Boundary deletion should NOT emit start_retained. Got: {:?}",
+                terms
+            );
         }
+    }
+
+    // ---- C2a: insertion at codon-1 boundary must NOT emit start_retained ----
+
+    #[test]
+    fn insertion_after_start_codon_no_start_retained() {
+        // Issue #84, C2a example: chr2:26254257 G>GACT
+        // CDS_pos=3 → cds_idx=2 (0-based). Insertion is AFTER the last
+        // nucleotide of codon 1. VEP's _overlaps_start_codon does not
+        // fire for this position → no start_retained_variant.
+        //
+        // CDS: ATG GCT GAA TGA (12 bases). Insert "ACT" after pos 1002
+        // (cds_idx=2, boundary of codon 1). Met is preserved in
+        // translation, but VEP does not check start codon at this position.
+        let cds = "ATGGCTGAATGA";
+        let c = classify_ins(cds, 1003, "ACT").unwrap();
+        assert!(
+            !c.start_retained,
+            "Insertion at cds_idx=2 (after start codon) should NOT set start_retained"
+        );
+        assert!(
+            !c.start_lost,
+            "Insertion at cds_idx=2 (after start codon) should NOT set start_lost"
+        );
+    }
+
+    #[test]
+    fn insertion_within_start_codon_sets_start_retained() {
+        // Insertion within start codon (cds_idx=0 or 1) should still fire.
+        // CDS: ATG GCT GAA TGA. Insert "AAA" after pos 1001 (cds_idx=1).
+        // This disrupts the start codon.
+        let cds = "ATGGCTGAATGA";
+        let c = classify_ins(cds, 1002, "AAA").unwrap();
+        // Insertion at cds_idx=1 is within start codon — should evaluate
+        // start codon consequences. The inserted bases shift the codon,
+        // so start_lost should fire.
+        assert!(
+            c.start_lost || c.start_retained,
+            "Insertion at cds_idx=1 (within start codon) should trigger start codon logic"
+        );
+    }
+
+    // ---- C2b: cds_start_NF transcripts — start codon logic by position ----
+
+    #[test]
+    fn snv_at_position1_non_met_start_emits_start_lost() {
+        // Issue #84, C2b example: chr11:124214755 G>A, AA=V/M
+        // Transcript has cds_start_NF — first AA is Val, not Met.
+        // VEP assigns start_lost (position-based) even though old AA != M.
+        //
+        // CDS: GTG GCT GAA TGA (Val Ala Glu Stop)
+        // SNV at pos 1000 (cds_idx=0): G→A changes GTG→ATG (Val→Met)
+        let cds = "GTGGCTGAATGA";
+        let c = classify_snv(cds, 1000, "G", "A").unwrap();
+        assert!(
+            c.start_lost,
+            "SNV at position 1 with non-Met start (cds_start_NF) should emit start_lost"
+        );
+        assert!(
+            c.start_retained,
+            "SNV creating Met at position 1 should also emit start_retained"
+        );
+    }
+
+    #[test]
+    fn snv_at_position1_non_met_to_non_met_emits_start_lost_only() {
+        // cds_start_NF transcript: first AA is Val, SNV changes to Leu (not Met).
+        // VEP: start_lost only (no start_retained since new AA is not Met).
+        //
+        // CDS: GTG GCT GAA TGA (Val Ala Glu Stop)
+        // SNV at pos 1002 (cds_idx=2): G→T changes GTG→GTT (Val→Val, synonymous
+        // at the amino acid level but still in start codon region).
+        // Better example: GTG→CTG (Val→Leu)
+        let cds = "GTGGCTGAATGA";
+        let c = classify_snv(cds, 1000, "G", "C").unwrap();
+        assert!(
+            c.start_lost,
+            "SNV at position 1 with non-Met start should emit start_lost"
+        );
+        assert!(
+            !c.start_retained,
+            "SNV not creating Met at position 1 should NOT emit start_retained"
+        );
+    }
+
+    #[test]
+    fn snv_at_position1_ile_to_met_emits_start_lost_and_retained() {
+        // Issue #84, C2b example: chr14:94366696 T>C, AA=I/M
+        // CDS: ATT GCT GAA TGA (Ile Ala Glu Stop)
+        // SNV at pos 1002 (cds_idx=2): T→G changes ATT→ATG (Ile→Met)
+        let cds = "ATTGCTGAATGA";
+        let c = classify_snv(cds, 1002, "T", "G").unwrap();
+        assert!(
+            c.start_lost,
+            "SNV at position 1 with Ile start (cds_start_NF) should emit start_lost"
+        );
+        assert!(
+            c.start_retained,
+            "SNV creating Met at position 1 should also emit start_retained"
+        );
+    }
+
+    // ---- C2a: deletion at start codon should NOT co-emit start_retained ----
+
+    #[test]
+    fn deletion_at_start_codon_no_extra_start_retained() {
+        // Issue #84, C2a example: chr12:56686880 CAT>C
+        // CDS_pos=1-2, frameshift at start codon.
+        // VEP: frameshift_variant&start_lost (no start_retained)
+        //
+        // CDS: ATG GCT GAA TGA. Delete "TG" at pos 1001-1002 (cds_idx=1-2).
+        let cds = "ATGGCTGAATGA";
+        let c = classify_deletion(cds, 1001, 1002, "TG").unwrap();
+        assert!(
+            c.start_lost,
+            "Deletion disrupting start codon should emit start_lost"
+        );
+        assert!(
+            !c.start_retained,
+            "Deletion disrupting start codon should NOT co-emit start_retained"
+        );
     }
 
     // ---------------------------------------------------------------
