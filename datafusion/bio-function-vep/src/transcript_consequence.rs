@@ -1155,6 +1155,8 @@ impl TranscriptConsequenceEngine {
 
         // Emit one CSQ entry per overlapping regulatory feature (matching VEP behavior).
         let mut seen_feature_ids: HashSet<&str> = HashSet::new();
+        let is_deletion =
+            variant.ref_allele.len() > variant.alt_allele.len() || variant.alt_allele == "-";
         for r in regulatory {
             if normalize_chrom(&r.chrom) != chrom || !feature_overlaps(variant, r.start, r.end) {
                 continue;
@@ -1163,6 +1165,13 @@ impl TranscriptConsequenceEngine {
                 continue;
             }
             let mut terms: BTreeSet<SoTerm> = sv_terms.clone();
+            // VEP: feature_ablation requires complete_overlap_feature
+            // (variant fully encompasses the feature) AND deletion.
+            // Traceability:
+            // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L323
+            if is_deletion && variant.start <= r.start && variant.end >= r.end {
+                terms.insert(SoTerm::RegulatoryRegionAblation);
+            }
             terms.insert(SoTerm::RegulatoryRegionVariant);
             let mut ordered: Vec<SoTerm> = terms.into_iter().collect();
             ordered.sort_by_key(|t| t.rank());
@@ -1669,11 +1678,13 @@ impl TranscriptConsequenceEngine {
                         terms.insert(SoTerm::InframeDeletion);
                     }
                 }
-                // VEP does not emit stop_gained/stop_lost alongside
-                // frameshift_variant or inframe indels — the primary
-                // indel consequence already describes the event.
-                if terms.contains(&SoTerm::FrameshiftVariant)
-                    || terms.contains(&SoTerm::InframeDeletion)
+                // VEP evaluates each consequence predicate independently.
+                // stop_lost CAN co-occur with frameshift_variant (when the
+                // frameshift extends past the original stop codon).
+                // Only suppress stop_gained/stop_lost for inframe indels
+                // where the primary indel consequence already describes the
+                // event.
+                if terms.contains(&SoTerm::InframeDeletion)
                     || terms.contains(&SoTerm::InframeInsertion)
                 {
                     classification.stop_gained = false;
@@ -2969,6 +2980,24 @@ fn classify_coding_change(
         {
             class.stop_retained = true;
         }
+        // For indels where the stop index shifted by exactly the indel
+        // length (in codons): the stop codon itself is preserved but
+        // moved due to the length change. VEP calls this stop_retained
+        // when the variant is near the stop codon region.
+        //
+        // Traceability: VEP's `stop_retained` for indels uses
+        // `_overlaps_stop_codon && !_ins_del_stop_altered`.
+        if !class.stop_retained && ref_len != alt_len {
+            let len_diff = alt_len as i64 - ref_len as i64;
+            let idx_diff = new_stop_idx as i64 - old_stop_idx as i64;
+            // The stop index shift should match the codon-level length
+            // change, and the variant must be near the stop codon (within
+            // 3 codons upstream of the original stop position).
+            let near_stop = end_idx >= stop_nt_start.saturating_sub(9) && start_idx <= stop_nt_end;
+            if near_stop && idx_diff == len_diff / 3 {
+                class.stop_retained = true;
+            }
+        }
     }
 
     let frameshift = !ref_len.abs_diff(alt_len).is_multiple_of(3);
@@ -3015,6 +3044,10 @@ fn classify_coding_change(
                     class.stop_gained = true;
                 } else if old_aa == '*' && new_aa != '*' {
                     class.stop_lost = true;
+                } else if old_aa == '*' && new_aa == '*' && !class.stop_retained {
+                    // SNV in stop codon that preserves the stop (e.g. TGA→TAA).
+                    // VEP: stop_retained_variant, not synonymous_variant.
+                    class.stop_retained = true;
                 }
             }
         }
@@ -3330,13 +3363,20 @@ fn classify_insertion(
     let old_stop = old_aas.iter().position(|aa| *aa == '*');
     let new_stop = new_aas.iter().position(|aa| *aa == '*');
     if let (Some(old_stop_idx), Some(new_stop_idx)) = (old_stop, new_stop) {
-        if old_stop_idx == new_stop_idx {
-            // The insertion is near the stop codon but stop position is preserved.
-            let stop_nt_start = old_stop_idx.saturating_mul(3);
-            let stop_nt_end = stop_nt_start.saturating_add(2);
-            if ranges_overlap_usize(ins_point, ins_point, stop_nt_start, stop_nt_end)
-                || (ins_point <= stop_nt_end && ins_point >= stop_nt_start.saturating_sub(3))
-            {
+        let stop_nt_start = old_stop_idx.saturating_mul(3);
+        let stop_nt_end = stop_nt_start.saturating_add(2);
+        let near_stop = ranges_overlap_usize(ins_point, ins_point, stop_nt_start, stop_nt_end)
+            || (ins_point <= stop_nt_end && ins_point >= stop_nt_start.saturating_sub(3));
+        if old_stop_idx == new_stop_idx && near_stop {
+            class.stop_retained = true;
+        }
+        // For insertions near the stop codon where the stop index shifts
+        // by the inserted codon count: the stop codon itself is preserved
+        // but the index moved due to inserted amino acids.
+        if !class.stop_retained && near_stop {
+            let idx_diff = new_stop_idx as i64 - old_stop_idx as i64;
+            let codon_diff = alt_len as i64 / 3;
+            if idx_diff == codon_diff {
                 class.stop_retained = true;
             }
         }
@@ -8927,6 +8967,78 @@ mod tests {
         assert_eq!(
             raw_cdna_position_from_genomic(&t, &refs, 401),
             Some("203".to_string())
+        );
+    }
+
+    // ── Issue #90 sub-pattern D: stop codon SNV → stop_retained ─────────
+
+    #[test]
+    fn stop_codon_snv_tga_to_taa_is_stop_retained() {
+        // Sub-pattern D: TGA→TAA (both stop codons) should be
+        // stop_retained_variant, not synonymous_variant.
+        // CDS: ATG GCT TGA (M A *) — change G→A at index 7 (pos 1007)
+        // TGA→TAA: both translate to * → stop_retained
+        let cds = "ATGGCTTGA";
+        let c = classify_snv(cds, 1007, "G", "A").unwrap();
+        assert!(
+            c.stop_retained,
+            "TGA→TAA should set stop_retained. Got: {:?}",
+            c
+        );
+        assert!(
+            !c.synonymous,
+            "TGA→TAA should NOT be synonymous. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn stop_codon_snv_taa_to_tag_is_stop_retained() {
+        // TAA→TAG: both stop codons → stop_retained
+        // CDS: ATG GCT TAA (M A *) — change second A→G at index 8 (pos 1008)
+        let cds = "ATGGCTTAA";
+        let c = classify_snv(cds, 1008, "A", "G").unwrap();
+        assert!(
+            c.stop_retained,
+            "TAA→TAG should set stop_retained. Got: {:?}",
+            c
+        );
+        assert!(!c.synonymous);
+    }
+
+    // ── Issue #90 sub-pattern A: deletion stop_retained with shifted index ──
+
+    #[test]
+    fn deletion_spanning_stop_region_with_shifted_index_is_stop_retained() {
+        // Sub-pattern A: deletion that removes bases near the stop codon
+        // but preserves the stop itself. The stop index shifts by the
+        // deletion length (in codons), but VEP calls stop_retained.
+        // CDS: ATG GCT AAA TGA (M A K *) — 12 bases
+        // Delete "AAA" at positions 1006-1008 (CDS indices 6-8)
+        // Mutated: ATG GCT TGA (M A *) — stop shifts from idx 3 to idx 2
+        // Indel is 3 bases (1 codon), idx_diff = 2-3 = -1 = -(3/3) ✓
+        let cds = "ATGGCTAAATGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        let v = var("22", 1006, 1008, "AAA", "-");
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v).unwrap();
+        assert!(
+            c.stop_retained,
+            "Deletion near stop with shifted index should be stop_retained. Got: stop_retained={}, stop_lost={}",
+            c.stop_retained, c.stop_lost
         );
     }
 }
