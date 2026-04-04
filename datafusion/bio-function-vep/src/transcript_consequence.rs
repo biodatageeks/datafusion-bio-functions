@@ -1701,7 +1701,7 @@ impl TranscriptConsequenceEngine {
                 return Some(classification);
             } else {
                 let cds = tx_translation.and_then(|t| t.cds_sequence.as_deref());
-                self.add_start_stop_heuristic_terms(terms, variant, tx, cds);
+                self.add_start_stop_heuristic_terms(terms, variant, tx, tx_exons, cds);
                 terms.insert(SoTerm::ProteinAlteringVariant);
                 if extends_into_utr {
                     return partial_coding_overlap_classification(tx, tx_exons, variant);
@@ -1737,7 +1737,7 @@ impl TranscriptConsequenceEngine {
         // (position + allele pattern based) but do NOT guess
         // missense/synonymous without codon evidence.
         let cds = tx_translation.and_then(|t| t.cds_sequence.as_deref());
-        self.add_start_stop_heuristic_terms(terms, variant, tx, cds);
+        self.add_start_stop_heuristic_terms(terms, variant, tx, tx_exons, cds);
 
         // Detect premature stop gain from allele pattern (in-frame
         // substitution where alt is a stop codon but ref is not).
@@ -1763,6 +1763,7 @@ impl TranscriptConsequenceEngine {
         terms: &mut BTreeSet<SoTerm>,
         variant: &VariantInput,
         tx: &TranscriptFeature,
+        tx_exons: &[&ExonFeature],
         cds_seq: Option<&str>,
     ) {
         if self.overlaps_start_codon(variant, tx) {
@@ -1821,7 +1822,7 @@ impl TranscriptConsequenceEngine {
                 // the start codon logic at lines 1779-1789.
                 if is_indel && cds_seq.is_some_and(|s| s.len() >= 3) {
                     let cds = cds_seq.unwrap();
-                    if mutated_cds_stop_preserved(cds, variant, tx) {
+                    if mutated_cds_stop_preserved(cds, variant, tx, tx_exons) {
                         terms.insert(SoTerm::StopRetainedVariant);
                     } else {
                         terms.insert(SoTerm::StopLost);
@@ -2731,29 +2732,21 @@ fn mutated_cds_stop_preserved(
     cds_seq: &str,
     variant: &VariantInput,
     tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
 ) -> bool {
-    let cds_start_genomic = tx.cds_start.unwrap_or(0);
-    let cds_end_genomic = tx.cds_end.unwrap_or(0);
-
     let ref_allele = normalize_allele_seq(&variant.ref_allele);
     let alt_allele = normalize_allele_seq(&variant.alt_allele);
 
-    // Map variant genomic position to 0-based CDS index
+    // Map variant genomic position to 0-based CDS index using proper
+    // exon-aware coordinate mapping (handles multi-exon transcripts).
     let var_start_genomic = if tx.strand >= 0 {
         variant.start
     } else {
         variant.end
     };
 
-    let cds_origin = if tx.strand >= 0 {
-        cds_start_genomic
-    } else {
-        cds_end_genomic
-    };
-    let cds_idx = if tx.strand >= 0 {
-        (var_start_genomic - cds_origin) as usize
-    } else {
-        (cds_origin - var_start_genomic) as usize
+    let Some(cds_idx) = genomic_to_cds_index(tx, tx_exons, var_start_genomic) else {
+        return false;
     };
 
     if cds_idx > cds_seq.len() {
@@ -8124,7 +8117,8 @@ mod tests {
         let mut terms = BTreeSet::new();
         // Simulate: variant overlaps start codon (102 overlaps 100-102) but
         // starts at the last base → ATG is not fully disrupted.
-        engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, None);
+        let exons_ref: Vec<&ExonFeature> = vec![];
+        engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons_ref, None);
         // The allele is not "ATG" so old heuristic would emit start_lost.
         // But the variant starts at pos 102 (== start_codon_end), not after.
         // So this should emit start_lost (codon IS touched).
@@ -8155,7 +8149,8 @@ mod tests {
         let mut terms = BTreeSet::new();
         // Check if overlaps_start_codon is true for this case.
         if engine.overlaps_start_codon(&v, &t) {
-            engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, None);
+            let exons_ref: Vec<&ExonFeature> = vec![];
+            engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons_ref, None);
             assert!(
                 terms.contains(&SoTerm::StartRetainedVariant),
                 "Deletion after start codon should emit start_retained, got: {:?}",
@@ -8440,7 +8435,8 @@ mod tests {
         let v = var("22", 218, 228, "TTTTTTTTTTT", "-");
         let mut terms = BTreeSet::new();
         if engine.overlaps_start_codon(&v, &t) {
-            engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, None);
+            let exons_ref: Vec<&ExonFeature> = vec![];
+            engine.add_start_stop_heuristic_terms(&mut terms, &v, &t, &exons_ref, None);
             // Boundary deletion touching start codon should emit start_lost
             // only — VEP does not co-emit start_retained for boundary
             // deletions (verified against GIAB HG002 benchmark).
@@ -9209,7 +9205,10 @@ mod tests {
         t.cdna_coding_end = Some(cds_len); // 9
         t.cdna_seq = Some(full_cdna);
 
-        let result = mutated_cds_stop_preserved(cds, &var("8", 1007, 1009, "AAC", "-"), &t);
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref = vec![&e];
+        let result =
+            mutated_cds_stop_preserved(cds, &var("8", 1007, 1009, "AAC", "-"), &t, &exons_ref);
         assert!(
             result,
             "Deletion spanning CDS/UTR boundary should be stop_retained when UTR bases form stop"
@@ -9241,9 +9240,12 @@ mod tests {
             Some(cds_end_pos),
         );
         t.cdna_coding_end = Some(cds_len);
-        t.cdna_seq = Some(full_cdna);
+        t.cdna_seq = Some(full_cdna.clone());
 
-        let result = mutated_cds_stop_preserved(cds, &var("8", 1007, 1009, "AAG", "-"), &t);
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref = vec![&e];
+        let result =
+            mutated_cds_stop_preserved(cds, &var("8", 1007, 1009, "AAG", "-"), &t, &exons_ref);
         assert!(
             !result,
             "Deletion spanning CDS/UTR boundary should be stop_lost when UTR bases don't form stop"
@@ -9270,7 +9272,10 @@ mod tests {
             Some(tx_end),
         );
 
-        let result = mutated_cds_stop_preserved(cds, &var("22", 1006, 1008, "AAA", "-"), &t);
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref = vec![&e];
+        let result =
+            mutated_cds_stop_preserved(cds, &var("22", 1006, 1008, "AAA", "-"), &t, &exons_ref);
         assert!(
             !result,
             "Without UTR, deletion making mutated shorter than CDS should return false (stop altered)"
@@ -9279,13 +9284,9 @@ mod tests {
 
     #[test]
     fn mutated_cds_stop_preserved_insertion_near_stop_retains_stop() {
-        // CDS: ATG GCT TAA (9 bases), insert "GCT" at position 1005 (between pos 5 and 6)
-        // Mutated: ATG GCT GCT TAA (12 bases)
-        // Original stop at index 6 (9-3), mutated codon at index 6 = "GCT" ≠ stop → false
-        // Wait — VEP checks codon at translateable_len - 3 = 6, which is "GCT" → not stop
-        // Let's instead insert 3 bases right before the stop: position 1005
-        // CDS indices: 0=A,1=T,2=G,3=G,4=C,5=T,6=T,7=A,8=A
-        // Insert "TAA" at cds_idx=5 → mutated = ATGGCTTAATAA (12 bytes)
+        // CDS: ATG GCT TAA (9 bases)
+        // Insert "TAA" at genomic position 1006 (cds_idx=6, the start of original stop).
+        // Mutated CDS+UTR: ATGGCT + TAA + TAA = ATGGCTTAATAA (12 bytes)
         // Original stop pos = 9-3 = 6, codon at 6 = "TAA" → stop preserved!
         let cds = "ATGGCTTAA";
         let cds_len = cds.len();
@@ -9301,7 +9302,10 @@ mod tests {
             Some(tx_end),
         );
 
-        let result = mutated_cds_stop_preserved(cds, &var("22", 1006, 1005, "-", "TAA"), &t);
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref = vec![&e];
+        let result =
+            mutated_cds_stop_preserved(cds, &var("22", 1006, 1005, "-", "TAA"), &t, &exons_ref);
         assert!(
             result,
             "Insertion that preserves stop codon at original position should return true"
