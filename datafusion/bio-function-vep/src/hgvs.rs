@@ -1148,25 +1148,26 @@ pub fn format_hgvsp(
             notation.kind = protein_event_type(&notation.ref_allele, &notation.alt_allele, false);
         }
         // Traceability:
-        // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
-        //   checks for peptide duplication BEFORE 3' shifting
-        //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1758
+        // - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
+        //   calls `_check_peptides_post_var()` (3' shift) FIRST, then
+        //   `_check_for_peptide_duplication()`. The shift may change the
+        //   insertion position, making the upstream sequence different when
+        //   the dup check runs.
+        //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2054-L2089
+        if shift_hgvs && matches!(notation.kind.as_str(), "ins" | "del") {
+            shift_peptides_post_var(&mut notation, &protein.ref_translation);
+        }
         if notation.kind == "ins"
             && check_for_peptide_duplication(&mut notation, &protein.ref_translation)
         {
-            // Dup detected — skip shift and flanking.
-        } else {
-            if shift_hgvs && matches!(notation.kind.as_str(), "ins" | "del") {
-                shift_peptides_post_var(&mut notation, &protein.ref_translation);
-            }
-            if notation.kind == "ins" {
-                notation.ref_allele = surrounding_peptides(
-                    &protein.ref_translation,
-                    notation.start.min(notation.end),
-                    &notation.original_ref,
-                    Some(2),
-                )?;
-            }
+            // Dup detected — skip flanking.
+        } else if notation.kind == "ins" {
+            notation.ref_allele = surrounding_peptides(
+                &protein.ref_translation,
+                notation.start.min(notation.end),
+                &notation.original_ref,
+                Some(2),
+            )?;
         }
     }
 
