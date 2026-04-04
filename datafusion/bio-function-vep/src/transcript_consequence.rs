@@ -2947,6 +2947,9 @@ fn classify_coding_change(
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L992-L1026>
     // - start_retained_variant = !_snp_start_altered for SNPs:
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L958>
+    // start_idx < 3: variant touches at least one of CDS positions 0, 1, 2
+    // (the start codon). Unlike the insertion path (cds_idx < 2), SNVs and
+    // deletions at position 2 DO overlap the start codon.
     if start_idx < 3 && !tx.cds_start_nf {
         if new_aas.first() == Some(&'M') {
             class.start_retained = true;
@@ -8275,18 +8278,20 @@ mod tests {
     }
 
     #[test]
-    fn insertion_within_start_codon_sets_start_retained() {
+    fn insertion_within_start_codon_emits_start_lost() {
         // Insertion within start codon (cds_idx=0 or 1) should still fire.
         // CDS: ATG GCT GAA TGA. Insert "AAA" after pos 1001 (cds_idx=1).
-        // This disrupts the start codon.
+        // A + AAA + TGGCTGAATGA → AAAATGGCTGAATGA, first codon = AAA = Lys.
+        // Met is lost, new AA is not Met → start_lost only.
         let cds = "ATGGCTGAATGA";
         let c = classify_ins(cds, 1002, "AAA").unwrap();
-        // Insertion at cds_idx=1 is within start codon — should evaluate
-        // start codon consequences. The inserted bases shift the codon,
-        // so start_lost should fire.
         assert!(
-            c.start_lost || c.start_retained,
-            "Insertion at cds_idx=1 (within start codon) should trigger start codon logic"
+            c.start_lost,
+            "Insertion at cds_idx=1 disrupts start codon: should emit start_lost"
+        );
+        assert!(
+            !c.start_retained,
+            "Insertion at cds_idx=1 produces Lys, not Met: should NOT emit start_retained"
         );
     }
 
