@@ -4825,13 +4825,17 @@ fn normalize_source_label(source: &str) -> Option<String> {
 /// the VEP-visible merged transcript state without heuristics.
 ///
 /// When `hgnc_backfill` is `false` (default), the symbol-based fallback is
-/// restricted to transcripts whose `gene_symbol_source` is `"HGNC"`.  VEP only
-/// emits `HGNC_ID` for genes whose primary symbol source is HGNC; genes with
-/// `SYMBOL_SOURCE=RFAM` (snoRNA) or no symbol source (some lncRNAs) leave
-/// `HGNC_ID` empty even when the gene has a valid HGNC entry.  Setting
-/// `hgnc_backfill` to `true` restores the previous behaviour which populates
-/// `HGNC_ID` for all transcripts where a unique mapping can be inferred —
-/// arguably more complete but not VEP-compatible.
+/// restricted to transcripts whose `gene_symbol_source` is `"HGNC"`.  VEP
+/// derives `HGNC_ID` from each transcript's gene `display_xref`, which is a
+/// per-gene-object attribute.  Transcripts of the same gene symbol can have
+/// different symbol sources (e.g. LINC03025 has both HGNC and EntrezGene
+/// transcripts); VEP only emits `HGNC_ID` for those whose gene object carries
+/// the HGNC `display_xref`.  The cache's per-transcript `gene_hgnc_id` column
+/// reflects this correctly, so the symbol fallback must only fill gaps for
+/// HGNC-source transcripts.  Setting `hgnc_backfill` to `true` restores the
+/// previous behaviour which populates `HGNC_ID` for all transcripts where a
+/// unique mapping can be inferred — arguably more complete but not
+/// VEP-compatible.
 ///
 /// See <https://github.com/biodatageeks/datafusion-bio-functions/issues/92>.
 fn backfill_missing_hgnc_ids(
@@ -4883,8 +4887,13 @@ fn backfill_missing_hgnc_ids(
             }
         }
         // Symbol-based fallback: only apply when hgnc_backfill is enabled or
-        // the transcript's gene_symbol_source is "HGNC".  VEP leaves HGNC_ID
-        // empty for genes whose SYMBOL_SOURCE is RFAM or absent (issue #92).
+        // the transcript's gene_symbol_source is "HGNC".  VEP derives HGNC_ID
+        // from each transcript's gene `display_xref`; genes whose
+        // SYMBOL_SOURCE is RFAM, EntrezGene, or absent may or may not carry
+        // an HGNC `display_xref`, and the cache's per-transcript
+        // `gene_hgnc_id` column already reflects that correctly.  The symbol
+        // fallback must only fill gaps for HGNC-source transcripts where the
+        // cache is incomplete (issue #92).
         let source_is_hgnc = tx
             .gene_symbol_source
             .as_deref()
@@ -7524,6 +7533,36 @@ mod tests {
             transcripts[1].gene_hgnc_id.as_deref(),
             Some("HGNC:1100"),
             "HGNC-source transcript without HGNC_ID should still get backfilled"
+        );
+    }
+
+    /// EntrezGene-source transcripts are NOT backfilled with `hgnc_backfill=false`.
+    /// VEP derives HGNC_ID from the gene's display_xref; EntrezGene transcripts
+    /// may or may not carry it depending on the gene object, and the cache
+    /// reflects this accurately (LINC03025 has both HGNC and EntrezGene
+    /// transcripts with different HGNC_ID status).
+    #[test]
+    fn test_backfill_hgnc_entrezgene_source_not_filled_by_default() {
+        let tx_hgnc = make_tx(
+            "ENST00000619971",
+            Some("LINC03025"),
+            Some("HGNC"),
+            Some("HGNC:56158"),
+        );
+        let tx_entrez = make_tx(
+            "ENST00000414223",
+            Some("LINC03025"),
+            Some("EntrezGene"),
+            None,
+        );
+
+        let mut transcripts = vec![tx_hgnc, tx_entrez];
+        let refseq_ids = vec![None, None];
+
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
+        assert_eq!(
+            transcripts[1].gene_hgnc_id, None,
+            "EntrezGene-source transcript should NOT get HGNC_ID when hgnc_backfill=false"
         );
     }
 
