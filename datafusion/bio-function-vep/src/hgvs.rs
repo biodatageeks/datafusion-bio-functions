@@ -1383,18 +1383,12 @@ fn check_for_peptide_duplication(
         return false;
     }
 
-    // Try dup check at the current position first.
-    if try_peptide_dup_at(notation, ref_translation, notation.start) {
-        return true;
-    }
-    // For codon-boundary insertions (empty preseq = no clipped prefix),
-    // also try one position forward to match VEP's genomic2pep mapper.
-    if notation.preseq.is_empty() {
-        if try_peptide_dup_at(notation, ref_translation, notation.start.saturating_add(1)) {
-            return true;
-        }
-    }
-    false
+    // Traceability:
+    // - VEP's `_check_for_peptide_duplication()` builds `upstream` from
+    //   `substr($reference_trans, 0, $start - 1)` + preseq, then checks
+    //   a single window at `$start - length($alt) - 1`. No fallback.
+    //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2410
+    try_peptide_dup_at(notation, ref_translation, notation.start)
 }
 
 fn try_peptide_dup_at(
@@ -2832,7 +2826,11 @@ mod tests {
     }
 
     #[test]
-    fn test_check_for_peptide_duplication_fallback_at_offset_2() {
+    fn test_check_for_peptide_duplication_no_fallback_when_upstream_mismatches() {
+        // VEP's _check_for_peptide_duplication() only checks at
+        // start - len(alt) - 1 (0-indexed) with no fallback. When the
+        // upstream sequence at that position doesn't match, the result
+        // stays as "ins".
         let mut notation = ProteinHgvsNotation {
             start: 3,
             end: 4,
@@ -2842,18 +2840,11 @@ mod tests {
             preseq: String::new(),
             kind: "ins".into(),
         };
-        // At start=3: test_new_start = 3-1-1 = 1. upstream = ref[..2] = "MA".
-        // upstream[1] = 'A'. Not 'K'. Fail.
-        // At start+1=4: test_new_start = 4-1-1 = 2. upstream = ref[..3] = "MAK".
-        // upstream[2] = 'K'. Match!
-        // At start+2=5: test_new_start = 5-1-1 = 3. upstream = ref[..4] = "MAKL".
-        // upstream[3] = 'L'. Not 'K'. Fail.
-        // Fallback tries offset 2 first (reversed), then 1. Offset 2 (start=5) fails.
-        // Offset 1 (start=4) succeeds.
+        // At start=3: upstream = "MA", test_new_start = 1, test_seq = "A" ≠ "K"
+        // VEP: no fallback → stays as "ins"
         let result = check_for_peptide_duplication(&mut notation, "MAKL*");
-        assert!(result);
-        assert_eq!(notation.kind, "dup");
-        assert_eq!(notation.start, 3); // 4 - 1
+        assert!(!result);
+        assert_eq!(notation.kind, "ins");
     }
 
     #[test]
@@ -3259,6 +3250,42 @@ mod tests {
         assert_eq!(notation.kind, "dup");
         assert_eq!(notation.start, 8);
         assert_eq!(notation.end, 8);
+    }
+
+    #[test]
+    fn peptide_dup_chr3_63912714_should_be_ins_not_dup() {
+        // Reproduces chr3:63912714 A>AGCAGCAGCC / ENST00000295900
+        // Amino acids: Q/QQQP at protein position 39
+        // Ref protein around pos 35-44: QQQQQPPPPP
+        // After clip: ref="", alt="QQP", start=40, preseq="Q"
+        // Upstream[36..39] = "QQQ" ≠ "QQP" → no dup at check_start=40
+        // Upstream[37..40] = "QQP" → MATCH at check_start=41 (fallback)
+        // VEP does NOT fallback when preseq is non-empty → VEP says ins
+        // Ref translation (simplified, only relevant positions):
+        let mut ref_translation = "M".repeat(34);
+        ref_translation.push_str("QQQQQPPPP"); // pos 35-43
+        ref_translation.push_str("QP"); // pos 44-45 (etc.)
+
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 39,
+            end: 39,
+            ref_peptide: "Q".to_string(),
+            alt_peptide: "QQQP".to_string(),
+            ref_translation: ref_translation.clone(),
+            alt_translation: {
+                let mut alt = ref_translation.clone();
+                alt.insert_str(39, "QQP"); // insert QQP after position 39
+                alt
+            },
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
+        let result = format_hgvsp(&translation, &protein, true);
+        // VEP: p.Gln39_Pro40insGlnGlnPro — NOT a dup
+        let r = result.unwrap();
+        assert!(r.contains("ins"), "Expected ins notation, got: {r}");
     }
 
     // ── HGVSc dup boundary revert tests (issue #88 remaining) ──────────
