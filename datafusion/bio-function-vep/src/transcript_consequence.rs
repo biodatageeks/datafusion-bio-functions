@@ -1690,6 +1690,12 @@ impl TranscriptConsequenceEngine {
                 // Only suppress stop_gained/stop_lost for inframe indels
                 // where the primary indel consequence already describes the
                 // event.
+                //
+                // Traceability:
+                // - VEP's `stop_lost` predicate fires independently of frameshift:
+                //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1340>
+                // - VEP's `frameshift_variant` predicate does NOT suppress stop_lost:
+                //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1434-L1468>
                 if terms.contains(&SoTerm::InframeDeletion)
                     || terms.contains(&SoTerm::InframeInsertion)
                 {
