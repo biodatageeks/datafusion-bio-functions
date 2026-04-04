@@ -3896,7 +3896,25 @@ pub(crate) fn raw_cdna_position_from_genomic(
             break;
         }
 
-        let prev_segment = coords.get(i.checked_sub(1)?)?;
+        if i == 0 {
+            // Position is before the first exon segment.  Extrapolate from
+            // the nearest boundary so that HGVS-shifted insertions near the
+            // transcript start still produce valid cDNA coordinates.
+            //
+            // Traceability: VEP's TranscriptMapper returns a Gap for
+            // out-of-bounds positions; `_get_cDNA_position` then
+            // extrapolates from the nearest mapped boundary.
+            let offset = segment.start - genomic_pos;
+            let coord = if tx.strand >= 0 {
+                segment.cdna_start as i64 - offset
+            } else {
+                segment.cdna_end as i64 + offset
+            };
+            cdna_position = Some(coord.to_string());
+            break;
+        }
+
+        let prev_segment = &coords[i - 1];
         let updist = (genomic_pos - prev_segment.end).abs();
         let downdist = (segment.start - genomic_pos).abs();
         cdna_position = Some(
@@ -3913,6 +3931,21 @@ pub(crate) fn raw_cdna_position_from_genomic(
             },
         );
         break;
+    }
+
+    // Position is after the last exon segment.  Extrapolate from the last
+    // boundary so that HGVS-shifted insertions near the transcript end
+    // still produce valid cDNA coordinates.
+    if cdna_position.is_none() {
+        if let Some(last) = coords.last() {
+            let offset = genomic_pos - last.end;
+            let coord = if tx.strand >= 0 {
+                last.cdna_end as i64 + offset
+            } else {
+                last.cdna_start as i64 - offset
+            };
+            cdna_position = Some(coord.to_string());
+        }
     }
 
     cdna_position
@@ -8770,6 +8803,130 @@ mod tests {
                 "motif_001",
                 "",
             ]
+        );
+    }
+
+    // ── raw_cdna_position_from_genomic boundary tests (issue #88) ───────
+
+    /// Forward-strand transcript with two exons: [100..200] and [300..400].
+    /// cDNA positions: exon1 = 1..101, exon2 = 102..202.
+    fn two_exon_fwd() -> (TranscriptFeature, Vec<ExonFeature>) {
+        let t = tx("TX1", "chr1", 100, 400, 1, "protein_coding", None, None);
+        let exons = vec![exon("TX1", 1, 100, 200), exon("TX1", 2, 300, 400)];
+        (t, exons)
+    }
+
+    /// Reverse-strand transcript with two exons: [100..200] and [300..400].
+    /// cDNA positions (reversed): exon1(100..200) = cdna 102..202,
+    ///                            exon2(300..400) = cdna 1..101.
+    fn two_exon_rev() -> (TranscriptFeature, Vec<ExonFeature>) {
+        let t = tx("TX1", "chr1", 100, 400, -1, "protein_coding", None, None);
+        let exons = vec![exon("TX1", 1, 100, 200), exon("TX1", 2, 300, 400)];
+        (t, exons)
+    }
+
+    #[test]
+    fn raw_cdna_position_within_exon_fwd() {
+        let (t, exons) = two_exon_fwd();
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Position 150 is in exon1, cDNA = 1 + (150 - 100) = 51
+        assert_eq!(
+            raw_cdna_position_from_genomic(&t, &refs, 150),
+            Some("51".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_cdna_position_within_exon_rev() {
+        let (t, exons) = two_exon_rev();
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Position 150 is in exon1 (genomic), which has cdna 102..202.
+        // reverse formula: cdna_start + (segment.end - pos) = 102 + (200 - 150) = 152
+        assert_eq!(
+            raw_cdna_position_from_genomic(&t, &refs, 150),
+            Some("152".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_cdna_position_intronic() {
+        let (t, exons) = two_exon_fwd();
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Position 250 is between exons (intron), equidistant.
+        // updist = |250 - 200| = 50, downdist = |300 - 250| = 50, equal → forward → updist wins
+        assert_eq!(
+            raw_cdna_position_from_genomic(&t, &refs, 250),
+            Some("101+50".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_cdna_position_before_first_segment_fwd() {
+        let (t, exons) = two_exon_fwd();
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Position 95 is 5 bases before first exon start (100).
+        // Extrapolate: cdna_start - offset = 1 - 5 = -4
+        assert_eq!(
+            raw_cdna_position_from_genomic(&t, &refs, 95),
+            Some("-4".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_cdna_position_before_first_segment_rev() {
+        let (t, exons) = two_exon_rev();
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Position 95 is 5 bases before first exon start (100).
+        // Reverse: cdna_end + offset = 202 + 5 = 207
+        assert_eq!(
+            raw_cdna_position_from_genomic(&t, &refs, 95),
+            Some("207".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_cdna_position_after_last_segment_fwd() {
+        let (t, exons) = two_exon_fwd();
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Position 405 is 5 bases after last exon end (400).
+        // Extrapolate: cdna_end + offset = 202 + 5 = 207
+        assert_eq!(
+            raw_cdna_position_from_genomic(&t, &refs, 405),
+            Some("207".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_cdna_position_after_last_segment_rev() {
+        let (t, exons) = two_exon_rev();
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Position 405 is 5 bases after last exon end (400).
+        // Reverse: cdna_start - offset = 1 - 5 = -4
+        assert_eq!(
+            raw_cdna_position_from_genomic(&t, &refs, 405),
+            Some("-4".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_cdna_position_one_before_first_segment_fwd() {
+        let (t, exons) = two_exon_fwd();
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Position 99: one base before first exon → cdna = 1 - 1 = 0
+        assert_eq!(
+            raw_cdna_position_from_genomic(&t, &refs, 99),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_cdna_position_one_after_last_segment_fwd() {
+        let (t, exons) = two_exon_fwd();
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Position 401: one base after last exon → cdna = 202 + 1 = 203
+        assert_eq!(
+            raw_cdna_position_from_genomic(&t, &refs, 401),
+            Some("203".to_string())
         );
     }
 }
