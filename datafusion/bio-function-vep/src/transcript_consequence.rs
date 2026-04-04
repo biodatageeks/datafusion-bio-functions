@@ -1817,9 +1817,8 @@ impl TranscriptConsequenceEngine {
             } else {
                 let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
                 let is_indel = ref_len != alt_len;
-                // Sequence-based check for indels: build mutated CDS last
-                // 3 bases and see if the stop codon is preserved. Mirrors
-                // the start codon logic at lines 1779-1789.
+                // VEP's exact _ins_del_stop_altered logic: concatenate CDS + 3' UTR,
+                // apply the mutation, check codon at original stop position.
                 if is_indel && cds_seq.is_some_and(|s| s.len() >= 3) {
                     let cds = cds_seq.unwrap();
                     if mutated_cds_stop_preserved(cds, variant, tx, tx_exons) {
