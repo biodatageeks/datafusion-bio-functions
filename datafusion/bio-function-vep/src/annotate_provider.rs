@@ -3856,7 +3856,9 @@ impl AnnotateProvider {
                             .map(|tx| if tx.gene_phenotype { "1" } else { "" })
                             .unwrap_or("");
                         let ccds = tx_opt.and_then(|tx| tx.ccds.as_deref()).unwrap_or("");
-                        let swissprot = tx_opt.and_then(|tx| tx.swissprot.as_deref()).unwrap_or("");
+                        let swissprot_raw =
+                            tx_opt.and_then(|tx| tx.swissprot.as_deref()).unwrap_or("");
+                        let swissprot = csq_escape(swissprot_raw);
                         let trembl_raw = tx_opt.and_then(|tx| tx.trembl.as_deref()).unwrap_or("");
                         let trembl = csq_escape(trembl_raw);
                         let uniparc = tx_opt.and_then(|tx| tx.uniparc.as_deref()).unwrap_or("");
