@@ -1,8 +1,13 @@
-//! Populate exon and translation keyspaces in an existing fjall database
-//! from Parquet files.
+//! Populate exon and translation keyspaces in a **separate** context fjall
+//! database from Parquet files.
+//!
+//! IMPORTANT: Context keyspaces are written to `<fjall_db_path>/context.fjall`,
+//! NOT into `variation.fjall` directly. Adding extra keyspaces to variation.fjall
+//! degrades point-lookup performance by ~10% due to block cache pressure from
+//! unused keyspace metadata.
 //!
 //! Usage:
-//!   load_context_kv <fjall_db_path> <exon_parquet> <translation_parquet>
+//!   load_context_kv <cache_dir> <exon_parquet> <translation_parquet>
 
 use std::time::Instant;
 
@@ -206,14 +211,18 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!(
-            "Usage: {} <fjall_db_path> <exon_parquet> <translation_parquet>",
+            "Usage: {} <cache_dir> <exon_parquet> <translation_parquet>",
             args[0]
         );
         std::process::exit(1);
     }
-    let fjall_path = &args[1];
+    let cache_dir = &args[1];
     let exon_parquet = &args[2];
     let translation_parquet = &args[3];
+
+    // Write to a separate context.fjall database, NOT into variation.fjall.
+    // Extra keyspaces in variation.fjall cause ~10% performance degradation.
+    let fjall_path = format!("{}/context.fjall", cache_dir);
 
     let ctx = SessionContext::new();
     ctx.register_parquet("exons", exon_parquet, Default::default())
@@ -240,7 +249,7 @@ async fn main() -> Result<()> {
     );
 
     println!("Opening fjall database at {fjall_path}...");
-    let db = fjall::Database::builder(fjall_path)
+    let db = fjall::Database::builder(&fjall_path)
         .cache_size(256 * 1024 * 1024)
         .open()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -260,6 +269,9 @@ async fn main() -> Result<()> {
     db.persist(fjall::PersistMode::SyncAll)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     println!("  persisted in {:.3}s", t0.elapsed().as_secs_f64());
+
+    // Let Drop run to trigger GC of old SSTs.
+    drop(db);
 
     println!("Done.");
     Ok(())

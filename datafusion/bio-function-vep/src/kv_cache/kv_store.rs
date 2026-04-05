@@ -642,6 +642,90 @@ mod tests {
         );
     }
 
+    /// Verify that `VepKvStore::create()` only creates meta + data keyspaces
+    /// (plus fjall's internal default). Extra keyspaces degrade point-lookup
+    /// performance by ~10% due to fjall block cache overhead.
+    #[test]
+    fn test_create_produces_minimal_keyspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let store = VepKvStore::create(dir.path(), schema).unwrap();
+        store.persist().unwrap();
+
+        // fjall always creates an internal default keyspace dir,
+        // so we expect 3 dirs on disk: default + meta + data.
+        let ks_dir = dir.path().join("keyspaces");
+        let count = std::fs::read_dir(&ks_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .ok()
+                    .and_then(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+                    .is_some()
+            })
+            .count();
+        assert_eq!(
+            count, 3,
+            "VepKvStore::create() must produce exactly 3 keyspace dirs (fjall default + meta + data), found {count}"
+        );
+
+        // Verify the expected keyspaces exist.
+        assert!(store.database().keyspace_exists("meta"));
+        assert!(store.database().keyspace_exists("data"));
+
+        // Verify no extra keyspaces.
+        for name in ["sift", "translations", "exons"] {
+            assert!(
+                !store.database().keyspace_exists(name),
+                "unexpected keyspace '{name}' found — extra keyspaces cause ~10% perf degradation"
+            );
+        }
+    }
+
+    /// After `open()`, no new keyspaces should be created beyond create()'s set.
+    #[test]
+    fn test_open_does_not_create_extra_keyspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let store = VepKvStore::create(dir.path(), schema).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let ks_dir = dir.path().join("keyspaces");
+        let count_before = std::fs::read_dir(&ks_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .ok()
+                    .and_then(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+                    .is_some()
+            })
+            .count();
+
+        let store = VepKvStore::open(dir.path()).unwrap();
+
+        let count_after = std::fs::read_dir(&ks_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .ok()
+                    .and_then(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+                    .is_some()
+            })
+            .count();
+        assert_eq!(
+            count_before, count_after,
+            "open() must not create extra keyspace dirs"
+        );
+
+        for name in ["sift", "translations", "exons"] {
+            assert!(
+                !store.database().keyspace_exists(name),
+                "open() created unexpected keyspace '{name}'"
+            );
+        }
+    }
+
     #[test]
     fn test_zstd_decompression_handles_large_expansion_ratio() {
         let dir = tempfile::tempdir().unwrap();

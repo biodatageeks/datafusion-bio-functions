@@ -243,6 +243,13 @@ impl CacheLoader {
             "Loaded {total_variants} variants into {total_positions} positions ({total_bytes} bytes) in {elapsed:.1}s"
         );
 
+        // Persist after compaction so the new version is durable, then let
+        // Drop run GC to delete old pre-compaction SSTs from disk.
+        // Previously used mem::forget to avoid a deadlock (issue #86), but
+        // that skipped GC and left ~200GB of dead SST files.
+        store.persist()?;
+        drop(store);
+
         Ok(LoadStats {
             total_variants,
             total_positions,

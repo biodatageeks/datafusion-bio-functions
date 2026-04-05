@@ -174,6 +174,26 @@ fn main() -> Result<()> {
     db.persist(fjall::PersistMode::SyncAll)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+    // Major-compact the sift keyspace so the LSM tree is fully optimized
+    // for reads (bloom filters built, levels merged).
+    // Without this, every lookup probes hundreds of L0 SSTs.
+    eprintln!("Running major compaction on sift keyspace...");
+    let compact_start = Instant::now();
+    sift_store
+        .keyspace()
+        .major_compact()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    eprintln!(
+        "Major compaction completed in {:.1}s",
+        compact_start.elapsed().as_secs_f64()
+    );
+
+    // Persist after compaction, then let Drop run GC to clean up old SSTs.
+    db.persist(fjall::PersistMode::SyncAll)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    drop(sift_store);
+    drop(db);
+
     let elapsed = t_start.elapsed().as_secs_f64();
     eprintln!(
         "Done in {elapsed:.1}s: {total_transcripts} transcripts, {total_sift_entries} sift entries, {total_polyphen_entries} polyphen entries"

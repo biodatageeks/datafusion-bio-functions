@@ -351,6 +351,85 @@ mod tests {
         assert!(store.get("ENST00000333333").unwrap().is_some());
     }
 
+    /// Verify that `SiftKvStore::create()` only creates the "sift" keyspace
+    /// (plus fjall's internal default). Extra keyspaces degrade performance.
+    #[test]
+    fn test_create_produces_minimal_keyspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+
+        let _store = SiftKvStore::create(&db).unwrap();
+        db.persist(fjall::PersistMode::SyncAll).unwrap();
+
+        // Only the "sift" keyspace should exist (no meta/data/translations/exons).
+        assert!(db.keyspace_exists(SIFT_KEYSPACE));
+        for name in ["translations", "exons"] {
+            assert!(
+                !db.keyspace_exists(name),
+                "SiftKvStore::create() created unexpected keyspace '{name}'"
+            );
+        }
+
+        // fjall default + sift = 2 dirs on disk.
+        let ks_dir = dir.path().join("keyspaces");
+        let count = std::fs::read_dir(&ks_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .ok()
+                    .and_then(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+                    .is_some()
+            })
+            .count();
+        assert_eq!(
+            count, 2,
+            "SiftKvStore::create() must produce exactly 2 keyspace dirs (fjall default + sift), found {count}"
+        );
+    }
+
+    /// Verify that `ingest_sorted()` only creates the "sift" keyspace.
+    #[test]
+    fn test_ingest_sorted_produces_minimal_keyspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+
+        let entries = vec![
+            ("ENST00000000001".to_string(), make_predictions()),
+            ("ENST00000000002".to_string(), make_predictions()),
+        ];
+        let _store = SiftKvStore::ingest_sorted(&db, entries.into_iter()).unwrap();
+        db.persist(fjall::PersistMode::SyncAll).unwrap();
+
+        assert!(db.keyspace_exists(SIFT_KEYSPACE));
+        for name in ["translations", "exons"] {
+            assert!(
+                !db.keyspace_exists(name),
+                "ingest_sorted() created unexpected keyspace '{name}'"
+            );
+        }
+
+        let ks_dir = dir.path().join("keyspaces");
+        let count = std::fs::read_dir(&ks_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .ok()
+                    .and_then(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+                    .is_some()
+            })
+            .count();
+        assert_eq!(
+            count, 2,
+            "ingest_sorted() must produce exactly 2 keyspace dirs (fjall default + sift), found {count}"
+        );
+    }
+
     #[test]
     fn test_open_keyspace_not_exists() {
         let dir = tempfile::tempdir().unwrap();

@@ -8,10 +8,17 @@ repos:
       - id: check-added-large-files
         args: ['--maxkb=500']
 
-  - repo: https://github.com/doublify/pre-commit-rust
-    rev: v1.0
+  - repo: local
     hooks:
       - id: fmt
-        args: ['--all', '--']
+        name: fmt
+        language: system
+        entry: cargo fmt --all --
+        types: [rust]
+        pass_filenames: false
       - id: clippy
-        args: ['--all-targets', '--all-features', '--', '-D', 'warnings']
+        name: clippy
+        language: system
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        types: [rust]
+        pass_filenames: false

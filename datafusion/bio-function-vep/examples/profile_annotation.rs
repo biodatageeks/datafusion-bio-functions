@@ -167,10 +167,19 @@ async fn main() -> Result<()> {
 
     let mut options = Vec::new();
 
+    // Detect fjall stores inside a partitioned cache directory.
+    let has_fjall = cache_dir.join("variation.fjall").is_dir();
+    if has_fjall {
+        eprintln!("[PREP] Detected variation.fjall — enabling use_fjall=true");
+    }
+
     if is_partitioned {
         // Partitioned path: context tables are handled internally per contig.
         // Signal partitioned mode explicitly.
         options.push("\"partitioned\":true".to_string());
+        if has_fjall {
+            options.push("\"use_fjall\":true".to_string());
+        }
         eprintln!("[PREP] Partitioned mode — context tables loaded per contig internally");
     } else {
         // Register context tables (flat layout).
