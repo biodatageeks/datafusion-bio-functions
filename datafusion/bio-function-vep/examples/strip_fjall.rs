@@ -123,7 +123,7 @@ fn main() {
     eprintln!("\nChecking translation_sift.fjall...");
     let sift_fjall = cache_dir.join("translation_sift.fjall");
     if sift_fjall.is_dir() {
-        check_keyspaces(&sift_fjall, &["meta", "sift"]);
+        check_keyspaces(&sift_fjall, &["sift"]);
     } else {
         eprintln!("  not found, skipping");
     }

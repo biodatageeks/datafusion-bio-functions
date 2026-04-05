@@ -905,6 +905,7 @@ impl CacheBuilder {
         // compacting — the bounded(1000) flume channel fills up, send() blocks while
         // the worker is still in compact(). All data is persisted and compacted above.
         // See: https://github.com/biodatageeks/datafusion-bio-functions/issues/86
+        #[cfg(not(test))]
         std::mem::forget(store);
 
         let elapsed = start_time.elapsed().as_secs_f64();
@@ -1452,8 +1453,11 @@ impl CacheBuilder {
         // compacting — the bounded(1000) flume channel fills up, send() blocks while
         // the worker is still in compact(). All data is persisted above.
         // See: https://github.com/biodatageeks/datafusion-bio-functions/issues/86
-        std::mem::forget(sift_store);
-        std::mem::forget(db);
+        #[cfg(not(test))]
+        {
+            std::mem::forget(sift_store);
+            std::mem::forget(db);
+        }
 
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(

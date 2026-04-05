@@ -43,6 +43,13 @@ fn main() {
             continue;
         }
 
+        // Guard: only open keyspaces that already exist. db.keyspace() with
+        // KeyspaceCreateOptions::default creates the keyspace if missing —
+        // that would introduce the extra keyspaces this PR removes (~10% perf hit).
+        if !db.keyspace_exists(ks_name) {
+            continue;
+        }
+
         let ks = match db.keyspace(ks_name, fjall::KeyspaceCreateOptions::default) {
             Ok(ks) => ks,
             Err(_) => continue,
