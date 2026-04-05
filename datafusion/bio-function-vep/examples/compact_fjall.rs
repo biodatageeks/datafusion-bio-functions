@@ -35,8 +35,10 @@ fn main() {
         .open()
         .expect("failed to open fjall database");
 
-    // Well-known keyspace names used across the VEP cache stores.
-    let known_keyspaces = ["data", "meta", "sift", "translations", "exons"];
+    // Only the keyspaces that should exist in production fjall stores.
+    // variation.fjall: "meta" + "data"
+    // translation_sift.fjall: "sift"
+    let known_keyspaces = ["data", "meta", "sift"];
 
     for ks_name in &known_keyspaces {
         if target_keyspace.is_some_and(|t| *ks_name != t) {
