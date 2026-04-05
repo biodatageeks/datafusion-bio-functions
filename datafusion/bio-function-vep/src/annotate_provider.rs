@@ -7591,4 +7591,39 @@ mod tests {
             "RefSeq ID-based mapping should work regardless of hgnc_backfill flag"
         );
     }
+
+    // ── csq_escape ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_csq_escape_comma_becomes_ampersand() {
+        // Multi-accession SWISSPROT values must not split CSQ entries (issue #93)
+        assert_eq!(
+            csq_escape("A0A0J9YXY3.52,P0DPF7.28"),
+            "A0A0J9YXY3.52&P0DPF7.28"
+        );
+    }
+
+    #[test]
+    fn test_csq_escape_pipe_becomes_ampersand() {
+        assert_eq!(csq_escape("a|b"), "a&b");
+    }
+
+    #[test]
+    fn test_csq_escape_semicolon_percent_encoded() {
+        assert_eq!(csq_escape("a;b"), "a%3Bb");
+    }
+
+    #[test]
+    fn test_csq_escape_dash_becomes_empty() {
+        assert_eq!(csq_escape("-"), "");
+    }
+
+    #[test]
+    fn test_csq_escape_no_change() {
+        let val = "Q9Y6K1.3";
+        let escaped = csq_escape(val);
+        assert_eq!(escaped, val);
+        // Should be a borrowed Cow (no allocation)
+        assert!(matches!(escaped, std::borrow::Cow::Borrowed(_)));
+    }
 }
