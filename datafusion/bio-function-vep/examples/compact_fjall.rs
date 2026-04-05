@@ -82,8 +82,8 @@ fn main() {
     db.persist(fjall::PersistMode::SyncAll)
         .expect("failed to persist");
 
-    // Skip Drop to avoid deadlock (issue #86).
-    std::mem::forget(db);
+    // Let Drop run to trigger GC of old pre-compaction SSTs.
+    drop(db);
 
     eprintln!("Done.");
 }

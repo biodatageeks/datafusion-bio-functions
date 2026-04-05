@@ -901,12 +901,12 @@ impl CacheBuilder {
             compact_start.elapsed().as_secs_f64()
         );
 
-        // Skip fjall's Drop which deadlocks when background worker threads are busy
-        // compacting — the bounded(1000) flume channel fills up, send() blocks while
-        // the worker is still in compact(). All data is persisted and compacted above.
-        // See: https://github.com/biodatageeks/datafusion-bio-functions/issues/86
-        #[cfg(not(test))]
-        std::mem::forget(store);
+        // Persist after final compaction so the new version (referencing only
+        // the merged SSTs) is durable. Then let Drop run normally — it triggers
+        // GC/maintenance that deletes the old pre-compaction SSTs from disk.
+        // Without this, mem::forget would skip GC and leave ~200GB of dead files.
+        store.persist()?;
+        drop(store);
 
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(
@@ -1446,18 +1446,12 @@ impl CacheBuilder {
             compact_start.elapsed().as_secs_f64()
         );
 
+        // Persist after compaction so the new version is durable, then let
+        // Drop run GC to delete old pre-compaction SSTs from disk.
         db.persist(fjall::PersistMode::SyncAll)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        // Skip fjall's Drop which deadlocks when background worker threads are busy
-        // compacting — the bounded(1000) flume channel fills up, send() blocks while
-        // the worker is still in compact(). All data is persisted above.
-        // See: https://github.com/biodatageeks/datafusion-bio-functions/issues/86
-        #[cfg(not(test))]
-        {
-            std::mem::forget(sift_store);
-            std::mem::forget(db);
-        }
+        drop(sift_store);
+        drop(db);
 
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(

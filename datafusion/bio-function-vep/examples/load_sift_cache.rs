@@ -188,10 +188,11 @@ fn main() -> Result<()> {
         compact_start.elapsed().as_secs_f64()
     );
 
-    // Skip fjall's Drop which deadlocks when background worker threads are
-    // busy compacting (issue #86). All data is persisted and compacted above.
-    std::mem::forget(sift_store);
-    std::mem::forget(db);
+    // Persist after compaction, then let Drop run GC to clean up old SSTs.
+    db.persist(fjall::PersistMode::SyncAll)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    drop(sift_store);
+    drop(db);
 
     let elapsed = t_start.elapsed().as_secs_f64();
     eprintln!(

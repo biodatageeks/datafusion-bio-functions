@@ -243,19 +243,12 @@ impl CacheLoader {
             "Loaded {total_variants} variants into {total_positions} positions ({total_bytes} bytes) in {elapsed:.1}s"
         );
 
-        // Skip fjall's Drop which deadlocks when background worker threads are
-        // busy compacting — the bounded(1000) flume channel fills up and
-        // send(Close) blocks permanently.  All data is persisted and compacted
-        // above, so skipping Drop via mem::forget is safe.
-        // See: https://github.com/biodatageeks/datafusion-bio-functions/issues/86
-        //
-        // In test builds we must run Drop normally so the lock file is released
-        // and subsequent VepKvStore::open() on the same directory succeeds.
-        #[cfg(not(test))]
-        {
-            let store = Arc::into_inner(store).expect("all partition handles joined");
-            std::mem::forget(store);
-        }
+        // Persist after compaction so the new version is durable, then let
+        // Drop run GC to delete old pre-compaction SSTs from disk.
+        // Previously used mem::forget to avoid a deadlock (issue #86), but
+        // that skipped GC and left ~200GB of dead SST files.
+        store.persist()?;
+        drop(store);
 
         Ok(LoadStats {
             total_variants,

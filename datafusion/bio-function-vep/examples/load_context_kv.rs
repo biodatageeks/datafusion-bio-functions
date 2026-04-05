@@ -270,8 +270,8 @@ async fn main() -> Result<()> {
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     println!("  persisted in {:.3}s", t0.elapsed().as_secs_f64());
 
-    // Skip fjall's Drop to avoid potential deadlock (issue #86).
-    std::mem::forget(db);
+    // Let Drop run to trigger GC of old SSTs.
+    drop(db);
 
     println!("Done.");
     Ok(())
