@@ -1872,10 +1872,13 @@ fn transcript_select_list(schema: &Schema) -> String {
         .map(|f| {
             if f.name() == "gene_hgnc_id" {
                 // Propagate: fill NULL gene_hgnc_id from any sibling transcript
-                // sharing the same gene_symbol. Guard with gene_symbol IS NOT NULL
-                // to avoid cross-pollination among NULL-symbol transcripts.
+                // sharing the same gene_symbol. Guards:
+                // - gene_symbol IS NOT NULL: avoid cross-pollination among NULL-symbol transcripts
+                // - gene_symbol_source = 'HGNC': VEP only emits HGNC_ID for HGNC-source
+                //   transcripts (#104); EntrezGene/RFAM transcripts stay empty
                 "COALESCE(gene_hgnc_id, \
                      CASE WHEN gene_symbol IS NOT NULL \
+                               AND gene_symbol_source = 'HGNC' \
                           THEN FIRST_VALUE(gene_hgnc_id) IGNORE NULLS \
                                OVER (PARTITION BY gene_symbol \
                                      ORDER BY gene_hgnc_id NULLS LAST) \
