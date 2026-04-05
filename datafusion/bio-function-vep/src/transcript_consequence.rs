@@ -40,8 +40,22 @@ impl VariantInput {
             .take_while(|(a, b)| a == b)
             .count();
 
-        if prefix_len == 0 || (prefix_len == ref_bytes.len() && prefix_len == alt_bytes.len()) {
-            // No trimming needed (SNV or identical alleles)
+        // Skip trimming for identical alleles or same-length substitutions
+        // with no common prefix (SNV/MNV). Different-length alleles (indels)
+        // still need suffix trimming even when prefix_len==0, e.g.
+        // T→AGTAAATTTTTTTTCT suffix-trims to ""→"AGTAAATTTTTTTTC" (insertion).
+        if prefix_len == ref_bytes.len() && prefix_len == alt_bytes.len() {
+            return Self {
+                chrom,
+                start: pos,
+                end,
+                ref_allele,
+                alt_allele,
+                hgvs_shift_forward: None,
+                hgvs_shift_reverse: None,
+            };
+        }
+        if prefix_len == 0 && ref_bytes.len() == alt_bytes.len() {
             return Self {
                 chrom,
                 start: pos,
@@ -6895,6 +6909,23 @@ mod tests {
         let v = VariantInput::from_vcf("22".into(), 100, 104, "AGCGT".into(), "AT".into());
         assert_eq!(v.ref_allele, "GCG");
         assert_eq!(v.alt_allele, "-");
+    }
+
+    #[test]
+    fn from_vcf_suffix_only_trim_no_common_prefix() {
+        // T→AGTAAATTTTTTTTCT: no common prefix, but common suffix "T".
+        // After suffix trim: ref="" alt="AGTAAATTTTTTTTC" → pure insertion.
+        let v = VariantInput::from_vcf(
+            "14".into(),
+            41106449,
+            41106449,
+            "T".into(),
+            "AGTAAATTTTTTTTCT".into(),
+        );
+        assert_eq!(v.ref_allele, "-");
+        assert_eq!(v.alt_allele, "AGTAAATTTTTTTTC");
+        assert_eq!(v.start, 41106449);
+        assert_eq!(v.end, 41106449);
     }
 
     // ---- classify_coding_change: SNV codons and amino acids ----
