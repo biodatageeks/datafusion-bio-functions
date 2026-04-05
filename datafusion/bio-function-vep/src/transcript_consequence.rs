@@ -2008,26 +2008,38 @@ impl TranscriptConsequenceEngine {
             if before_start_end >= tx.start.saturating_sub(self.upstream_distance)
                 && before_start_end < tx.start
             {
-                let dist = tx.start.saturating_sub(variant.end).max(0);
+                // VEP's _before_start() uses (transcript_start - 1) - variant_end
+                let dist = tx
+                    .start
+                    .saturating_sub(variant.end)
+                    .saturating_sub(1)
+                    .max(0);
                 return Some((SoTerm::UpstreamGeneVariant, dist));
             }
             let down_start = tx.end.saturating_add(1);
             let down_end = tx.end.saturating_add(self.downstream_distance);
             if overlaps(check_start, variant.end, down_start, down_end) {
-                let dist = check_start.saturating_sub(tx.end).max(0);
+                // VEP's _after_end() uses variant_start - (transcript_end + 1)
+                let dist = check_start.saturating_sub(tx.end).saturating_sub(1).max(0);
                 return Some((SoTerm::DownstreamGeneVariant, dist));
             }
         } else {
             let up_start = tx.end.saturating_add(1);
             let up_end = tx.end.saturating_add(self.upstream_distance);
             if overlaps(check_start, variant.end, up_start, up_end) {
-                let dist = check_start.saturating_sub(tx.end).max(0);
+                // VEP's _after_end() uses variant_start - (transcript_end + 1)
+                let dist = check_start.saturating_sub(tx.end).saturating_sub(1).max(0);
                 return Some((SoTerm::UpstreamGeneVariant, dist));
             }
             if before_start_end >= tx.start.saturating_sub(self.downstream_distance)
                 && before_start_end < tx.start
             {
-                let dist = tx.start.saturating_sub(variant.end).max(0);
+                // VEP's _before_start() uses (transcript_start - 1) - variant_end
+                let dist = tx
+                    .start
+                    .saturating_sub(variant.end)
+                    .saturating_sub(1)
+                    .max(0);
                 return Some((SoTerm::DownstreamGeneVariant, dist));
             }
         }
@@ -5037,6 +5049,113 @@ mod tests {
         let out = engine.evaluate_variant(&variant, std::slice::from_ref(&negative), &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].terms, vec![SoTerm::IntergenicVariant]);
+    }
+
+    /// VEP DISTANCE convention: 0 means "immediately adjacent to transcript
+    /// boundary" (1bp gap between variant and transcript). Verify all four
+    /// strand × direction combinations.
+    #[test]
+    fn upstream_downstream_distance_matches_vep_convention() {
+        let engine = TranscriptConsequenceEngine::new(5000, 5000);
+
+        // Positive-strand transcript: start=1000, end=2000
+        let pos = tx(
+            "txp",
+            "22",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1100),
+            Some(1900),
+        );
+        // Negative-strand transcript: start=3000, end=4000
+        let neg = tx(
+            "txn",
+            "22",
+            3000,
+            4000,
+            -1,
+            "protein_coding",
+            Some(3100),
+            Some(3900),
+        );
+
+        // ── Upstream, positive strand ──
+        // Variant at pos 900, tx.start=1000 → VEP: (1000-1) - 900 = 99
+        let up_p = engine.evaluate_variant(
+            &var("22", 900, 900, "A", "G"),
+            std::slice::from_ref(&pos),
+            &[],
+        );
+        assert_eq!(up_p[0].terms, vec![SoTerm::UpstreamGeneVariant]);
+        assert_eq!(up_p[0].distance, Some(99));
+
+        // Variant at pos 999 (immediately before tx) → VEP distance = 0
+        let up_p_adj = engine.evaluate_variant(
+            &var("22", 999, 999, "A", "G"),
+            std::slice::from_ref(&pos),
+            &[],
+        );
+        assert_eq!(up_p_adj[0].terms, vec![SoTerm::UpstreamGeneVariant]);
+        assert_eq!(up_p_adj[0].distance, Some(0));
+
+        // ── Downstream, positive strand ──
+        // Variant at pos 2100, tx.end=2000 → VEP: 2100 - (2000+1) = 99
+        let down_p = engine.evaluate_variant(
+            &var("22", 2100, 2100, "A", "G"),
+            std::slice::from_ref(&pos),
+            &[],
+        );
+        assert_eq!(down_p[0].terms, vec![SoTerm::DownstreamGeneVariant]);
+        assert_eq!(down_p[0].distance, Some(99));
+
+        // Variant at pos 2001 (immediately after tx) → VEP distance = 0
+        let down_p_adj = engine.evaluate_variant(
+            &var("22", 2001, 2001, "A", "G"),
+            std::slice::from_ref(&pos),
+            &[],
+        );
+        assert_eq!(down_p_adj[0].terms, vec![SoTerm::DownstreamGeneVariant]);
+        assert_eq!(down_p_adj[0].distance, Some(0));
+
+        // ── Upstream, negative strand (after tx.end) ──
+        // Variant at pos 4100, tx.end=4000 → VEP: 4100 - (4000+1) = 99
+        let up_n = engine.evaluate_variant(
+            &var("22", 4100, 4100, "A", "G"),
+            std::slice::from_ref(&neg),
+            &[],
+        );
+        assert_eq!(up_n[0].terms, vec![SoTerm::UpstreamGeneVariant]);
+        assert_eq!(up_n[0].distance, Some(99));
+
+        // Variant at pos 4001 (immediately after tx) → VEP distance = 0
+        let up_n_adj = engine.evaluate_variant(
+            &var("22", 4001, 4001, "A", "G"),
+            std::slice::from_ref(&neg),
+            &[],
+        );
+        assert_eq!(up_n_adj[0].terms, vec![SoTerm::UpstreamGeneVariant]);
+        assert_eq!(up_n_adj[0].distance, Some(0));
+
+        // ── Downstream, negative strand (before tx.start) ──
+        // Variant at pos 2900, tx.start=3000 → VEP: (3000-1) - 2900 = 99
+        let down_n = engine.evaluate_variant(
+            &var("22", 2900, 2900, "A", "G"),
+            std::slice::from_ref(&neg),
+            &[],
+        );
+        assert_eq!(down_n[0].terms, vec![SoTerm::DownstreamGeneVariant]);
+        assert_eq!(down_n[0].distance, Some(99));
+
+        // Variant at pos 2999 (immediately before tx) → VEP distance = 0
+        let down_n_adj = engine.evaluate_variant(
+            &var("22", 2999, 2999, "A", "G"),
+            std::slice::from_ref(&neg),
+            &[],
+        );
+        assert_eq!(down_n_adj[0].terms, vec![SoTerm::DownstreamGeneVariant]);
+        assert_eq!(down_n_adj[0].distance, Some(0));
     }
 
     #[test]
