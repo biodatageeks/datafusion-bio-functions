@@ -35,20 +35,29 @@ fn main() {
         .open()
         .expect("failed to open fjall database");
 
-    // Only the keyspaces that should exist in production fjall stores.
-    // variation.fjall: "meta" + "data"
-    // translation_sift.fjall: "sift"
-    let known_keyspaces = ["data", "meta", "sift"];
-
-    for ks_name in &known_keyspaces {
-        if target_keyspace.is_some_and(|t| *ks_name != t) {
-            continue;
+    // Each fjall store has its own set of keyspaces:
+    //   variation.fjall:        "meta" + "data"
+    //   translation_sift.fjall: "sift"
+    // When a specific keyspace is requested via CLI arg, compact only that.
+    // Otherwise, compact only keyspaces that actually exist in this store.
+    let explicit: [&str; 1];
+    let keyspaces_to_try: &[&str] = if let Some(name) = target_keyspace {
+        // User explicitly chose — trust them.
+        explicit = [name];
+        &explicit
+    } else {
+        // Auto-detect: only try keyspaces that belong to known store types.
+        if fjall_path.contains("translation_sift") {
+            &["sift"]
+        } else {
+            // variation.fjall or unknown — try meta + data.
+            &["meta", "data"]
         }
+    };
 
-        // Guard: only open keyspaces that already exist. db.keyspace() with
-        // KeyspaceCreateOptions::default creates the keyspace if missing —
-        // that would introduce the extra keyspaces this PR removes (~10% perf hit).
+    for ks_name in keyspaces_to_try {
         if !db.keyspace_exists(ks_name) {
+            eprintln!("Keyspace '{ks_name}' not found, skipping");
             continue;
         }
 
