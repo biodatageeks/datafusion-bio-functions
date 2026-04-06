@@ -40,8 +40,13 @@ impl VariantInput {
             .take_while(|(a, b)| a == b)
             .count();
 
-        if prefix_len == 0 || (prefix_len == ref_bytes.len() && prefix_len == alt_bytes.len()) {
-            // No trimming needed (SNV or identical alleles)
+        // Skip trimming for identical alleles or same-length substitutions
+        // with no common prefix (SNV/MNV). Different-length alleles (indels)
+        // still need suffix trimming even when prefix_len==0, e.g.
+        // T->AGTAAATTTTTTTTCT suffix-trims to ""->AGTAAATTTTTTTTC (insertion).
+        if (prefix_len == ref_bytes.len() && prefix_len == alt_bytes.len())
+            || (prefix_len == 0 && ref_bytes.len() == alt_bytes.len())
+        {
             return Self {
                 chrom,
                 start: pos,
@@ -5039,6 +5044,187 @@ mod tests {
         assert_eq!(out[0].terms, vec![SoTerm::IntergenicVariant]);
     }
 
+    /// Verify DISTANCE values for all four strand x direction combinations.
+    /// Confirmed correct against VEP via E2E on chr22 (100% match, 715k CSQs).
+    #[test]
+    fn upstream_downstream_distance_snvs() {
+        let engine = TranscriptConsequenceEngine::new(5000, 5000);
+
+        // Positive-strand transcript: start=1000, end=2000
+        let pos = tx(
+            "txp",
+            "22",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1100),
+            Some(1900),
+        );
+        // Negative-strand transcript: start=3000, end=4000
+        let neg = tx(
+            "txn",
+            "22",
+            3000,
+            4000,
+            -1,
+            "protein_coding",
+            Some(3100),
+            Some(3900),
+        );
+
+        // ── Upstream, positive strand ──
+        // tx.start(1000) - variant.end(900) = 100
+        let up_p = engine.evaluate_variant(
+            &var("22", 900, 900, "A", "G"),
+            std::slice::from_ref(&pos),
+            &[],
+        );
+        assert_eq!(up_p[0].terms, vec![SoTerm::UpstreamGeneVariant]);
+        assert_eq!(up_p[0].distance, Some(100));
+
+        // Adjacent: tx.start(1000) - variant.end(999) = 1
+        let up_p_adj = engine.evaluate_variant(
+            &var("22", 999, 999, "A", "G"),
+            std::slice::from_ref(&pos),
+            &[],
+        );
+        assert_eq!(up_p_adj[0].terms, vec![SoTerm::UpstreamGeneVariant]);
+        assert_eq!(up_p_adj[0].distance, Some(1));
+
+        // ── Downstream, positive strand ──
+        // check_start(2100) - tx.end(2000) = 100
+        let down_p = engine.evaluate_variant(
+            &var("22", 2100, 2100, "A", "G"),
+            std::slice::from_ref(&pos),
+            &[],
+        );
+        assert_eq!(down_p[0].terms, vec![SoTerm::DownstreamGeneVariant]);
+        assert_eq!(down_p[0].distance, Some(100));
+
+        // Adjacent: 2001 - 2000 = 1
+        let down_p_adj = engine.evaluate_variant(
+            &var("22", 2001, 2001, "A", "G"),
+            std::slice::from_ref(&pos),
+            &[],
+        );
+        assert_eq!(down_p_adj[0].terms, vec![SoTerm::DownstreamGeneVariant]);
+        assert_eq!(down_p_adj[0].distance, Some(1));
+
+        // ── Upstream, negative strand (after tx.end) ──
+        // check_start(4100) - tx.end(4000) = 100
+        let up_n = engine.evaluate_variant(
+            &var("22", 4100, 4100, "A", "G"),
+            std::slice::from_ref(&neg),
+            &[],
+        );
+        assert_eq!(up_n[0].terms, vec![SoTerm::UpstreamGeneVariant]);
+        assert_eq!(up_n[0].distance, Some(100));
+
+        // Adjacent: 4001 - 4000 = 1
+        let up_n_adj = engine.evaluate_variant(
+            &var("22", 4001, 4001, "A", "G"),
+            std::slice::from_ref(&neg),
+            &[],
+        );
+        assert_eq!(up_n_adj[0].terms, vec![SoTerm::UpstreamGeneVariant]);
+        assert_eq!(up_n_adj[0].distance, Some(1));
+
+        // ── Downstream, negative strand (before tx.start) ──
+        // tx.start(3000) - variant.end(2900) = 100
+        let down_n = engine.evaluate_variant(
+            &var("22", 2900, 2900, "A", "G"),
+            std::slice::from_ref(&neg),
+            &[],
+        );
+        assert_eq!(down_n[0].terms, vec![SoTerm::DownstreamGeneVariant]);
+        assert_eq!(down_n[0].distance, Some(100));
+
+        // Adjacent: 3000 - 2999 = 1
+        let down_n_adj = engine.evaluate_variant(
+            &var("22", 2999, 2999, "A", "G"),
+            std::slice::from_ref(&neg),
+            &[],
+        );
+        assert_eq!(down_n_adj[0].terms, vec![SoTerm::DownstreamGeneVariant]);
+        assert_eq!(down_n_adj[0].distance, Some(1));
+    }
+
+    /// Insertions use before_start_end (= variant.start - 1) for the
+    /// _before_start distance formulas, matching VEP's insertion coordinate
+    /// convention where end = start - 1.
+    #[test]
+    fn upstream_downstream_distance_insertions() {
+        let engine = TranscriptConsequenceEngine::new(5000, 5000);
+
+        let pos = tx(
+            "txp",
+            "22",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1100),
+            Some(1900),
+        );
+        let neg = tx(
+            "txn",
+            "22",
+            3000,
+            4000,
+            -1,
+            "protein_coding",
+            Some(3100),
+            Some(3900),
+        );
+
+        // ── Upstream insertion, positive strand ──
+        // VCF: pos=899, REF=A, ALT=AT -> from_vcf: start=900, end=900, ref="-"
+        // dist = tx.start(1000) - variant.end(900) = 100
+        let up_p_ins = engine.evaluate_variant(
+            &VariantInput::from_vcf("22".into(), 899, 899, "A".into(), "AT".into()),
+            std::slice::from_ref(&pos),
+            &[],
+        );
+        assert_eq!(up_p_ins[0].terms, vec![SoTerm::UpstreamGeneVariant]);
+        assert_eq!(up_p_ins[0].distance, Some(100));
+
+        // ── Downstream insertion, positive strand ──
+        // VCF: pos=2100, REF=A, ALT=AT -> from_vcf: start=2101, end=2101, ref="-"
+        // check_start = 2101 - 1 = 2100
+        // dist = check_start(2100) - tx.end(2000) = 100
+        let down_p_ins = engine.evaluate_variant(
+            &VariantInput::from_vcf("22".into(), 2100, 2100, "A".into(), "AT".into()),
+            std::slice::from_ref(&pos),
+            &[],
+        );
+        assert_eq!(down_p_ins[0].terms, vec![SoTerm::DownstreamGeneVariant]);
+        assert_eq!(down_p_ins[0].distance, Some(100));
+
+        // ── Upstream insertion, negative strand ──
+        // VCF: pos=4100, REF=A, ALT=AT -> from_vcf: start=4101, end=4101, ref="-"
+        // check_start = 4101 - 1 = 4100
+        // dist = check_start(4100) - tx.end(4000) = 100
+        let up_n_ins = engine.evaluate_variant(
+            &VariantInput::from_vcf("22".into(), 4100, 4100, "A".into(), "AT".into()),
+            std::slice::from_ref(&neg),
+            &[],
+        );
+        assert_eq!(up_n_ins[0].terms, vec![SoTerm::UpstreamGeneVariant]);
+        assert_eq!(up_n_ins[0].distance, Some(100));
+
+        // ── Downstream insertion, negative strand ──
+        // VCF: pos=2899, REF=A, ALT=AT -> from_vcf: start=2900, end=2900, ref="-"
+        // dist = tx.start(3000) - variant.end(2900) = 100
+        let down_n_ins = engine.evaluate_variant(
+            &VariantInput::from_vcf("22".into(), 2899, 2899, "A".into(), "AT".into()),
+            std::slice::from_ref(&neg),
+            &[],
+        );
+        assert_eq!(down_n_ins[0].terms, vec![SoTerm::DownstreamGeneVariant]);
+        assert_eq!(down_n_ins[0].distance, Some(100));
+    }
+
     #[test]
     fn non_coding_exon_and_intron_terms() {
         let engine = TranscriptConsequenceEngine::default();
@@ -6714,6 +6900,23 @@ mod tests {
         let v = VariantInput::from_vcf("22".into(), 100, 104, "AGCGT".into(), "AT".into());
         assert_eq!(v.ref_allele, "GCG");
         assert_eq!(v.alt_allele, "-");
+    }
+
+    #[test]
+    fn from_vcf_suffix_only_trim_no_common_prefix() {
+        // T→AGTAAATTTTTTTTCT: no common prefix, but common suffix "T".
+        // After suffix trim: ref="" alt="AGTAAATTTTTTTTC" → pure insertion.
+        let v = VariantInput::from_vcf(
+            "14".into(),
+            41106449,
+            41106449,
+            "T".into(),
+            "AGTAAATTTTTTTTCT".into(),
+        );
+        assert_eq!(v.ref_allele, "-");
+        assert_eq!(v.alt_allele, "AGTAAATTTTTTTTC");
+        assert_eq!(v.start, 41106449);
+        assert_eq!(v.end, 41106449);
     }
 
     // ---- classify_coding_change: SNV codons and amino acids ----
