@@ -1035,6 +1035,7 @@ impl TranscriptConsequenceEngine {
         // of the surrounding coding context.  If the variant is within CDS
         // bounds and sits in a frameshift intron, emit coding_sequence_variant.
         let in_frameshift_intron = !overlaps_exon && self.in_frameshift_intron(variant, tx_exons);
+        let cds_overlap = self.overlaps_cds(variant, tx);
 
         if is_non_coding_biotype(&tx.biotype) && overlaps_exon {
             // VEP: mature_miRNA_variant for miRNA transcripts where variant
@@ -1054,10 +1055,8 @@ impl TranscriptConsequenceEngine {
             if !in_mature_mirna {
                 terms.insert(SoTerm::NonCodingTranscriptExonVariant);
             }
-        } else if (overlaps_exon
-            || cds_end_exon_boundary
-            || (in_frameshift_intron && self.overlaps_cds(variant, tx)))
-            && (self.overlaps_cds(variant, tx) || ins_left_flank_in_cds)
+        } else if (overlaps_exon || cds_end_exon_boundary || (in_frameshift_intron && cds_overlap))
+            && (cds_overlap || ins_left_flank_in_cds)
         {
             // VEP's TranscriptMapper includes frameshift intron (≤13bp) bases
             // in the CDS, so genomic2cds() returns valid CDS coordinates for
@@ -11068,5 +11067,91 @@ mod tests {
             "Should NOT only have coding_sequence_variant, got: {:?}",
             terms
         );
+    }
+
+    #[test]
+    fn issue_118_frameshift_intron_insertion_populates_coding_fields() {
+        // Stronger test for frameshift intron: insertion at exon1.end + 1
+        // where the anchor (variant.start - 1 = exon1.end) maps to CDS.
+        // classify_insertion should succeed and populate CDS/protein fields.
+        //
+        // Layout: exon1(1000-1008) — 10bp intron(1009-1018) — exon2(1019-1030)
+        // CDS: 1000-1030, insert 4bp at position 1009 (exon1.end + 1).
+        // Anchor: variant.start - 1 = 1008 = exon1.end → maps to CDS index 8.
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGCTGAATGATTTCCCGGG"; // 21 bases
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1040,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1030),
+        );
+        t.cdna_coding_end = Some(21);
+        t.spliced_seq = Some(format!("{cds}AAATTT"));
+        let e1 = exon("T1", 1, 1000, 1008);
+        let e2 = exon("T1", 2, 1019, 1030);
+        let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
+        let tr = translation("T1", Some(21), Some(7), None, Some(cds));
+        // Insert at 1009 — anchor at 1008 (exon1.end) maps to CDS index 8
+        let v = var("1", 1009, 1009, "-", "GGGG");
+        let (terms, coding_class) =
+            engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            term_set.contains(&SoTerm::FrameshiftVariant),
+            "Should have frameshift_variant, got: {:?}",
+            terms
+        );
+        let cc = coding_class.expect("Coding classification must be present");
+        assert!(cc.cds_position_start.is_some(), "CDS position must be set");
+        assert!(
+            cc.protein_position_start.is_some(),
+            "Protein position must be set"
+        );
+    }
+
+    #[test]
+    fn issue_118_positive_strand_insertion_anchor_fallback() {
+        // Positive strand: insertion at the first base of a non-first exon.
+        // Primary anchor (variant.start - 1) is in the intron → fails.
+        // Fallback: variant.start = first base of next exon → maps to CDS.
+        //
+        // Layout: exon1(1000-1008) — intron(1009-1019) — exon2(1020-1030)
+        // CDS: 1000-1030 (spans both exons)
+        // Insert "G" at position 1020 (exon2 start).
+        // Primary anchor: 1019 (intron) → fails.
+        // Fallback: 1020 (exon2 first base) → maps, cds_idx adjusted by -1.
+        let cds = "ATGGCTGAAATGGCTGAAATG"; // 21 bases (9 + 12)
+        let t = tx(
+            "T1",
+            "1",
+            990,
+            1040,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1030),
+        );
+        let e1 = exon("T1", 1, 1000, 1008);
+        let e2 = exon("T1", 2, 1020, 1030);
+        let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
+        let v = var("1", 1020, 1020, "-", "G");
+        let c = classify_insertion(&t, &exons_ref, cds, &v, "G");
+        assert!(
+            c.is_some(),
+            "classify_insertion must succeed with positive-strand anchor fallback"
+        );
+        let c = c.unwrap();
+        // CDS index: exon1 has 9 bases (indices 0-8). Fallback maps 1020
+        // (first base of exon2) to CDS index 9, adjusted -1 → cds_idx = 8.
+        // cds_position_start = 8 + 1 = 9, cds_position_end = 10.
+        assert_eq!(c.cds_position_start, Some(9), "CDS position start");
+        assert_eq!(c.cds_position_end, Some(10), "CDS position end");
+        assert_eq!(c.protein_position_start, Some(3), "Protein position");
+        assert!(c.codons.is_some(), "Codons must be populated");
     }
 }
