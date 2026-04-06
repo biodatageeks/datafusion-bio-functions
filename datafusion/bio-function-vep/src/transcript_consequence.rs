@@ -1005,6 +1005,23 @@ impl TranscriptConsequenceEngine {
             }
         });
 
+        // VEP's within_cds() uses inverted insertion coordinates (start > end)
+        // which naturally span the CDS boundary in overlap checks.  An insertion
+        // at exon.end+1 where the left flank (exon.end) is in the CDS is
+        // considered within CDS by VEP, even though it fails overlaps_exon.
+        // This handles transcripts where the last coding exon ends at the CDS
+        // boundary (no 3' UTR exon extension).
+        //
+        // Traceability:
+        // - Ensembl Variation `BaseTranscriptVariationAllele::within_cds()`
+        //   checks cds_start/cds_end via genomic2cds mapper which maps both
+        //   insertion flanks independently
+        //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L627-L648>
+        let cds_end_exon_boundary = is_ins
+            && !overlaps_exon
+            && self.insertion_left_flank_in_cds(variant, tx)
+            && tx_exons.iter().any(|e| variant.start == e.end + 1);
+
         // VEP adds intron_variant when the variant overlaps the intron body
         // (excluding splice site positions at the first/last 2bp).  The
         // narrower range in variant_overlaps_intron handles this correctly
@@ -1043,7 +1060,7 @@ impl TranscriptConsequenceEngine {
             // intron bases).  Emit only coding_sequence_variant — no
             // specific child (frameshift/inframe) — so it survives stripping.
             terms.insert(SoTerm::CodingSequenceVariant);
-        } else if overlaps_exon
+        } else if (overlaps_exon || cds_end_exon_boundary)
             && (self.overlaps_cds(variant, tx)
                 || (is_ins && self.insertion_left_flank_in_cds(variant, tx)))
         {
@@ -1081,7 +1098,10 @@ impl TranscriptConsequenceEngine {
         // VEP's _after_coding: insertions right at an exon boundary where
         // the exon contains CDS get a UTR term even though the insertion
         // doesn't overlap the exon (it falls in the intron).
+        // Skip this for CDS boundary insertions that already entered the
+        // coding path — VEP's _after_coding gates on !within_cds().
         if is_ins
+            && !cds_end_exon_boundary
             && !terms.contains(&SoTerm::ThreePrimeUtrVariant)
             && !terms.contains(&SoTerm::FivePrimeUtrVariant)
         {
@@ -10512,6 +10532,55 @@ mod tests {
         assert!(
             engine.insertion_left_flank_in_cds(&v_boundary, &t),
             "Insertion at cds_end+1 (neg strand 5' end) left flank should be in CDS"
+        );
+    }
+
+    #[test]
+    fn cds_end_exon_boundary_insertion_enters_coding_path() {
+        // Issue #118: insertion at exon end where exon.end == cds_end.
+        // The exon does NOT extend into UTR, so overlaps_exon is FALSE.
+        // But VEP's within_cds() maps the left flank to CDS and gives
+        // coding consequences.
+        //
+        // Transcript: 990-1030, CDS: 1000-1008, Exon: 1000-1008
+        // (exon ends exactly at CDS end — no UTR extension)
+        // Insertion at position 1009 (exon.end + 1 == cds_end + 1)
+        let engine = TranscriptConsequenceEngine::default();
+        let mut t = tx(
+            "T1",
+            "22",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        t.cdna_coding_end = Some(9);
+        t.spliced_seq = Some("ATGGAATGACCCGGG".to_string());
+        // Exon ends at CDS end (no UTR in this exon)
+        let e = exon("T1", 1, 1000, 1008);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(9), Some(3), Some("ME*"), Some("ATGGAATGA"));
+        let v = var("22", 1009, 1009, "-", "G");
+        let (terms, coding_class) =
+            engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            term_set.contains(&SoTerm::FrameshiftVariant)
+                || term_set.contains(&SoTerm::CodingSequenceVariant),
+            "Exon-boundary CDS-end insertion should produce coding consequence, got: {:?}",
+            terms
+        );
+        // Should NOT have 3'UTR (VEP's _after_coding gates on !within_cds)
+        assert!(
+            !term_set.contains(&SoTerm::ThreePrimeUtrVariant),
+            "Should NOT have 3'UTR for CDS boundary insertion, got: {:?}",
+            terms
+        );
+        assert!(
+            coding_class.is_some(),
+            "Coding classification should be present"
         );
     }
 }
