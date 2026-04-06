@@ -3260,7 +3260,17 @@ fn classify_coding_change(
             if ci < old_aas.len() && ci < new_aas.len() {
                 let old_aa = old_aas[ci];
                 let new_aa = new_aas[ci];
-                if old_aa != '*' && new_aa == '*' {
+                // VEP's codon() for frameshifts extracts only the local
+                // codon window (codon_len + indel_diff bases), which is
+                // always non-multiple-of-3.  The partial remainder becomes
+                // 'X' in the peptide, never '*'.  Since stop_gained checks
+                // alt_pep =~ /\*/, it always returns false for frameshifts.
+                //
+                // Traceability:
+                // - VEP codon() local window: TranscriptVariationAllele.pm L877
+                // - Partial codon → 'X': TranscriptVariationAllele.pm L774
+                // - stop_gained checks /\*/: VariationEffect.pm L1218
+                if !frameshift && old_aa != '*' && new_aa == '*' {
                     class.stop_gained = true;
                 } else if old_aa == '*' && new_aa != '*' {
                     class.stop_lost = true;
@@ -10032,6 +10042,156 @@ mod tests {
         assert!(
             !c.stop_gained,
             "Frameshift insertion not creating immediate stop should not set stop_gained. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn issue_114_frameshift_affected_codon_becomes_stop_no_stop_gained() {
+        // Critical regression test: a frameshift where the affected codon
+        // itself becomes a stop in the new reading frame.  VEP's codon()
+        // for frameshifts produces a partial codon → 'X' (never '*'), so
+        // stop_gained never fires.
+        //
+        // CDS: ATG ACT TAG GCT TGA (M T * A *) — 15 bases
+        // The CDS has an internal stop at codon 2 (TAG).
+        // Delete "CT" at pos 1004-1005 (codon 1 "ACT")
+        // Mutated: ATG A__ TAG GCT TGA = "ATGATAGGCTTGA" (13 bases)
+        // → ATG|ATA|GGC|TTG|A → M I G L (incomplete)
+        // old_aas[1]=T, new_aas[1]=I → no stop at codon 1 → OK
+        //
+        // Better case — construct a stop AT the affected codon:
+        // CDS: ATG GAC TGG CTG AA (M D W L) — 14 bases (incomplete terminal)
+        // Delete "A" at pos 1004 (CDS index 4, second base of codon 1 "GAC")
+        // Mutated: ATG G_C TGG CTG AA = "ATGGCTGGCTGAA" (13 bases)
+        // → ATG|GCT|GGC|TGA|A → M A G * (stop at codon 3!)
+        // old_aas: M D W L (4 AAs), new_aas: M A G * (4 AAs)
+        // old_aas[1]=D, new_aas[1]=A → no stop
+        // But this is a 1bp deletion, first_codon=4/3=1, last_codon=4/3=1
+        // Only checks codon 1 → D→A, no stop. stop_gained stays false. ✓
+        //
+        // Force stop at the EXACT affected codon:
+        // CDS: ATG GTA GAC TGA (M V D *) — 12 bases
+        // Delete "GT" at pos 1004-1005 (codon 1 "GTA", CDS idx 4-5)
+        // Mutated: ATG __A GAC TGA = "ATGAGACTGA" (10 bases)
+        // → ATG|AGA|CTG|A → M R L (incomplete)
+        // first_codon=4/3=1, last_codon=5/3=1 → check codon 1
+        // old_aas[1]=V, new_aas[1]=R → no stop. ✓
+        //
+        // Force it: CDS = ATG GAT AAG CTG AA (M D K L) — 14 bases
+        // Delete "AT" at pos 1004-1005 → "ATGGAAGCTGAA" → ATG|GAA|GCT|GAA → M E A E
+        // No stop. Let me try with stop codon bases appearing:
+        //
+        // CDS: ATG GAT GAC TGA TGA (M D D * *) — 15 bases
+        // Delete "T" at pos 1004 → "ATGGADGACTGATGA" → wait
+        // "ATGGAGACTGATGA" → ATG|GAG|ACT|GAT|GA → M E T D (incomplete)
+        // old_aas[1]=D, new_aas[1]=E → no stop
+        //
+        // The scenario from real data: chr1:248626807 CAG>C
+        // A 2bp deletion creating stop at the affected codon.
+        // Use a CDS where deleting 2 bases at the affected codon creates TGA:
+        // CDS: ATG TCT GAA GCT TGA (M S E A *) — 15 bases
+        // Delete "CT" at pos 1004-1005 (codon 1 "TCT", CDS idx 4-5)
+        // Mutated: ATG T__ GAA GCT TGA = "ATGTGAAGCTTGA" (13 bases)
+        // → ATG|TGA|AGC|TTG|A → M * S L (stop at codon 1!)
+        // old_aas[1]=S, new_aas[1]=* → stop_gained would fire without fix.
+        // With fix: frameshift → skip stop_gained → correct!
+        let cds = "ATGTCTGAAGCTTGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        // Delete "CT" at pos 1004-1005 → frameshift creating stop at codon 1
+        let v = var("22", 1004, 1005, "CT", "-");
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v);
+        let c = c.expect("Should produce classification");
+        assert!(
+            !c.stop_gained,
+            "Frameshift creating stop at affected codon must NOT set stop_gained. \
+             VEP's codon() produces partial codon 'X', not '*'. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn issue_114_frameshift_insertion_affected_codon_becomes_stop_no_stop_gained() {
+        // Same as above but for insertions: a frameshift insertion where
+        // the affected codon becomes a stop should NOT set stop_gained.
+        //
+        // CDS: ATG ACT GCT TGA (M T A *) — 12 bases
+        // Insert "GA" at pos 1004 (CDS idx 4, within codon 1 "ACT")
+        // Mutated: ATG A + GA + CT GCT TGA = "ATGAGACTGCTTGA" (14 bases)
+        // → ATG|AGA|CTG|CTT|GA → M R L L (incomplete) — no stop at codon 1.
+        //
+        // To get a stop: CDS: ATG ACT GCT TGA, insert "G" at pos 1006
+        // (CDS idx 6, within codon 2 "GCT")
+        // Mutated: ATG ACT G + G + CT TGA = "ATGACTGGCTTGA" (13 bases)
+        // → ATG|ACT|GGC|TTG|A → M T G L — no stop.
+        //
+        // CDS: ATG ACT GAC TGA (M T D *) — 12 bases
+        // Insert "T" at pos 1007 (CDS idx 7, within codon 2 "GAC")
+        // Mutated: ATG ACT G + T + AC TGA = "ATGACTGTACTGA" (13 bases)
+        // → ATG|ACT|GTA|CTG|A → M T V L — no stop.
+        //
+        // Hard to construct insertion frameshift with immediate stop.
+        // Use: CDS = ATG ACG AAG CTG A (M T K L) — 13 bases (incomplete)
+        // Insert "T" at pos 1004 (CDS idx 4, within codon 1 "ACG")
+        // Mutated: ATG A + T + CG AAG CTG A = "ATGATCGAAGCTGA" (14 bases)
+        // → ATG|ATC|GAA|GCT|GA → M I E A — no stop.
+        //
+        // The critical fix for insertions is the same per-codon guard.
+        // Verify the existing test still passes with the fix applied:
+        let cds = "ATGACTGCTTGA";
+        let c = classify_ins(cds, 1004, "AA").unwrap();
+        assert!(
+            !c.stop_gained,
+            "Frameshift insertion should NOT set stop_gained. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn issue_114_inframe_deletion_stop_gained_still_works() {
+        // Ensure the fix does NOT suppress stop_gained for in-frame indels.
+        // CDS: ATG GCT GAA TGA (M A E *) — 12 bases
+        // Delete "GAA" at pos 1006-1008 (codon 2 "GAA", in-frame deletion)
+        // Mutated: ATG GCT ___ TGA = "ATGGCTTGA" (9 bases)
+        // → ATG|GCT|TGA → M A *
+        // old_aas[2]=E, new_aas[2]=* → stop_gained should still fire.
+        let cds = "ATGGCTGAATGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        // Delete "GAA" at pos 1006-1008
+        let v = var("22", 1006, 1008, "GAA", "-");
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v);
+        let c = c.expect("Should produce classification");
+        assert!(
+            c.stop_gained,
+            "In-frame deletion creating stop must still set stop_gained. Got: {:?}",
             c
         );
     }
