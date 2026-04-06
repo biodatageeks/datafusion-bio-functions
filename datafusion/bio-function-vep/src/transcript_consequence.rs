@@ -1577,15 +1577,20 @@ impl TranscriptConsequenceEngine {
     }
 
     /// For insertions, check if the left flanking base (variant.start - 1)
-    /// is within the CDS.  VEP uses inverted coordinates for insertions
-    /// (start > end), which naturally includes the CDS boundary in its
-    /// overlap check.  Our coordinate convention (start == end) misses
-    /// insertions right at cds_end, so we check the left flank separately.
+    /// is within the CDS at the 3' end (stop-codon side).
+    ///
+    /// VEP's `_overlap_cds()` uses inverted insertion coordinates
+    /// (start = pos+1, end = pos) with `overlap(coding_start, coding_end,
+    /// vf.start, vf.end)`.  This resolves to:
+    ///   coding_start <= pos  AND  coding_end >= pos+1
+    /// i.e., the VCF padding base must be strictly before the last CDS base.
+    ///
+    /// On **negative strand**, the 5' CDS end is at cds_end (genomic).
+    /// An insertion at cds_end+1 is in the 5'UTR, not the CDS.  VEP's
+    /// overlap returns FALSE (coding_end < vf.start).  Exclude this case.
     ///
     /// Traceability:
     /// - Ensembl Variation `BaseTranscriptVariationAllele::_overlap_cds()`
-    ///   uses generic overlap on (vf.start, vf.end) where insertions have
-    ///   start = pos+1, end = pos — the swapped pair spans the CDS boundary.
     ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L511-L518>
     fn insertion_left_flank_in_cds(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
@@ -1595,7 +1600,17 @@ impl TranscriptConsequenceEngine {
             return false;
         }
         let left_flank = variant.start.saturating_sub(1);
-        left_flank >= cds_start && left_flank <= cds_end
+        if left_flank < cds_start || left_flank > cds_end {
+            return false;
+        }
+        // On negative strand, the 5' CDS boundary is at cds_end (genomic).
+        // Insertions at cds_end+1 are in the 5'UTR — VEP's _overlap_cds
+        // returns FALSE for these.  On positive strand, cds_end is the 3'
+        // boundary and insertions there are within CDS.
+        if tx.strand < 0 && left_flank == cds_end {
+            return false;
+        }
+        true
     }
 
     /// Returns true when a deletion extends beyond the exons it overlaps
@@ -10506,8 +10521,9 @@ mod tests {
     #[test]
     fn insertion_at_cds_end_negative_strand() {
         // Negative strand: CDS boundary insertion.
-        // For negative strand, CDS starts at higher genomic position.
-        // Insert at cds_start - 1 (3' end of CDS on negative strand).
+        // On negative strand, cds_end (genomic) is the 5' CDS boundary.
+        // Insertions at cds_end+1 are in the 5'UTR — VEP does NOT treat
+        // these as within CDS.
         let engine = TranscriptConsequenceEngine::default();
         let t = tx(
             "T1",
@@ -10520,18 +10536,26 @@ mod tests {
             Some(1150),
         );
         // Insertion at position 1050 (= cds_start). Left flank = 1049 is outside CDS.
-        // This should NOT be in CDS.
         let v_outside = var("22", 1050, 1050, "-", "G");
         assert!(
             !engine.insertion_left_flank_in_cds(&v_outside, &t),
             "Insertion at cds_start (neg strand 3' end) left flank is outside CDS"
         );
         // Insertion at position 1151 (= cds_end + 1). Left flank = 1150 = cds_end.
-        // This IS the 5' CDS boundary on negative strand.
-        let v_boundary = var("22", 1151, 1151, "-", "G");
+        // On negative strand, cds_end is the 5' CDS boundary. VEP's
+        // _overlap_cds returns FALSE → 5'UTR, NOT coding.
+        let v_5prime = var("22", 1151, 1151, "-", "G");
         assert!(
-            engine.insertion_left_flank_in_cds(&v_boundary, &t),
-            "Insertion at cds_end+1 (neg strand 5' end) left flank should be in CDS"
+            !engine.insertion_left_flank_in_cds(&v_5prime, &t),
+            "Neg strand: insertion at cds_end+1 (5' boundary) should NOT be in CDS"
+        );
+        // Insertion at position 1051 (= cds_start + 1). Left flank = 1050 = cds_start.
+        // On negative strand, cds_start is the 3' CDS boundary. This IS
+        // within CDS (left flank at the 3' CDS end).
+        let v_3prime = var("22", 1051, 1051, "-", "G");
+        assert!(
+            engine.insertion_left_flank_in_cds(&v_3prime, &t),
+            "Neg strand: insertion at cds_start+1 (3' boundary) left flank should be in CDS"
         );
     }
 
