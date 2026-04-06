@@ -10060,6 +10060,125 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inframe_insertion_downstream_stop_no_false_stop_gained() {
+        // Inframe insertion that shifts a downstream stop earlier should
+        // NOT set stop_gained.  VEP only checks the local codon window.
+        // CDS: ATG GCT TAG TGA (M A * *) — 12 bases (internal stop at codon 2)
+        // Insert "GGC" at pos 1003 (CDS index 3, within codon 1 "GCT")
+        // Mutated: ATG + GGC + GCT TAG TGA → "ATGGGCGCTTAGTGA"
+        // → ATG|GGC|GCT|TAG|TGA → M G A * *
+        // Global: old_stop=2, new_stop=3 → new > old → stop_lost candidate.
+        // Per-codon at affected index (3/3=1): old_aas[1]=A, new_aas[1]=G → no stop.
+        let cds = "ATGGCTTAGTGA";
+        let c = classify_ins(cds, 1003, "GGC").unwrap();
+        assert!(
+            !c.stop_gained,
+            "Inframe insertion shifting downstream stop should NOT set stop_gained. Got: {:?}",
+            c
+        );
+        assert!(
+            !c.stop_lost,
+            "Inframe insertion shifting downstream stop should NOT set stop_lost. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn inframe_deletion_removing_stop_codon_no_stop_lost() {
+        // Inframe deletion that removes a stop codon: the per-codon check
+        // at the deletion boundary should NOT fire stop_lost because the
+        // affected codon index in new_aas is beyond bounds.
+        // CDS: ATG GCT TAA (M A *) — 9 bases
+        // Delete "TAA" at pos 1006-1008 → "ATGGCT" → M A (no stop)
+        // Per-codon at affected indices (6/3=2): old_aas[2]=*, new_aas.len()=2
+        // → ci < new_aas.len() fails → no stop_lost from per-codon.
+        let cds = "ATGGCTTAA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        let v = var("22", 1006, 1008, "TAA", "-");
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v);
+        if let Some(c) = c {
+            assert!(
+                !c.stop_lost,
+                "Inframe deletion of terminal stop: per-codon should not fire stop_lost. Got: {:?}",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn inframe_deletion_shifting_stop_earlier_no_false_stop_gained_long_cds() {
+        // Larger CDS: deletion far from stop that shifts global stop index
+        // earlier. Per-codon check at affected codons should see no stop
+        // transition → stop_gained stays false.
+        // CDS: ATG GCT AAA GCT GCT GCT AAA TGA (M A K A A A K *) — 24 bases
+        // Delete "GCT" at pos 1009-1011 (codon 3 "GCT")
+        // Mutated: ATG GCT AAA GCT GCT AAA TGA (M A K A A K *) — 21 bases
+        // old_stop=7, new_stop=6 → new < old → global would set stop_gained.
+        // Per-codon at affected index (9/3=3): old_aas[3]=A, new_aas[3]=A → same.
+        let cds = "ATGGCTAAAGCTGCTGCTAAATGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        let v = var("22", 1009, 1011, "GCT", "-");
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v).unwrap();
+        assert!(
+            !c.stop_gained,
+            "Inframe deletion in middle of CDS should NOT set stop_gained. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn inframe_insertion_not_at_stop_no_false_stop_lost() {
+        // Inframe insertion far from stop: should not set stop_lost even
+        // though global stop index shifts.
+        // CDS: ATG GCT TGA (M A *) — 9 bases
+        // Insert "AAA" at pos 1003 (CDS index 3)
+        // Mutated: ATG + AAA + GCT TGA → ATG|AAA|GCT|TGA → M K A *
+        // old_stop=2, new_stop=3 → new > old. Global would set stop_lost
+        // (if stop_might_be_disrupted). Per-codon at index 3/3=1:
+        // old_aas[1]=A, new_aas[1]=K → no stop transition.
+        let cds = "ATGGCTTGA";
+        let c = classify_ins(cds, 1003, "AAA").unwrap();
+        assert!(
+            !c.stop_lost,
+            "Inframe insertion far from stop should NOT set stop_lost. Got: {:?}",
+            c
+        );
+        assert!(
+            !c.stop_gained,
+            "Inframe insertion far from stop should NOT set stop_gained. Got: {:?}",
+            c
+        );
+    }
+
     // ── Issue #117: frameshift insertion false stop_retained ──────────────
 
     #[test]
