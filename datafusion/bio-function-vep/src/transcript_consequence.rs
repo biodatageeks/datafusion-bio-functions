@@ -1054,15 +1054,24 @@ impl TranscriptConsequenceEngine {
             if !in_mature_mirna {
                 terms.insert(SoTerm::NonCodingTranscriptExonVariant);
             }
-        } else if in_frameshift_intron && self.overlaps_cds(variant, tx) {
-            // VEP treats frameshift intron variants as coding but cannot
-            // determine the precise codon change (the CDS includes the
-            // intron bases).  Emit only coding_sequence_variant — no
-            // specific child (frameshift/inframe) — so it survives stripping.
-            terms.insert(SoTerm::CodingSequenceVariant);
-        } else if (overlaps_exon || cds_end_exon_boundary)
+        } else if (overlaps_exon
+            || cds_end_exon_boundary
+            || (in_frameshift_intron && self.overlaps_cds(variant, tx)))
             && (self.overlaps_cds(variant, tx) || ins_left_flank_in_cds)
         {
+            // VEP's TranscriptMapper includes frameshift intron (≤13bp) bases
+            // in the CDS, so genomic2cds() returns valid CDS coordinates for
+            // positions within frameshift introns.  All normal coding predicates
+            // (frameshift, stop_gained, codons, amino_acids) fire.  Route these
+            // through add_coding_terms instead of short-circuiting to
+            // coding_sequence_variant.
+            //
+            // Traceability:
+            // - Ensembl TranscriptMapper includes frameshift intron coords:
+            //   <https://github.com/Ensembl/ensembl/blob/release/113/modules/Bio/EnsEMBL/TranscriptMapper.pm>
+            // - VEP VariationEffect::coding_sequence_variant uses within_cds
+            //   which returns true for frameshift intron positions:
+            //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm>
             coding_class = self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
             // Deletions that extend beyond CDS into UTR: add UTR term
             // for the UTR portion.
@@ -3499,12 +3508,34 @@ fn classify_insertion(
     // anchor is the base before the insertion (start-1).  On negative strand,
     // genomic coordinates are reversed relative to CDS, so the anchor is
     // variant.start itself (which maps to the earlier CDS position).
+    //
+    // VEP's Ensembl mapper maps BOTH flanking positions of an insertion
+    // natively (start=end+1 notation).  When the primary anchor is outside
+    // the coding exon (boundary insertion), the other flank may still map.
+    // Fall back to the alternate flank and adjust the CDS index by -1 since
+    // the alternate is one CDS position past the insertion point.
+    //
+    // Traceability:
+    // - Ensembl `TranscriptMapper::genomic2cds()` maps both flanks
+    //   <https://github.com/Ensembl/ensembl/blob/release/113/modules/Bio/EnsEMBL/TranscriptMapper.pm#L410>
+    // - Ensembl `BaseTranscriptVariation::cds_coords()` fallback
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L515-L523>
     let anchor_pos = if tx.strand >= 0 {
         variant.start.saturating_sub(1)
     } else {
         variant.start
     };
-    let cds_idx = genomic_to_cds_index(tx, tx_exons, anchor_pos).map(|i| i + leading_n_offset)?;
+    let cds_idx = genomic_to_cds_index(tx, tx_exons, anchor_pos)
+        .or_else(|| {
+            // Primary anchor outside coding exon — try the other flank.
+            let alt = if tx.strand >= 0 {
+                variant.start
+            } else {
+                variant.start.saturating_sub(1)
+            };
+            genomic_to_cds_index(tx, tx_exons, alt).and_then(|i| i.checked_sub(1))
+        })
+        .map(|i| i + leading_n_offset)?;
 
     // Build alt sequence in transcript orientation
     let alt_tx = if tx.strand >= 0 {
@@ -10939,6 +10970,103 @@ mod tests {
             c.protein_position_start,
             Some(5),
             "Protein position must include leading N offset"
+        );
+    }
+
+    #[test]
+    fn issue_118_negative_strand_insertion_anchor_fallback() {
+        // chr3:12606048 pattern: negative strand insertion at an internal
+        // exon boundary. Primary anchor (variant.start) is in the intron,
+        // so genomic_to_cds_index fails. classify_insertion must fall back
+        // to the alternate flank (variant.start - 1 = exon.end).
+        //
+        // Layout: exon1(1000-1008) — intron(1009-1019) — exon2(1020-1029)
+        // Negative strand, CDS spans both exons: cds_start=1000, cds_end=1029
+        // CDS total: 9 + 10 = 19 bases → on negative strand, rev-comp
+        // Insert at position 1009 (exon1.end + 1, in intron)
+        // Anchor (neg strand): variant.start = 1009 → intron → fails
+        // Fallback: variant.start - 1 = 1008 → exon1.end → maps to CDS
+        //
+        // CDS sequence (19 bases, reversed from exon2 then exon1)
+        let cds = "ATGGCTGAAATGGCTGAAA"; // 19 bases
+        let t = tx(
+            "T1",
+            "1",
+            990,
+            1040,
+            -1,
+            "protein_coding",
+            Some(1000),
+            Some(1029),
+        );
+        let e1 = exon("T1", 1, 1000, 1008);
+        let e2 = exon("T1", 2, 1020, 1029);
+        let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
+        // Insert "C" at position 1009 (intron between exons)
+        let v = var("1", 1009, 1009, "-", "C");
+        let c = classify_insertion(&t, &exons_ref, cds, &v, "C");
+        assert!(
+            c.is_some(),
+            "classify_insertion must succeed with anchor fallback for neg strand"
+        );
+        let c = c.unwrap();
+        assert!(
+            c.cds_position_start.is_some(),
+            "CDS position must be set after anchor fallback"
+        );
+        assert!(
+            c.protein_position_start.is_some(),
+            "Protein position must be set after anchor fallback"
+        );
+    }
+
+    #[test]
+    fn issue_118_frameshift_intron_insertion_gets_coding_consequences() {
+        // chr20:37179387 pattern: insertion in a frameshift intron (≤13bp).
+        // VEP includes frameshift intron bases in the CDS and computes
+        // full coding consequences (frameshift_variant, stop_gained, etc.).
+        // Our code must route these through add_coding_terms instead of
+        // short-circuiting to coding_sequence_variant.
+        //
+        // Layout: exon1(1000-1008) — 10bp intron(1009-1018) — exon2(1019-1030)
+        // CDS: 1000-1030 (spans both exons + frameshift intron)
+        // Insert 4 bases at position 1010 (within the frameshift intron)
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGCTGAATGATTTCCCGGG"; // 21 bases across both exons
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1040,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1030),
+        );
+        t.cdna_coding_end = Some(21);
+        t.spliced_seq = Some(format!("{cds}AAATTT"));
+        let e1 = exon("T1", 1, 1000, 1008);
+        let e2 = exon("T1", 2, 1019, 1030);
+        let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
+        let tr = translation("T1", Some(21), Some(7), None, Some(cds));
+        // Insert "GGGG" at position 1010 (inside frameshift intron 1009-1018)
+        let v = var("1", 1010, 1010, "-", "GGGG");
+        let (terms, _coding_class) =
+            engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+
+        // Should have frameshift_variant (4bp insertion, not multiple of 3)
+        // instead of just coding_sequence_variant
+        assert!(
+            term_set.contains(&SoTerm::FrameshiftVariant)
+                || term_set.contains(&SoTerm::InframeInsertion),
+            "Frameshift intron insertion should get coding consequence, got: {:?}",
+            terms
+        );
+        assert!(
+            !terms.iter().all(|t| *t == SoTerm::CodingSequenceVariant),
+            "Should NOT only have coding_sequence_variant, got: {:?}",
+            terms
         );
     }
 }
