@@ -10607,4 +10607,251 @@ mod tests {
             "Coding classification should be present"
         );
     }
+
+    // ---------------------------------------------------------------
+    // Issue #118 — real-variant regression tests
+    //
+    // Each test reproduces the exact pattern from the E2E mismatch
+    // report: an insertion at an exon boundary where exon.end ==
+    // cds_end, causing empty CDS/protein fields.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn issue_118_chr3_12606048_t_tg_1bp_frameshift_at_exon_boundary() {
+        // chr3:12606048 T>TG — 1bp insertion (frameshift) at exon boundary.
+        // VEP: frameshift_variant&splice_region_variant, CDS_position=680-681,
+        //      Protein_position=227, Amino_acids=R/SX, Codons=aga/agCa
+        // vepyr (before fix): splice_region_variant only, all coding fields empty.
+        //
+        // Simplified model: CDS = 12 bases (4 codons), exon ends at CDS end.
+        // Insert 1 base at exon.end + 1 → frameshift.
+        let engine = TranscriptConsequenceEngine::default();
+        // CDS: ATG GCT GAA AGA = M A E R (12 bases, positions 1000-1011)
+        // Last codon "AGA" = Arg (R), matching VEP's ref amino acid.
+        let cds = "ATGGCTGAAAGA";
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        t.cdna_coding_end = Some(12);
+        t.spliced_seq = Some(format!("{cds}CCCGGG")); // CDS + UTR
+        // Exon ends exactly at CDS end — no UTR extension in this exon
+        let e = exon("T1", 1, 1000, 1011);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(12), Some(4), Some("MAER"), Some(cds));
+        // Insert "G" at position 1012 (exon.end + 1 == cds_end + 1)
+        let v = var("1", 1012, 1012, "-", "G");
+        let (terms, coding_class) =
+            engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+
+        assert!(
+            term_set.contains(&SoTerm::FrameshiftVariant),
+            "Should have frameshift_variant for 1bp insertion, got: {:?}",
+            terms
+        );
+        assert!(
+            !term_set.contains(&SoTerm::ThreePrimeUtrVariant),
+            "Should NOT have 3'UTR, got: {:?}",
+            terms
+        );
+
+        let cc = coding_class.expect("Coding classification must be present");
+        assert_eq!(cc.cds_position_start, Some(12), "CDS position start");
+        assert_eq!(cc.cds_position_end, Some(13), "CDS position end");
+        assert_eq!(cc.protein_position_start, Some(4), "Protein position");
+        assert!(
+            cc.amino_acids.is_some(),
+            "Amino acids must be populated, got None"
+        );
+        assert!(cc.codons.is_some(), "Codons must be populated, got None");
+        // Ref amino acid should be R (Arg, from codon AGA)
+        let aa = cc.amino_acids.as_ref().unwrap();
+        assert!(
+            aa.starts_with("R/"),
+            "Ref amino acid should be R (Arg), got: {aa}"
+        );
+    }
+
+    #[test]
+    fn issue_118_chr16_89224802_g_ggtga_4bp_frameshift_at_exon_boundary() {
+        // chr16:89224802 G>GGTGA — 4bp insertion (frameshift) at exon boundary.
+        // VEP: frameshift_variant&splice_region_variant, CDS_position=118-119,
+        //      Protein_position=40, Amino_acids=E/GEX, Codons=gaa/gGTGAaa
+        // vepyr (before fix): splice_region_variant only, all coding fields empty.
+        //
+        // Simplified model: CDS = 15 bases (5 codons), last codon = GAA (Glu).
+        // Insert 4 bases "GTGA" at exon.end + 1 → frameshift.
+        let engine = TranscriptConsequenceEngine::default();
+        // CDS: ATG GCT AAA GCT GAA = M A K A E (15 bases, positions 1000-1014)
+        let cds = "ATGGCTAAAGCTGAA";
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1014),
+        );
+        t.cdna_coding_end = Some(15);
+        t.spliced_seq = Some(format!("{cds}CCCGGGAAA")); // CDS + UTR
+        let e = exon("T1", 1, 1000, 1014);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(15), Some(5), Some("MARAE"), Some(cds));
+        // Insert "GTGA" at position 1015 (exon.end + 1)
+        let v = var("1", 1015, 1015, "-", "GTGA");
+        let (terms, coding_class) =
+            engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+
+        assert!(
+            term_set.contains(&SoTerm::FrameshiftVariant),
+            "Should have frameshift_variant for 4bp insertion, got: {:?}",
+            terms
+        );
+        assert!(
+            !term_set.contains(&SoTerm::ThreePrimeUtrVariant),
+            "Should NOT have 3'UTR, got: {:?}",
+            terms
+        );
+
+        let cc = coding_class.expect("Coding classification must be present");
+        assert_eq!(cc.cds_position_start, Some(15), "CDS position start");
+        assert_eq!(cc.cds_position_end, Some(16), "CDS position end");
+        assert_eq!(cc.protein_position_start, Some(5), "Protein position");
+        assert!(
+            cc.amino_acids.is_some(),
+            "Amino acids must be populated, got None"
+        );
+        assert!(cc.codons.is_some(), "Codons must be populated, got None");
+        // Ref amino acid should be E (Glu, from codon GAA)
+        let aa = cc.amino_acids.as_ref().unwrap();
+        assert!(
+            aa.starts_with("E/"),
+            "Ref amino acid should be E (Glu), got: {aa}"
+        );
+    }
+
+    #[test]
+    fn issue_118_chr20_37179387_large_frameshift_at_exon_boundary() {
+        // chr20:37179387 G>GCTTATAGACAGGGCCCCGCGGCCGGCACT — 29bp insertion
+        // (frameshift) at exon boundary.
+        // VEP: splice_donor_variant&stop_gained&frameshift_variant,
+        //      CDS_position=92-93, Protein_position=31,
+        //      Amino_acids=N/KVPAAGPCL*X,
+        //      Codons=aac/aaAGTGCCGGCCGCGGGGCCCTGTCTATAAGc
+        // vepyr (before fix): coding_sequence_variant only, all coding fields empty.
+        //
+        // Simplified model: CDS = 12 bases (4 codons), last codon = AAC (Asn).
+        // Insert 29 bases at exon.end + 1 → frameshift.
+        let engine = TranscriptConsequenceEngine::default();
+        // CDS: ATG GCT GAA AAC = M A E N (12 bases, positions 1000-1011)
+        let cds = "ATGGCTGAAAAC";
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1060,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        t.cdna_coding_end = Some(12);
+        t.spliced_seq = Some(format!("{cds}CCCGGGAAATTTCCCGGGAAATTT")); // CDS + UTR
+        let e = exon("T1", 1, 1000, 1011);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(12), Some(4), Some("MAEN"), Some(cds));
+        // Insert 29 bases at position 1012 (exon.end + 1)
+        let v = var("1", 1012, 1012, "-", "CTTATAGACAGGGCCCCGCGGCCGGCACT");
+        let (terms, coding_class) =
+            engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+
+        assert!(
+            term_set.contains(&SoTerm::FrameshiftVariant),
+            "Should have frameshift_variant for 29bp insertion, got: {:?}",
+            terms
+        );
+        assert!(
+            !term_set.contains(&SoTerm::ThreePrimeUtrVariant),
+            "Should NOT have 3'UTR, got: {:?}",
+            terms
+        );
+
+        let cc = coding_class.expect("Coding classification must be present");
+        assert_eq!(cc.cds_position_start, Some(12), "CDS position start");
+        assert_eq!(cc.cds_position_end, Some(13), "CDS position end");
+        assert_eq!(cc.protein_position_start, Some(4), "Protein position");
+        assert!(
+            cc.amino_acids.is_some(),
+            "Amino acids must be populated, got None"
+        );
+        assert!(cc.codons.is_some(), "Codons must be populated, got None");
+        // Ref amino acid should be N (Asn, from codon AAC)
+        let aa = cc.amino_acids.as_ref().unwrap();
+        assert!(
+            aa.starts_with("N/"),
+            "Ref amino acid should be N (Asn), got: {aa}"
+        );
+    }
+
+    #[test]
+    fn issue_118_chr7_103989356_negative_strand_5utr_not_coding() {
+        // chr7:103989356 T>TGCCGCC — 6bp insertion on negative strand.
+        // This is at the 5' CDS boundary (cds_end on negative strand),
+        // NOT a coding variant. VEP: 5_prime_UTR_variant.
+        // Regression test: insertion_left_flank_in_cds must return FALSE
+        // for negative strand when left_flank == cds_end.
+        let engine = TranscriptConsequenceEngine::default();
+        // Negative strand transcript, CDS at 1050-1150
+        let t = tx(
+            "T1",
+            "1",
+            1000,
+            1200,
+            -1,
+            "protein_coding",
+            Some(1050),
+            Some(1150),
+        );
+        // Exon ends at CDS end (5' boundary on negative strand)
+        let e = exon("T1", 1, 1100, 1150);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        // Insert at position 1151 (cds_end + 1 = 5'UTR on negative strand)
+        let v = var("1", 1151, 1151, "-", "GCCGCC");
+
+        // insertion_left_flank_in_cds should be FALSE (5' boundary, not 3')
+        assert!(
+            !engine.insertion_left_flank_in_cds(&v, &t),
+            "Neg strand: insertion at 5' CDS boundary should NOT be in CDS"
+        );
+
+        // cds_end_exon_boundary should also be FALSE (since left_flank check fails)
+        let is_ins = true;
+        let overlaps_exon = exons_ref.iter().any(|e| {
+            if is_ins {
+                v.start > e.start && v.start <= e.end
+            } else {
+                false
+            }
+        });
+        assert!(!overlaps_exon, "Should not overlap exon");
+        let cds_end_boundary = is_ins
+            && !overlaps_exon
+            && engine.insertion_left_flank_in_cds(&v, &t)
+            && exons_ref.iter().any(|e| v.start == e.end + 1);
+        assert!(
+            !cds_end_boundary,
+            "cds_end_exon_boundary should be FALSE for neg strand 5' boundary"
+        );
+    }
 }
