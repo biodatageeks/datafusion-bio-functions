@@ -306,7 +306,12 @@ where
         if flank_start <= 0 {
             return Ok(None);
         }
-        let post_seq = read_reference_sequence(reader, chrom, flank_start, flank_start + 999)?;
+        // Scale flank with indel size so indels >1000bp still shift correctly.
+        // VEP Perl hardcodes 1000bp but has a loop_limiter guard; we do both.
+        // Use indel_len + 1000 to ensure room beyond the indel for shifting.
+        let flank_size = seq_to_check.len() as i64 + 1000;
+        let post_seq =
+            read_reference_sequence(reader, chrom, flank_start, flank_start + flank_size - 1)?;
         let pre_seq = String::new();
         let (computed_shift_length, shifted_seq, shifted_hgvs_output, new_start, new_end) =
             perform_shift_ensembl(
@@ -329,7 +334,8 @@ where
         if flank_end <= 0 {
             return Ok(None);
         }
-        let flank_start = (flank_end - 999).max(1);
+        let flank_size = seq_to_check.len() as i64 + 1000;
+        let flank_start = (flank_end - flank_size + 1).max(1);
         let pre_seq = read_reference_sequence(reader, chrom, flank_start, flank_end)?;
         let post_seq = String::new();
         let (computed_shift_length, shifted_seq, shifted_hgvs_output, new_start, new_end) =
@@ -840,10 +846,19 @@ fn perform_shift_ensembl(
     let vf_strand = 1i8;
     let hgvs_reverse = vf_strand != seq_strand;
     let start_n = usize::from(reverse);
+    // Perl guard: $loop_limiter = length($post_seq) if $loop_limiter < 0;
+    // When indel_length > flank length, fall back to flank length so the
+    // character-by-character shift loop can still find the correct (small) shift.
     let loop_limiter = if reverse {
-        pre_seq.len().saturating_sub(indel_length).saturating_add(1)
+        if indel_length > pre_seq.len() {
+            pre_seq.len()
+        } else {
+            pre_seq.len() - indel_length + 1
+        }
+    } else if indel_length > post_seq.len() {
+        post_seq.len()
     } else {
-        post_seq.len().saturating_sub(indel_length)
+        post_seq.len() - indel_length
     };
 
     for n in start_n..=loop_limiter {
@@ -2599,9 +2614,11 @@ mod tests {
     fn test_perform_shift_ensembl_rotates_hgvs_output_in_vf_orientation() {
         let (shift_length, shifted_seq, shifted_output, start, end) =
             perform_shift_ensembl(b"GATG", b"GATG", "", "TG", 100, 99, true, -1);
-        assert_eq!(shift_length, 1);
-        assert_eq!(String::from_utf8(shifted_seq).unwrap(), "GGAT");
-        assert_eq!(String::from_utf8(shifted_output).unwrap(), "ATGG");
+        // With corrected loop_limiter guard, the loop now walks 2 matching
+        // bases in pre_seq ("TG") instead of stopping after 1.
+        assert_eq!(shift_length, 2);
+        assert_eq!(String::from_utf8(shifted_seq).unwrap(), "TGGA");
+        assert_eq!(String::from_utf8(shifted_output).unwrap(), "TGGA");
         assert_eq!((start, end), (100, 99));
     }
 
@@ -2770,6 +2787,72 @@ mod tests {
             perform_shift_ensembl(b"TC", b"TC", "TCAA", "", 100, 99, false, 1);
         assert_eq!(shift, 2);
         assert_eq!(hgvs, b"TC"); // full rotation
+    }
+
+    // ---------------------------------------------------------------
+    // perform_shift_ensembl — large-indel loop_limiter guard (#99)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_perform_shift_forward_indel_longer_than_flank() {
+        // Simulates a >1000bp deletion where indel_length exceeds
+        // post_seq length. The loop_limiter guard must allow the
+        // character-by-character loop to still find the correct shift.
+        // Indel "ABCDE" (5 bytes) with only 3 bytes of flank "ABX".
+        // The first 2 bases match (A, B), then X mismatches.
+        let (shift, _seq, _hgvs, start, end) =
+            perform_shift_ensembl(b"ABCDE", b"ABCDE", "ABX", "", 100, 104, false, 1);
+        assert_eq!(shift, 2);
+        assert_eq!(start, 102);
+        assert_eq!(end, 106);
+    }
+
+    #[test]
+    fn test_perform_shift_forward_indel_longer_than_flank_no_match() {
+        // Indel longer than flank but first base doesn't match.
+        let (shift, seq, _hgvs, start, end) =
+            perform_shift_ensembl(b"ABCDE", b"ABCDE", "XYZ", "", 100, 104, false, 1);
+        assert_eq!(shift, 0);
+        assert_eq!(seq, b"ABCDE");
+        assert_eq!(start, 100);
+        assert_eq!(end, 104);
+    }
+
+    #[test]
+    fn test_perform_shift_reverse_indel_longer_than_flank() {
+        // Reverse-strand: indel "GATGC" (5 bytes) with pre_seq "ATG"
+        // (3 bytes). indel > flank triggers the guard. Last 2 bases of
+        // pre_seq ("TG") match the trailing "TG" of the indel.
+        let (shift, _seq, _hgvs, start, end) =
+            perform_shift_ensembl(b"GATGC", b"GATGC", "", "XTG", 100, 99, true, -1);
+        // 'C' vs 'G' at pre_seq[0] — only first iteration matches (n=1: 'C' vs 'G' → mismatch).
+        // Actually: n=1: last of "GATGC"='C', pre_seq[3-1]='G' → mismatch → shift=0.
+        assert_eq!(shift, 0);
+        assert_eq!((start, end), (100, 99));
+    }
+
+    #[test]
+    fn test_perform_shift_reverse_indel_longer_matches() {
+        // Reverse-strand: indel "GATGG" (5 bytes) with pre_seq "XGG"
+        // (3 bytes). Guard triggers. Last byte 'G' matches pre_seq[2]='G',
+        // then next rotation's last byte 'G' matches pre_seq[1]='G',
+        // then 'T' vs 'X' → mismatch.
+        let (shift, _seq, _hgvs, start, end) =
+            perform_shift_ensembl(b"GATGG", b"GATGG", "", "XGG", 100, 99, true, -1);
+        assert_eq!(shift, 2);
+        assert_eq!((start, end), (100, 99));
+    }
+
+    #[test]
+    fn test_perform_shift_forward_indel_larger_than_flank() {
+        // indel "ABCDE" (5 bytes), flank "ABX" (3 bytes, strictly shorter).
+        // Guard triggers: loop_limiter = 3 instead of saturating to 0.
+        // n=0: 'A'=='A' → shift=1; n=1: 'B'=='B' → shift=2; n=2: 'C'=='X' → break.
+        let (shift, _seq, _hgvs, start, end) =
+            perform_shift_ensembl(b"ABCDE", b"ABCDE", "ABX", "", 100, 104, false, 1);
+        assert_eq!(shift, 2);
+        assert_eq!(start, 102);
+        assert_eq!(end, 106);
     }
 
     // ---------------------------------------------------------------
