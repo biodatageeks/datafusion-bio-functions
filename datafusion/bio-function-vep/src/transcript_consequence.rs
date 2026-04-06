@@ -1043,7 +1043,10 @@ impl TranscriptConsequenceEngine {
             // intron bases).  Emit only coding_sequence_variant — no
             // specific child (frameshift/inframe) — so it survives stripping.
             terms.insert(SoTerm::CodingSequenceVariant);
-        } else if overlaps_exon && self.overlaps_cds(variant, tx) {
+        } else if overlaps_exon
+            && (self.overlaps_cds(variant, tx)
+                || (is_ins && self.insertion_left_flank_in_cds(variant, tx)))
+        {
             coding_class = self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
             // Deletions that extend beyond CDS into UTR: add UTR term
             // for the UTR portion.
@@ -1553,6 +1556,28 @@ impl TranscriptConsequenceEngine {
         overlaps(variant.start, variant.end, cds_start, cds_end)
     }
 
+    /// For insertions, check if the left flanking base (variant.start - 1)
+    /// is within the CDS.  VEP uses inverted coordinates for insertions
+    /// (start > end), which naturally includes the CDS boundary in its
+    /// overlap check.  Our coordinate convention (start == end) misses
+    /// insertions right at cds_end, so we check the left flank separately.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariationAllele::_overlap_cds()`
+    ///   uses generic overlap on (vf.start, vf.end) where insertions have
+    ///   start = pos+1, end = pos — the swapped pair spans the CDS boundary.
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L511-L518>
+    fn insertion_left_flank_in_cds(&self, variant: &VariantInput, tx: &TranscriptFeature) -> bool {
+        let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
+            return false;
+        };
+        if cds_start <= 0 || cds_end <= 0 {
+            return false;
+        }
+        let left_flank = variant.start.saturating_sub(1);
+        left_flank >= cds_start && left_flank <= cds_end
+    }
+
     /// Returns true when a deletion extends beyond the exons it overlaps
     /// into a non-frameshift intron.  VEP treats these as "complex indels"
     /// where CDS consequences can't be determined — only
@@ -1642,7 +1667,7 @@ impl TranscriptConsequenceEngine {
         // cannot be computed. Preserve those bounds here instead of dropping
         // the coding position fields entirely.
         if self.is_complex_indel(variant, tx_exons) {
-            return partial_coding_overlap_classification(tx, tx_exons, variant);
+            return partial_coding_overlap_classification(tx, tx_exons, tx_translation, variant);
         }
 
         if cds_is_incomplete(tx, tx_translation) && self.overlaps_stop_codon(variant, tx) {
@@ -1712,7 +1737,12 @@ impl TranscriptConsequenceEngine {
                 self.add_start_stop_heuristic_terms(terms, variant, tx, tx_exons, cds);
                 terms.insert(SoTerm::ProteinAlteringVariant);
                 if extends_into_utr {
-                    return partial_coding_overlap_classification(tx, tx_exons, variant);
+                    return partial_coding_overlap_classification(
+                        tx,
+                        tx_exons,
+                        tx_translation,
+                        variant,
+                    );
                 }
             }
             terms.insert(SoTerm::ProteinAlteringVariant);
@@ -3451,12 +3481,44 @@ fn classify_insertion(
 
     // Build mutated CDS: insert alt bases after cds_idx (i.e., at cds_idx+1).
     let ins_point = cds_idx + 1;
-    let mut mutated = Vec::with_capacity(cds_seq.len() + alt_len);
-    mutated.extend_from_slice(&cds_seq.as_bytes()[..ins_point]);
-    mutated.extend_from_slice(alt_tx.as_bytes());
-    mutated.extend_from_slice(&cds_seq.as_bytes()[ins_point..]);
 
-    let old_aas = translate_protein_from_cds(cds_seq.as_bytes())?;
+    // When the CDS has an incomplete terminal codon, VEP pads it with 3'UTR
+    // bases to complete the reading frame before translating.  This lets VEP
+    // report ref amino acids even for the incomplete codon.  Reproduce that
+    // behaviour here by padding both the original and mutated CDS.
+    //
+    // Traceability:
+    // - Ensembl `Bio::EnsEMBL::Transcript::translate()` with `complete_codons`
+    //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Transcript.pm#L765-L780>
+    let remainder = cds_seq.len() % 3;
+    let cds_bytes: Vec<u8>;
+    let effective_cds: &[u8] = if remainder != 0 {
+        let pad_needed = 3 - remainder;
+        let utr = three_prime_utr_seq(tx);
+        let pad: Vec<u8> = utr
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes()
+            .iter()
+            .take(pad_needed)
+            .copied()
+            .collect();
+        if pad.len() == pad_needed {
+            cds_bytes = [cds_seq.as_bytes(), &pad].concat();
+            &cds_bytes
+        } else {
+            cds_seq.as_bytes()
+        }
+    } else {
+        cds_seq.as_bytes()
+    };
+
+    let mut mutated = Vec::with_capacity(effective_cds.len() + alt_len);
+    mutated.extend_from_slice(&effective_cds[..ins_point]);
+    mutated.extend_from_slice(alt_tx.as_bytes());
+    mutated.extend_from_slice(&effective_cds[ins_point..]);
+
+    let old_aas = translate_protein_from_cds(effective_cds)?;
     let new_aas = translate_protein_from_cds(&mutated)?;
     let mut class = CodingClassification::default();
 
@@ -3624,9 +3686,9 @@ fn classify_insertion(
     } else if frameshift {
         // Frameshift insertion within codon: ref codon all lowercase, alt codon with inserted bases uppercase
         let codon_start = first_codon * 3;
-        let codon_end = ((first_codon + 1) * 3).min(cds_seq.len());
-        if codon_end <= cds_seq.len() {
-            let ref_codon: String = cds_seq.as_bytes()[codon_start..codon_end]
+        let codon_end = ((first_codon + 1) * 3).min(effective_cds.len());
+        if codon_end <= effective_cds.len() {
+            let ref_codon: String = effective_cds[codon_start..codon_end]
                 .iter()
                 .map(|&b| (b as char).to_ascii_lowercase())
                 .collect();
@@ -3650,9 +3712,9 @@ fn classify_insertion(
     } else {
         // Inframe insertion within codon: ref=lowercase, alt=codon+inserted(uppercase)
         let codon_start = first_codon * 3;
-        let codon_end = ((first_codon + 1) * 3).min(cds_seq.len());
-        if codon_end <= cds_seq.len() {
-            let ref_codon: String = cds_seq.as_bytes()[codon_start..codon_end]
+        let codon_end = ((first_codon + 1) * 3).min(effective_cds.len());
+        if codon_end <= effective_cds.len() {
+            let ref_codon: String = effective_cds[codon_start..codon_end]
                 .iter()
                 .map(|&b| (b as char).to_ascii_lowercase())
                 .collect();
@@ -4538,6 +4600,7 @@ fn genomic_to_cds_index(
 fn partial_coding_overlap_classification(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
 ) -> Option<CodingClassification> {
     let segments = coding_segments(tx, tx_exons)?;
@@ -4593,6 +4656,17 @@ fn partial_coding_overlap_classification(
     } else {
         variant_start < first_overlap_genomic
     };
+
+    // VEP prepends N characters to the CDS sequence when the first coding
+    // exon starts mid-codon (non-zero phase).  These Ns align the reading
+    // frame to codon boundaries.  Apply the same offset here so that CDS
+    // and protein positions match those reported by classify_coding_change.
+    let leading_n_offset = tx_translation
+        .and_then(|t| t.cds_sequence.as_deref())
+        .map(|cds| cds.as_bytes().iter().take_while(|&&b| b == b'N').count())
+        .unwrap_or(0);
+    let first_idx = first_idx + leading_n_offset;
+    let last_idx = last_idx + leading_n_offset;
 
     let mut class = CodingClassification::default();
     class.cds_position_start = (!extends_before_coding).then_some(first_idx + 1);
@@ -10214,6 +10288,230 @@ mod tests {
             !c.stop_retained,
             "2bp frameshift insertion should NOT set stop_retained. Got: {:?}",
             c
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #118: CDS/protein fields missing at CDS boundary
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn insertion_left_flank_in_cds_positive_strand() {
+        // Insertion just past CDS end: variant.start = cds_end + 1.
+        // Left flanking base (start - 1) is within CDS.
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            1200,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1100),
+        );
+        let v = var("22", 1101, 1101, "-", "G");
+        assert!(
+            engine.insertion_left_flank_in_cds(&v, &t),
+            "Insertion at cds_end+1 should have left flank in CDS"
+        );
+    }
+
+    #[test]
+    fn insertion_left_flank_in_cds_well_past_end() {
+        // Insertion well past CDS end: left flank is NOT in CDS.
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            1200,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1100),
+        );
+        let v = var("22", 1110, 1110, "-", "G");
+        assert!(
+            !engine.insertion_left_flank_in_cds(&v, &t),
+            "Insertion well past CDS end should NOT have left flank in CDS"
+        );
+    }
+
+    #[test]
+    fn cds_boundary_insertion_gets_frameshift_and_coding_positions() {
+        // Issue #118: insertion at CDS end should enter coding path.
+        // CDS: ATG GAA TGA (9 bases, M E *), positions 1000-1008.
+        // Exon: 1000-1020 (extends into UTR).
+        // Insert "G" at position 1009 (just past CDS end).
+        let engine = TranscriptConsequenceEngine::default();
+        let mut t = tx(
+            "T1",
+            "22",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1008),
+        );
+        t.cdna_coding_end = Some(19); // CDS spans bytes 10..19 in the cDNA
+        t.spliced_seq = Some("NNNNNNNNNN".to_string() + "ATGGAATGA" + "CCCGGG");
+        let e = exon("T1", 1, 990, 1030);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(9), Some(3), Some("ME*"), Some("ATGGAATGA"));
+        // VEP-style insertion: ref="-", variant.start = 1009 (pos after last CDS base)
+        let v = var("22", 1009, 1009, "-", "G");
+        let (terms, coding_class) =
+            engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            term_set.contains(&SoTerm::FrameshiftVariant)
+                || term_set.contains(&SoTerm::InframeInsertion),
+            "Insertion at CDS boundary should produce coding consequence, got: {:?}",
+            terms
+        );
+        assert!(
+            coding_class.is_some(),
+            "Coding classification should be present for CDS boundary insertion"
+        );
+        let cc = coding_class.unwrap();
+        assert!(
+            cc.cds_position_start.is_some(),
+            "CDS position start should be set"
+        );
+        assert!(
+            cc.cds_position_end.is_some(),
+            "CDS position end should be set"
+        );
+        assert!(
+            cc.protein_position_start.is_some(),
+            "Protein position start should be set"
+        );
+    }
+
+    #[test]
+    fn incomplete_terminal_codon_insertion_amino_acids() {
+        // CDS: ATG GAA AG (8 bases = incomplete terminal codon, last codon "AG")
+        // 3' UTR starts with "A" → padding gives "AGA" → Arg (R)
+        // Insert "C" after CDS position 8 → mutated last codon "AGC" = Ser (S)
+        // Expected amino_acids: "R/SX" (frameshift)
+        let cds = "ATGGAAAG"; // 8 bases, incomplete terminal codon
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1; // = 1007
+        let mut t = tx(
+            "T1",
+            "22",
+            1000,
+            1020,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        // Set up UTR: after CDS position 8 (cdna_coding_end = 8), UTR = "ACGT..."
+        t.cdna_coding_end = Some(8);
+        t.spliced_seq = Some("ATGGAAAGACGTACGT".to_string()); // CDS + UTR
+        let e = exon("T1", 1, 1000, 1020);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        // Insert "C" after the last CDS base (position 1008, just past CDS)
+        let v = var("22", 1008, 1008, "-", "C");
+        let c = classify_insertion(&t, &exons_ref, cds, &v, "C");
+        assert!(c.is_some(), "classify_insertion should succeed");
+        let c = c.unwrap();
+        // CDS position: 8-9 (1-based, insertion between positions 8 and 9)
+        assert_eq!(c.cds_position_start, Some(8));
+        assert_eq!(c.cds_position_end, Some(9));
+        // Protein position: codon_at = 7/3 = 2 (0-based) → position 3 (1-based)
+        assert_eq!(c.protein_position_start, Some(3));
+        // Amino acids should be present (not empty)
+        assert!(
+            c.amino_acids.is_some(),
+            "Amino acids should be computed for incomplete terminal codon insertion, got None"
+        );
+        // Codons should be present
+        assert!(
+            c.codons.is_some(),
+            "Codons should be computed for incomplete terminal codon insertion, got None"
+        );
+    }
+
+    #[test]
+    fn partial_coding_overlap_with_leading_n_offset() {
+        // Transcript with phase 2 (leading NN in CDS sequence).
+        // CDS: NN + ATG GCT GAA TGA → 14 bases total (2 leading Ns).
+        // Genomic CDS: 1000-1011 (12 bases).
+        // Deletion at 1010-1015 extends past CDS into UTR.
+        // Without leading_n_offset: first_idx = 10, CDS pos = 11.
+        // With leading_n_offset: first_idx = 12, CDS pos = 13.
+        let t = tx(
+            "T1",
+            "22",
+            990,
+            1020,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        let e = exon("T1", 1, 990, 1020);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(14), Some(4), None, Some("NNATGGCTGAATGA"));
+        // Deletion from 1010 to 1015 (extends past CDS end 1011)
+        let v = var("22", 1010, 1015, "AATGAC", "-");
+        let c = partial_coding_overlap_classification(&t, &exons_ref, Some(&tr), &v);
+        assert!(c.is_some(), "Should produce classification");
+        let c = c.unwrap();
+        // First overlapping base: position 1010, CDS offset = 10 (0-based)
+        // + leading_n_offset (2) = 12. 1-based = 13.
+        assert_eq!(
+            c.cds_position_start,
+            Some(13),
+            "CDS position should include leading N offset"
+        );
+        // extends_after_coding = true → end is None (?)
+        assert_eq!(
+            c.cds_position_end, None,
+            "CDS position end should be None (?) for deletion extending past CDS"
+        );
+        // Protein position: (12 / 3) + 1 = 5
+        assert_eq!(
+            c.protein_position_start,
+            Some(5),
+            "Protein position should include leading N offset"
+        );
+    }
+
+    #[test]
+    fn insertion_at_cds_end_negative_strand() {
+        // Negative strand: CDS boundary insertion.
+        // For negative strand, CDS starts at higher genomic position.
+        // Insert at cds_start - 1 (3' end of CDS on negative strand).
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            1200,
+            -1,
+            "protein_coding",
+            Some(1050),
+            Some(1150),
+        );
+        // Insertion at position 1050 (= cds_start). Left flank = 1049 is outside CDS.
+        // This should NOT be in CDS.
+        let v_outside = var("22", 1050, 1050, "-", "G");
+        assert!(
+            !engine.insertion_left_flank_in_cds(&v_outside, &t),
+            "Insertion at cds_start (neg strand 3' end) left flank is outside CDS"
+        );
+        // Insertion at position 1151 (= cds_end + 1). Left flank = 1150 = cds_end.
+        // This IS the 5' CDS boundary on negative strand.
+        let v_boundary = var("22", 1151, 1151, "-", "G");
+        assert!(
+            engine.insertion_left_flank_in_cds(&v_boundary, &t),
+            "Insertion at cds_end+1 (neg strand 5' end) left flank should be in CDS"
         );
     }
 }
