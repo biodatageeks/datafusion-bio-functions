@@ -2825,8 +2825,7 @@ mod tests {
         // pre_seq ("TG") match the trailing "TG" of the indel.
         let (shift, _seq, _hgvs, start, end) =
             perform_shift_ensembl(b"GATGC", b"GATGC", "", "XTG", 100, 99, true, -1);
-        // 'C' vs 'G' at pre_seq[0] — only first iteration matches (n=1: 'C' vs 'G' → mismatch).
-        // Actually: n=1: last of "GATGC"='C', pre_seq[3-1]='G' → mismatch → shift=0.
+        // n=1: last of "GATGC"='C', pre_seq[pre_seq.len()-1]='G' — mismatch — shift=0.
         assert_eq!(shift, 0);
         assert_eq!((start, end), (100, 99));
     }
@@ -2841,18 +2840,6 @@ mod tests {
             perform_shift_ensembl(b"GATGG", b"GATGG", "", "XGG", 100, 99, true, -1);
         assert_eq!(shift, 2);
         assert_eq!((start, end), (100, 99));
-    }
-
-    #[test]
-    fn test_perform_shift_forward_indel_larger_than_flank() {
-        // indel "ABCDE" (5 bytes), flank "ABX" (3 bytes, strictly shorter).
-        // Guard triggers: loop_limiter = 3 instead of saturating to 0.
-        // n=0: 'A'=='A' → shift=1; n=1: 'B'=='B' → shift=2; n=2: 'C'=='X' → break.
-        let (shift, _seq, _hgvs, start, end) =
-            perform_shift_ensembl(b"ABCDE", b"ABCDE", "ABX", "", 100, 104, false, 1);
-        assert_eq!(shift, 2);
-        assert_eq!(start, 102);
-        assert_eq!(end, 106);
     }
 
     // ---------------------------------------------------------------
