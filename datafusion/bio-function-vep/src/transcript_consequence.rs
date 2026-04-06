@@ -1676,7 +1676,7 @@ impl TranscriptConsequenceEngine {
                 terms.insert(SoTerm::FrameshiftVariant);
             }
 
-            if let Some(mut classification) =
+            if let Some(classification) =
                 classify_coding_change(tx, tx_exons, tx_translation, variant)
             {
                 // VEP's frameshift predicate returns 0 when stop_retained
@@ -1701,23 +1701,9 @@ impl TranscriptConsequenceEngine {
                 //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1290-L1340>
                 // - VEP's `frameshift_variant` predicate does NOT suppress stop_lost:
                 //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1434-L1468>
-                //
-                // VEP: stop_gained CAN co-occur with inframe indels
-                // (predicates are independent — no mutual exclusion gate).
-                // Only suppress stop_lost — verified by existing tests that
-                // inframe deletion of the stop codon = inframe_deletion only.
-                //
-                // Traceability:
-                // - stop_gained has no inframe_deletion/inframe_insertion guard:
-                //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1208-L1228>
-                // - stop_lost has no inframe guard either but suppress here
-                //   to match VEP's structural behavior for stop codon deletions:
-                //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1230-L1282>
-                if terms.contains(&SoTerm::InframeDeletion)
-                    || terms.contains(&SoTerm::InframeInsertion)
-                {
-                    classification.stop_lost = false;
-                }
+                // No caller-level stop_gained/stop_lost suppression needed —
+                // classify_coding_change uses per-codon analysis for all
+                // indels, matching VEP's local-peptide approach.
                 apply_codon_classification(terms, &classification);
                 terms.insert(SoTerm::ProteinAlteringVariant);
                 return Some(classification);
@@ -3170,11 +3156,13 @@ fn classify_coding_change(
     // may miss a new stop introduced *after* an existing internal stop
     // (pseudogenes / LoF transcripts).  Check each affected codon.
     //
-    // For frameshifts: VEP's codon() extracts only the local codon window
-    // (not the full downstream sequence).  stop_gained/stop_lost only fire
-    // when the codon(s) at the variant position transition to/from a stop —
-    // premature stops further downstream in the new reading frame are
-    // invisible.  Override the global comparison with per-codon results.
+    // For indels (both frameshifts AND inframe): VEP's codon() extracts
+    // only the local codon window (not the full downstream sequence).
+    // stop_gained/stop_lost only fire when the codon(s) at the variant
+    // position transition to/from a stop — premature stops further
+    // downstream (whether from a reading frame shift or from codon
+    // rearrangement) are invisible.  Override the global comparison
+    // with per-codon results for all indels.
     //
     // Traceability:
     // - VEP codon() extracts only the local codon window from alternate CDS:
@@ -3185,9 +3173,10 @@ fn classify_coding_change(
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1208-L1228>
     // - stop_lost checks $ref_pep =~ /\*/ against local peptide only:
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1230-L1282>
-    if frameshift || (ref_len == alt_len && !class.stop_gained && !class.stop_lost) {
-        if frameshift {
-            // Reset global results — for frameshifts, only the affected
+    let is_indel = ref_len != alt_len;
+    if is_indel || (ref_len == alt_len && !class.stop_gained && !class.stop_lost) {
+        if is_indel {
+            // Reset global results — for indels, only the affected
             // codon(s) determine stop_gained/stop_lost.
             class.stop_gained = false;
             class.stop_lost = false;
@@ -10030,6 +10019,44 @@ mod tests {
             collapsed.contains(&SoTerm::StopGained),
             "stop_gained should co-occur with inframe_deletion: {:?}",
             collapsed
+        );
+    }
+
+    #[test]
+    fn inframe_deletion_downstream_stop_no_false_stop_gained() {
+        // Regression test: an inframe deletion that does NOT create a stop
+        // at the affected codon(s) should NOT set stop_gained, even if the
+        // deletion shifts a downstream stop codon to an earlier position in
+        // the global protein.  VEP only checks the local codon window.
+        //
+        // CDS: ATG GCT AAA GCT TAG TGA (M A K A * *) — 18 bases
+        // Delete "AAA" at pos 1006-1008 → "ATG GCT GCT TAG TGA" = M A A * *
+        // old_aas = [M, A, K, A, *, *], new_aas = [M, A, A, *, *]
+        // Global comparison: old_stop=4, new_stop=3 → new < old → stop_gained!
+        // Per-codon at affected indices (6/3=2 to 8/3=2): codon 2 only.
+        // old_aas[2]=K, new_aas[2]=A → no stop transition → stop_gained=false ✓
+        let cds = "ATGGCTAAAGCTTAGTGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        let v = var("22", 1006, 1008, "AAA", "-");
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v).unwrap();
+        assert!(
+            !c.stop_gained,
+            "Inframe deletion with downstream stop shift should NOT set stop_gained. Got: {:?}",
+            c
         );
     }
 
