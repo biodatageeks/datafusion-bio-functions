@@ -266,8 +266,9 @@ impl SoTerm {
             | Self::IncompleteTerminalCodonVariant
             | Self::StartRetainedVariant
             | Self::StopRetainedVariant
-            | Self::SynonymousVariant
-            | Self::CodingSequenceVariant => SoImpact::Low,
+            | Self::SynonymousVariant => SoImpact::Low,
+
+            Self::CodingSequenceVariant => SoImpact::Modifier,
 
             Self::MatureMirnaVariant
             | Self::FivePrimeUtrVariant
