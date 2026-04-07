@@ -1098,6 +1098,12 @@ impl TranscriptConsequenceEngine {
                 terms.remove(&SoTerm::InframeInsertion);
                 terms.remove(&SoTerm::InframeDeletion);
                 terms.remove(&SoTerm::ProteinAlteringVariant);
+                // Note: VEP's start_lost/stop_lost/stop_gained predicates
+                // also guard on defined cds_start/cds_end (L1445 pattern).
+                // Heuristic terms from add_start_stop_heuristic_terms are
+                // not removed here — tiny mid-gene frameshift introns don't
+                // overlap start/stop codons in practice.  If this ever
+                // fires, extend the remove list.
             }
 
             // Deletions that extend beyond CDS into UTR: add UTR term
