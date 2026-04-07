@@ -1728,20 +1728,32 @@ impl TranscriptConsequenceEngine {
         // Traceability:
         // - VEP partial_codon (incomplete_terminal_codon_variant predicate):
         //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1479-L1505>
+        // VEP's cds_length = length(_translateable_seq), which is the
+        // SPLICED CDS (includes leading N padding, excludes introns).
+        // Prefer translation data; fall back to summing coding_segments.
         let cds_len_opt = tx_translation
             .and_then(|t| {
+                // cds_len and cds_sequence.len() both include leading Ns,
+                // matching VEP's _translateable_seq.
                 t.cds_len
                     .or_else(|| t.cds_sequence.as_ref().map(|s| s.len()))
             })
             .or_else(|| {
-                let (Some(s), Some(e)) = (tx.cds_start, tx.cds_end) else {
-                    return None;
-                };
-                Some(usize::try_from(e - s + 1).unwrap_or(0))
+                // No translation data — compute spliced CDS length from
+                // coding segments (sum of exon/CDS overlaps), not the
+                // genomic span which includes introns.
+                coding_segments(tx, tx_exons).map(|segs| {
+                    segs.iter()
+                        .map(|(s, e)| usize::try_from(e - s + 1).unwrap_or(0))
+                        .sum()
+                })
             });
         if let Some(cds_len) = cds_len_opt {
             let variant_pos = variant.start.min(variant.end);
             if let Some(cds_idx) = genomic_to_cds_index(tx, tx_exons, variant_pos) {
+                // leading_n is only available from cds_sequence. When
+                // cds_len comes from t.cds_len, both values include
+                // leading Ns (VEP's _translateable_seq is N-inclusive).
                 let leading_n = tx_translation
                     .and_then(|t| t.cds_sequence.as_deref())
                     .map(|s| s.as_bytes().iter().take_while(|&&b| b == b'N').count())
