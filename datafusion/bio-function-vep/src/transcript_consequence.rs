@@ -2749,6 +2749,10 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     // Specific coding children that strip both CodingSequenceVariant
     // and ProteinAlteringVariant as parents.
+    //
+    // NOTE: IncompleteTerminalCodonVariant is NOT included here — VEP
+    // emits both incomplete_terminal_codon_variant AND coding_sequence_variant
+    // together (both tier 3, co-occurring peers).
     let has_specific_child = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
         || terms.contains(&SoTerm::StopGained)
@@ -2758,8 +2762,7 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         || terms.contains(&SoTerm::InframeInsertion)
         || terms.contains(&SoTerm::InframeDeletion)
         || terms.contains(&SoTerm::StopRetainedVariant)
-        || terms.contains(&SoTerm::StartRetainedVariant)
-        || terms.contains(&SoTerm::IncompleteTerminalCodonVariant);
+        || terms.contains(&SoTerm::StartRetainedVariant);
 
     // CodingSequenceVariant is stripped by specific children OR by
     // ProteinAlteringVariant (which is itself a child of CSV).
