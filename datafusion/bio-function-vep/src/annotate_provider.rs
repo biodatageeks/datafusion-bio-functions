@@ -6161,11 +6161,8 @@ fn hydrate_window(
     hgvs_reader: &mut Option<FastaReader>,
     hydrated_cds_tx_ids: &mut HashSet<String>,
     window_batches: &[RecordBatch],
-    hgvs_flags: HgvsFlags,
+    _hgvs_flags: HgvsFlags,
 ) -> Result<()> {
-    if !hgvs_flags.any() || !hgvs_flags.shift_hgvs {
-        return Ok(());
-    }
     let Some(reader) = hgvs_reader.as_mut() else {
         return Ok(());
     };
@@ -6423,16 +6420,11 @@ impl Stream for ContigAnnotationStream {
                             config.downstream_distance,
                             config.hgvs_flags.shift_hgvs,
                         );
-                        let hgvs_reader = if config.hgvs_flags.any() && config.hgvs_flags.shift_hgvs
-                        {
-                            config.reference_fasta_path.as_deref().and_then(|path| {
-                                fasta::io::indexed_reader::Builder::default()
-                                    .build_from_path(path)
-                                    .ok()
-                            })
-                        } else {
-                            None
-                        };
+                        let hgvs_reader = config.reference_fasta_path.as_deref().and_then(|path| {
+                            fasta::io::indexed_reader::Builder::default()
+                                .build_from_path(path)
+                                .ok()
+                        });
                         // SIFT source: when use_fjall, use SiftKvStore from fjall
                         // for lazy per-transcript lookups; otherwise use parquet
                         // SiftDirectReader.

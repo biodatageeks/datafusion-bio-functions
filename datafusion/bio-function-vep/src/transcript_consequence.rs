@@ -1982,7 +1982,7 @@ impl TranscriptConsequenceEngine {
                 //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L872-L882>
                 if is_indel {
                     let is_frameshift = !ref_len.abs_diff(alt_len).is_multiple_of(3);
-                    match ins_del_start_altered(tx, tx_exons, variant) {
+                    match ins_del_start_altered(tx, tx_exons, variant, cds_seq) {
                         Some(false) => {
                             // ATG preserved at CDS-start → start_retained
                             terms.insert(SoTerm::StartRetainedVariant);
@@ -3316,7 +3316,8 @@ fn classify_coding_change(
         //    is a frameshift, VEP's peptide-level check also fires start_lost
         //    (full affected peptide range differs) alongside start_retained.
         if ref_len != alt_len {
-            match ins_del_start_altered(tx, tx_exons, variant) {
+            match ins_del_start_altered(tx, tx_exons, variant, translation.cds_sequence.as_deref())
+            {
                 Some(false) => {
                     class.start_retained = true;
                     if !ref_len.abs_diff(alt_len).is_multiple_of(3) {
@@ -3873,7 +3874,7 @@ fn classify_insertion(
             class.start_lost = true;
         }
         // 2. Nucleotide level: VEP's _ins_del_start_altered in cDNA space
-        match ins_del_start_altered(tx, tx_exons, variant) {
+        match ins_del_start_altered(tx, tx_exons, variant, Some(cds_seq)) {
             Some(false) => {
                 class.start_retained = true;
                 if !alt_len.is_multiple_of(3) {
@@ -4124,13 +4125,52 @@ fn classify_insertion(
     Some(class)
 }
 
+/// Return the 5'UTR and translateable sequence needed for VEP's
+/// `_ins_del_start_altered()` check.
+///
+/// `spliced_seq` already matches Ensembl's edited transcript cache. `cdna_seq`
+/// only works here when it actually contains full cDNA. In our caches it is
+/// often CDS-only, in which case `cdna_coding_end` sits beyond the sequence
+/// length and the sequence is unusable for the UTR + CDS check whenever a 5'UTR
+/// exists.
+fn start_codon_context<'a>(
+    tx: &'a TranscriptFeature,
+    translateable_seq: Option<&'a str>,
+) -> Option<(Option<&'a str>, &'a str)> {
+    let atg_start = tx.cdna_coding_start?.checked_sub(1)?;
+    if let Some(seq) = tx.spliced_seq.as_deref() {
+        let coding_end = tx.cdna_coding_end?;
+        if atg_start < coding_end && coding_end <= seq.len() {
+            let utr = (atg_start > 0).then_some(&seq[..atg_start]);
+            return Some((utr, &seq[atg_start..coding_end]));
+        }
+    }
+
+    if let Some(seq) = tx.cdna_seq.as_deref() {
+        if atg_start == 0 {
+            return Some((None, seq));
+        }
+        if let Some(coding_end) = tx.cdna_coding_end {
+            if atg_start < coding_end && coding_end <= seq.len() {
+                return Some((Some(&seq[..atg_start]), &seq[atg_start..coding_end]));
+            }
+        }
+    }
+
+    (atg_start == 0)
+        .then_some(translateable_seq.or(tx.cdna_seq.as_deref()))
+        .flatten()
+        .map(|seq| (None, seq))
+}
+
 /// Returns `true` if the indel destroys the start codon (ATG at the original
 /// CDS-start position in cDNA space). Mirrors VEP's `_ins_del_start_altered()`
 /// which applies the variant to the combined 5'UTR + CDS sequence and checks
 /// if ATG is preserved at the original CDS boundary.
 ///
-/// Returns `None` when cDNA data is unavailable (no spliced_seq/cdna_seq,
-/// no cdna_coding_start, or variant can't be mapped to cDNA coordinates).
+/// Returns `None` when full cDNA data is unavailable (no spliced transcript
+/// sequence, CDS-only `cdna_seq`, no cdna_coding_start, or variant can't be
+/// mapped to cDNA coordinates).
 ///
 /// Traceability:
 /// - VEP `_ins_del_start_altered`:
@@ -4139,10 +4179,19 @@ fn ins_del_start_altered(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
     variant: &VariantInput,
+    translateable_seq: Option<&str>,
 ) -> Option<bool> {
-    let cdna_coding_start = tx.cdna_coding_start?;
-    let full_seq = tx.spliced_seq.as_deref().or(tx.cdna_seq.as_deref())?;
-    let seq_bytes = full_seq.as_bytes();
+    let (utr, translateable) = start_codon_context(tx, translateable_seq)?;
+    let mut utr_and_translateable = Vec::with_capacity(
+        utr.map_or(0, str::len)
+            .saturating_add(translateable.len())
+            .saturating_sub(normalize_allele_seq(&variant.ref_allele).len()),
+    );
+    if let Some(utr) = utr {
+        utr_and_translateable.extend_from_slice(utr.as_bytes());
+    }
+    utr_and_translateable.extend_from_slice(translateable.as_bytes());
+    let seq_bytes = utr_and_translateable.as_slice();
 
     let ref_allele = normalize_allele_seq(&variant.ref_allele);
     let alt_allele = normalize_allele_seq(&variant.alt_allele);
@@ -4197,13 +4246,24 @@ fn ins_del_start_altered(
         mutated.extend_from_slice(&seq_bytes[after..]);
     }
 
-    // Check if ATG is at the original CDS-start position.
-    if mutated.len() >= cdna_coding_start + 3 {
-        let new_sc = &mutated[cdna_coding_start..cdna_coding_start + 3];
-        Some(!new_sc.eq_ignore_ascii_case(b"ATG"))
-    } else {
-        Some(true) // sequence too short → start codon destroyed
+    if let Some(utr) = utr {
+        let atg_start = utr.len();
+        if mutated.len() >= atg_start + 3 {
+            let new_sc = &mutated[atg_start..atg_start + 3];
+            let new_utr = &mutated[..utr.len()];
+            if new_utr.eq_ignore_ascii_case(utr.as_bytes()) && new_sc.eq_ignore_ascii_case(b"ATG") {
+                return Some(false);
+            }
+        }
     }
+
+    // Sequence shorter than the translateable CDS → start codon destroyed.
+    if mutated.len() < translateable.len() {
+        return Some(true);
+    }
+
+    let translated_suffix = &mutated[mutated.len() - translateable.len()..];
+    Some(!translated_suffix.eq_ignore_ascii_case(translateable.as_bytes()))
 }
 
 /// Build the first 3 bases of the mutated CDS for an indel near the start
@@ -9436,13 +9496,55 @@ mod tests {
     // Tests for the new ins_del_start_altered() function and the
     // start_lost / start_retained co-occurrence for frameshifts.
 
-    /// Helper: build a transcript with cDNA data (spliced_seq + cdna_coding_start)
-    /// for testing ins_del_start_altered. The cDNA is 5'UTR + CDS concatenated.
-    fn tx_with_cdna(utr_seq: &str, cds_seq: &str) -> (TranscriptFeature, Vec<ExonFeature>) {
+    /// Helper: build a transcript with full cDNA data. `cdna_coding_start`
+    /// follows Ensembl's 1-based convention.
+    fn tx_with_cdna_on_strand(
+        utr_seq: &str,
+        cds_seq: &str,
+        strand: i8,
+    ) -> (TranscriptFeature, Vec<ExonFeature>) {
         let cdna = format!("{utr_seq}{cds_seq}");
         let utr_len = utr_seq.len();
+        let cds_len = cds_seq.len();
         let total_len = cdna.len();
         // Genomic coords: exon covers 1000..(1000+total_len-1)
+        let tx_start = 1000i64;
+        let tx_end = tx_start + total_len as i64 - 1;
+        let (cds_start, cds_end) = if strand >= 0 {
+            (tx_start + utr_len as i64, tx_end)
+        } else {
+            (tx_start, tx_start + cds_len as i64 - 1)
+        };
+        let mut t = tx(
+            "T1",
+            "22",
+            tx_start,
+            tx_end,
+            strand,
+            "protein_coding",
+            Some(cds_start),
+            Some(cds_end),
+        );
+        t.spliced_seq = Some(cdna);
+        t.cdna_coding_start = Some(utr_len + 1);
+        t.cdna_coding_end = Some(total_len);
+        let e = exon("T1", 1, tx_start, tx_end);
+        (t, vec![e])
+    }
+
+    fn tx_with_cdna(utr_seq: &str, cds_seq: &str) -> (TranscriptFeature, Vec<ExonFeature>) {
+        tx_with_cdna_on_strand(utr_seq, cds_seq, 1)
+    }
+
+    /// Helper: mirror the cache layout where `cdna_seq` contains CDS only,
+    /// while cDNA coding coordinates still refer to the full transcript.
+    fn tx_with_cds_only_cdna(
+        utr_seq: &str,
+        cds_seq: &str,
+    ) -> (TranscriptFeature, Vec<ExonFeature>) {
+        let utr_len = utr_seq.len();
+        let cds_len = cds_seq.len();
+        let total_len = utr_len + cds_len;
         let tx_start = 1000i64;
         let tx_end = tx_start + total_len as i64 - 1;
         let cds_start = tx_start + utr_len as i64;
@@ -9457,8 +9559,8 @@ mod tests {
             Some(cds_start),
             Some(cds_end),
         );
-        t.spliced_seq = Some(cdna);
-        t.cdna_coding_start = Some(utr_len);
+        t.cdna_seq = Some(cds_seq.to_string());
+        t.cdna_coding_start = Some(utr_len + 1);
         t.cdna_coding_end = Some(total_len);
         let e = exon("T1", 1, tx_start, tx_end);
         (t, vec![e])
@@ -9471,7 +9573,7 @@ mod tests {
         let (t, exons) = tx_with_cdna("GCGC", "ATGGCTGAATGA");
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 1005, 1006, "TG", "-");
-        let result = ins_del_start_altered(&t, &exons_ref, &v);
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
         assert_eq!(
             result,
             Some(true),
@@ -9487,7 +9589,7 @@ mod tests {
         let (t, exons) = tx_with_cdna("GCGC", "ATGGCTGAATGA");
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 1007, 1007, "G", "-");
-        let result = ins_del_start_altered(&t, &exons_ref, &v);
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
         assert_eq!(
             result,
             Some(false),
@@ -9502,7 +9604,7 @@ mod tests {
         let (t, exons) = tx_with_cdna("GCGC", "ATGGCTGAATGA");
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 1008, 1008, "-", "TT");
-        let result = ins_del_start_altered(&t, &exons_ref, &v);
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
         assert_eq!(
             result,
             Some(false),
@@ -9511,41 +9613,41 @@ mod tests {
     }
 
     #[test]
-    fn ins_del_start_altered_utr_deletion_shifts_to_atg() {
+    fn ins_del_start_altered_utr_deletion_preserves_translateable_suffix() {
         // 5'UTR = "GCATG", CDS = "ATGGCTGAATGA"
-        // Full cDNA: GCATG|ATGGCTGAATGA, cdna_coding_start = 5
+        // Full cDNA: GCATG|ATGGCTGAATGA, cdna_coding_start = 6
         // Delete "GC" at genomic 1000-1001 (cDNA positions 0-1).
         // Mutated cDNA: ATG|ATGGCTGAATGA
-        // At cdna_coding_start=5: position 5 → 'G' (from "ATGATG...")
-        // Actually mutated = "ATGATGGCTGAATGA" (13 chars), pos 5..8 = "GGC" → not ATG.
-        // So start is altered.
+        // VEP does not require ATG to remain at the original byte offset when
+        // the 5'UTR changes. It compares the suffix that will be translated,
+        // and here that suffix is still the original CDS, so start is retained.
         let (t, exons) = tx_with_cdna("GCATG", "ATGGCTGAATGA");
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 1000, 1001, "GC", "-");
-        let result = ins_del_start_altered(&t, &exons_ref, &v);
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
         assert_eq!(
             result,
-            Some(true),
-            "UTR deletion shifting CDS should destroy start codon at original position"
+            Some(false),
+            "UTR deletion that preserves the translated suffix should retain the start codon"
         );
     }
 
     #[test]
-    fn ins_del_start_altered_utr_deletion_preserves_atg_by_coincidence() {
+    fn ins_del_start_altered_utr_deletion_can_retain_shifted_start() {
         // 5'UTR = "ATATG", CDS = "ATGGCTGAATGA"
-        // Full cDNA: ATATG|ATGGCTGAATGA, cdna_coding_start = 5
+        // Full cDNA: ATATG|ATGGCTGAATGA, cdna_coding_start = 6
         // Delete "AT" at genomic 1000-1001 (cDNA positions 0-1).
         // Mutated cDNA: "ATG" + "ATGGCTGAATGA" = "ATGATGGCTGAATGA"
-        // At cdna_coding_start=5: position 5..8 = "GGC" → not ATG.
-        // Start codon destroyed.
+        // The UTR now ends with ATG, and the translated suffix still matches
+        // the original CDS. VEP therefore returns start_retained_variant.
         let (t, exons) = tx_with_cdna("ATATG", "ATGGCTGAATGA");
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 1000, 1001, "AT", "-");
-        let result = ins_del_start_altered(&t, &exons_ref, &v);
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
         assert_eq!(
             result,
-            Some(true),
-            "UTR deletion should destroy start codon at original CDS position"
+            Some(false),
+            "UTR deletion can still retain the start codon when the translated suffix is unchanged"
         );
     }
 
@@ -9568,8 +9670,37 @@ mod tests {
         let e = exon("T1", 1, 1000, tx_end);
         let exons_ref: Vec<&ExonFeature> = vec![&e];
         let v = var("22", 1001, 1002, "TG", "-");
-        let result = ins_del_start_altered(&t, &exons_ref, &v);
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
         assert_eq!(result, None, "No cDNA data → should return None");
+    }
+
+    #[test]
+    fn ins_del_start_altered_returns_none_for_cds_only_cdna_cache() {
+        let (t, exons) = tx_with_cds_only_cdna("GCGC", "ATGGCTGAATGA");
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 1006, 1006, "G", "-");
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
+        assert_eq!(
+            result, None,
+            "CDS-only cdna_seq must not be treated as full cDNA for start-retained checks"
+        );
+    }
+
+    #[test]
+    fn ins_del_start_altered_negative_strand_boundary_deletion_preserves_atg() {
+        // Transcript cDNA: 5'UTR ATGCC + CDS ATGAAAAAA on the negative strand.
+        // Delete the last 2 UTR bases plus the start codon in genomic space.
+        // The remaining UTR prefix ("ATG") shifts into the CDS boundary, so the
+        // translateable suffix remains unchanged and VEP calls start_retained.
+        let (t, exons) = tx_with_cdna_on_strand("ATGCC", "ATGAAAAAA", -1);
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 1006, 1010, "CATGG", "-");
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
+        assert_eq!(
+            result,
+            Some(false),
+            "Boundary deletion with full negative-strand cDNA should preserve the start codon"
+        );
     }
 
     /// Helper: classify a deletion in a transcript with cDNA data.
@@ -9581,6 +9712,21 @@ mod tests {
         ref_allele: &str,
     ) -> Option<CodingClassification> {
         let (t, exons) = tx_with_cdna(utr_seq, cds_seq);
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let cds_len = cds_seq.len();
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
+        let v = var("22", del_start, del_end, ref_allele, "-");
+        classify_coding_change(&t, &exons_ref, Some(&tr), &v)
+    }
+
+    fn classify_deletion_with_cds_only_cdna(
+        utr_seq: &str,
+        cds_seq: &str,
+        del_start: i64,
+        del_end: i64,
+        ref_allele: &str,
+    ) -> Option<CodingClassification> {
+        let (t, exons) = tx_with_cds_only_cdna(utr_seq, cds_seq);
         let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
         let cds_len = cds_seq.len();
         let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
@@ -9610,6 +9756,20 @@ mod tests {
             c.start_lost,
             "Frameshift preserving ATG: should ALSO emit start_lost (VEP peptide check). Got: start_retained={}, start_lost={}",
             c.start_retained, c.start_lost
+        );
+    }
+
+    #[test]
+    fn issue_125_frameshift_deletion_with_cds_only_cdna_uses_cds_fallback() {
+        let c =
+            classify_deletion_with_cds_only_cdna("GCGC", "ATGGCTGAATGA", 1006, 1006, "G").unwrap();
+        assert!(
+            c.start_retained,
+            "CDS-only cache transcripts should still co-emit start_retained via CDS fallback"
+        );
+        assert!(
+            c.start_lost,
+            "Frameshift preserving ATG should still co-emit start_lost via peptide logic"
         );
     }
 
@@ -9675,7 +9835,7 @@ mod tests {
         // Instead, insert after CDS pos -1 (in the UTR, genomic 1004):
         // This would be an insertion at the UTR/CDS boundary. cds_idx maps
         // to 0 via alternate flank. Mutated cDNA: GCGC + TT + ATGGCTGAATGA
-        // At cdna_coding_start=4: "AT" (inserted) + "ATGG..." → pos 4..7 = "ATAT"
+        // At cdna_coding_start=5 (1-based): "AT" (inserted) + "ATGG..." → pos 5..7 = "ATA"
         // → not ATG. So this doesn't work either.
         //
         // For insertions, preserving ATG at the cDNA level while being within
@@ -9685,7 +9845,7 @@ mod tests {
         // Mutated CDS: "A" + "ATG" + "TGGCTGAATGA" = "AATGTGGCTGAATGA"
         // First 3 at CDS level: "AAT" ≠ ATG.
         // But at cDNA level: mutated cDNA = "GCGC" + "A" + "ATG" + "TGGCTGAATGA"
-        // = "GCGCAATGTGGCTGAATGA", cdna_coding_start=4 → "AATG"[0:3] = "AAT" ≠ ATG.
+        // = "GCGCAATGTGGCTGAATGA", cdna_coding_start=5 (1-based) → "AAT" ≠ ATG.
         //
         // The preservation happens more naturally for insertions AFTER the
         // start codon (cds_idx >= 2), but those don't pass the cds_idx < 2 gate.
