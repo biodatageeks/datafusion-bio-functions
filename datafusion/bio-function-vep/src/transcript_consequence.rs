@@ -3328,7 +3328,28 @@ fn classify_coding_change(
                         class.start_lost = true;
                     }
                 }
-                None => {} // no cDNA data, keep amino acid level results
+                None => {
+                    // No cDNA data — check the mutated CDS vector directly.
+                    // Equivalent to VEP's _ins_del_start_altered but using
+                    // CDS-only sequence instead of UTR+CDS combined.
+                    //
+                    // Traceability:
+                    // - VEP _ins_del_start_altered checks new_sc eq 'ATG':
+                    //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1005-L1010>
+                    // - VEP start_retained_variant = !_ins_del_start_altered:
+                    //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L957-L962>
+                    // - VEP start_lost peptide check co-fires for frameshifts:
+                    //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L872-L882>
+                    if mutated.len() >= leading_n_offset + 3
+                        && mutated[leading_n_offset..leading_n_offset + 3]
+                            .eq_ignore_ascii_case(b"ATG")
+                    {
+                        class.start_retained = true;
+                        if !ref_len.abs_diff(alt_len).is_multiple_of(3) {
+                            class.start_lost = true;
+                        }
+                    }
+                }
             }
         }
     }
@@ -3864,7 +3885,23 @@ fn classify_insertion(
                     class.start_lost = true;
                 }
             }
-            None => {} // no cDNA data, keep amino acid level results
+            None => {
+                // No cDNA data — check the mutated CDS vector directly.
+                //
+                // Traceability:
+                // - VEP _ins_del_start_altered:
+                //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1005-L1010>
+                // - VEP start_retained_variant = !_ins_del_start_altered:
+                //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L957-L962>
+                if mutated.len() >= leading_n_offset + 3
+                    && mutated[leading_n_offset..leading_n_offset + 3].eq_ignore_ascii_case(b"ATG")
+                {
+                    class.start_retained = true;
+                    if !alt_len.is_multiple_of(3) {
+                        class.start_lost = true;
+                    }
+                }
+            }
         }
     }
 
