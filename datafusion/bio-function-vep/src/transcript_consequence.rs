@@ -1757,6 +1757,30 @@ impl TranscriptConsequenceEngine {
                         terms.insert(SoTerm::InframeDeletion);
                     }
                 }
+                // VEP's inframe_insertion requires ref_pep to be an exact
+                // prefix OR suffix of alt_pep (pure insertion in the peptide).
+                // When the insertion disrupts a flanking codon, the containment
+                // check fails → inframe_insertion returns 0 → protein_altering_variant
+                // fires as the catch-all.
+                //
+                // Traceability:
+                // - VEP inframe_insertion containment check:
+                //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1125>
+                // - VEP protein_altering_variant catch-all:
+                //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L375-L393>
+                if terms.contains(&SoTerm::InframeInsertion) {
+                    if let Some(aa) = &classification.amino_acids {
+                        if let Some((ref_pep, alt_pep)) = aa.split_once('/') {
+                            let alt_trimmed = alt_pep.split('*').next().unwrap_or(alt_pep);
+                            let is_pure =
+                                alt_trimmed.starts_with(ref_pep) || alt_trimmed.ends_with(ref_pep);
+                            if !is_pure && ref_pep != "-" {
+                                terms.remove(&SoTerm::InframeInsertion);
+                            }
+                        }
+                    }
+                }
+
                 // VEP evaluates each consequence predicate independently.
                 // stop_lost CAN co-occur with frameshift_variant (when the
                 // frameshift extends past the original stop codon).
@@ -2680,7 +2704,9 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 /// - Ensembl Variation `BaseVariationFeatureOverlapAllele::_get_cons_term_rank()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749>
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
-    let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
+    // Specific coding children that strip both CodingSequenceVariant
+    // and ProteinAlteringVariant as parents.
+    let has_specific_child = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
         || terms.contains(&SoTerm::StopGained)
         || terms.contains(&SoTerm::StopLost)
@@ -2692,8 +2718,12 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         || terms.contains(&SoTerm::StartRetainedVariant)
         || terms.contains(&SoTerm::IncompleteTerminalCodonVariant);
 
-    if has_specific_coding {
+    // CodingSequenceVariant is stripped by specific children OR by
+    // ProteinAlteringVariant (which is itself a child of CSV).
+    if has_specific_child || terms.contains(&SoTerm::ProteinAlteringVariant) {
         terms.remove(&SoTerm::CodingSequenceVariant);
+    }
+    if has_specific_child {
         terms.remove(&SoTerm::ProteinAlteringVariant);
     }
 
@@ -11501,6 +11531,145 @@ mod tests {
         assert!(
             !term_set.contains(&SoTerm::FrameshiftVariant),
             "frameshift_variant should be suppressed by stop_retained, got: {:?}",
+            terms
+        );
+    }
+
+    // ── Issue #124: protein_altering_variant for complex inframe insertions ──
+
+    #[test]
+    fn issue_124_complex_inframe_insertion_gets_protein_altering_variant() {
+        // chr2:119437075 pattern: 6bp in-frame insertion where the insertion
+        // disrupts a flanking codon, producing a complex AA change where
+        // ref_pep is neither a prefix nor suffix of alt_pep.
+        // VEP: protein_altering_variant.  Our code: was inframe_insertion.
+        //
+        // CDS: ATG GCT GAA GCT TGA (M A E A *) — 15 bases
+        // Insert "GGGAAA" (6 bases, in-frame) at pos 1004 (CDS idx 4,
+        // after 1st base of codon 1 "GCT" — disrupts the codon)
+        // Mutated: ATG G + GGGAAA + CT GAA GCT TGA
+        //   = "ATGGGGGAAACTGAAGCTTGA" (21 bases)
+        // → ATG|GGG|GAA|ACT|GAA|GCT|TGA → M G E T E A *
+        // ref_pep at codon 1 = "A" (from GCT)
+        // alt_pep first AA = "G" (from GGG) — differs from ref!
+        // "A" is NOT a prefix or suffix of "GETEA..."
+        // → inframe_insertion returns false → protein_altering_variant fires
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGCTGAAGCTTGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        t.cdna_coding_end = Some(cds_len);
+        t.spliced_seq = Some(format!("{cds}CCCGGG"));
+        let e = exon("T1", 1, 990, 1030);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        // Insert "GGGAAA" at pos 1004 (within codon 1, after 1st base)
+        let v = var("1", 1004, 1004, "-", "GGGAAA");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            term_set.contains(&SoTerm::ProteinAlteringVariant),
+            "Complex inframe insertion should get protein_altering_variant, got: {:?}",
+            terms
+        );
+        assert!(
+            !term_set.contains(&SoTerm::InframeInsertion),
+            "Should NOT have inframe_insertion for complex change, got: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn issue_124_pure_inframe_insertion_still_gets_inframe_insertion() {
+        // Regression guard: a pure codon-boundary in-frame insertion
+        // should keep inframe_insertion (ref="-" is guarded).
+        // Full pipeline test to verify InframeInsertion survives.
+        //
+        // CDS: ATG GCT GAA TGA (M A E *) — 12 bases
+        // Insert "GCTGCT" (6 bases, 2 codons) at pos 1006 (codon boundary)
+        // amino_acids = "-/AA" → ref_pep = "-" → guarded → pure
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGCTGAATGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        t.cdna_coding_end = Some(cds_len);
+        t.spliced_seq = Some(format!("{cds}CCCGGG"));
+        let e = exon("T1", 1, 990, 1030);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        let v = var("1", 1006, 1006, "-", "GCTGCT");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            term_set.contains(&SoTerm::InframeInsertion),
+            "Pure codon-boundary insertion should keep inframe_insertion, got: {:?}",
+            terms
+        );
+        assert!(
+            !term_set.contains(&SoTerm::ProteinAlteringVariant),
+            "Should NOT have protein_altering_variant for pure insertion, got: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn issue_124_within_codon_complex_insertion_gets_protein_altering() {
+        // Within-codon insertions almost always change the codon at the
+        // insertion point, making them "complex". Full pipeline test.
+        //
+        // CDS: ATG GCT GAA TGA (M A E *) — 12 bases
+        // Insert "GCTGCT" (6 bases) at pos 1004 (within codon 1, after 1st base)
+        // ref_pep = "A", alt first AA ≠ "A" → complex → protein_altering_variant
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGCTGAATGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        t.cdna_coding_end = Some(cds_len);
+        t.spliced_seq = Some(format!("{cds}CCCGGG"));
+        let e = exon("T1", 1, 990, 1030);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        let v = var("1", 1004, 1004, "-", "GCTGCT");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            term_set.contains(&SoTerm::ProteinAlteringVariant),
+            "Within-codon complex insertion should get protein_altering_variant, got: {:?}",
+            terms
+        );
+        assert!(
+            !term_set.contains(&SoTerm::InframeInsertion),
+            "Should NOT have inframe_insertion for complex change, got: {:?}",
             terms
         );
     }
