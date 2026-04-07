@@ -1771,7 +1771,12 @@ impl TranscriptConsequenceEngine {
                 if terms.contains(&SoTerm::InframeInsertion) {
                     if let Some(aa) = &classification.amino_acids {
                         if let Some((ref_pep, alt_pep)) = aa.split_once('/') {
-                            let alt_trimmed = alt_pep.split('*').next().unwrap_or(alt_pep);
+                            // VEP: $alt_pep =~ s/\*.+/\*/; — keeps the first '*',
+                            // removes everything after it.
+                            let alt_trimmed = match alt_pep.find('*') {
+                                Some(pos) if pos + 1 < alt_pep.len() => &alt_pep[..pos + 1],
+                                _ => alt_pep,
+                            };
                             let is_pure =
                                 alt_trimmed.starts_with(ref_pep) || alt_trimmed.ends_with(ref_pep);
                             if !is_pure && ref_pep != "-" {
@@ -3734,17 +3739,26 @@ fn classify_insertion(
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1320-L1355>
     // - codon() local window extraction (codon_len + allele_len - vf_nt_len):
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L877>
-    if !class.stop_retained && codon_at < old_aas.len() {
-        let ref_aa = old_aas[codon_at];
-        // Translate the LOCAL codon window from the mutated CDS, matching
-        // VEP's codon() extraction: codon_len (3) + alt_len bytes.
-        // For pure insertions ref is empty (vf_nt_len = 0), so
-        // window = codon_len + alt_len - 0 = 3 + alt_len.
+    // Translate the LOCAL codon window from the mutated CDS, matching
+    // VEP's codon() extraction: codon_len (3) + alt_len bytes.
+    // For pure insertions ref is empty (vf_nt_len = 0), so
+    // window = codon_len + alt_len - 0 = 3 + alt_len.
+    //
+    // VEP uses this same local window for BOTH stop_retained and
+    // stop_gained predicates (both call _get_peptide_alleles).
+    let local_aas = if codon_at < old_aas.len() {
         let codon_start = codon_at * 3;
         let window_len = 3 + alt_len;
         let window_end = (codon_start + window_len).min(mutated.len());
         let local_window = &mutated[codon_start..window_end];
-        let local_aas = translate_protein_from_cds(local_window).unwrap_or_default();
+        translate_protein_from_cds(local_window).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // stop_retained: VEP's ref_eq_alt_sequence (VariationEffect.pm L1320-1355)
+    if !class.stop_retained && codon_at < old_aas.len() {
+        let ref_aa = old_aas[codon_at];
         // Condition 1: ref_pep == first alt AA AND alt contains '*'
         if ref_aa != '*' && local_aas.first() == Some(&ref_aa) && local_aas.contains(&'*') {
             class.stop_retained = true;
@@ -3752,6 +3766,22 @@ fn classify_insertion(
         // Condition 3: both contain '*' at the same position
         if !class.stop_retained && ref_aa == '*' && local_aas.first() == Some(&'*') {
             class.stop_retained = true;
+        }
+    }
+
+    // stop_gained: VEP's stop_gained (VariationEffect.pm L1207-1227)
+    // Uses the SAME local codon window as stop_retained. No frameshift
+    // guard — the commented-out `return () if frameshift(@_)` in
+    // _get_peptide_alleles (L781) means frameshifts ARE included.
+    // Fires when alt_pep contains '*' and ref_pep does not.
+    //
+    // Traceability:
+    // - stop_gained predicate:
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1207-L1227>
+    if !class.stop_retained && !class.stop_gained && codon_at < old_aas.len() {
+        let ref_aa = old_aas[codon_at];
+        if ref_aa != '*' && local_aas.contains(&'*') {
+            class.stop_gained = true;
         }
     }
 
@@ -11671,6 +11701,211 @@ mod tests {
             !term_set.contains(&SoTerm::InframeInsertion),
             "Should NOT have inframe_insertion for complex change, got: {:?}",
             terms
+        );
+    }
+
+    #[test]
+    fn issue_124_alt_trimming_preserves_stop_for_containment_check() {
+        // Regression guard: VEP's alt_pep trimming keeps the first '*':
+        //   $alt_pep =~ s/\*.+/\*/;  → "*XY" becomes "*", "L*X" becomes "L*"
+        // Our old code used split('*').next() which DROPPED the '*':
+        //   "*XY" → "", "L*X" → "L"
+        // This caused ref_pep="*" to fail the containment check against ""
+        // and incorrectly strip InframeInsertion.
+        //
+        // Verify the trimming directly via classify_ins where stop_retained
+        // fires and amino_acids contain '*' in the ref position.
+        //
+        // CDS: ATG GCT GAA TGA (M A E *) — 12 bases
+        // Insert "AATGAGGGGG" (10 bases) at pos 1007 → stop_retained fires
+        // (from #117 local window check). amino_acids = "*/E*GGGGE" or similar.
+        // The containment check must NOT strip InframeInsertion.
+        let cds = "ATGGCTGAATGA";
+        let c = classify_ins(cds, 1007, "AATGAGGGGG").unwrap();
+        // stop_retained fires for this case (#117)
+        assert!(c.stop_retained, "Should have stop_retained. Got: {:?}", c);
+        // The amino_acids string has ref_pep containing '*'
+        // With correct trimming, the containment check should pass
+        if let Some(aa) = &c.amino_acids {
+            if let Some((ref_pep, alt_pep)) = aa.split_once('/') {
+                let alt_trimmed = match alt_pep.find('*') {
+                    Some(pos) if pos + 1 < alt_pep.len() => &alt_pep[..pos + 1],
+                    _ => alt_pep,
+                };
+                let is_pure = alt_trimmed.starts_with(ref_pep) || alt_trimmed.ends_with(ref_pep);
+                assert!(
+                    is_pure || ref_pep == "-",
+                    "Stop-retained amino acids should pass containment check. \
+                     ref_pep={ref_pep:?}, alt_trimmed={alt_trimmed:?}"
+                );
+            }
+        }
+    }
+
+    // ── Issue #116: stop_gained via local codon window for insertions ────
+
+    #[test]
+    fn issue_116_frameshift_insertion_stop_gained_local_window() {
+        // chr11:5727045 pattern: 4bp insertion (frameshift) where the local
+        // codon window (3 + 4 = 7 bytes → 2 AAs) includes a new stop codon.
+        // VEP: stop_gained&frameshift_variant.
+        //
+        // For stop_gained to fire (not stop_retained), the first local AA
+        // must DIFFER from the ref AA (so stop_retained Cond 1 fails).
+        //
+        // CDS: ATG GAT GAA TGA (M D E *) — 12 bases
+        // Insert "CCTG" at pos 1004 (CDS idx 4, after 2nd base of codon 1 "GAT")
+        // cds_idx = 3, codon_at = 1, ins_point = 4
+        // Mutated: "ATGG" + "CCTG" + "ATGAATGA" = "ATGGCCTGATGAATGA" (16 bytes)
+        // Local window (7 bytes at codon 1): mutated[3..10] = "GCCTGAT"
+        // → GCC|TGA → A * (Ala, Stop)
+        // ref_aa = D (from GAT), local[0] = A → A ≠ D → stop_retained fails
+        // local contains '*', ref_aa ≠ '*' → stop_gained fires!
+        let cds = "ATGGATGAATGA";
+        let c = classify_ins(cds, 1004, "CCTG").unwrap();
+        assert!(
+            c.stop_gained,
+            "4bp frameshift insertion creating stop in local window should set stop_gained. Got: {:?}",
+            c
+        );
+        assert!(
+            !c.stop_retained,
+            "Should NOT be stop_retained (first local AA differs from ref). Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn issue_116_large_frameshift_insertion_stop_gained() {
+        // chr20:37179387 pattern: 28bp insertion (frameshift) where the
+        // local window (3 + 28 = 31 bytes → 10 AAs) includes a stop.
+        // VEP: splice_donor_variant&stop_gained&frameshift_variant.
+        //
+        // CDS: ATG GCT GAA GCT AAA GCT TGA (M A E A K A *) — 21 bases
+        // Insert 28 bases containing a stop codon in the window.
+        // Insert "AGTGCCGGCCGCGGGGCCCTGTCTATAAAG" at pos 1004
+        // → local window large enough to contain TGA from inserted sequence.
+        //
+        // Simpler: use classify_ins with a CDS where the inserted bases
+        // form a stop within the local window.
+        // CDS: ATG GCT GAA GCT TGA (M A E A *) — 15 bases
+        // Insert "TGAGGGGGGGGGGGGGGGGGGGGGGGGG" (28 bases) at pos 1004
+        // Local window (31 bytes at codon 1): first 30 bytes translate to 10 AAs
+        // "GTGAGGGGGGGGGGGGGGGGGGGGGGGGGCT" → G|TGA|GGG|... → stop at position 1!
+        // Wait: "G" + "TGAGGGG...GGG" + "CT"
+        // First 30 bytes: GTG|AGG|GGG|GGG|GGG|GGG|GGG|GGG|GGG|GCT
+        // → V R G G G G G G G A — no stop.
+        //
+        // Need TGA to fall on a codon boundary in the local window.
+        // Insert "GGTGAGGGGGGGGGGGGGGGGGGGGGGG" (28 bases starting with GGTGA):
+        // Local window at codon 1: "G" + "GGTGA..." + "CT"
+        // = "GGGTGAGGGG...GGGCT"
+        // → GGG|TGA|GGG|... → G * G ... — stop at position 1!
+        let cds = "ATGGCTGAAGCTTGA";
+        let c = classify_ins(cds, 1004, "GGTGAGGGGGGGGGGGGGGGGGGGGGGG").unwrap();
+        assert!(
+            c.stop_gained,
+            "28bp frameshift insertion with stop in local window should set stop_gained. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn issue_116_frameshift_insertion_no_false_stop_gained() {
+        // Regression guard: frameshift insertion where the local window
+        // does NOT contain a stop should NOT set stop_gained.
+        //
+        // CDS: ATG GCT GAA GCT TGA (M A E A *) — 15 bases
+        // Insert "T" at pos 1004 (1bp frameshift, window = 4 bytes → 1 AA)
+        // Local window: "GTCT" → GTC → V — no stop.
+        let cds = "ATGGCTGAAGCTTGA";
+        let c = classify_ins(cds, 1004, "T").unwrap();
+        assert!(
+            !c.stop_gained,
+            "1bp frameshift far from stop should NOT set stop_gained. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn issue_116_stop_gained_suppressed_when_stop_retained() {
+        // VEP: stop_gained returns 0 when stop_retained is true (L1217).
+        // Verify stop_gained does NOT fire when stop_retained already fired.
+        //
+        // Use the #117 test pattern: 10bp insertion near stop where
+        // stop_retained fires. stop_gained should NOT also fire.
+        let cds = "ATGGCTGAATGA";
+        let c = classify_ins(cds, 1007, "AATGAGGGGG").unwrap();
+        assert!(c.stop_retained, "Should have stop_retained. Got: {:?}", c);
+        assert!(
+            !c.stop_gained,
+            "stop_gained must be suppressed when stop_retained is true. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn issue_116_full_pipeline_frameshift_with_stop_gained() {
+        // Full pipeline test: 4bp insertion creating stop in local window
+        // where first local AA differs from ref → stop_gained (not retained).
+        // → both frameshift_variant AND stop_gained in final terms.
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGATGAATGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        t.cdna_coding_end = Some(cds_len);
+        t.spliced_seq = Some(format!("{cds}CCCGGG"));
+        let e = exon("T1", 1, 990, 1030);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        // Insert "CCTG" at pos 1004 (creates stop in local window, first AA changes)
+        let v = var("1", 1004, 1004, "-", "CCTG");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            term_set.contains(&SoTerm::FrameshiftVariant),
+            "Should have frameshift_variant, got: {:?}",
+            terms
+        );
+        assert!(
+            term_set.contains(&SoTerm::StopGained),
+            "Should have stop_gained alongside frameshift, got: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn issue_116_inframe_insertion_near_stop_earlier_check_catches() {
+        // Edge case from review: 3bp inframe insertion 1 codon before
+        // the stop. The earlier stop_retained check (full CDS translation,
+        // old_stop_idx == new_stop_idx) fires because the stop position
+        // is preserved. This blocks stop_gained.
+        //
+        // CDS: ATG GAT GAA TGA (M D E *) — 12 bases
+        // Insert "CCT" at pos 1007 (within codon 2, after 1st base)
+        // Mutated: "ATGGATGCCTAATGA" → M D A * *
+        // old_stop = 3, new_stop = 3 → stop_retained from earlier check.
+        let cds = "ATGGATGAATGA";
+        let c = classify_ins(cds, 1007, "CCT").unwrap();
+        assert!(
+            c.stop_retained,
+            "Earlier check (old_stop==new_stop near insertion) should fire. Got: {:?}",
+            c
+        );
+        assert!(
+            !c.stop_gained,
+            "stop_gained must be blocked by stop_retained. Got: {:?}",
+            c
         );
     }
 }
