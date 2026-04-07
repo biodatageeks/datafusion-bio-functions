@@ -2759,6 +2759,25 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 /// - Ensembl Variation `BaseVariationFeatureOverlapAllele::_get_cons_term_rank()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749>
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
+    // VEP's frameshift_variant and inframe_deletion predicates both have
+    // `return 0 if partial_codon(@_)`.  When the variant is at an
+    // incomplete terminal codon, these terms are suppressed.  Must run
+    // BEFORE has_specific_child so they don't incorrectly strip
+    // CodingSequenceVariant.
+    //
+    // Note: inframe_insertion does NOT have the guard in VEP — it CAN
+    // co-occur with incomplete_terminal_codon_variant.
+    //
+    // Traceability:
+    // - VEP frameshift partial_codon guard:
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1442>
+    // - VEP inframe_deletion partial_codon guard:
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1167>
+    if terms.contains(&SoTerm::IncompleteTerminalCodonVariant) {
+        terms.remove(&SoTerm::FrameshiftVariant);
+        terms.remove(&SoTerm::InframeDeletion);
+    }
+
     // Specific coding children that strip both CodingSequenceVariant
     // and ProteinAlteringVariant as parents.
     //
@@ -12187,6 +12206,114 @@ mod tests {
         assert!(
             !term_set.contains(&SoTerm::SynonymousVariant),
             "Should NOT have synonymous_variant at incomplete codon. Got: {:?}",
+            terms
+        );
+    }
+
+    // ── Issue #130: partial_codon suppresses frameshift/inframe_deletion ──
+
+    #[test]
+    fn issue_130_frameshift_suppressed_at_incomplete_terminal_codon() {
+        // chr3:44499299 pattern: deletion (frameshift) at incomplete
+        // terminal codon. VEP: coding_sequence_variant (MODIFIER).
+        // vepyr (before fix): frameshift_variant (HIGH).
+        //
+        // VEP's frameshift has `return 0 if partial_codon(@_)` (L1442).
+        //
+        // CDS: ATG GCT GA (8 bases, 8%3=2 → 2-base incomplete codon)
+        // Delete "A" at pos 1007 (last CDS base, in incomplete codon)
+        // → frameshift_variant, but suppressed by partial_codon.
+        //
+        // Traceability:
+        // - VEP frameshift partial_codon guard:
+        //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1442>
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGCTGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let mut t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end + 10,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        t.cdna_coding_end = Some(cds_len);
+        t.spliced_seq = Some(format!("{cds}CCCGGG"));
+        let e = exon("T1", 1, 1000, tx_end + 10);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        let v = var("22", 1007, 1007, "A", "-");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            !term_set.contains(&SoTerm::FrameshiftVariant),
+            "frameshift_variant must be suppressed at incomplete terminal codon. Got: {:?}",
+            terms
+        );
+        assert!(
+            term_set.contains(&SoTerm::IncompleteTerminalCodonVariant),
+            "Should have incomplete_terminal_codon_variant. Got: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn issue_130_inframe_deletion_suppressed_at_incomplete_terminal_codon() {
+        // VEP's inframe_deletion has `return 0 if partial_codon(@_)` (L1167).
+        //
+        // CDS: ATG GCT GAA GA (11 bases, 11%3=2 → 2-base incomplete)
+        // Delete "GAA" at pos 1006-1008 (3bp in-frame deletion within CDS)
+        // → if affected codon overlaps incomplete region, suppressed.
+        // Note: this tests the strip, not the partial_codon detection.
+        let mut terms = std::collections::BTreeSet::new();
+        terms.insert(SoTerm::IncompleteTerminalCodonVariant);
+        terms.insert(SoTerm::InframeDeletion);
+        terms.insert(SoTerm::CodingSequenceVariant);
+        strip_parent_terms(&mut terms);
+        assert!(
+            !terms.contains(&SoTerm::InframeDeletion),
+            "inframe_deletion must be stripped when incomplete_terminal_codon present. Got: {:?}",
+            terms
+        );
+        assert!(
+            terms.contains(&SoTerm::CodingSequenceVariant),
+            "coding_sequence_variant must survive. Got: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn issue_130_inframe_insertion_not_suppressed_at_incomplete_terminal_codon() {
+        // VEP's inframe_insertion does NOT have partial_codon guard.
+        // It CAN co-occur with incomplete_terminal_codon_variant.
+        let mut terms = std::collections::BTreeSet::new();
+        terms.insert(SoTerm::IncompleteTerminalCodonVariant);
+        terms.insert(SoTerm::InframeInsertion);
+        terms.insert(SoTerm::CodingSequenceVariant);
+        strip_parent_terms(&mut terms);
+        assert!(
+            terms.contains(&SoTerm::InframeInsertion),
+            "inframe_insertion must NOT be stripped (no partial_codon guard in VEP). Got: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn issue_130_frameshift_not_suppressed_at_complete_codon() {
+        // Regression guard: frameshift at a COMPLETE codon should NOT
+        // be suppressed.
+        let mut terms = std::collections::BTreeSet::new();
+        terms.insert(SoTerm::FrameshiftVariant);
+        terms.insert(SoTerm::CodingSequenceVariant);
+        // No IncompleteTerminalCodonVariant → no suppression
+        strip_parent_terms(&mut terms);
+        assert!(
+            terms.contains(&SoTerm::FrameshiftVariant),
+            "frameshift at complete codon must NOT be stripped. Got: {:?}",
             terms
         );
     }
