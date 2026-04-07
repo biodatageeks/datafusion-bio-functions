@@ -1713,8 +1713,58 @@ impl TranscriptConsequenceEngine {
             return partial_coding_overlap_classification(tx, tx_exons, tx_translation, variant);
         }
 
-        if cds_is_incomplete(tx, tx_translation) && self.overlaps_stop_codon(variant, tx) {
-            terms.insert(SoTerm::IncompleteTerminalCodonVariant);
+        // VEP's partial_codon predicate — exact replay:
+        //
+        //   $cds_length     = length $bvfo->_translateable_seq;
+        //   $codon_cds_start = ($bvfo->translation_start * 3) - 2;
+        //   $last_codon_len  = $cds_length - ($codon_cds_start - 1);
+        //   return ($last_codon_len < 3 and $last_codon_len > 0);
+        //
+        // In 0-based terms: codon_start = (cds_idx / 3) * 3, then
+        // last_codon_len = cds_length - codon_start.  Fires when
+        // 0 < last_codon_len < 3, i.e. the variant's codon extends past
+        // the CDS end and has only 1-2 bases.
+        //
+        // Traceability:
+        // - VEP partial_codon (incomplete_terminal_codon_variant predicate):
+        //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1479-L1505>
+        // VEP's cds_length = length(_translateable_seq), which is the
+        // SPLICED CDS (includes leading N padding, excludes introns).
+        // Prefer translation data; fall back to summing coding_segments.
+        let cds_len_opt = tx_translation
+            .and_then(|t| {
+                // cds_len and cds_sequence.len() both include leading Ns,
+                // matching VEP's _translateable_seq.
+                t.cds_len
+                    .or_else(|| t.cds_sequence.as_ref().map(|s| s.len()))
+            })
+            .or_else(|| {
+                // No translation data — compute spliced CDS length from
+                // coding segments (sum of exon/CDS overlaps), not the
+                // genomic span which includes introns.
+                coding_segments(tx, tx_exons).map(|segs| {
+                    segs.iter()
+                        .map(|(s, e)| usize::try_from(e - s + 1).unwrap_or(0))
+                        .sum()
+                })
+            });
+        if let Some(cds_len) = cds_len_opt {
+            let variant_pos = variant.start.min(variant.end);
+            if let Some(cds_idx) = genomic_to_cds_index(tx, tx_exons, variant_pos) {
+                // leading_n is only available from cds_sequence. When
+                // cds_len comes from t.cds_len, both values include
+                // leading Ns (VEP's _translateable_seq is N-inclusive).
+                let leading_n = tx_translation
+                    .and_then(|t| t.cds_sequence.as_deref())
+                    .map(|s| s.as_bytes().iter().take_while(|&&b| b == b'N').count())
+                    .unwrap_or(0);
+                let adj_idx = cds_idx + leading_n;
+                let codon_start = (adj_idx / 3) * 3;
+                let last_codon_len = cds_len.saturating_sub(codon_start);
+                if last_codon_len > 0 && last_codon_len < 3 {
+                    terms.insert(SoTerm::IncompleteTerminalCodonVariant);
+                }
+            }
         }
 
         if ref_len != alt_len {
@@ -2711,6 +2761,10 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
     // Specific coding children that strip both CodingSequenceVariant
     // and ProteinAlteringVariant as parents.
+    //
+    // NOTE: IncompleteTerminalCodonVariant is NOT included here — VEP
+    // emits both incomplete_terminal_codon_variant AND coding_sequence_variant
+    // together (both tier 3, co-occurring peers).
     let has_specific_child = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
         || terms.contains(&SoTerm::StopGained)
@@ -2720,8 +2774,7 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         || terms.contains(&SoTerm::InframeInsertion)
         || terms.contains(&SoTerm::InframeDeletion)
         || terms.contains(&SoTerm::StopRetainedVariant)
-        || terms.contains(&SoTerm::StartRetainedVariant)
-        || terms.contains(&SoTerm::IncompleteTerminalCodonVariant);
+        || terms.contains(&SoTerm::StartRetainedVariant);
 
     // CodingSequenceVariant is stripped by specific children OR by
     // ProteinAlteringVariant (which is itself a child of CSV).
@@ -2754,9 +2807,17 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         terms.remove(&SoTerm::SpliceRegionVariant);
     }
 
-    // VEP doesn't emit incomplete_terminal_codon_variant when a more specific
-    // stop consequence (stop_lost, stop_gained) is already present.
-    if terms.contains(&SoTerm::StopLost) || terms.contains(&SoTerm::StopGained) {
+    // VEP's stop_retained has `return 0 if partial_codon(@_)` — the two
+    // terms cannot co-occur.  Similarly, stop_lost and stop_gained are
+    // more specific and suppress incomplete_terminal_codon_variant.
+    //
+    // Traceability:
+    // - VEP stop_retained partial_codon guard:
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1289>
+    if terms.contains(&SoTerm::StopLost)
+        || terms.contains(&SoTerm::StopGained)
+        || terms.contains(&SoTerm::StopRetainedVariant)
+    {
         terms.remove(&SoTerm::IncompleteTerminalCodonVariant);
     }
 }
@@ -3332,14 +3393,37 @@ fn classify_coding_change(
 
     if ref_len == alt_len {
         let aa_changed = old_aas != new_aas;
+        // VEP's synonymous_variant has: ($ref_pep !~ /X/) && ($alt_pep !~ /X/)
+        // When peptides contain 'X' (from incomplete terminal codon or
+        // N-padded first codon on cds_start_NF transcripts), synonymous
+        // is suppressed. coding_sequence_variant fires as fallback.
+        //
+        // Traceability:
+        // - VEP synonymous_variant X guard:
+        //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1076-L1082>
+        let first_codon_snv = start_idx / 3;
+        let last_codon_snv = end_idx / 3;
+        // Incomplete terminal codons don't produce an amino acid in
+        // translate_protein_from_cds (only complete codons are translated).
+        // Treat missing positions (ci >= aas.len()) as X-containing.
+        let has_x = (first_codon_snv..=last_codon_snv).any(|ci| {
+            old_aas.get(ci) == Some(&'X')
+                || new_aas.get(ci) == Some(&'X')
+                || ci >= old_aas.len()
+                || ci >= new_aas.len()
+        });
+        // VEP's missense_variant also has `return 0 if partial_codon(@_)`
+        // (VariationEffect.pm L1093). Suppress missense when the affected
+        // codon is in the incomplete terminal region.
         if aa_changed
             && !class.stop_gained
             && !class.stop_lost
             && !class.start_lost
             && !class.stop_retained
+            && !has_x
         {
             class.missense = true;
-        } else if !aa_changed && !class.stop_retained && !class.start_retained {
+        } else if !aa_changed && !class.stop_retained && !class.start_retained && !has_x {
             class.synonymous = true;
         }
     }
@@ -5820,21 +5904,36 @@ mod tests {
                 .contains(&SoTerm::StartRetainedVariant)
         );
 
-        let incomplete = engine.evaluate_variant(
-            &var("22", 239, 241, "TAA", "TAG"),
+        // Variant must fall IN the incomplete codon (the last 1 base).
+        // Use evaluate_variant_with_context with CDS sequence so
+        // classify_coding_change works and produces X-containing peptides.
+        let cds_91 = "ATG".to_string() + &"GCT".repeat(29) + "A"; // 91 bases
+        let translations = vec![translation("pc2", Some(91), Some(30), None, Some(&cds_91))];
+        let incomplete = engine.evaluate_variant_with_context(
+            &var("22", 241, 241, "A", "G"),
             std::slice::from_ref(&tx_incomplete),
             &exons,
+            &translations,
+            &[],
+            &[],
+            &[],
+            &[],
         );
+        let collapsed = TranscriptConsequenceEngine::collapse_variant_terms(&incomplete);
         assert!(
-            incomplete[0]
-                .terms
-                .contains(&SoTerm::IncompleteTerminalCodonVariant)
+            collapsed.contains(&SoTerm::IncompleteTerminalCodonVariant),
+            "Should have incomplete_terminal_codon_variant. Got: {:?}",
+            collapsed
         );
     }
 
     #[test]
-    fn incomplete_terminal_uses_translation_cds_len_when_cds_sequence_missing() {
+    fn incomplete_terminal_uses_cds_sequence_len_for_partial_codon() {
+        // Verify partial_codon fires when the variant falls in the
+        // incomplete terminal codon, using CDS sequence length.
         let engine = TranscriptConsequenceEngine::default();
+        // CDS: 10 bases (10 % 3 = 1 → 1 incomplete base at position 9)
+        // Genomic: 100-109
         let tx = tx(
             "pc",
             "22",
@@ -5843,13 +5942,15 @@ mod tests {
             1,
             "protein_coding",
             Some(100),
-            Some(108), // complete by genomic span
+            Some(109),
         );
         let exons = vec![exon("pc", 1, 90, 140)];
-        let translations = vec![translation("pc", Some(10), Some(3), None, None)];
+        let cds = "ATGGCTGAAT"; // 10 bases, incomplete terminal "T"
+        let translations = vec![translation("pc", Some(10), Some(3), None, Some(cds))];
 
+        // Variant at position 109 (the incomplete base, CDS index 9)
         let assignments = engine.evaluate_variant_with_context(
-            &var("22", 106, 108, "TAA", "TAG"),
+            &var("22", 109, 109, "T", "A"),
             &[tx],
             &exons,
             &translations,
@@ -11906,6 +12007,187 @@ mod tests {
             !c.stop_gained,
             "stop_gained must be blocked by stop_retained. Got: {:?}",
             c
+        );
+    }
+
+    // ── Issue #101: incomplete_terminal_codon companion term fixes ───────
+
+    #[test]
+    fn issue_101_snv_at_incomplete_codon_no_synonymous() {
+        // Sub-pattern A: SNV in incomplete terminal codon.
+        // VEP: incomplete_terminal_codon_variant&coding_sequence_variant
+        // vepyr (before fix): incomplete_terminal_codon_variant&synonymous_variant
+        //
+        // VEP's synonymous_variant has ($ref_pep !~ /X/) && ($alt_pep !~ /X/).
+        // Incomplete codons translate to X → synonymous suppressed.
+        //
+        // CDS: ATG GCT GA (8 bases, incomplete terminal "GA")
+        // SNV at last base: G→T (changes incomplete codon GA→TA)
+        // Both translate to X → old_aas == new_aas → was synonymous.
+        // With fix: has_x → synonymous suppressed → coding_sequence_variant.
+        //
+        // Traceability:
+        // - VEP synonymous_variant X guard:
+        //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1076-L1082>
+        let cds = "ATGGCTGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end + 10,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        let e = exon("T1", 1, 1000, tx_end + 10);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        // SNV at position 1007 (last CDS base, incomplete codon)
+        let v = var("22", 1007, 1007, "A", "T");
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v);
+        if let Some(c) = c {
+            assert!(
+                !c.synonymous,
+                "SNV at incomplete terminal codon must NOT be synonymous (peptides contain X). Got: {:?}",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn issue_101_snv_at_complete_codon_still_synonymous() {
+        // Regression guard: SNV at a COMPLETE codon that doesn't change
+        // the amino acid should still get synonymous_variant.
+        let cds = "ATGGCTGAATGA"; // 12 bases, complete
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end + 10,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        let e = exon("T1", 1, 1000, tx_end + 10);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        // Synonymous SNV: GCT→GCC (both = Ala) at position 1004
+        let v = var("22", 1005, 1005, "T", "C");
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v);
+        let c = c.expect("Should classify");
+        assert!(
+            c.synonymous,
+            "Synonymous SNV at complete codon should still be synonymous. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn issue_101_stop_retained_strips_incomplete_terminal_codon() {
+        // Sub-pattern B: incomplete_terminal_codon_variant should NOT
+        // co-occur with stop_retained_variant. VEP's stop_retained has
+        // `return 0 if partial_codon(@_)`.
+        //
+        // Traceability:
+        // - VEP stop_retained partial_codon guard:
+        //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1289>
+        let mut terms = std::collections::BTreeSet::new();
+        terms.insert(SoTerm::IncompleteTerminalCodonVariant);
+        terms.insert(SoTerm::StopRetainedVariant);
+        strip_parent_terms(&mut terms);
+        assert!(
+            !terms.contains(&SoTerm::IncompleteTerminalCodonVariant),
+            "incomplete_terminal_codon should be stripped when stop_retained present. Got: {:?}",
+            terms
+        );
+        assert!(
+            terms.contains(&SoTerm::StopRetainedVariant),
+            "stop_retained should be kept. Got: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn issue_101_false_incomplete_terminal_codon_not_emitted() {
+        // Sub-pattern A2: variant near the stop codon on a COMPLETE CDS
+        // should NOT get incomplete_terminal_codon_variant.
+        //
+        // Traceability:
+        // - VEP partial_codon: only fires when cds_len % 3 != 0:
+        //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1478-L1493>
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGCTGAATGA"; // 12 bases, COMPLETE (12 % 3 == 0)
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let mut t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end + 10,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        t.cdna_coding_end = Some(cds_len);
+        t.spliced_seq = Some(format!("{cds}CCCGGG"));
+        let e = exon("T1", 1, 1000, tx_end + 10);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        // SNV at the stop codon (last 3 bases of COMPLETE CDS)
+        let v = var("22", 1009, 1009, "T", "A");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            !term_set.contains(&SoTerm::IncompleteTerminalCodonVariant),
+            "Complete CDS should NOT emit incomplete_terminal_codon_variant. Got: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn issue_101_partial_codon_fires_for_incomplete_cds() {
+        // Positive case: variant at the incomplete terminal codon on an
+        // incomplete CDS should get incomplete_terminal_codon_variant.
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGCTGA"; // 8 bases, 8 % 3 = 2 → 2-base incomplete codon
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let mut t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end + 10,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        t.cdna_coding_end = Some(cds_len);
+        t.spliced_seq = Some(format!("{cds}CCCGGG"));
+        let e = exon("T1", 1, 1000, tx_end + 10);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        // SNV at position 1007 (CDS idx 7, within incomplete codon at positions 6-7)
+        let v = var("22", 1007, 1007, "A", "T");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            term_set.contains(&SoTerm::IncompleteTerminalCodonVariant),
+            "SNV at incomplete codon should get incomplete_terminal_codon_variant. Got: {:?}",
+            terms
+        );
+        // Should NOT have synonymous (X-containing peptides)
+        assert!(
+            !term_set.contains(&SoTerm::SynonymousVariant),
+            "Should NOT have synonymous_variant at incomplete codon. Got: {:?}",
+            terms
         );
     }
 }
