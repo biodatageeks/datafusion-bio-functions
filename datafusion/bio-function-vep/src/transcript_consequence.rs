@@ -1073,6 +1073,33 @@ impl TranscriptConsequenceEngine {
             //   which returns true for frameshift intron positions:
             //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm>
             coding_class = self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
+
+            // VEP's frameshift/inframe predicates all have:
+            //   return 0 unless defined $bvfo->cds_start && defined $bvfo->cds_end;
+            // For variants inside frameshift introns, the TranscriptMapper
+            // returns Gap objects → cds_start/cds_end are undefined → all
+            // specific coding predicates return 0.  Only coding_unknown
+            // (coding_sequence_variant) fires via the within_frameshift_intron
+            // fallback in within_cds().
+            //
+            // Our classify_coding_change returning None is equivalent to
+            // VEP's cds_start/cds_end being undefined — the variant can't
+            // be mapped to CDS coordinates through the intron gap.
+            //
+            // Traceability:
+            // - VEP frameshift: return 0 unless defined cds_start/cds_end:
+            //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1445>
+            // - VEP within_cds frameshift intron fallback:
+            //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L660-L668>
+            // - VEP coding_unknown catches the result:
+            //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1507-L1537>
+            if in_frameshift_intron && coding_class.is_none() {
+                terms.remove(&SoTerm::FrameshiftVariant);
+                terms.remove(&SoTerm::InframeInsertion);
+                terms.remove(&SoTerm::InframeDeletion);
+                terms.remove(&SoTerm::ProteinAlteringVariant);
+            }
+
             // Deletions that extend beyond CDS into UTR: add UTR term
             // for the UTR portion.
             if !is_ins {
@@ -11506,17 +11533,12 @@ mod tests {
             engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
         let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
 
-        // Should have frameshift_variant (4bp insertion, not multiple of 3)
-        // instead of just coding_sequence_variant
+        // Mid-intron insertion: classify_coding_change fails (anchor in
+        // intron body, can't map to CDS). VEP falls back to
+        // coding_sequence_variant only.
         assert!(
-            term_set.contains(&SoTerm::FrameshiftVariant)
-                || term_set.contains(&SoTerm::InframeInsertion),
-            "Frameshift intron insertion should get coding consequence, got: {:?}",
-            terms
-        );
-        assert!(
-            !terms.iter().all(|t| *t == SoTerm::CodingSequenceVariant),
-            "Should NOT only have coding_sequence_variant, got: {:?}",
+            term_set.contains(&SoTerm::CodingSequenceVariant),
+            "Mid-intron frameshift should get coding_sequence_variant, got: {:?}",
             terms
         );
     }
