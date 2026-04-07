@@ -3688,6 +3688,8 @@ fn classify_insertion(
     //
     //   1. ref_pep == first alt AA  AND  alt_pep contains '*'
     //   2. Full protein body unchanged after splice AND tail < 3 chars
+    //      — not implemented (requires full protein splice comparison;
+    //      low-frequency edge case deferred for now)
     //   3. Both ref_pep and alt_pep contain '*' at the same position
     //
     // This fires for BOTH in-frame AND frameshift insertions.  For small
@@ -3706,6 +3708,8 @@ fn classify_insertion(
         let ref_aa = old_aas[codon_at];
         // Translate the LOCAL codon window from the mutated CDS, matching
         // VEP's codon() extraction: codon_len (3) + alt_len bytes.
+        // For pure insertions ref is empty (vf_nt_len = 0), so
+        // window = codon_len + alt_len - 0 = 3 + alt_len.
         let codon_start = codon_at * 3;
         let window_len = 3 + alt_len;
         let window_end = (codon_start + window_len).min(mutated.len());
@@ -3716,10 +3720,7 @@ fn classify_insertion(
             class.stop_retained = true;
         }
         // Condition 3: both contain '*' at the same position
-        if !class.stop_retained
-            && ref_aa == '*'
-            && local_aas.iter().position(|&aa| aa == '*') == Some(0)
-        {
+        if !class.stop_retained && ref_aa == '*' && local_aas.first() == Some(&'*') {
             class.stop_retained = true;
         }
     }
@@ -10896,11 +10897,16 @@ mod tests {
         let (terms, coding_class) =
             engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
         let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        // 1bp insertion at the stop codon: local codon window includes '*',
+        // so stop_retained fires → frameshift overridden to inframe_insertion.
         assert!(
-            term_set.contains(&SoTerm::FrameshiftVariant)
-                || term_set.contains(&SoTerm::InframeInsertion)
-                || term_set.contains(&SoTerm::CodingSequenceVariant),
-            "Exon-boundary CDS-end insertion should produce coding consequence, got: {:?}",
+            term_set.contains(&SoTerm::InframeInsertion),
+            "Exon-boundary CDS-end 1bp insertion at stop should get inframe_insertion (via stop_retained), got: {:?}",
+            terms
+        );
+        assert!(
+            term_set.contains(&SoTerm::StopRetainedVariant),
+            "Should have stop_retained_variant, got: {:?}",
             terms
         );
         // Should NOT have 3'UTR (VEP's _after_coding gates on !within_cds)
@@ -11187,10 +11193,16 @@ mod tests {
             engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
         let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
 
+        // 1bp insertion at cds_end+1 (stop codon region): local codon window
+        // includes '*' → stop_retained → inframe_insertion override.
         assert!(
-            term_set.contains(&SoTerm::FrameshiftVariant)
-                || term_set.contains(&SoTerm::InframeInsertion),
-            "Within-exon CDS boundary insertion should have coding consequence, got: {:?}",
+            term_set.contains(&SoTerm::InframeInsertion),
+            "Within-exon CDS boundary 1bp insertion at stop should get inframe_insertion, got: {:?}",
+            terms
+        );
+        assert!(
+            term_set.contains(&SoTerm::StopRetainedVariant),
+            "Should have stop_retained_variant, got: {:?}",
             terms
         );
         assert!(
@@ -11358,21 +11370,12 @@ mod tests {
         // stop_retained fires → frameshift suppressed → inframe_insertion.
         //
         // CDS: ATG GCT GAA TGA (M A E *) — 12 bases
-        // Insert 10 bases at pos 1007 (CDS idx 7, within codon 2 "GAA")
-        // The 10 inserted bases include a stop codon within the window.
-        // Use "TGAGGGGGGG" so that the local window includes TGA.
-        // Mutated at codon 2: GAA → G + TGAGGGGGGG + AA
-        // Local window (13 bytes from mutated): "GTGAGGGGGGGAA"
-        // → GTG|AGG|GGG|GAA → V R G E — no stop in this window.
-        //
-        // Better: insert bases that place TGA within the window.
-        // CDS: ATG GCT GAA TGA (M A E *) — 12 bases
         // Insert "AATGAGGGGG" (10 bases) at pos 1007 (within codon 2)
         // Mutated codon 2 region: G + AATGAGGGGG + AA
-        // Local window (13 bytes): "GAATGAGGGGGA" + "A" = 13 bytes
-        // → GAA|TGA|GGG|GGA → E * G G — stop at position 1!
-        // ref_aa = old_aas[2] = E. local_aas[0] = E (matches). local_aas contains *.
-        // → stop_retained = true!
+        // Local window (13 bytes): "GAATGAGGGGGAA"
+        // → GAA|TGA|GGG|GAA → E * G E — stop at position 1!
+        // ref_aa = old_aas[2] = E. local_aas[0] = E (matches). Contains *.
+        // → stop_retained = true.
         let cds = "ATGGCTGAATGA";
         let c = classify_ins(cds, 1007, "AATGAGGGGG").unwrap();
         assert!(
