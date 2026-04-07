@@ -1766,10 +1766,11 @@ impl TranscriptConsequenceEngine {
         // Prefer translation data; fall back to summing coding_segments.
         let cds_len_opt = tx_translation
             .and_then(|t| {
-                // cds_len and cds_sequence.len() both include leading Ns,
-                // matching VEP's _translateable_seq.
-                t.cds_len
-                    .or_else(|| t.cds_sequence.as_ref().map(|s| s.len()))
+                // VEP uses length(_translateable_seq). In our cache, `cds_len`
+                // can exclude leading N padding while `cds_sequence` preserves
+                // the actual translateable sequence length used by codon/peptide
+                // coordinates, so prefer the sequence length when available.
+                t.cds_sequence.as_ref().map(|s| s.len()).or(t.cds_len)
             })
             .or_else(|| {
                 // No translation data — compute spliced CDS length from
@@ -1784,9 +1785,9 @@ impl TranscriptConsequenceEngine {
         if let Some(cds_len) = cds_len_opt {
             let variant_pos = variant.start.min(variant.end);
             if let Some(cds_idx) = genomic_to_cds_index(tx, tx_exons, variant_pos) {
-                // leading_n is only available from cds_sequence. When
-                // cds_len comes from t.cds_len, both values include
-                // leading Ns (VEP's _translateable_seq is N-inclusive).
+                // leading_n is only available from cds_sequence. We use it to
+                // convert exon-mapped CDS indices into the padded
+                // _translateable_seq coordinate space that VEP uses here.
                 let leading_n = tx_translation
                     .and_then(|t| t.cds_sequence.as_deref())
                     .map(|s| s.as_bytes().iter().take_while(|&&b| b == b'N').count())
@@ -3084,6 +3085,7 @@ impl CodingClassification {
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499>
 fn build_protein_hgvs_data(
     class: &CodingClassification,
+    peptide_alleles: Option<&str>,
     old_aas: &[char],
     new_aas: &[char],
     frameshift: bool,
@@ -3092,7 +3094,7 @@ fn build_protein_hgvs_data(
     let raw_end = class
         .protein_position_end
         .or(class.protein_position_start)?;
-    let (ref_peptide, alt_peptide) = match class.amino_acids.as_deref() {
+    let (ref_peptide, alt_peptide) = match peptide_alleles {
         Some(value) => match value.split_once('/') {
             Some((left, right)) => (left.to_string(), right.to_string()),
             None => (value.to_string(), value.to_string()),
@@ -3718,7 +3720,19 @@ fn classify_coding_change(
     } else {
         new_aas.clone()
     };
-    class.protein_hgvs = build_protein_hgvs_data(&class, &old_aas, &hgvs_new_aas, frameshift);
+    let hgvs_amino_acids = class.amino_acids.clone().or_else(|| {
+        class
+            .codons
+            .as_deref()
+            .and_then(pep_allele_string_from_codon_allele_string)
+    });
+    class.protein_hgvs = build_protein_hgvs_data(
+        &class,
+        hgvs_amino_acids.as_deref(),
+        &old_aas,
+        &hgvs_new_aas,
+        frameshift,
+    );
     Some(class)
 }
 
@@ -4121,7 +4135,19 @@ fn classify_insertion(
     } else {
         new_aas.clone()
     };
-    class.protein_hgvs = build_protein_hgvs_data(&class, &old_aas, &hgvs_new_aas, frameshift);
+    let hgvs_amino_acids = class.amino_acids.clone().or_else(|| {
+        class
+            .codons
+            .as_deref()
+            .and_then(pep_allele_string_from_codon_allele_string)
+    });
+    class.protein_hgvs = build_protein_hgvs_data(
+        &class,
+        hgvs_amino_acids.as_deref(),
+        &old_aas,
+        &hgvs_new_aas,
+        frameshift,
+    );
     Some(class)
 }
 
@@ -6204,28 +6230,31 @@ mod tests {
 
     #[test]
     fn incomplete_terminal_uses_cds_sequence_len_for_partial_codon() {
-        // Verify partial_codon fires when the variant falls in the
-        // incomplete terminal codon, using CDS sequence length.
+        // Verify partial_codon uses the padded translateable sequence length,
+        // not the unpadded cds_len. Real caches can exclude leading N padding
+        // from cds_len while cds_sequence still includes it.
         let engine = TranscriptConsequenceEngine::default();
-        // CDS: 10 bases (10 % 3 = 1 → 1 incomplete base at position 9)
-        // Genomic: 100-109
+        // Unpadded CDS: 8 bases (ATGGCTGA) → last incomplete codon "GA".
+        // Padded translateable_seq: NNATGGCTGA (leading phase Ns), so the
+        // last incomplete codon is still visible only when we use len=10.
         let tx = tx(
             "pc",
             "22",
             90,
-            140,
+            107,
             1,
             "protein_coding",
             Some(100),
-            Some(109),
+            Some(107),
         );
-        let exons = vec![exon("pc", 1, 90, 140)];
-        let cds = "ATGGCTGAAT"; // 10 bases, incomplete terminal "T"
-        let translations = vec![translation("pc", Some(10), Some(3), None, Some(cds))];
+        let exons = vec![exon("pc", 1, 90, 107)];
+        let cds = "NNATGGCTGA";
+        let translations = vec![translation("pc", Some(8), Some(3), None, Some(cds))];
 
-        // Variant at position 109 (the incomplete base, CDS index 9)
+        // Variant at the last coding base. With the old cds_len-based logic
+        // adj_idx landed exactly at cds_len and partial_codon returned false.
         let assignments = engine.evaluate_variant_with_context(
-            &var("22", 109, 109, "T", "A"),
+            &var("22", 107, 107, "A", "T"),
             &[tx],
             &exons,
             &translations,
@@ -12970,6 +12999,89 @@ mod tests {
             !term_set.contains(&SoTerm::SynonymousVariant),
             "Should NOT have synonymous_variant at incomplete codon. Got: {:?}",
             terms
+        );
+    }
+
+    #[test]
+    fn issue_136_real_negative_strand_terminal_snv_emits_itcv_and_hgvsp() {
+        const ISSUE_136_CDS: &str = concat!(
+            "NNGCGGGTCATGGCGCCCCGAGCCCTCCTCCTGCTGCTCTCGGGAGGCCTGGCCCTGACCGAGACCT",
+            "GGGCCTGCTCCCACTCCATGAGGTATTTCGACACCGCCGTGTCCCGGCCCGGCCGCGGAGAGCCCCG",
+            "CTTCATCTCAGTGGGCTACGTGGACGACACGCAGTTCGTGCGGTTCGACAGCGACGCCGCGAGTCCG",
+            "AGAGGGGAGCCGCGGGCGCCGTGGGTGGAGCAGGAGGGGCCGGAGTATTGGGACCGGGAGACACAGA",
+            "AGTACAAGCGCCAGGCACAGGCTGACCGAGTGAGCCTGCGGAACCTGCGCGGCTACTACAACCAGAG",
+            "CGAGGACGGGTCTCACACCCTCCAGAGGATGTCTGGCTGCGACCTGGGGCCCGACGGGCGCCTCCTC",
+            "CGCGGGTATGACCAGTCCGCCTACGACGGCAAGGATTACATCGCCCTGAACGAGGACCTGCGCTCCT",
+            "GGACCGCCGCGGACACCGCGGCTCAGATCACCCAGCGCAAGTTGGAGGCGGCCCGTGCGGCGGAGCA",
+            "GCTGAGAGCCTACCTGGAGGGCACGTGCGTGGAGTGGCTCCGCAGATACCTGGAGAACGGGAAGGAG",
+            "ACGCTGCAGCGCGCAGAACCCCCAAAGACACACGTGACCCACCACCCCCTCTCTGACCATGAGGCCA",
+            "GCAGGAGATGGAACCTTCCAGAAGTGGGCAGCTGTGGTGGTGCCTTCTGGACAAGAGCAGAGATACA",
+            "CGTGCCATATGCAGCACGAGGGGCTGCAAGAGCCCCTCACCCTGAGC"
+        );
+
+        let engine = TranscriptConsequenceEngine::default();
+        let mut tx = tx(
+            "ENST00000415537",
+            "6",
+            31_270_214,
+            31_272_069,
+            -1,
+            "protein_coding",
+            Some(31_270_214),
+            Some(31_272_069),
+        );
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(782);
+        tx.cds_start_nf = true;
+        tx.cds_end_nf = true;
+        tx.flags_str = Some("cds_start_NF&cds_end_NF".to_string());
+
+        let exons = vec![
+            exon("ENST00000415537", 1, 31_271_999, 31_272_069),
+            exon("ENST00000415537", 2, 31_271_599, 31_271_868),
+            exon("ENST00000415537", 3, 31_271_073, 31_271_348),
+            exon("ENST00000415537", 4, 31_270_439, 31_270_485),
+            exon("ENST00000415537", 5, 31_270_214, 31_270_331),
+        ];
+
+        let mut tr = translation(
+            "ENST00000415537",
+            Some(782),
+            Some(261),
+            None,
+            Some(ISSUE_136_CDS),
+        );
+        tr.stable_id = Some("ENSP00000400410".to_string());
+        tr.version = Some(1);
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("6", 31_270_214, 31_270_214, "G", "T"),
+            &[tx],
+            &exons,
+            &[tr],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let consequence = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENST00000415537"))
+            .expect("expected transcript consequence");
+        let term_set: std::collections::BTreeSet<_> = consequence.terms.iter().copied().collect();
+
+        assert_eq!(
+            term_set,
+            std::collections::BTreeSet::from([
+                SoTerm::IncompleteTerminalCodonVariant,
+                SoTerm::CodingSequenceVariant,
+            ]),
+            "Unexpected consequence terms for issue #136: {:?}",
+            consequence.terms
+        );
+        assert_eq!(
+            consequence.hgvsp.as_deref(),
+            Some("ENSP00000400410.1:p.Ter262=")
         );
     }
 }

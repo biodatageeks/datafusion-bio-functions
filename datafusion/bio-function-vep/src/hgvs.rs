@@ -1535,25 +1535,32 @@ fn stop_loss_extra_aa(
     (extra > 0).then_some(extra)
 }
 
+fn hgvs_aa_one_to_three(aa: char) -> &'static str {
+    match aa {
+        'X' => "Ter",
+        _ => aa_one_to_three(aa),
+    }
+}
+
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2083-L2112>
 fn peptide_to_three_letter(peptide: &str) -> String {
-    peptide.chars().map(aa_one_to_three).collect()
+    peptide.chars().map(hgvs_aa_one_to_three).collect()
 }
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1877-L1880>
 fn peptide_first_three(peptide: &str) -> Option<&'static str> {
-    Some(aa_one_to_three(peptide.chars().next()?))
+    Some(hgvs_aa_one_to_three(peptide.chars().next()?))
 }
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1877-L1880>
 fn peptide_last_three(peptide: &str) -> Option<&'static str> {
-    Some(aa_one_to_three(peptide.chars().last()?))
+    Some(hgvs_aa_one_to_three(peptide.chars().last()?))
 }
 
 /// Traceability:
@@ -1943,6 +1950,26 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ala2=".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_partial_codon_synonymous_uses_ter() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 262,
+            end: 262,
+            ref_peptide: "X".to_string(),
+            alt_peptide: "X".to_string(),
+            ref_translation: "XRVM".to_string(),
+            alt_translation: "XRVM".to_string(),
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter262=".to_string())
         );
     }
 
