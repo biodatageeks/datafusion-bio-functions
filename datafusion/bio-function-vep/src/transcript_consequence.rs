@@ -11883,4 +11883,29 @@ mod tests {
             terms
         );
     }
+
+    #[test]
+    fn issue_116_inframe_insertion_near_stop_earlier_check_catches() {
+        // Edge case from review: 3bp inframe insertion 1 codon before
+        // the stop. The earlier stop_retained check (full CDS translation,
+        // old_stop_idx == new_stop_idx) fires because the stop position
+        // is preserved. This blocks stop_gained.
+        //
+        // CDS: ATG GAT GAA TGA (M D E *) — 12 bases
+        // Insert "CCT" at pos 1007 (within codon 2, after 1st base)
+        // Mutated: "ATGGATGCCTAATGA" → M D A * *
+        // old_stop = 3, new_stop = 3 → stop_retained from earlier check.
+        let cds = "ATGGATGAATGA";
+        let c = classify_ins(cds, 1007, "CCT").unwrap();
+        assert!(
+            c.stop_retained,
+            "Earlier check (old_stop==new_stop near insertion) should fire. Got: {:?}",
+            c
+        );
+        assert!(
+            !c.stop_gained,
+            "stop_gained must be blocked by stop_retained. Got: {:?}",
+            c
+        );
+    }
 }
