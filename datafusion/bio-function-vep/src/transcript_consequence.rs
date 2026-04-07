@@ -1966,38 +1966,63 @@ impl TranscriptConsequenceEngine {
                 let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
                 let is_indel = ref_len != alt_len;
 
-                // Sequence-based check: construct mutated CDS first 3 bases
-                // and see if ATG is preserved. start_lost and start_retained
-                // are mutually exclusive — VEP's start_retained returns
-                // !_ins_del_start_altered().
+                // VEP's _ins_del_start_altered works in cDNA space (5'UTR +
+                // CDS combined) to check if ATG is preserved at the original
+                // CDS-start position. start_retained = !altered.
+                // start_lost can CO-OCCUR with start_retained for frameshifts:
+                // VEP's peptide-level check fires start_lost when the full
+                // affected peptide range differs from the reference.
                 //
                 // Traceability:
                 // - _ins_del_start_altered:
                 //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L990-L1022>
                 // - start_retained_variant = !_ins_del_start_altered:
                 //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L947-L962>
-                if is_indel && cds_seq.is_some_and(|s| s.len() >= 3) {
-                    let cds = cds_seq.unwrap();
-                    let cds_start = tx.cds_start.unwrap_or(0);
-                    // Build a simple mutated CDS by applying the indel
-                    // at the variant's position relative to CDS start.
-                    let mutated_first3 = mutated_cds_first3(cds, variant, tx, cds_start);
-                    if mutated_first3.as_deref() == Some("ATG") {
-                        terms.insert(SoTerm::StartRetainedVariant);
-                    } else {
-                        terms.insert(SoTerm::StartLost);
-                    }
-                } else if is_indel {
-                    // No CDS sequence: fall back to position-based check.
-                    let start_codon_end = if tx.strand >= 0 {
-                        tx.cds_start.unwrap_or(0) + 2
-                    } else {
-                        tx.cds_end.unwrap_or(0)
-                    };
-                    if variant.start > start_codon_end {
-                        terms.insert(SoTerm::StartRetainedVariant);
-                    } else {
-                        terms.insert(SoTerm::StartLost);
+                // - start_lost peptide check:
+                //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L872-L882>
+                if is_indel {
+                    let is_frameshift = !ref_len.abs_diff(alt_len).is_multiple_of(3);
+                    match ins_del_start_altered(tx, tx_exons, variant) {
+                        Some(false) => {
+                            // ATG preserved at CDS-start → start_retained
+                            terms.insert(SoTerm::StartRetainedVariant);
+                            // Frameshift: VEP peptide check co-fires start_lost
+                            if is_frameshift {
+                                terms.insert(SoTerm::StartLost);
+                            }
+                        }
+                        Some(true) => {
+                            terms.insert(SoTerm::StartLost);
+                        }
+                        None => {
+                            // No cDNA data — fall back to mutated_cds_first3
+                            if cds_seq.is_some_and(|s| s.len() >= 3) {
+                                let cds = cds_seq.unwrap();
+                                let cds_start = tx.cds_start.unwrap_or(0);
+                                let mutated_first3 =
+                                    mutated_cds_first3(cds, variant, tx, cds_start);
+                                if mutated_first3.as_deref() == Some("ATG") {
+                                    terms.insert(SoTerm::StartRetainedVariant);
+                                    if is_frameshift {
+                                        terms.insert(SoTerm::StartLost);
+                                    }
+                                } else {
+                                    terms.insert(SoTerm::StartLost);
+                                }
+                            } else {
+                                // No CDS sequence: position-based fallback.
+                                let start_codon_end = if tx.strand >= 0 {
+                                    tx.cds_start.unwrap_or(0) + 2
+                                } else {
+                                    tx.cds_end.unwrap_or(0)
+                                };
+                                if variant.start > start_codon_end {
+                                    terms.insert(SoTerm::StartRetainedVariant);
+                                } else {
+                                    terms.insert(SoTerm::StartLost);
+                                }
+                            }
+                        }
                     }
                 } else {
                     terms.insert(SoTerm::StartLost);
@@ -3279,11 +3304,32 @@ fn classify_coding_change(
     // (the start codon). Unlike the insertion path (cds_idx < 2), SNVs and
     // deletions at position 2 DO overlap the start codon.
     if start_idx < 3 && !tx.cds_start_nf {
+        // 1. Amino acid level (works for SNVs and as fallback for indels)
         if new_aas.first() == Some(&'M') {
             class.start_retained = true;
         }
         if old_aas.first() != new_aas.first() {
             class.start_lost = true;
+        }
+        // 2. Nucleotide level for indels: VEP's _ins_del_start_altered works
+        //    in cDNA space (5'UTR + CDS). When ATG is preserved AND the indel
+        //    is a frameshift, VEP's peptide-level check also fires start_lost
+        //    (full affected peptide range differs) alongside start_retained.
+        if ref_len != alt_len {
+            match ins_del_start_altered(tx, tx_exons, variant) {
+                Some(false) => {
+                    class.start_retained = true;
+                    if !ref_len.abs_diff(alt_len).is_multiple_of(3) {
+                        class.start_lost = true;
+                    }
+                }
+                Some(true) => {
+                    if !ref_len.abs_diff(alt_len).is_multiple_of(3) {
+                        class.start_lost = true;
+                    }
+                }
+                None => {} // no cDNA data, keep amino acid level results
+            }
         }
     }
 
@@ -3798,11 +3844,27 @@ fn classify_insertion(
     // - _overlaps_start_codon overlap gate:
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L965-L985>
     if cds_idx < 2 && !tx.cds_start_nf {
+        // 1. Amino acid level
         if new_aas.first() == Some(&'M') {
             class.start_retained = true;
         }
         if old_aas.first() != new_aas.first() {
             class.start_lost = true;
+        }
+        // 2. Nucleotide level: VEP's _ins_del_start_altered in cDNA space
+        match ins_del_start_altered(tx, tx_exons, variant) {
+            Some(false) => {
+                class.start_retained = true;
+                if !alt_len.is_multiple_of(3) {
+                    class.start_lost = true;
+                }
+            }
+            Some(true) => {
+                if !alt_len.is_multiple_of(3) {
+                    class.start_lost = true;
+                }
+            }
+            None => {} // no cDNA data, keep amino acid level results
         }
     }
 
@@ -4025,9 +4087,93 @@ fn classify_insertion(
     Some(class)
 }
 
+/// Returns `true` if the indel destroys the start codon (ATG at the original
+/// CDS-start position in cDNA space). Mirrors VEP's `_ins_del_start_altered()`
+/// which applies the variant to the combined 5'UTR + CDS sequence and checks
+/// if ATG is preserved at the original CDS boundary.
+///
+/// Returns `None` when cDNA data is unavailable (no spliced_seq/cdna_seq,
+/// no cdna_coding_start, or variant can't be mapped to cDNA coordinates).
+///
+/// Traceability:
+/// - VEP `_ins_del_start_altered`:
+///   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm>
+fn ins_del_start_altered(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+) -> Option<bool> {
+    let cdna_coding_start = tx.cdna_coding_start?;
+    let full_seq = tx.spliced_seq.as_deref().or(tx.cdna_seq.as_deref())?;
+    let seq_bytes = full_seq.as_bytes();
+
+    let ref_allele = normalize_allele_seq(&variant.ref_allele);
+    let alt_allele = normalize_allele_seq(&variant.alt_allele);
+    let is_ins = ref_allele.is_empty();
+
+    // Map variant anchors to cDNA coordinates.
+    // For insertions VEP uses (cdna_start, cdna_end) where cdna_start > cdna_end
+    // (inverted range). We map both flanks and use the lower as the splice point.
+    let cdna_start = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start)?;
+    let cdna_end = if is_ins {
+        // Insertion: VEP maps start and start-1. We map start only;
+        // the splice point is cdna_start (insert after this position).
+        cdna_start
+    } else {
+        genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.end)?
+    };
+    let (cdna_min, cdna_max) = if is_ins {
+        (cdna_start, cdna_start)
+    } else {
+        (cdna_start.min(cdna_end), cdna_start.max(cdna_end))
+    };
+
+    // Build alt allele in transcript orientation.
+    let alt_bytes: Vec<u8> = if alt_allele.is_empty() {
+        Vec::new()
+    } else if tx.strand >= 0 {
+        alt_allele.to_ascii_uppercase().into_bytes()
+    } else {
+        reverse_complement(&alt_allele)?
+            .to_ascii_uppercase()
+            .into_bytes()
+    };
+
+    // Apply the variant to the full cDNA (UTR + CDS + 3'UTR).
+    let mut mutated =
+        Vec::with_capacity(seq_bytes.len().saturating_sub(ref_allele.len()) + alt_bytes.len());
+    if is_ins {
+        // Insert after cdna_min
+        let splice = cdna_min + 1;
+        if splice > seq_bytes.len() {
+            return Some(true);
+        }
+        mutated.extend_from_slice(&seq_bytes[..splice]);
+        mutated.extend_from_slice(&alt_bytes);
+        mutated.extend_from_slice(&seq_bytes[splice..]);
+    } else {
+        if cdna_min >= seq_bytes.len() {
+            return Some(true);
+        }
+        mutated.extend_from_slice(&seq_bytes[..cdna_min]);
+        mutated.extend_from_slice(&alt_bytes);
+        let after = (cdna_max + 1).min(seq_bytes.len());
+        mutated.extend_from_slice(&seq_bytes[after..]);
+    }
+
+    // Check if ATG is at the original CDS-start position.
+    if mutated.len() >= cdna_coding_start + 3 {
+        let new_sc = &mutated[cdna_coding_start..cdna_coding_start + 3];
+        Some(!new_sc.eq_ignore_ascii_case(b"ATG"))
+    } else {
+        Some(true) // sequence too short → start codon destroyed
+    }
+}
+
 /// Build the first 3 bases of the mutated CDS for an indel near the start
-/// codon. Used by the start_retained/start_lost heuristic when CDS sequence
-/// is available. Returns None if the variant position can't be mapped.
+/// codon. Used as fallback when cDNA data is unavailable for
+/// `ins_del_start_altered`. Returns None if the variant position can't be
+/// mapped.
 ///
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_ins_del_start_altered()`
