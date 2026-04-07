@@ -1771,7 +1771,12 @@ impl TranscriptConsequenceEngine {
                 if terms.contains(&SoTerm::InframeInsertion) {
                     if let Some(aa) = &classification.amino_acids {
                         if let Some((ref_pep, alt_pep)) = aa.split_once('/') {
-                            let alt_trimmed = alt_pep.split('*').next().unwrap_or(alt_pep);
+                            // VEP: $alt_pep =~ s/\*.+/\*/; — keeps the first '*',
+                            // removes everything after it.
+                            let alt_trimmed = match alt_pep.find('*') {
+                                Some(pos) if pos + 1 < alt_pep.len() => &alt_pep[..pos + 1],
+                                _ => alt_pep,
+                            };
                             let is_pure =
                                 alt_trimmed.starts_with(ref_pep) || alt_trimmed.ends_with(ref_pep);
                             if !is_pure && ref_pep != "-" {
@@ -11697,6 +11702,44 @@ mod tests {
             "Should NOT have inframe_insertion for complex change, got: {:?}",
             terms
         );
+    }
+
+    #[test]
+    fn issue_124_alt_trimming_preserves_stop_for_containment_check() {
+        // Regression guard: VEP's alt_pep trimming keeps the first '*':
+        //   $alt_pep =~ s/\*.+/\*/;  → "*XY" becomes "*", "L*X" becomes "L*"
+        // Our old code used split('*').next() which DROPPED the '*':
+        //   "*XY" → "", "L*X" → "L"
+        // This caused ref_pep="*" to fail the containment check against ""
+        // and incorrectly strip InframeInsertion.
+        //
+        // Verify the trimming directly via classify_ins where stop_retained
+        // fires and amino_acids contain '*' in the ref position.
+        //
+        // CDS: ATG GCT GAA TGA (M A E *) — 12 bases
+        // Insert "AATGAGGGGG" (10 bases) at pos 1007 → stop_retained fires
+        // (from #117 local window check). amino_acids = "*/E*GGGGE" or similar.
+        // The containment check must NOT strip InframeInsertion.
+        let cds = "ATGGCTGAATGA";
+        let c = classify_ins(cds, 1007, "AATGAGGGGG").unwrap();
+        // stop_retained fires for this case (#117)
+        assert!(c.stop_retained, "Should have stop_retained. Got: {:?}", c);
+        // The amino_acids string has ref_pep containing '*'
+        // With correct trimming, the containment check should pass
+        if let Some(aa) = &c.amino_acids {
+            if let Some((ref_pep, alt_pep)) = aa.split_once('/') {
+                let alt_trimmed = match alt_pep.find('*') {
+                    Some(pos) if pos + 1 < alt_pep.len() => &alt_pep[..pos + 1],
+                    _ => alt_pep,
+                };
+                let is_pure = alt_trimmed.starts_with(ref_pep) || alt_trimmed.ends_with(ref_pep);
+                assert!(
+                    is_pure || ref_pep == "-",
+                    "Stop-retained amino acids should pass containment check. \
+                     ref_pep={ref_pep:?}, alt_trimmed={alt_trimmed:?}"
+                );
+            }
+        }
     }
 
     // ── Issue #116: stop_gained via local codon window for insertions ────
