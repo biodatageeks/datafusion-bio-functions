@@ -1713,14 +1713,21 @@ impl TranscriptConsequenceEngine {
             return partial_coding_overlap_classification(tx, tx_exons, tx_translation, variant);
         }
 
-        // VEP's partial_codon predicate: the variant's translation_start
-        // falls in the last codon of the CDS AND that codon has < 3 bases.
-        // This only fires for transcripts where cds_len % 3 != 0.
+        // VEP's partial_codon predicate — exact replay:
+        //
+        //   $cds_length     = length $bvfo->_translateable_seq;
+        //   $codon_cds_start = ($bvfo->translation_start * 3) - 2;
+        //   $last_codon_len  = $cds_length - ($codon_cds_start - 1);
+        //   return ($last_codon_len < 3 and $last_codon_len > 0);
+        //
+        // In 0-based terms: codon_start = (cds_idx / 3) * 3, then
+        // last_codon_len = cds_length - codon_start.  Fires when
+        // 0 < last_codon_len < 3, i.e. the variant's codon extends past
+        // the CDS end and has only 1-2 bases.
         //
         // Traceability:
         // - VEP partial_codon (incomplete_terminal_codon_variant predicate):
-        //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1478-L1493>
-        // Determine CDS length: prefer translation data, fall back to genomic span.
+        //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1479-L1505>
         let cds_len_opt = tx_translation
             .and_then(|t| {
                 t.cds_len
@@ -1733,22 +1740,17 @@ impl TranscriptConsequenceEngine {
                 Some(usize::try_from(e - s + 1).unwrap_or(0))
             });
         if let Some(cds_len) = cds_len_opt {
-            let remainder = cds_len % 3;
-            if remainder != 0 {
-                // CDS has an incomplete terminal codon (1 or 2 bases).
-                // Check if the variant's CDS position falls in this region.
-                let incomplete_start = cds_len - remainder; // 0-based start of incomplete codon
-                let variant_pos = variant.start.min(variant.end);
-                if let Some(cds_idx) = genomic_to_cds_index(tx, tx_exons, variant_pos) {
-                    let leading_n = tx_translation
-                        .and_then(|t| t.cds_sequence.as_deref())
-                        .map(|s| s.as_bytes().iter().take_while(|&&b| b == b'N').count())
-                        .unwrap_or(0);
-                    let adj_idx = cds_idx + leading_n;
-                    let codon_start = (adj_idx / 3) * 3;
-                    if codon_start >= incomplete_start {
-                        terms.insert(SoTerm::IncompleteTerminalCodonVariant);
-                    }
+            let variant_pos = variant.start.min(variant.end);
+            if let Some(cds_idx) = genomic_to_cds_index(tx, tx_exons, variant_pos) {
+                let leading_n = tx_translation
+                    .and_then(|t| t.cds_sequence.as_deref())
+                    .map(|s| s.as_bytes().iter().take_while(|&&b| b == b'N').count())
+                    .unwrap_or(0);
+                let adj_idx = cds_idx + leading_n;
+                let codon_start = (adj_idx / 3) * 3;
+                let last_codon_len = cds_len.saturating_sub(codon_start);
+                if last_codon_len > 0 && last_codon_len < 3 {
+                    terms.insert(SoTerm::IncompleteTerminalCodonVariant);
                 }
             }
         }
@@ -3395,11 +3397,15 @@ fn classify_coding_change(
                 || ci >= old_aas.len()
                 || ci >= new_aas.len()
         });
+        // VEP's missense_variant also has `return 0 if partial_codon(@_)`
+        // (VariationEffect.pm L1093). Suppress missense when the affected
+        // codon is in the incomplete terminal region.
         if aa_changed
             && !class.stop_gained
             && !class.stop_lost
             && !class.start_lost
             && !class.stop_retained
+            && !has_x
         {
             class.missense = true;
         } else if !aa_changed && !class.stop_retained && !class.start_retained && !has_x {
