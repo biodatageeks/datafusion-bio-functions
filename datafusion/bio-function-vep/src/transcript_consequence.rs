@@ -1073,6 +1073,39 @@ impl TranscriptConsequenceEngine {
             //   which returns true for frameshift intron positions:
             //   <https://github.com/Ensembl/ensembl-variation/blob/release/113/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm>
             coding_class = self.add_coding_terms(&mut terms, variant, tx, tx_exons, tx_translation);
+
+            // VEP's frameshift/inframe predicates all have:
+            //   return 0 unless defined $bvfo->cds_start && defined $bvfo->cds_end;
+            // For variants inside frameshift introns, the TranscriptMapper
+            // returns Gap objects → cds_start/cds_end are undefined → all
+            // specific coding predicates return 0.  Only coding_unknown
+            // (coding_sequence_variant) fires via the within_frameshift_intron
+            // fallback in within_cds().
+            //
+            // Our classify_coding_change returning None is equivalent to
+            // VEP's cds_start/cds_end being undefined — the variant can't
+            // be mapped to CDS coordinates through the intron gap.
+            //
+            // Traceability:
+            // - VEP frameshift: return 0 unless defined cds_start/cds_end:
+            //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1445>
+            // - VEP within_cds frameshift intron fallback:
+            //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L660-L668>
+            // - VEP coding_unknown catches the result:
+            //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1507-L1537>
+            if in_frameshift_intron && coding_class.is_none() {
+                terms.remove(&SoTerm::FrameshiftVariant);
+                terms.remove(&SoTerm::InframeInsertion);
+                terms.remove(&SoTerm::InframeDeletion);
+                terms.remove(&SoTerm::ProteinAlteringVariant);
+                // Note: VEP's start_lost/stop_lost/stop_gained predicates
+                // also guard on defined cds_start/cds_end (L1445 pattern).
+                // Heuristic terms from add_start_stop_heuristic_terms are
+                // not removed here — tiny mid-gene frameshift introns don't
+                // overlap start/stop codons in practice.  If this ever
+                // fires, extend the remove list.
+            }
+
             // Deletions that extend beyond CDS into UTR: add UTR term
             // for the UTR portion.
             if !is_ins {
@@ -11506,17 +11539,135 @@ mod tests {
             engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
         let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
 
-        // Should have frameshift_variant (4bp insertion, not multiple of 3)
-        // instead of just coding_sequence_variant
+        // Mid-intron insertion: classify_coding_change fails (anchor in
+        // intron body, can't map to CDS). VEP falls back to
+        // coding_sequence_variant only.
         assert!(
-            term_set.contains(&SoTerm::FrameshiftVariant)
-                || term_set.contains(&SoTerm::InframeInsertion),
-            "Frameshift intron insertion should get coding consequence, got: {:?}",
+            term_set.contains(&SoTerm::CodingSequenceVariant),
+            "Mid-intron frameshift should get coding_sequence_variant, got: {:?}",
+            terms
+        );
+    }
+
+    // ── Issue #132: frameshift intron regression ───────────────────────────
+
+    #[test]
+    fn issue_132_deletion_spanning_frameshift_intron_gets_coding_sequence_variant() {
+        // chr3:44499299 pattern: 2bp deletion spanning a 2bp frameshift
+        // intron. TranscriptMapper returns Gap → cds_start/cds_end
+        // undefined → VEP's frameshift returns 0 → coding_sequence_variant.
+        //
+        // Layout: exon1(1000-1008) — 2bp intron(1009-1010) — exon2(1011-1020)
+        // CDS: 1000-1020 (spans both exons + intron)
+        // Delete positions 1009-1010 (the entire frameshift intron)
+        //
+        // Traceability:
+        // - VEP frameshift: return 0 unless defined cds_start/cds_end:
+        //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1445>
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGCTGAATGATTTCCCGGG"; // 21 bases
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1020),
+        );
+        t.cdna_coding_end = Some(21);
+        t.spliced_seq = Some(format!("{cds}AAATTT"));
+        let e1 = exon("T1", 1, 1000, 1008);
+        let e2 = exon("T1", 2, 1011, 1020);
+        let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
+        let tr = translation("T1", Some(21), Some(7), None, Some(cds));
+        // Delete the 2bp intron
+        let v = var("1", 1009, 1010, "XX", "-");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            !term_set.contains(&SoTerm::FrameshiftVariant),
+            "Deletion spanning frameshift intron must NOT get frameshift_variant. Got: {:?}",
             terms
         );
         assert!(
-            !terms.iter().all(|t| *t == SoTerm::CodingSequenceVariant),
-            "Should NOT only have coding_sequence_variant, got: {:?}",
+            term_set.contains(&SoTerm::CodingSequenceVariant),
+            "Should get coding_sequence_variant. Got: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn issue_132_inframe_deletion_in_frameshift_intron_no_inframe_term() {
+        // 3bp inframe deletion within a frameshift intron.
+        // classify_coding_change fails → InframeDeletion removed.
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGCTGAATGATTTCCCGGG";
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1020),
+        );
+        t.cdna_coding_end = Some(21);
+        t.spliced_seq = Some(format!("{cds}AAATTT"));
+        let e1 = exon("T1", 1, 1000, 1008);
+        // 5bp intron
+        let e2 = exon("T1", 2, 1014, 1020);
+        let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
+        let tr = translation("T1", Some(21), Some(7), None, Some(cds));
+        // Delete 3bp in the intron
+        let v = var("1", 1009, 1011, "XXX", "-");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            !term_set.contains(&SoTerm::InframeDeletion),
+            "Inframe deletion in frameshift intron must NOT get inframe_deletion. Got: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn issue_132_exon_boundary_insertion_still_gets_coding_terms() {
+        // Regression guard: insertion at the exon boundary of a frameshift
+        // intron where the anchor DOES map to CDS → classify_coding_change
+        // succeeds → coding_class is Some → specific terms are KEPT.
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGGCTGAATGATTTCCCGGG";
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1040,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1030),
+        );
+        t.cdna_coding_end = Some(21);
+        t.spliced_seq = Some(format!("{cds}AAATTT"));
+        let e1 = exon("T1", 1, 1000, 1008);
+        let e2 = exon("T1", 2, 1019, 1030);
+        let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
+        let tr = translation("T1", Some(21), Some(7), None, Some(cds));
+        // Insert at exon1 end + 1 → anchor at 1008 maps to CDS
+        let v = var("1", 1009, 1009, "-", "GGGG");
+        let (terms, coding_class) =
+            engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
+        assert!(
+            coding_class.is_some(),
+            "Exon-boundary insertion should have coding classification. Got: {:?}",
+            terms
+        );
+        assert!(
+            term_set.contains(&SoTerm::FrameshiftVariant),
+            "Exon-boundary insertion with successful classification should keep frameshift. Got: {:?}",
             terms
         );
     }
