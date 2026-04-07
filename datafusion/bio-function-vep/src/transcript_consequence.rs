@@ -2704,24 +2704,8 @@ fn strip_coding_parent_terms(terms: &mut BTreeSet<SoTerm>) {
 /// - Ensembl Variation `BaseVariationFeatureOverlapAllele::_get_cons_term_rank()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm#L713-L749>
 fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
-    let has_specific_coding = terms.contains(&SoTerm::MissenseVariant)
-        || terms.contains(&SoTerm::SynonymousVariant)
-        || terms.contains(&SoTerm::StopGained)
-        || terms.contains(&SoTerm::StopLost)
-        || terms.contains(&SoTerm::StartLost)
-        || terms.contains(&SoTerm::FrameshiftVariant)
-        || terms.contains(&SoTerm::InframeInsertion)
-        || terms.contains(&SoTerm::InframeDeletion)
-        || terms.contains(&SoTerm::StopRetainedVariant)
-        || terms.contains(&SoTerm::StartRetainedVariant)
-        || terms.contains(&SoTerm::IncompleteTerminalCodonVariant)
-        || terms.contains(&SoTerm::ProteinAlteringVariant);
-
-    if has_specific_coding {
-        terms.remove(&SoTerm::CodingSequenceVariant);
-    }
-    // protein_altering_variant is stripped when more specific children
-    // (inframe_insertion, inframe_deletion, missense, etc.) are present.
+    // Specific coding children that strip both CodingSequenceVariant
+    // and ProteinAlteringVariant as parents.
     let has_specific_child = terms.contains(&SoTerm::MissenseVariant)
         || terms.contains(&SoTerm::SynonymousVariant)
         || terms.contains(&SoTerm::StopGained)
@@ -2733,6 +2717,12 @@ fn strip_parent_terms(terms: &mut BTreeSet<SoTerm>) {
         || terms.contains(&SoTerm::StopRetainedVariant)
         || terms.contains(&SoTerm::StartRetainedVariant)
         || terms.contains(&SoTerm::IncompleteTerminalCodonVariant);
+
+    // CodingSequenceVariant is stripped by specific children OR by
+    // ProteinAlteringVariant (which is itself a child of CSV).
+    if has_specific_child || terms.contains(&SoTerm::ProteinAlteringVariant) {
+        terms.remove(&SoTerm::CodingSequenceVariant);
+    }
     if has_specific_child {
         terms.remove(&SoTerm::ProteinAlteringVariant);
     }
@@ -11601,61 +11591,86 @@ mod tests {
 
     #[test]
     fn issue_124_pure_inframe_insertion_still_gets_inframe_insertion() {
-        // Regression guard: a pure in-frame insertion where ref_pep IS a
-        // prefix of alt_pep should still get inframe_insertion, not
-        // protein_altering_variant.
+        // Regression guard: a pure codon-boundary in-frame insertion
+        // should keep inframe_insertion (ref="-" is guarded).
+        // Full pipeline test to verify InframeInsertion survives.
         //
         // CDS: ATG GCT GAA TGA (M A E *) — 12 bases
         // Insert "GCTGCT" (6 bases, 2 codons) at pos 1006 (codon boundary)
-        // Mutated: ATG GCT + GCTGCT + GAA TGA
-        //   = "ATGGCTGCTGCTGAATGA" (18 bases)
-        // → ATG|GCT|GCT|GCT|GAA|TGA → M A A A E *
-        // ref amino acids: "AE" (at insertion point)
-        // At codon boundary insertion: ref="-", alt="AA" → pure insertion
-        // "-" starts/ends with "-" → pure
+        // amino_acids = "-/AA" → ref_pep = "-" → guarded → pure
+        let engine = TranscriptConsequenceEngine::default();
         let cds = "ATGGCTGAATGA";
-        let c = classify_ins(cds, 1006, "GCTGCT").unwrap();
-        // amino_acids should be like "-/AA" for codon-boundary insertion
-        // Pure insertion: amino_acids starts with "-/" → inframe_insertion kept
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        t.cdna_coding_end = Some(cds_len);
+        t.spliced_seq = Some(format!("{cds}CCCGGG"));
+        let e = exon("T1", 1, 990, 1030);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        let v = var("1", 1006, 1006, "-", "GCTGCT");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
         assert!(
-            c.amino_acids
-                .as_ref()
-                .map_or(false, |aa| aa.starts_with("-/")),
-            "Pure codon-boundary insertion should have -/ amino acids, got: {:?}",
-            c.amino_acids
+            term_set.contains(&SoTerm::InframeInsertion),
+            "Pure codon-boundary insertion should keep inframe_insertion, got: {:?}",
+            terms
+        );
+        assert!(
+            !term_set.contains(&SoTerm::ProteinAlteringVariant),
+            "Should NOT have protein_altering_variant for pure insertion, got: {:?}",
+            terms
         );
     }
 
     #[test]
-    fn issue_124_pure_within_codon_insertion_keeps_inframe() {
-        // In-frame insertion within a codon where ref_pep IS a prefix
-        // of alt_pep (the first AA is preserved, new AAs follow).
+    fn issue_124_within_codon_complex_insertion_gets_protein_altering() {
+        // Within-codon insertions almost always change the codon at the
+        // insertion point, making them "complex". Full pipeline test.
         //
         // CDS: ATG GCT GAA TGA (M A E *) — 12 bases
-        // Insert "GCTGCT" (6 bases) at pos 1004 (CDS idx 4, within codon 1 "GCT")
-        // Mutated: ATG G + GCTGCT + CT GAA TGA
-        //   = "ATGGGCTGCTCTGAATGA" (18 bases)
-        // → ATG|GGC|TGC|TCT|GAA|TGA → M G C S E *
-        // old_aas[1] = A, new_aas[1] = G → A is NOT a prefix of "GCSE"
-        // This is actually a complex change → protein_altering_variant
-        //
-        // For a pure within-codon insertion where ref IS preserved:
-        // CDS: ATG ACT GAA TGA (M T E *) — 12 bases
-        // Insert "GCTGCT" at pos 1004 (within "ACT")
-        // Mutated: ATG A + GCTGCT + CT GAA TGA
-        //   = "ATGAGCTGCTCTGAATGA" (18 bytes)
-        // → ATG|AGC|TGC|TCT|GAA|TGA → M S C S E *
-        // ref "T", alt "SCSE" → T not prefix of SCSE → complex.
-        //
-        // Actually, within-codon insertions almost always change the codon
-        // at the insertion point, making them "complex". Only codon-boundary
-        // insertions are reliably "pure". This is consistent with VEP.
-        // This test verifies that the check runs without error.
+        // Insert "GCTGCT" (6 bases) at pos 1004 (within codon 1, after 1st base)
+        // ref_pep = "A", alt first AA ≠ "A" → complex → protein_altering_variant
+        let engine = TranscriptConsequenceEngine::default();
         let cds = "ATGGCTGAATGA";
-        let c = classify_ins(cds, 1004, "GCTGCT").unwrap();
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let mut t = tx(
+            "T1",
+            "1",
+            990,
+            1030,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        t.cdna_coding_end = Some(cds_len);
+        t.spliced_seq = Some(format!("{cds}CCCGGG"));
+        let e = exon("T1", 1, 990, 1030);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
+        let v = var("1", 1004, 1004, "-", "GCTGCT");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &exons_ref, Some(&tr));
+        let term_set: std::collections::BTreeSet<_> = terms.iter().collect();
         assert!(
-            c.amino_acids.is_some(),
-            "Should compute amino acids for within-codon insertion"
+            term_set.contains(&SoTerm::ProteinAlteringVariant),
+            "Within-codon complex insertion should get protein_altering_variant, got: {:?}",
+            terms
+        );
+        assert!(
+            !term_set.contains(&SoTerm::InframeInsertion),
+            "Should NOT have inframe_insertion for complex change, got: {:?}",
+            terms
         );
     }
 }
