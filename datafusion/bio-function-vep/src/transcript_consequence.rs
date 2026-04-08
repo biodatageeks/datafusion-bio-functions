@@ -821,6 +821,8 @@ impl TranscriptConsequenceEngine {
                         let exon_str = which_exon_str(variant, &tx_exons);
                         let intron_str = which_intron_str(variant, &tx_exons, tx.strand);
                         let cdna_position = compute_cdna_position(variant, tx, &tx_exons);
+                        let original_allows_protein_hgvs =
+                            original_terms_allow_protein_hgvs(&terms);
                         let (cds_position, protein_position, amino_acids, codons, protein_hgvs) =
                             if let Some(ref cc) = coding_class {
                                 let n_pad_len = tx_translation
@@ -864,6 +866,7 @@ impl TranscriptConsequenceEngine {
                                     &tx_exons,
                                     tx_translation,
                                     variant,
+                                    original_allows_protein_hgvs,
                                     cc.protein_hgvs.as_ref(),
                                     self.shift_hgvs,
                                 );
@@ -876,6 +879,7 @@ impl TranscriptConsequenceEngine {
                                     &tx_exons,
                                     tx_translation,
                                     variant,
+                                    original_allows_protein_hgvs,
                                     None,
                                     self.shift_hgvs,
                                 );
@@ -3144,6 +3148,27 @@ fn build_protein_hgvs_data(
     })
 }
 
+fn original_terms_allow_protein_hgvs(terms: &[SoTerm]) -> bool {
+    terms.iter().any(|term| {
+        matches!(
+            term,
+            SoTerm::MissenseVariant
+                | SoTerm::SynonymousVariant
+                | SoTerm::StopGained
+                | SoTerm::StopLost
+                | SoTerm::StartLost
+                | SoTerm::FrameshiftVariant
+                | SoTerm::InframeInsertion
+                | SoTerm::InframeDeletion
+                | SoTerm::StopRetainedVariant
+                | SoTerm::StartRetainedVariant
+                | SoTerm::ProteinAlteringVariant
+                | SoTerm::IncompleteTerminalCodonVariant
+                | SoTerm::CodingSequenceVariant
+        )
+    })
+}
+
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
 ///   applies `_return_3prime()` before checking coding coordinates, so protein
@@ -3155,9 +3180,17 @@ fn protein_hgvs_for_output(
     tx_exons: &[&ExonFeature],
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
+    original_allows_protein_hgvs: bool,
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
     shift_hgvs: bool,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
+    // Ensembl only emits HGVSp when the original transcript variation is
+    // coding (`$pre->{coding}`), even if HGVS 3' shifting later moves an
+    // intronic indel into CDS coordinates for HGVSc.
+    if !original_allows_protein_hgvs {
+        return None;
+    }
+
     if !shift_hgvs {
         return fallback.cloned();
     }
@@ -13331,6 +13364,87 @@ mod tests {
         assert_eq!(
             consequence.hgvsp.as_deref(),
             Some("ENSP00000482568.2:p.Pro43ThrfsTer43")
+        );
+    }
+
+    #[test]
+    fn shifted_hgvsp_is_suppressed_when_original_terms_are_splice_only() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(5000, 5000, true);
+        let cds = "ATGGATGATAGCGACTTTGCCTAA";
+
+        let mut tx = tx(
+            "ENSTSHIFT0001",
+            "1",
+            1000,
+            1044,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1044),
+        );
+        tx.version = Some(1);
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(cds.len());
+        tx.translation_stable_id = Some("ENSPSHIFT0001".to_string());
+
+        let exons = vec![
+            exon("ENSTSHIFT0001", 1, 1000, 1008),
+            exon("ENSTSHIFT0001", 2, 1030, 1044),
+        ];
+
+        let mut tr = translation(
+            "ENSTSHIFT0001",
+            Some(cds.len()),
+            Some(cds.len() / 3),
+            None,
+            Some(cds),
+        );
+        tr.stable_id = Some("ENSPSHIFT0001".to_string());
+        tr.version = Some(1);
+
+        // Original variant is a splice acceptor deletion in the intron.
+        // HGVS 3' shifting moves the deletion into exon 2, where a shifted
+        // coding classification would exist. VEP still leaves HGVSp empty
+        // because the original TVA is not coding.
+        let mut v = var("1", 1028, 1029, "AG", "-");
+        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 2,
+            start: 1030,
+            end: 1031,
+            shifted_allele_string: "AG".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+
+        let assignments =
+            engine.evaluate_variant_with_context(&v, &[tx], &exons, &[tr], &[], &[], &[], &[]);
+        let consequence = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENSTSHIFT0001"))
+            .expect("expected transcript consequence");
+        let term_set: std::collections::BTreeSet<_> = consequence.terms.iter().copied().collect();
+
+        assert!(
+            term_set.contains(&SoTerm::SpliceAcceptorVariant),
+            "Synthetic splice-site indel should stay splice-only. Got: {:?}",
+            consequence.terms
+        );
+        assert!(
+            !term_set.contains(&SoTerm::CodingSequenceVariant),
+            "Synthetic splice-site indel must not become coding in the original consequence. Got: {:?}",
+            consequence.terms
+        );
+        assert!(
+            consequence.hgvsc.is_some(),
+            "Shifted HGVSc should still be emitted for splice-only indels"
+        );
+        assert_eq!(
+            consequence.hgvsp, None,
+            "HGVSp must stay empty when the original transcript variation is not coding"
         );
     }
 }
