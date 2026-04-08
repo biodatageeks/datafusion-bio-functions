@@ -2365,7 +2365,15 @@ impl TranscriptConsequenceEngine {
             // A variant in the exonic boundary region of a frameshift intron
             // can still receive splice_region_variant.
             let is_frameshift_intron = (intron_end - intron_start).abs() <= 12;
-            if is_frameshift_intron && overlaps(sv_min, sv_max, intron_start, intron_end) {
+            let overlaps_intron_body = if is_ins {
+                // VEP evaluates insertions with inverted coordinates
+                // (`start = P`, `end = P-1`). For intron-body checks this
+                // means P must be strictly after the first intronic base.
+                sv.start > intron_start && sv.start <= intron_end
+            } else {
+                overlaps(sv_min, sv_max, intron_start, intron_end)
+            };
+            if is_frameshift_intron && overlaps_intron_body {
                 continue;
             }
 
@@ -3715,6 +3723,17 @@ fn classify_coding_change(
         }
     }
 
+    if !class.stop_lost && frameshift && alt_len < ref_len {
+        if class
+            .codons
+            .as_deref()
+            .and_then(frameshift_deletion_partial_stop_lost_from_codon_allele_string)
+            .unwrap_or(false)
+        {
+            class.stop_lost = true;
+        }
+    }
+
     // For HGVS stop-loss / frameshift extension distance, translate the
     // mutated CDS + 3' UTR so that the new stop codon can be found even
     // when it falls in the UTR region.
@@ -5060,6 +5079,15 @@ fn peptide_from_codon_allele(codon: &str) -> Option<String> {
         peptide.push('-');
     }
     Some(peptide)
+}
+
+fn frameshift_deletion_partial_stop_lost_from_codon_allele_string(
+    codon_allele_string: &str,
+) -> Option<bool> {
+    let (ref_codon, alt_codon) = codon_allele_string.split_once('/')?;
+    let ref_pep = peptide_from_codon_allele(ref_codon)?;
+    let alt_pep = peptide_from_codon_allele(alt_codon)?;
+    Some(ref_pep.contains('*') && !alt_pep.contains('*') && alt_pep.contains('X'))
 }
 
 fn translate_codon_bytes(codon: [u8; 3]) -> Option<char> {
@@ -8768,6 +8796,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn frameshift_deletion_partial_stop_lost_detected_from_codon_alleles() {
+        assert_eq!(
+            frameshift_deletion_partial_stop_lost_from_codon_allele_string("tGa/ta"),
+            Some(true)
+        );
+        assert_eq!(
+            frameshift_deletion_partial_stop_lost_from_codon_allele_string("tcATAA/tc"),
+            Some(true)
+        );
+        assert_eq!(
+            frameshift_deletion_partial_stop_lost_from_codon_allele_string("TAA/-"),
+            Some(false)
+        );
+    }
+
     // ---- deletion frameshift: preserve last ref AA before X ----
 
     #[test]
@@ -10764,6 +10808,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn frameshift_deletion_partial_terminal_stop_sets_stop_lost() {
+        let cds = "ATGTGA";
+        let c = classify_deletion(cds, 1004, 1004, "G").unwrap();
+        assert_eq!(c.codons.as_deref(), Some("tGa/ta"));
+        assert!(
+            c.stop_lost,
+            "Frameshift deletion leaving a partial stop codon should set stop_lost. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn issue_terminal_stop_frameshift_deletion_on_nmd_transcript_cofires_stop_lost() {
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGTCATAA";
+        let mut t = tx(
+            "T1",
+            "11",
+            1000,
+            1008,
+            1,
+            "nonsense_mediated_decay",
+            Some(1000),
+            Some(1008),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(cds.len());
+        t.translation_stable_id = Some("ENSPT1".to_string());
+        let e = exon("T1", 1, 1000, 1008);
+        let tr = translation("T1", Some(cds.len()), Some(3), None, Some(cds));
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("11", 1005, 1008, "ATAA", "-"),
+            &[t],
+            &[e],
+            &[tr],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let consequence = assignments
+            .first()
+            .expect("expected transcript consequence");
+        let term_set: std::collections::BTreeSet<_> = consequence.terms.iter().copied().collect();
+
+        assert!(
+            term_set.contains(&SoTerm::FrameshiftVariant),
+            "Expected frameshift_variant, got: {:?}",
+            consequence.terms
+        );
+        assert!(
+            term_set.contains(&SoTerm::StopLost),
+            "Expected stop_lost, got: {:?}",
+            consequence.terms
+        );
+        assert!(
+            term_set.contains(&SoTerm::NmdTranscriptVariant),
+            "Expected NMD_transcript_variant, got: {:?}",
+            consequence.terms
+        );
+        assert_eq!(consequence.codons.as_deref(), Some("tcATAA/tc"));
+    }
+
     // ── Issue #90 sub-pattern E: miRNA insertion at boundary ─────────────
 
     #[test]
@@ -12216,6 +12325,44 @@ mod tests {
             term_set.contains(&SoTerm::CodingSequenceVariant),
             "Mid-intron frameshift should get coding_sequence_variant, got: {:?}",
             terms
+        );
+    }
+
+    #[test]
+    fn issue_118_negative_strand_one_bp_frameshift_intron_boundary_insertion_gets_splice_donor() {
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "20",
+            1000,
+            1200,
+            -1,
+            "protein_coding",
+            Some(1000),
+            Some(1200),
+        );
+        // 1bp intron at 1092 between the two exons. On the negative strand,
+        // that single intronic base is the donor site.
+        let exons = vec![exon("T1", 1, 1093, 1200), exon("T1", 2, 1000, 1091)];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("20", 1092, 1092, "-", "AAAA"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let consequence = assignments
+            .first()
+            .expect("expected transcript consequence");
+
+        assert!(
+            consequence.terms.contains(&SoTerm::SpliceDonorVariant),
+            "Boundary insertion next to a 1bp negative-strand frameshift intron should keep splice_donor_variant. Got: {:?}",
+            consequence.terms
         );
     }
 
