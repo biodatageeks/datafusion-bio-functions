@@ -14,6 +14,8 @@ use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use crate::plugin::ActivePlugins;
+
 /// Callback invoked after each batch is written to VCF.
 /// Arguments: (rows_in_batch, total_rows_written_so_far, total_input_rows).
 /// `total_input_rows` is 0 if the count was not computed (show_progress=false).
@@ -32,34 +34,16 @@ pub struct AnnotateVcfConfig {
     pub use_fjall: bool,
     /// Enable HGVS notation.
     pub hgvs: bool,
-    /// Enable transcript HGVS notation explicitly.
-    pub hgvsc: bool,
-    /// Enable protein HGVS notation explicitly.
-    pub hgvsp: bool,
-    /// Enable 3' HGVS shifting explicitly.
-    pub shift_hgvs: Option<bool>,
-    /// Don't URI-escape HGVS output.
-    pub no_escape: bool,
-    /// Remove version from HGVSp IDs.
-    pub remove_hgvsp_version: bool,
-    /// Format HGVSp using prediction-style parentheses.
-    pub hgvsp_use_prediction: bool,
-    /// Use RefSeq cache/transcripts in place of Ensembl transcripts.
-    pub refseq: bool,
     /// Use merged Ensembl+RefSeq cache.
     pub merged: bool,
-    /// Restrict to GENCODE basic transcripts.
-    pub gencode_basic: bool,
-    /// Restrict to GENCODE primary transcripts.
-    pub gencode_primary: bool,
-    /// Keep all RefSeq transcripts, including CCDS/EST-style rows.
-    pub all_refseq: bool,
-    /// Exclude predicted RefSeq transcripts (XM_/XR_).
-    pub exclude_predicted: bool,
     /// Maximum allowed `failed` flag value from cache.
     pub failed: Option<i64>,
     /// Upstream/downstream distance for transcript overlap.
     pub distance: Option<String>,
+    /// Base plugin directory, typically `<cache_dir>/plugins`.
+    pub plugins_dir: Option<String>,
+    /// Explicit plugin names to enable.
+    pub plugins: Vec<String>,
     /// Output compression type.
     pub compression: VcfCompressionType,
     /// Show an indicatif progress bar on stderr (for Rust CLI).
@@ -78,20 +62,11 @@ impl Default for AnnotateVcfConfig {
             reference_fasta_path: None,
             use_fjall: false,
             hgvs: false,
-            hgvsc: false,
-            hgvsp: false,
-            shift_hgvs: None,
-            no_escape: false,
-            remove_hgvsp_version: false,
-            hgvsp_use_prediction: false,
-            refseq: false,
             merged: false,
-            gencode_basic: false,
-            gencode_primary: false,
-            all_refseq: false,
-            exclude_predicted: false,
             failed: None,
             distance: None,
+            plugins_dir: None,
+            plugins: Vec::new(),
             compression: VcfCompressionType::Plain,
             show_progress: false,
             on_batch_written: None,
@@ -105,12 +80,25 @@ impl std::fmt::Debug for AnnotateVcfConfig {
             .field("everything", &self.everything)
             .field("compression", &self.compression)
             .field("show_progress", &self.show_progress)
+            .field("plugins", &self.plugins)
             .field("on_batch_written", &self.on_batch_written.is_some())
             .finish()
     }
 }
 
 impl AnnotateVcfConfig {
+    fn active_plugins(&self) -> ActivePlugins {
+        let Some(plugins_dir) = self.plugins_dir.as_deref() else {
+            return ActivePlugins::default();
+        };
+        let plugins_dir = Path::new(plugins_dir);
+        if self.plugins.is_empty() {
+            ActivePlugins::discover(plugins_dir)
+        } else {
+            ActivePlugins::from_names(&self.plugins, plugins_dir)
+        }
+    }
+
     fn to_options_json(&self) -> String {
         let mut opts = serde_json::Map::new();
         opts.insert("partitioned".into(), serde_json::Value::Bool(true));
@@ -132,41 +120,8 @@ impl AnnotateVcfConfig {
         if self.hgvs {
             opts.insert("hgvs".into(), serde_json::Value::Bool(true));
         }
-        if self.hgvsc {
-            opts.insert("hgvsc".into(), serde_json::Value::Bool(true));
-        }
-        if self.hgvsp {
-            opts.insert("hgvsp".into(), serde_json::Value::Bool(true));
-        }
-        if let Some(shift_hgvs) = self.shift_hgvs {
-            opts.insert("shift_hgvs".into(), serde_json::Value::Bool(shift_hgvs));
-        }
-        if self.no_escape {
-            opts.insert("no_escape".into(), serde_json::Value::Bool(true));
-        }
-        if self.remove_hgvsp_version {
-            opts.insert("remove_hgvsp_version".into(), serde_json::Value::Bool(true));
-        }
-        if self.hgvsp_use_prediction {
-            opts.insert("hgvsp_use_prediction".into(), serde_json::Value::Bool(true));
-        }
-        if self.refseq {
-            opts.insert("refseq".into(), serde_json::Value::Bool(true));
-        }
         if self.merged {
             opts.insert("merged".into(), serde_json::Value::Bool(true));
-        }
-        if self.gencode_basic {
-            opts.insert("gencode_basic".into(), serde_json::Value::Bool(true));
-        }
-        if self.gencode_primary {
-            opts.insert("gencode_primary".into(), serde_json::Value::Bool(true));
-        }
-        if self.all_refseq {
-            opts.insert("all_refseq".into(), serde_json::Value::Bool(true));
-        }
-        if self.exclude_predicted {
-            opts.insert("exclude_predicted".into(), serde_json::Value::Bool(true));
         }
         if let Some(failed) = self.failed {
             opts.insert(
@@ -176,6 +131,24 @@ impl AnnotateVcfConfig {
         }
         if let Some(ref dist) = self.distance {
             opts.insert("distance".into(), serde_json::Value::String(dist.clone()));
+        }
+        if let Some(ref plugins_dir) = self.plugins_dir {
+            opts.insert(
+                "plugins_dir".into(),
+                serde_json::Value::String(plugins_dir.clone()),
+            );
+        }
+        if !self.plugins.is_empty() {
+            opts.insert(
+                "plugins".into(),
+                serde_json::Value::Array(
+                    self.plugins
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
         }
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
@@ -356,11 +329,13 @@ pub async fn annotate_to_vcf(
                 }
                 arrow_field.with_metadata(merged_metadata)
             } else if name == "CSQ" {
-                let field_names = crate::golden_benchmark::csq_field_names_for_mode(
-                    config.everything,
-                    config.refseq,
-                    config.merged,
-                );
+                let active_plugins = config.active_plugins();
+                let mut field_names: Vec<&str> = if config.everything {
+                    crate::golden_benchmark::CSQ_FIELD_NAMES_EVERYTHING.to_vec()
+                } else {
+                    crate::golden_benchmark::CSQ_FIELD_NAMES.to_vec()
+                };
+                field_names.extend(active_plugins.csq_field_names());
                 let format_list = field_names.join("|");
                 let description =
                     format!("Consequence annotations from annotate_vep. Format: {format_list}");

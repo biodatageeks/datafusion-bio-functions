@@ -675,6 +675,35 @@ impl<'a> PositionEntryReader<'a> {
             _ => None,
         }
     }
+
+    /// Read a single float value from a column, widened to f32.
+    ///
+    /// Returns `None` if the value is null or the column is not a float type.
+    pub fn read_f32_value(&self, col_idx: usize, allele_row: usize) -> Option<f32> {
+        if col_idx >= self.col_offsets.len() {
+            return None;
+        }
+        let (col_offset, type_code) = self.col_offsets[col_idx];
+        let dt = decode_data_type(type_code).ok()?;
+        let data = &self.data[col_offset..];
+
+        if !is_non_null(data, allele_row) {
+            return None;
+        }
+        let values_off = null_bitmap_size(self.num_alleles);
+
+        match dt {
+            DataType::Float32 => {
+                let off = values_off + allele_row * 4;
+                Some(f32::from_le_bytes(data[off..off + 4].try_into().unwrap()))
+            }
+            DataType::Float64 => {
+                let off = values_off + allele_row * 8;
+                Some(f64::from_le_bytes(data[off..off + 8].try_into().unwrap()) as f32)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Compute the packed size of a single column's data (after the type byte).
