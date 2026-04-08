@@ -3378,6 +3378,9 @@ fn classify_coding_change(
                     }
                 }
                 Some(true) => {
+                    // Inframe start codon loss is handled above by the
+                    // peptide-level first-amino-acid check. The nucleotide
+                    // fallback only needs to co-fire start_lost for frameshifts.
                     if !ref_len.abs_diff(alt_len).is_multiple_of(3) {
                         class.start_lost = true;
                     }
@@ -4343,6 +4346,9 @@ fn ins_del_start_altered(
                 return Some(false);
             }
         }
+        // When the 5'UTR changes, observed VEP parity for the regression cases
+        // comes from preserving the translateable suffix rather than requiring
+        // ATG to remain at the original byte offset, so fall through.
     }
 
     // Sequence shorter than the translateable CDS → start codon destroyed.
@@ -9877,17 +9883,22 @@ mod tests {
     }
 
     #[test]
-    fn inframe_deletion_preserving_atg_emits_start_retained_only() {
-        // Inframe deletion (3bp) after start codon, ATG preserved.
-        // ins_del_start_altered returns false, inframe → no start_lost co-fire.
+    fn inframe_deletion_after_start_codon_emits_no_start_terms() {
+        // Inframe deletion (3bp) after the start codon. ATG is preserved, but
+        // the variant no longer overlaps CDS positions 0..=2, so neither
+        // start_retained nor start_lost should fire.
         // 5'UTR = "GCGC", CDS = "ATGGCTGAAAAATGA" (15bp = 5 codons)
         // Delete "GCT" at pos 1007-1009 (CDS pos 3-5) → inframe deletion.
         let c = classify_deletion_with_cdna("GCGC", "ATGGCTGAAAAATGA", 1007, 1009, "GCT").unwrap();
         assert!(
-            c.start_retained || !c.start_lost,
-            "Inframe deletion preserving ATG should NOT co-fire start_lost. Got: start_retained={}, start_lost={}",
-            c.start_retained,
-            c.start_lost
+            !c.start_retained,
+            "Inframe deletion after the start codon should NOT emit start_retained. Got: start_retained={}, start_lost={}",
+            c.start_retained, c.start_lost
+        );
+        assert!(
+            !c.start_lost,
+            "Inframe deletion after the start codon should NOT emit start_lost. Got: start_retained={}, start_lost={}",
+            c.start_retained, c.start_lost
         );
     }
 

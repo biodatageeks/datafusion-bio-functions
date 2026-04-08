@@ -6163,6 +6163,10 @@ impl RecordBatchStream for ContigAnnotationStream {
 /// Hydrate a window of batches: compute variant intervals, hydrate new
 /// transcripts (skip already-hydrated), apply translateable_seq overrides.
 /// Mirrors the SIFT sliding-window pattern.
+///
+/// We intentionally do not gate this on `shift_hgvs`: start-codon indel
+/// classification needs hydrated cDNA/spliced sequence even when callers only
+/// request consequence terms and HGVSc shifting is disabled.
 fn hydrate_window(
     transcripts: &mut [TranscriptFeature],
     exons: &[ExonFeature],
@@ -6171,7 +6175,6 @@ fn hydrate_window(
     hgvs_reader: &mut Option<FastaReader>,
     hydrated_cds_tx_ids: &mut HashSet<String>,
     window_batches: &[RecordBatch],
-    _hgvs_flags: HgvsFlags,
 ) -> Result<()> {
     let Some(reader) = hgvs_reader.as_mut() else {
         return Ok(());
@@ -6632,7 +6635,6 @@ impl Stream for ContigAnnotationStream {
                         &mut ann.hgvs_reader,
                         &mut ann.hydrated_cds_tx_ids,
                         &window_batches,
-                        ann.config.hgvs_flags,
                     ) {
                         let fut = make_cleanup_future(
                             Arc::clone(&ann.session),
