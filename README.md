@@ -201,7 +201,18 @@ cargo run -p datafusion-bio-function-vep --example load_cache_full --features kv
 ```
 
 - Third argument is thread count (`target_partitions` + loader parallelism).
+- Optional fourth argument is a comma-separated chromosome list, for example `1,2,X`.
 - Output path is recreated if it already exists.
+
+Create a chromosome-scoped Fjall cache from a Parquet variation cache:
+
+```bash
+cargo run -p datafusion-bio-function-vep --example load_cache_full --features kv-cache --release -- \
+  /path/to/115_GRCh38_variants.parquet \
+  /path/to/variation_fjall_chr1_chr2 \
+  8 \
+  1,2
+```
 
 Create a filtered cache (single chromosome) and optionally tune compression:
 
