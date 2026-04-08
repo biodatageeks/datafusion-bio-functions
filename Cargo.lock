@@ -1106,8 +1106,8 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-format-core"
-version = "1.1.1"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=f9d3128f6da36d17d484c97822ba1451407e48a3#f9d3128f6da36d17d484c97822ba1451407e48a3"
+version = "1.2.0"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=25fe271dd92f67640af8e8bfb9a8198c168c7ab4#25fe271dd92f67640af8e8bfb9a8198c168c7ab4"
 dependencies = [
  "async-compression",
  "bytes",
@@ -1128,12 +1128,12 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-format-ensembl-cache"
-version = "1.1.1"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=f9d3128f6da36d17d484c97822ba1451407e48a3#f9d3128f6da36d17d484c97822ba1451407e48a3"
+version = "1.2.0"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=25fe271dd92f67640af8e8bfb9a8198c168c7ab4#25fe271dd92f67640af8e8bfb9a8198c168c7ab4"
 dependencies = [
  "async-trait",
  "datafusion",
- "datafusion-bio-format-core 1.1.1",
+ "datafusion-bio-format-core 1.2.0",
  "datafusion-execution",
  "flate2",
  "log",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-function-pileup"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-function-ranges"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "ahash",
  "async-trait",
@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-function-vep"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "ahash",
  "arrow-ipc",
@@ -4747,7 +4747,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "superintervals"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "aligned-vec",
  "serde",
