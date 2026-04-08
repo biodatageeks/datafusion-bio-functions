@@ -869,7 +869,17 @@ impl TranscriptConsequenceEngine {
                                 );
                                 (cds_pos, prot_pos, amino_acids, codons, protein_hgvs)
                             } else {
-                                (None, None, None, None, None)
+                                // VEP can still emit HGVSp for HGVS-shifted indels whose
+                                // original consequence stayed coding_sequence_variant.
+                                let protein_hgvs = protein_hgvs_for_output(
+                                    tx,
+                                    &tx_exons,
+                                    tx_translation,
+                                    variant,
+                                    None,
+                                    self.shift_hgvs,
+                                );
+                                (None, None, None, None, protein_hgvs)
                             };
                         let flags = compute_flags(tx);
                         // Compute HGVSc notation.
@@ -13082,6 +13092,98 @@ mod tests {
         assert_eq!(
             consequence.hgvsp.as_deref(),
             Some("ENSP00000400410.1:p.Ter262=")
+        );
+    }
+
+    #[test]
+    fn issue_orai1_frameshift_intron_deletion_keeps_csv_but_emits_shifted_hgvsp() {
+        const ORAI1_CDS: &str = concat!(
+            "ATGCATCCGGAGCCCGCCCCGCCCCCGAGCCGCAGCAGTCCCGAGCTTCCCCCAAGCGGCGGCAGCAC",
+            "CACCAGCGGCAGCCGCCGGAGCCGCCGCCGCAGCGGGGACGGGGAGCCCCCGGGGGCCCCGCCACCGC",
+            "CGCCGTCCGCCGTCACCTACCCGGACTGGATCGGCCAGAGTTACTCCGAGGTGATGAGCCTCAACGAG",
+            "CACTCCATGCAGGCGCTGTCCTGGCGCAAGCTCTACTTGAGCCGCGCCAAGCTTAAAGCCTCCAGCCG",
+            "GACCTCGGCTCTGCTCTCCGGCTTCGCCATGGTGGCAATGGTGGAGGTGCAGCTGGACGCTGACCACG",
+            "ACTACCCACCGGGGCTGCTCATCGCCTTCAGTGCCTGCACCACAGTGCTGGTGGCTGTGCACCTGTTT",
+            "GCGCTCATGATCAGCACCTGCATCCTGCCCAACATCGAGGCGGTGAGCAACGTGCACAATCTCAACTC",
+            "GGTCAAGGAGTCCCCCCATGAGCGCATGCACCGCCACATCGAGCTGGCCTGGGCCTTCTCCACCGTCA",
+            "TCGGCACGCTGCTCTTCCTAGCTGAGGTGGTGCTGCTCTGCTGGGTCAAGTTCTTGCCCCTCAAGAAG",
+            "CAGCCAGGCCAGCCAAGGCCCACCAGCAAGCCCCCCGCCAGTGGCGCAGCAGCCAACGTCAGCACCAG",
+            "CGGCATCACCCCGGGCCAGGCAGCTGCCATCGCCTCGACCACCATCATGGTGCCCTTCGGCCTGATCT",
+            "TTATCGTCTTCGCCGTCCACTTCTACCGCTCACTGGTTAGCCATAAGACTGACCGACAGTTCCAGGAG",
+            "CTCAACGAGCTGGCGGAGTTTGCCCGCTTACAGGACCAGCTGGACCACAGAGGGGACCACCCCCTGAC",
+            "GCCCGGCAGCCACTATGCCTAG"
+        );
+
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(5000, 5000, true);
+        let mut tx = tx(
+            "ENST00000617316",
+            "12",
+            121_626_550,
+            121_642_040,
+            1,
+            "protein_coding",
+            Some(121_626_743),
+            Some(121_641_643),
+        );
+        tx.version = Some(2);
+        tx.cdna_coding_start = Some(194);
+        tx.cdna_coding_end = Some(1099);
+        tx.translation_stable_id = Some("ENSP00000482568".to_string());
+        tx.is_canonical = true;
+
+        let exons = vec![
+            exon("ENST00000617316", 1, 121_626_550, 121_626_865),
+            exon("ENST00000617316", 2, 121_626_871, 121_627_050),
+            exon("ENST00000617316", 3, 121_641_041, 121_642_040),
+        ];
+
+        let mut tr = translation(
+            "ENST00000617316",
+            Some(906),
+            Some(301),
+            None,
+            Some(ORAI1_CDS),
+        );
+        tr.stable_id = Some("ENSP00000482568".to_string());
+        tr.version = Some(2);
+
+        let mut v = var("12", 121_626_866, 121_626_870, "GCCCC", "-");
+        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 8,
+            start: 121_626_874,
+            end: 121_626_878,
+            shifted_allele_string: "CCGCC".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+
+        let assignments =
+            engine.evaluate_variant_with_context(&v, &[tx], &exons, &[tr], &[], &[], &[], &[]);
+        let consequence = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENST00000617316"))
+            .expect("expected transcript consequence");
+        let term_set: std::collections::BTreeSet<_> = consequence.terms.iter().copied().collect();
+
+        assert_eq!(
+            term_set,
+            std::collections::BTreeSet::from([SoTerm::CodingSequenceVariant]),
+            "Unexpected ORAI1 terms: {:?}",
+            consequence.terms
+        );
+        assert_eq!(consequence.cds_position, None);
+        assert_eq!(consequence.protein_position, None);
+        assert_eq!(
+            consequence.hgvsc.as_deref(),
+            Some("ENST00000617316.2:c.127_131del")
+        );
+        assert_eq!(
+            consequence.hgvsp.as_deref(),
+            Some("ENSP00000482568.2:p.Pro43ThrfsTer43")
         );
     }
 }
