@@ -2289,7 +2289,6 @@ impl AnnotateProvider {
             let refseq_id_idx = schema.index_of("refseq_id").ok();
             let source_idx = schema.index_of("source").ok();
             let version_idx = schema.index_of("version").ok();
-            let raw_json_idx = schema.index_of("raw_object_json").ok();
             let cds_start_nf_idx = schema.index_of("cds_start_nf").ok();
             let cds_end_nf_idx = schema.index_of("cds_end_nf").ok();
             let mirna_regions_idx = schema.index_of("mature_mirna_regions").ok();
@@ -2385,21 +2384,14 @@ impl AnnotateProvider {
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                     .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf));
 
-                let raw_object_json =
-                    raw_json_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_stable_id =
                     gene_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_symbol =
                     gene_symbol_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_symbol_source = gene_symbol_source_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let promoted_gene_hgnc_id =
+                let gene_hgnc_id =
                     gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let gene_hgnc_id = match raw_object_json.as_deref() {
-                    Some(raw_json) => gene_hgnc_id_from_raw_json(raw_json)
-                        .unwrap_or_else(|| promoted_gene_hgnc_id.clone()),
-                    None => promoted_gene_hgnc_id,
-                };
                 let refseq_id =
                     refseq_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let source = source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
@@ -4819,22 +4811,6 @@ fn normalize_source_label(source: &str) -> Option<String> {
     }
 }
 
-/// Prefer the serialized VEP cache state for `_gene_hgnc_id`.
-///
-/// The promoted parquet `gene_hgnc_id` column may be more aggressively
-/// propagated than the original VEP cache object. `raw_object_json` preserves
-/// the per-transcript `_gene_hgnc_id` that VEP would emit.
-fn gene_hgnc_id_from_raw_json(raw_json: &str) -> Option<Option<String>> {
-    let value: Value = serde_json::from_str(raw_json).ok()?;
-    Some(
-        value
-            .get("_gene_hgnc_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && *value != "-")
-            .map(str::to_string),
-    )
-}
-
 /// Fill missing merged-mode `HGNC_ID` values for RefSeq rows using the paired
 /// Ensembl transcript mapping in the merged cache, with a unique-gene-symbol
 /// fallback when no explicit `refseq_id -> HGNC_ID` link exists.
@@ -4855,13 +4831,12 @@ fn gene_hgnc_id_from_raw_json(raw_json: &str) -> Option<Option<String>> {
 /// per-gene-object attribute.  Transcripts of the same gene symbol can have
 /// different symbol sources (e.g. LINC03025 has both HGNC and EntrezGene
 /// transcripts); VEP only emits `HGNC_ID` for those whose gene object carries
-/// the HGNC `display_xref`.  The serialized transcript object in
-/// `raw_object_json` reflects this correctly even when the promoted parquet
-/// `gene_hgnc_id` column has been over-propagated, so the symbol fallback must
-/// only fill gaps for HGNC-source transcripts.  Setting `hgnc_backfill` to
-/// `true` restores the previous behaviour which populates `HGNC_ID` for all
-/// transcripts where a unique mapping can be inferred — arguably more complete
-/// but not VEP-compatible.
+/// the HGNC `display_xref`.  The cache's per-transcript `gene_hgnc_id` column
+/// reflects this correctly, so the symbol fallback must only fill gaps for
+/// HGNC-source transcripts.  Setting `hgnc_backfill` to `true` restores the
+/// previous behaviour which populates `HGNC_ID` for all transcripts where a
+/// unique mapping can be inferred — arguably more complete but not
+/// VEP-compatible.
 ///
 /// See <https://github.com/biodatageeks/datafusion-bio-functions/issues/92>.
 fn backfill_missing_hgnc_ids(
@@ -4916,9 +4891,10 @@ fn backfill_missing_hgnc_ids(
         // the transcript's gene_symbol_source is "HGNC".  VEP derives HGNC_ID
         // from each transcript's gene `display_xref`; genes whose
         // SYMBOL_SOURCE is RFAM, EntrezGene, or absent may or may not carry
-        // an HGNC `display_xref`.  We therefore only symbol-backfill
-        // HGNC-source transcripts when the serialized cache object still lacks
-        // `_gene_hgnc_id` (issue #92).
+        // an HGNC `display_xref`, and the cache's per-transcript
+        // `gene_hgnc_id` column already reflects that correctly.  The symbol
+        // fallback must only fill gaps for HGNC-source transcripts where the
+        // cache is incomplete (issue #92).
         let source_is_hgnc = tx
             .gene_symbol_source
             .as_deref()
@@ -7452,19 +7428,6 @@ mod tests {
             appris: None,
             ncrna_structure: None,
         }
-    }
-
-    #[test]
-    fn test_gene_hgnc_id_from_raw_json_prefers_serialized_state() {
-        let raw_with_hgnc = r#"{"_gene_hgnc_id":"HGNC:26671","_gene_symbol_source":"EntrezGene"}"#;
-        let raw_without_hgnc = r#"{"_gene_symbol_source":"RFAM"}"#;
-
-        assert_eq!(
-            gene_hgnc_id_from_raw_json(raw_with_hgnc),
-            Some(Some("HGNC:26671".to_string()))
-        );
-        assert_eq!(gene_hgnc_id_from_raw_json(raw_without_hgnc), Some(None));
-        assert_eq!(gene_hgnc_id_from_raw_json("{"), None);
     }
 
     /// Issue #92 — SNORA75 (snoRNA, SYMBOL_SOURCE=RFAM): VEP leaves HGNC_ID
