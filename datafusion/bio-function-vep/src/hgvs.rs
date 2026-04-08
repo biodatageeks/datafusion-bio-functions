@@ -253,6 +253,9 @@ pub fn format_hgvsc(
     ) {
         std::mem::swap(&mut start, &mut end);
     }
+    if !hgvsc_coord_is_valid(tx, tx_exons, &start) || !hgvsc_coord_is_valid(tx, tx_exons, &end) {
+        return None;
+    }
     format_hgvs_string(&tx_id, numbering, &start, &end, &notation)
 }
 
@@ -979,6 +982,46 @@ fn format_hgvs_string(
             return None;
         };
     Some(format!("{ref_name}:{numbering}.{suffix}"))
+}
+
+fn transcript_spliced_length(tx: &TranscriptFeature, tx_exons: &[&ExonFeature]) -> Option<usize> {
+    if !tx.cdna_mapper_segments.is_empty() {
+        return tx
+            .cdna_mapper_segments
+            .iter()
+            .map(|segment| segment.cdna_end)
+            .max();
+    }
+    tx_exons.iter().try_fold(0usize, |acc, exon| {
+        let exon_len =
+            usize::try_from(exon.end.saturating_sub(exon.start).saturating_add(1)).ok()?;
+        acc.checked_add(exon_len)
+    })
+}
+
+fn hgvsc_coord_is_valid(tx: &TranscriptFeature, tx_exons: &[&ExonFeature], coord: &str) -> bool {
+    let is_star = coord.starts_with('*');
+    let Some((value, _offset)) = split_hgvs_coord(coord) else {
+        return false;
+    };
+    let Some(total_len) = transcript_spliced_length(tx, tx_exons).map(|len| len as i64) else {
+        return false;
+    };
+
+    if let Some((start_codon, stop_codon)) = coding_cdna_bounds(tx, tx_exons) {
+        let start_codon = start_codon as i64;
+        let stop_codon = stop_codon as i64;
+        if is_star {
+            let max_star = total_len - stop_codon;
+            return value >= 1 && value <= max_star;
+        }
+
+        let min_five_prime = -(start_codon - 1);
+        let max_coding = stop_codon - start_codon + 1;
+        return value != 0 && value >= min_five_prime && value <= max_coding;
+    }
+
+    !is_star && value >= 1 && value <= total_len
 }
 
 /// Traceability:
@@ -2472,6 +2515,52 @@ mod tests {
         assert_eq!(
             format_hgvsc(&tx, &exons, None, None, "GTGT", "-", 120, 123, Some(&shift)),
             Some("ENSTHGVS000001.1:n.51_54del".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_suppresses_shifted_noncoding_coords_past_transcript_end() {
+        let tx = make_transcript("lncRNA", 1, None, None);
+        let exon = make_exon();
+        let exons = [&exon];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 2,
+            start: 141,
+            end: 141,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: "AA".to_string(),
+            shifted_output_allele: "AA".to_string(),
+            alt_orig_allele_string: "AA".to_string(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+        assert_eq!(
+            format_hgvsc(&tx, &exons, None, None, "-", "AA", 139, 139, Some(&shift)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_suppresses_shifted_utr_coords_past_valid_star_range() {
+        let tx = make_transcript("protein_coding", 1, Some(100), Some(120));
+        let exon = make_exon();
+        let exons = [&exon];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 3,
+            start: 141,
+            end: 144,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: "AAAA".to_string(),
+            shifted_output_allele: "-".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+        assert_eq!(
+            format_hgvsc(&tx, &exons, None, None, "AAAA", "-", 138, 141, Some(&shift)),
+            None
         );
     }
 
