@@ -1677,7 +1677,9 @@ fn format_appris(raw: &str) -> String {
 /// VEP maps variant cDNA positions into the expanded structure array:
 ///   `struct_index = cdna_pos - ncrna_start`
 /// Characters `(` and `)` → `miRNA_stem`, `.` → `miRNA_loop`.
-/// Output is sorted, `&`-joined unique SO terms.
+/// Output is sorted, `&`-joined SO terms after deduplicating raw structure
+/// characters. Because `(` and `)` are distinct before mapping, VEP can emit
+/// `miRNA_stem` twice for a single overlapped region.
 fn mirna_structure_field(
     ncrna_structure: Option<&str>,
     biotype: &str,
@@ -1747,8 +1749,10 @@ fn mirna_structure_field(
         }
     }
 
-    // Map variant cDNA positions to structure indices and collect SO terms.
-    let mut has_stem = false;
+    // Map variant cDNA positions to structure indices and collect the distinct
+    // raw structure characters overlapped by the variant, matching VEP.
+    let mut has_open_stem = false;
+    let mut has_close_stem = false;
     let mut has_loop = false;
     for pos in cs..=ce {
         if pos < struct_start {
@@ -1759,19 +1763,26 @@ fn mirna_structure_field(
             continue;
         }
         match expanded[idx] {
-            b'(' | b')' => has_stem = true,
+            b'(' => has_open_stem = true,
+            b')' => has_close_stem = true,
             b'.' => has_loop = true,
             _ => {}
         }
     }
 
-    // Sorted output: miRNA_loop < miRNA_stem (alphabetical).
-    match (has_loop, has_stem) {
-        (true, true) => "miRNA_loop&miRNA_stem".to_string(),
-        (true, false) => "miRNA_loop".to_string(),
-        (false, true) => "miRNA_stem".to_string(),
-        (false, false) => String::new(),
+    let mut terms = Vec::new();
+    if has_open_stem {
+        terms.push("miRNA_stem");
     }
+    if has_close_stem {
+        terms.push("miRNA_stem");
+    }
+    if has_loop {
+        terms.push("miRNA_loop");
+    }
+
+    terms.sort_unstable();
+    terms.join("&")
 }
 
 /// Look up SIFT and PolyPhen predictions from the per-transcript LRU cache.
@@ -2289,7 +2300,6 @@ impl AnnotateProvider {
             let refseq_id_idx = schema.index_of("refseq_id").ok();
             let source_idx = schema.index_of("source").ok();
             let version_idx = schema.index_of("version").ok();
-            let raw_json_idx = schema.index_of("raw_object_json").ok();
             let cds_start_nf_idx = schema.index_of("cds_start_nf").ok();
             let cds_end_nf_idx = schema.index_of("cds_end_nf").ok();
             let mirna_regions_idx = schema.index_of("mature_mirna_regions").ok();
@@ -6153,6 +6163,10 @@ impl RecordBatchStream for ContigAnnotationStream {
 /// Hydrate a window of batches: compute variant intervals, hydrate new
 /// transcripts (skip already-hydrated), apply translateable_seq overrides.
 /// Mirrors the SIFT sliding-window pattern.
+///
+/// We intentionally do not gate this on `shift_hgvs`: start-codon indel
+/// classification needs hydrated cDNA/spliced sequence even when callers only
+/// request consequence terms and HGVSc shifting is disabled.
 fn hydrate_window(
     transcripts: &mut [TranscriptFeature],
     exons: &[ExonFeature],
@@ -6161,11 +6175,7 @@ fn hydrate_window(
     hgvs_reader: &mut Option<FastaReader>,
     hydrated_cds_tx_ids: &mut HashSet<String>,
     window_batches: &[RecordBatch],
-    hgvs_flags: HgvsFlags,
 ) -> Result<()> {
-    if !hgvs_flags.any() || !hgvs_flags.shift_hgvs {
-        return Ok(());
-    }
     let Some(reader) = hgvs_reader.as_mut() else {
         return Ok(());
     };
@@ -6423,16 +6433,11 @@ impl Stream for ContigAnnotationStream {
                             config.downstream_distance,
                             config.hgvs_flags.shift_hgvs,
                         );
-                        let hgvs_reader = if config.hgvs_flags.any() && config.hgvs_flags.shift_hgvs
-                        {
-                            config.reference_fasta_path.as_deref().and_then(|path| {
-                                fasta::io::indexed_reader::Builder::default()
-                                    .build_from_path(path)
-                                    .ok()
-                            })
-                        } else {
-                            None
-                        };
+                        let hgvs_reader = config.reference_fasta_path.as_deref().and_then(|path| {
+                            fasta::io::indexed_reader::Builder::default()
+                                .build_from_path(path)
+                                .ok()
+                        });
                         // SIFT source: when use_fjall, use SiftKvStore from fjall
                         // for lazy per-transcript lookups; otherwise use parquet
                         // SiftDirectReader.
@@ -6630,7 +6635,6 @@ impl Stream for ContigAnnotationStream {
                         &mut ann.hgvs_reader,
                         &mut ann.hydrated_cds_tx_ids,
                         &window_batches,
-                        ann.config.hgvs_flags,
                     ) {
                         let fut = make_cleanup_future(
                             Arc::clone(&ann.session),
@@ -7166,6 +7170,29 @@ mod tests {
             format_prediction("tolerated - low confidence", 0.23),
             "tolerated_low_confidence(0.23)"
         );
+    }
+
+    // ── mirna_structure_field ──────────────────────────────────────────
+
+    #[test]
+    fn test_mirna_structure_field_preserves_distinct_stem_sides() {
+        assert_eq!(
+            mirna_structure_field(Some("(.)."), "miRNA", Some(1), Some(4)),
+            "miRNA_loop&miRNA_stem&miRNA_stem"
+        );
+    }
+
+    #[test]
+    fn test_mirna_structure_field_open_and_close_stem_only() {
+        assert_eq!(
+            mirna_structure_field(Some("()"), "miRNA", Some(1), Some(2)),
+            "miRNA_stem&miRNA_stem"
+        );
+    }
+
+    #[test]
+    fn test_mirna_structure_field_non_mirna_empty() {
+        assert!(mirna_structure_field(Some("(.)."), "lncRNA", Some(1), Some(4)).is_empty());
     }
 
     // ── lookup_sift_polyphen ───────────────────────────────────────────

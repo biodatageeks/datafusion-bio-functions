@@ -1535,25 +1535,32 @@ fn stop_loss_extra_aa(
     (extra > 0).then_some(extra)
 }
 
+fn hgvs_aa_one_to_three(aa: char) -> &'static str {
+    match aa {
+        'X' => "Ter",
+        _ => aa_one_to_three(aa),
+    }
+}
+
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2083-L2112>
 fn peptide_to_three_letter(peptide: &str) -> String {
-    peptide.chars().map(aa_one_to_three).collect()
+    peptide.chars().map(hgvs_aa_one_to_three).collect()
 }
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1877-L1880>
 fn peptide_first_three(peptide: &str) -> Option<&'static str> {
-    Some(aa_one_to_three(peptide.chars().next()?))
+    Some(hgvs_aa_one_to_three(peptide.chars().next()?))
 }
 
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_protein_format()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1877-L1880>
 fn peptide_last_three(peptide: &str) -> Option<&'static str> {
-    Some(aa_one_to_three(peptide.chars().last()?))
+    Some(hgvs_aa_one_to_three(peptide.chars().last()?))
 }
 
 /// Traceability:
@@ -1943,6 +1950,26 @@ mod tests {
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ala2=".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_partial_codon_synonymous_uses_ter() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 262,
+            end: 262,
+            ref_peptide: "X".to_string(),
+            alt_peptide: "X".to_string(),
+            ref_translation: "XRVM".to_string(),
+            alt_translation: "XRVM".to_string(),
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.Ter262=".to_string())
         );
     }
 
@@ -2445,6 +2472,75 @@ mod tests {
         assert_eq!(
             format_hgvsc(&tx, &exons, None, None, "GTGT", "-", 120, 123, Some(&shift)),
             Some("ENSTHGVS000001.1:n.51_54del".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_suppresses_shifted_noncoding_coords_past_transcript_end() {
+        let tx = make_transcript("lncRNA", 1, None, None);
+        let exon = make_exon();
+        let exons = [&exon];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 2,
+            start: 141,
+            end: 141,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: "AA".to_string(),
+            shifted_output_allele: "AA".to_string(),
+            alt_orig_allele_string: "AA".to_string(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+        assert_eq!(
+            format_hgvsc(&tx, &exons, None, None, "-", "AA", 139, 139, Some(&shift)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_suppresses_shifted_utr_coords_past_valid_star_range() {
+        let tx = make_transcript("protein_coding", 1, Some(100), Some(120));
+        let exon = make_exon();
+        let exons = [&exon];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 3,
+            start: 141,
+            end: 144,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: "AAAA".to_string(),
+            shifted_output_allele: "-".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+        assert_eq!(
+            format_hgvsc(&tx, &exons, None, None, "AAAA", "-", 138, 141, Some(&shift)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_allows_large_star_coordinate_inside_transcript_span() {
+        let mut tx = make_transcript("protein_coding", 1, Some(100), Some(108));
+        tx.end = 6010;
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 90,
+            end: 108,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 6000,
+            end: 6010,
+        };
+        let exons = [&exon1, &exon2];
+        assert_eq!(
+            format_hgvsc(&tx, &exons, None, None, "A", "G", 510, 510, None),
+            Some("ENSTHGVS000001.1:c.*402A>G".to_string())
         );
     }
 

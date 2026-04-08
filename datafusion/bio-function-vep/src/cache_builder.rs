@@ -27,7 +27,8 @@ use futures::StreamExt;
 use log::info;
 
 use datafusion_bio_format_ensembl_cache::{
-    EnsemblCacheOptions, EnsemblCacheTableProvider, EnsemblEntityKind,
+    EnsemblCacheOptions, EnsemblCacheTableProvider, EnsemblEntityKind, VEP_CACHE_REGION_SIZE_BP,
+    build_export_query, build_export_query_multi_chrom,
 };
 
 use crate::annotate_provider::read_compact_predictions;
@@ -58,6 +59,33 @@ const CHROM_CODE_ORDER: &[&str] = &[
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
     "18", "19", "20", "21", "22", "X", "Y", "MT",
 ];
+
+fn transcript_region_start_expr(start_col: &str) -> String {
+    format!(
+        "(CAST(FLOOR(({start_col} - 1) / {VEP_CACHE_REGION_SIZE_BP}.0) AS BIGINT) * {VEP_CACHE_REGION_SIZE_BP} + 1)"
+    )
+}
+
+fn translation_source_region_preference_expr(start_col: &str, source_file_col: &str) -> String {
+    let region_start = transcript_region_start_expr(start_col);
+    let region_end = format!("({region_start} + {} - 1)", VEP_CACHE_REGION_SIZE_BP);
+    format!(
+        "CASE WHEN {source_file_col} LIKE CONCAT('%/', CAST({region_start} AS VARCHAR), '-', CAST({region_end} AS VARCHAR), '.gz') THEN 0 ELSE 1 END"
+    )
+}
+
+fn build_translation_dedup_query_with_where_clause(table_name: &str, where_clause: &str) -> String {
+    let source_pref = translation_source_region_preference_expr("start", "source_file");
+    format!(
+        "SELECT * FROM (\
+            SELECT *, ROW_NUMBER() OVER (\
+                PARTITION BY transcript_id \
+                ORDER BY {source_pref}, cdna_coding_start NULLS LAST, source_file\
+            ) AS _rn \
+            FROM {table_name}{where_clause}\
+        ) WHERE _rn = 1"
+    )
+}
 
 /// Statistics returned after building one entity.
 #[derive(Debug, Clone)]
@@ -297,7 +325,7 @@ impl CacheBuilder {
 
         for (chrom, output_file, is_other) in &chrom_batches {
             let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
-            let query = build_query(kind, table_name, Some(chrom), None);
+            let query = build_export_query(kind, table_name, Some(chrom), None);
 
             let df = ctx.sql(&query).await?;
             let plan = df.create_physical_plan().await?;
@@ -1100,14 +1128,9 @@ impl CacheBuilder {
     ) -> Result<(Option<(String, usize)>, Option<(String, usize)>)> {
         let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
 
-        let dedup_query = format!(
-            "SELECT * FROM (\
-                SELECT *, ROW_NUMBER() OVER (\
-                    PARTITION BY transcript_id \
-                    ORDER BY cdna_coding_start NULLS LAST\
-                ) AS _rn \
-                FROM {table_name} WHERE chrom = '{chrom}'\
-            ) WHERE _rn = 1"
+        let dedup_query = build_translation_dedup_query_with_where_clause(
+            table_name,
+            &format!(" WHERE chrom = '{chrom}'"),
         );
         let df = ctx.sql(&dedup_query).await?;
         let schema = df.schema().clone();
@@ -1243,14 +1266,9 @@ impl CacheBuilder {
             .map(|c| format!("'{c}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        let dedup_query = format!(
-            "SELECT * FROM (\
-                SELECT *, ROW_NUMBER() OVER (\
-                    PARTITION BY transcript_id \
-                    ORDER BY cdna_coding_start NULLS LAST\
-                ) AS _rn \
-                FROM {table_name} WHERE chrom IN ({in_list})\
-            ) WHERE _rn = 1"
+        let dedup_query = build_translation_dedup_query_with_where_clause(
+            table_name,
+            &format!(" WHERE chrom IN ({in_list})"),
         );
         let df = ctx.sql(&dedup_query).await?;
         let schema = df.schema().clone();
@@ -1505,7 +1523,7 @@ impl CacheBuilder {
 
         for chrom in &main_chroms {
             let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
-            let query = build_query(kind, table_name, Some(chrom), tx_schema);
+            let query = build_export_query(kind, table_name, Some(chrom), tx_schema);
             let output_file = format!("{}/{subdir}/chr{chrom}.parquet", self.output_dir);
 
             let df = ctx.sql(&query).await?;
@@ -1552,7 +1570,7 @@ impl CacheBuilder {
         if !other_chroms.is_empty() {
             let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
             let other_refs: Vec<&str> = other_chroms.iter().map(|s| s.as_str()).collect();
-            let query = build_query_multi_chrom(kind, table_name, &other_refs, tx_schema);
+            let query = build_export_query_multi_chrom(kind, table_name, &other_refs, tx_schema);
             let output_file = format!("{}/{subdir}/other.parquet", self.output_dir);
 
             let df = ctx.sql(&query).await?;
@@ -1859,130 +1877,6 @@ fn writer_properties(
     }
 
     builder.build()
-}
-
-/// Build an explicit column list for transcripts that propagates `gene_hgnc_id`
-/// from any sibling transcript sharing the same `gene_symbol`.
-///
-/// Replicates VEP's `merge_features()` behaviour — see issue #105.
-fn transcript_select_list(schema: &Schema) -> String {
-    schema
-        .fields()
-        .iter()
-        .map(|f| {
-            if f.name() == "gene_hgnc_id" {
-                // Propagate: fill NULL gene_hgnc_id from any sibling transcript
-                // sharing the same gene_symbol. This replicates VEP's merge_features()
-                // which propagates purely by symbol, regardless of gene_symbol_source.
-                // Guard: gene_symbol IS NOT NULL to avoid cross-pollination among
-                // NULL-symbol transcripts.
-                // Note: whether to *emit* HGNC_ID for non-HGNC-source transcripts
-                // is a runtime decision (hgnc_backfill flag, #104), not a cache decision.
-                "COALESCE(gene_hgnc_id, \
-                     CASE WHEN gene_symbol IS NOT NULL \
-                          THEN FIRST_VALUE(gene_hgnc_id) IGNORE NULLS \
-                               OVER (PARTITION BY gene_symbol \
-                                     ORDER BY gene_hgnc_id NULLS LAST) \
-                          ELSE NULL END) AS gene_hgnc_id"
-                    .to_string()
-            } else {
-                format!("\"{}\"", f.name())
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn build_query(
-    kind: EnsemblEntityKind,
-    table_name: &str,
-    chrom_filter: Option<&str>,
-    schema: Option<&Schema>,
-) -> String {
-    let where_clause = chrom_filter
-        .map(|c| format!(" WHERE chrom = '{c}'"))
-        .unwrap_or_default();
-
-    match kind {
-        EnsemblEntityKind::Transcript => {
-            let schema = schema.expect("Transcript requires schema for HGNC propagation");
-            let select_list = transcript_select_list(schema);
-            // Explicit column list includes HGNC propagation and excludes _rn.
-            format!(
-                "SELECT {select_list} FROM (\
-                    SELECT *, ROW_NUMBER() OVER (\
-                        PARTITION BY stable_id \
-                        ORDER BY cds_start NULLS LAST\
-                    ) AS _rn \
-                    FROM {table_name}{where_clause}\
-                ) WHERE _rn = 1 \
-                ORDER BY chrom, start"
-            )
-        }
-        EnsemblEntityKind::Translation => unreachable!("use build_translation() instead"),
-        EnsemblEntityKind::Exon => {
-            format!(
-                "SELECT * FROM (\
-                    SELECT *, ROW_NUMBER() OVER (\
-                        PARTITION BY transcript_id, exon_number \
-                        ORDER BY stable_id NULLS LAST\
-                    ) AS _rn \
-                    FROM {table_name}{where_clause}\
-                ) WHERE _rn = 1 \
-                ORDER BY transcript_id, start"
-            )
-        }
-        _ => {
-            format!("SELECT * FROM {table_name}{where_clause} ORDER BY chrom, start")
-        }
-    }
-}
-
-fn build_query_multi_chrom(
-    kind: EnsemblEntityKind,
-    table_name: &str,
-    chroms: &[&str],
-    schema: Option<&Schema>,
-) -> String {
-    let list = chroms
-        .iter()
-        .map(|c| format!("'{c}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let where_clause = format!(" WHERE chrom IN ({list})");
-
-    match kind {
-        EnsemblEntityKind::Transcript => {
-            let schema = schema.expect("Transcript requires schema for HGNC propagation");
-            let select_list = transcript_select_list(schema);
-            format!(
-                "SELECT {select_list} FROM (\
-                    SELECT *, ROW_NUMBER() OVER (\
-                        PARTITION BY stable_id \
-                        ORDER BY cds_start NULLS LAST\
-                    ) AS _rn \
-                    FROM {table_name}{where_clause}\
-                ) WHERE _rn = 1 \
-                ORDER BY chrom, start"
-            )
-        }
-        EnsemblEntityKind::Translation => unreachable!(),
-        EnsemblEntityKind::Exon => {
-            format!(
-                "SELECT * FROM (\
-                    SELECT *, ROW_NUMBER() OVER (\
-                        PARTITION BY transcript_id, exon_number \
-                        ORDER BY stable_id NULLS LAST\
-                    ) AS _rn \
-                    FROM {table_name}{where_clause}\
-                ) WHERE _rn = 1 \
-                ORDER BY transcript_id, start"
-            )
-        }
-        _ => {
-            format!("SELECT * FROM {table_name}{where_clause} ORDER BY chrom, start")
-        }
-    }
 }
 
 fn project_batch(batch: &RecordBatch, target_schema: &SchemaRef) -> Result<RecordBatch> {
@@ -2419,13 +2313,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_query
+    // shared export query builder
     // -----------------------------------------------------------------------
     fn test_transcript_schema() -> Schema {
         Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
             Field::new("start", DataType::Int64, false),
             Field::new("stable_id", DataType::Utf8, false),
+            Field::new("cds_start", DataType::Int64, true),
             Field::new("gene_symbol", DataType::Utf8, true),
             Field::new("gene_hgnc_id", DataType::Utf8, true),
         ])
@@ -2433,13 +2328,13 @@ mod tests {
 
     #[test]
     fn test_build_query_variation_no_filter() {
-        let q = build_query(EnsemblEntityKind::Variation, "var", None, None);
+        let q = build_export_query(EnsemblEntityKind::Variation, "var", None, None);
         assert_eq!(q, "SELECT * FROM var ORDER BY chrom, start");
     }
 
     #[test]
     fn test_build_query_variation_with_filter() {
-        let q = build_query(EnsemblEntityKind::Variation, "var", Some("1"), None);
+        let q = build_export_query(EnsemblEntityKind::Variation, "var", Some("1"), None);
         assert_eq!(
             q,
             "SELECT * FROM var WHERE chrom = '1' ORDER BY chrom, start"
@@ -2449,7 +2344,7 @@ mod tests {
     #[test]
     fn test_build_query_transcript_dedup() {
         let schema = test_transcript_schema();
-        let q = build_query(
+        let q = build_export_query(
             EnsemblEntityKind::Transcript,
             "tx",
             Some("X"),
@@ -2466,7 +2361,7 @@ mod tests {
     #[test]
     fn test_build_query_transcript_hgnc_propagation() {
         let schema = test_transcript_schema();
-        let q = build_query(
+        let q = build_export_query(
             EnsemblEntityKind::Transcript,
             "tx",
             Some("9"),
@@ -2481,8 +2376,8 @@ mod tests {
             "transcript query must use FIRST_VALUE IGNORE NULLS window"
         );
         assert!(
-            q.contains("PARTITION BY gene_symbol"),
-            "HGNC propagation must partition by gene_symbol"
+            q.contains("PARTITION BY chrom, gene_symbol"),
+            "HGNC propagation must partition by chrom, gene_symbol and cache region"
         );
         // Explicit column list should NOT contain _rn
         assert!(
@@ -2493,17 +2388,17 @@ mod tests {
 
     #[test]
     fn test_build_query_exon_dedup() {
-        let q = build_query(EnsemblEntityKind::Exon, "exon", None, None);
+        let q = build_export_query(EnsemblEntityKind::Exon, "exon", None, None);
         assert!(q.contains("PARTITION BY transcript_id, exon_number"));
         assert!(q.contains("ORDER BY transcript_id, start"));
     }
 
     // -----------------------------------------------------------------------
-    // build_query_multi_chrom
+    // shared multi-chrom export query builder
     // -----------------------------------------------------------------------
     #[test]
     fn test_build_query_multi_chrom() {
-        let q = build_query_multi_chrom(
+        let q = build_export_query_multi_chrom(
             EnsemblEntityKind::Variation,
             "var",
             &["MT", "GL000220"],
@@ -2516,7 +2411,7 @@ mod tests {
     #[test]
     fn test_build_query_multi_chrom_transcript() {
         let schema = test_transcript_schema();
-        let q = build_query_multi_chrom(
+        let q = build_export_query_multi_chrom(
             EnsemblEntityKind::Transcript,
             "tx",
             &["1", "2"],
@@ -2529,6 +2424,23 @@ mod tests {
             q.contains("COALESCE(gene_hgnc_id"),
             "multi-chrom transcript query must include HGNC propagation"
         );
+    }
+
+    #[test]
+    fn test_build_translation_dedup_query_prefers_transcript_start_region() {
+        let q = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom = '2'");
+        assert!(q.contains("PARTITION BY transcript_id"));
+        assert!(q.contains("source_file LIKE CONCAT('%/'"));
+        assert!(q.contains("cdna_coding_start NULLS LAST"));
+        assert!(q.contains("WHERE chrom = '2'"));
+    }
+
+    #[test]
+    fn test_build_translation_dedup_query_multi_chrom_prefers_transcript_start_region() {
+        let q = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom IN ('2', 'X')");
+        assert!(q.contains("PARTITION BY transcript_id"));
+        assert!(q.contains("source_file LIKE CONCAT('%/'"));
+        assert!(q.contains("WHERE chrom IN ('2', 'X')"));
     }
 
     // -----------------------------------------------------------------------
@@ -3158,7 +3070,7 @@ mod tests {
     fn test_build_query_single_chrom_for_other() {
         // Verify that per-contig queries use single WHERE chrom = '...'
         // instead of massive IN clause
-        let q = build_query(
+        let q = build_export_query(
             EnsemblEntityKind::Variation,
             "var",
             Some("GL000220.1"),

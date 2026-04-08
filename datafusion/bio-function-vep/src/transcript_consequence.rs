@@ -821,6 +821,8 @@ impl TranscriptConsequenceEngine {
                         let exon_str = which_exon_str(variant, &tx_exons);
                         let intron_str = which_intron_str(variant, &tx_exons, tx.strand);
                         let cdna_position = compute_cdna_position(variant, tx, &tx_exons);
+                        let original_allows_protein_hgvs =
+                            original_terms_allow_protein_hgvs(&terms);
                         let (cds_position, protein_position, amino_acids, codons, protein_hgvs) =
                             if let Some(ref cc) = coding_class {
                                 let n_pad_len = tx_translation
@@ -864,12 +866,24 @@ impl TranscriptConsequenceEngine {
                                     &tx_exons,
                                     tx_translation,
                                     variant,
+                                    original_allows_protein_hgvs,
                                     cc.protein_hgvs.as_ref(),
                                     self.shift_hgvs,
                                 );
                                 (cds_pos, prot_pos, amino_acids, codons, protein_hgvs)
                             } else {
-                                (None, None, None, None, None)
+                                // VEP can still emit HGVSp for HGVS-shifted indels whose
+                                // original consequence stayed coding_sequence_variant.
+                                let protein_hgvs = protein_hgvs_for_output(
+                                    tx,
+                                    &tx_exons,
+                                    tx_translation,
+                                    variant,
+                                    original_allows_protein_hgvs,
+                                    None,
+                                    self.shift_hgvs,
+                                );
+                                (None, None, None, None, protein_hgvs)
                             };
                         let flags = compute_flags(tx);
                         // Compute HGVSc notation.
@@ -1766,10 +1780,11 @@ impl TranscriptConsequenceEngine {
         // Prefer translation data; fall back to summing coding_segments.
         let cds_len_opt = tx_translation
             .and_then(|t| {
-                // cds_len and cds_sequence.len() both include leading Ns,
-                // matching VEP's _translateable_seq.
-                t.cds_len
-                    .or_else(|| t.cds_sequence.as_ref().map(|s| s.len()))
+                // VEP uses length(_translateable_seq). In our cache, `cds_len`
+                // can exclude leading N padding while `cds_sequence` preserves
+                // the actual translateable sequence length used by codon/peptide
+                // coordinates, so prefer the sequence length when available.
+                t.cds_sequence.as_ref().map(|s| s.len()).or(t.cds_len)
             })
             .or_else(|| {
                 // No translation data — compute spliced CDS length from
@@ -1784,9 +1799,9 @@ impl TranscriptConsequenceEngine {
         if let Some(cds_len) = cds_len_opt {
             let variant_pos = variant.start.min(variant.end);
             if let Some(cds_idx) = genomic_to_cds_index(tx, tx_exons, variant_pos) {
-                // leading_n is only available from cds_sequence. When
-                // cds_len comes from t.cds_len, both values include
-                // leading Ns (VEP's _translateable_seq is N-inclusive).
+                // leading_n is only available from cds_sequence. We use it to
+                // convert exon-mapped CDS indices into the padded
+                // _translateable_seq coordinate space that VEP uses here.
                 let leading_n = tx_translation
                     .and_then(|t| t.cds_sequence.as_deref())
                     .map(|s| s.as_bytes().iter().take_while(|&&b| b == b'N').count())
@@ -1966,38 +1981,63 @@ impl TranscriptConsequenceEngine {
                 let (ref_len, alt_len) = allele_lengths(&variant.ref_allele, &variant.alt_allele);
                 let is_indel = ref_len != alt_len;
 
-                // Sequence-based check: construct mutated CDS first 3 bases
-                // and see if ATG is preserved. start_lost and start_retained
-                // are mutually exclusive — VEP's start_retained returns
-                // !_ins_del_start_altered().
+                // VEP's _ins_del_start_altered works in cDNA space (5'UTR +
+                // CDS combined) to check if ATG is preserved at the original
+                // CDS-start position. start_retained = !altered.
+                // start_lost can CO-OCCUR with start_retained for frameshifts:
+                // VEP's peptide-level check fires start_lost when the full
+                // affected peptide range differs from the reference.
                 //
                 // Traceability:
                 // - _ins_del_start_altered:
                 //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L990-L1022>
                 // - start_retained_variant = !_ins_del_start_altered:
                 //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L947-L962>
-                if is_indel && cds_seq.is_some_and(|s| s.len() >= 3) {
-                    let cds = cds_seq.unwrap();
-                    let cds_start = tx.cds_start.unwrap_or(0);
-                    // Build a simple mutated CDS by applying the indel
-                    // at the variant's position relative to CDS start.
-                    let mutated_first3 = mutated_cds_first3(cds, variant, tx, cds_start);
-                    if mutated_first3.as_deref() == Some("ATG") {
-                        terms.insert(SoTerm::StartRetainedVariant);
-                    } else {
-                        terms.insert(SoTerm::StartLost);
-                    }
-                } else if is_indel {
-                    // No CDS sequence: fall back to position-based check.
-                    let start_codon_end = if tx.strand >= 0 {
-                        tx.cds_start.unwrap_or(0) + 2
-                    } else {
-                        tx.cds_end.unwrap_or(0)
-                    };
-                    if variant.start > start_codon_end {
-                        terms.insert(SoTerm::StartRetainedVariant);
-                    } else {
-                        terms.insert(SoTerm::StartLost);
+                // - start_lost peptide check:
+                //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L872-L882>
+                if is_indel {
+                    let is_frameshift = !ref_len.abs_diff(alt_len).is_multiple_of(3);
+                    match ins_del_start_altered(tx, tx_exons, variant, cds_seq) {
+                        Some(false) => {
+                            // ATG preserved at CDS-start → start_retained
+                            terms.insert(SoTerm::StartRetainedVariant);
+                            // Frameshift: VEP peptide check co-fires start_lost
+                            if is_frameshift {
+                                terms.insert(SoTerm::StartLost);
+                            }
+                        }
+                        Some(true) => {
+                            terms.insert(SoTerm::StartLost);
+                        }
+                        None => {
+                            // No cDNA data — fall back to mutated_cds_first3
+                            if cds_seq.is_some_and(|s| s.len() >= 3) {
+                                let cds = cds_seq.unwrap();
+                                let cds_start = tx.cds_start.unwrap_or(0);
+                                let mutated_first3 =
+                                    mutated_cds_first3(cds, variant, tx, cds_start);
+                                if mutated_first3.as_deref() == Some("ATG") {
+                                    terms.insert(SoTerm::StartRetainedVariant);
+                                    if is_frameshift {
+                                        terms.insert(SoTerm::StartLost);
+                                    }
+                                } else {
+                                    terms.insert(SoTerm::StartLost);
+                                }
+                            } else {
+                                // No CDS sequence: position-based fallback.
+                                let start_codon_end = if tx.strand >= 0 {
+                                    tx.cds_start.unwrap_or(0) + 2
+                                } else {
+                                    tx.cds_end.unwrap_or(0)
+                                };
+                                if variant.start > start_codon_end {
+                                    terms.insert(SoTerm::StartRetainedVariant);
+                                } else {
+                                    terms.insert(SoTerm::StartLost);
+                                }
+                            }
+                        }
                     }
                 } else {
                     terms.insert(SoTerm::StartLost);
@@ -2329,7 +2369,15 @@ impl TranscriptConsequenceEngine {
             // A variant in the exonic boundary region of a frameshift intron
             // can still receive splice_region_variant.
             let is_frameshift_intron = (intron_end - intron_start).abs() <= 12;
-            if is_frameshift_intron && overlaps(sv_min, sv_max, intron_start, intron_end) {
+            let overlaps_intron_body = if is_ins {
+                // VEP evaluates insertions with inverted coordinates
+                // (`start = P`, `end = P-1`). For intron-body checks this
+                // means P must be strictly after the first intronic base.
+                sv.start > intron_start && sv.start <= intron_end
+            } else {
+                overlaps(sv_min, sv_max, intron_start, intron_end)
+            };
+            if is_frameshift_intron && overlaps_intron_body {
                 continue;
             }
 
@@ -3059,6 +3107,7 @@ impl CodingClassification {
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499>
 fn build_protein_hgvs_data(
     class: &CodingClassification,
+    peptide_alleles: Option<&str>,
     old_aas: &[char],
     new_aas: &[char],
     frameshift: bool,
@@ -3067,7 +3116,7 @@ fn build_protein_hgvs_data(
     let raw_end = class
         .protein_position_end
         .or(class.protein_position_start)?;
-    let (ref_peptide, alt_peptide) = match class.amino_acids.as_deref() {
+    let (ref_peptide, alt_peptide) = match peptide_alleles {
         Some(value) => match value.split_once('/') {
             Some((left, right)) => (left.to_string(), right.to_string()),
             None => (value.to_string(), value.to_string()),
@@ -3099,6 +3148,27 @@ fn build_protein_hgvs_data(
     })
 }
 
+fn original_terms_allow_protein_hgvs(terms: &[SoTerm]) -> bool {
+    terms.iter().any(|term| {
+        matches!(
+            term,
+            SoTerm::MissenseVariant
+                | SoTerm::SynonymousVariant
+                | SoTerm::StopGained
+                | SoTerm::StopLost
+                | SoTerm::StartLost
+                | SoTerm::FrameshiftVariant
+                | SoTerm::InframeInsertion
+                | SoTerm::InframeDeletion
+                | SoTerm::StopRetainedVariant
+                | SoTerm::StartRetainedVariant
+                | SoTerm::ProteinAlteringVariant
+                | SoTerm::IncompleteTerminalCodonVariant
+                | SoTerm::CodingSequenceVariant
+        )
+    })
+}
+
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
 ///   applies `_return_3prime()` before checking coding coordinates, so protein
@@ -3110,9 +3180,17 @@ fn protein_hgvs_for_output(
     tx_exons: &[&ExonFeature],
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
+    original_allows_protein_hgvs: bool,
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
     shift_hgvs: bool,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
+    // Ensembl only emits HGVSp when the original transcript variation is
+    // coding (`$pre->{coding}`), even if HGVS 3' shifting later moves an
+    // intronic indel into CDS coordinates for HGVSc.
+    if !original_allows_protein_hgvs {
+        return None;
+    }
+
     if !shift_hgvs {
         return fallback.cloned();
     }
@@ -3279,11 +3357,57 @@ fn classify_coding_change(
     // (the start codon). Unlike the insertion path (cds_idx < 2), SNVs and
     // deletions at position 2 DO overlap the start codon.
     if start_idx < 3 && !tx.cds_start_nf {
+        // 1. Amino acid level (works for SNVs and as fallback for indels)
         if new_aas.first() == Some(&'M') {
             class.start_retained = true;
         }
         if old_aas.first() != new_aas.first() {
             class.start_lost = true;
+        }
+        // 2. Nucleotide level for indels: VEP's _ins_del_start_altered works
+        //    in cDNA space (5'UTR + CDS). When ATG is preserved AND the indel
+        //    is a frameshift, VEP's peptide-level check also fires start_lost
+        //    (full affected peptide range differs) alongside start_retained.
+        if ref_len != alt_len {
+            match ins_del_start_altered(tx, tx_exons, variant, translation.cds_sequence.as_deref())
+            {
+                Some(false) => {
+                    class.start_retained = true;
+                    if !ref_len.abs_diff(alt_len).is_multiple_of(3) {
+                        class.start_lost = true;
+                    }
+                }
+                Some(true) => {
+                    // Inframe start codon loss is handled above by the
+                    // peptide-level first-amino-acid check. The nucleotide
+                    // fallback only needs to co-fire start_lost for frameshifts.
+                    if !ref_len.abs_diff(alt_len).is_multiple_of(3) {
+                        class.start_lost = true;
+                    }
+                }
+                None => {
+                    // No cDNA data — check the mutated CDS vector directly.
+                    // Equivalent to VEP's _ins_del_start_altered but using
+                    // CDS-only sequence instead of UTR+CDS combined.
+                    //
+                    // Traceability:
+                    // - VEP _ins_del_start_altered checks new_sc eq 'ATG':
+                    //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1005-L1010>
+                    // - VEP start_retained_variant = !_ins_del_start_altered:
+                    //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L957-L962>
+                    // - VEP start_lost peptide check co-fires for frameshifts:
+                    //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L872-L882>
+                    if mutated.len() >= leading_n_offset + 3
+                        && mutated[leading_n_offset..leading_n_offset + 3]
+                            .eq_ignore_ascii_case(b"ATG")
+                    {
+                        class.start_retained = true;
+                        if !ref_len.abs_diff(alt_len).is_multiple_of(3) {
+                            class.start_lost = true;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3635,6 +3759,17 @@ fn classify_coding_change(
         }
     }
 
+    if !class.stop_lost && frameshift && alt_len < ref_len {
+        if class
+            .codons
+            .as_deref()
+            .and_then(frameshift_deletion_partial_stop_lost_from_codon_allele_string)
+            .unwrap_or(false)
+        {
+            class.stop_lost = true;
+        }
+    }
+
     // For HGVS stop-loss / frameshift extension distance, translate the
     // mutated CDS + 3' UTR so that the new stop codon can be found even
     // when it falls in the UTR region.
@@ -3650,7 +3785,19 @@ fn classify_coding_change(
     } else {
         new_aas.clone()
     };
-    class.protein_hgvs = build_protein_hgvs_data(&class, &old_aas, &hgvs_new_aas, frameshift);
+    let hgvs_amino_acids = class.amino_acids.clone().or_else(|| {
+        class
+            .codons
+            .as_deref()
+            .and_then(pep_allele_string_from_codon_allele_string)
+    });
+    class.protein_hgvs = build_protein_hgvs_data(
+        &class,
+        hgvs_amino_acids.as_deref(),
+        &old_aas,
+        &hgvs_new_aas,
+        frameshift,
+    );
     Some(class)
 }
 
@@ -3798,11 +3945,43 @@ fn classify_insertion(
     // - _overlaps_start_codon overlap gate:
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L965-L985>
     if cds_idx < 2 && !tx.cds_start_nf {
+        // 1. Amino acid level
         if new_aas.first() == Some(&'M') {
             class.start_retained = true;
         }
         if old_aas.first() != new_aas.first() {
             class.start_lost = true;
+        }
+        // 2. Nucleotide level: VEP's _ins_del_start_altered in cDNA space
+        match ins_del_start_altered(tx, tx_exons, variant, Some(cds_seq)) {
+            Some(false) => {
+                class.start_retained = true;
+                if !alt_len.is_multiple_of(3) {
+                    class.start_lost = true;
+                }
+            }
+            Some(true) => {
+                if !alt_len.is_multiple_of(3) {
+                    class.start_lost = true;
+                }
+            }
+            None => {
+                // No cDNA data — check the mutated CDS vector directly.
+                //
+                // Traceability:
+                // - VEP _ins_del_start_altered:
+                //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L1005-L1010>
+                // - VEP start_retained_variant = !_ins_del_start_altered:
+                //   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm#L957-L962>
+                if mutated.len() >= leading_n_offset + 3
+                    && mutated[leading_n_offset..leading_n_offset + 3].eq_ignore_ascii_case(b"ATG")
+                {
+                    class.start_retained = true;
+                    if !alt_len.is_multiple_of(3) {
+                        class.start_lost = true;
+                    }
+                }
+            }
         }
     }
 
@@ -4021,13 +4200,170 @@ fn classify_insertion(
     } else {
         new_aas.clone()
     };
-    class.protein_hgvs = build_protein_hgvs_data(&class, &old_aas, &hgvs_new_aas, frameshift);
+    let hgvs_amino_acids = class.amino_acids.clone().or_else(|| {
+        class
+            .codons
+            .as_deref()
+            .and_then(pep_allele_string_from_codon_allele_string)
+    });
+    class.protein_hgvs = build_protein_hgvs_data(
+        &class,
+        hgvs_amino_acids.as_deref(),
+        &old_aas,
+        &hgvs_new_aas,
+        frameshift,
+    );
     Some(class)
 }
 
+/// Return the 5'UTR and translateable sequence needed for VEP's
+/// `_ins_del_start_altered()` check.
+///
+/// `spliced_seq` already matches Ensembl's edited transcript cache. `cdna_seq`
+/// only works here when it actually contains full cDNA. In our caches it is
+/// often CDS-only, in which case `cdna_coding_end` sits beyond the sequence
+/// length and the sequence is unusable for the UTR + CDS check whenever a 5'UTR
+/// exists.
+fn start_codon_context<'a>(
+    tx: &'a TranscriptFeature,
+    translateable_seq: Option<&'a str>,
+) -> Option<(Option<&'a str>, &'a str)> {
+    let atg_start = tx.cdna_coding_start?.checked_sub(1)?;
+    if let Some(seq) = tx.spliced_seq.as_deref() {
+        let coding_end = tx.cdna_coding_end?;
+        if atg_start < coding_end && coding_end <= seq.len() {
+            let utr = (atg_start > 0).then_some(&seq[..atg_start]);
+            return Some((utr, &seq[atg_start..coding_end]));
+        }
+    }
+
+    if let Some(seq) = tx.cdna_seq.as_deref() {
+        if atg_start == 0 {
+            return Some((None, seq));
+        }
+        if let Some(coding_end) = tx.cdna_coding_end {
+            if atg_start < coding_end && coding_end <= seq.len() {
+                return Some((Some(&seq[..atg_start]), &seq[atg_start..coding_end]));
+            }
+        }
+    }
+
+    (atg_start == 0)
+        .then_some(translateable_seq.or(tx.cdna_seq.as_deref()))
+        .flatten()
+        .map(|seq| (None, seq))
+}
+
+/// Returns `true` if the indel destroys the start codon (ATG at the original
+/// CDS-start position in cDNA space). Mirrors VEP's `_ins_del_start_altered()`
+/// which applies the variant to the combined 5'UTR + CDS sequence and checks
+/// if ATG is preserved at the original CDS boundary.
+///
+/// Returns `None` when full cDNA data is unavailable (no spliced transcript
+/// sequence, CDS-only `cdna_seq`, no cdna_coding_start, or variant can't be
+/// mapped to cDNA coordinates).
+///
+/// Traceability:
+/// - VEP `_ins_del_start_altered`:
+///   <https://github.com/Ensembl/ensembl-variation/blob/main/modules/Bio/EnsEMBL/Variation/Utils/VariationEffect.pm>
+fn ins_del_start_altered(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+    translateable_seq: Option<&str>,
+) -> Option<bool> {
+    let (utr, translateable) = start_codon_context(tx, translateable_seq)?;
+    let mut utr_and_translateable = Vec::with_capacity(
+        utr.map_or(0, str::len)
+            .saturating_add(translateable.len())
+            .saturating_sub(normalize_allele_seq(&variant.ref_allele).len()),
+    );
+    if let Some(utr) = utr {
+        utr_and_translateable.extend_from_slice(utr.as_bytes());
+    }
+    utr_and_translateable.extend_from_slice(translateable.as_bytes());
+    let seq_bytes = utr_and_translateable.as_slice();
+
+    let ref_allele = normalize_allele_seq(&variant.ref_allele);
+    let alt_allele = normalize_allele_seq(&variant.alt_allele);
+    let is_ins = ref_allele.is_empty();
+
+    // Map variant anchors to cDNA coordinates.
+    // genomic_to_cdna_index_for_transcript returns 1-based indices;
+    // convert to 0-based for byte-level string operations.
+    let cdna_start =
+        genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start)?.checked_sub(1)?;
+    let cdna_end = if is_ins {
+        cdna_start
+    } else {
+        genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.end)?.checked_sub(1)?
+    };
+    let (cdna_min, cdna_max) = if is_ins {
+        (cdna_start, cdna_start)
+    } else {
+        (cdna_start.min(cdna_end), cdna_start.max(cdna_end))
+    };
+
+    // Build alt allele in transcript orientation.
+    let alt_bytes: Vec<u8> = if alt_allele.is_empty() {
+        Vec::new()
+    } else if tx.strand >= 0 {
+        alt_allele.to_ascii_uppercase().into_bytes()
+    } else {
+        reverse_complement(&alt_allele)?
+            .to_ascii_uppercase()
+            .into_bytes()
+    };
+
+    // Apply the variant to the full cDNA (UTR + CDS + 3'UTR).
+    let mut mutated =
+        Vec::with_capacity(seq_bytes.len().saturating_sub(ref_allele.len()) + alt_bytes.len());
+    if is_ins {
+        // Insert after cdna_min
+        let splice = cdna_min + 1;
+        if splice > seq_bytes.len() {
+            return Some(true);
+        }
+        mutated.extend_from_slice(&seq_bytes[..splice]);
+        mutated.extend_from_slice(&alt_bytes);
+        mutated.extend_from_slice(&seq_bytes[splice..]);
+    } else {
+        if cdna_min >= seq_bytes.len() {
+            return Some(true);
+        }
+        mutated.extend_from_slice(&seq_bytes[..cdna_min]);
+        mutated.extend_from_slice(&alt_bytes);
+        let after = (cdna_max + 1).min(seq_bytes.len());
+        mutated.extend_from_slice(&seq_bytes[after..]);
+    }
+
+    if let Some(utr) = utr {
+        let atg_start = utr.len();
+        if mutated.len() >= atg_start + 3 {
+            let new_sc = &mutated[atg_start..atg_start + 3];
+            let new_utr = &mutated[..utr.len()];
+            if new_utr.eq_ignore_ascii_case(utr.as_bytes()) && new_sc.eq_ignore_ascii_case(b"ATG") {
+                return Some(false);
+            }
+        }
+        // When the 5'UTR changes, observed VEP parity for the regression cases
+        // comes from preserving the translateable suffix rather than requiring
+        // ATG to remain at the original byte offset, so fall through.
+    }
+
+    // Sequence shorter than the translateable CDS → start codon destroyed.
+    if mutated.len() < translateable.len() {
+        return Some(true);
+    }
+
+    let translated_suffix = &mutated[mutated.len() - translateable.len()..];
+    Some(!translated_suffix.eq_ignore_ascii_case(translateable.as_bytes()))
+}
+
 /// Build the first 3 bases of the mutated CDS for an indel near the start
-/// codon. Used by the start_retained/start_lost heuristic when CDS sequence
-/// is available. Returns None if the variant position can't be mapped.
+/// codon. Used as fallback when cDNA data is unavailable for
+/// `ins_del_start_altered`. Returns None if the variant position can't be
+/// mapped.
 ///
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_ins_del_start_altered()`
@@ -4439,6 +4775,11 @@ pub(crate) fn raw_cdna_position_from_genomic(
     genomic_pos: i64,
 ) -> Option<String> {
     let coords = transcript_cdna_coords(tx, tx_exons)?;
+    let span_start = coords.iter().map(|segment| segment.start).min()?;
+    let span_end = coords.iter().map(|segment| segment.end).max()?;
+    if genomic_pos < span_start || genomic_pos > span_end {
+        return None;
+    }
     let mut cdna_position = None;
 
     for (i, segment) in coords.iter().enumerate() {
@@ -4451,24 +4792,6 @@ pub(crate) fn raw_cdna_position_from_genomic(
                 segment.cdna_start as i64 + (genomic_pos - segment.start)
             } else {
                 segment.cdna_start as i64 + (segment.end - genomic_pos)
-            };
-            cdna_position = Some(coord.to_string());
-            break;
-        }
-
-        if i == 0 {
-            // Position is before the first exon segment.  Extrapolate from
-            // the nearest boundary so that HGVS-shifted insertions near the
-            // transcript start still produce valid cDNA coordinates.
-            //
-            // Traceability: VEP's TranscriptMapper returns a Gap for
-            // out-of-bounds positions; `_get_cDNA_position` then
-            // extrapolates from the nearest mapped boundary.
-            let offset = segment.start - genomic_pos;
-            let coord = if tx.strand >= 0 {
-                segment.cdna_start as i64 - offset
-            } else {
-                segment.cdna_end as i64 + offset
             };
             cdna_position = Some(coord.to_string());
             break;
@@ -4491,21 +4814,6 @@ pub(crate) fn raw_cdna_position_from_genomic(
             },
         );
         break;
-    }
-
-    // Position is after the last exon segment.  Extrapolate from the last
-    // boundary so that HGVS-shifted insertions near the transcript end
-    // still produce valid cDNA coordinates.
-    if cdna_position.is_none() {
-        if let Some(last) = coords.last() {
-            let offset = genomic_pos - last.end;
-            let coord = if tx.strand >= 0 {
-                last.cdna_end as i64 + offset
-            } else {
-                last.cdna_start as i64 - offset
-            };
-            cdna_position = Some(coord.to_string());
-        }
     }
 
     cdna_position
@@ -4782,6 +5090,15 @@ fn peptide_from_codon_allele(codon: &str) -> Option<String> {
         peptide.push('-');
     }
     Some(peptide)
+}
+
+fn frameshift_deletion_partial_stop_lost_from_codon_allele_string(
+    codon_allele_string: &str,
+) -> Option<bool> {
+    let (ref_codon, alt_codon) = codon_allele_string.split_once('/')?;
+    let ref_pep = peptide_from_codon_allele(ref_codon)?;
+    let alt_pep = peptide_from_codon_allele(alt_codon)?;
+    Some(ref_pep.contains('*') && !alt_pep.contains('*') && alt_pep.contains('X'))
 }
 
 fn translate_codon_bytes(codon: [u8; 3]) -> Option<char> {
@@ -5962,28 +6279,31 @@ mod tests {
 
     #[test]
     fn incomplete_terminal_uses_cds_sequence_len_for_partial_codon() {
-        // Verify partial_codon fires when the variant falls in the
-        // incomplete terminal codon, using CDS sequence length.
+        // Verify partial_codon uses the padded translateable sequence length,
+        // not the unpadded cds_len. Real caches can exclude leading N padding
+        // from cds_len while cds_sequence still includes it.
         let engine = TranscriptConsequenceEngine::default();
-        // CDS: 10 bases (10 % 3 = 1 → 1 incomplete base at position 9)
-        // Genomic: 100-109
+        // Unpadded CDS: 8 bases (ATGGCTGA) → last incomplete codon "GA".
+        // Padded translateable_seq: NNATGGCTGA (leading phase Ns), so the
+        // last incomplete codon is still visible only when we use len=10.
         let tx = tx(
             "pc",
             "22",
             90,
-            140,
+            107,
             1,
             "protein_coding",
             Some(100),
-            Some(109),
+            Some(107),
         );
-        let exons = vec![exon("pc", 1, 90, 140)];
-        let cds = "ATGGCTGAAT"; // 10 bases, incomplete terminal "T"
-        let translations = vec![translation("pc", Some(10), Some(3), None, Some(cds))];
+        let exons = vec![exon("pc", 1, 90, 107)];
+        let cds = "NNATGGCTGA";
+        let translations = vec![translation("pc", Some(8), Some(3), None, Some(cds))];
 
-        // Variant at position 109 (the incomplete base, CDS index 9)
+        // Variant at the last coding base. With the old cds_len-based logic
+        // adj_idx landed exactly at cds_len and partial_codon returned false.
         let assignments = engine.evaluate_variant_with_context(
-            &var("22", 109, 109, "T", "A"),
+            &var("22", 107, 107, "A", "T"),
             &[tx],
             &exons,
             &translations,
@@ -8487,6 +8807,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn frameshift_deletion_partial_stop_lost_detected_from_codon_alleles() {
+        assert_eq!(
+            frameshift_deletion_partial_stop_lost_from_codon_allele_string("tGa/ta"),
+            Some(true)
+        );
+        assert_eq!(
+            frameshift_deletion_partial_stop_lost_from_codon_allele_string("tcATAA/tc"),
+            Some(true)
+        );
+        assert_eq!(
+            frameshift_deletion_partial_stop_lost_from_codon_allele_string("TAA/-"),
+            Some(false)
+        );
+    }
+
     // ---- deletion frameshift: preserve last ref AA before X ----
 
     #[test]
@@ -9248,6 +9584,400 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // Issue #125: ins_del_start_altered — cDNA-space start codon check
+    // ---------------------------------------------------------------
+    //
+    // Tests for the new ins_del_start_altered() function and the
+    // start_lost / start_retained co-occurrence for frameshifts.
+
+    /// Helper: build a transcript with full cDNA data. `cdna_coding_start`
+    /// follows Ensembl's 1-based convention.
+    fn tx_with_cdna_on_strand(
+        utr_seq: &str,
+        cds_seq: &str,
+        strand: i8,
+    ) -> (TranscriptFeature, Vec<ExonFeature>) {
+        let cdna = format!("{utr_seq}{cds_seq}");
+        let utr_len = utr_seq.len();
+        let cds_len = cds_seq.len();
+        let total_len = cdna.len();
+        // Genomic coords: exon covers 1000..(1000+total_len-1)
+        let tx_start = 1000i64;
+        let tx_end = tx_start + total_len as i64 - 1;
+        let (cds_start, cds_end) = if strand >= 0 {
+            (tx_start + utr_len as i64, tx_end)
+        } else {
+            (tx_start, tx_start + cds_len as i64 - 1)
+        };
+        let mut t = tx(
+            "T1",
+            "22",
+            tx_start,
+            tx_end,
+            strand,
+            "protein_coding",
+            Some(cds_start),
+            Some(cds_end),
+        );
+        t.spliced_seq = Some(cdna);
+        t.cdna_coding_start = Some(utr_len + 1);
+        t.cdna_coding_end = Some(total_len);
+        let e = exon("T1", 1, tx_start, tx_end);
+        (t, vec![e])
+    }
+
+    fn tx_with_cdna(utr_seq: &str, cds_seq: &str) -> (TranscriptFeature, Vec<ExonFeature>) {
+        tx_with_cdna_on_strand(utr_seq, cds_seq, 1)
+    }
+
+    /// Helper: mirror the cache layout where `cdna_seq` contains CDS only,
+    /// while cDNA coding coordinates still refer to the full transcript.
+    fn tx_with_cds_only_cdna(
+        utr_seq: &str,
+        cds_seq: &str,
+    ) -> (TranscriptFeature, Vec<ExonFeature>) {
+        let utr_len = utr_seq.len();
+        let cds_len = cds_seq.len();
+        let total_len = utr_len + cds_len;
+        let tx_start = 1000i64;
+        let tx_end = tx_start + total_len as i64 - 1;
+        let cds_start = tx_start + utr_len as i64;
+        let cds_end = tx_end;
+        let mut t = tx(
+            "T1",
+            "22",
+            tx_start,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(cds_start),
+            Some(cds_end),
+        );
+        t.cdna_seq = Some(cds_seq.to_string());
+        t.cdna_coding_start = Some(utr_len + 1);
+        t.cdna_coding_end = Some(total_len);
+        let e = exon("T1", 1, tx_start, tx_end);
+        (t, vec![e])
+    }
+
+    #[test]
+    fn ins_del_start_altered_deletion_destroys_atg() {
+        // 5'UTR = "GCGC", CDS = "ATGGCTGAATGA"
+        // Deletion of "TG" at CDS pos 1-2 (genomic 1005-1006) destroys ATG.
+        let (t, exons) = tx_with_cdna("GCGC", "ATGGCTGAATGA");
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 1005, 1006, "TG", "-");
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
+        assert_eq!(
+            result,
+            Some(true),
+            "Deleting TG from ATG should destroy start codon"
+        );
+    }
+
+    #[test]
+    fn ins_del_start_altered_deletion_preserves_atg() {
+        // 5'UTR = "GCGC", CDS = "ATGGCTGAATGA"
+        // Deletion of "G" at CDS pos 3 (genomic 1007) — ATG is at CDS pos 0-2,
+        // so deleting at pos 3 preserves ATG.
+        let (t, exons) = tx_with_cdna("GCGC", "ATGGCTGAATGA");
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 1007, 1007, "G", "-");
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
+        assert_eq!(
+            result,
+            Some(false),
+            "Deleting after ATG should preserve start codon"
+        );
+    }
+
+    #[test]
+    fn ins_del_start_altered_insertion_preserves_atg() {
+        // 5'UTR = "GCGC", CDS = "ATGGCTGAATGA"
+        // Insert "TT" after CDS pos 3 (genomic 1008). ATG at 1004-1006 is untouched.
+        let (t, exons) = tx_with_cdna("GCGC", "ATGGCTGAATGA");
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 1008, 1008, "-", "TT");
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
+        assert_eq!(
+            result,
+            Some(false),
+            "Insertion after start codon should preserve ATG"
+        );
+    }
+
+    #[test]
+    fn ins_del_start_altered_utr_deletion_preserves_translateable_suffix() {
+        // 5'UTR = "GCATG", CDS = "ATGGCTGAATGA"
+        // Full cDNA: GCATG|ATGGCTGAATGA, cdna_coding_start = 6
+        // Delete "GC" at genomic 1000-1001 (cDNA positions 0-1).
+        // Mutated cDNA: ATG|ATGGCTGAATGA
+        // VEP does not require ATG to remain at the original byte offset when
+        // the 5'UTR changes. It compares the suffix that will be translated,
+        // and here that suffix is still the original CDS, so start is retained.
+        let (t, exons) = tx_with_cdna("GCATG", "ATGGCTGAATGA");
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 1000, 1001, "GC", "-");
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
+        assert_eq!(
+            result,
+            Some(false),
+            "UTR deletion that preserves the translated suffix should retain the start codon"
+        );
+    }
+
+    #[test]
+    fn ins_del_start_altered_utr_deletion_can_retain_shifted_start() {
+        // 5'UTR = "ATATG", CDS = "ATGGCTGAATGA"
+        // Full cDNA: ATATG|ATGGCTGAATGA, cdna_coding_start = 6
+        // Delete "AT" at genomic 1000-1001 (cDNA positions 0-1).
+        // Mutated cDNA: "ATG" + "ATGGCTGAATGA" = "ATGATGGCTGAATGA"
+        // The UTR now ends with ATG, and the translated suffix still matches
+        // the original CDS. VEP therefore returns start_retained_variant.
+        let (t, exons) = tx_with_cdna("ATATG", "ATGGCTGAATGA");
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 1000, 1001, "AT", "-");
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
+        assert_eq!(
+            result,
+            Some(false),
+            "UTR deletion can still retain the start codon when the translated suffix is unchanged"
+        );
+    }
+
+    #[test]
+    fn ins_del_start_altered_returns_none_without_cdna() {
+        // Transcript without spliced_seq/cdna_seq → returns None
+        let cds = "ATGGCTGAATGA";
+        let cds_len = cds.len();
+        let tx_end = 1000 + cds_len as i64 - 1;
+        let t = tx(
+            "T1",
+            "22",
+            1000,
+            tx_end,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(tx_end),
+        );
+        let e = exon("T1", 1, 1000, tx_end);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let v = var("22", 1001, 1002, "TG", "-");
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
+        assert_eq!(result, None, "No cDNA data → should return None");
+    }
+
+    #[test]
+    fn ins_del_start_altered_returns_none_for_cds_only_cdna_cache() {
+        let (t, exons) = tx_with_cds_only_cdna("GCGC", "ATGGCTGAATGA");
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 1006, 1006, "G", "-");
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
+        assert_eq!(
+            result, None,
+            "CDS-only cdna_seq must not be treated as full cDNA for start-retained checks"
+        );
+    }
+
+    #[test]
+    fn ins_del_start_altered_negative_strand_boundary_deletion_preserves_atg() {
+        // Transcript cDNA: 5'UTR ATGCC + CDS ATGAAAAAA on the negative strand.
+        // Delete the last 2 UTR bases plus the start codon in genomic space.
+        // The remaining UTR prefix ("ATG") shifts into the CDS boundary, so the
+        // translateable suffix remains unchanged and VEP calls start_retained.
+        let (t, exons) = tx_with_cdna_on_strand("ATGCC", "ATGAAAAAA", -1);
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("22", 1006, 1010, "CATGG", "-");
+        let result = ins_del_start_altered(&t, &exons_ref, &v, None);
+        assert_eq!(
+            result,
+            Some(false),
+            "Boundary deletion with full negative-strand cDNA should preserve the start codon"
+        );
+    }
+
+    /// Helper: classify a deletion in a transcript with cDNA data.
+    fn classify_deletion_with_cdna(
+        utr_seq: &str,
+        cds_seq: &str,
+        del_start: i64,
+        del_end: i64,
+        ref_allele: &str,
+    ) -> Option<CodingClassification> {
+        let (t, exons) = tx_with_cdna(utr_seq, cds_seq);
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let cds_len = cds_seq.len();
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
+        let v = var("22", del_start, del_end, ref_allele, "-");
+        classify_coding_change(&t, &exons_ref, Some(&tr), &v)
+    }
+
+    fn classify_deletion_with_cds_only_cdna(
+        utr_seq: &str,
+        cds_seq: &str,
+        del_start: i64,
+        del_end: i64,
+        ref_allele: &str,
+    ) -> Option<CodingClassification> {
+        let (t, exons) = tx_with_cds_only_cdna(utr_seq, cds_seq);
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let cds_len = cds_seq.len();
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
+        let v = var("22", del_start, del_end, ref_allele, "-");
+        classify_coding_change(&t, &exons_ref, Some(&tr), &v)
+    }
+
+    #[test]
+    fn issue_125_frameshift_deletion_preserving_atg_cofires_start_lost_and_retained() {
+        // Issue #125: chr1:152223252 AT>A pattern.
+        // Frameshift deletion AT the start codon that coincidentally preserves ATG.
+        //
+        // 5'UTR = "GCGC", CDS = "ATGGCTGAATGA"
+        // CDS layout: A(0) T(1) G(2) G(3) C(4) T(5) ...
+        // Delete "G" at CDS pos 2 (genomic 1006) → frameshift.
+        // Mutated CDS: "AT" + "GCTGAATGA" = "ATGCTGAATGA" → first 3 = "ATG" preserved!
+        // Amino acid level: old[0]=M, new[0]=M → start_lost=false from AA check.
+        // But ins_del_start_altered returns false (ATG preserved) + frameshift
+        // → nucleotide-level check co-fires start_lost alongside start_retained.
+        let c = classify_deletion_with_cdna("GCGC", "ATGGCTGAATGA", 1006, 1006, "G").unwrap();
+        assert!(
+            c.start_retained,
+            "Frameshift preserving ATG: should emit start_retained. Got: start_retained={}, start_lost={}",
+            c.start_retained, c.start_lost
+        );
+        assert!(
+            c.start_lost,
+            "Frameshift preserving ATG: should ALSO emit start_lost (VEP peptide check). Got: start_retained={}, start_lost={}",
+            c.start_retained, c.start_lost
+        );
+    }
+
+    #[test]
+    fn issue_125_frameshift_deletion_with_cds_only_cdna_uses_cds_fallback() {
+        let c =
+            classify_deletion_with_cds_only_cdna("GCGC", "ATGGCTGAATGA", 1006, 1006, "G").unwrap();
+        assert!(
+            c.start_retained,
+            "CDS-only cache transcripts should still co-emit start_retained via CDS fallback"
+        );
+        assert!(
+            c.start_lost,
+            "Frameshift preserving ATG should still co-emit start_lost via peptide logic"
+        );
+    }
+
+    #[test]
+    fn frameshift_deletion_destroying_atg_emits_start_lost_only() {
+        // Delete "TG" from ATG → CDS starts with "A..." → ATG destroyed.
+        // ins_del_start_altered returns true → start_lost, no start_retained.
+        let c = classify_deletion_with_cdna("GCGC", "ATGGCTGAATGA", 1005, 1006, "TG").unwrap();
+        assert!(
+            c.start_lost,
+            "Deletion destroying ATG should emit start_lost"
+        );
+        assert!(
+            !c.start_retained,
+            "Deletion destroying ATG should NOT emit start_retained"
+        );
+    }
+
+    #[test]
+    fn inframe_deletion_after_start_codon_emits_no_start_terms() {
+        // Inframe deletion (3bp) after the start codon. ATG is preserved, but
+        // the variant no longer overlaps CDS positions 0..=2, so neither
+        // start_retained nor start_lost should fire.
+        // 5'UTR = "GCGC", CDS = "ATGGCTGAAAAATGA" (15bp = 5 codons)
+        // Delete "GCT" at pos 1007-1009 (CDS pos 3-5) → inframe deletion.
+        let c = classify_deletion_with_cdna("GCGC", "ATGGCTGAAAAATGA", 1007, 1009, "GCT").unwrap();
+        assert!(
+            !c.start_retained,
+            "Inframe deletion after the start codon should NOT emit start_retained. Got: start_retained={}, start_lost={}",
+            c.start_retained, c.start_lost
+        );
+        assert!(
+            !c.start_lost,
+            "Inframe deletion after the start codon should NOT emit start_lost. Got: start_retained={}, start_lost={}",
+            c.start_retained, c.start_lost
+        );
+    }
+
+    /// Helper: classify an insertion in a transcript with cDNA data.
+    fn classify_ins_with_cdna(
+        utr_seq: &str,
+        cds_seq: &str,
+        ins_pos: i64,
+        alt_allele: &str,
+    ) -> Option<CodingClassification> {
+        let (t, exons) = tx_with_cdna(utr_seq, cds_seq);
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let cds_len = cds_seq.len();
+        let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds_seq));
+        let v = var("22", ins_pos, ins_pos, "-", alt_allele);
+        classify_coding_change(&t, &exons_ref, Some(&tr), &v)
+    }
+
+    #[test]
+    fn issue_125_frameshift_insertion_preserving_atg_cofires_start_lost_and_retained() {
+        // Frameshift insertion within start codon that preserves ATG.
+        // 5'UTR = "GCGC", CDS = "ATGGCTGAATGA"
+        // Insert "TT" after CDS pos 2 (genomic 1007, within codon 1).
+        // cds_idx for insertion anchor: variant.start-1 = 1006, maps to CDS
+        // idx 2. But classify_insertion uses cds_idx < 2 gate. So we need
+        // insertion at cds_idx 0 or 1.
+        //
+        // Insert "TT" after CDS pos 0 (genomic 1005, after the 'A' of ATG).
+        // cds_idx = 1 (anchor = 1004 → CDS idx 0; ins_point = cds_idx+1 = 1).
+        // Mutated CDS: "A" + "TT" + "TGGCTGAATGA" = "ATTTGGCTGAATGA" (frameshift)
+        // First 3 CDS bases of mutated: "ATT" ≠ ATG → ATG NOT preserved at CDS level.
+        //
+        // Instead, insert after CDS pos -1 (in the UTR, genomic 1004):
+        // This would be an insertion at the UTR/CDS boundary. cds_idx maps
+        // to 0 via alternate flank. Mutated cDNA: GCGC + TT + ATGGCTGAATGA
+        // At cdna_coding_start=5 (1-based): "AT" (inserted) + "ATGG..." → pos 5..7 = "ATA"
+        // → not ATG. So this doesn't work either.
+        //
+        // For insertions, preserving ATG at the cDNA level while being within
+        // the start codon requires the inserted bases to happen to form ATG.
+        // Let's use: CDS = "ATGGCTGAATGA", insert "ATG" after CDS pos 0
+        // (genomic 1005). cds_idx = 0 (via anchor at 1004).
+        // Mutated CDS: "A" + "ATG" + "TGGCTGAATGA" = "AATGTGGCTGAATGA"
+        // First 3 at CDS level: "AAT" ≠ ATG.
+        // But at cDNA level: mutated cDNA = "GCGC" + "A" + "ATG" + "TGGCTGAATGA"
+        // = "GCGCAATGTGGCTGAATGA", cdna_coding_start=5 (1-based) → "AAT" ≠ ATG.
+        //
+        // The preservation happens more naturally for insertions AFTER the
+        // start codon (cds_idx >= 2), but those don't pass the cds_idx < 2 gate.
+        // This test validates that the cDNA-space check returns the correct
+        // altered=true result for insertions that do destroy ATG.
+        let c = classify_ins_with_cdna("GCGC", "ATGGCTGAATGA", 1005, "TT").unwrap();
+        assert!(
+            c.start_lost,
+            "Frameshift insertion disrupting ATG should emit start_lost"
+        );
+        // ins_del_start_altered returns true (ATG destroyed) → no start_retained
+        assert!(
+            !c.start_retained,
+            "Frameshift insertion disrupting ATG should NOT emit start_retained"
+        );
+    }
+
+    #[test]
+    fn inframe_insertion_preserving_atg_no_start_lost() {
+        // Inframe insertion (3bp) after start codon, ATG preserved.
+        // 5'UTR = "GCGC", CDS = "ATGGCTGAATGA"
+        // Insert "AAA" after CDS pos 3 (genomic 1008, at codon boundary).
+        let c = classify_ins_with_cdna("GCGC", "ATGGCTGAATGA", 1008, "AAA").unwrap();
+        // For inframe insertion, start_lost should NOT co-fire
+        // (ATG preserved and it's not a frameshift).
+        assert!(
+            !c.start_lost,
+            "Inframe insertion preserving ATG should NOT emit start_lost. Got: start_retained={}, start_lost={}",
+            c.start_retained, c.start_lost
+        );
+    }
+
+    // ---------------------------------------------------------------
     // three_prime_utr_seq — LoF biotype suppression and fallback
     // ---------------------------------------------------------------
 
@@ -9654,70 +10384,42 @@ mod tests {
     fn raw_cdna_position_before_first_segment_fwd() {
         let (t, exons) = two_exon_fwd();
         let refs: Vec<&ExonFeature> = exons.iter().collect();
-        // Position 95 is 5 bases before first exon start (100).
-        // Extrapolate: cdna_start - offset = 1 - 5 = -4
-        assert_eq!(
-            raw_cdna_position_from_genomic(&t, &refs, 95),
-            Some("-4".to_string())
-        );
+        assert_eq!(raw_cdna_position_from_genomic(&t, &refs, 95), None);
     }
 
     #[test]
     fn raw_cdna_position_before_first_segment_rev() {
         let (t, exons) = two_exon_rev();
         let refs: Vec<&ExonFeature> = exons.iter().collect();
-        // Position 95 is 5 bases before first exon start (100).
-        // Reverse: cdna_end + offset = 202 + 5 = 207
-        assert_eq!(
-            raw_cdna_position_from_genomic(&t, &refs, 95),
-            Some("207".to_string())
-        );
+        assert_eq!(raw_cdna_position_from_genomic(&t, &refs, 95), None);
     }
 
     #[test]
     fn raw_cdna_position_after_last_segment_fwd() {
         let (t, exons) = two_exon_fwd();
         let refs: Vec<&ExonFeature> = exons.iter().collect();
-        // Position 405 is 5 bases after last exon end (400).
-        // Extrapolate: cdna_end + offset = 202 + 5 = 207
-        assert_eq!(
-            raw_cdna_position_from_genomic(&t, &refs, 405),
-            Some("207".to_string())
-        );
+        assert_eq!(raw_cdna_position_from_genomic(&t, &refs, 405), None);
     }
 
     #[test]
     fn raw_cdna_position_after_last_segment_rev() {
         let (t, exons) = two_exon_rev();
         let refs: Vec<&ExonFeature> = exons.iter().collect();
-        // Position 405 is 5 bases after last exon end (400).
-        // Reverse: cdna_start - offset = 1 - 5 = -4
-        assert_eq!(
-            raw_cdna_position_from_genomic(&t, &refs, 405),
-            Some("-4".to_string())
-        );
+        assert_eq!(raw_cdna_position_from_genomic(&t, &refs, 405), None);
     }
 
     #[test]
     fn raw_cdna_position_one_before_first_segment_fwd() {
         let (t, exons) = two_exon_fwd();
         let refs: Vec<&ExonFeature> = exons.iter().collect();
-        // Position 99: one base before first exon → cdna = 1 - 1 = 0
-        assert_eq!(
-            raw_cdna_position_from_genomic(&t, &refs, 99),
-            Some("0".to_string())
-        );
+        assert_eq!(raw_cdna_position_from_genomic(&t, &refs, 99), None);
     }
 
     #[test]
     fn raw_cdna_position_one_after_last_segment_fwd() {
         let (t, exons) = two_exon_fwd();
         let refs: Vec<&ExonFeature> = exons.iter().collect();
-        // Position 401: one base after last exon → cdna = 202 + 1 = 203
-        assert_eq!(
-            raw_cdna_position_from_genomic(&t, &refs, 401),
-            Some("203".to_string())
-        );
+        assert_eq!(raw_cdna_position_from_genomic(&t, &refs, 401), None);
     }
 
     // ── Issue #90 sub-pattern D: stop codon SNV → stop_retained ─────────
@@ -10092,6 +10794,71 @@ mod tests {
                 c
             );
         }
+    }
+
+    #[test]
+    fn frameshift_deletion_partial_terminal_stop_sets_stop_lost() {
+        let cds = "ATGTGA";
+        let c = classify_deletion(cds, 1004, 1004, "G").unwrap();
+        assert_eq!(c.codons.as_deref(), Some("tGa/ta"));
+        assert!(
+            c.stop_lost,
+            "Frameshift deletion leaving a partial stop codon should set stop_lost. Got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn issue_terminal_stop_frameshift_deletion_on_nmd_transcript_cofires_stop_lost() {
+        let engine = TranscriptConsequenceEngine::default();
+        let cds = "ATGTCATAA";
+        let mut t = tx(
+            "T1",
+            "11",
+            1000,
+            1008,
+            1,
+            "nonsense_mediated_decay",
+            Some(1000),
+            Some(1008),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(cds.len());
+        t.translation_stable_id = Some("ENSPT1".to_string());
+        let e = exon("T1", 1, 1000, 1008);
+        let tr = translation("T1", Some(cds.len()), Some(3), None, Some(cds));
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("11", 1005, 1008, "ATAA", "-"),
+            &[t],
+            &[e],
+            &[tr],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let consequence = assignments
+            .first()
+            .expect("expected transcript consequence");
+        let term_set: std::collections::BTreeSet<_> = consequence.terms.iter().copied().collect();
+
+        assert!(
+            term_set.contains(&SoTerm::FrameshiftVariant),
+            "Expected frameshift_variant, got: {:?}",
+            consequence.terms
+        );
+        assert!(
+            term_set.contains(&SoTerm::StopLost),
+            "Expected stop_lost, got: {:?}",
+            consequence.terms
+        );
+        assert!(
+            term_set.contains(&SoTerm::NmdTranscriptVariant),
+            "Expected NMD_transcript_variant, got: {:?}",
+            consequence.terms
+        );
+        assert_eq!(consequence.codons.as_deref(), Some("tcATAA/tc"));
     }
 
     // ── Issue #90 sub-pattern E: miRNA insertion at boundary ─────────────
@@ -11549,6 +12316,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn issue_118_negative_strand_one_bp_frameshift_intron_boundary_insertion_gets_splice_donor() {
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "20",
+            1000,
+            1200,
+            -1,
+            "protein_coding",
+            Some(1000),
+            Some(1200),
+        );
+        // 1bp intron at 1092 between the two exons. On the negative strand,
+        // that single intronic base is the donor site.
+        let exons = vec![exon("T1", 1, 1093, 1200), exon("T1", 2, 1000, 1091)];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("20", 1092, 1092, "-", "AAAA"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let consequence = assignments
+            .first()
+            .expect("expected transcript consequence");
+
+        assert!(
+            consequence.terms.contains(&SoTerm::SpliceDonorVariant),
+            "Boundary insertion next to a 1bp negative-strand frameshift intron should keep splice_donor_variant. Got: {:?}",
+            consequence.terms
+        );
+    }
+
     // ── Issue #132: frameshift intron regression ───────────────────────────
 
     #[test]
@@ -12339,6 +13144,262 @@ mod tests {
             !term_set.contains(&SoTerm::SynonymousVariant),
             "Should NOT have synonymous_variant at incomplete codon. Got: {:?}",
             terms
+        );
+    }
+
+    #[test]
+    fn issue_136_real_negative_strand_terminal_snv_emits_itcv_and_hgvsp() {
+        const ISSUE_136_CDS: &str = concat!(
+            "NNGCGGGTCATGGCGCCCCGAGCCCTCCTCCTGCTGCTCTCGGGAGGCCTGGCCCTGACCGAGACCT",
+            "GGGCCTGCTCCCACTCCATGAGGTATTTCGACACCGCCGTGTCCCGGCCCGGCCGCGGAGAGCCCCG",
+            "CTTCATCTCAGTGGGCTACGTGGACGACACGCAGTTCGTGCGGTTCGACAGCGACGCCGCGAGTCCG",
+            "AGAGGGGAGCCGCGGGCGCCGTGGGTGGAGCAGGAGGGGCCGGAGTATTGGGACCGGGAGACACAGA",
+            "AGTACAAGCGCCAGGCACAGGCTGACCGAGTGAGCCTGCGGAACCTGCGCGGCTACTACAACCAGAG",
+            "CGAGGACGGGTCTCACACCCTCCAGAGGATGTCTGGCTGCGACCTGGGGCCCGACGGGCGCCTCCTC",
+            "CGCGGGTATGACCAGTCCGCCTACGACGGCAAGGATTACATCGCCCTGAACGAGGACCTGCGCTCCT",
+            "GGACCGCCGCGGACACCGCGGCTCAGATCACCCAGCGCAAGTTGGAGGCGGCCCGTGCGGCGGAGCA",
+            "GCTGAGAGCCTACCTGGAGGGCACGTGCGTGGAGTGGCTCCGCAGATACCTGGAGAACGGGAAGGAG",
+            "ACGCTGCAGCGCGCAGAACCCCCAAAGACACACGTGACCCACCACCCCCTCTCTGACCATGAGGCCA",
+            "GCAGGAGATGGAACCTTCCAGAAGTGGGCAGCTGTGGTGGTGCCTTCTGGACAAGAGCAGAGATACA",
+            "CGTGCCATATGCAGCACGAGGGGCTGCAAGAGCCCCTCACCCTGAGC"
+        );
+
+        let engine = TranscriptConsequenceEngine::default();
+        let mut tx = tx(
+            "ENST00000415537",
+            "6",
+            31_270_214,
+            31_272_069,
+            -1,
+            "protein_coding",
+            Some(31_270_214),
+            Some(31_272_069),
+        );
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(782);
+        tx.cds_start_nf = true;
+        tx.cds_end_nf = true;
+        tx.flags_str = Some("cds_start_NF&cds_end_NF".to_string());
+
+        let exons = vec![
+            exon("ENST00000415537", 1, 31_271_999, 31_272_069),
+            exon("ENST00000415537", 2, 31_271_599, 31_271_868),
+            exon("ENST00000415537", 3, 31_271_073, 31_271_348),
+            exon("ENST00000415537", 4, 31_270_439, 31_270_485),
+            exon("ENST00000415537", 5, 31_270_214, 31_270_331),
+        ];
+
+        let mut tr = translation(
+            "ENST00000415537",
+            Some(782),
+            Some(261),
+            None,
+            Some(ISSUE_136_CDS),
+        );
+        tr.stable_id = Some("ENSP00000400410".to_string());
+        tr.version = Some(1);
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("6", 31_270_214, 31_270_214, "G", "T"),
+            &[tx],
+            &exons,
+            &[tr],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let consequence = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENST00000415537"))
+            .expect("expected transcript consequence");
+        let term_set: std::collections::BTreeSet<_> = consequence.terms.iter().copied().collect();
+
+        assert_eq!(
+            term_set,
+            std::collections::BTreeSet::from([
+                SoTerm::IncompleteTerminalCodonVariant,
+                SoTerm::CodingSequenceVariant,
+            ]),
+            "Unexpected consequence terms for issue #136: {:?}",
+            consequence.terms
+        );
+        assert_eq!(
+            consequence.hgvsp.as_deref(),
+            Some("ENSP00000400410.1:p.Ter262=")
+        );
+    }
+
+    #[test]
+    fn issue_orai1_frameshift_intron_deletion_keeps_csv_but_emits_shifted_hgvsp() {
+        const ORAI1_CDS: &str = concat!(
+            "ATGCATCCGGAGCCCGCCCCGCCCCCGAGCCGCAGCAGTCCCGAGCTTCCCCCAAGCGGCGGCAGCAC",
+            "CACCAGCGGCAGCCGCCGGAGCCGCCGCCGCAGCGGGGACGGGGAGCCCCCGGGGGCCCCGCCACCGC",
+            "CGCCGTCCGCCGTCACCTACCCGGACTGGATCGGCCAGAGTTACTCCGAGGTGATGAGCCTCAACGAG",
+            "CACTCCATGCAGGCGCTGTCCTGGCGCAAGCTCTACTTGAGCCGCGCCAAGCTTAAAGCCTCCAGCCG",
+            "GACCTCGGCTCTGCTCTCCGGCTTCGCCATGGTGGCAATGGTGGAGGTGCAGCTGGACGCTGACCACG",
+            "ACTACCCACCGGGGCTGCTCATCGCCTTCAGTGCCTGCACCACAGTGCTGGTGGCTGTGCACCTGTTT",
+            "GCGCTCATGATCAGCACCTGCATCCTGCCCAACATCGAGGCGGTGAGCAACGTGCACAATCTCAACTC",
+            "GGTCAAGGAGTCCCCCCATGAGCGCATGCACCGCCACATCGAGCTGGCCTGGGCCTTCTCCACCGTCA",
+            "TCGGCACGCTGCTCTTCCTAGCTGAGGTGGTGCTGCTCTGCTGGGTCAAGTTCTTGCCCCTCAAGAAG",
+            "CAGCCAGGCCAGCCAAGGCCCACCAGCAAGCCCCCCGCCAGTGGCGCAGCAGCCAACGTCAGCACCAG",
+            "CGGCATCACCCCGGGCCAGGCAGCTGCCATCGCCTCGACCACCATCATGGTGCCCTTCGGCCTGATCT",
+            "TTATCGTCTTCGCCGTCCACTTCTACCGCTCACTGGTTAGCCATAAGACTGACCGACAGTTCCAGGAG",
+            "CTCAACGAGCTGGCGGAGTTTGCCCGCTTACAGGACCAGCTGGACCACAGAGGGGACCACCCCCTGAC",
+            "GCCCGGCAGCCACTATGCCTAG"
+        );
+
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(5000, 5000, true);
+        let mut tx = tx(
+            "ENST00000617316",
+            "12",
+            121_626_550,
+            121_642_040,
+            1,
+            "protein_coding",
+            Some(121_626_743),
+            Some(121_641_643),
+        );
+        tx.version = Some(2);
+        tx.cdna_coding_start = Some(194);
+        tx.cdna_coding_end = Some(1099);
+        tx.translation_stable_id = Some("ENSP00000482568".to_string());
+        tx.is_canonical = true;
+
+        let exons = vec![
+            exon("ENST00000617316", 1, 121_626_550, 121_626_865),
+            exon("ENST00000617316", 2, 121_626_871, 121_627_050),
+            exon("ENST00000617316", 3, 121_641_041, 121_642_040),
+        ];
+
+        let mut tr = translation(
+            "ENST00000617316",
+            Some(906),
+            Some(301),
+            None,
+            Some(ORAI1_CDS),
+        );
+        tr.stable_id = Some("ENSP00000482568".to_string());
+        tr.version = Some(2);
+
+        let mut v = var("12", 121_626_866, 121_626_870, "GCCCC", "-");
+        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 8,
+            start: 121_626_874,
+            end: 121_626_878,
+            shifted_allele_string: "CCGCC".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+
+        let assignments =
+            engine.evaluate_variant_with_context(&v, &[tx], &exons, &[tr], &[], &[], &[], &[]);
+        let consequence = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENST00000617316"))
+            .expect("expected transcript consequence");
+        let term_set: std::collections::BTreeSet<_> = consequence.terms.iter().copied().collect();
+
+        assert_eq!(
+            term_set,
+            std::collections::BTreeSet::from([SoTerm::CodingSequenceVariant]),
+            "Unexpected ORAI1 terms: {:?}",
+            consequence.terms
+        );
+        assert_eq!(consequence.cds_position, None);
+        assert_eq!(consequence.protein_position, None);
+        assert_eq!(
+            consequence.hgvsc.as_deref(),
+            Some("ENST00000617316.2:c.127_131del")
+        );
+        assert_eq!(
+            consequence.hgvsp.as_deref(),
+            Some("ENSP00000482568.2:p.Pro43ThrfsTer43")
+        );
+    }
+
+    #[test]
+    fn shifted_hgvsp_is_suppressed_when_original_terms_are_splice_only() {
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(5000, 5000, true);
+        let cds = "ATGGATGATAGCGACTTTGCCTAA";
+
+        let mut tx = tx(
+            "ENSTSHIFT0001",
+            "1",
+            1000,
+            1044,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1044),
+        );
+        tx.version = Some(1);
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(cds.len());
+        tx.translation_stable_id = Some("ENSPSHIFT0001".to_string());
+
+        let exons = vec![
+            exon("ENSTSHIFT0001", 1, 1000, 1008),
+            exon("ENSTSHIFT0001", 2, 1030, 1044),
+        ];
+
+        let mut tr = translation(
+            "ENSTSHIFT0001",
+            Some(cds.len()),
+            Some(cds.len() / 3),
+            None,
+            Some(cds),
+        );
+        tr.stable_id = Some("ENSPSHIFT0001".to_string());
+        tr.version = Some(1);
+
+        // Original variant is a splice acceptor deletion in the intron.
+        // HGVS 3' shifting moves the deletion into exon 2, where a shifted
+        // coding classification would exist. VEP still leaves HGVSp empty
+        // because the original TVA is not coding.
+        let mut v = var("1", 1028, 1029, "AG", "-");
+        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 2,
+            start: 1030,
+            end: 1031,
+            shifted_allele_string: "AG".to_string(),
+            shifted_compare_allele: "-".to_string(),
+            shifted_output_allele: "-".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+
+        let assignments =
+            engine.evaluate_variant_with_context(&v, &[tx], &exons, &[tr], &[], &[], &[], &[]);
+        let consequence = assignments
+            .iter()
+            .find(|entry| entry.transcript_id.as_deref() == Some("ENSTSHIFT0001"))
+            .expect("expected transcript consequence");
+        let term_set: std::collections::BTreeSet<_> = consequence.terms.iter().copied().collect();
+
+        assert!(
+            term_set.contains(&SoTerm::SpliceAcceptorVariant),
+            "Synthetic splice-site indel should stay splice-only. Got: {:?}",
+            consequence.terms
+        );
+        assert!(
+            !term_set.contains(&SoTerm::CodingSequenceVariant),
+            "Synthetic splice-site indel must not become coding in the original consequence. Got: {:?}",
+            consequence.terms
+        );
+        assert!(
+            consequence.hgvsc.is_some(),
+            "Shifted HGVSc should still be emitted for splice-only indels"
+        );
+        assert_eq!(
+            consequence.hgvsp, None,
+            "HGVSp must stay empty when the original transcript variation is not coding"
         );
     }
 }
