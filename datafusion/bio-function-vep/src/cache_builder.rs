@@ -27,8 +27,8 @@ use futures::StreamExt;
 use log::info;
 
 use datafusion_bio_format_ensembl_cache::{
-    EnsemblCacheOptions, EnsemblCacheTableProvider, EnsemblEntityKind, build_export_query,
-    build_export_query_multi_chrom,
+    EnsemblCacheOptions, EnsemblCacheTableProvider, EnsemblEntityKind, VEP_CACHE_REGION_SIZE_BP,
+    build_export_query, build_export_query_multi_chrom,
 };
 
 use crate::annotate_provider::read_compact_predictions;
@@ -59,6 +59,33 @@ const CHROM_CODE_ORDER: &[&str] = &[
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
     "18", "19", "20", "21", "22", "X", "Y", "MT",
 ];
+
+fn transcript_region_start_expr(start_col: &str) -> String {
+    format!(
+        "(CAST(FLOOR(({start_col} - 1) / {VEP_CACHE_REGION_SIZE_BP}.0) AS BIGINT) * {VEP_CACHE_REGION_SIZE_BP} + 1)"
+    )
+}
+
+fn translation_source_region_preference_expr(start_col: &str, source_file_col: &str) -> String {
+    let region_start = transcript_region_start_expr(start_col);
+    let region_end = format!("({region_start} + {} - 1)", VEP_CACHE_REGION_SIZE_BP);
+    format!(
+        "CASE WHEN {source_file_col} LIKE CONCAT('%/', CAST({region_start} AS VARCHAR), '-', CAST({region_end} AS VARCHAR), '.gz') THEN 0 ELSE 1 END"
+    )
+}
+
+fn build_translation_dedup_query_with_where_clause(table_name: &str, where_clause: &str) -> String {
+    let source_pref = translation_source_region_preference_expr("start", "source_file");
+    format!(
+        "SELECT * FROM (\
+            SELECT *, ROW_NUMBER() OVER (\
+                PARTITION BY transcript_id \
+                ORDER BY {source_pref}, cdna_coding_start NULLS LAST, source_file\
+            ) AS _rn \
+            FROM {table_name}{where_clause}\
+        ) WHERE _rn = 1"
+    )
+}
 
 /// Statistics returned after building one entity.
 #[derive(Debug, Clone)]
@@ -1101,14 +1128,9 @@ impl CacheBuilder {
     ) -> Result<(Option<(String, usize)>, Option<(String, usize)>)> {
         let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
 
-        let dedup_query = format!(
-            "SELECT * FROM (\
-                SELECT *, ROW_NUMBER() OVER (\
-                    PARTITION BY transcript_id \
-                    ORDER BY cdna_coding_start NULLS LAST\
-                ) AS _rn \
-                FROM {table_name} WHERE chrom = '{chrom}'\
-            ) WHERE _rn = 1"
+        let dedup_query = build_translation_dedup_query_with_where_clause(
+            table_name,
+            &format!(" WHERE chrom = '{chrom}'"),
         );
         let df = ctx.sql(&dedup_query).await?;
         let schema = df.schema().clone();
@@ -1244,14 +1266,9 @@ impl CacheBuilder {
             .map(|c| format!("'{c}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        let dedup_query = format!(
-            "SELECT * FROM (\
-                SELECT *, ROW_NUMBER() OVER (\
-                    PARTITION BY transcript_id \
-                    ORDER BY cdna_coding_start NULLS LAST\
-                ) AS _rn \
-                FROM {table_name} WHERE chrom IN ({in_list})\
-            ) WHERE _rn = 1"
+        let dedup_query = build_translation_dedup_query_with_where_clause(
+            table_name,
+            &format!(" WHERE chrom IN ({in_list})"),
         );
         let df = ctx.sql(&dedup_query).await?;
         let schema = df.schema().clone();
@@ -2407,6 +2424,23 @@ mod tests {
             q.contains("COALESCE(gene_hgnc_id"),
             "multi-chrom transcript query must include HGNC propagation"
         );
+    }
+
+    #[test]
+    fn test_build_translation_dedup_query_prefers_transcript_start_region() {
+        let q = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom = '2'");
+        assert!(q.contains("PARTITION BY transcript_id"));
+        assert!(q.contains("source_file LIKE CONCAT('%/'"));
+        assert!(q.contains("cdna_coding_start NULLS LAST"));
+        assert!(q.contains("WHERE chrom = '2'"));
+    }
+
+    #[test]
+    fn test_build_translation_dedup_query_multi_chrom_prefers_transcript_start_region() {
+        let q = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom IN ('2', 'X')");
+        assert!(q.contains("PARTITION BY transcript_id"));
+        assert!(q.contains("source_file LIKE CONCAT('%/'"));
+        assert!(q.contains("WHERE chrom IN ('2', 'X')"));
     }
 
     // -----------------------------------------------------------------------
