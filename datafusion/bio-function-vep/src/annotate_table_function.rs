@@ -726,6 +726,155 @@ mod tests {
         .expect("valid context exon batch")
     }
 
+    fn pick_vcf_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![155])),
+                Arc::new(Int64Array::from(vec![155])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .expect("valid pick vcf batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid pick vcf memtable")
+    }
+
+    fn pick_cache_batch(cached_csq: Option<&str>, cached_most: Option<&str>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("consequence_types", DataType::Utf8, true),
+            Field::new("most_severe_consequence", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![155])),
+                Arc::new(Int64Array::from(vec![155])),
+                Arc::new(StringArray::from(vec![Some("rs_pick")])),
+                Arc::new(StringArray::from(vec!["A/G"])),
+                Arc::new(StringArray::from(vec![cached_csq])),
+                Arc::new(StringArray::from(vec![cached_most])),
+                Arc::new(Int64Array::from(vec![0])),
+            ],
+        )
+        .expect("valid pick cache batch")
+    }
+
+    fn pick_transcripts_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("strand", DataType::Int64, false),
+            Field::new("biotype", DataType::Utf8, false),
+            Field::new("cds_start", DataType::Int64, true),
+            Field::new("cds_end", DataType::Int64, true),
+            Field::new("gene_stable_id", DataType::Utf8, true),
+            Field::new("gene_symbol", DataType::Utf8, true),
+            Field::new("is_canonical", DataType::Boolean, true),
+            Field::new("tsl", DataType::Int64, true),
+            Field::new("mane_select", DataType::Utf8, true),
+            Field::new("mane_plus_clinical", DataType::Utf8, true),
+            Field::new("ccds", DataType::Utf8, true),
+            Field::new("appris", DataType::Utf8, true),
+            Field::new("translation_stable_id", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "ENSTPICK0001",
+                    "ENSTPICK0002",
+                    "ENSTPICK0003",
+                ])),
+                Arc::new(StringArray::from(vec!["1", "1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(Int64Array::from(vec![250, 250, 250])),
+                Arc::new(Int64Array::from(vec![1, 1, 1])),
+                Arc::new(StringArray::from(vec![
+                    "protein_coding",
+                    "protein_coding",
+                    "protein_coding",
+                ])),
+                Arc::new(Int64Array::from(vec![120, 120, 120])),
+                Arc::new(Int64Array::from(vec![240, 240, 240])),
+                Arc::new(StringArray::from(vec![
+                    Some("ENSGPICK0001"),
+                    Some("ENSGPICK0001"),
+                    Some("ENSGPICK0002"),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("GENE1"),
+                    Some("GENE1"),
+                    Some("GENE2"),
+                ])),
+                Arc::new(datafusion::arrow::array::BooleanArray::from(vec![
+                    Some(false),
+                    Some(true),
+                    Some(false),
+                ])),
+                Arc::new(Int64Array::from(vec![Some(5), Some(1), Some(3)])),
+                Arc::new(StringArray::from(vec![Some("NM_PICK_1"), None, None])),
+                Arc::new(StringArray::from(vec![None::<&str>, None, None])),
+                Arc::new(StringArray::from(vec![
+                    Some("CCDS1"),
+                    Some("CCDS2"),
+                    Some("CCDS3"),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("principal2"),
+                    Some("principal1"),
+                    Some("alternative1"),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("ENSPICK0001"),
+                    Some("ENSPICK0002"),
+                    Some("ENSPICK0003"),
+                ])),
+            ],
+        )
+        .expect("valid pick transcript batch")
+    }
+
+    fn pick_exons_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("exon_number", DataType::Int64, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "ENSTPICK0001",
+                    "ENSTPICK0002",
+                    "ENSTPICK0003",
+                ])),
+                Arc::new(Int64Array::from(vec![1, 1, 1])),
+                Arc::new(Int64Array::from(vec![100, 100, 100])),
+                Arc::new(Int64Array::from(vec![250, 250, 250])),
+            ],
+        )
+        .expect("valid pick exon batch")
+    }
+
     fn context_regulatory_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("stable_id", DataType::Utf8, false),
@@ -1597,6 +1746,20 @@ mod tests {
         }
     }
 
+    fn list_row_string_values(
+        col: &Arc<dyn datafusion::arrow::array::Array>,
+        row: usize,
+    ) -> Vec<Option<String>> {
+        let arr = col
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("expected list array");
+        if !arr.is_valid(row) {
+            return Vec::new();
+        }
+        string_values(&arr.value(row))
+    }
+
     fn csq_entries(csq: &str) -> Vec<Vec<&str>> {
         csq.split(',')
             .map(|entry| entry.split('|').collect())
@@ -2141,6 +2304,258 @@ mod tests {
         .expect("transcript hgvs prediction entry should exist");
         assert_eq!(hgvs_prediction_entry[10], "");
         assert_eq!(hgvs_prediction_entry[11], "ENSPHGVS000001.1:p.(Ala2Thr)",);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_flag_pick_allele_gene_marks_one_pick_per_gene_and_aligns_flags_columns()
+     {
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &pick_cache_batch(None, None));
+        write_batch_to_cache(&tmpdir, "transcript", &pick_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &pick_exons_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_pick", Arc::new(pick_vcf_table()))
+            .expect("register pick vcf");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let (_fasta_dir, fasta_path) = write_test_indexed_fasta("1", &"N".repeat(512));
+        let sql = format!(
+            "SELECT \"CSQ\", \"FLAGS\", \"Feature\" \
+             FROM annotate_vep( \
+               'vcf_pick', \
+               '{cache_path}', \
+               '{backend}', \
+               '{{\"partitioned\":true,\"everything\":true,\"flag_pick_allele_gene\":true,\
+                  \"pick_order\":\"mane_select,tsl,canonical\",\"reference_fasta_path\":\"{}\"}}' \
+             )",
+            fasta_path.replace('\'', "''")
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("pick query should parse")
+            .collect()
+            .await
+            .expect("collect pick annotate_vep");
+        let batch = &batches[0];
+        let csq = string_values(batch.column_by_name("CSQ").expect("csq column exists"));
+        let csq0 = csq[0].as_ref().expect("csq should be present");
+        let picked_features: Vec<String> = csq_entries(csq0)
+            .into_iter()
+            .filter(|fields| {
+                fields.len() == 80
+                    && fields[5] == "Transcript"
+                    && fields[20].split('&').any(|flag| flag == "PICK")
+            })
+            .map(|fields| fields[6].to_string())
+            .collect();
+        assert_eq!(
+            picked_features,
+            vec!["ENSTPICK0001".to_string(), "ENSTPICK0003".to_string()]
+        );
+
+        let flags = list_row_string_values(
+            batch.column_by_name("FLAGS").expect("flags column exists"),
+            0,
+        );
+        let features = list_row_string_values(
+            batch
+                .column_by_name("Feature")
+                .expect("feature column exists"),
+            0,
+        );
+        let picked_typed_features: Vec<String> = features
+            .iter()
+            .zip(flags.iter())
+            .filter_map(
+                |(feature, flags)| match (feature.as_deref(), flags.as_deref()) {
+                    (Some(feature), Some(flags)) if flags.split('&').any(|flag| flag == "PICK") => {
+                        Some(feature.to_string())
+                    }
+                    _ => None,
+                },
+            )
+            .collect();
+        assert_eq!(picked_typed_features, picked_features);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_pick_order_changes_transcript_winner() {
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &pick_cache_batch(None, None));
+        write_batch_to_cache(&tmpdir, "transcript", &pick_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &pick_exons_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_pick_order", Arc::new(pick_vcf_table()))
+            .expect("register pick-order vcf");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let (_fasta_dir, fasta_path) = write_test_indexed_fasta("1", &"N".repeat(512));
+        let sql = format!(
+            "SELECT \"CSQ\" \
+             FROM annotate_vep( \
+               'vcf_pick_order', \
+               '{cache_path}', \
+               '{backend}', \
+               '{{\"partitioned\":true,\"everything\":true,\"flag_pick_allele_gene\":true,\
+                  \"pick_order\":\"tsl,mane_select,canonical\",\"reference_fasta_path\":\"{}\"}}' \
+             )",
+            fasta_path.replace('\'', "''")
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("pick-order query should parse")
+            .collect()
+            .await
+            .expect("collect pick-order annotate_vep");
+        let csq = string_values(batches[0].column_by_name("CSQ").expect("csq column exists"));
+        let csq0 = csq[0].as_ref().expect("csq should be present");
+        let picked_features: Vec<String> = csq_entries(csq0)
+            .into_iter()
+            .filter(|fields| {
+                fields.len() == 80
+                    && fields[5] == "Transcript"
+                    && fields[20].split('&').any(|flag| flag == "PICK")
+            })
+            .map(|fields| fields[6].to_string())
+            .collect();
+        assert_eq!(
+            picked_features,
+            vec!["ENSTPICK0002".to_string(), "ENSTPICK0003".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_flag_pick_allele_gene_bypasses_cache_hit_fast_path() {
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(
+            &tmpdir,
+            "variation",
+            &pick_cache_batch(Some("missense_variant"), Some("missense_variant")),
+        );
+        write_batch_to_cache(&tmpdir, "transcript", &pick_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &pick_exons_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_pick_hit", Arc::new(pick_vcf_table()))
+            .expect("register pick-hit vcf");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let (_fasta_dir, fasta_path) = write_test_indexed_fasta("1", &"N".repeat(512));
+        let default_sql = format!(
+            "SELECT \"CSQ\" \
+             FROM annotate_vep( \
+               'vcf_pick_hit', \
+               '{cache_path}', \
+               '{backend}', \
+               '{{\"partitioned\":true,\"everything\":true,\"reference_fasta_path\":\"{}\"}}' \
+             )",
+            fasta_path.replace('\'', "''")
+        );
+        let default_batches = ctx
+            .sql(&default_sql)
+            .await
+            .expect("default cache-hit query should parse")
+            .collect()
+            .await
+            .expect("collect default cache-hit annotate_vep");
+        let default_csq = string_values(
+            default_batches[0]
+                .column_by_name("CSQ")
+                .expect("csq column exists"),
+        );
+        let default_entries = csq_entries(default_csq[0].as_ref().expect("default csq present"));
+        assert_eq!(default_entries.len(), 1);
+        assert_eq!(default_entries[0][5], "");
+        assert_eq!(default_entries[0][6], "");
+
+        let pick_sql = format!(
+            "SELECT \"CSQ\" \
+             FROM annotate_vep( \
+               'vcf_pick_hit', \
+               '{cache_path}', \
+               '{backend}', \
+               '{{\"partitioned\":true,\"everything\":true,\"flag_pick_allele_gene\":true,\
+                  \"pick_order\":\"mane_select,tsl,canonical\",\"reference_fasta_path\":\"{}\"}}' \
+             )",
+            fasta_path.replace('\'', "''")
+        );
+        let pick_batches = ctx
+            .sql(&pick_sql)
+            .await
+            .expect("pick cache-hit query should parse")
+            .collect()
+            .await
+            .expect("collect pick cache-hit annotate_vep");
+        let pick_csq = string_values(
+            pick_batches[0]
+                .column_by_name("CSQ")
+                .expect("csq column exists"),
+        );
+        let pick_entries = csq_entries(pick_csq[0].as_ref().expect("pick csq present"));
+        let pick_transcript_features: Vec<String> = pick_entries
+            .iter()
+            .filter(|fields| fields.len() == 80 && fields[5] == "Transcript")
+            .map(|fields| fields[6].to_string())
+            .collect();
+        let picked_features: Vec<String> = pick_entries
+            .iter()
+            .filter(|fields| {
+                fields.len() == 80
+                    && fields[5] == "Transcript"
+                    && fields[20].split('&').any(|flag| flag == "PICK")
+            })
+            .map(|fields| fields[6].to_string())
+            .collect();
+        assert_eq!(
+            pick_transcript_features,
+            vec![
+                "ENSTPICK0001".to_string(),
+                "ENSTPICK0002".to_string(),
+                "ENSTPICK0003".to_string(),
+            ]
+        );
+        assert_eq!(
+            picked_features,
+            vec!["ENSTPICK0001".to_string(), "ENSTPICK0003".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_rejects_invalid_pick_order() {
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &pick_cache_batch(None, None));
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_pick_invalid", Arc::new(pick_vcf_table()))
+            .expect("register invalid-pick vcf");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT \"CSQ\" \
+             FROM annotate_vep( \
+               'vcf_pick_invalid', \
+               '{cache_path}', \
+               '{backend}', \
+               '{{\"partitioned\":true,\"flag_pick_allele_gene\":true,\"pick_order\":\"mane_select,bogus\"}}' \
+             )"
+        );
+        let err = ctx
+            .sql(&sql)
+            .await
+            .expect("invalid pick-order query should parse")
+            .collect()
+            .await
+            .expect_err("invalid pick_order should fail")
+            .to_string();
+        assert!(err.contains("unsupported pick_order criterion 'bogus'"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
