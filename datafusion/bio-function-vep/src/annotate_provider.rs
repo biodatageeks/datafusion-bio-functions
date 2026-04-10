@@ -1208,6 +1208,9 @@ impl Default for PickFlags {
     fn default() -> Self {
         Self {
             flag_pick_allele_gene: false,
+            // Traceability:
+            // - Ensembl VEP release 115 default `pick_order`
+            //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L300-L307>
             pick_order: vec![
                 PickCriterion::ManeSelect,
                 PickCriterion::ManePlusClinical,
@@ -2071,178 +2074,277 @@ fn format_appris(raw: &str) -> String {
     raw.replace("principal", "P").replace("alternative", "A")
 }
 
-fn parse_appris_pick_rank(raw: Option<&str>) -> (u8, u8) {
+fn parse_appris_pick_rank(raw: Option<&str>) -> u8 {
     let Some(raw) = raw else {
-        return (3, u8::MAX);
+        return 100;
     };
-    if let Some(suffix) = raw.strip_prefix("principal") {
-        return (0, suffix.parse::<u8>().unwrap_or(u8::MAX));
-    }
-    if let Some(suffix) = raw.strip_prefix("alternative") {
-        return (1, suffix.parse::<u8>().unwrap_or(u8::MAX));
-    }
-    (2, u8::MAX)
-}
 
-fn compare_pick_bool(a: bool, b: bool) -> Ordering {
-    match (a, b) {
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        _ => Ordering::Equal,
-    }
-}
-
-fn compare_pick_option_i32(a: Option<i32>, b: Option<i32>) -> Ordering {
-    match (a, b) {
-        (Some(av), Some(bv)) => av.cmp(&bv),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
-}
-
-fn compare_pick_usize_desc(a: usize, b: usize) -> Ordering {
-    b.cmp(&a)
-}
-
-fn compare_pick_biotype(a: Option<&str>, b: Option<&str>) -> Ordering {
-    let rank = |value: Option<&str>| match value {
-        Some("protein_coding") => 0_u8,
-        Some(other) if !other.is_empty() => 1_u8,
-        _ => 2_u8,
+    // Traceability:
+    // - Ensembl VEP release 115 `pick_worst_VariationFeatureOverlapAllele()`
+    //   parses APPRIS as `([A-Za-z]).+(\\d+)`, then adds 10 for
+    //   `alternative*` values
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L756-L767>
+    let Some(first) = raw
+        .chars()
+        .next()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .map(|ch| ch.to_ascii_lowercase())
+    else {
+        return 100;
     };
-    rank(a)
-        .cmp(&rank(b))
-        .then_with(|| a.unwrap_or("").cmp(b.unwrap_or("")))
+    let trailing_digits_len = raw
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
+    if trailing_digits_len == 0 {
+        return 100;
+    }
+    let digits = &raw[raw.len() - trailing_digits_len..];
+    let Some(mut grade) = digits.parse::<u8>().ok() else {
+        return 100;
+    };
+    if grade == 0 {
+        return 100;
+    }
+    if first == 'a' {
+        grade = grade.saturating_add(10);
+    }
+    grade
+}
+
+#[derive(Debug, Clone)]
+struct PickCandidateInfo {
+    assignment_idx: usize,
+    mane_select: u8,
+    mane_plus_clinical: u8,
+    canonical: u8,
+    ccds: u8,
+    length: i64,
+    biotype: u8,
+    tsl: i32,
+    appris: u8,
+    ensembl: u8,
+    refseq: u8,
+    rank: u32,
+}
+
+fn build_pick_candidate_info(
+    assignment_idx: usize,
+    assignments: &[TranscriptConsequence],
+    ctx: &PreparedContext<'_>,
+) -> PickCandidateInfo {
+    let tc = &assignments[assignment_idx];
+    let tx = tc.transcript_idx.map(|idx| ctx.transcripts[idx]);
+
+    let (mane_select, mane_plus_clinical, canonical, ccds, length, biotype, tsl, appris) =
+        if let Some(tx) = tx {
+            // Traceability:
+            // - Ensembl VEP release 115 `pick_worst_VariationFeatureOverlapAllele()`
+            //   initializes transcript criteria from transcript attributes,
+            //   translation/CDS length, and `_source_cache`
+            //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L702-L767>
+            let length =
+                if let Some(translation) = ctx.translation_by_tx.get(tx.transcript_id.as_str()) {
+                    let cds_len = translation
+                        .cds_sequence
+                        .as_ref()
+                        .map(|sequence| sequence.len())
+                        .or(translation.cds_len)
+                        .unwrap_or(0);
+                    -i64::try_from(cds_len).unwrap_or(i64::MAX)
+                } else {
+                    -tx.end.saturating_sub(tx.start).saturating_add(1)
+                };
+            (
+                if tx
+                    .mane_select
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    0
+                } else {
+                    1
+                },
+                if tx
+                    .mane_plus_clinical
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    0
+                } else {
+                    1
+                },
+                if tx.is_canonical { 0 } else { 1 },
+                if tx
+                    .ccds
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty() && value != "-")
+                {
+                    0
+                } else {
+                    1
+                },
+                length,
+                if tx.biotype == "protein_coding" { 0 } else { 1 },
+                tx.tsl.unwrap_or(100),
+                parse_appris_pick_rank(tx.appris.as_deref()),
+            )
+        } else {
+            (1, 1, 1, 1, 0, 1, 100, 100)
+        };
+
+    PickCandidateInfo {
+        assignment_idx,
+        mane_select,
+        mane_plus_clinical,
+        canonical,
+        ccds,
+        length,
+        biotype,
+        tsl,
+        appris,
+        ensembl: pick_assignment_source_rank(tx, "ensembl"),
+        refseq: pick_assignment_source_rank(tx, "refseq"),
+        rank: pick_assignment_rank(tc),
+    }
 }
 
 fn pick_assignment_gene_key(
     tc: &TranscriptConsequence,
     ctx: &PreparedContext<'_>,
 ) -> Option<String> {
+    // Traceability:
+    // - Ensembl VEP release 115 groups transcript consequences by
+    //   `transcript->{_gene_stable_id}`, only falling back to a gene-adaptor
+    //   lookup when that cache slot is absent
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L845-L855>
+    //
+    // We intentionally require the cache-provided `gene_stable_id` here and do
+    // not substitute `gene_symbol` or `transcript_id`, because those are local
+    // heuristics rather than VEP pick-group semantics.
     let tx = ctx.transcripts.get(tc.transcript_idx?)?;
-    tx.gene_stable_id
-        .clone()
-        .or_else(|| tx.gene_symbol.clone())
-        .or_else(|| Some(tx.transcript_id.clone()))
+    tx.gene_stable_id.clone()
 }
 
-fn pick_assignment_source_rank(tx: Option<&TranscriptFeature>, wanted: &str) -> bool {
+fn pick_assignment_source_rank(tx: Option<&TranscriptFeature>, wanted: &str) -> u8 {
     let Some(tx) = tx else {
-        return false;
+        return 1;
     };
-    let source = tx
+
+    // Traceability:
+    // - Ensembl VEP release 115 sets `$info->{lc($tr->{_source_cache})} = 0`
+    //   and only exact `ensembl` / `refseq` keys influence those categories
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L734-L741>
+    if tx
         .source
         .as_deref()
-        .and_then(normalize_source_label)
-        .unwrap_or_else(|| {
-            if tx.transcript_id.starts_with("ENS") {
-                "Ensembl".to_string()
-            } else if tx.transcript_id.starts_with("NM_")
-                || tx.transcript_id.starts_with("NR_")
-                || tx.transcript_id.starts_with("XM_")
-                || tx.transcript_id.starts_with("XR_")
-            {
-                "RefSeq".to_string()
-            } else {
-                String::new()
-            }
-        });
-    source == wanted
+        .is_some_and(|source| source.eq_ignore_ascii_case(wanted))
+    {
+        0
+    } else {
+        1
+    }
 }
 
 fn pick_assignment_rank(tc: &TranscriptConsequence) -> u32 {
     most_severe_term(tc.terms.iter())
         .map(|term| term.rank() as u32)
-        .unwrap_or(u32::MAX)
+        .unwrap_or(1000)
 }
 
-fn pick_assignment_length(tc: &TranscriptConsequence, ctx: &PreparedContext<'_>) -> usize {
-    let Some(tx_idx) = tc.transcript_idx else {
-        return 0;
-    };
-    let tx = ctx.transcripts[tx_idx];
-    if let Some(length) = ctx
-        .translation_by_tx
-        .get(tx.transcript_id.as_str())
-        .and_then(|translation| translation.protein_len.or(translation.cds_len))
-    {
-        return length;
+fn retain_best_pick_candidates<T, F>(
+    candidates: &mut Vec<PickCandidateInfo>,
+    mut key: F,
+) -> Option<usize>
+where
+    T: Ord + Copy,
+    F: FnMut(&PickCandidateInfo) -> T,
+{
+    candidates.sort_by_key(|candidate| key(candidate));
+    let best = key(&candidates[0]);
+    let keep = candidates
+        .iter()
+        .take_while(|candidate| key(candidate) == best)
+        .count();
+    if keep == 1 {
+        return Some(candidates[0].assignment_idx);
     }
-    tx.end
-        .saturating_sub(tx.start)
-        .saturating_add(1)
-        .try_into()
-        .unwrap_or(0)
+    candidates.truncate(keep);
+    None
 }
 
-fn compare_pick_assignments(
-    a_idx: usize,
-    b_idx: usize,
+fn pick_worst_assignment(
+    candidate_indices: &[usize],
     assignments: &[TranscriptConsequence],
     ctx: &PreparedContext<'_>,
     pick_order: &[PickCriterion],
-) -> Ordering {
-    let a = &assignments[a_idx];
-    let b = &assignments[b_idx];
-    let a_tx = a.transcript_idx.map(|idx| ctx.transcripts[idx]);
-    let b_tx = b.transcript_idx.map(|idx| ctx.transcripts[idx]);
+) -> Option<usize> {
+    // Traceability:
+    // - Ensembl VEP release 115
+    //   `OutputFactory::pick_worst_VariationFeatureOverlapAllele()`
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L679-L809>
+    //
+    // VEP computes category values for all candidates, stably sorts on one
+    // `pick_order` criterion at a time, keeps only the tied best candidates,
+    // and then repeats with the next criterion.
+    let mut candidates: Vec<PickCandidateInfo> = candidate_indices
+        .iter()
+        .copied()
+        .map(|assignment_idx| build_pick_candidate_info(assignment_idx, assignments, ctx))
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0].assignment_idx);
+    }
 
     for criterion in pick_order {
-        let ordering = match criterion {
-            PickCriterion::ManeSelect => compare_pick_bool(
-                a_tx.and_then(|tx| tx.mane_select.as_deref()).is_some(),
-                b_tx.and_then(|tx| tx.mane_select.as_deref()).is_some(),
-            ),
-            PickCriterion::ManePlusClinical => compare_pick_bool(
-                a_tx.and_then(|tx| tx.mane_plus_clinical.as_deref())
-                    .is_some(),
-                b_tx.and_then(|tx| tx.mane_plus_clinical.as_deref())
-                    .is_some(),
-            ),
-            PickCriterion::Canonical => compare_pick_bool(
-                a_tx.map(|tx| tx.is_canonical).unwrap_or(false),
-                b_tx.map(|tx| tx.is_canonical).unwrap_or(false),
-            ),
+        let winner = match criterion {
+            PickCriterion::ManeSelect => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.mane_select)
+            }
+            PickCriterion::ManePlusClinical => {
+                retain_best_pick_candidates(&mut candidates, |candidate| {
+                    candidate.mane_plus_clinical
+                })
+            }
+            PickCriterion::Canonical => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.canonical)
+            }
             PickCriterion::Appris => {
-                parse_appris_pick_rank(a_tx.and_then(|tx| tx.appris.as_deref())).cmp(
-                    &parse_appris_pick_rank(b_tx.and_then(|tx| tx.appris.as_deref())),
-                )
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.appris)
             }
             PickCriterion::Tsl => {
-                compare_pick_option_i32(a_tx.and_then(|tx| tx.tsl), b_tx.and_then(|tx| tx.tsl))
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.tsl)
             }
-            PickCriterion::Biotype => compare_pick_biotype(
-                a_tx.map(|tx| tx.biotype.as_str()),
-                b_tx.map(|tx| tx.biotype.as_str()),
-            ),
-            PickCriterion::Ccds => compare_pick_bool(
-                a_tx.and_then(|tx| tx.ccds.as_deref()).is_some(),
-                b_tx.and_then(|tx| tx.ccds.as_deref()).is_some(),
-            ),
-            PickCriterion::Rank => pick_assignment_rank(a).cmp(&pick_assignment_rank(b)),
-            PickCriterion::Length => compare_pick_usize_desc(
-                pick_assignment_length(a, ctx),
-                pick_assignment_length(b, ctx),
-            ),
-            PickCriterion::Ensembl => compare_pick_bool(
-                pick_assignment_source_rank(a_tx, "Ensembl"),
-                pick_assignment_source_rank(b_tx, "Ensembl"),
-            ),
-            PickCriterion::Refseq => compare_pick_bool(
-                pick_assignment_source_rank(a_tx, "RefSeq"),
-                pick_assignment_source_rank(b_tx, "RefSeq"),
-            ),
+            PickCriterion::Biotype => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.biotype)
+            }
+            PickCriterion::Ccds => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.ccds)
+            }
+            PickCriterion::Rank => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.rank)
+            }
+            PickCriterion::Length => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.length)
+            }
+            PickCriterion::Ensembl => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.ensembl)
+            }
+            PickCriterion::Refseq => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.refseq)
+            }
         };
-        if ordering != Ordering::Equal {
-            return ordering;
+        if winner.is_some() {
+            return winner;
         }
     }
 
-    a.transcript_idx
-        .cmp(&b.transcript_idx)
-        .then_with(|| a.transcript_id.cmp(&b.transcript_id))
-        .then_with(|| a_idx.cmp(&b_idx))
+    candidates.first().map(|candidate| candidate.assignment_idx)
 }
 
 fn append_pick_flag(flags: &mut Option<String>) {
@@ -2276,17 +2378,11 @@ fn mark_flag_pick_allele_gene(
     }
 
     for candidate_indices in grouped.values() {
-        if candidate_indices.is_empty() {
+        let Some(winner) =
+            pick_worst_assignment(candidate_indices, assignments, ctx, &pick_flags.pick_order)
+        else {
             continue;
-        }
-        let mut winner = candidate_indices[0];
-        for &candidate in candidate_indices.iter().skip(1) {
-            if compare_pick_assignments(candidate, winner, assignments, ctx, &pick_flags.pick_order)
-                == Ordering::Less
-            {
-                winner = candidate;
-            }
-        }
+        };
         append_pick_flag(&mut assignments[winner].flags);
     }
 }
@@ -8828,7 +8924,7 @@ impl TableProvider for AnnotateProvider {
 mod tests {
     use super::*;
     use crate::transcript_consequence::{
-        CachedPredictions, ProteinDomainFeature, SiftPolyphenCache, TranslationFeature,
+        CachedPredictions, FeatureType, ProteinDomainFeature, SiftPolyphenCache, TranslationFeature,
     };
 
     // ── format_appris ──────────────────────────────────────────────────
@@ -8897,6 +8993,152 @@ mod tests {
         let mut empty = None;
         append_pick_flag(&mut empty);
         assert_eq!(empty, Some("PICK".to_string()));
+    }
+
+    #[test]
+    fn test_parse_appris_pick_rank_matches_release_115() {
+        assert_eq!(parse_appris_pick_rank(Some("principal5")), 5);
+        assert_eq!(parse_appris_pick_rank(Some("alternative2")), 12);
+        assert_eq!(parse_appris_pick_rank(Some("other")), 100);
+        assert_eq!(parse_appris_pick_rank(None), 100);
+    }
+
+    #[test]
+    fn test_mark_flag_pick_allele_gene_requires_exact_source_match() {
+        let mut tx_havana = make_tx("ENST00000001", Some("GENE1"), Some("HGNC"), None);
+        tx_havana.gene_stable_id = Some("ENSG00000001".to_string());
+        tx_havana.biotype = "protein_coding".to_string();
+        tx_havana.source = Some("ensembl_havana".to_string());
+
+        let mut tx_ensembl = make_tx("ENST00000002", Some("GENE1"), Some("HGNC"), None);
+        tx_ensembl.gene_stable_id = Some("ENSG00000001".to_string());
+        tx_ensembl.biotype = "protein_coding".to_string();
+        tx_ensembl.source = Some("Ensembl".to_string());
+
+        let transcripts = vec![tx_havana, tx_ensembl];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let mut assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        mark_flag_pick_allele_gene(
+            &mut assignments,
+            &ctx,
+            &PickFlags {
+                flag_pick_allele_gene: true,
+                pick_order: vec![PickCriterion::Ensembl],
+            },
+        );
+
+        assert_eq!(assignments[0].flags, None);
+        assert_eq!(assignments[1].flags, Some("PICK".to_string()));
+    }
+
+    #[test]
+    fn test_mark_flag_pick_allele_gene_prefers_cds_length_over_protein_length() {
+        let mut tx_shorter_cds = make_tx("ENST00000011", Some("GENE1"), Some("HGNC"), None);
+        tx_shorter_cds.gene_stable_id = Some("ENSG00000011".to_string());
+        tx_shorter_cds.biotype = "protein_coding".to_string();
+
+        let mut tx_longer_cds = make_tx("ENST00000012", Some("GENE1"), Some("HGNC"), None);
+        tx_longer_cds.gene_stable_id = Some("ENSG00000011".to_string());
+        tx_longer_cds.biotype = "protein_coding".to_string();
+
+        let transcripts = vec![tx_shorter_cds, tx_longer_cds];
+        let translations = vec![
+            TranslationFeature {
+                transcript_id: "ENST00000011".to_string(),
+                cds_len: Some(90),
+                protein_len: Some(100),
+                translation_seq: None,
+                cds_sequence: Some("A".repeat(90)),
+                stable_id: None,
+                version: None,
+                protein_features: Vec::new(),
+            },
+            TranslationFeature {
+                transcript_id: "ENST00000012".to_string(),
+                cds_len: Some(99),
+                protein_len: Some(20),
+                translation_seq: None,
+                cds_sequence: Some("A".repeat(99)),
+                stable_id: None,
+                version: None,
+                protein_features: Vec::new(),
+            },
+        ];
+        let ctx = PreparedContext::new(&transcripts, &[], &translations, &[], &[], &[], &[]);
+        let mut assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        mark_flag_pick_allele_gene(
+            &mut assignments,
+            &ctx,
+            &PickFlags {
+                flag_pick_allele_gene: true,
+                pick_order: vec![PickCriterion::Length],
+            },
+        );
+
+        assert_eq!(assignments[0].flags, None);
+        assert_eq!(assignments[1].flags, Some("PICK".to_string()));
+    }
+
+    #[test]
+    fn test_mark_flag_pick_allele_gene_requires_gene_stable_id() {
+        let mut tx_a = make_tx("ENST00000021", Some("GENE1"), Some("HGNC"), None);
+        tx_a.biotype = "protein_coding".to_string();
+        tx_a.is_canonical = false;
+
+        let mut tx_b = make_tx("ENST00000022", Some("GENE1"), Some("HGNC"), None);
+        tx_b.biotype = "protein_coding".to_string();
+        tx_b.is_canonical = true;
+
+        let transcripts = vec![tx_a, tx_b];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let mut assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        mark_flag_pick_allele_gene(
+            &mut assignments,
+            &ctx,
+            &PickFlags {
+                flag_pick_allele_gene: true,
+                pick_order: vec![PickCriterion::Canonical],
+            },
+        );
+
+        assert_eq!(assignments[0].flags, None);
+        assert_eq!(assignments[1].flags, None);
     }
 
     // ── format_prediction ──────────────────────────────────────────────
