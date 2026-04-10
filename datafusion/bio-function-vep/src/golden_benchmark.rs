@@ -642,6 +642,49 @@ pub const CSQ_FIELD_NAMES_EVERYTHING: &[&str] = &[
     "TRANSCRIPTION_FACTORS",
 ];
 
+/// Return the CSQ field names for the selected transcript source mode.
+///
+/// The non-`everything` profile preserves the existing explicit benchmark field
+/// order and swaps the transcript-source block near `SOURCE`:
+/// - default Ensembl: `SOURCE`
+/// - RefSeq: `REFSEQ_MATCH`, `BAM_EDIT`
+/// - merged: `REFSEQ_MATCH`, `BAM_EDIT`, `SOURCE`
+///
+/// The `everything` profile inserts the RefSeq-specific fields next to the
+/// transcript metadata block, after `UNIPROT_ISOFORM`, matching VEP's flag
+/// expansion order more closely.
+pub fn csq_field_names_for_mode(everything: bool, refseq: bool, merged: bool) -> Vec<&'static str> {
+    let mut fields = if everything {
+        CSQ_FIELD_NAMES_EVERYTHING.to_vec()
+    } else {
+        CSQ_FIELD_NAMES.to_vec()
+    };
+
+    if everything {
+        if let Some(insert_at) = fields.iter().position(|field| *field == "GENE_PHENO") {
+            if merged {
+                fields.splice(insert_at..insert_at, ["REFSEQ_MATCH", "BAM_EDIT", "SOURCE"]);
+            } else if refseq {
+                fields.splice(insert_at..insert_at, ["REFSEQ_MATCH", "BAM_EDIT"]);
+            }
+        }
+        return fields;
+    }
+
+    if let Some(source_idx) = fields.iter().position(|field| *field == "SOURCE") {
+        if merged {
+            fields.splice(
+                source_idx..=source_idx,
+                ["REFSEQ_MATCH", "BAM_EDIT", "SOURCE"],
+            );
+        } else if refseq {
+            fields.splice(source_idx..=source_idx, ["REFSEQ_MATCH", "BAM_EDIT"]);
+        }
+    }
+
+    fields
+}
+
 /// Sample of a field-level mismatch for debugging.
 #[derive(Debug, Clone)]
 pub struct FieldMismatchSample {
@@ -1235,6 +1278,35 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[74], "PUBMED");
         assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[75], "MOTIF_NAME");
         assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[79], "TRANSCRIPTION_FACTORS");
+    }
+
+    #[test]
+    fn csq_field_names_for_refseq_and_merged_modes_insert_expected_fields() {
+        let refseq = csq_field_names_for_mode(false, true, false);
+        assert_eq!(refseq.len(), 75);
+        assert_eq!(refseq[28], "REFSEQ_MATCH");
+        assert_eq!(refseq[29], "BAM_EDIT");
+        assert_eq!(refseq[30], "VARIANT_CLASS");
+
+        let merged = csq_field_names_for_mode(false, false, true);
+        assert_eq!(merged.len(), 76);
+        assert_eq!(merged[28], "REFSEQ_MATCH");
+        assert_eq!(merged[29], "BAM_EDIT");
+        assert_eq!(merged[30], "SOURCE");
+        assert_eq!(merged[31], "VARIANT_CLASS");
+
+        let everything_refseq = csq_field_names_for_mode(true, true, false);
+        assert_eq!(everything_refseq.len(), 82);
+        assert_eq!(everything_refseq[36], "REFSEQ_MATCH");
+        assert_eq!(everything_refseq[37], "BAM_EDIT");
+        assert_eq!(everything_refseq[38], "GENE_PHENO");
+
+        let everything_merged = csq_field_names_for_mode(true, false, true);
+        assert_eq!(everything_merged.len(), 83);
+        assert_eq!(everything_merged[36], "REFSEQ_MATCH");
+        assert_eq!(everything_merged[37], "BAM_EDIT");
+        assert_eq!(everything_merged[38], "SOURCE");
+        assert_eq!(everything_merged[39], "GENE_PHENO");
     }
 
     #[test]

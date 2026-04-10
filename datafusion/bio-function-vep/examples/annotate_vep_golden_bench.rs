@@ -19,11 +19,11 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::golden_benchmark::{
-    CSQ_FIELD_NAMES_EVERYTHING, ComparisonReport, CsqFieldReport, CsqMultiplicityReport,
-    CsqUnmatchedReport, DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ, DEFAULT_EXTERNAL_VEP_CACHE_DIR,
+    ComparisonReport, CsqFieldReport, CsqMultiplicityReport, CsqUnmatchedReport,
+    DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ, DEFAULT_EXTERNAL_VEP_CACHE_DIR,
     DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, TermComparisonReport, VariantAnnotation, VariantDiscrepancy,
     VariantKey, collect_discrepancies, compare_annotation_terms, compare_annotations,
-    compare_csq_fields, compare_csq_fields_with_names, diagnose_csq_multiplicity,
+    compare_csq_fields_with_names, csq_field_names_for_mode, diagnose_csq_multiplicity,
     diagnose_unmatched_csq, ensure_local_copy, normalize_chrom, parse_vep_vcf_annotations,
     sample_gz_vcf_first_n,
 };
@@ -44,8 +44,18 @@ struct Args {
     work_dir: PathBuf,
     /// Directory containing context parquet files (transcripts, exons, etc.).
     context_dir: Option<PathBuf>,
+    /// Whether to use VEP --refseq flag (RefSeq-only cache/transcripts).
+    refseq: bool,
     /// Whether to use VEP --merged flag (for merged Ensembl+RefSeq cache).
     merged: bool,
+    /// Restrict to GENCODE basic transcripts.
+    gencode_basic: bool,
+    /// Restrict to GENCODE primary transcripts.
+    gencode_primary: bool,
+    /// Keep all RefSeq transcripts, including CCDS/EST-style rows.
+    all_refseq: bool,
+    /// Exclude predicted RefSeq transcripts (XM_/XR_).
+    exclude_predicted: bool,
     /// Which steps to run: "ensembl", "datafusion", or "ensembl,datafusion" (default: both).
     /// Comparison only runs when both steps are enabled.
     steps: Vec<String>,
@@ -76,6 +86,7 @@ impl Args {
     fn parse() -> Self {
         let args: Vec<String> = std::env::args().collect();
 
+        let refseq = args.iter().any(|a| a == "--refseq");
         // Check for --merged flag anywhere in args.
         let merged = args.iter().any(|a| a == "--merged");
         // Parse --steps=ensembl,datafusion (default: both).
@@ -153,7 +164,20 @@ impl Args {
                     .unwrap_or(DEFAULT_WORK_DIR),
             ),
             context_dir: positional.get(8).map(|s| PathBuf::from(s.as_str())),
+            refseq,
             merged,
+            gencode_basic: args
+                .iter()
+                .any(|a| a == "--gencode-basic" || a == "--gencode_basic"),
+            gencode_primary: args
+                .iter()
+                .any(|a| a == "--gencode-primary" || a == "--gencode_primary"),
+            all_refseq: args
+                .iter()
+                .any(|a| a == "--all-refseq" || a == "--all_refseq"),
+            exclude_predicted: args
+                .iter()
+                .any(|a| a == "--exclude-predicted" || a == "--exclude_predicted"),
             steps,
             extended_probes: args.iter().any(|a| a == "--extended-probes"),
             hgvs,
@@ -196,7 +220,12 @@ async fn main() -> Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(auto-discover)".to_string())
     );
+    println!("  refseq: {}", args.refseq);
     println!("  merged: {}", args.merged);
+    println!("  gencode_basic: {}", args.gencode_basic);
+    println!("  gencode_primary: {}", args.gencode_primary);
+    println!("  all_refseq: {}", args.all_refseq);
+    println!("  exclude_predicted: {}", args.exclude_predicted);
     println!("  steps: {:?}", args.steps);
     println!("  extended_probes: {}", args.extended_probes);
     println!("  hgvs: {}", args.hgvs);
@@ -306,7 +335,12 @@ async fn main() -> Result<()> {
                 &golden_vcf,
                 &args.work_dir,
                 &args.vep_cache_dir,
+                args.refseq,
                 args.merged,
+                args.gencode_basic,
+                args.gencode_primary,
+                args.all_refseq,
+                args.exclude_predicted,
                 args.hgvs,
                 args.shift_hgvs,
                 args.reference_fasta_path.as_deref(),
@@ -363,11 +397,8 @@ async fn main() -> Result<()> {
     if let (Some(golden), Some(ours)) = (&golden_annotations, &ours_annotations) {
         let report = compare_annotations(golden, ours);
         let term_report = compare_annotation_terms(golden, ours);
-        let csq_field_report = if args.everything {
-            compare_csq_fields_with_names(golden, ours, CSQ_FIELD_NAMES_EVERYTHING)
-        } else {
-            compare_csq_fields(golden, ours)
-        };
+        let csq_field_names = csq_field_names_for_mode(args.everything, args.refseq, args.merged);
+        let csq_field_report = compare_csq_fields_with_names(golden, ours, &csq_field_names);
         let discrepancies = collect_discrepancies(golden, ours);
         let unmatched_report = diagnose_unmatched_csq(golden, ours);
         let multiplicity_report = diagnose_csq_multiplicity(golden, ours);
@@ -461,8 +492,23 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
             entries.push("\"max_af\":true".to_string());
             entries.push("\"pubmed\":true".to_string());
         }
+        if args.refseq {
+            entries.push("\"refseq\":true".to_string());
+        }
         if args.merged {
             entries.push("\"merged\":true".to_string());
+        }
+        if args.gencode_basic {
+            entries.push("\"gencode_basic\":true".to_string());
+        }
+        if args.gencode_primary {
+            entries.push("\"gencode_primary\":true".to_string());
+        }
+        if args.all_refseq {
+            entries.push("\"all_refseq\":true".to_string());
+        }
+        if args.exclude_predicted {
+            entries.push("\"exclude_predicted\":true".to_string());
         }
         if args.use_fjall {
             entries.push("\"use_fjall\":true".to_string());
@@ -641,8 +687,28 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
         entries.push("\"pubmed\":true".to_string());
     }
 
+    if args.refseq {
+        entries.push("\"refseq\":true".to_string());
+    }
+
     if args.merged {
         entries.push("\"merged\":true".to_string());
+    }
+
+    if args.gencode_basic {
+        entries.push("\"gencode_basic\":true".to_string());
+    }
+
+    if args.gencode_primary {
+        entries.push("\"gencode_primary\":true".to_string());
+    }
+
+    if args.all_refseq {
+        entries.push("\"all_refseq\":true".to_string());
+    }
+
+    if args.exclude_predicted {
+        entries.push("\"exclude_predicted\":true".to_string());
     }
 
     if entries.is_empty() {
@@ -730,7 +796,12 @@ fn run_vep_docker(
     golden_vcf: &Path,
     work_dir: &Path,
     vep_cache_dir: &Path,
+    refseq: bool,
     merged: bool,
+    gencode_basic: bool,
+    gencode_primary: bool,
+    all_refseq: bool,
+    exclude_predicted: bool,
     hgvs: bool,
     shift_hgvs: Option<bool>,
     reference_fasta_path: Option<&Path>,
@@ -844,28 +915,31 @@ fn run_vep_docker(
         cmd.arg("--max_af");
         cmd.arg("--pubmed");
 
-        // Explicit field order matching CSQ_FIELD_NAMES (74 fields).
-        cmd.arg("--fields").arg(
-            "Allele,Consequence,IMPACT,SYMBOL,Gene,Feature_type,Feature,BIOTYPE,EXON,INTRON,\
-                  HGVSc,HGVSp,cDNA_position,CDS_position,Protein_position,Amino_acids,Codons,\
-                  Existing_variation,DISTANCE,STRAND,FLAGS,SYMBOL_SOURCE,HGNC_ID,\
-                  MOTIF_NAME,MOTIF_POS,HIGH_INF_POS,MOTIF_SCORE_CHANGE,TRANSCRIPTION_FACTORS,SOURCE,\
-                  VARIANT_CLASS,CANONICAL,TSL,MANE_SELECT,MANE_PLUS_CLINICAL,ENSP,GENE_PHENO,CCDS,\
-                  SWISSPROT,TREMBL,UNIPARC,UNIPROT_ISOFORM,\
-                  AF,AFR_AF,AMR_AF,EAS_AF,EUR_AF,SAS_AF,\
-                  gnomADe_AF,gnomADe_AFR,gnomADe_AMR,gnomADe_ASJ,gnomADe_EAS,gnomADe_FIN,\
-                  gnomADe_MID,gnomADe_NFE,gnomADe_REMAINING,gnomADe_SAS,\
-                  gnomADg_AF,gnomADg_AFR,gnomADg_AMI,gnomADg_AMR,gnomADg_ASJ,gnomADg_EAS,\
-                  gnomADg_FIN,gnomADg_MID,gnomADg_NFE,gnomADg_REMAINING,gnomADg_SAS,\
-                  MAX_AF,MAX_AF_POPS,CLIN_SIG,SOMATIC,PHENO,PUBMED",
-        );
+        let fields = csq_field_names_for_mode(false, refseq, merged).join(",");
+        cmd.arg("--fields").arg(fields);
     }
 
+    if refseq {
+        cmd.arg("--refseq");
+        cmd.arg("--use_given_ref");
+    }
     if merged {
         cmd.arg("--merged");
         // Merged caches auto-enable --use_transcript_ref which requires FASTA.
         // Use --use_given_ref to skip the FASTA requirement.
         cmd.arg("--use_given_ref");
+    }
+    if gencode_basic {
+        cmd.arg("--gencode_basic");
+    }
+    if gencode_primary {
+        cmd.arg("--gencode_primary");
+    }
+    if all_refseq {
+        cmd.arg("--all_refseq");
+    }
+    if exclude_predicted {
+        cmd.arg("--exclude_predicted");
     }
 
     let output = cmd.output().map_err(io_err)?;

@@ -143,7 +143,17 @@ pub struct TranscriptFeature {
     pub gene_symbol: Option<String>,
     pub gene_symbol_source: Option<String>,
     pub gene_hgnc_id: Option<String>,
+    /// Transcript display_xref ID used by VEP's RefSeq MT transcript filter.
+    pub display_xref_id: Option<String>,
+    /// Transcript source normalized to VEP-facing labels (`Ensembl` / `RefSeq`)
+    /// when available.
     pub source: Option<String>,
+    /// Pre-formatted REFSEQ_MATCH field, joined with `&` like VEP's VCF output.
+    pub refseq_match: Option<String>,
+    /// True when the transcript carries the `gencode_basic` attribute.
+    pub is_gencode_basic: bool,
+    /// True when the transcript carries the `gencode_primary` attribute.
+    pub is_gencode_primary: bool,
     /// RefSeq transcript edit status used by Ensembl when deciding whether
     /// transcript-level HGVS shifting must use edited transcript sequence.
     pub bam_edit_status: Option<String>,
@@ -5458,7 +5468,11 @@ mod tests {
             gene_symbol: None,
             gene_symbol_source: None,
             gene_hgnc_id: None,
+            display_xref_id: None,
             source: None,
+            refseq_match: None,
+            is_gencode_basic: false,
+            is_gencode_primary: false,
             bam_edit_status: None,
             has_non_polya_rna_edit: false,
             spliced_seq: None,

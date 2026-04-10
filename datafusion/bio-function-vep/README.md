@@ -60,7 +60,12 @@ SELECT * FROM annotate_vep(
 | `extended_probes` | Interval-overlap fallback for shifted indels | No |
 | `reference_fasta_path` | Indexed FASTA for HGVS genomic shifting | No |
 | `partitioned` | Use per-chromosome partitioned cache | No |
+| `refseq` | Use RefSeq cache/transcripts instead of Ensembl transcripts | No |
 | `merged` | Use VEP `--merged` Ensembl+RefSeq cache | No |
+| `gencode_basic` | Restrict consequences to transcripts with `gencode_basic` attribute | No |
+| `gencode_primary` | Restrict consequences to transcripts with `gencode_primary` attribute | No |
+| `all_refseq` | Keep all RefSeq cache transcripts, including CCDS/EST-style rows | No |
+| `exclude_predicted` | Exclude predicted RefSeq transcripts (`XM_` / `XR_`) | No |
 
 ## Output Modes
 
@@ -289,7 +294,7 @@ cargo run --release --example annotate_vep_golden_bench -- \
 | 7 | `work_dir` | Output directory for reports and intermediate files |
 | 8 | `context_dir` | Directory with context parquet files |
 
-**Optional flags:** `--steps=ensembl,datafusion`, `--extended-probes`, `--merged`
+**Optional flags:** `--steps=ensembl,datafusion`, `--extended-probes`, `--refseq`, `--merged`, `--gencode-basic`, `--gencode-primary`, `--all-refseq`, `--exclude-predicted`
 
 **Output files** (in `work_dir`, named by VCF stem):
 

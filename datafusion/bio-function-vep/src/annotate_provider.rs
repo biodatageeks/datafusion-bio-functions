@@ -93,7 +93,7 @@ use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
     ProteinDomainFeature, RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind,
     SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequence, TranscriptConsequenceEngine,
-    TranscriptFeature, TranslationFeature, VariantInput, is_vep_transcript,
+    TranscriptFeature, TranslationFeature, VariantInput,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -1142,6 +1142,102 @@ impl HgvsFlags {
     fn any(self) -> bool {
         self.hgvsc || self.hgvsp
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TranscriptSourceMode {
+    #[default]
+    Ensembl,
+    RefSeq,
+    Merged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct TranscriptSelectionFlags {
+    source_mode: TranscriptSourceMode,
+    gencode_basic: bool,
+    gencode_primary: bool,
+    all_refseq: bool,
+    exclude_predicted: bool,
+}
+
+impl TranscriptSelectionFlags {
+    fn from_options_json(options_json: Option<&str>) -> Result<Self> {
+        let parse = |key| {
+            options_json
+                .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
+                .unwrap_or(false)
+        };
+
+        let refseq = parse("refseq");
+        let merged = parse("merged");
+        let gencode_basic = parse("gencode_basic");
+        let gencode_primary = parse("gencode_primary");
+        let all_refseq = parse("all_refseq");
+        let exclude_predicted = parse("exclude_predicted");
+
+        if refseq && merged {
+            return Err(DataFusionError::Execution(
+                "annotate_vep(): --refseq and --merged are mutually exclusive".to_string(),
+            ));
+        }
+        if refseq && gencode_basic {
+            return Err(DataFusionError::Execution(
+                "annotate_vep(): --refseq and --gencode_basic are mutually exclusive".to_string(),
+            ));
+        }
+        if refseq && gencode_primary {
+            return Err(DataFusionError::Execution(
+                "annotate_vep(): --refseq and --gencode_primary are mutually exclusive".to_string(),
+            ));
+        }
+        if gencode_basic && gencode_primary {
+            return Err(DataFusionError::Execution(
+                "annotate_vep(): --gencode_basic and --gencode_primary are mutually exclusive"
+                    .to_string(),
+            ));
+        }
+
+        let source_mode = if merged {
+            TranscriptSourceMode::Merged
+        } else if refseq {
+            TranscriptSourceMode::RefSeq
+        } else {
+            TranscriptSourceMode::Ensembl
+        };
+
+        Ok(Self {
+            source_mode,
+            gencode_basic,
+            gencode_primary,
+            all_refseq,
+            exclude_predicted,
+        })
+    }
+
+    fn merged(self) -> bool {
+        self.source_mode == TranscriptSourceMode::Merged
+    }
+
+    fn refseq_fields(self) -> bool {
+        matches!(
+            self.source_mode,
+            TranscriptSourceMode::RefSeq | TranscriptSourceMode::Merged
+        )
+    }
+
+    fn source_field(self) -> bool {
+        self.source_mode == TranscriptSourceMode::Merged
+    }
+}
+
+#[derive(Debug, Default)]
+struct TranscriptRawMetadata {
+    display_xref_id: Option<String>,
+    source: Option<String>,
+    refseq_match: Option<String>,
+    is_gencode_basic: bool,
+    is_gencode_primary: bool,
 }
 
 /// A single co-located variant entry with allele and clinical metadata.
@@ -2300,6 +2396,7 @@ impl AnnotateProvider {
             let refseq_id_idx = schema.index_of("refseq_id").ok();
             let source_idx = schema.index_of("source").ok();
             let version_idx = schema.index_of("version").ok();
+            let raw_object_json_idx = schema.index_of("raw_object_json").ok();
             let cds_start_nf_idx = schema.index_of("cds_start_nf").ok();
             let cds_end_nf_idx = schema.index_of("cds_end_nf").ok();
             let mirna_regions_idx = schema.index_of("mature_mirna_regions").ok();
@@ -2394,6 +2491,17 @@ impl AnnotateProvider {
                 let flags_str = flags_str_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                     .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf));
+                let raw_metadata = raw_object_json_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .map(|raw| parse_transcript_raw_metadata(&raw))
+                    .unwrap_or_default();
+                let TranscriptRawMetadata {
+                    display_xref_id,
+                    source: raw_source,
+                    refseq_match,
+                    is_gencode_basic,
+                    is_gencode_primary,
+                } = raw_metadata;
 
                 let gene_stable_id =
                     gene_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
@@ -2405,7 +2513,11 @@ impl AnnotateProvider {
                     gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let refseq_id =
                     refseq_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let source = source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let source = raw_source.or_else(|| {
+                    source_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .and_then(|value| normalize_source_label(&value))
+                });
                 let bam_edit_status =
                     bam_edit_status_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
@@ -2464,7 +2576,11 @@ impl AnnotateProvider {
                     gene_symbol,
                     gene_symbol_source,
                     gene_hgnc_id,
+                    display_xref_id,
                     source,
+                    refseq_match,
+                    is_gencode_basic,
+                    is_gencode_primary,
                     bam_edit_status,
                     has_non_polya_rna_edit,
                     spliced_seq,
@@ -3217,11 +3333,8 @@ impl AnnotateProvider {
 
         let flags = VepFlags::from_options_json(self.options_json.as_deref());
         let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
-        let merged = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_bool_option(opts, "merged"))
-            .unwrap_or(false);
+        let transcript_selection =
+            TranscriptSelectionFlags::from_options_json(self.options_json.as_deref())?;
         let allowed_failed = self
             .options_json
             .as_deref()
@@ -3280,7 +3393,7 @@ impl AnnotateProvider {
             translations_sift_table: translations_sift_table.map(|s| s.to_string()),
             flags,
             hgvs_flags,
-            merged,
+            transcript_selection,
             allowed_failed,
             reference_fasta_path,
             upstream_distance,
@@ -3333,7 +3446,7 @@ impl AnnotateProvider {
         skip_typed_cols: bool,
         flags: &VepFlags,
         hgvs_flags: &HgvsFlags,
-        merged: bool,
+        transcript_selection: TranscriptSelectionFlags,
         hgvs_reference_reader: &mut Option<FastaReader>,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
@@ -3527,6 +3640,8 @@ impl AnnotateProvider {
         // Reusable permutation index for VEP-compatible CSQ ordering.
         // Allocated once, reused across all rows in the batch.
         let mut sorted_indices: Vec<usize> = Vec::new();
+        let include_refseq_fields = transcript_selection.refseq_fields();
+        let include_source_field = transcript_selection.source_field();
 
         for row in 0..batch.num_rows() {
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
@@ -3652,18 +3767,48 @@ impl AnnotateProvider {
                         .map(|t| impact_label(t.impact()))
                         .unwrap_or_else(|| impact_label(SoImpact::Modifier));
                     if flags.everything {
-                        let _ = write!(
-                            csq_buf,
-                            "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
-                             {variant_class}|||||||||||||||||||||\
-                             {batch3_suffix}|||||"
-                        );
+                        if include_source_field {
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
+                                 {variant_class}|||||||||||||||\
+                                 {batch3_suffix}|||||"
+                            );
+                        } else if include_refseq_fields {
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
+                                 {variant_class}||||||||||||||\
+                                 {batch3_suffix}|||||"
+                            );
+                        } else {
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
+                                 {variant_class}|||||||||||||||||||||\
+                                 {batch3_suffix}|||||"
+                            );
+                        }
                     } else {
-                        let _ = write!(
-                            csq_buf,
-                            "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
-                             {variant_class}||||||||||||{batch3_suffix}"
-                        );
+                        if include_source_field {
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}|||||||||||\
+                                 {variant_class}||||||||||||{batch3_suffix}"
+                            );
+                        } else if include_refseq_fields {
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||\
+                                 {variant_class}||||||||||||{batch3_suffix}"
+                            );
+                        } else {
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
+                                 {variant_class}||||||||||||{batch3_suffix}"
+                            );
+                        }
                     };
                 }
                 most_str = most_val.clone();
@@ -3843,7 +3988,14 @@ impl AnnotateProvider {
                         } else {
                             String::new()
                         };
-                        let source_val = if merged { source } else { "" };
+                        let refseq_match = tx_opt
+                            .and_then(|tx| tx.refseq_match.as_deref())
+                            .unwrap_or("");
+                        let bam_edit = tx_opt
+                            .and_then(|tx| tx.bam_edit_status.as_deref())
+                            .map(str::to_ascii_uppercase)
+                            .unwrap_or_default();
+                        let source_val = if include_source_field { source } else { "" };
 
                         // Batch 1 fields from transcript metadata.
                         let canonical = tx_opt
@@ -3989,49 +4141,135 @@ impl AnnotateProvider {
                             // Traceability:
                             // - VEP Constants.pm CSQ field order for --everything
                             //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
-                             {exon}|{intron}|{hgvsc}|{hgvsp}|\
-                             {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                             {existing_var}|{distance}|{strand_str}|{tc_flags}|\
-                             {variant_class}|{symbol_source}|{hgnc_id}|\
-                             {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                             {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{gene_pheno}|\
-                             {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
-                             {hgvs_offset}|\
-                             {batch3_suffix}|||||"
-                            );
+                            if include_source_field {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|\
+                                 {variant_class}|{symbol_source}|{hgnc_id}|\
+                                 {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
+                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{bam_edit}|{source_val}|{gene_pheno}|\
+                                 {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
+                                 {hgvs_offset}|\
+                                 {batch3_suffix}|||||"
+                                );
+                            } else if include_refseq_fields {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|\
+                                 {variant_class}|{symbol_source}|{hgnc_id}|\
+                                 {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
+                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{bam_edit}|{gene_pheno}|\
+                                 {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
+                                 {hgvs_offset}|\
+                                 {batch3_suffix}|||||"
+                                );
+                            } else {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|\
+                                 {variant_class}|{symbol_source}|{hgnc_id}|\
+                                 {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
+                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{gene_pheno}|\
+                                 {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
+                                 {hgvs_offset}|\
+                                 {batch3_suffix}|||||"
+                                );
+                            }
                         } else {
                             // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
-                             {exon}|{intron}|{hgvsc}|{hgvsp}|\
-                             {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                             {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
-                             |||||{source_val}|\
-                             {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
-                             {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
-                             {batch3_suffix}"
-                            );
+                            if include_source_field {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
+                                 |||||{refseq_match}|{bam_edit}|{source_val}|\
+                                 {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
+                                 {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
+                                 {batch3_suffix}"
+                                );
+                            } else if include_refseq_fields {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
+                                 |||||{refseq_match}|{bam_edit}|\
+                                 {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
+                                 {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
+                                 {batch3_suffix}"
+                                );
+                            } else {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
+                                 |||||{source_val}|\
+                                 {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
+                                 {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
+                                 {batch3_suffix}"
+                                );
+                            }
                         }
                     }
                     if csq_buf.is_empty() {
                         let impact = impact_label(SoImpact::Modifier);
                         if flags.everything {
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
-                             {variant_class}|||||||||||||||||||||\
-                             {batch3_suffix}|||||"
-                            );
+                            if include_source_field {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
+                                 {variant_class}|||||||||||||||\
+                                 {batch3_suffix}|||||"
+                                );
+                            } else if include_refseq_fields {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
+                                 {variant_class}||||||||||||||\
+                                 {batch3_suffix}|||||"
+                                );
+                            } else {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
+                                 {variant_class}|||||||||||||||||||||\
+                                 {batch3_suffix}|||||"
+                                );
+                            }
                         } else {
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
-                             {variant_class}||||||||||||{batch3_suffix}"
-                            );
+                            if include_source_field {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}|||||||||||\
+                                 {variant_class}||||||||||||{batch3_suffix}"
+                                );
+                            } else if include_refseq_fields {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||\
+                                 {variant_class}||||||||||||{batch3_suffix}"
+                                );
+                            } else {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
+                                 {variant_class}||||||||||||{batch3_suffix}"
+                                );
+                            }
                         }
                     }
                 } // end if !skip_csq (cache-miss CSQ formatting)
@@ -4822,6 +5060,186 @@ fn normalize_source_label(source: &str) -> Option<String> {
     }
 }
 
+fn json_unwrap_value(value: &Value) -> &Value {
+    value.get("__value").unwrap_or(value)
+}
+
+fn push_unique_string(out: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
+    if seen.insert(value.to_string()) {
+        out.push(value.to_string());
+    }
+}
+
+fn add_refseq_match_codes_from_compare_value(
+    value: &str,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    for part in value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let Some((_, suffix)) = part.rsplit_once(':') else {
+            continue;
+        };
+        match suffix {
+            "whole_transcript" => push_unique_string(out, seen, "rseq_ens_match_wt"),
+            "cds_only" => push_unique_string(out, seen, "rseq_ens_match_cds"),
+            _ => {}
+        }
+    }
+}
+
+fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata {
+    let Ok(root) = serde_json::from_str::<Value>(raw_object_json) else {
+        return TranscriptRawMetadata::default();
+    };
+    let tx = json_unwrap_value(&root);
+    let display_xref_id = tx
+        .get("display_xref")
+        .map(json_unwrap_value)
+        .and_then(|xref| xref.get("display_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let source = tx
+        .get("_source_cache")
+        .and_then(Value::as_str)
+        .and_then(normalize_source_label);
+
+    let mut refseq_match_codes = Vec::new();
+    let mut seen_refseq_match_codes = HashSet::new();
+    let mut is_gencode_basic = false;
+    let mut is_gencode_primary = false;
+
+    if let Some(attributes) = tx.get("attributes").and_then(Value::as_array) {
+        for attribute in attributes {
+            let attribute = json_unwrap_value(attribute);
+            let Some(code) = attribute.get("code").and_then(Value::as_str) else {
+                continue;
+            };
+            match code {
+                "gencode_basic" => is_gencode_basic = true,
+                "gencode_primary" => is_gencode_primary = true,
+                "enst_refseq_compare" => {
+                    if let Some(value) = attribute.get("value").and_then(Value::as_str) {
+                        add_refseq_match_codes_from_compare_value(
+                            value,
+                            &mut refseq_match_codes,
+                            &mut seen_refseq_match_codes,
+                        );
+                    }
+                }
+                _ if code.starts_with("rseq") => {
+                    push_unique_string(&mut refseq_match_codes, &mut seen_refseq_match_codes, code);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    TranscriptRawMetadata {
+        display_xref_id,
+        source,
+        refseq_match: (!refseq_match_codes.is_empty()).then(|| refseq_match_codes.join("&")),
+        is_gencode_basic,
+        is_gencode_primary,
+    }
+}
+
+fn is_ensembl_transcript(tx: &TranscriptFeature) -> bool {
+    tx.source.as_deref() == Some("Ensembl") || tx.transcript_id.starts_with("ENST")
+}
+
+fn is_refseq_transcript(tx: &TranscriptFeature) -> bool {
+    tx.source.as_deref() == Some("RefSeq")
+        || matches!(
+            tx.transcript_id.as_bytes().get(..2),
+            Some(b"NM") | Some(b"NR") | Some(b"XM") | Some(b"XR")
+        )
+}
+
+fn is_predicted_refseq_transcript(tx: &TranscriptFeature) -> bool {
+    tx.transcript_id.starts_with("XM_") || tx.transcript_id.starts_with("XR_")
+}
+
+fn is_mitochondrial_chrom(chrom: &str) -> bool {
+    matches!(
+        chrom.strip_prefix("chr").unwrap_or(chrom),
+        "M" | "MT" | "m" | "mt"
+    )
+}
+
+fn is_default_refseq_transcript_id(tx: &TranscriptFeature) -> bool {
+    let id = tx.transcript_id.as_str();
+    let starts_with_refseq_accession = id.len() >= 4
+        && id.as_bytes()[0].is_ascii_uppercase()
+        && id.as_bytes()[1].is_ascii_uppercase()
+        && id.as_bytes()[2] == b'_'
+        && id.as_bytes()[3].is_ascii_digit();
+    if starts_with_refseq_accession {
+        return true;
+    }
+
+    if is_mitochondrial_chrom(&tx.chrom) {
+        let is_mt_stable_id = (id.len() == 4 && id.chars().all(|ch| ch.is_ascii_digit()))
+            || id
+                .strip_prefix("rna-")
+                .unwrap_or(id)
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+                && id.strip_prefix("rna-").unwrap_or(id).len() >= 3;
+        if is_mt_stable_id {
+            return true;
+        }
+    }
+
+    tx.display_xref_id.as_deref().is_some_and(|display_id| {
+        let is_refseq_accession = display_id.len() >= 4
+            && display_id.as_bytes()[0].is_ascii_uppercase()
+            && display_id.as_bytes()[1].is_ascii_uppercase()
+            && display_id.as_bytes()[2] == b'_'
+            && display_id.as_bytes()[3].is_ascii_digit();
+        let is_mt_display_id =
+            display_id.len() == 4 && display_id.chars().all(|ch| ch.is_ascii_digit());
+        is_refseq_accession || is_mt_display_id
+    })
+}
+
+fn passes_transcript_selection(
+    tx: &TranscriptFeature,
+    selection: TranscriptSelectionFlags,
+) -> bool {
+    if tx.transcript_id.is_empty() {
+        return false;
+    }
+
+    if selection.gencode_basic && !tx.is_gencode_basic {
+        return false;
+    }
+    if selection.gencode_primary && !tx.is_gencode_primary {
+        return false;
+    }
+    if selection.exclude_predicted && is_predicted_refseq_transcript(tx) {
+        return false;
+    }
+
+    match selection.source_mode {
+        TranscriptSourceMode::Ensembl => is_ensembl_transcript(tx),
+        TranscriptSourceMode::RefSeq => {
+            is_refseq_transcript(tx)
+                && (selection.all_refseq || is_default_refseq_transcript_id(tx))
+        }
+        TranscriptSourceMode::Merged => {
+            if is_refseq_transcript(tx) {
+                selection.all_refseq || is_default_refseq_transcript_id(tx)
+            } else {
+                is_ensembl_transcript(tx)
+            }
+        }
+    }
+}
+
 /// Fill missing merged-mode `HGNC_ID` values for RefSeq rows using the paired
 /// Ensembl transcript mapping in the merged cache, with a unique-gene-symbol
 /// fallback when no explicit `refseq_id -> HGNC_ID` link exists.
@@ -5459,15 +5877,7 @@ fn apply_translateable_seq_overrides(
 }
 
 fn is_refseq_transcript_for_hydration(tx: &TranscriptFeature) -> bool {
-    tx.source
-        .as_deref()
-        .and_then(normalize_source_label)
-        .as_deref()
-        == Some("RefSeq")
-        || matches!(
-            tx.transcript_id.as_bytes().get(..2),
-            Some(b"NM") | Some(b"NR") | Some(b"XM") | Some(b"XR")
-        )
+    is_refseq_transcript(tx)
 }
 
 fn read_reference_sequence<R>(
@@ -5847,7 +6257,7 @@ struct ContigAnnotationConfig {
     translations_sift_table: Option<String>,
     flags: VepFlags,
     hgvs_flags: HgvsFlags,
-    merged: bool,
+    transcript_selection: TranscriptSelectionFlags,
     allowed_failed: i64,
     reference_fasta_path: Option<String>,
     upstream_distance: i64,
@@ -6331,7 +6741,7 @@ fn annotate_window(
             skip_typed_cols,
             &ann.config.flags,
             &ann.config.hgvs_flags,
-            ann.config.merged,
+            ann.config.transcript_selection,
             &mut ann.hgvs_reader,
         )?;
 
@@ -6888,7 +7298,7 @@ async fn prepare_contig_context(
         let (tx, seq) = tmp_provider.load_transcripts(table, &worklist).await?;
         let filtered: Vec<_> = tx
             .into_iter()
-            .filter(|t| is_vep_transcript(&t.transcript_id, config.merged))
+            .filter(|t| passes_transcript_selection(t, config.transcript_selection))
             .collect();
         (filtered, seq)
     } else {
@@ -7441,7 +7851,11 @@ mod tests {
             gene_symbol: symbol.map(|s| s.to_string()),
             gene_symbol_source: symbol_source.map(|s| s.to_string()),
             gene_hgnc_id: hgnc_id.map(|s| s.to_string()),
+            display_xref_id: None,
             source: None,
+            refseq_match: None,
+            is_gencode_basic: false,
+            is_gencode_primary: false,
             bam_edit_status: None,
             has_non_polya_rna_edit: false,
             spliced_seq: None,
@@ -7464,6 +7878,132 @@ mod tests {
             appris: None,
             ncrna_structure: None,
         }
+    }
+
+    fn make_selection_tx(id: &str, source: Option<&str>) -> TranscriptFeature {
+        let mut tx = make_tx(id, None, None, None);
+        tx.chrom = "1".to_string();
+        tx.biotype = "protein_coding".to_string();
+        tx.source = source.map(str::to_string);
+        tx
+    }
+
+    #[test]
+    fn test_transcript_selection_flags_reject_invalid_combinations() {
+        let err =
+            TranscriptSelectionFlags::from_options_json(Some("{\"refseq\":true,\"merged\":true}"))
+                .expect_err("refseq+merged should be rejected")
+                .to_string();
+        assert!(err.contains("--refseq and --merged"));
+
+        let err = TranscriptSelectionFlags::from_options_json(Some(
+            "{\"refseq\":true,\"gencode_basic\":true}",
+        ))
+        .expect_err("refseq+gencode_basic should be rejected")
+        .to_string();
+        assert!(err.contains("--refseq and --gencode_basic"));
+
+        let err = TranscriptSelectionFlags::from_options_json(Some(
+            "{\"gencode_basic\":true,\"gencode_primary\":true}",
+        ))
+        .expect_err("gencode_basic+gencode_primary should be rejected")
+        .to_string();
+        assert!(err.contains("--gencode_basic and --gencode_primary"));
+    }
+
+    #[test]
+    fn test_parse_transcript_raw_metadata_maps_refseq_compare_codes() {
+        let raw = r#"{
+          "__class":"Bio::EnsEMBL::Transcript",
+          "__value":{
+            "_source_cache":"RefSeq",
+            "display_xref":{"display_id":"NM_000001"},
+            "attributes":[
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_basic","value":"1"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_primary","value":"1"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only,ENST00000619216:whole_transcript"}}
+            ]
+          }
+        }"#;
+
+        let metadata = parse_transcript_raw_metadata(raw);
+        assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
+        assert_eq!(metadata.display_xref_id.as_deref(), Some("NM_000001"));
+        assert_eq!(
+            metadata.refseq_match.as_deref(),
+            Some("rseq_ens_match_cds&rseq_ens_match_wt")
+        );
+        assert!(metadata.is_gencode_basic);
+        assert!(metadata.is_gencode_primary);
+    }
+
+    #[test]
+    fn test_passes_transcript_selection_matches_vep_refseq_filters() {
+        let ensembl_tx = make_selection_tx("ENST00000311111", Some("Ensembl"));
+        let nm_tx = make_selection_tx("NM_000001", Some("RefSeq"));
+        let mut ccds_tx = make_selection_tx("CCDS1234.1", Some("RefSeq"));
+        ccds_tx.display_xref_id = Some("CCDS1234".to_string());
+        let xm_tx = make_selection_tx("XM_123456", Some("RefSeq"));
+        let mut gencode_tx = make_selection_tx("ENST00000322222", Some("Ensembl"));
+        gencode_tx.is_gencode_basic = true;
+        gencode_tx.is_gencode_primary = true;
+
+        let default_selection = TranscriptSelectionFlags::from_options_json(None).unwrap();
+        assert!(passes_transcript_selection(&ensembl_tx, default_selection));
+        assert!(!passes_transcript_selection(&nm_tx, default_selection));
+
+        let refseq_selection =
+            TranscriptSelectionFlags::from_options_json(Some("{\"refseq\":true}")).unwrap();
+        assert!(!passes_transcript_selection(&ensembl_tx, refseq_selection));
+        assert!(passes_transcript_selection(&nm_tx, refseq_selection));
+        assert!(
+            !passes_transcript_selection(&ccds_tx, refseq_selection),
+            "CCDS rows should be excluded unless all_refseq is enabled"
+        );
+
+        let all_refseq_selection = TranscriptSelectionFlags::from_options_json(Some(
+            "{\"merged\":true,\"all_refseq\":true}",
+        ))
+        .unwrap();
+        assert!(passes_transcript_selection(
+            &ensembl_tx,
+            all_refseq_selection
+        ));
+        assert!(passes_transcript_selection(&nm_tx, all_refseq_selection));
+        assert!(passes_transcript_selection(&ccds_tx, all_refseq_selection));
+
+        let exclude_predicted_selection = TranscriptSelectionFlags::from_options_json(Some(
+            "{\"merged\":true,\"all_refseq\":true,\"exclude_predicted\":true}",
+        ))
+        .unwrap();
+        assert!(
+            !passes_transcript_selection(&xm_tx, exclude_predicted_selection),
+            "XM_/XR_ transcripts should be filtered by exclude_predicted"
+        );
+
+        let gencode_basic_selection =
+            TranscriptSelectionFlags::from_options_json(Some("{\"gencode_basic\":true}")).unwrap();
+        assert!(passes_transcript_selection(
+            &gencode_tx,
+            gencode_basic_selection
+        ));
+        assert!(!passes_transcript_selection(
+            &ensembl_tx,
+            gencode_basic_selection
+        ));
+
+        let gencode_primary_selection = TranscriptSelectionFlags::from_options_json(Some(
+            "{\"merged\":true,\"gencode_primary\":true}",
+        ))
+        .unwrap();
+        assert!(passes_transcript_selection(
+            &gencode_tx,
+            gencode_primary_selection
+        ));
+        assert!(!passes_transcript_selection(
+            &nm_tx,
+            gencode_primary_selection
+        ));
     }
 
     /// Issue #92 — SNORA75 (snoRNA, SYMBOL_SOURCE=RFAM): VEP leaves HGNC_ID

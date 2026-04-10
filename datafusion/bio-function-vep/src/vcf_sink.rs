@@ -32,8 +32,18 @@ pub struct AnnotateVcfConfig {
     pub use_fjall: bool,
     /// Enable HGVS notation.
     pub hgvs: bool,
+    /// Use RefSeq cache/transcripts in place of Ensembl transcripts.
+    pub refseq: bool,
     /// Use merged Ensembl+RefSeq cache.
     pub merged: bool,
+    /// Restrict to GENCODE basic transcripts.
+    pub gencode_basic: bool,
+    /// Restrict to GENCODE primary transcripts.
+    pub gencode_primary: bool,
+    /// Keep all RefSeq transcripts, including CCDS/EST-style rows.
+    pub all_refseq: bool,
+    /// Exclude predicted RefSeq transcripts (XM_/XR_).
+    pub exclude_predicted: bool,
     /// Maximum allowed `failed` flag value from cache.
     pub failed: Option<i64>,
     /// Upstream/downstream distance for transcript overlap.
@@ -56,7 +66,12 @@ impl Default for AnnotateVcfConfig {
             reference_fasta_path: None,
             use_fjall: false,
             hgvs: false,
+            refseq: false,
             merged: false,
+            gencode_basic: false,
+            gencode_primary: false,
+            all_refseq: false,
+            exclude_predicted: false,
             failed: None,
             distance: None,
             compression: VcfCompressionType::Plain,
@@ -99,8 +114,23 @@ impl AnnotateVcfConfig {
         if self.hgvs {
             opts.insert("hgvs".into(), serde_json::Value::Bool(true));
         }
+        if self.refseq {
+            opts.insert("refseq".into(), serde_json::Value::Bool(true));
+        }
         if self.merged {
             opts.insert("merged".into(), serde_json::Value::Bool(true));
+        }
+        if self.gencode_basic {
+            opts.insert("gencode_basic".into(), serde_json::Value::Bool(true));
+        }
+        if self.gencode_primary {
+            opts.insert("gencode_primary".into(), serde_json::Value::Bool(true));
+        }
+        if self.all_refseq {
+            opts.insert("all_refseq".into(), serde_json::Value::Bool(true));
+        }
+        if self.exclude_predicted {
+            opts.insert("exclude_predicted".into(), serde_json::Value::Bool(true));
         }
         if let Some(failed) = self.failed {
             opts.insert(
@@ -290,11 +320,11 @@ pub async fn annotate_to_vcf(
                 }
                 arrow_field.with_metadata(merged_metadata)
             } else if name == "CSQ" {
-                let field_names = if config.everything {
-                    crate::golden_benchmark::CSQ_FIELD_NAMES_EVERYTHING
-                } else {
-                    crate::golden_benchmark::CSQ_FIELD_NAMES
-                };
+                let field_names = crate::golden_benchmark::csq_field_names_for_mode(
+                    config.everything,
+                    config.refseq,
+                    config.merged,
+                );
                 let format_list = field_names.join("|");
                 let description =
                     format!("Consequence annotations from annotate_vep. Format: {format_list}");
