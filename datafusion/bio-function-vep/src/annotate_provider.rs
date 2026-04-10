@@ -91,9 +91,9 @@ use crate::partitioned_cache::PartitionedParquetCache;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
-    ProteinDomainFeature, RegulatoryFeature, SiftPolyphenCache, StructuralFeature, SvEventKind,
-    SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequence, TranscriptConsequenceEngine,
-    TranscriptFeature, TranslationFeature, VariantInput,
+    ProteinDomainFeature, RefSeqEdit, RegulatoryFeature, SiftPolyphenCache, StructuralFeature,
+    SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequence,
+    TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature, VariantInput,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -1236,6 +1236,7 @@ struct TranscriptRawMetadata {
     display_xref_id: Option<String>,
     source: Option<String>,
     refseq_match: Option<String>,
+    refseq_edits: Vec<RefSeqEdit>,
     is_gencode_basic: bool,
     is_gencode_primary: bool,
 }
@@ -2499,6 +2500,7 @@ impl AnnotateProvider {
                     display_xref_id,
                     source: raw_source,
                     refseq_match,
+                    refseq_edits,
                     is_gencode_basic,
                     is_gencode_primary,
                 } = raw_metadata;
@@ -2579,6 +2581,7 @@ impl AnnotateProvider {
                     display_xref_id,
                     source,
                     refseq_match,
+                    refseq_edits,
                     is_gencode_basic,
                     is_gencode_primary,
                     bam_edit_status,
@@ -3771,14 +3774,14 @@ impl AnnotateProvider {
                             let _ = write!(
                                 csq_buf,
                                 "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
-                                 {variant_class}|||||||||||||||\
+                                 {variant_class}||||||||||||||||\
                                  {batch3_suffix}|||||"
                             );
                         } else if include_refseq_fields {
                             let _ = write!(
                                 csq_buf,
                                 "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
-                                 {variant_class}||||||||||||||\
+                                 {variant_class}|||||||||||||||\
                                  {batch3_suffix}|||||"
                             );
                         } else {
@@ -3793,13 +3796,13 @@ impl AnnotateProvider {
                         if include_source_field {
                             let _ = write!(
                                 csq_buf,
-                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}|||||||||||\
+                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
                                  {variant_class}||||||||||||{batch3_suffix}"
                             );
                         } else if include_refseq_fields {
                             let _ = write!(
                                 csq_buf,
-                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||\
+                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}|||||||||||\
                                  {variant_class}||||||||||||{batch3_suffix}"
                             );
                         } else {
@@ -3996,6 +3999,18 @@ impl AnnotateProvider {
                             .map(str::to_ascii_uppercase)
                             .unwrap_or_default();
                         let source_val = if include_source_field { source } else { "" };
+                        let refseq_offset = tx_opt
+                            .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
+                            .and_then(|tx| {
+                                tc.cdna_position
+                                    .as_deref()
+                                    .and_then(parse_cdna_position_start)
+                                    .and_then(|cdna_start| {
+                                        refseq_misalignment_offset(tx, cdna_start)
+                                    })
+                            })
+                            .map(|offset| offset.to_string())
+                            .unwrap_or_default();
 
                         // Batch 1 fields from transcript metadata.
                         let canonical = tx_opt
@@ -4150,7 +4165,7 @@ impl AnnotateProvider {
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|\
                                  {variant_class}|{symbol_source}|{hgnc_id}|\
                                  {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{bam_edit}|{source_val}|{gene_pheno}|\
+                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{source_val}|{refseq_offset}|{bam_edit}|{gene_pheno}|\
                                  {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                                  {hgvs_offset}|\
                                  {batch3_suffix}|||||"
@@ -4164,7 +4179,7 @@ impl AnnotateProvider {
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|\
                                  {variant_class}|{symbol_source}|{hgnc_id}|\
                                  {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{bam_edit}|{gene_pheno}|\
+                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{refseq_offset}|{bam_edit}|{gene_pheno}|\
                                  {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                                  {hgvs_offset}|\
                                  {batch3_suffix}|||||"
@@ -4193,7 +4208,7 @@ impl AnnotateProvider {
                                  {exon}|{intron}|{hgvsc}|{hgvsp}|\
                                  {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
-                                 |||||{refseq_match}|{bam_edit}|{source_val}|\
+                                 |||||{refseq_match}|{source_val}|{refseq_offset}|{bam_edit}|\
                                  {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                                  {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                                  {batch3_suffix}"
@@ -4205,7 +4220,7 @@ impl AnnotateProvider {
                                  {exon}|{intron}|{hgvsc}|{hgvsp}|\
                                  {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
-                                 |||||{refseq_match}|{bam_edit}|\
+                                 |||||{refseq_match}|{refseq_offset}|{bam_edit}|\
                                  {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                                  {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                                  {batch3_suffix}"
@@ -4232,14 +4247,14 @@ impl AnnotateProvider {
                                 let _ = write!(
                                     csq_buf,
                                     "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
-                                 {variant_class}|||||||||||||||\
+                                 {variant_class}||||||||||||||||\
                                  {batch3_suffix}|||||"
                                 );
                             } else if include_refseq_fields {
                                 let _ = write!(
                                     csq_buf,
                                     "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
-                                 {variant_class}||||||||||||||\
+                                 {variant_class}|||||||||||||||\
                                  {batch3_suffix}|||||"
                                 );
                             } else {
@@ -4254,13 +4269,13 @@ impl AnnotateProvider {
                             if include_source_field {
                                 let _ = write!(
                                     csq_buf,
-                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}|||||||||||\
+                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
                                  {variant_class}||||||||||||{batch3_suffix}"
                                 );
                             } else if include_refseq_fields {
                                 let _ = write!(
                                     csq_buf,
-                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||\
+                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}|||||||||||\
                                  {variant_class}||||||||||||{batch3_suffix}"
                                 );
                             } else {
@@ -5091,6 +5106,30 @@ fn add_refseq_match_codes_from_compare_value(
     }
 }
 
+fn parse_refseq_edit_attribute(attribute: &Value) -> Option<RefSeqEdit> {
+    let value = attribute.get("value").and_then(Value::as_str)?;
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    if !matches!(parts.len(), 2 | 3) {
+        return None;
+    }
+
+    let start = parts[0].parse::<i64>().ok()?;
+    let end = parts[1].parse::<i64>().ok()?;
+    let replacement_len = (parts.len() == 3).then(|| parts[2].len());
+    let same_len_substitution = replacement_len.is_some_and(|len| end - start + 1 == len as i64);
+    let op_x_edit = attribute
+        .get("description")
+        .and_then(Value::as_str)
+        .is_some_and(|description| description.contains("op=X"));
+
+    Some(RefSeqEdit {
+        start,
+        end,
+        replacement_len,
+        skip_refseq_offset: same_len_substitution || op_x_edit,
+    })
+}
+
 fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata {
     let Ok(root) = serde_json::from_str::<Value>(raw_object_json) else {
         return TranscriptRawMetadata::default();
@@ -5109,6 +5148,7 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
 
     let mut refseq_match_codes = Vec::new();
     let mut seen_refseq_match_codes = HashSet::new();
+    let mut refseq_edits = Vec::new();
     let mut is_gencode_basic = false;
     let mut is_gencode_primary = false;
 
@@ -5133,6 +5173,11 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
                 _ if code.starts_with("rseq") => {
                     push_unique_string(&mut refseq_match_codes, &mut seen_refseq_match_codes, code);
                 }
+                _ if code.starts_with("_rna_edit") => {
+                    if let Some(edit) = parse_refseq_edit_attribute(attribute) {
+                        refseq_edits.push(edit);
+                    }
+                }
                 _ => {}
             }
         }
@@ -5142,6 +5187,7 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
         display_xref_id,
         source,
         refseq_match: (!refseq_match_codes.is_empty()).then(|| refseq_match_codes.join("&")),
+        refseq_edits,
         is_gencode_basic,
         is_gencode_primary,
     }
@@ -5157,6 +5203,61 @@ fn is_refseq_transcript(tx: &TranscriptFeature) -> bool {
             tx.transcript_id.as_bytes().get(..2),
             Some(b"NM") | Some(b"NR") | Some(b"XM") | Some(b"XR")
         )
+}
+
+fn is_refseq_offset_transcript(tx: &TranscriptFeature) -> bool {
+    tx.transcript_id.starts_with("NM_") || tx.transcript_id.starts_with("XM_")
+}
+
+fn parse_cdna_position_start(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let mut chars = value.char_indices();
+    let mut sign = 1_i64;
+    let mut digit_start = 0;
+
+    if let Some((_, '-')) = chars.clone().next() {
+        sign = -1;
+        digit_start = 1;
+        chars.next();
+    }
+
+    let mut digit_end = digit_start;
+    for (idx, ch) in value[digit_start..].char_indices() {
+        if ch.is_ascii_digit() {
+            digit_end = digit_start + idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if digit_end == digit_start {
+        return None;
+    }
+
+    value[digit_start..digit_end]
+        .parse::<i64>()
+        .ok()
+        .map(|pos| pos * sign)
+}
+
+fn refseq_misalignment_offset(tx: &TranscriptFeature, cdna_start: i64) -> Option<i64> {
+    if !is_refseq_offset_transcript(tx) || tx.refseq_edits.is_empty() {
+        return None;
+    }
+
+    let mut offset = 0_i64;
+    for edit in &tx.refseq_edits {
+        if edit.skip_refseq_offset || cdna_start < edit.start {
+            continue;
+        }
+
+        if let Some(replacement_len) = edit.replacement_len {
+            offset += replacement_len as i64;
+        } else {
+            offset += -1 - (edit.end - edit.start);
+        }
+    }
+
+    (offset != 0).then_some(offset)
 }
 
 fn is_predicted_refseq_transcript(tx: &TranscriptFeature) -> bool {
@@ -7854,6 +7955,7 @@ mod tests {
             display_xref_id: None,
             source: None,
             refseq_match: None,
+            refseq_edits: Vec::new(),
             is_gencode_basic: false,
             is_gencode_primary: false,
             bam_edit_status: None,
@@ -7921,7 +8023,11 @@ mod tests {
             "attributes":[
               {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_basic","value":"1"}},
               {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_primary","value":"1"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only,ENST00000619216:whole_transcript"}}
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only,ENST00000619216:whole_transcript"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"10 9 AAA"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"20 20 G"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"30 31"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"40 40 T","description":"op=X"}}
             ]
           }
         }"#;
@@ -7935,6 +8041,74 @@ mod tests {
         );
         assert!(metadata.is_gencode_basic);
         assert!(metadata.is_gencode_primary);
+        assert_eq!(
+            metadata.refseq_edits,
+            vec![
+                RefSeqEdit {
+                    start: 10,
+                    end: 9,
+                    replacement_len: Some(3),
+                    skip_refseq_offset: false,
+                },
+                RefSeqEdit {
+                    start: 20,
+                    end: 20,
+                    replacement_len: Some(1),
+                    skip_refseq_offset: true,
+                },
+                RefSeqEdit {
+                    start: 30,
+                    end: 31,
+                    replacement_len: None,
+                    skip_refseq_offset: false,
+                },
+                RefSeqEdit {
+                    start: 40,
+                    end: 40,
+                    replacement_len: Some(1),
+                    skip_refseq_offset: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_refseq_misalignment_offset_matches_vep_rules() {
+        let mut tx = make_selection_tx("NM_000001", Some("RefSeq"));
+        tx.refseq_edits = vec![
+            RefSeqEdit {
+                start: 10,
+                end: 9,
+                replacement_len: Some(3),
+                skip_refseq_offset: false,
+            },
+            RefSeqEdit {
+                start: 20,
+                end: 20,
+                replacement_len: Some(1),
+                skip_refseq_offset: true,
+            },
+            RefSeqEdit {
+                start: 30,
+                end: 31,
+                replacement_len: None,
+                skip_refseq_offset: false,
+            },
+            RefSeqEdit {
+                start: 40,
+                end: 40,
+                replacement_len: Some(1),
+                skip_refseq_offset: true,
+            },
+        ];
+
+        assert_eq!(parse_cdna_position_start("35-36"), Some(35));
+        assert_eq!(parse_cdna_position_start("35+2"), Some(35));
+        assert_eq!(refseq_misalignment_offset(&tx, 35), Some(1));
+        assert_eq!(refseq_misalignment_offset(&tx, 5), None);
+
+        tx.transcript_id = "NR_000001".to_string();
+        assert_eq!(refseq_misalignment_offset(&tx, 35), None);
     }
 
     #[test]

@@ -123,6 +123,14 @@ pub struct TranscriptCdnaMapperSegment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefSeqEdit {
+    pub start: i64,
+    pub end: i64,
+    pub replacement_len: Option<usize>,
+    pub skip_refseq_offset: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptFeature {
     pub transcript_id: String,
     pub chrom: String,
@@ -150,6 +158,8 @@ pub struct TranscriptFeature {
     pub source: Option<String>,
     /// Pre-formatted REFSEQ_MATCH field, joined with `&` like VEP's VCF output.
     pub refseq_match: Option<String>,
+    /// Parsed `_rna_edit*` transcript attributes used for VEP `REFSEQ_OFFSET`.
+    pub refseq_edits: Vec<RefSeqEdit>,
     /// True when the transcript carries the `gencode_basic` attribute.
     pub is_gencode_basic: bool,
     /// True when the transcript carries the `gencode_primary` attribute.
@@ -5471,6 +5481,7 @@ mod tests {
             display_xref_id: None,
             source: None,
             refseq_match: None,
+            refseq_edits: Vec::new(),
             is_gencode_basic: false,
             is_gencode_primary: false,
             bam_edit_status: None,

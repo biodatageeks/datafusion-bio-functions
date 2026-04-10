@@ -1763,6 +1763,7 @@ mod tests {
             display_xref_id: None,
             source: None,
             refseq_match: None,
+            refseq_edits: Vec::new(),
             is_gencode_basic: false,
             is_gencode_primary: false,
             bam_edit_status: None,
