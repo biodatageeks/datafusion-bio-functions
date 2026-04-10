@@ -649,12 +649,26 @@ pub const CSQ_FIELD_NAMES_EVERYTHING: &[&str] = &[
 /// The `everything` profile inserts the RefSeq-specific fields next to the
 /// transcript metadata block, after `UNIPROT_ISOFORM`, matching VEP's flag
 /// expansion order more closely.
-pub fn csq_field_names_for_mode(everything: bool, refseq: bool, merged: bool) -> Vec<&'static str> {
+///
+/// `flag_pick_allele_gene` contributes a standalone `PICK` field immediately
+/// after `FLAGS`, not a synthetic token inside `FLAGS`.
+pub fn csq_field_names_for_mode(
+    everything: bool,
+    refseq: bool,
+    merged: bool,
+    include_pick: bool,
+) -> Vec<&'static str> {
     let mut fields = if everything {
         CSQ_FIELD_NAMES_EVERYTHING.to_vec()
     } else {
         CSQ_FIELD_NAMES.to_vec()
     };
+
+    if include_pick {
+        if let Some(flags_idx) = fields.iter().position(|field| *field == "FLAGS") {
+            fields.insert(flags_idx + 1, "PICK");
+        }
+    }
 
     if everything {
         if let Some(insert_at) = fields.iter().position(|field| *field == "GENE_PHENO") {
@@ -714,6 +728,10 @@ pub fn csq_field_names_for_mode(everything: bool, refseq: bool, merged: bool) ->
     }
 
     fields
+}
+
+pub fn csq_field_names(everything: bool, include_pick: bool) -> Vec<&'static str> {
+    csq_field_names_for_mode(everything, false, false, include_pick)
 }
 
 /// Sample of a field-level mismatch for debugging.
@@ -1313,7 +1331,7 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
 
     #[test]
     fn csq_field_names_for_refseq_and_merged_modes_insert_expected_fields() {
-        let refseq = csq_field_names_for_mode(false, true, false);
+        let refseq = csq_field_names_for_mode(false, true, false, false);
         assert_eq!(refseq.len(), 78);
         assert_eq!(refseq[28], "REFSEQ_MATCH");
         assert_eq!(refseq[29], "REFSEQ_OFFSET");
@@ -1322,7 +1340,7 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         assert_eq!(refseq[32], "BAM_EDIT");
         assert_eq!(refseq[33], "VARIANT_CLASS");
 
-        let merged = csq_field_names_for_mode(false, false, true);
+        let merged = csq_field_names_for_mode(false, false, true, false);
         assert_eq!(merged.len(), 79);
         assert_eq!(merged[28], "REFSEQ_MATCH");
         assert_eq!(merged[29], "SOURCE");
@@ -1332,7 +1350,7 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         assert_eq!(merged[33], "BAM_EDIT");
         assert_eq!(merged[34], "VARIANT_CLASS");
 
-        let everything_refseq = csq_field_names_for_mode(true, true, false);
+        let everything_refseq = csq_field_names_for_mode(true, true, false, false);
         assert_eq!(everything_refseq.len(), 85);
         assert_eq!(everything_refseq[36], "REFSEQ_MATCH");
         assert_eq!(everything_refseq[37], "REFSEQ_OFFSET");
@@ -1341,7 +1359,7 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         assert_eq!(everything_refseq[40], "BAM_EDIT");
         assert_eq!(everything_refseq[41], "GENE_PHENO");
 
-        let everything_merged = csq_field_names_for_mode(true, false, true);
+        let everything_merged = csq_field_names_for_mode(true, false, true, false);
         assert_eq!(everything_merged.len(), 86);
         assert_eq!(everything_merged[36], "REFSEQ_MATCH");
         assert_eq!(everything_merged[37], "SOURCE");
@@ -1350,6 +1368,21 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         assert_eq!(everything_merged[40], "USED_REF");
         assert_eq!(everything_merged[41], "BAM_EDIT");
         assert_eq!(everything_merged[42], "GENE_PHENO");
+    }
+
+    #[test]
+    fn csq_field_names_pick_inserts_standalone_pick_after_flags() {
+        let default_fields = csq_field_names(false, true);
+        assert_eq!(default_fields.len(), 75);
+        assert_eq!(default_fields[20], "FLAGS");
+        assert_eq!(default_fields[21], "PICK");
+        assert_eq!(default_fields[22], "SYMBOL_SOURCE");
+
+        let everything_fields = csq_field_names(true, true);
+        assert_eq!(everything_fields.len(), 81);
+        assert_eq!(everything_fields[20], "FLAGS");
+        assert_eq!(everything_fields[21], "PICK");
+        assert_eq!(everything_fields[22], "VARIANT_CLASS");
     }
 
     #[test]

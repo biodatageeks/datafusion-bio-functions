@@ -573,6 +573,8 @@ pub struct TranscriptConsequence {
     pub distance: Option<i64>,
     /// FLAGS: e.g. "cds_start_NF", "cds_end_NF".
     pub flags: Option<String>,
+    /// VEP `PICK` output flag emitted when this consequence wins a pick mode.
+    pub picked: bool,
     /// Override biotype for non-transcript features (e.g. regulatory feature_type).
     pub biotype_override: Option<String>,
     /// HGVSc notation (e.g. "ENST00000379410.6:c.1043G>A").

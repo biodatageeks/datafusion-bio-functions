@@ -24,6 +24,10 @@ pub type OnBatchWritten = Box<dyn Fn(usize, usize, usize) + Send + Sync>;
 pub struct AnnotateVcfConfig {
     /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
     pub everything: bool,
+    /// Add standalone `PICK=1` markers for the chosen transcript per allele+gene.
+    pub flag_pick_allele_gene: bool,
+    /// Override Ensembl VEP's default pick-order ranking.
+    pub pick_order: Option<String>,
     /// Use interval-overlap fallback for shifted indels.
     pub extended_probes: bool,
     /// Path to indexed reference FASTA (required for `everything` / `hgvs`).
@@ -74,6 +78,8 @@ impl Default for AnnotateVcfConfig {
     fn default() -> Self {
         Self {
             everything: false,
+            flag_pick_allele_gene: false,
+            pick_order: None,
             extended_probes: false,
             reference_fasta_path: None,
             use_fjall: false,
@@ -116,6 +122,18 @@ impl AnnotateVcfConfig {
         opts.insert("partitioned".into(), serde_json::Value::Bool(true));
         if self.everything {
             opts.insert("everything".into(), serde_json::Value::Bool(true));
+        }
+        if self.flag_pick_allele_gene {
+            opts.insert(
+                "flag_pick_allele_gene".into(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if let Some(ref pick_order) = self.pick_order {
+            opts.insert(
+                "pick_order".into(),
+                serde_json::Value::String(pick_order.clone()),
+            );
         }
         if self.extended_probes {
             opts.insert("extended_probes".into(), serde_json::Value::Bool(true));
@@ -179,6 +197,17 @@ impl AnnotateVcfConfig {
         }
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
+}
+
+fn csq_header_description(config: &AnnotateVcfConfig) -> String {
+    let field_names = crate::golden_benchmark::csq_field_names_for_mode(
+        config.everything,
+        config.refseq,
+        config.merged,
+        config.flag_pick_allele_gene,
+    );
+    let format_list = field_names.join("|");
+    format!("Consequence annotations from Ensembl VEP. Format: {format_list}")
 }
 
 /// Annotate a VCF file and write results to an output VCF.
@@ -356,14 +385,7 @@ pub async fn annotate_to_vcf(
                 }
                 arrow_field.with_metadata(merged_metadata)
             } else if name == "CSQ" {
-                let field_names = crate::golden_benchmark::csq_field_names_for_mode(
-                    config.everything,
-                    config.refseq,
-                    config.merged,
-                );
-                let format_list = field_names.join("|");
-                let description =
-                    format!("Consequence annotations from annotate_vep. Format: {format_list}");
+                let description = csq_header_description(config);
                 let mut meta = std::collections::HashMap::new();
                 meta.insert("bio.vcf.field.field_type".to_string(), "INFO".to_string());
                 meta.insert("bio.vcf.field.description".to_string(), description);
@@ -420,4 +442,37 @@ pub async fn annotate_to_vcf(
     pb.finish_and_clear();
 
     Ok(total_rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_options_json_emits_pick_flags() {
+        let config = AnnotateVcfConfig {
+            everything: true,
+            flag_pick_allele_gene: true,
+            pick_order: Some("mane_select,tsl,canonical".to_string()),
+            ..Default::default()
+        };
+
+        let json = config.to_options_json();
+        assert!(json.contains("\"everything\":true"));
+        assert!(json.contains("\"flag_pick_allele_gene\":true"));
+        assert!(json.contains("\"pick_order\":\"mane_select,tsl,canonical\""));
+    }
+
+    #[test]
+    fn test_csq_header_description_matches_vep_pick_layout() {
+        let config = AnnotateVcfConfig {
+            everything: true,
+            flag_pick_allele_gene: true,
+            ..Default::default()
+        };
+
+        let description = csq_header_description(&config);
+        assert!(description.starts_with("Consequence annotations from Ensembl VEP. Format: "));
+        assert!(description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
+    }
 }
