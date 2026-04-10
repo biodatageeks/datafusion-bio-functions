@@ -1223,7 +1223,7 @@ dependencies = [
  "futures",
  "indicatif",
  "log",
- "lz4_flex 0.12.0",
+ "lz4_flex 0.12.1",
  "noodles-core 0.16.0",
  "noodles-fasta",
  "noodles-vcf 0.80.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
@@ -2909,9 +2909,9 @@ dependencies = [
 
 [[package]]
 name = "lz4_flex"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab6473172471198271ff72e9379150e9dfd70d8e533e0752a27e515b48dd375e"
+checksum = "98c23545df7ecf1b16c303910a69b079e8e251d60f7dd2cc9b4177f2afaf1746"
 dependencies = [
  "twox-hash",
 ]
