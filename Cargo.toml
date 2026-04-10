@@ -13,5 +13,5 @@ edition = "2024"
 [workspace.dependencies]
 datafusion = { version = "50.3.0" }
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "rt", "macros"] }
-futures = "0.3.31"
+futures = "0.3.32"
 log = "0.4.27"
