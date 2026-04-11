@@ -1237,6 +1237,7 @@ struct TranscriptRawMetadata {
     source: Option<String>,
     refseq_match: Option<String>,
     refseq_edits: Vec<RefSeqEdit>,
+    flags_str: Option<String>,
     is_gencode_basic: bool,
     is_gencode_primary: bool,
 }
@@ -2489,9 +2490,6 @@ impl AnnotateProvider {
                         cdna_mapper_segments_from_list_column(batch.column(idx).as_ref(), row)
                     })
                     .unwrap_or_default();
-                let flags_str = flags_str_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf));
                 let raw_metadata = raw_object_json_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                     .map(|raw| parse_transcript_raw_metadata(&raw))
@@ -2501,9 +2499,14 @@ impl AnnotateProvider {
                     source: raw_source,
                     refseq_match,
                     refseq_edits,
+                    flags_str: raw_flags_str,
                     is_gencode_basic,
                     is_gencode_primary,
                 } = raw_metadata;
+                let flags_str = flags_str_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or(raw_flags_str)
+                    .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf));
 
                 let gene_stable_id =
                     gene_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
@@ -4011,6 +4014,8 @@ impl AnnotateProvider {
                             })
                             .map(|offset| offset.to_string())
                             .unwrap_or_default();
+                        let given_ref = tc.given_ref.as_deref().unwrap_or("");
+                        let used_ref = tc.used_ref.as_deref().unwrap_or("");
 
                         // Batch 1 fields from transcript metadata.
                         let canonical = tx_opt
@@ -4165,7 +4170,7 @@ impl AnnotateProvider {
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|\
                                  {variant_class}|{symbol_source}|{hgnc_id}|\
                                  {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{source_val}|{refseq_offset}|||{bam_edit}|{gene_pheno}|\
+                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}|{gene_pheno}|\
                                  {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                                  {hgvs_offset}|\
                                  {batch3_suffix}|||||"
@@ -4179,7 +4184,7 @@ impl AnnotateProvider {
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|\
                                  {variant_class}|{symbol_source}|{hgnc_id}|\
                                  {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{refseq_offset}|||{bam_edit}|{gene_pheno}|\
+                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}|{gene_pheno}|\
                                  {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                                  {hgvs_offset}|\
                                  {batch3_suffix}|||||"
@@ -4208,7 +4213,7 @@ impl AnnotateProvider {
                                  {exon}|{intron}|{hgvsc}|{hgvsp}|\
                                  {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
-                                 |||||{refseq_match}|{source_val}|{refseq_offset}|||{bam_edit}|\
+                                 |||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}|\
                                  {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                                  {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                                  {batch3_suffix}"
@@ -4220,7 +4225,7 @@ impl AnnotateProvider {
                                  {exon}|{intron}|{hgvsc}|{hgvsp}|\
                                  {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
-                                 |||||{refseq_match}|{refseq_offset}|||{bam_edit}|\
+                                 |||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}|\
                                  {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                                  {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                                  {batch3_suffix}"
@@ -5085,27 +5090,6 @@ fn push_unique_string(out: &mut Vec<String>, seen: &mut HashSet<String>, value: 
     }
 }
 
-fn add_refseq_match_codes_from_compare_value(
-    value: &str,
-    out: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-) {
-    for part in value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        let Some((_, suffix)) = part.rsplit_once(':') else {
-            continue;
-        };
-        match suffix {
-            "whole_transcript" => push_unique_string(out, seen, "rseq_ens_match_wt"),
-            "cds_only" => push_unique_string(out, seen, "rseq_ens_match_cds"),
-            _ => {}
-        }
-    }
-}
-
 fn parse_refseq_edit_attribute(attribute: &Value) -> Option<RefSeqEdit> {
     let value = attribute.get("value").and_then(Value::as_str)?;
     let parts: Vec<&str> = value.split_whitespace().collect();
@@ -5148,6 +5132,8 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
 
     let mut refseq_match_codes = Vec::new();
     let mut seen_refseq_match_codes = HashSet::new();
+    let mut flags = Vec::new();
+    let mut seen_flags = HashSet::new();
     let mut refseq_edits = Vec::new();
     let mut is_gencode_basic = false;
     let mut is_gencode_primary = false;
@@ -5161,14 +5147,8 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
             match code {
                 "gencode_basic" => is_gencode_basic = true,
                 "gencode_primary" => is_gencode_primary = true,
-                "enst_refseq_compare" => {
-                    if let Some(value) = attribute.get("value").and_then(Value::as_str) {
-                        add_refseq_match_codes_from_compare_value(
-                            value,
-                            &mut refseq_match_codes,
-                            &mut seen_refseq_match_codes,
-                        );
-                    }
+                "cds_start_NF" | "cds_end_NF" => {
+                    push_unique_string(&mut flags, &mut seen_flags, code)
                 }
                 _ if code.starts_with("rseq") => {
                     push_unique_string(&mut refseq_match_codes, &mut seen_refseq_match_codes, code);
@@ -5188,6 +5168,7 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
         source,
         refseq_match: (!refseq_match_codes.is_empty()).then(|| refseq_match_codes.join("&")),
         refseq_edits,
+        flags_str: (!flags.is_empty()).then(|| flags.join("&")),
         is_gencode_basic,
         is_gencode_primary,
     }
@@ -5417,19 +5398,16 @@ fn backfill_missing_hgnc_ids(
                 continue;
             }
         }
-        // Symbol-based fallback: only apply when hgnc_backfill is enabled or
-        // the transcript's gene_symbol_source is "HGNC".  VEP derives HGNC_ID
-        // from each transcript's gene `display_xref`; genes whose
-        // SYMBOL_SOURCE is RFAM, EntrezGene, or absent may or may not carry
-        // an HGNC `display_xref`, and the cache's per-transcript
-        // `gene_hgnc_id` column already reflects that correctly.  The symbol
-        // fallback must only fill gaps for HGNC-source transcripts where the
-        // cache is incomplete (issue #92).
+        // Symbol-based fallback: keep the strict default for Ensembl
+        // non-HGNC-source transcripts (issue #92), but allow RefSeq rows.
+        // The merged cache often omits promoted `gene_hgnc_id` on RefSeq
+        // transcript rows even when VEP's gene object emits it.
         let source_is_hgnc = tx
             .gene_symbol_source
             .as_deref()
             .is_some_and(|s| s == "HGNC");
-        if hgnc_backfill || source_is_hgnc {
+        let source_is_refseq = is_refseq_transcript(tx);
+        if hgnc_backfill || source_is_hgnc || source_is_refseq {
             if let Some(symbol) = tx.gene_symbol.as_deref() {
                 if let Some(hgnc_id) = unique_hgnc_by_symbol.get(symbol) {
                     tx.gene_hgnc_id = Some(hgnc_id.clone());
@@ -8014,7 +7992,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_transcript_raw_metadata_maps_refseq_compare_codes() {
+    fn test_parse_transcript_raw_metadata_uses_direct_refseq_match_codes() {
         let raw = r#"{
           "__class":"Bio::EnsEMBL::Transcript",
           "__value":{
@@ -8024,6 +8002,8 @@ mod tests {
               {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_basic","value":"1"}},
               {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_primary","value":"1"}},
               {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only,ENST00000619216:whole_transcript"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"rseq_ens_match_cds","value":"1"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"cds_start_NF","value":"1"}},
               {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"10 9 AAA"}},
               {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"20 20 G"}},
               {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"30 31"}},
@@ -8035,10 +8015,8 @@ mod tests {
         let metadata = parse_transcript_raw_metadata(raw);
         assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
         assert_eq!(metadata.display_xref_id.as_deref(), Some("NM_000001"));
-        assert_eq!(
-            metadata.refseq_match.as_deref(),
-            Some("rseq_ens_match_cds&rseq_ens_match_wt")
-        );
+        assert_eq!(metadata.refseq_match.as_deref(), Some("rseq_ens_match_cds"));
+        assert_eq!(metadata.flags_str.as_deref(), Some("cds_start_NF"));
         assert!(metadata.is_gencode_basic);
         assert!(metadata.is_gencode_primary);
         assert_eq!(
@@ -8109,6 +8087,21 @@ mod tests {
 
         tx.transcript_id = "NR_000001".to_string();
         assert_eq!(refseq_misalignment_offset(&tx, 35), None);
+    }
+
+    #[test]
+    fn test_parse_transcript_raw_metadata_ignores_refseq_compare_without_direct_code() {
+        let raw = r#"{
+          "__class":"Bio::EnsEMBL::Transcript",
+          "__value":{
+            "attributes":[
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only"}}
+            ]
+          }
+        }"#;
+
+        let metadata = parse_transcript_raw_metadata(raw);
+        assert_eq!(metadata.refseq_match, None);
     }
 
     #[test]
@@ -8307,6 +8300,26 @@ mod tests {
             transcripts[1].gene_hgnc_id, None,
             "EntrezGene-source transcript should NOT get HGNC_ID when hgnc_backfill=false"
         );
+    }
+
+    /// RefSeq/Gnomon rows in the merged cache can carry EntrezGene
+    /// SYMBOL_SOURCE while VEP still emits the gene object's HGNC display_xref.
+    #[test]
+    fn test_backfill_hgnc_refseq_entrezgene_source_filled_by_default() {
+        let tx_hgnc = make_tx(
+            "ENST00000400906",
+            Some("SLC2A7"),
+            Some("HGNC"),
+            Some("HGNC:13445"),
+        );
+        let mut tx_refseq = make_tx("XM_011540824.3", Some("SLC2A7"), Some("EntrezGene"), None);
+        tx_refseq.source = Some("RefSeq".to_string());
+
+        let mut transcripts = vec![tx_hgnc, tx_refseq];
+        let refseq_ids = vec![None, None];
+
+        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
+        assert_eq!(transcripts[1].gene_hgnc_id.as_deref(), Some("HGNC:13445"));
     }
 
     /// RefSeq ID-based backfill still works regardless of `hgnc_backfill` flag.

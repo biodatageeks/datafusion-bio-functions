@@ -495,6 +495,11 @@ pub struct TranscriptConsequence {
     pub hgvsc: Option<String>,
     /// HGVSp notation (e.g. "ENSP00000368698.2:p.Arg348His").
     pub hgvsp: Option<String>,
+    /// GIVEN_REF field: VEP-normalized reference allele in VF orientation.
+    pub given_ref: Option<String>,
+    /// USED_REF field: transcript-reference allele after RefSeq edit handling,
+    /// emitted in VF/genomic orientation.
+    pub used_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -841,6 +846,8 @@ impl TranscriptConsequenceEngine {
                         let exon_str = which_exon_str(variant, &tx_exons);
                         let intron_str = which_intron_str(variant, &tx_exons, tx.strand);
                         let cdna_position = compute_cdna_position(variant, tx, &tx_exons);
+                        let given_ref = given_ref_for_output(variant);
+                        let used_ref = used_ref_for_transcript_variant(variant, tx, &tx_exons);
                         let original_allows_protein_hgvs =
                             original_terms_allow_protein_hgvs(&terms);
                         let (cds_position, protein_position, amino_acids, codons, protein_hgvs) =
@@ -906,13 +913,15 @@ impl TranscriptConsequenceEngine {
                                 (None, None, None, None, protein_hgvs)
                             };
                         let flags = compute_flags(tx);
+                        let hgvsc_ref_allele =
+                            used_ref.as_deref().unwrap_or(variant.ref_allele.as_str());
                         // Compute HGVSc notation.
                         let hgvsc = crate::hgvs::format_hgvsc(
                             tx,
                             &tx_exons,
                             cdna_position.as_deref(),
                             cds_position.as_deref(),
-                            &variant.ref_allele,
+                            hgvsc_ref_allele,
                             &variant.alt_allele,
                             variant.start,
                             variant.end,
@@ -949,10 +958,14 @@ impl TranscriptConsequenceEngine {
                             flags,
                             hgvsc,
                             hgvsp,
+                            given_ref,
+                            used_ref,
                             ..Default::default()
                         });
                     }
                 } else if let Some((term, dist)) = self.upstream_downstream_term(variant, tx) {
+                    let given_ref = given_ref_for_output(variant);
+                    let used_ref = used_ref_for_transcript_variant(variant, tx, &tx_exons);
                     out.push(TranscriptConsequence {
                         transcript_id: Some(tx.transcript_id.clone()),
                         transcript_idx: Some(tx_idx),
@@ -960,6 +973,8 @@ impl TranscriptConsequenceEngine {
                         terms: vec![term],
                         distance: Some(dist),
                         flags: compute_flags(tx),
+                        given_ref,
+                        used_ref,
                         ..Default::default()
                     });
                 }
@@ -3333,8 +3348,25 @@ fn classify_coding_change(
         reverse_complement(&alt_genomic)?.to_ascii_uppercase()
     };
 
+    let edited_ref_tx = edited_transcript_reference_allele(variant, tx, tx_exons)
+        .filter(|seq| seq.len() == ref_len);
+    let effective_ref_tx = edited_ref_tx.as_deref().unwrap_or(ref_tx.as_str());
     let ref_seq_slice = &cds_seq[start_idx..=end_idx];
-    if ref_seq_slice != ref_tx {
+    let cds_seq = if ref_seq_slice != effective_ref_tx {
+        if edited_ref_tx.is_none()
+            || !uses_refseq_transcript_reference(tx)
+            || ref_seq_slice.len() != effective_ref_tx.len()
+        {
+            return None;
+        }
+        let mut edited_cds = cds_seq.into_bytes();
+        edited_cds.splice(start_idx..=end_idx, effective_ref_tx.bytes());
+        String::from_utf8(edited_cds).ok()?
+    } else {
+        cds_seq
+    };
+    let ref_seq_slice = &cds_seq[start_idx..=end_idx];
+    if ref_seq_slice != effective_ref_tx {
         return None;
     }
 
@@ -4938,7 +4970,7 @@ fn compute_cdna_position(
     if !in_exon {
         return None;
     }
-    if is_ins {
+    let cdna_position = if is_ins {
         let a = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start.saturating_sub(1));
         let b = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start);
         match (a, b) {
@@ -5002,7 +5034,136 @@ fn compute_cdna_position(
             }
             (None, None) => None,
         }
+    };
+    cdna_position
+        .map(|position| adjust_refseq_cdna_output_position(tx, &position).unwrap_or(position))
+}
+
+fn given_ref_for_output(variant: &VariantInput) -> Option<String> {
+    let allele = normalize_allele_seq(&variant.ref_allele);
+    (!allele.is_empty()).then_some(allele)
+}
+
+fn used_ref_for_transcript_variant(
+    variant: &VariantInput,
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+) -> Option<String> {
+    let given_ref = given_ref_for_output(variant)?;
+    let Some(transcript_ref) = edited_transcript_reference_allele(variant, tx, tx_exons) else {
+        return Some(given_ref);
+    };
+    if transcript_ref.len() != given_ref.len() {
+        return Some(given_ref);
     }
+    if tx.strand >= 0 {
+        Some(transcript_ref)
+    } else {
+        reverse_complement(&transcript_ref).map(|seq| seq.to_ascii_uppercase())
+    }
+}
+
+fn uses_refseq_transcript_reference(tx: &TranscriptFeature) -> bool {
+    tx.bam_edit_status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
+        && tx.has_non_polya_rna_edit
+}
+
+fn edited_transcript_reference_allele(
+    variant: &VariantInput,
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+) -> Option<String> {
+    if !uses_refseq_transcript_reference(tx) {
+        return None;
+    }
+    let ref_len = normalize_allele_seq(&variant.ref_allele).len();
+    if ref_len == 0 {
+        return None;
+    }
+    let transcript_seq = tx.spliced_seq.as_deref().or(tx.cdna_seq.as_deref())?;
+    let genomic_positions = genomic_range(variant.start, variant.end)?;
+    if genomic_positions.len() != ref_len {
+        return None;
+    }
+    let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
+    for pos in genomic_positions {
+        let cdna = genomic_to_cdna_index_for_transcript(tx, tx_exons, pos)?;
+        if cdna == 0 || cdna > transcript_seq.len() {
+            return None;
+        }
+        cdna_positions.push(cdna);
+    }
+    cdna_positions.sort_unstable();
+    let seq = transcript_seq.as_bytes();
+    let mut transcript_ref = String::with_capacity(cdna_positions.len());
+    for cdna in cdna_positions {
+        transcript_ref.push((seq[cdna - 1] as char).to_ascii_uppercase());
+    }
+    Some(transcript_ref)
+}
+
+pub(crate) fn refseq_misalignment_offset_for_cdna(
+    tx: &TranscriptFeature,
+    cdna_start: i64,
+) -> Option<i64> {
+    if !(tx.transcript_id.starts_with("NM_") || tx.transcript_id.starts_with("XM_")) {
+        return None;
+    }
+    let mut offset = 0i64;
+    for edit in &tx.refseq_edits {
+        if edit.skip_refseq_offset {
+            continue;
+        }
+        let Some(replacement_len) = edit.replacement_len else {
+            continue;
+        };
+        if edit.start >= cdna_start {
+            continue;
+        }
+        let replaced_len = edit.end.saturating_sub(edit.start).saturating_add(1);
+        offset += replacement_len as i64 - replaced_len;
+    }
+    (offset != 0).then_some(offset)
+}
+
+pub(crate) fn adjust_refseq_cdna_component(tx: &TranscriptFeature, value: &str) -> Option<String> {
+    if !tx.cdna_mapper_segments.is_empty() || value.is_empty() || value == "?" {
+        return None;
+    }
+    let split_idx = value
+        .char_indices()
+        .skip(1)
+        .find_map(|(idx, ch)| matches!(ch, '+' | '-').then_some(idx))
+        .unwrap_or(value.len());
+    let (coord_part, suffix) = value.split_at(split_idx);
+    let coord = coord_part.parse::<i64>().ok()?;
+    let offset = refseq_misalignment_offset_for_cdna(tx, coord)?;
+    Some(format!("{}{suffix}", coord + offset))
+}
+
+fn adjust_refseq_cdna_output_position(tx: &TranscriptFeature, value: &str) -> Option<String> {
+    if !tx.cdna_mapper_segments.is_empty() {
+        return None;
+    }
+    if let Some((left, right)) = value.split_once('-') {
+        if !left.is_empty()
+            && !right.is_empty()
+            && !left.contains('+')
+            && !right.contains('+')
+            && !right.contains('-')
+        {
+            let adjusted_left = adjust_refseq_cdna_component(tx, left);
+            let adjusted_right = adjust_refseq_cdna_component(tx, right);
+            if adjusted_left.is_some() || adjusted_right.is_some() {
+                let left = adjusted_left.unwrap_or_else(|| left.to_string());
+                let right = adjusted_right.unwrap_or_else(|| right.to_string());
+                return Some(format!("{left}-{right}"));
+            }
+        }
+    }
+    adjust_refseq_cdna_component(tx, value)
 }
 
 /// Compute FLAGS field from transcript attributes.
@@ -8229,6 +8390,140 @@ mod tests {
         assert_eq!(
             compute_cdna_position(&v, &t, &refs),
             Some("2842".to_string())
+        );
+    }
+
+    #[test]
+    fn compute_cdna_position_applies_refseq_offset_without_mapper_segments() {
+        let mut t = tx(
+            "NM_OFFSET.1",
+            "1",
+            100,
+            3000,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(2500),
+        );
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 1506,
+            end: 1505,
+            replacement_len: Some(201),
+            skip_refseq_offset: false,
+        }];
+        let exons = vec![exon("NM_OFFSET.1", 1, 100, 3000)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("1", 2740, 2740, "G", "C");
+
+        assert_eq!(
+            compute_cdna_position(&v, &t, &refs),
+            Some("2842".to_string())
+        );
+    }
+
+    #[test]
+    fn compute_cdna_position_does_not_double_apply_refseq_offset_with_mapper_segments() {
+        let mut t = tx(
+            "NM_OFFSET.1",
+            "1",
+            100,
+            3000,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(2500),
+        );
+        t.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 100,
+            genomic_end: 3000,
+            cdna_start: 202,
+            cdna_end: 3102,
+            ori: 1,
+        }];
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 1506,
+            end: 1505,
+            replacement_len: Some(201),
+            skip_refseq_offset: false,
+        }];
+        let exons = vec![exon("NM_OFFSET.1", 1, 100, 3000)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("1", 2740, 2740, "G", "C");
+
+        assert_eq!(
+            compute_cdna_position(&v, &t, &refs),
+            Some("2842".to_string())
+        );
+    }
+
+    #[test]
+    fn transcript_consequence_uses_edited_refseq_reference_for_output_and_coding() {
+        let mut t = tx(
+            "NM_EDIT.1",
+            "1",
+            100,
+            108,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(9);
+        t.bam_edit_status = Some("ok".to_string());
+        t.has_non_polya_rna_edit = true;
+        t.spliced_seq = Some("ACGATGTAA".to_string());
+        let exons = vec![exon("NM_EDIT.1", 1, 100, 108)];
+        let translations = vec![TranslationFeature {
+            transcript_id: "NM_EDIT.1".to_string(),
+            cds_len: Some(9),
+            protein_len: Some(3),
+            translation_seq: None,
+            cds_sequence: Some("ATGATGTAA".to_string()),
+            stable_id: Some("NP_EDIT.1".to_string()),
+            version: None,
+            protein_features: Vec::new(),
+        }];
+        let v = var("1", 101, 101, "T", "C");
+
+        let out = TranscriptConsequenceEngine::default().evaluate_variant_with_context(
+            &v,
+            &[t],
+            &exons,
+            &translations,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let tc = out
+            .iter()
+            .find(|tc| tc.transcript_id.as_deref() == Some("NM_EDIT.1"))
+            .expect("transcript consequence");
+
+        assert!(tc.terms.contains(&SoTerm::SynonymousVariant));
+        assert!(!tc.terms.contains(&SoTerm::MissenseVariant));
+        assert_eq!(tc.given_ref.as_deref(), Some("T"));
+        assert_eq!(tc.used_ref.as_deref(), Some("C"));
+        assert_eq!(tc.hgvsc.as_deref(), Some("NM_EDIT.1:c.2C>C"));
+        assert_eq!(tc.codons.as_deref(), Some("aCg/aCg"));
+        assert_eq!(tc.amino_acids.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn used_ref_reverse_complements_edited_refseq_reference_on_minus_strand() {
+        let mut t = tx("NR_EDIT.1", "1", 100, 108, -1, "lncRNA", None, None);
+        t.bam_edit_status = Some("ok".to_string());
+        t.has_non_polya_rna_edit = true;
+        t.spliced_seq = Some("TAAAAAAAA".to_string());
+        let exons = vec![exon("NR_EDIT.1", 1, 100, 108)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("1", 108, 108, "T", "A");
+
+        assert_eq!(given_ref_for_output(&v).as_deref(), Some("T"));
+        assert_eq!(
+            used_ref_for_transcript_variant(&v, &t, &refs).as_deref(),
+            Some("A")
         );
     }
 

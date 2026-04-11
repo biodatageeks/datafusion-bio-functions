@@ -473,7 +473,7 @@ mod tests {
             Field::new("bam_edit_status", DataType::Utf8, true),
             Field::new("raw_object_json", DataType::Utf8, true),
         ]));
-        let raw = r#"{"__class":"Bio::EnsEMBL::Transcript","__value":{"_source_cache":"RefSeq","display_xref":{"display_id":"NM_000001"},"attributes":[{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only"}}]}}"#;
+        let raw = r#"{"__class":"Bio::EnsEMBL::Transcript","__value":{"_source_cache":"RefSeq","display_xref":{"display_id":"NM_000001"},"attributes":[{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only"}},{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"rseq_ens_match_cds","value":"1"}}]}}"#;
         RecordBatch::try_new(
             schema,
             vec![
@@ -2831,8 +2831,8 @@ mod tests {
         assert_eq!(refseq_entry[6], "NM_000001");
         assert_eq!(refseq_entry[28], "rseq_ens_match_cds");
         assert_eq!(refseq_entry[29], "");
-        assert_eq!(refseq_entry[30], "");
-        assert_eq!(refseq_entry[31], "");
+        assert_eq!(refseq_entry[30], "A");
+        assert_eq!(refseq_entry[31], "A");
         assert_eq!(refseq_entry[32], "OK");
 
         let merged_sql = format!(
@@ -2858,8 +2858,8 @@ mod tests {
         assert_eq!(merged_entry[28], "rseq_ens_match_cds");
         assert_eq!(merged_entry[29], "RefSeq");
         assert_eq!(merged_entry[30], "");
-        assert_eq!(merged_entry[31], "");
-        assert_eq!(merged_entry[32], "");
+        assert_eq!(merged_entry[31], "A");
+        assert_eq!(merged_entry[32], "A");
         assert_eq!(merged_entry[33], "OK");
     }
 

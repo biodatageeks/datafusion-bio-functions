@@ -5,8 +5,8 @@ use std::io::{BufRead, Seek};
 
 use crate::transcript_consequence::{
     ExonFeature, TranscriptCdnaMapperSegment, TranscriptFeature, TranslationFeature,
-    genomic_to_cdna_index_for_transcript, raw_cdna_position_from_genomic,
-    unshifted_cdna_bounds_for_hgvs_shift,
+    adjust_refseq_cdna_component, genomic_to_cdna_index_for_transcript,
+    raw_cdna_position_from_genomic, unshifted_cdna_bounds_for_hgvs_shift,
 };
 use datafusion::common::{DataFusionError, Result};
 use noodles_core::{Position, Region};
@@ -235,7 +235,8 @@ pub fn format_hgvsc(
             }
         }
     }
-    if notation.kind != "dup" {
+    let identical_substitution = notation.kind == ">" && notation.ref_allele == notation.alt_allele;
+    if notation.kind != "dup" && !identical_substitution {
         clip_alleles(&mut notation, tx.strand);
     }
     let (mut start, mut end) = if notation.kind == ">"
@@ -626,12 +627,21 @@ fn hgvs_variant_notation(
         alt_allele.to_string()
     };
 
+    let ref_len = ref_allele.len();
+    let alt_len = alt_allele.len();
     if ref_allele == alt_allele {
+        if ref_len == 1 {
+            return Some(HgvsNotation {
+                start: ref_start,
+                end: ref_end,
+                ref_allele,
+                alt_allele,
+                kind: ">".to_string(),
+            });
+        }
         return None;
     }
 
-    let ref_len = ref_allele.len();
-    let alt_len = alt_allele.len();
     let kind = if alt_len == 0 {
         "del".to_string()
     } else if ref_len == alt_len {
@@ -1006,6 +1016,7 @@ fn hgvs_cdna_position_from_genomic(
     genomic_pos: i64,
 ) -> Option<String> {
     let cdna_position = raw_cdna_position_from_genomic(tx, tx_exons, genomic_pos)?;
+    let cdna_position = adjust_refseq_cdna_component(tx, &cdna_position).unwrap_or(cdna_position);
     shift_to_hgvs_coding_coordinates(tx, tx_exons, &cdna_position)
 }
 
@@ -2650,6 +2661,31 @@ mod tests {
         let exons = [&exon1, &exon2, &exon3];
         assert_eq!(
             hgvs_cdna_position_from_genomic(&tx, &exons, 41383346),
+            Some("2842".to_string())
+        );
+    }
+
+    #[test]
+    fn test_hgvs_cdna_position_applies_refseq_offset_without_mapper_segments() {
+        let mut tx = make_transcript("non_coding", 1, None, None);
+        tx.transcript_id = "NM_OFFSET.1".to_string();
+        tx.start = 100;
+        tx.end = 3000;
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 1506,
+            end: 1505,
+            replacement_len: Some(201),
+            skip_refseq_offset: false,
+        }];
+        let exon = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 3000,
+        };
+        let exons = [&exon];
+        assert_eq!(
+            hgvs_cdna_position_from_genomic(&tx, &exons, 2740),
             Some("2842".to_string())
         );
     }
