@@ -217,14 +217,16 @@ pub fn format_hgvsc(
     let mut notation =
         hgvs_variant_notation(&feature_ref, &feature_alt, variant_start, variant_end)?;
     if let Some(shift) = dup_context {
-        let shifted_feature_alt = hgvs_feature_strand_alleles(
-            tx,
-            "-",
+        let shifted_insertion_dup_allele = if refseq_intronic_insertion {
+            shift.alt_orig_allele_string.as_str()
+        } else {
             edited_shifted_output_allele
                 .as_deref()
-                .unwrap_or(&shift.shifted_output_allele),
-        )
-        .map(|(_, alt)| alt)?;
+                .unwrap_or(&shift.shifted_output_allele)
+        };
+        let shifted_feature_alt =
+            hgvs_feature_strand_alleles(tx, "-", shifted_insertion_dup_allele)
+                .map(|(_, alt)| alt)?;
         apply_shifted_insertion_duplication(tx, &shifted_feature_alt, shift, &mut notation);
         // If the dup range extends outside the transcript's genomic
         // span (before first exon or after last exon), VEP keeps the
@@ -2390,6 +2392,45 @@ mod tests {
         assert!(
             hgvsc.ends_with("insAAAG"),
             "expected original inserted allele in RefSeq intronic HGVSc, got {hgvsc}"
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_refseq_intronic_dup_detection_uses_original_allele() {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = "NM_004442".to_string();
+        tx.source = Some("RefSeq".to_string());
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 110,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 200,
+            end: 210,
+        };
+        let exons = [&exon1, &exon2];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 22,
+            start: 151,
+            end: 150,
+            shifted_compare_allele: "GT".to_string(),
+            shifted_allele_string: "GT".to_string(),
+            shifted_output_allele: "GT".to_string(),
+            alt_orig_allele_string: "TG".to_string(),
+            five_prime_context: "TG".to_string(),
+            three_prime_context: "CA".to_string(),
+        };
+
+        let hgvsc = format_hgvsc(&tx, &exons, None, None, "-", "TG", 148, 147, Some(&shift))
+            .expect("HGVSc");
+        assert!(
+            hgvsc.ends_with("dup"),
+            "expected RefSeq intronic duplication notation, got {hgvsc}"
         );
     }
 
