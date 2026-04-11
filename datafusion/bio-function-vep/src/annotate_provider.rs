@@ -4165,7 +4165,7 @@ impl AnnotateProvider {
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|\
                                  {variant_class}|{symbol_source}|{hgnc_id}|\
                                  {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{source_val}|{refseq_offset}|{bam_edit}|{gene_pheno}|\
+                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{source_val}|{refseq_offset}|||{bam_edit}|{gene_pheno}|\
                                  {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                                  {hgvs_offset}|\
                                  {batch3_suffix}|||||"
@@ -4179,7 +4179,7 @@ impl AnnotateProvider {
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|\
                                  {variant_class}|{symbol_source}|{hgnc_id}|\
                                  {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{refseq_offset}|{bam_edit}|{gene_pheno}|\
+                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{refseq_offset}|||{bam_edit}|{gene_pheno}|\
                                  {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                                  {hgvs_offset}|\
                                  {batch3_suffix}|||||"
@@ -4208,7 +4208,7 @@ impl AnnotateProvider {
                                  {exon}|{intron}|{hgvsc}|{hgvsp}|\
                                  {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
-                                 |||||{refseq_match}|{source_val}|{refseq_offset}|{bam_edit}|\
+                                 |||||{refseq_match}|{source_val}|{refseq_offset}|||{bam_edit}|\
                                  {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                                  {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                                  {batch3_suffix}"
@@ -4220,7 +4220,7 @@ impl AnnotateProvider {
                                  {exon}|{intron}|{hgvsc}|{hgvsp}|\
                                  {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                                  {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
-                                 |||||{refseq_match}|{refseq_offset}|{bam_edit}|\
+                                 |||||{refseq_match}|{refseq_offset}|||{bam_edit}|\
                                  {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                                  {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                                  {batch3_suffix}"

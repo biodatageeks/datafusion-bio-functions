@@ -2826,12 +2826,14 @@ mod tests {
         );
         let refseq_entry = csq_entries(refseq_csq[0].as_deref().expect("refseq csq present"))
             .into_iter()
-            .find(|fields| fields.len() == 76 && fields[5] == "Transcript")
+            .find(|fields| fields.len() == 78 && fields[5] == "Transcript")
             .expect("expected transcript CSQ entry in refseq mode");
         assert_eq!(refseq_entry[6], "NM_000001");
         assert_eq!(refseq_entry[28], "rseq_ens_match_cds");
         assert_eq!(refseq_entry[29], "");
-        assert_eq!(refseq_entry[30], "OK");
+        assert_eq!(refseq_entry[30], "");
+        assert_eq!(refseq_entry[31], "");
+        assert_eq!(refseq_entry[32], "OK");
 
         let merged_sql = format!(
             "SELECT \"CSQ\" FROM annotate_vep('vcf_refseq', '{cache_path}', 'parquet', '{{\"partitioned\":true,\"merged\":true}}')"
@@ -2850,13 +2852,15 @@ mod tests {
         );
         let merged_entry = csq_entries(merged_csq[0].as_deref().expect("merged csq present"))
             .into_iter()
-            .find(|fields| fields.len() == 77 && fields[5] == "Transcript")
+            .find(|fields| fields.len() == 79 && fields[5] == "Transcript")
             .expect("expected transcript CSQ entry in merged mode");
         assert_eq!(merged_entry[6], "NM_000001");
         assert_eq!(merged_entry[28], "rseq_ens_match_cds");
         assert_eq!(merged_entry[29], "RefSeq");
         assert_eq!(merged_entry[30], "");
-        assert_eq!(merged_entry[31], "OK");
+        assert_eq!(merged_entry[31], "");
+        assert_eq!(merged_entry[32], "");
+        assert_eq!(merged_entry[33], "OK");
     }
 
     #[tokio::test(flavor = "multi_thread")]

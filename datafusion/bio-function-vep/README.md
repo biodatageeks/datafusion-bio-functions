@@ -60,7 +60,7 @@ SELECT * FROM annotate_vep(
 | `extended_probes` | Interval-overlap fallback for shifted indels | No |
 | `reference_fasta_path` | Indexed FASTA for HGVS genomic shifting | No |
 | `partitioned` | Use per-chromosome partitioned cache | No |
-| `refseq` | Use RefSeq cache/transcripts and emit RefSeq CSQ fields (`REFSEQ_MATCH`, `REFSEQ_OFFSET`, `BAM_EDIT`) | No |
+| `refseq` | Use RefSeq cache/transcripts and emit RefSeq CSQ fields (`REFSEQ_MATCH`, `REFSEQ_OFFSET`, `GIVEN_REF`, `USED_REF`, `BAM_EDIT`) | No |
 | `merged` | Use VEP `--merged` Ensembl+RefSeq cache and emit RefSeq/source CSQ fields | No |
 | `gencode_basic` | Restrict consequences to transcripts with `gencode_basic` attribute | No |
 | `gencode_primary` | Restrict consequences to transcripts with `gencode_primary` attribute | No |
