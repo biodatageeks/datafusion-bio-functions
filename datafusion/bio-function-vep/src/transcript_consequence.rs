@@ -852,8 +852,7 @@ impl TranscriptConsequenceEngine {
                         } else {
                             None
                         };
-                        let used_ref =
-                            used_ref_for_transcript_variant(variant, tx, &tx_exons, hgvs_shift);
+                        let used_ref = used_ref_for_transcript_variant(variant, tx, &tx_exons);
                         let original_allows_protein_hgvs =
                             original_terms_allow_protein_hgvs(&terms);
                         let (cds_position, protein_position, amino_acids, codons, protein_hgvs) =
@@ -967,16 +966,7 @@ impl TranscriptConsequenceEngine {
                     }
                 } else if let Some((term, dist)) = self.upstream_downstream_term(variant, tx) {
                     let given_ref = given_ref_for_output(variant);
-                    let used_ref = used_ref_for_transcript_variant(
-                        variant,
-                        tx,
-                        &tx_exons,
-                        if self.shift_hgvs {
-                            variant.hgvs_shift_for_strand(tx.strand)
-                        } else {
-                            None
-                        },
-                    );
+                    let used_ref = used_ref_for_transcript_variant(variant, tx, &tx_exons);
                     out.push(TranscriptConsequence {
                         transcript_id: Some(tx.transcript_id.clone()),
                         transcript_idx: Some(tx_idx),
@@ -5059,16 +5049,8 @@ fn used_ref_for_transcript_variant(
     variant: &VariantInput,
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
-    genomic_shift: Option<&HgvsGenomicShift>,
 ) -> Option<String> {
     let given_ref = given_ref_for_output(variant)?;
-    if variant.alt_allele == "-" {
-        if let Some(shifted_ref) = genomic_shift.and_then(shifted_deleted_ref_for_used_ref) {
-            if shifted_ref.len() == given_ref.len() {
-                return Some(shifted_ref);
-            }
-        }
-    }
     let Some(transcript_ref) = edited_transcript_reference_allele(variant, tx, tx_exons) else {
         return Some(given_ref);
     };
@@ -5080,11 +5062,6 @@ fn used_ref_for_transcript_variant(
     } else {
         reverse_complement(&transcript_ref).map(|seq| seq.to_ascii_uppercase())
     }
-}
-
-fn shifted_deleted_ref_for_used_ref(shift: &HgvsGenomicShift) -> Option<String> {
-    let shifted_ref = shift.shifted_allele_string.to_ascii_uppercase();
-    (!shifted_ref.is_empty() && shifted_ref != "-").then_some(shifted_ref)
 }
 
 fn uses_refseq_transcript_reference(tx: &TranscriptFeature) -> bool {
@@ -8559,7 +8536,7 @@ mod tests {
 
         assert_eq!(given_ref_for_output(&v).as_deref(), Some("T"));
         assert_eq!(
-            used_ref_for_transcript_variant(&v, &t, &refs, None).as_deref(),
+            used_ref_for_transcript_variant(&v, &t, &refs).as_deref(),
             Some("A")
         );
     }
@@ -8593,46 +8570,8 @@ mod tests {
         let v = var("1", 2740, 2740, "G", "T");
 
         assert_eq!(
-            used_ref_for_transcript_variant(&v, &t, &refs, None).as_deref(),
+            used_ref_for_transcript_variant(&v, &t, &refs).as_deref(),
             Some("C")
-        );
-    }
-
-    #[test]
-    fn used_ref_uses_shifted_deleted_reference_when_hgvs_shifted() {
-        let t = tx(
-            "ENST_DEL.1",
-            "1",
-            86580000,
-            86580300,
-            1,
-            "protein_coding",
-            Some(86580000),
-            Some(86580300),
-        );
-        let exons = vec![exon("ENST_DEL.1", 1, 86580000, 86580300)];
-        let refs: Vec<&ExonFeature> = exons.iter().collect();
-        let v = var("1", 86580214, 86580219, "CCTACA", "-");
-        let shift = HgvsGenomicShift {
-            strand: 1,
-            shift_length: 5,
-            start: 86580219,
-            end: 86580224,
-            shifted_compare_allele: "-".to_string(),
-            shifted_allele_string: "ACCTAC".to_string(),
-            shifted_output_allele: "-".to_string(),
-            alt_orig_allele_string: "-".to_string(),
-            five_prime_context: String::new(),
-            three_prime_context: String::new(),
-        };
-
-        assert_eq!(
-            used_ref_for_transcript_variant(&v, &t, &refs, Some(&shift)).as_deref(),
-            Some("ACCTAC")
-        );
-        assert_eq!(
-            used_ref_for_transcript_variant(&v, &t, &refs, None).as_deref(),
-            Some("CCTACA")
         );
     }
 
