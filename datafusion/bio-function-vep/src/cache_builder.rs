@@ -1363,6 +1363,12 @@ impl CacheBuilder {
 
     /// Build fjall for translation_sift: re-read parquet sorted by transcript_id,
     /// parse predictions, and ingest into SiftKvStore.
+    ///
+    /// Merged caches can contain the same transcript_id on a canonical
+    /// chromosome and on a patch/alt contig in `other.parquet`. Since fjall is
+    /// keyed only by transcript_id, we resolve duplicates here by preferring
+    /// canonical chromosomes. Within the same source class, we keep the richer
+    /// prediction matrix.
     async fn build_sift_fjall(
         &self,
         sift_parquet_files: &[(String, usize)],
@@ -1402,7 +1408,9 @@ impl CacheBuilder {
             SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
 
         let mut total_rows = 0usize;
-        let mut sorted_preds: BTreeMap<String, CachedPredictions> = BTreeMap::new();
+        let mut duplicate_rows = 0usize;
+        let mut replacement_rows = 0usize;
+        let mut sorted_preds: BTreeMap<String, SiftBuildEntry> = BTreeMap::new();
 
         for (parquet_path, _) in sift_parquet_files {
             read_ctx
@@ -1419,11 +1427,13 @@ impl CacheBuilder {
                 }
 
                 let schema = batch.schema();
+                let chrom_idx = schema.index_of("chrom")?;
                 let tid_idx = schema.index_of("transcript_id")?;
                 let sift_idx = schema.index_of("sift_predictions").ok();
                 let poly_idx = schema.index_of("polyphen_predictions").ok();
 
                 for row in 0..batch.num_rows() {
+                    let chrom = string_value(batch.column(chrom_idx).as_ref(), row).to_string();
                     let transcript_id =
                         string_value(batch.column(tid_idx).as_ref(), row).to_string();
 
@@ -1435,7 +1445,26 @@ impl CacheBuilder {
                         preds.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
                     }
                     preds.sort();
-                    sorted_preds.insert(transcript_id, preds);
+                    let new_entry = SiftBuildEntry {
+                        chrom,
+                        predictions: preds,
+                    };
+                    match sorted_preds.entry(transcript_id) {
+                        std::collections::btree_map::Entry::Vacant(slot) => {
+                            slot.insert(new_entry);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut slot) => {
+                            duplicate_rows += 1;
+                            if should_replace_sift_build_entry(
+                                slot.get(),
+                                &new_entry.chrom,
+                                &new_entry.predictions,
+                            ) {
+                                slot.insert(new_entry);
+                                replacement_rows += 1;
+                            }
+                        }
+                    }
                     total_rows += 1;
                 }
 
@@ -1446,12 +1475,22 @@ impl CacheBuilder {
         }
 
         let transcript_count = sorted_preds.len();
+        if duplicate_rows > 0 {
+            info!(
+                "translation_sift.fjall: resolved {duplicate_rows} duplicate transcript rows, replaced {replacement_rows} with preferred sources"
+            );
+        }
         info!(
             "translation_sift.fjall: ingesting {} transcripts from {} rows via sorted bulk load...",
             transcript_count, total_rows
         );
         // sorted_preds is consumed by ingest_sorted; memory freed before compaction.
-        let sift_store = SiftKvStore::ingest_sorted(&db, sorted_preds.into_iter())?;
+        let sift_store = SiftKvStore::ingest_sorted(
+            &db,
+            sorted_preds
+                .into_iter()
+                .map(|(transcript_id, entry)| (transcript_id, entry.predictions)),
+        )?;
 
         info!("Running major compaction on translation_sift.fjall...");
         let compact_start = Instant::now();
@@ -2066,6 +2105,43 @@ fn split_chroms(
         }
         None => (MAIN_CHROMS.iter().map(|s| s.to_string()).collect(), vec![]),
     }
+}
+
+#[derive(Debug, Clone)]
+struct SiftBuildEntry {
+    chrom: String,
+    predictions: CachedPredictions,
+}
+
+fn is_canonical_chrom(chrom: &str) -> bool {
+    CHROM_TO_CODE_SET.contains(&chrom)
+}
+
+fn prediction_entry_count(predictions: &CachedPredictions) -> usize {
+    predictions.sift.len() + predictions.polyphen.len()
+}
+
+fn should_replace_sift_build_entry(
+    existing: &SiftBuildEntry,
+    new_chrom: &str,
+    new_predictions: &CachedPredictions,
+) -> bool {
+    let existing_is_canonical = is_canonical_chrom(&existing.chrom);
+    let new_is_canonical = is_canonical_chrom(new_chrom);
+
+    if existing_is_canonical != new_is_canonical {
+        return new_is_canonical;
+    }
+
+    let existing_entries = prediction_entry_count(&existing.predictions);
+    let new_entries = prediction_entry_count(new_predictions);
+
+    if existing_entries != new_entries {
+        return new_entries > existing_entries;
+    }
+
+    // Keep the first-seen row when source class and prediction counts are equal.
+    false
 }
 
 /// Extract a string value from a Utf8, LargeUtf8, or Utf8View array.
@@ -2749,6 +2825,73 @@ mod tests {
             Some(256),
         );
         assert_eq!(props.max_row_group_size(), 256);
+    }
+
+    fn test_cached_predictions(sift_len: usize, polyphen_len: usize) -> CachedPredictions {
+        use crate::transcript_consequence::CompactPrediction;
+
+        CachedPredictions {
+            sift: (0..sift_len)
+                .map(|i| CompactPrediction {
+                    position: i as i32,
+                    amino_acid: 0,
+                    prediction: 0,
+                    score: 0.0,
+                })
+                .collect(),
+            polyphen: (0..polyphen_len)
+                .map(|i| CompactPrediction {
+                    position: i as i32,
+                    amino_acid: 0,
+                    prediction: 4,
+                    score: 0.0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_should_replace_sift_build_entry_prefers_canonical_chrom() {
+        let canonical = SiftBuildEntry {
+            chrom: "1".to_string(),
+            predictions: test_cached_predictions(10, 10),
+        };
+        let alt = SiftBuildEntry {
+            chrom: "HSCHR1_1_CTG3".to_string(),
+            predictions: test_cached_predictions(20, 20),
+        };
+
+        assert!(
+            should_replace_sift_build_entry(&alt, &canonical.chrom, &canonical.predictions),
+            "canonical row should replace patch/alt row"
+        );
+        assert!(
+            !should_replace_sift_build_entry(&canonical, &alt.chrom, &alt.predictions),
+            "patch/alt row must not overwrite canonical row even if it appears later"
+        );
+    }
+
+    #[test]
+    fn test_should_replace_sift_build_entry_prefers_richer_predictions_within_same_source_class() {
+        let sparse_other = SiftBuildEntry {
+            chrom: "HSCHR1_6_CTG31".to_string(),
+            predictions: test_cached_predictions(2, 2),
+        };
+        let rich_other = SiftBuildEntry {
+            chrom: "HG2515_PATCH".to_string(),
+            predictions: test_cached_predictions(5, 5),
+        };
+
+        assert!(should_replace_sift_build_entry(
+            &sparse_other,
+            &rich_other.chrom,
+            &rich_other.predictions
+        ));
+        assert!(!should_replace_sift_build_entry(
+            &rich_other,
+            &sparse_other.chrom,
+            &sparse_other.predictions
+        ));
     }
 
     // -----------------------------------------------------------------------
