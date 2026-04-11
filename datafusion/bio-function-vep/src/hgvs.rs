@@ -173,6 +173,10 @@ pub fn format_hgvsc(
         'n'
     };
     let use_genomic_shift = genomic_shift.filter(|_| ref_allele == "-" || alt_allele == "-");
+    let refseq_intronic_insertion = use_genomic_shift.is_some()
+        && ref_allele == "-"
+        && is_refseq_hgvs_transcript(tx)
+        && !variant_lies_within_transcript_sequence(tx_exons, variant_start, variant_end, true);
     let edited_shifted_output_allele = use_genomic_shift.and_then(|_| {
         edited_transcript_shifted_output_allele(
             tx,
@@ -193,9 +197,13 @@ pub fn format_hgvsc(
             (
                 ref_allele,
                 if ref_allele == "-" {
-                    edited_shifted_output_allele
-                        .as_deref()
-                        .unwrap_or(shift.shifted_output_allele.as_str())
+                    if refseq_intronic_insertion {
+                        shift.alt_orig_allele_string.as_str()
+                    } else {
+                        edited_shifted_output_allele
+                            .as_deref()
+                            .unwrap_or(shift.shifted_output_allele.as_str())
+                    }
                 } else {
                     alt_allele
                 },
@@ -808,6 +816,14 @@ fn apply_shifted_insertion_duplication(
             notation.end = display_start - 1;
         }
     }
+}
+
+fn is_refseq_hgvs_transcript(tx: &TranscriptFeature) -> bool {
+    tx.source.as_deref() == Some("RefSeq")
+        || matches!(
+            tx.transcript_id.as_bytes().get(..2),
+            Some(b"NM") | Some(b"NR") | Some(b"XM") | Some(b"XR")
+        )
 }
 
 fn variant_lies_within_transcript_sequence(
@@ -2335,6 +2351,45 @@ mod tests {
         assert_eq!(
             format_hgvsc(&tx, &exons, None, None, "-", "AAGT", 148, 147, Some(&shift)),
             Some("ENSTHGVS000001.1:n.11+41_11+44dup".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_keeps_original_refseq_intronic_insertion_allele_after_shift() {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = "NR_047526".to_string();
+        tx.source = Some("RefSeq".to_string());
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 110,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 200,
+            end: 210,
+        };
+        let exons = [&exon1, &exon2];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 3,
+            start: 151,
+            end: 150,
+            shifted_compare_allele: "GAAA".to_string(),
+            shifted_allele_string: "GAAA".to_string(),
+            shifted_output_allele: "GAAA".to_string(),
+            alt_orig_allele_string: "AAAG".to_string(),
+            five_prime_context: "TAAA".to_string(),
+            three_prime_context: "TTTC".to_string(),
+        };
+
+        let hgvsc = format_hgvsc(&tx, &exons, None, None, "-", "AAAG", 148, 147, Some(&shift))
+            .expect("HGVSc");
+        assert!(
+            hgvsc.ends_with("insAAAG"),
+            "expected original inserted allele in RefSeq intronic HGVSc, got {hgvsc}"
         );
     }
 
