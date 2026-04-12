@@ -6,7 +6,7 @@ use std::io::{BufRead, Seek};
 use crate::transcript_consequence::{
     ExonFeature, TranscriptCdnaMapperSegment, TranscriptFeature, TranslationFeature,
     adjust_refseq_cdna_component, genomic_to_cdna_index_for_transcript,
-    raw_cdna_position_from_genomic, unshifted_cdna_bounds_for_hgvs_shift,
+    raw_cdna_position_from_genomic,
 };
 use datafusion::common::{DataFusionError, Result};
 use noodles_core::{Position, Region};
@@ -173,20 +173,8 @@ pub fn format_hgvsc(
         'n'
     };
     let use_genomic_shift = genomic_shift.filter(|_| ref_allele == "-" || alt_allele == "-");
-    let refseq_intronic_insertion = use_genomic_shift.is_some()
-        && ref_allele == "-"
-        && is_refseq_hgvs_transcript(tx)
-        && !variant_lies_within_transcript_sequence(tx_exons, variant_start, variant_end, true);
-    let edited_shifted_output_allele = use_genomic_shift.and_then(|_| {
-        edited_transcript_shifted_output_allele(
-            tx,
-            tx_exons,
-            ref_allele,
-            alt_allele,
-            variant_start,
-            variant_end,
-        )
-    });
+    let edited_shifted_output_allele = use_genomic_shift
+        .and_then(|_| edited_transcript_insertion_allele(tx, ref_allele, alt_allele));
     let dup_context = use_genomic_shift.filter(|shift| {
         ref_allele == "-"
             && !shift.shifted_output_allele.is_empty()
@@ -197,13 +185,9 @@ pub fn format_hgvsc(
             (
                 ref_allele,
                 if ref_allele == "-" {
-                    if refseq_intronic_insertion {
-                        shift.alt_orig_allele_string.as_str()
-                    } else {
-                        edited_shifted_output_allele
-                            .as_deref()
-                            .unwrap_or(shift.shifted_output_allele.as_str())
-                    }
+                    edited_shifted_output_allele
+                        .as_deref()
+                        .unwrap_or(shift.shifted_output_allele.as_str())
                 } else {
                     alt_allele
                 },
@@ -217,13 +201,9 @@ pub fn format_hgvsc(
     let mut notation =
         hgvs_variant_notation(&feature_ref, &feature_alt, variant_start, variant_end)?;
     if let Some(shift) = dup_context {
-        let shifted_insertion_dup_allele = if refseq_intronic_insertion {
-            shift.alt_orig_allele_string.as_str()
-        } else {
-            edited_shifted_output_allele
-                .as_deref()
-                .unwrap_or(&shift.shifted_output_allele)
-        };
+        let shifted_insertion_dup_allele = edited_shifted_output_allele
+            .as_deref()
+            .unwrap_or(&shift.shifted_output_allele);
         let shifted_feature_alt =
             hgvs_feature_strand_alleles(tx, "-", shifted_insertion_dup_allele)
                 .map(|(_, alt)| alt)?;
@@ -478,88 +458,25 @@ fn parse_shiftable_indel<'a>(
 }
 
 /// Traceability:
-/// - Ensembl Variation `TranscriptVariationAllele::_return_3prime()`
-///   uses edited transcript `spliced_seq` for RefSeq HGVS shifting when RNA
-///   edit attributes are present
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L149-L235>
-/// - Ensembl VEP `AnnotationType::Transcript::edit_transcript()` stores the
-///   edited sequence on `_variation_effect_feature_cache.spliced_seq`
-///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L596-L597>
-fn edited_transcript_shifted_output_allele(
+/// - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
+///   replaces HGVS `alt` with transcript-space `feature_seq` when `_rna_edit`
+///   attributes are present
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1443-L1449>
+/// - Ensembl VEP `AnnotationType::Transcript::edit_transcript()` marks the
+///   transcript with `_bam_edit_status = ok` when those edits were applied
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L579-L597>
+fn edited_transcript_insertion_allele(
     tx: &TranscriptFeature,
-    tx_exons: &[&ExonFeature],
     ref_allele: &str,
     alt_allele: &str,
-    variant_start: i64,
-    variant_end: i64,
 ) -> Option<String> {
-    if tx.bam_edit_status.as_deref() != Some("ok") || !tx.has_non_polya_rna_edit {
+    if tx.bam_edit_status.as_deref() != Some("ok") {
         return None;
     }
     if ref_allele != "-" || alt_allele.is_empty() || alt_allele == "-" {
         return None;
     }
-
-    let edited_transcript_seq = tx.spliced_seq.as_deref()?;
-    let (start, end) = unshifted_cdna_bounds_for_hgvs_shift(
-        tx,
-        tx_exons,
-        variant_start,
-        variant_end,
-        ref_allele,
-        alt_allele,
-    )?;
-    if start == 0 || end == 0 || start > end || end > edited_transcript_seq.len() {
-        return None;
-    }
-
-    let search_start = start.saturating_sub(1001);
-    let search_end = edited_transcript_seq.len().min(end.saturating_add(1000));
-    let pre_seq = edited_transcript_seq[search_start..start.saturating_sub(1)].to_ascii_uppercase();
-    let post_seq = edited_transcript_seq[end..search_end].to_ascii_uppercase();
-    shift_output_allele_across_transcript(alt_allele, &pre_seq, &post_seq, tx.strand)
-}
-
-/// Traceability:
-/// - Ensembl Variation `TranscriptVariationAllele::_return_3prime()`
-///   calls `perform_shift()` for edited RefSeq transcripts with the
-///   transcript strand as `seq_strand` and the reverse flag derived
-///   from the strand direction
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L237-L243>
-/// - Ensembl Variation `TranscriptVariationAllele::perform_shift()`
-///   rotates the transcript-side allele and HGVS output allele separately
-///   depending on transcript strand and variation-feature strand
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L291-L351>
-fn shift_output_allele_across_transcript(
-    alt_allele: &str,
-    pre_seq: &str,
-    post_seq: &str,
-    transcript_strand: i8,
-) -> Option<String> {
-    let vf_allele = alt_allele.to_ascii_uppercase();
-    let feature_allele = if transcript_strand >= 0 {
-        vf_allele.clone()
-    } else {
-        reverse_complement(&vf_allele)?
-    };
-    let seq_to_check = feature_allele.into_bytes();
-    let hgvs_output = vf_allele.into_bytes();
-
-    // VEP: $reverse = (-1 * ($strand - 1)) / 2
-    let reverse = transcript_strand < 0;
-    // VEP: perform_shift(..., $strand) — transcript strand as seq_strand
-    let (_, _, shifted_output, _, _) = perform_shift_ensembl(
-        &seq_to_check,
-        &hgvs_output,
-        post_seq,
-        pre_seq,
-        0, // var_start/end not used for output allele
-        0,
-        reverse,
-        transcript_strand,
-    );
-
-    String::from_utf8(shifted_output).ok()
+    Some(alt_allele.to_ascii_uppercase())
 }
 
 fn build_reference_region(chrom: &str, start: i64, end: i64) -> Result<Region> {
@@ -818,34 +735,6 @@ fn apply_shifted_insertion_duplication(
             notation.end = display_start - 1;
         }
     }
-}
-
-fn is_refseq_hgvs_transcript(tx: &TranscriptFeature) -> bool {
-    tx.source.as_deref() == Some("RefSeq")
-        || matches!(
-            tx.transcript_id.as_bytes().get(..2),
-            Some(b"NM") | Some(b"NR") | Some(b"XM") | Some(b"XR")
-        )
-}
-
-fn variant_lies_within_transcript_sequence(
-    tx_exons: &[&ExonFeature],
-    start: i64,
-    end: i64,
-    is_insertion: bool,
-) -> bool {
-    if is_insertion {
-        return tx_exons
-            .iter()
-            .any(|exon| start > exon.start && start <= exon.end);
-    }
-
-    let target_len = end.saturating_sub(start).saturating_add(1);
-    let covered = tx_exons
-        .iter()
-        .map(|exon| overlap_len(start, end, exon.start, exon.end))
-        .sum::<i64>();
-    covered == target_len
 }
 
 /// Traceability:
@@ -2275,31 +2164,6 @@ mod tests {
     }
 
     #[test]
-    fn test_edited_transcript_shifted_output_allele_uses_spliced_seq_for_intronic_insertions() {
-        let mut tx = make_transcript("protein_coding", 1, Some(95), Some(118));
-        tx.bam_edit_status = Some("ok".to_string());
-        tx.has_non_polya_rna_edit = true;
-        tx.spliced_seq = Some("TTTTTTTTTTTGCTTTTTTT".to_string());
-        let exon1 = ExonFeature {
-            transcript_id: tx.transcript_id.clone(),
-            exon_number: 1,
-            start: 90,
-            end: 99,
-        };
-        let exon2 = ExonFeature {
-            transcript_id: tx.transcript_id.clone(),
-            exon_number: 2,
-            start: 110,
-            end: 119,
-        };
-        let exons = [&exon1, &exon2];
-        assert_eq!(
-            edited_transcript_shifted_output_allele(&tx, &exons, "-", "GAA", 104, 104),
-            Some("AAG".to_string())
-        );
-    }
-
-    #[test]
     fn test_format_hgvsc_shifts_exonic_indels_when_hgvs_shift_is_available() {
         let tx = make_transcript("protein_coding", 1, Some(100), Some(108));
         let exon = make_exon();
@@ -2357,7 +2221,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_hgvsc_keeps_original_refseq_intronic_insertion_allele_after_shift() {
+    fn test_format_hgvsc_uses_shifted_refseq_intronic_insertion_allele_without_bam_edit() {
         let mut tx = make_transcript("lncRNA", 1, None, None);
         tx.transcript_id = "NR_047526".to_string();
         tx.source = Some("RefSeq".to_string());
@@ -2390,16 +2254,59 @@ mod tests {
         let hgvsc = format_hgvsc(&tx, &exons, None, None, "-", "AAAG", 148, 147, Some(&shift))
             .expect("HGVSc");
         assert!(
-            hgvsc.ends_with("insAAAG"),
-            "expected original inserted allele in RefSeq intronic HGVSc, got {hgvsc}"
+            hgvsc.ends_with("insGAAA"),
+            "expected shifted inserted allele in default RefSeq intronic HGVSc, got {hgvsc}"
         );
     }
 
     #[test]
-    fn test_format_hgvsc_refseq_intronic_dup_detection_uses_original_allele() {
+    fn test_format_hgvsc_uses_edited_refseq_intronic_insertion_allele_with_bam_edit() {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = "NR_047526".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.bam_edit_status = Some("ok".to_string());
+        tx.spliced_seq = Some("ACGTACGTACGTTTCGATCGTA".to_string());
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 110,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 200,
+            end: 210,
+        };
+        let exons = [&exon1, &exon2];
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 3,
+            start: 151,
+            end: 150,
+            shifted_compare_allele: "GAAA".to_string(),
+            shifted_allele_string: "GAAA".to_string(),
+            shifted_output_allele: "GAAA".to_string(),
+            alt_orig_allele_string: "AAAG".to_string(),
+            five_prime_context: "TAAA".to_string(),
+            three_prime_context: "TTTC".to_string(),
+        };
+
+        let hgvsc = format_hgvsc(&tx, &exons, None, None, "-", "AAAG", 148, 147, Some(&shift))
+            .expect("HGVSc");
+        assert!(
+            hgvsc.ends_with("insAAAG"),
+            "expected BAM-edited transcript allele in RefSeq intronic HGVSc, got {hgvsc}"
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_refseq_intronic_dup_detection_uses_edited_allele() {
         let mut tx = make_transcript("lncRNA", 1, None, None);
         tx.transcript_id = "NM_004442".to_string();
         tx.source = Some("RefSeq".to_string());
+        tx.bam_edit_status = Some("ok".to_string());
+        tx.spliced_seq = Some("ACGTACGTACGTTTCGATCGTA".to_string());
         let exon1 = ExonFeature {
             transcript_id: tx.transcript_id.clone(),
             exon_number: 1,
