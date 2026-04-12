@@ -201,9 +201,11 @@ pub fn format_hgvsc(
     let mut notation =
         hgvs_variant_notation(&feature_ref, &feature_alt, variant_start, variant_end)?;
     if let Some(shift) = dup_context {
-        let shifted_insertion_dup_allele = edited_shifted_output_allele
-            .as_deref()
-            .unwrap_or(&shift.shifted_output_allele);
+        // VEP determines transcript-level insertion duplication from the shifted
+        // HGVS allele first, then later overrides the displayed inserted bases
+        // for BAM-edited RefSeq transcripts. Dup coordinates therefore follow
+        // `hgvs_allele_string`, not the later transcript-space override.
+        let shifted_insertion_dup_allele = shift.shifted_output_allele.as_str();
         let shifted_feature_alt =
             hgvs_feature_strand_alleles(tx, "-", shifted_insertion_dup_allele)
                 .map(|(_, alt)| alt)?;
@@ -2301,7 +2303,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_hgvsc_refseq_intronic_dup_detection_uses_edited_allele() {
+    fn test_format_hgvsc_refseq_intronic_dup_detection_uses_shifted_hgvs_allele() {
         let mut tx = make_transcript("lncRNA", 1, None, None);
         tx.transcript_id = "NM_004442".to_string();
         tx.source = Some("RefSeq".to_string());
@@ -2329,7 +2331,7 @@ mod tests {
             shifted_allele_string: "GT".to_string(),
             shifted_output_allele: "GT".to_string(),
             alt_orig_allele_string: "TG".to_string(),
-            five_prime_context: "TG".to_string(),
+            five_prime_context: "GT".to_string(),
             three_prime_context: "CA".to_string(),
         };
 
