@@ -3648,13 +3648,6 @@ impl AnnotateProvider {
         let mut sorted_indices: Vec<usize> = Vec::new();
         let include_refseq_fields = transcript_selection.refseq_fields();
         let include_source_field = transcript_selection.source_field();
-        let is_merged_mode = transcript_selection.merged();
-        // Reusable set of gene symbols that have an Ensembl-sourced HGNC_ID
-        // among the current variant's overlapping transcripts.  Used to
-        // replicate VEP's merge_features propagation scope (Transcript.pm:270,
-        // 285): RefSeq transcripts only receive HGNC_ID when an Ensembl donor
-        // with the same symbol overlaps the same variant.
-        let mut merged_hgnc_symbols: HashSet<&str> = HashSet::new();
 
         for row in 0..batch.num_rows() {
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
@@ -3933,26 +3926,6 @@ impl AnnotateProvider {
                     });
                 }
 
-                // In merged mode, collect gene symbols where an Ensembl
-                // transcript carries HGNC_ID for this variant's overlapping
-                // set.  VEP's merge_features only propagates _gene_hgnc_id
-                // among transcripts that co-overlap the same input buffer;
-                // RefSeq rows at Ensembl-absent loci must stay blank.
-                if is_merged_mode {
-                    merged_hgnc_symbols.clear();
-                    for tc in &row_assignments {
-                        if let Some(tx) = tc.transcript_idx.map(|i| &ctx.transcripts[i]) {
-                            if is_ensembl_transcript(tx) {
-                                if let (Some(_hgnc), Some(sym)) =
-                                    (&tx.gene_hgnc_id, tx.gene_symbol.as_deref())
-                                {
-                                    merged_hgnc_symbols.insert(sym);
-                                }
-                            }
-                        }
-                    }
-                }
-
                 // Build per-transcript CSQ entries into reusable buffer (already cleared above).
                 // Skip the entire CSQ formatting when the csq column is not projected.
                 if !skip_csq {
@@ -3975,29 +3948,13 @@ impl AnnotateProvider {
                         let tx_opt = tc.transcript_idx.map(|idx| &ctx.transcripts[idx]);
                         let (symbol, gene, biotype_tx, strand_str, symbol_source, hgnc_id, source) =
                             if let Some(tx) = tx_opt {
-                                // Gate HGNC_ID in merged mode: RefSeq
-                                // transcripts only inherit the ID when an
-                                // Ensembl transcript with the same gene
-                                // symbol (and HGNC_ID) overlaps this
-                                // variant — matching VEP merge_features.
-                                let effective_hgnc = if is_merged_mode
-                                    && is_refseq_transcript(tx)
-                                    && !tx
-                                        .gene_symbol
-                                        .as_deref()
-                                        .is_some_and(|s| merged_hgnc_symbols.contains(s))
-                                {
-                                    ""
-                                } else {
-                                    tx.gene_hgnc_id.as_deref().unwrap_or("")
-                                };
                                 (
                                     tx.gene_symbol.as_deref().unwrap_or(""),
                                     tx.gene_stable_id.as_deref().unwrap_or(""),
                                     tx.biotype.as_str(),
                                     if tx.strand >= 0 { "1" } else { "-1" },
                                     tx.gene_symbol_source.as_deref().unwrap_or(""),
-                                    effective_hgnc,
+                                    tx.gene_hgnc_id.as_deref().unwrap_or(""),
                                     tx.source.as_deref().unwrap_or(""),
                                 )
                             } else {
@@ -4492,19 +4449,7 @@ impl AnnotateProvider {
                         );
                         append_opt_str(
                             b_hgnc_id.values(),
-                            tx_opt.and_then(|tx| {
-                                if is_merged_mode
-                                    && is_refseq_transcript(tx)
-                                    && !tx
-                                        .gene_symbol
-                                        .as_deref()
-                                        .is_some_and(|s| merged_hgnc_symbols.contains(s))
-                                {
-                                    None
-                                } else {
-                                    tx.gene_hgnc_id.as_deref()
-                                }
-                            }),
+                            tx_opt.and_then(|tx| tx.gene_hgnc_id.as_deref()),
                         );
 
                         // CANONICAL
