@@ -231,6 +231,15 @@ pub fn format_hgvsc(
     if notation.kind != "dup" && !identical_substitution {
         clip_alleles(&mut notation, tx.strand);
     }
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
+    //   replaces clipped alleles with feature_seq when `_rna_edit` attributes
+    //   are present on the transcript
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1443-L1449>
+    if !tx.refseq_edits.is_empty() {
+        notation.ref_allele = feature_ref.clone();
+        notation.alt_allele = feature_alt.clone();
+    }
     let (mut start, mut end) = if notation.kind == ">"
         && numbering == 'c'
         && cds_position.is_some_and(|value| !value.is_empty() && !value.contains('_'))
