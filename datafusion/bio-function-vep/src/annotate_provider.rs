@@ -5399,15 +5399,15 @@ fn backfill_missing_hgnc_ids(
             }
         }
         // Symbol-based fallback: keep the strict default for Ensembl
-        // non-HGNC-source transcripts (issue #92), but allow coding RefSeq
-        // rows where VEP still exposes the gene object's HGNC display_xref.
+        // non-HGNC-source transcripts (issue #92), but allow RefSeq rows.
+        // VEP still exposes the gene object's HGNC display_xref on both
+        // coding and non-coding RefSeq transcripts such as XR_/NR_ rows.
         let source_is_hgnc = tx
             .gene_symbol_source
             .as_deref()
             .is_some_and(|s| s == "HGNC");
-        let source_is_refseq_coding =
-            tx.transcript_id.starts_with("NM_") || tx.transcript_id.starts_with("XM_");
-        if hgnc_backfill || source_is_hgnc || source_is_refseq_coding {
+        let source_is_refseq = is_refseq_transcript(tx);
+        if hgnc_backfill || source_is_hgnc || source_is_refseq {
             if let Some(symbol) = tx.gene_symbol.as_deref() {
                 if let Some(hgnc_id) = unique_hgnc_by_symbol.get(symbol) {
                     tx.gene_hgnc_id = Some(hgnc_id.clone());
@@ -8323,7 +8323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backfill_hgnc_refseq_noncoding_entrezgene_source_not_filled_by_default() {
+    fn test_backfill_hgnc_refseq_noncoding_entrezgene_source_filled_by_default() {
         let tx_hgnc = make_tx(
             "ENST00000919191",
             Some("NBAS"),
@@ -8337,7 +8337,7 @@ mod tests {
         let refseq_ids = vec![None, None];
 
         backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
-        assert_eq!(transcripts[1].gene_hgnc_id, None);
+        assert_eq!(transcripts[1].gene_hgnc_id.as_deref(), Some("HGNC:15625"));
     }
 
     /// RefSeq ID-based backfill still works regardless of `hgnc_backfill` flag.

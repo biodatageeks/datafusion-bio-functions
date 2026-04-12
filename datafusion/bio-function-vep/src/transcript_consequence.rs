@@ -3208,6 +3208,54 @@ fn build_protein_hgvs_data(
     })
 }
 
+fn shifted_equal_protein_hgvs(
+    class: &CodingClassification,
+    protein_hgvs: &crate::hgvs::ProteinHgvsData,
+) -> Option<crate::hgvs::ProteinHgvsData> {
+    if protein_hgvs.frameshift
+        || protein_hgvs.ref_peptide != "-"
+        || protein_hgvs.alt_peptide.is_empty()
+    {
+        return None;
+    }
+
+    let start = class.protein_position_start?;
+    let end = class
+        .protein_position_end
+        .or(class.protein_position_start)?;
+    let low = start.min(end);
+    let high = start.max(end);
+
+    let ref_window = protein_hgvs
+        .ref_translation
+        .chars()
+        .skip(low.checked_sub(1)?)
+        .take(high.checked_sub(low)?.saturating_add(1))
+        .collect::<String>();
+    let alt_window = protein_hgvs
+        .alt_translation
+        .chars()
+        .skip(low.checked_sub(1)?)
+        .take(high.checked_sub(low)?.saturating_add(1))
+        .collect::<String>();
+
+    if ref_window.is_empty() || ref_window != alt_window {
+        return None;
+    }
+
+    Some(crate::hgvs::ProteinHgvsData {
+        start: low,
+        end: high,
+        ref_peptide: ref_window.clone(),
+        alt_peptide: alt_window,
+        ref_translation: protein_hgvs.ref_translation.clone(),
+        alt_translation: protein_hgvs.alt_translation.clone(),
+        frameshift: protein_hgvs.frameshift,
+        start_lost: protein_hgvs.start_lost,
+        stop_lost: protein_hgvs.stop_lost,
+    })
+}
+
 fn original_terms_allow_protein_hgvs(terms: &[SoTerm]) -> bool {
     terms.iter().any(|term| {
         matches!(
@@ -3282,8 +3330,13 @@ fn protein_hgvs_for_output(
         hgvs_shift_reverse: None,
     };
 
-    classify_coding_change(tx, tx_exons, tx_translation, &shifted_variant)
-        .and_then(|class| class.protein_hgvs)
+    classify_coding_change(tx, tx_exons, tx_translation, &shifted_variant).and_then(|class| {
+        class
+            .protein_hgvs
+            .as_ref()
+            .and_then(|protein| shifted_equal_protein_hgvs(&class, protein))
+            .or(class.protein_hgvs)
+    })
 }
 
 fn apply_codon_classification(terms: &mut BTreeSet<SoTerm>, c: &CodingClassification) {
@@ -8606,6 +8659,32 @@ mod tests {
 
         assert_eq!(adjust_refseq_cds_output_position(&t, 35, 0), Some(35));
         assert_eq!(adjust_refseq_cds_output_position(&t, 2015, 0), Some(2018));
+    }
+
+    #[test]
+    fn shifted_equal_protein_hgvs_uses_shifted_translation_window_when_unchanged() {
+        let class = CodingClassification {
+            protein_position_start: Some(25),
+            protein_position_end: Some(26),
+            ..Default::default()
+        };
+        let protein = crate::hgvs::ProteinHgvsData {
+            start: 26,
+            end: 25,
+            ref_peptide: "-".to_string(),
+            alt_peptide: "E".to_string(),
+            ref_translation: "M".repeat(24) + "EEEEK",
+            alt_translation: "M".repeat(24) + "EEEEEK",
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
+
+        let adjusted = shifted_equal_protein_hgvs(&class, &protein).expect("adjusted hgvs");
+        assert_eq!(adjusted.start, 25);
+        assert_eq!(adjusted.end, 26);
+        assert_eq!(adjusted.ref_peptide, "EE");
+        assert_eq!(adjusted.alt_peptide, "EE");
     }
 
     #[test]
