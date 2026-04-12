@@ -2352,6 +2352,82 @@ impl TranscriptConsequenceEngine {
         false
     }
 
+    /// Returns true when the transcript contains any frameshift intron
+    /// (≤13 bp). VEP caches this on the transcript and uses it to stretch
+    /// exon overlap checks for consequence include predicates.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariation::_overlapped_introns_and_boundary_no_tree()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L903-L914>
+    /// - Ensembl Variation `BaseTranscriptVariation::_overlapped_exons()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L858-L866>
+    fn transcript_has_frameshift_intron(&self, tx_exons: &[&ExonFeature]) -> bool {
+        if tx_exons.len() < 2 {
+            return false;
+        }
+        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
+        sorted.sort_by_key(|e| e.start);
+        sorted.windows(2).any(|pair| {
+            let intron_start = pair[0].end + 1;
+            let intron_end = pair[1].start - 1;
+            intron_start <= intron_end && (intron_end - intron_start).abs() <= 12
+        })
+    }
+
+    /// VEP consequence include predicates use `_overlapped_exons`, not the
+    /// stricter `within_feature()` insertion semantics. When a transcript has
+    /// any frameshift intron, VEP expands exon overlap by 12 bp on both sides
+    /// for these include checks.
+    ///
+    /// This matters for `splice_polypyrimidine_tract_variant`, whose include
+    /// gate is `exon => 0, intron => 1`. Some RefSeq transcripts with a tiny
+    /// frameshift intron elsewhere therefore suppress PPT even when the
+    /// observed variant is still intronic by the effect-specific overlap path.
+    ///
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariation::_overlapped_exons()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L848-L866>
+    fn overlaps_exon_for_consequence_include(
+        &self,
+        variant: &VariantInput,
+        tx_exons: &[&ExonFeature],
+    ) -> bool {
+        let stretch = if self.transcript_has_frameshift_intron(tx_exons) {
+            12
+        } else {
+            0
+        };
+        tx_exons.iter().any(|exon| {
+            overlaps(
+                variant.start,
+                variant.end,
+                exon.start - stretch,
+                exon.end + stretch,
+            )
+        })
+    }
+
+    /// Traceability:
+    /// - Ensembl Variation `BaseTranscriptVariation::_overlapped_introns_and_boundary_no_tree()`
+    ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L871-L903>
+    fn overlaps_intron_for_consequence_include(
+        &self,
+        variant: &VariantInput,
+        tx_exons: &[&ExonFeature],
+    ) -> bool {
+        if tx_exons.len() < 2 {
+            return false;
+        }
+        let mut sorted: Vec<&ExonFeature> = tx_exons.to_vec();
+        sorted.sort_by_key(|e| e.start);
+        sorted.windows(2).any(|pair| {
+            let intron_start = pair[0].end + 1;
+            let intron_end = pair[1].start - 1;
+            intron_start <= intron_end
+                && overlaps(variant.start, variant.end, intron_start, intron_end)
+        })
+    }
+
     /// Returns true if the variant falls within a frameshift intron (≤13bp).
     /// VEP treats such variants as part of the surrounding coding context.
     ///
@@ -2411,6 +2487,8 @@ impl TranscriptConsequenceEngine {
         } else {
             (sv.end, sv.start)
         };
+        let allow_polypyrimidine = self.overlaps_intron_for_consequence_include(sv, tx_exons)
+            && !self.overlaps_exon_for_consequence_include(sv, tx_exons);
 
         // Derive introns from sorted exon pairs.
         let mut sorted_exons: Vec<&ExonFeature> = tx_exons.to_vec();
@@ -2462,6 +2540,10 @@ impl TranscriptConsequenceEngine {
             } else {
                 self.add_splice_for_intron_negative(terms, sv, is_ins, intron_start, intron_end);
             }
+        }
+
+        if !allow_polypyrimidine {
+            terms.remove(&SoTerm::SplicePolypyrimidineTractVariant);
         }
     }
 
@@ -7531,6 +7613,149 @@ mod tests {
         assert!(
             terms.contains(&SoTerm::FrameshiftVariant),
             "Should still get frameshift from CDS overlap: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn ppt_suppressed_when_frameshift_intron_stretches_exon_include_window() {
+        // Main intron: 201..299, variant at 294 sits in the PPT window before
+        // exon 2. A distant 2bp intron elsewhere in the transcript activates
+        // VEP's global 12bp exon stretch for consequence include predicates,
+        // which suppresses PPT (`exon => 0, intron => 1`).
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            100,
+            600,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(600),
+        );
+        let exons = vec![
+            exon("T1", 1, 100, 200),
+            exon("T1", 2, 300, 400),
+            exon("T1", 3, 450, 500),
+            exon("T1", 4, 503, 600),
+        ];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 294, 294, "A", "G"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::SpliceRegionVariant),
+            "Expected splice_region from acceptor-adjacent intronic SNV: {:?}",
+            terms
+        );
+        assert!(
+            terms.contains(&SoTerm::IntronVariant),
+            "Expected intron_variant for intronic SNV: {:?}",
+            terms
+        );
+        assert!(
+            !terms.contains(&SoTerm::SplicePolypyrimidineTractVariant),
+            "Frameshift-intron exon stretch should suppress PPT: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn ppt_retained_without_frameshift_intron_exon_stretch() {
+        // Same acceptor-side SNV geometry as the previous test, but without a
+        // distant frameshift intron. VEP keeps PPT here because the include
+        // predicate still sees `exon => 0`.
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            100,
+            600,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(600),
+        );
+        let exons = vec![
+            exon("T1", 1, 100, 200),
+            exon("T1", 2, 300, 400),
+            exon("T1", 3, 450, 600),
+        ];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 294, 294, "A", "G"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::SplicePolypyrimidineTractVariant),
+            "Without frameshift-intron exon stretch, PPT should be retained: {:?}",
+            terms
+        );
+    }
+
+    #[test]
+    fn ppt_suppressed_for_insertion_when_frameshift_intron_stretches_exon_window() {
+        // Insertion equivalent of the chr19 residual pattern: the insertion
+        // remains intronic for effect-specific logic, but VEP's stretched exon
+        // include window suppresses PPT when the transcript has any 2bp intron.
+        let engine = TranscriptConsequenceEngine::default();
+        let t = tx(
+            "T1",
+            "22",
+            100,
+            600,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(600),
+        );
+        let exons = vec![
+            exon("T1", 1, 100, 200),
+            exon("T1", 2, 300, 400),
+            exon("T1", 3, 450, 500),
+            exon("T1", 4, 503, 600),
+        ];
+
+        let assignments = engine.evaluate_variant_with_context(
+            &var("22", 294, 294, "-", "GCG"),
+            &[t],
+            &exons,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let terms = &assignments[0].terms;
+        assert!(
+            terms.contains(&SoTerm::SpliceRegionVariant),
+            "Expected splice_region from acceptor-adjacent insertion: {:?}",
+            terms
+        );
+        assert!(
+            terms.contains(&SoTerm::IntronVariant),
+            "Expected intron_variant for intronic insertion: {:?}",
+            terms
+        );
+        assert!(
+            !terms.contains(&SoTerm::SplicePolypyrimidineTractVariant),
+            "Frameshift-intron exon stretch should suppress PPT for insertions: {:?}",
             terms
         );
     }
