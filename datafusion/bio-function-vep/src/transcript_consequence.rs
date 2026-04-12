@@ -3666,13 +3666,22 @@ fn classify_coding_change(
     let first_codon = start_idx / 3;
     let last_codon = end_idx / 3;
 
-    // CDS position (1-based)
-    class.cds_position_start = Some(start_idx + 1);
-    class.cds_position_end = Some(end_idx + 1);
+    // CDS/protein display positions follow the padded CDS index space used by
+    // VEP, then apply RefSeq transcript misalignment offsets for downstream
+    // coding positions.
+    let raw_cds_position_start = start_idx + 1;
+    let raw_cds_position_end = end_idx + 1;
+    class.cds_position_start =
+        adjust_refseq_cds_output_position(tx, raw_cds_position_start, leading_n_offset)
+            .or(Some(raw_cds_position_start));
+    class.cds_position_end =
+        adjust_refseq_cds_output_position(tx, raw_cds_position_end, leading_n_offset)
+            .or(Some(raw_cds_position_end));
 
-    // Protein position (1-based)
-    class.protein_position_start = Some(first_codon + 1);
-    class.protein_position_end = Some(last_codon + 1);
+    let display_cds_position_start = class.cds_position_start.unwrap_or(raw_cds_position_start);
+    let display_cds_position_end = class.cds_position_end.unwrap_or(raw_cds_position_end);
+    class.protein_position_start = Some((display_cds_position_start + 2) / 3);
+    class.protein_position_end = Some((display_cds_position_end + 2) / 3);
 
     // Amino acids
     let frameshift = !ref_len.abs_diff(alt_len).is_multiple_of(3);
@@ -3987,8 +3996,14 @@ fn classify_insertion(
 
     // CDS position: insertion between cds_idx and cds_idx+1 in 0-based,
     // which is (cds_idx+1)-(cds_idx+2) in 1-based VEP convention.
-    class.cds_position_start = Some(cds_idx + 1);
-    class.cds_position_end = Some(cds_idx + 2);
+    let raw_cds_position_start = cds_idx + 1;
+    let raw_cds_position_end = cds_idx + 2;
+    class.cds_position_start =
+        adjust_refseq_cds_output_position(tx, raw_cds_position_start, leading_n_offset)
+            .or(Some(raw_cds_position_start));
+    class.cds_position_end =
+        adjust_refseq_cds_output_position(tx, raw_cds_position_end, leading_n_offset)
+            .or(Some(raw_cds_position_end));
 
     // Protein position: VEP maps BOTH flanking bases of the insertion via
     // genomic2pep, which converts each CDS position independently through
@@ -3996,10 +4011,12 @@ fn classify_insertion(
     // positions, the insertion is at a codon boundary.
     // https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L477-L478
     let codon_at = cds_idx / 3;
-    let hgvs_cds_a =
-        genomic_to_cds_index(tx, tx_exons, variant.start).map(|i| i + leading_n_offset + 1); // 1-based
+    let hgvs_cds_a = genomic_to_cds_index(tx, tx_exons, variant.start)
+        .map(|i| i + leading_n_offset + 1)
+        .and_then(|raw| adjust_refseq_cds_output_position(tx, raw, leading_n_offset).or(Some(raw)));
     let hgvs_cds_b = genomic_to_cds_index(tx, tx_exons, variant.start.saturating_sub(1))
-        .map(|i| i + leading_n_offset + 1); // 1-based
+        .map(|i| i + leading_n_offset + 1)
+        .and_then(|raw| adjust_refseq_cds_output_position(tx, raw, leading_n_offset).or(Some(raw)));
     let (pep_a, pep_b) = match (hgvs_cds_a, hgvs_cds_b) {
         (Some(a), Some(b)) => ((a + 2) / 3, (b + 2) / 3),
         _ => (codon_at + 1, codon_at + 1),
@@ -5202,6 +5219,35 @@ pub(crate) fn refseq_misalignment_offset_for_cdna(
     (offset != 0).then_some(offset)
 }
 
+fn adjust_refseq_cds_output_position(
+    tx: &TranscriptFeature,
+    raw_cds_position: usize,
+    leading_n_offset: usize,
+) -> Option<usize> {
+    if raw_cds_position == 0
+        || !(tx.transcript_id.starts_with("NM_") || tx.transcript_id.starts_with("XM_"))
+    {
+        return Some(raw_cds_position);
+    }
+
+    let cdna_without_padding = match raw_cds_position.checked_sub(leading_n_offset) {
+        Some(0) | None => return Some(raw_cds_position),
+        Some(value) => value,
+    };
+    let cdna_coding_start = match tx.cdna_coding_start {
+        Some(value) => value,
+        None => return Some(raw_cds_position),
+    };
+    let cdna_position = cdna_coding_start
+        .checked_add(cdna_without_padding)?
+        .checked_sub(1)?;
+    let adjusted = raw_cds_position as i64
+        + refseq_misalignment_offset_for_cdna(tx, cdna_position as i64).unwrap_or(0);
+    (adjusted > 0)
+        .then(|| usize::try_from(adjusted).ok())
+        .flatten()
+}
+
 pub(crate) fn adjust_refseq_cdna_component(tx: &TranscriptFeature, value: &str) -> Option<String> {
     if !tx.cdna_mapper_segments.is_empty() || value.is_empty() || value == "?" {
         return None;
@@ -5516,10 +5562,18 @@ fn partial_coding_overlap_classification(
     let last_idx = last_idx + leading_n_offset;
 
     let mut class = CodingClassification::default();
-    class.cds_position_start = (!extends_before_coding).then_some(first_idx + 1);
-    class.cds_position_end = (!extends_after_coding).then_some(last_idx + 1);
-    class.protein_position_start = (!extends_before_coding).then_some((first_idx / 3) + 1);
-    class.protein_position_end = (!extends_after_coding).then_some((last_idx / 3) + 1);
+    let raw_cds_position_start = first_idx + 1;
+    let raw_cds_position_end = last_idx + 1;
+    class.cds_position_start = (!extends_before_coding).then(|| {
+        adjust_refseq_cds_output_position(tx, raw_cds_position_start, leading_n_offset)
+            .unwrap_or(raw_cds_position_start)
+    });
+    class.cds_position_end = (!extends_after_coding).then(|| {
+        adjust_refseq_cds_output_position(tx, raw_cds_position_end, leading_n_offset)
+            .unwrap_or(raw_cds_position_end)
+    });
+    class.protein_position_start = class.cds_position_start.map(|value| (value + 2) / 3);
+    class.protein_position_end = class.cds_position_end.map(|value| (value + 2) / 3);
     Some(class)
 }
 
@@ -8528,6 +8582,30 @@ mod tests {
             compute_cdna_position(&v, &t, &refs),
             Some("2842".to_string())
         );
+    }
+
+    #[test]
+    fn adjust_refseq_cds_output_position_applies_offset_only_downstream_of_edit() {
+        let mut t = tx(
+            "NM_015120.4",
+            "2",
+            73385758,
+            73609919,
+            1,
+            "protein_coding",
+            Some(73385869),
+            Some(73609615),
+        );
+        t.cdna_coding_start = Some(112);
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 186,
+            end: 185,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+
+        assert_eq!(adjust_refseq_cds_output_position(&t, 35, 0), Some(35));
+        assert_eq!(adjust_refseq_cds_output_position(&t, 2015, 0), Some(2018));
     }
 
     #[test]

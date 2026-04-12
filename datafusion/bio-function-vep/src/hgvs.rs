@@ -934,7 +934,15 @@ fn hgvs_cdna_position_from_genomic(
     genomic_pos: i64,
 ) -> Option<String> {
     let cdna_position = raw_cdna_position_from_genomic(tx, tx_exons, genomic_pos)?;
-    let cdna_position = adjust_refseq_cdna_component(tx, &cdna_position).unwrap_or(cdna_position);
+    let has_intron_offset = cdna_position
+        .char_indices()
+        .skip(1)
+        .any(|(_, ch)| matches!(ch, '+' | '-'));
+    let cdna_position = if has_intron_offset {
+        cdna_position
+    } else {
+        adjust_refseq_cdna_component(tx, &cdna_position).unwrap_or(cdna_position)
+    };
     shift_to_hgvs_coding_coordinates(tx, tx_exons, &cdna_position)
 }
 
@@ -1317,11 +1325,6 @@ fn shift_peptides_post_var(notation: &mut ProteinHgvsNotation, ref_translation: 
 ///   builds upstream from `substr($reference_trans, 0, $start - 1)` + preseq, then
 ///   tests whether the alt peptide matches the upstream at `start - alt_len - 1`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2410>
-/// - VEP's `$hgvs_notation->{start}` comes from `translation_start()` via the
-///   `genomic2pep()` mapper, which for codon-boundary insertions can return a
-///   position 1 higher than our `protein_position_start`. We compensate by also
-///   trying with `start + 1` when the insertion has no clipped prefix (boundary).
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L467-L499>
 fn check_for_peptide_duplication(
     notation: &mut ProteinHgvsNotation,
     ref_translation: &str,
@@ -1365,39 +1368,6 @@ fn try_peptide_dup_at(
         notation.kind = "dup".to_string();
         notation.end = check_start.saturating_sub(1);
         notation.start = check_start.saturating_sub(alt_len);
-
-        // 3' walk: slide the dup window rightward through identical
-        // residues to reach the 3'-most position per HGVS nomenclature.
-        //
-        // Traceability: VEP's `_check_for_peptide_duplication()` performs
-        // this walk internally; vepyr's original code only found the
-        // leftmost (5') match.
-        // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2371-L2410
-        // The single-char rotation check (comparing the char sliding out
-        // of the left with the char sliding in from the right) intentionally
-        // matches VEP's `_shift_3prime()` which performs the same rotation.
-        // For periodic repeats ("PA","PA","PA"...) this correctly walks to
-        // the 3'-most position. For non-periodic sequences the window
-        // content rotates but the walk produces the same result as VEP.
-        let ref_chars: Vec<char> = ref_translation.chars().collect();
-        while notation.end < ref_chars.len() {
-            let first = ref_chars.get(notation.start.saturating_sub(1)).copied();
-            let next = ref_chars.get(notation.end).copied();
-            match (first, next) {
-                (Some(f), Some(n)) if f == n => {
-                    notation.start += 1;
-                    notation.end += 1;
-                }
-                _ => break,
-            }
-        }
-
-        // Update alt_allele to the amino acids at the shifted positions
-        // so that format_hgvsp_notation shows the correct residue names.
-        if let Some(slice) = ref_chars.get(notation.start.saturating_sub(1)..notation.end) {
-            notation.alt_allele = slice.iter().collect();
-        }
-
         true
     } else {
         false
@@ -1506,7 +1476,7 @@ fn format_hgvsp_notation(
     {
         out.push_str(&format!(
             "{}{}=",
-            peptide_first_three(&notation.ref_allele)?,
+            peptide_to_three_letter(&notation.ref_allele),
             notation.start
         ));
         return Some(out);
@@ -1995,8 +1965,8 @@ mod tests {
     fn test_format_hgvsp_insertion_duplication_uses_dup_notation() {
         let translation = make_translation();
         let protein = ProteinHgvsData {
-            start: 3,
-            end: 3,
+            start: 4,
+            end: 4,
             ref_peptide: "-".to_string(),
             alt_peptide: "A".to_string(),
             ref_translation: "MAA*".to_string(),
@@ -2005,10 +1975,29 @@ mod tests {
             start_lost: false,
             stop_lost: false,
         };
-        // 3' walk shifts dup from Ala2 to Ala3 (rightmost A in "MAA*")
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
             Some("ENSPHGVS000001.1:p.Ala3dup".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsp_synonymous_multi_residue_uses_full_peptide_string() {
+        let translation = make_translation();
+        let protein = ProteinHgvsData {
+            start: 25,
+            end: 26,
+            ref_peptide: "EE".to_string(),
+            alt_peptide: "EE".to_string(),
+            ref_translation: "M".repeat(24) + "EEEEK",
+            alt_translation: "M".repeat(24) + "EEEEK",
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
+        assert_eq!(
+            format_hgvsp(&translation, &protein, true),
+            Some("ENSPHGVS000001.1:p.GluGlu25=".to_string())
         );
     }
 
@@ -2705,6 +2694,39 @@ mod tests {
     }
 
     #[test]
+    fn test_hgvs_cdna_position_does_not_apply_refseq_offset_to_intronic_coords() {
+        let mut tx = make_transcript("protein_coding", 1, Some(100), Some(599));
+        tx.transcript_id = "NM_OFFSET.1".to_string();
+        tx.start = 100;
+        tx.end = 599;
+        tx.cdna_coding_start = Some(1);
+        tx.cdna_coding_end = Some(400);
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 150,
+            end: 149,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 100,
+            end: 299,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 400,
+            end: 599,
+        };
+        let exons = [&exon1, &exon2];
+        assert_eq!(
+            hgvs_cdna_position_from_genomic(&tx, &exons, 349),
+            Some("200+50".to_string())
+        );
+    }
+
+    #[test]
     fn test_shift_to_hgvs_coding_coordinates_prefers_cached_cdna_coding_bounds() {
         let mut tx = make_transcript("protein_coding", 1, Some(100), Some(108));
         tx.cdna_coding_start = Some(21);
@@ -3031,7 +3053,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // check_for_peptide_duplication — fallback positions
+    // check_for_peptide_duplication — direct upstream match
     // ---------------------------------------------------------------
 
     #[test]
@@ -3107,12 +3129,11 @@ mod tests {
         };
         // ref = "MAKLKL*". At start=5: test_new_start = 5-2-1 = 2.
         // upstream = ref[..4] = "MAKL". upstream[2..4] = "KL". Match!
-        // 3' walk shifts KL(3-4) → KL(5-6) (rightmost repeat)
         let result = check_for_peptide_duplication(&mut notation, "MAKLKL*");
         assert!(result);
         assert_eq!(notation.kind, "dup");
-        assert_eq!(notation.start, 5);
-        assert_eq!(notation.end, 6);
+        assert_eq!(notation.start, 3);
+        assert_eq!(notation.end, 4);
     }
 
     // ---------------------------------------------------------------
@@ -3345,15 +3366,13 @@ mod tests {
         );
     }
 
-    // ── try_peptide_dup_at 3' shift tests (issue #89) ───────────────────
+    // ── try_peptide_dup_at direct upstream-match tests ──────────────────
 
     #[test]
-    fn peptide_dup_single_residue_shifts_3prime() {
+    fn peptide_dup_single_residue_keeps_upstream_match_coordinates() {
         // Ref: MAAAEEEEK — E at positions 5,6,7,8 (1-based)
         // Insert "E" at check_start=6 → upstream="MAAAE"
         // test_new_start = 6-1-1 = 4, test_seq = upstream[4..5] = "E" ✓
-        // Initial dup at start=5, end=5
-        // 3' walk: E(5)==E(6)→6,6; E(6)==E(7)→7,7; E(7)==E(8)→8,8; E(8)==K(9)→stop
         let mut notation = ProteinHgvsNotation {
             start: 6,
             end: 6,
@@ -3366,16 +3385,14 @@ mod tests {
         let result = try_peptide_dup_at(&mut notation, "MAAAEEEEK", 6);
         assert!(result);
         assert_eq!(notation.kind, "dup");
-        assert_eq!(notation.start, 8);
-        assert_eq!(notation.end, 8);
+        assert_eq!(notation.start, 5);
+        assert_eq!(notation.end, 5);
     }
 
     #[test]
     fn peptide_dup_single_residue_no_shift_needed() {
         // Ref: MAEK — E at position 3 only, followed by K
         // check_start=4: upstream="MAE", test_new_start=4-1-1=2, test_seq="E" ✓
-        // Initial dup at start=3, end=3
-        // 3' walk: E(3)==K(4)→stop
         let mut notation = ProteinHgvsNotation {
             start: 4,
             end: 4,
@@ -3393,12 +3410,10 @@ mod tests {
     }
 
     #[test]
-    fn peptide_dup_multi_residue_shifts_3prime() {
+    fn peptide_dup_multi_residue_uses_direct_upstream_match() {
         // Ref: MPAPAPAD — "PA" repeats at 2-3, 4-5, 6-7
         // Insert "PA" at check_start=4: upstream="MPA"
         // test_new_start = 4-2-1 = 1, test_seq = upstream[1..3] = "PA" ✓
-        // Initial dup at start=2, end=3
-        // 3' walk: P(2)==P(4)→3,4; A(3)==A(5)→4,5; P(4)==P(6)→5,6; A(5)==A(7)→6,7; P(6)==D(8)→stop
         let mut notation = ProteinHgvsNotation {
             start: 4,
             end: 5,
@@ -3411,16 +3426,14 @@ mod tests {
         let result = try_peptide_dup_at(&mut notation, "MPAPAPAD", 4);
         assert!(result);
         assert_eq!(notation.kind, "dup");
-        assert_eq!(notation.start, 6);
-        assert_eq!(notation.end, 7);
+        assert_eq!(notation.start, 2);
+        assert_eq!(notation.end, 3);
     }
 
     #[test]
-    fn peptide_dup_shift_stops_at_ref_end() {
+    fn peptide_dup_keeps_initial_match_at_ref_end() {
         // Ref: MAAEE — E at positions 4,5
         // check_start=5: upstream="MAAE", test_new_start=5-1-1=3, test_seq="E" ✓
-        // Initial dup at start=4, end=4
-        // 3' walk: E(4)==E(5)→5,5; E(5)==? (end of ref)→stop
         let mut notation = ProteinHgvsNotation {
             start: 5,
             end: 5,
@@ -3433,18 +3446,17 @@ mod tests {
         let result = try_peptide_dup_at(&mut notation, "MAAEE", 5);
         assert!(result);
         assert_eq!(notation.kind, "dup");
-        assert_eq!(notation.start, 5);
-        assert_eq!(notation.end, 5);
+        assert_eq!(notation.start, 4);
+        assert_eq!(notation.end, 4);
     }
 
     #[test]
-    fn peptide_dup_issue89_example_glu25_to_glu28() {
-        // Issue #89 example: p.Glu25dup → p.Glu28dup (shift +3)
+    fn peptide_dup_issue89_example_keeps_pre_shift_dup_coordinates() {
+        // The peptide duplication check itself does not perform an extra
+        // 3' walk. Any right-shifting happens earlier in `_check_peptides_post_var`.
         // Ref has E at positions 25,26,27,28 then K at 29.
         let mut ref_translation = "M".repeat(24);
         ref_translation.push_str("EEEEK"); // pos 25-28: E, 29: K
-        // check_start=26: upstream includes pos 25 (E), test confirms dup at 25
-        // 3' walk: E(25)==E(26)→26; E(26)==E(27)→27; E(27)==E(28)→28; E(28)==K(29)→stop
         let mut notation = ProteinHgvsNotation {
             start: 26,
             end: 26,
@@ -3457,17 +3469,14 @@ mod tests {
         let result = try_peptide_dup_at(&mut notation, &ref_translation, 26);
         assert!(result);
         assert_eq!(notation.kind, "dup");
-        assert_eq!(notation.start, 28);
-        assert_eq!(notation.end, 28);
+        assert_eq!(notation.start, 25);
+        assert_eq!(notation.end, 25);
     }
 
     #[test]
-    fn peptide_dup_non_periodic_advances_like_vep() {
-        // Non-periodic sequences: the single-char rotation check matches
-        // VEP's _shift_3prime() behavior. For ref "MABAC", alt "AB":
-        // Initial dup at 2-3, walk: ref[1]=A == ref[3]=A → advance to 3-4.
-        // ref[2]=B ≠ ref[4]=C → stop at 3-4.
-        // alt_allele is refreshed from ref[2..4] = "AC".
+    fn peptide_dup_non_periodic_uses_direct_upstream_match() {
+        // For ref "MABAC", alt "AB", duplication is reported from the
+        // directly matching upstream window without any additional walk.
         let mut notation = ProteinHgvsNotation {
             start: 3,
             end: 3,
@@ -3480,18 +3489,17 @@ mod tests {
         let result = try_peptide_dup_at(&mut notation, "MABAC", 4);
         assert!(result);
         assert_eq!(notation.kind, "dup");
-        // Advances to 3-4 (matches VEP's single-char rotation)
-        assert_eq!(notation.start, 3);
-        assert_eq!(notation.end, 4);
-        // alt_allele refreshed from reference at new positions (3-4 = "BA")
-        assert_eq!(notation.alt_allele, "BA");
+        assert_eq!(notation.start, 2);
+        assert_eq!(notation.end, 3);
+        assert_eq!(notation.alt_allele, "AB");
     }
 
     #[test]
     fn peptide_dup_via_check_for_peptide_duplication() {
-        // Test the full check_for_peptide_duplication flow with 3' shift.
+        // Test the full duplication check without an extra internal 3' walk.
         // Ref: MAAAEEEEK — E at 5,6,7,8
-        // Insertion "E" at position 6 → dup detected and 3' shifted to 8.
+        // Insertion "E" at position 6 → dup detected at the directly
+        // matching upstream position.
         let mut notation = ProteinHgvsNotation {
             start: 6,
             end: 6,
@@ -3504,8 +3512,8 @@ mod tests {
         let result = check_for_peptide_duplication(&mut notation, "MAAAEEEEK");
         assert!(result);
         assert_eq!(notation.kind, "dup");
-        assert_eq!(notation.start, 8);
-        assert_eq!(notation.end, 8);
+        assert_eq!(notation.start, 5);
+        assert_eq!(notation.end, 5);
     }
 
     #[test]
