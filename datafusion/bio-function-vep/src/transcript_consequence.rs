@@ -3300,10 +3300,25 @@ fn shifted_equal_protein_hgvs(
     class: &CodingClassification,
     protein_hgvs: &crate::hgvs::ProteinHgvsData,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
-    if protein_hgvs.frameshift
-        || protein_hgvs.ref_peptide != "-"
-        || protein_hgvs.alt_peptide.is_empty()
-    {
+    if protein_hgvs.frameshift {
+        return None;
+    }
+
+    let peptide_len = |value: &str| {
+        if value == "-" {
+            0
+        } else {
+            value.chars().count()
+        }
+    };
+    let ref_len = peptide_len(&protein_hgvs.ref_peptide);
+    let alt_len = peptide_len(&protein_hgvs.alt_peptide);
+
+    // Ensembl only applies `_shift_3prime()` to protein HGVS insertions and
+    // deletions. Our shifted local peptide alleles can therefore look like
+    // either `-/E` (boundary insertion) or `E/EE` (codon-splitting insertion)
+    // while still resolving to a synonymous shifted peptide window.
+    if ref_len == alt_len {
         return None;
     }
 
@@ -8917,6 +8932,40 @@ mod tests {
         assert_eq!(adjusted.end, 26);
         assert_eq!(adjusted.ref_peptide, "EE");
         assert_eq!(adjusted.alt_peptide, "EE");
+    }
+
+    #[test]
+    fn shifted_equal_protein_hgvs_handles_codon_splitting_insertion_window() {
+        let class = CodingClassification {
+            protein_position_start: Some(25),
+            protein_position_end: Some(26),
+            ..Default::default()
+        };
+        let protein = crate::hgvs::ProteinHgvsData {
+            start: 28,
+            end: 28,
+            ref_peptide: "E".to_string(),
+            alt_peptide: "EE".to_string(),
+            ref_translation: "M".repeat(24) + "EEEEK",
+            alt_translation: "M".repeat(24) + "EEEEEK",
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
+
+        let adjusted = shifted_equal_protein_hgvs(&class, &protein).expect("adjusted hgvs");
+        assert_eq!(adjusted.start, 25);
+        assert_eq!(adjusted.end, 26);
+        assert_eq!(adjusted.ref_peptide, "EE");
+        assert_eq!(adjusted.alt_peptide, "EE");
+
+        let mut translation = translation("NM_015120.4", None, None, None, None);
+        translation.stable_id = Some("NP_055935.4".to_string());
+        translation.version = Some(1);
+        assert_eq!(
+            crate::hgvs::format_hgvsp(&translation, &adjusted, true),
+            Some("NP_055935.4:p.GluGlu25=".to_string())
+        );
     }
 
     #[test]
