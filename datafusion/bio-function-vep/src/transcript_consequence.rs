@@ -3314,11 +3314,14 @@ fn shifted_equal_protein_hgvs(
     let ref_len = peptide_len(&protein_hgvs.ref_peptide);
     let alt_len = peptide_len(&protein_hgvs.alt_peptide);
 
-    // Ensembl only applies `_shift_3prime()` to protein HGVS insertions and
-    // deletions. Our shifted local peptide alleles can therefore look like
-    // either `-/E` (boundary insertion) or `E/EE` (codon-splitting insertion)
-    // while still resolving to a synonymous shifted peptide window.
-    if ref_len == alt_len {
+    // Ensembl's protein HGVS formatter only emits "=" when the post-processed
+    // peptide alleles are equal and the event type is not "ins" or "fs".
+    // Boundary insertions (`-/ALT`) must therefore remain insertion/dup
+    // candidates, and deletions must remain deletions. The only extra case we
+    // need to normalize here is a codon-splitting insertion-like peptide
+    // allele such as `E/EE`, where both sides are non-empty and the shifted
+    // translated window is unchanged.
+    if ref_len == 0 || alt_len <= ref_len {
         return None;
     }
 
@@ -8927,11 +8930,7 @@ mod tests {
             stop_lost: false,
         };
 
-        let adjusted = shifted_equal_protein_hgvs(&class, &protein).expect("adjusted hgvs");
-        assert_eq!(adjusted.start, 25);
-        assert_eq!(adjusted.end, 26);
-        assert_eq!(adjusted.ref_peptide, "EE");
-        assert_eq!(adjusted.alt_peptide, "EE");
+        assert!(shifted_equal_protein_hgvs(&class, &protein).is_none());
     }
 
     #[test]
@@ -8966,6 +8965,50 @@ mod tests {
             crate::hgvs::format_hgvsp(&translation, &adjusted, true),
             Some("NP_055935.4:p.GluGlu25=".to_string())
         );
+    }
+
+    #[test]
+    fn shifted_equal_protein_hgvs_does_not_collapse_duplication_like_insertions() {
+        let class = CodingClassification {
+            protein_position_start: Some(48),
+            protein_position_end: Some(50),
+            ..Default::default()
+        };
+        let protein = crate::hgvs::ProteinHgvsData {
+            start: 50,
+            end: 48,
+            ref_peptide: "-".to_string(),
+            alt_peptide: "GGG".to_string(),
+            ref_translation: "M".repeat(47) + "GGGQQ",
+            alt_translation: "M".repeat(47) + "GGGGGGQQ",
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
+
+        assert!(shifted_equal_protein_hgvs(&class, &protein).is_none());
+    }
+
+    #[test]
+    fn shifted_equal_protein_hgvs_does_not_collapse_deletions() {
+        let class = CodingClassification {
+            protein_position_start: Some(541),
+            protein_position_end: Some(546),
+            ..Default::default()
+        };
+        let protein = crate::hgvs::ProteinHgvsData {
+            start: 541,
+            end: 546,
+            ref_peptide: "QQQQQQ".to_string(),
+            alt_peptide: "-".to_string(),
+            ref_translation: "M".repeat(540) + "QQQQQQAA",
+            alt_translation: "M".repeat(540) + "QQQQQAA",
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+        };
+
+        assert!(shifted_equal_protein_hgvs(&class, &protein).is_none());
     }
 
     #[test]
