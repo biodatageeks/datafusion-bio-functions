@@ -3150,9 +3150,13 @@ fn mutated_cds_stop_preserved(
         variant.end
     };
 
-    let Some(cds_idx) = genomic_to_cds_index(tx, tx_exons, var_start_genomic) else {
+    let leading_n_offset = cds_seq.bytes().take_while(|&b| b == b'N').count();
+    let Some(raw_cds_idx) = genomic_to_cds_index(tx, tx_exons, var_start_genomic) else {
         return false;
     };
+    let raw_cds_idx = raw_cds_idx.saturating_add(leading_n_offset);
+    let cds_idx =
+        adjust_refseq_cds_sequence_index(tx, raw_cds_idx, leading_n_offset).unwrap_or(raw_cds_idx);
 
     if cds_idx > cds_seq.len() {
         return false;
@@ -3297,10 +3301,11 @@ fn build_protein_hgvs_data(
 }
 
 fn shifted_equal_protein_hgvs(
+    tx: &TranscriptFeature,
     class: &CodingClassification,
     protein_hgvs: &crate::hgvs::ProteinHgvsData,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
-    if protein_hgvs.frameshift {
+    if !uses_refseq_transcript_reference(tx) || protein_hgvs.frameshift {
         return None;
     }
 
@@ -3359,6 +3364,218 @@ fn shifted_equal_protein_hgvs(
         frameshift: protein_hgvs.frameshift,
         start_lost: protein_hgvs.start_lost,
         stop_lost: protein_hgvs.stop_lost,
+    })
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::codon()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L798-L888>
+/// - Ensembl Variation `TranscriptVariationAllele::peptide()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L700-L797>
+fn local_peptide_from_codon_window(codon: &[u8]) -> Option<String> {
+    if codon.is_empty() {
+        return Some("-".to_string());
+    }
+    let whole_len = codon.len() / 3 * 3;
+    let whole = &codon[..whole_len];
+    let partial = &codon[whole_len..];
+    let mut peptide = if whole.is_empty() {
+        String::new()
+    } else {
+        translate_protein_from_cds(whole)?.into_iter().collect()
+    };
+    if !partial.is_empty() && peptide != "*" {
+        peptide.push('X');
+    }
+    if peptide.is_empty() {
+        peptide.push('-');
+    }
+    Some(peptide)
+}
+
+/// Build the local protein HGVS peptide alleles using the same codon-window
+/// extraction Ensembl uses in `TranscriptVariationAllele::codon()` and
+/// `TranscriptVariationAllele::peptide()`.
+///
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1593-L1758>
+/// - Ensembl Variation `TranscriptVariationAllele::codon()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L798-L888>
+/// - Ensembl Variation `TranscriptVariationAllele::peptide()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L700-L797>
+fn literal_indel_protein_hgvs_data(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+    class: &CodingClassification,
+) -> Option<crate::hgvs::ProteinHgvsData> {
+    let translation = tx_translation?;
+    let cds_seq = translation.cds_sequence.as_deref()?.to_ascii_uppercase();
+    let ref_genomic = normalize_allele_seq(&variant.ref_allele);
+    let alt_genomic = normalize_allele_seq(&variant.alt_allele);
+    let ref_len = ref_genomic.len();
+    let alt_len = alt_genomic.len();
+    if ref_len == alt_len {
+        return None;
+    }
+
+    let leading_n_offset = cds_seq.bytes().take_while(|&b| b == b'N').count();
+
+    let (raw_start_idx, raw_end_idx, start_idx, end_idx, alt_tx, cds_seq) = if ref_len == 0 {
+        let anchor_pos = if tx.strand >= 0 {
+            variant.start.saturating_sub(1)
+        } else {
+            variant.start
+        };
+        let raw_cds_idx = genomic_to_cds_index(tx, tx_exons, anchor_pos)
+            .or_else(|| {
+                let alt = if tx.strand >= 0 {
+                    variant.start
+                } else {
+                    variant.start.saturating_sub(1)
+                };
+                genomic_to_cds_index(tx, tx_exons, alt).and_then(|i| i.checked_sub(1))
+            })
+            .map(|i| i + leading_n_offset)?;
+        let cds_idx = adjust_refseq_cds_sequence_index(tx, raw_cds_idx, leading_n_offset)
+            .unwrap_or(raw_cds_idx);
+        let alt_tx = if tx.strand >= 0 {
+            alt_genomic.to_ascii_uppercase()
+        } else {
+            reverse_complement(&alt_genomic)?.to_ascii_uppercase()
+        };
+        (raw_cds_idx, raw_cds_idx, cds_idx, cds_idx, alt_tx, cds_seq)
+    } else {
+        let genomic_positions = genomic_range(variant.start, variant.end)?;
+        if genomic_positions.len() != ref_len {
+            return None;
+        }
+
+        let mut raw_cds_indices = Vec::with_capacity(genomic_positions.len());
+        let mut cds_indices = Vec::with_capacity(genomic_positions.len());
+        for pos in &genomic_positions {
+            let raw_idx =
+                genomic_to_cds_index(tx, tx_exons, *pos)?.saturating_add(leading_n_offset);
+            raw_cds_indices.push(raw_idx);
+            cds_indices.push(
+                adjust_refseq_cds_sequence_index(tx, raw_idx, leading_n_offset).unwrap_or(raw_idx),
+            );
+        }
+        raw_cds_indices.sort_unstable();
+        cds_indices.sort_unstable();
+        if cds_indices
+            .windows(2)
+            .any(|w| w[1] != w[0].saturating_add(1))
+        {
+            return None;
+        }
+        let start_idx = *cds_indices.first()?;
+        let end_idx = *cds_indices.last()?;
+        let ref_tx = if tx.strand >= 0 {
+            ref_genomic
+        } else {
+            reverse_complement(&ref_genomic)?.to_ascii_uppercase()
+        };
+        let alt_tx = if tx.strand >= 0 {
+            alt_genomic.to_ascii_uppercase()
+        } else {
+            reverse_complement(&alt_genomic)?.to_ascii_uppercase()
+        };
+        let edited_ref_tx = edited_transcript_reference_allele(variant, tx, tx_exons)
+            .filter(|seq| seq.len() == ref_len);
+        let effective_ref_tx = edited_ref_tx.as_deref().unwrap_or(ref_tx.as_str());
+        let ref_seq_slice = &cds_seq[start_idx..=end_idx];
+        let cds_seq = if ref_seq_slice != effective_ref_tx {
+            if edited_ref_tx.is_none()
+                || !uses_refseq_transcript_reference(tx)
+                || ref_seq_slice.len() != effective_ref_tx.len()
+            {
+                return None;
+            }
+            let mut edited_cds = cds_seq.into_bytes();
+            edited_cds.splice(start_idx..=end_idx, effective_ref_tx.bytes());
+            String::from_utf8(edited_cds).ok()?
+        } else {
+            cds_seq
+        };
+        (
+            *raw_cds_indices.first()?,
+            *raw_cds_indices.last()?,
+            start_idx,
+            end_idx,
+            alt_tx,
+            cds_seq,
+        )
+    };
+
+    let mut mutated = Vec::with_capacity(
+        cds_seq
+            .len()
+            .saturating_sub(ref_len)
+            .saturating_add(alt_len),
+    );
+    if ref_len == 0 {
+        let ins_point = start_idx.saturating_add(1);
+        mutated.extend_from_slice(&cds_seq.as_bytes()[..ins_point]);
+        mutated.extend_from_slice(alt_tx.as_bytes());
+        mutated.extend_from_slice(&cds_seq.as_bytes()[ins_point..]);
+    } else {
+        mutated.extend_from_slice(&cds_seq.as_bytes()[..start_idx]);
+        mutated.extend_from_slice(alt_tx.as_bytes());
+        mutated.extend_from_slice(&cds_seq.as_bytes()[end_idx + 1..]);
+    }
+
+    let old_aas = translate_protein_from_cds(cds_seq.as_bytes())?;
+    let new_aas = translate_protein_from_cds(&mutated)?;
+
+    let raw_start = class.protein_position_start?;
+    let raw_end = class
+        .protein_position_end
+        .or(class.protein_position_start)?;
+    let low = raw_start.min(raw_end);
+    let high = raw_start.max(raw_end);
+    let codon_cds_start = low.checked_mul(3)?.checked_sub(2)?;
+    let codon_cds_end = high.checked_mul(3)?;
+    let codon_len = codon_cds_end.checked_sub(codon_cds_start)?.checked_add(1)?;
+    let codon_start_idx = codon_cds_start.checked_sub(1)?;
+    if codon_start_idx > cds_seq.len() {
+        return None;
+    }
+
+    let ref_end_idx = codon_start_idx.saturating_add(codon_len).min(cds_seq.len());
+    let ref_codon = &cds_seq.as_bytes()[codon_start_idx..ref_end_idx];
+    let alt_window_len = codon_len as i64 + alt_len as i64 - ref_len as i64;
+    let alt_end_idx = if alt_window_len <= 0 {
+        codon_start_idx
+    } else {
+        codon_start_idx
+            .saturating_add(usize::try_from(alt_window_len).ok()?)
+            .min(mutated.len())
+    };
+    let alt_codon = &mutated[codon_start_idx..alt_end_idx];
+
+    let ref_peptide = local_peptide_from_codon_window(ref_codon)?;
+    let alt_peptide = local_peptide_from_codon_window(alt_codon)?;
+    let (start, end) = if ref_peptide == "-" && raw_start != raw_end {
+        (raw_end, raw_start)
+    } else {
+        (raw_start, raw_end)
+    };
+
+    let _ = (raw_start_idx, raw_end_idx); // traceability only
+
+    Some(crate::hgvs::ProteinHgvsData {
+        start,
+        end,
+        ref_peptide,
+        alt_peptide,
+        ref_translation: old_aas.iter().collect(),
+        alt_translation: new_aas.iter().collect(),
+        frameshift: !ref_len.abs_diff(alt_len).is_multiple_of(3),
+        start_lost: class.start_lost,
+        stop_lost: class.stop_lost,
     })
 }
 
@@ -3437,10 +3654,13 @@ fn protein_hgvs_for_output(
     };
 
     classify_coding_change(tx, tx_exons, tx_translation, &shifted_variant).and_then(|class| {
-        class
-            .protein_hgvs
-            .as_ref()
-            .and_then(|protein| shifted_equal_protein_hgvs(&class, protein))
+        literal_indel_protein_hgvs_data(tx, tx_exons, tx_translation, &shifted_variant, &class)
+            .or_else(|| {
+                class
+                    .protein_hgvs
+                    .as_ref()
+                    .and_then(|protein| shifted_equal_protein_hgvs(tx, &class, protein))
+            })
             .or(class.protein_hgvs)
     })
 }
@@ -3503,11 +3723,16 @@ fn classify_coding_change(
     // genomic-to-CDS mapping lines up with the padded string.
     let leading_n_offset = cds_seq.bytes().take_while(|&b| b == b'N').count();
 
+    let mut raw_cds_indices = Vec::with_capacity(genomic_positions.len());
     let mut cds_indices = Vec::with_capacity(genomic_positions.len());
     for pos in &genomic_positions {
-        let idx = genomic_to_cds_index(tx, tx_exons, *pos)?;
-        cds_indices.push(idx + leading_n_offset);
+        let raw_idx = genomic_to_cds_index(tx, tx_exons, *pos)?.saturating_add(leading_n_offset);
+        raw_cds_indices.push(raw_idx);
+        cds_indices.push(
+            adjust_refseq_cds_sequence_index(tx, raw_idx, leading_n_offset).unwrap_or(raw_idx),
+        );
     }
+    raw_cds_indices.sort_unstable();
     cds_indices.sort_unstable();
     if cds_indices
         .windows(2)
@@ -3515,6 +3740,8 @@ fn classify_coding_change(
     {
         return None;
     }
+    let raw_start_idx = *raw_cds_indices.first()?;
+    let raw_end_idx = *raw_cds_indices.last()?;
     let start_idx = *cds_indices.first()?;
     let end_idx = *cds_indices.last()?;
     if end_idx >= cds_seq.len() {
@@ -3828,8 +4055,8 @@ fn classify_coding_change(
     // CDS/protein display positions follow the padded CDS index space used by
     // VEP, then apply RefSeq transcript misalignment offsets for downstream
     // coding positions.
-    let raw_cds_position_start = start_idx + 1;
-    let raw_cds_position_end = end_idx + 1;
+    let raw_cds_position_start = raw_start_idx + 1;
+    let raw_cds_position_end = raw_end_idx + 1;
     class.cds_position_start =
         adjust_refseq_cds_output_position(tx, raw_cds_position_start, leading_n_offset)
             .or(Some(raw_cds_position_start));
@@ -4091,7 +4318,7 @@ fn classify_insertion(
     } else {
         variant.start
     };
-    let cds_idx = genomic_to_cds_index(tx, tx_exons, anchor_pos)
+    let raw_cds_idx = genomic_to_cds_index(tx, tx_exons, anchor_pos)
         .or_else(|| {
             // Primary anchor outside coding exon — try the other flank.
             let alt = if tx.strand >= 0 {
@@ -4102,6 +4329,8 @@ fn classify_insertion(
             genomic_to_cds_index(tx, tx_exons, alt).and_then(|i| i.checked_sub(1))
         })
         .map(|i| i + leading_n_offset)?;
+    let cds_idx =
+        adjust_refseq_cds_sequence_index(tx, raw_cds_idx, leading_n_offset).unwrap_or(raw_cds_idx);
 
     // Build alt sequence in transcript orientation
     let alt_tx = if tx.strand >= 0 {
@@ -4155,8 +4384,8 @@ fn classify_insertion(
 
     // CDS position: insertion between cds_idx and cds_idx+1 in 0-based,
     // which is (cds_idx+1)-(cds_idx+2) in 1-based VEP convention.
-    let raw_cds_position_start = cds_idx + 1;
-    let raw_cds_position_end = cds_idx + 2;
+    let raw_cds_position_start = raw_cds_idx + 1;
+    let raw_cds_position_end = raw_cds_idx + 2;
     class.cds_position_start =
         adjust_refseq_cds_output_position(tx, raw_cds_position_start, leading_n_offset)
             .or(Some(raw_cds_position_start));
@@ -4365,7 +4594,7 @@ fn classify_insertion(
             // the last codon affected by the inserted bases.
             let alt_end_codon = (ins_point + alt_len).saturating_sub(1) / 3;
             let alt_end = (alt_end_codon + 1).min(new_aas.len());
-            let at_boundary = ins_point % 3 == 0;
+            let at_boundary = ins_point.is_multiple_of(3);
             if at_boundary {
                 // At codon boundary: ref="-", alt=inserted AAs only
                 let ins_start_codon = ins_point / 3;
@@ -4385,7 +4614,7 @@ fn classify_insertion(
     }
 
     // Codons — inserted bases start at ins_point in the mutated CDS.
-    let at_codon_boundary = ins_point % 3 == 0;
+    let at_codon_boundary = ins_point.is_multiple_of(3);
     if at_codon_boundary {
         // Insertion at codon boundary (both frameshift and inframe): ref="-", alt=UPPERCASE
         let alt_codon: String = alt_tx.chars().map(|c| c.to_ascii_uppercase()).collect();
@@ -5369,7 +5598,7 @@ pub(crate) fn refseq_misalignment_offset_for_cdna(
         let Some(replacement_len) = edit.replacement_len else {
             continue;
         };
-        if edit.start >= cdna_start {
+        if edit.end >= cdna_start {
             continue;
         }
         let replaced_len = edit.end.saturating_sub(edit.start).saturating_add(1);
@@ -5405,6 +5634,17 @@ fn adjust_refseq_cds_output_position(
     (adjusted > 0)
         .then(|| usize::try_from(adjusted).ok())
         .flatten()
+}
+
+fn adjust_refseq_cds_sequence_index(
+    tx: &TranscriptFeature,
+    raw_cds_index: usize,
+    leading_n_offset: usize,
+) -> Option<usize> {
+    let raw_cds_position = raw_cds_index.checked_add(1)?;
+    let adjusted = adjust_refseq_cds_output_position(tx, raw_cds_position, leading_n_offset)
+        .unwrap_or(raw_cds_position);
+    adjusted.checked_sub(1)
 }
 
 pub(crate) fn adjust_refseq_cdna_component(tx: &TranscriptFeature, value: &str) -> Option<String> {
@@ -8913,6 +9153,16 @@ mod tests {
 
     #[test]
     fn shifted_equal_protein_hgvs_uses_shifted_translation_window_when_unchanged() {
+        let t = tx(
+            "ENST_TEST.1",
+            "1",
+            1,
+            100,
+            1,
+            "protein_coding",
+            Some(1),
+            Some(100),
+        );
         let class = CodingClassification {
             protein_position_start: Some(25),
             protein_position_end: Some(26),
@@ -8930,11 +9180,22 @@ mod tests {
             stop_lost: false,
         };
 
-        assert!(shifted_equal_protein_hgvs(&class, &protein).is_none());
+        assert!(shifted_equal_protein_hgvs(&t, &class, &protein).is_none());
     }
 
     #[test]
     fn shifted_equal_protein_hgvs_handles_codon_splitting_insertion_window() {
+        let mut t = tx(
+            "NM_015120.4",
+            "2",
+            73385758,
+            73609919,
+            1,
+            "protein_coding",
+            Some(73385869),
+            Some(73609615),
+        );
+        t.bam_edit_status = Some("ok".to_string());
         let class = CodingClassification {
             protein_position_start: Some(25),
             protein_position_end: Some(26),
@@ -8952,7 +9213,7 @@ mod tests {
             stop_lost: false,
         };
 
-        let adjusted = shifted_equal_protein_hgvs(&class, &protein).expect("adjusted hgvs");
+        let adjusted = shifted_equal_protein_hgvs(&t, &class, &protein).expect("adjusted hgvs");
         assert_eq!(adjusted.start, 25);
         assert_eq!(adjusted.end, 26);
         assert_eq!(adjusted.ref_peptide, "EE");
@@ -8969,6 +9230,16 @@ mod tests {
 
     #[test]
     fn shifted_equal_protein_hgvs_does_not_collapse_duplication_like_insertions() {
+        let t = tx(
+            "ENST_DUP.1",
+            "1",
+            1,
+            100,
+            1,
+            "protein_coding",
+            Some(1),
+            Some(100),
+        );
         let class = CodingClassification {
             protein_position_start: Some(48),
             protein_position_end: Some(50),
@@ -8986,11 +9257,22 @@ mod tests {
             stop_lost: false,
         };
 
-        assert!(shifted_equal_protein_hgvs(&class, &protein).is_none());
+        assert!(shifted_equal_protein_hgvs(&t, &class, &protein).is_none());
     }
 
     #[test]
     fn shifted_equal_protein_hgvs_does_not_collapse_deletions() {
+        let mut t = tx(
+            "NM_DEL.1",
+            "1",
+            1,
+            100,
+            1,
+            "protein_coding",
+            Some(1),
+            Some(100),
+        );
+        t.bam_edit_status = Some("ok".to_string());
         let class = CodingClassification {
             protein_position_start: Some(541),
             protein_position_end: Some(546),
@@ -9008,7 +9290,7 @@ mod tests {
             stop_lost: false,
         };
 
-        assert!(shifted_equal_protein_hgvs(&class, &protein).is_none());
+        assert!(shifted_equal_protein_hgvs(&t, &class, &protein).is_none());
     }
 
     #[test]
@@ -9063,6 +9345,50 @@ mod tests {
         assert_eq!(tc.hgvsc.as_deref(), Some("NM_EDIT.1:c.2C>C"));
         assert_eq!(tc.codons.as_deref(), Some("aCg/aCg"));
         assert_eq!(tc.amino_acids.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn classify_coding_change_applies_refseq_offset_to_sequence_indices() {
+        let mut t = tx(
+            "NM_EDIT_OFFSET.1",
+            "1",
+            100,
+            111,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(111),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(15);
+        t.bam_edit_status = Some("ok".to_string());
+        t.has_non_polya_rna_edit = true;
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 4,
+            end: 3,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        t.spliced_seq = Some("ATGGTAAAATTTCCC".to_string());
+        let e = exon("NM_EDIT_OFFSET.1", 1, 100, 111);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation(
+            "NM_EDIT_OFFSET.1",
+            Some(15),
+            Some(5),
+            None,
+            Some("ATGGTAAAATTTCCC"),
+        );
+        let v = var("1", 103, 103, "A", "G");
+
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v).expect("classification");
+        assert!(c.missense);
+        assert_eq!(c.codons, Some("Aaa/Gaa".to_string()));
+        assert_eq!(c.amino_acids, Some("K/E".to_string()));
+        assert_eq!(c.cds_position_start, Some(7));
+        assert_eq!(c.cds_position_end, Some(7));
+        assert_eq!(c.protein_position_start, Some(3));
+        assert_eq!(c.protein_position_end, Some(3));
     }
 
     #[test]
