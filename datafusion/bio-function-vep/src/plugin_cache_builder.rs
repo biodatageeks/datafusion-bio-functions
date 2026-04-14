@@ -39,6 +39,8 @@ pub fn convert_plugin(
     plugin: PluginKind,
     partitions: usize,
     memory_limit_gb: usize,
+    assume_sorted_input: bool,
+    preview_rows: Option<usize>,
 ) -> Result<Vec<(String, usize)>> {
     match plugin {
         PluginKind::ClinVar => convert_plugin_to_parquet(
@@ -48,6 +50,8 @@ pub fn convert_plugin(
             partitions,
             memory_limit_gb,
             None,
+            assume_sorted_input,
+            preview_rows,
         ),
         PluginKind::Cadd => {
             let (snv_source, indel_source) = resolve_cadd_sources(source_path)?;
@@ -58,6 +62,8 @@ pub fn convert_plugin(
                 partitions,
                 memory_limit_gb,
                 None,
+                assume_sorted_input,
+                preview_rows,
             )
         }
         PluginKind::SpliceAI => convert_plugin_to_parquet(
@@ -67,6 +73,8 @@ pub fn convert_plugin(
             partitions,
             memory_limit_gb,
             None,
+            assume_sorted_input,
+            preview_rows,
         ),
         PluginKind::AlphaMissense => convert_plugin_to_parquet(
             "alphamissense",
@@ -75,6 +83,8 @@ pub fn convert_plugin(
             partitions,
             memory_limit_gb,
             None,
+            assume_sorted_input,
+            preview_rows,
         ),
         PluginKind::DbNSFP => convert_plugin_to_parquet(
             "dbnsfp",
@@ -83,6 +93,8 @@ pub fn convert_plugin(
             partitions,
             memory_limit_gb,
             None,
+            assume_sorted_input,
+            preview_rows,
         ),
     }
 }
@@ -94,6 +106,8 @@ pub fn convert_plugin_to_parquet(
     partitions: usize,
     memory_limit_gb: usize,
     chromosomes: Option<Vec<String>>,
+    assume_sorted_input: bool,
+    preview_rows: Option<usize>,
 ) -> Result<Vec<(String, usize)>> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| DataFusionError::Execution(format!("Failed to create runtime: {e}")))?;
@@ -104,6 +118,8 @@ pub fn convert_plugin_to_parquet(
         partitions,
         memory_limit_gb,
         chromosomes,
+        assume_sorted_input,
+        preview_rows,
     ))
 }
 
@@ -114,6 +130,8 @@ pub fn convert_cadd_sources_to_parquet(
     partitions: usize,
     memory_limit_gb: usize,
     chromosomes: Option<Vec<String>>,
+    assume_sorted_input: bool,
+    preview_rows: Option<usize>,
 ) -> Result<Vec<(String, usize)>> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| DataFusionError::Execution(format!("Failed to create runtime: {e}")))?;
@@ -124,6 +142,8 @@ pub fn convert_cadd_sources_to_parquet(
         partitions,
         memory_limit_gb,
         chromosomes,
+        assume_sorted_input,
+        preview_rows,
     ))
 }
 
@@ -152,6 +172,8 @@ async fn convert_plugin_to_parquet_async(
     partitions: usize,
     _memory_limit_gb: usize,
     chromosomes: Option<Vec<String>>,
+    assume_sorted_input: bool,
+    preview_rows: Option<usize>,
 ) -> Result<Vec<(String, usize)>> {
     let config = SessionConfig::new().with_target_partitions(partitions);
     let ctx = SessionContext::new_with_config(config);
@@ -160,14 +182,18 @@ async fn convert_plugin_to_parquet_async(
 
     let select_query = plugin_kind.select_query();
     let chrom_col = plugin_kind.chrom_column();
-    let chroms = discover_chromosomes(&ctx, "source", chrom_col).await?;
     let requested: Option<HashSet<String>> = chromosomes.map(|values| {
         values
             .into_iter()
             .map(|value| normalize_chrom(&value))
             .collect()
     });
-    let grouped = group_chromosomes(chroms, requested.as_ref());
+    let grouped = if let Some(requested_values) = requested.as_ref() {
+        group_requested_chromosomes(requested_values)
+    } else {
+        let chroms = discover_chromosomes(&ctx, "source", chrom_col).await?;
+        group_chromosomes(chroms, None)
+    };
     let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
     let (main_chroms, other_chroms): (Vec<(String, Vec<String>)>, Vec<(String, Vec<String>)>) =
         grouped
@@ -186,7 +212,11 @@ async fn convert_plugin_to_parquet_async(
 
     for (norm, raw_chroms) in &main_chroms {
         let where_clause = plugin_build_where_clause(chrom_col, raw_chroms);
-        let query = format!("{select_query}{where_clause} ORDER BY chrom, pos, ref, alt");
+        let query = format!(
+            "{select_query}{where_clause}{}{}",
+            plugin_order_clause(plugin_name, assume_sorted_input),
+            plugin_limit_clause(preview_rows)
+        );
         let output_file = format!("{output_dir}/chr{norm}.parquet");
 
         let rows = write_query_to_parquet(&ctx, plugin_name, &query, &output_file).await?;
@@ -203,7 +233,11 @@ async fn convert_plugin_to_parquet_async(
             .flat_map(|(_, raws)| raws.iter().cloned())
             .collect();
         let where_clause = plugin_build_where_clause(chrom_col, &all_other_raw);
-        let query = format!("{select_query}{where_clause} ORDER BY chrom, pos, ref, alt");
+        let query = format!(
+            "{select_query}{where_clause}{}{}",
+            plugin_order_clause(plugin_name, assume_sorted_input),
+            plugin_limit_clause(preview_rows)
+        );
         let output_file = format!("{output_dir}/other.parquet");
 
         let rows = write_query_to_parquet(&ctx, plugin_name, &query, &output_file).await?;
@@ -229,6 +263,8 @@ async fn convert_cadd_sources_to_parquet_async(
     partitions: usize,
     _memory_limit_gb: usize,
     chromosomes: Option<Vec<String>>,
+    assume_sorted_input: bool,
+    preview_rows: Option<usize>,
 ) -> Result<Vec<(String, usize)>> {
     let config = SessionConfig::new().with_target_partitions(partitions);
     let ctx = SessionContext::new_with_config(config);
@@ -241,15 +277,19 @@ async fn convert_cadd_sources_to_parquet_async(
     )
     .await?;
 
-    let mut chroms = discover_chromosomes(&ctx, "source_snv", "chrom").await?;
-    chroms.extend(discover_chromosomes(&ctx, "source_indel", "chrom").await?);
     let requested: Option<HashSet<String>> = chromosomes.map(|values| {
         values
             .into_iter()
             .map(|value| normalize_chrom(&value))
             .collect()
     });
-    let grouped = group_chromosomes(chroms, requested.as_ref());
+    let grouped = if let Some(requested_values) = requested.as_ref() {
+        group_requested_chromosomes(requested_values)
+    } else {
+        let mut chroms = discover_chromosomes(&ctx, "source_snv", "chrom").await?;
+        chroms.extend(discover_chromosomes(&ctx, "source_indel", "chrom").await?);
+        group_chromosomes(chroms, None)
+    };
     let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
     let (main_chroms, other_chroms): (Vec<(String, Vec<String>)>, Vec<(String, Vec<String>)>) =
         grouped
@@ -261,13 +301,16 @@ async fn convert_cadd_sources_to_parquet_async(
         main_chroms.len(),
         other_chroms.len()
     );
+    if assume_sorted_input {
+        eprintln!("  cadd: assume_sorted_input ignored because CADD merges SNV + indel sources");
+    }
 
     let mut all_results = Vec::new();
     let global_start = Instant::now();
     let mut total_rows = 0usize;
 
     for (norm, raw_chroms) in &main_chroms {
-        let query = cadd_union_query(raw_chroms);
+        let query = cadd_union_query(raw_chroms, preview_rows);
         let output_file = format!("{output_dir}/chr{norm}.parquet");
         let rows = write_query_to_parquet(&ctx, "cadd", &query, &output_file).await?;
         total_rows += rows;
@@ -282,7 +325,7 @@ async fn convert_cadd_sources_to_parquet_async(
             .iter()
             .flat_map(|(_, raws)| raws.iter().cloned())
             .collect();
-        let query = cadd_union_query(&all_other_raw);
+        let query = cadd_union_query(&all_other_raw, preview_rows);
         let output_file = format!("{output_dir}/other.parquet");
         let rows = write_query_to_parquet(&ctx, "cadd", &query, &output_file).await?;
         total_rows += rows;
@@ -363,6 +406,20 @@ fn group_chromosomes(
             continue;
         }
         grouped.entry(canonical).or_default().insert(chrom);
+    }
+    grouped
+        .into_iter()
+        .map(|(canonical, raw_values)| (canonical, raw_values.into_iter().collect()))
+        .collect()
+}
+
+fn group_requested_chromosomes(requested: &HashSet<String>) -> Vec<(String, Vec<String>)> {
+    let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for chrom in requested {
+        let canonical = normalize_chrom(chrom);
+        for alias in chrom_aliases(&canonical) {
+            grouped.entry(canonical.clone()).or_default().insert(alias);
+        }
     }
     grouped
         .into_iter()
@@ -469,6 +526,20 @@ fn normalize_chrom(chrom: &str) -> String {
     chrom.strip_prefix("chr").unwrap_or(chrom).to_string()
 }
 
+fn plugin_order_clause(plugin_name: &str, assume_sorted_input: bool) -> &'static str {
+    if assume_sorted_input && plugin_name != "cadd" {
+        ""
+    } else {
+        " ORDER BY chrom, pos, ref, alt"
+    }
+}
+
+fn plugin_limit_clause(preview_rows: Option<usize>) -> String {
+    preview_rows
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_default()
+}
+
 async fn write_query_to_parquet(
     ctx: &SessionContext,
     plugin_name: &str,
@@ -562,11 +633,20 @@ fn chrom_aliases_for_sql(chrom: &str) -> Vec<String> {
     }
 }
 
+fn chrom_aliases(chrom: &str) -> Vec<String> {
+    let normalized = chrom.strip_prefix("chr").unwrap_or(chrom);
+    if normalized == chrom {
+        vec![normalized.to_string(), format!("chr{normalized}")]
+    } else {
+        vec![normalized.to_string(), chrom.to_string()]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PLUGIN_ROW_GROUP_SIZE, convert_plugin_to_parquet, normalize_chrom, plugin_select_query,
-        plugin_writer_properties,
+        PLUGIN_ROW_GROUP_SIZE, convert_plugin_to_parquet, group_requested_chromosomes,
+        normalize_chrom, plugin_select_query, plugin_writer_properties,
     };
     use datafusion::arrow::array::{Float32Array, Int32Array, StringArray, UInt32Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -593,6 +673,15 @@ mod tests {
     fn normalize_chrom_strips_prefix_only_when_present() {
         assert_eq!(normalize_chrom("chr7"), "7");
         assert_eq!(normalize_chrom("X"), "X");
+    }
+
+    #[test]
+    fn requested_chromosomes_expand_chr_aliases_without_scan() {
+        let grouped = group_requested_chromosomes(
+            &["Y".to_string(), "MT".to_string()].into_iter().collect(),
+        );
+        assert!(grouped.contains(&(String::from("MT"), vec![String::from("MT"), String::from("chrMT")])));
+        assert!(grouped.contains(&(String::from("Y"), vec![String::from("Y"), String::from("chrY")])));
     }
 
     #[test]
@@ -681,6 +770,7 @@ mod tests {
             1,
             32,
             None,
+            false,
         )
         .expect("convert");
         assert_eq!(results.len(), 1);
@@ -731,6 +821,7 @@ mod tests {
             1,
             32,
             None,
+            false,
         )
         .expect("convert");
         assert_eq!(results[0].1, 1);
@@ -773,8 +864,8 @@ mod tests {
         write_gzip_text(
             &source,
             concat!(
-                "#chr\tpos(1-based)\tref\talt\tSIFT4G_score\tSIFT4G_pred\tPolyphen2_HDIV_score\tPolyphen2_HVAR_score\tLRT_score\tLRT_pred\tMutationTaster_score\tREVEL_score\tMetaSVM_score\tMetaSVM_pred\tMetaLR_score\tMetaLR_pred\tGERP++_RS\tphyloP100way_vertebrate\tphyloP30way_mammalian\tphastCons100way_vertebrate\tphastCons30way_mammalian\tSiPhy_29way_logOdds\tCADD_raw\tCADD_phred\tFATHMM_score\tFATHMM_pred\tPROVEAN_score\tPROVEAN_pred\tVEST4_score\tBayesDel_addAF_score\tBayesDel_noAF_score\tMutationTaster_pred\n",
-                "X\t100\tA\tG\t0.1\tT\t0.2\t0.3\t0.4\tD\t0.5\t0.6\t0.7\tD\t0.8\tD\t1.0\t1.1\t1.2\t1.3\t1.4\t1.5\t1.6\t10.0\t0.9\tD\tN\tD\t0.7\t0.11\t0.12\tD\n",
+                "#chr\tpos(1-based)\tref\talt\tSIFT4G_score\tSIFT4G_pred\tPolyphen2_HDIV_score\tPolyphen2_HVAR_score\tMutationTaster_score\tMutationTaster_pred\tPROVEAN_score\tPROVEAN_pred\tVEST4_score\tMetaSVM_score\tMetaSVM_pred\tMetaLR_score\tMetaLR_pred\tREVEL_score\tGERP++_RS\tphyloP100way_vertebrate\tphastCons100way_vertebrate\tCADD_raw\tCADD_phred\n",
+                "X\t100\tA\tG\t0.1\tT\t0.2\t0.3\t0.5\tD\tN\tD\t0.7\t0.8\tD\t0.9\tD\t0.6\t1.0\t1.1\t1.3\t1.6\t10.0\n",
             ),
         );
 
@@ -787,6 +878,7 @@ mod tests {
             1,
             32,
             None,
+            false,
         )
         .expect("convert");
         assert_eq!(results[0].1, 1);
@@ -807,6 +899,11 @@ mod tests {
             "revel_score",
             "phylop100way",
             "cadd_phred",
+            "lrt_score",
+            "fathmm_score",
+            "phylop30way",
+            "phastcons30way",
+            "siphy_29way",
         ] {
             assert!(batch.schema().index_of(column).is_ok(), "{column}");
         }
@@ -842,6 +939,7 @@ mod tests {
             1,
             32,
             None,
+            false,
         )
         .expect("convert");
         assert_eq!(results[0].1, 1);
@@ -900,6 +998,7 @@ mod tests {
             1,
             32,
             None,
+            false,
         )
         .expect("convert");
         assert_eq!(results[0].1, 2);
