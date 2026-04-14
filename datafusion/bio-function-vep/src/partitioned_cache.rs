@@ -149,7 +149,22 @@ pub async fn deregister_table(session: &SessionContext, name: &str) -> Result<()
 
 /// Generate an ephemeral table name for a context_type + chrom combination.
 fn ephemeral_table_name(context_type: &str, chrom: &str) -> String {
-    format!("__vep_partitioned_{context_type}_{chrom}")
+    format!(
+        "__vep_partitioned_{context_type}_{}",
+        sanitize_identifier_component(chrom)
+    )
+}
+
+fn sanitize_identifier_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    out
 }
 
 /// Natural chromosome ordering: numeric chroms first (sorted numerically),
@@ -207,6 +222,10 @@ mod tests {
         assert_eq!(
             ephemeral_table_name("variation", "chr1"),
             "__vep_partitioned_variation_chr1"
+        );
+        assert_eq!(
+            ephemeral_table_name("transcript", "chrY"),
+            "__vep_partitioned_transcript_chry"
         );
     }
 
