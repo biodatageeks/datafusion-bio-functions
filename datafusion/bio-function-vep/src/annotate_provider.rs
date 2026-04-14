@@ -6406,35 +6406,6 @@ struct TranscriptCacheRegion {
     region_index: i64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PersistedTranscriptGeneFields {
-    gene_symbol: Option<String>,
-    gene_symbol_source: Option<String>,
-    gene_hgnc_id: Option<String>,
-}
-
-impl PersistedTranscriptGeneFields {
-    fn from_transcript(tx: &TranscriptFeature) -> Self {
-        Self {
-            gene_symbol: tx.gene_symbol.clone(),
-            gene_symbol_source: tx.gene_symbol_source.clone(),
-            gene_hgnc_id: tx.gene_hgnc_id.clone(),
-        }
-    }
-
-    fn apply_to_transcript(&self, tx: &mut TranscriptFeature) {
-        if self.gene_symbol.is_some() {
-            tx.gene_symbol = self.gene_symbol.clone();
-        }
-        if self.gene_symbol_source.is_some() {
-            tx.gene_symbol_source = self.gene_symbol_source.clone();
-        }
-        if self.gene_hgnc_id.is_some() {
-            tx.gene_hgnc_id = self.gene_hgnc_id.clone();
-        }
-    }
-}
-
 type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
 
 /// Everything needed to start streaming annotation for a contig.
@@ -6470,7 +6441,7 @@ struct ContigAnnotationState {
     mirnas: Vec<MirnaFeature>,
     structural: Vec<StructuralFeature>,
     transcript_cache_regions: HashMap<String, Vec<TranscriptCacheRegion>>,
-    persisted_transcript_gene_fields: HashMap<String, PersistedTranscriptGeneFields>,
+    persisted_buffer_transcripts: HashMap<String, TranscriptFeature>,
     // Colocated (built lazily from sink on first window).
     colocated_map: HashMap<ColocatedKey, ColocatedData>,
     colocated_map_built: bool,
@@ -6832,12 +6803,21 @@ fn collect_buffer_cache_regions(
     Ok(regions)
 }
 
-fn prune_persisted_transcript_gene_fields(
-    persisted_fields: &mut HashMap<String, PersistedTranscriptGeneFields>,
+/// Retain only transcript objects that still belong to active Ensembl
+/// transcript cache regions, mirroring `clean_cache()` pruning of cached
+/// transcript objects between adjacent input buffers.
+///
+/// Traceability:
+/// - Ensembl VEP `AnnotationSource::clean_cache()`
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L392-L422>
+/// - Ensembl VEP region cache population in `get_features_by_regions_uncached()`
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L109-L139>
+fn prune_persisted_buffer_transcripts(
+    persisted_transcripts: &mut HashMap<String, TranscriptFeature>,
     transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
     active_regions: &HashSet<TranscriptCacheRegion>,
 ) {
-    persisted_fields.retain(|transcript_id, _| {
+    persisted_transcripts.retain(|transcript_id, _| {
         transcript_cache_regions
             .get(transcript_id)
             .is_some_and(|regions| regions.iter().any(|region| active_regions.contains(region)))
@@ -6889,7 +6869,7 @@ fn build_buffer_local_transcripts(
 fn build_stateful_buffer_local_transcripts(
     transcripts: &[TranscriptFeature],
     transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
-    persisted_fields: &mut HashMap<String, PersistedTranscriptGeneFields>,
+    persisted_transcripts: &mut HashMap<String, TranscriptFeature>,
     buffer_batches: &[RecordBatch],
     chrom: &str,
     min_start: i64,
@@ -6899,8 +6879,8 @@ fn build_stateful_buffer_local_transcripts(
 ) -> Result<Vec<TranscriptFeature>> {
     let active_regions =
         collect_buffer_cache_regions(buffer_batches, upstream_distance, downstream_distance)?;
-    prune_persisted_transcript_gene_fields(
-        persisted_fields,
+    prune_persisted_buffer_transcripts(
+        persisted_transcripts,
         transcript_cache_regions,
         &active_regions,
     );
@@ -6914,19 +6894,27 @@ fn build_stateful_buffer_local_transcripts(
         downstream_distance,
     );
 
+    // Reuse the same transcript objects across adjacent input buffers while
+    // their 1 Mb cache regions remain active, matching Ensembl VEP's region
+    // cache plus in-place `merge_features()` mutation behavior.
+    //
+    // Traceability:
+    // - Ensembl VEP `AnnotationSource::get_features_by_regions_uncached()`
+    //   caches feature objects by region
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L109-L139>
+    // - Ensembl VEP `AnnotationType::Transcript::merge_features()`
+    //   mutates transcript objects in place
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L246-L310>
     for tx in &mut buffer_transcripts {
-        if let Some(fields) = persisted_fields.get(&tx.transcript_id) {
-            fields.apply_to_transcript(tx);
+        if let Some(persisted) = persisted_transcripts.get(&tx.transcript_id) {
+            *tx = persisted.clone();
         }
     }
 
     apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
 
     for tx in &buffer_transcripts {
-        persisted_fields.insert(
-            tx.transcript_id.clone(),
-            PersistedTranscriptGeneFields::from_transcript(tx),
-        );
+        persisted_transcripts.insert(tx.transcript_id.clone(), tx.clone());
     }
 
     Ok(buffer_transcripts)
@@ -7038,7 +7026,7 @@ fn annotate_window(
         let buffer_transcripts = build_stateful_buffer_local_transcripts(
             &ann.transcripts,
             &ann.transcript_cache_regions,
-            &mut ann.persisted_transcript_gene_fields,
+            &mut ann.persisted_buffer_transcripts,
             &buffer_batches,
             &chrom,
             min_start,
@@ -7306,7 +7294,7 @@ impl Stream for ContigAnnotationStream {
                                 .iter()
                                 .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
                                 .collect(),
-                            persisted_transcript_gene_fields: HashMap::new(),
+                            persisted_buffer_transcripts: HashMap::new(),
                             transcripts: ready.transcripts,
                             translateable_seq_by_tx: ready.translateable_seq_by_tx,
                             exons: ready.exons,
@@ -8704,13 +8692,13 @@ mod tests {
             .iter()
             .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
             .collect();
-        let mut persisted_fields = HashMap::new();
+        let mut persisted_transcripts = HashMap::new();
 
         let first_buffer = vec![make_buffer_batch("chr2", 150, 150)];
         let first_scoped = build_stateful_buffer_local_transcripts(
             &transcripts,
             &transcript_regions,
-            &mut persisted_fields,
+            &mut persisted_transcripts,
             &first_buffer,
             "chr2",
             150,
@@ -8729,7 +8717,7 @@ mod tests {
         let second_scoped = build_stateful_buffer_local_transcripts(
             &transcripts,
             &transcript_regions,
-            &mut persisted_fields,
+            &mut persisted_transcripts,
             &second_buffer,
             "chr2",
             650_000,
@@ -8780,13 +8768,13 @@ mod tests {
             .iter()
             .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
             .collect();
-        let mut persisted_fields = HashMap::new();
+        let mut persisted_transcripts = HashMap::new();
 
         let first_buffer = vec![make_buffer_batch("chr2", 150, 150)];
         build_stateful_buffer_local_transcripts(
             &transcripts,
             &transcript_regions,
-            &mut persisted_fields,
+            &mut persisted_transcripts,
             &first_buffer,
             "chr2",
             150,
@@ -8800,7 +8788,7 @@ mod tests {
         let second_scoped = build_stateful_buffer_local_transcripts(
             &transcripts,
             &transcript_regions,
-            &mut persisted_fields,
+            &mut persisted_transcripts,
             &second_buffer,
             "chr2",
             1_050_000,
