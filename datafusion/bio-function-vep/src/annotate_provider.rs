@@ -5605,9 +5605,7 @@ fn lookup_domains(
     labels.join("&")
 }
 
-/// Rebuild RefSeq/XM/XR CDS strings from the indexed genomic reference so the
-/// transcript engine sees the same spliced reference sequence Ensembl Variation
-/// uses through transcript objects during HGVS/coding consequence evaluation.
+/// Rebuild RefSeq/XM/XR CDS strings for transcript consequence evaluation.
 ///
 /// Traceability:
 /// - Ensembl Variation `BaseTranscriptVariationAllele::_get_peptide_alleles()`
@@ -5615,10 +5613,24 @@ fn lookup_domains(
 ///   allele string
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariationAllele.pm#L367-L509>
 ///
-/// In our merged parquet cache, a small subset of RefSeq transcript CDS strings
-/// diverge from the genomic reference sequence that VEP's transcript objects
-/// expose. Reconstructing the spliced CDS from the indexed FASTA restores the
-/// same sequence basis without changing transcript/exon coordinates.
+/// For BAM-edited RefSeq transcripts Ensembl derives translateable sequence
+/// from the edited transcript object (`spliced_seq` + seq edits), not directly
+/// from genomic exons. Prefer that edited CDS slice when present; otherwise
+/// fall back to rebuilding from genomic FASTA for transcripts that still need
+/// hydration.
+fn edited_refseq_translation_cds_from_spliced_seq(tx: &TranscriptFeature) -> Option<String> {
+    if tx.bam_edit_status.as_deref() != Some("ok") {
+        return None;
+    }
+    let spliced_seq = tx.spliced_seq.as_deref()?;
+    let start = tx.cdna_coding_start?.checked_sub(1)?;
+    let end = tx.cdna_coding_end?;
+    if start >= end || end > spliced_seq.len() {
+        return None;
+    }
+    Some(spliced_seq[start..end].to_ascii_uppercase())
+}
+
 fn hydrate_refseq_translation_cds_from_reference<R>(
     reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
     transcripts: &[TranscriptFeature],
@@ -5658,6 +5670,10 @@ where
             .map(|intervals| interval_overlaps_any(intervals, tx.start, tx.end))
             .unwrap_or(false);
         if !overlaps_input {
+            continue;
+        }
+        if let Some(edited_cds) = edited_refseq_translation_cds_from_spliced_seq(tx) {
+            hydrated_by_tx.insert(tx.transcript_id.clone(), edited_cds);
             continue;
         }
         let (Some(cds_start), Some(cds_end)) = (tx.cds_start, tx.cds_end) else {
@@ -8287,6 +8303,30 @@ mod tests {
         tx.biotype = "protein_coding".to_string();
         tx.source = source.map(str::to_string);
         tx
+    }
+
+    #[test]
+    fn edited_refseq_translation_cds_from_spliced_seq_prefers_edited_transcript_sequence() {
+        let mut tx = make_tx("NM_EDIT.1", None, None, None, None);
+        tx.bam_edit_status = Some("ok".to_string());
+        tx.cdna_coding_start = Some(5);
+        tx.cdna_coding_end = Some(13);
+        tx.spliced_seq = Some("AAAATCGCACTTTGGG".to_string());
+
+        assert_eq!(
+            edited_refseq_translation_cds_from_spliced_seq(&tx).as_deref(),
+            Some("TCGCACTTT")
+        );
+    }
+
+    #[test]
+    fn edited_refseq_translation_cds_from_spliced_seq_ignores_unedited_transcripts() {
+        let mut tx = make_tx("NM_RAW.1", None, None, None, None);
+        tx.cdna_coding_start = Some(5);
+        tx.cdna_coding_end = Some(13);
+        tx.spliced_seq = Some("AAAATCGCACTTTGGG".to_string());
+
+        assert_eq!(edited_refseq_translation_cds_from_spliced_seq(&tx), None);
     }
 
     fn make_buffer_batch(chrom: &str, start: i64, end: i64) -> RecordBatch {
