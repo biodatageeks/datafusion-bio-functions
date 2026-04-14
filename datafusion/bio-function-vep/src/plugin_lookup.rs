@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, Float32Array, Float32Builder, Int32Array, Int32Builder, RecordBatch,
-    StringArray, StringBuilder, new_null_array,
+    Array, ArrayRef, Float32Array, Float32Builder, Int32Array, Int32Builder, LargeStringArray,
+    RecordBatch, StringArray, StringBuilder, StringViewArray, new_null_array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result;
@@ -81,22 +81,22 @@ impl PluginIndex {
 
         let full_schema = batches[0].schema();
         let join_cols = ["chrom", "pos", "ref", "alt"];
-        let expected_value_names = kind
+        let expected_fields = kind
             .plugin_kind()
             .output_fields()
             .into_iter()
-            .map(|field| field.name().to_string())
-            .collect::<Vec<_>>();
+            .map(|field| (field.name().to_string(), Arc::new(field)))
+            .collect::<HashMap<_, _>>();
 
-        // Identify value columns (everything not in join key).
+        // Keep runtime schema stable even if parquet was inferred as Utf8View/LargeUtf8.
         let value_fields: Vec<Arc<Field>> = full_schema
             .fields()
             .iter()
-            .filter(|f| {
-                !join_cols.contains(&f.name().as_str())
-                    && expected_value_names.iter().any(|name| name == f.name())
+            .filter_map(|field| {
+                (!join_cols.contains(&field.name().as_str()))
+                    .then(|| expected_fields.get(field.name()).cloned())
+                    .flatten()
             })
-            .cloned()
             .collect();
         let value_schema = Arc::new(Schema::new(value_fields));
 
@@ -124,9 +124,9 @@ impl PluginIndex {
                 .iter()
                 .map(|f| {
                     let idx = full_schema.index_of(f.name()).unwrap();
-                    batch.column(idx).clone()
+                    normalize_array_to_field(batch.column(idx), f)
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             value_batches.push(RecordBatch::try_new(value_schema.clone(), value_cols)?);
         }
 
@@ -145,22 +145,32 @@ impl PluginIndex {
 
     #[cfg(feature = "kv-cache")]
     fn load_fjall(kind: PluginSourceKind, plugin_dir: &str, chrom: &str) -> Result<Option<Self>> {
-        let path = std::path::Path::new(plugin_dir)
+        let plugin_path = std::path::Path::new(plugin_dir);
+        let plugin_name = plugin_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("plugin");
+        let parent = plugin_path.parent().unwrap_or(plugin_path);
+        let path = if parent
             .parent()
-            .unwrap_or(std::path::Path::new(plugin_dir))
-            .join(format!(
-                "{}.fjall",
-                std::path::Path::new(plugin_dir)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("plugin")
-            ));
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "parquet")
+        {
+            parent
+                .parent()
+                .and_then(|path| path.parent())
+                .unwrap_or(parent)
+                .join(format!("{plugin_name}.fjall"))
+        } else {
+            parent.join(format!("{plugin_name}.fjall"))
+        };
         if !path.exists() {
             return Ok(None);
         }
 
         let store = VepKvStore::open(&path)?;
-        let value_fields: Vec<Arc<Field>> = store
+        let store_value_fields = store
             .schema()
             .fields()
             .iter()
@@ -168,9 +178,35 @@ impl PluginIndex {
                 !["chrom", "start", "end", "allele_string"].contains(&field.name().as_str())
             })
             .cloned()
+            .collect::<Vec<_>>();
+        let store_value_indices = store_value_fields
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| (field.name().to_string(), idx))
+            .collect::<HashMap<_, _>>();
+        let value_fields: Vec<Arc<Field>> = kind
+            .plugin_kind()
+            .output_fields()
+            .into_iter()
+            .map(Arc::new)
+            .filter(|field| store_value_indices.contains_key(field.name()))
             .collect();
         let value_schema = Arc::new(Schema::new(value_fields));
-        let value_col_indices = (0..value_schema.fields().len()).collect();
+        let value_col_indices = value_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                store_value_indices
+                    .get(field.name())
+                    .copied()
+                    .ok_or_else(|| {
+                        datafusion::common::DataFusionError::Execution(format!(
+                            "plugin fjall store missing field '{}'",
+                            field.name()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Some(Self {
             kind,
@@ -405,8 +441,8 @@ impl ContigPlugins {
             if plugin_cfg.kind == PluginKind::Cadd {
                 self.append_cadd_columns(
                     &pos_col,
-                    ref_col,
-                    alt_col,
+                    &ref_col,
+                    &alt_col,
                     num_rows,
                     &mut all_columns,
                     &mut all_fields,
@@ -422,8 +458,8 @@ impl ContigPlugins {
             if let Some(index) = maybe_index {
                 index.append_lookup_columns(
                     &pos_col,
-                    ref_col,
-                    alt_col,
+                    &ref_col,
+                    &alt_col,
                     num_rows,
                     &mut all_columns,
                     &mut all_fields,
@@ -554,7 +590,7 @@ fn append_plugin_value(
                         builder.append_null();
                     }
                 }
-                DataType::Utf8 => {
+                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => {
                     let builder = builder
                         .as_any_mut()
                         .downcast_mut::<StringBuilder>()
@@ -591,7 +627,7 @@ fn append_plugin_value(
                     datafusion::common::DataFusionError::Execution("expected Int32Builder".into())
                 })?
                 .append_null(),
-            DataType::Utf8 => builder
+            DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => builder
                 .as_any_mut()
                 .downcast_mut::<StringBuilder>()
                 .ok_or_else(|| {
@@ -671,10 +707,73 @@ fn build_lookup_column(
             }
             Ok(Arc::new(builder.finish()))
         }
+        DataType::Utf8View => {
+            let src = source.as_any().downcast_ref::<StringViewArray>().unwrap();
+            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 16);
+            for idx in row_indices {
+                match idx {
+                    Some(i) if !src.is_null(*i as usize) => {
+                        builder.append_value(src.value(*i as usize))
+                    }
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::LargeUtf8 => {
+            let src = source.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 16);
+            for idx in row_indices {
+                match idx {
+                    Some(i) if !src.is_null(*i as usize) => {
+                        builder.append_value(src.value(*i as usize))
+                    }
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
         dt => {
             // Fallback: create null array for unsupported types.
             Ok(new_null_array(dt, num_rows))
         }
+    }
+}
+
+fn normalize_array_to_field(source: &ArrayRef, field: &Field) -> Result<ArrayRef> {
+    match (source.data_type(), field.data_type()) {
+        (DataType::Utf8, DataType::Utf8) => Ok(source.clone()),
+        (DataType::Utf8View, DataType::Utf8) => {
+            let array = source
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| {
+                    datafusion::common::DataFusionError::Execution(
+                        "expected StringViewArray".into(),
+                    )
+                })?;
+            Ok(Arc::new(StringArray::from_iter((0..array.len()).map(|i| {
+                (!array.is_null(i)).then(|| array.value(i))
+            }))))
+        }
+        (DataType::LargeUtf8, DataType::Utf8) => {
+            let array = source
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    datafusion::common::DataFusionError::Execution(
+                        "expected LargeStringArray".into(),
+                    )
+                })?;
+            Ok(Arc::new(StringArray::from_iter((0..array.len()).map(|i| {
+                (!array.is_null(i)).then(|| array.value(i))
+            }))))
+        }
+        (source_ty, field_ty) if source_ty == field_ty => Ok(source.clone()),
+        (source_ty, field_ty) => Err(datafusion::common::DataFusionError::Execution(format!(
+            "plugin field '{}' expected {field_ty} but source column had {source_ty}",
+            field.name()
+        ))),
     }
 }
 
@@ -691,6 +790,14 @@ fn string_value(source: &ArrayRef, row_idx: usize) -> Option<String> {
         DataType::Utf8 => source
             .as_any()
             .downcast_ref::<StringArray>()
+            .and_then(|array| (!array.is_null(row_idx)).then(|| array.value(row_idx).to_string())),
+        DataType::Utf8View => source
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .and_then(|array| (!array.is_null(row_idx)).then(|| array.value(row_idx).to_string())),
+        DataType::LargeUtf8 => source
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
             .and_then(|array| (!array.is_null(row_idx)).then(|| array.value(row_idx).to_string())),
         _ => None,
     }
@@ -729,22 +836,50 @@ fn get_i64_column(batch: &RecordBatch, name: &str) -> Result<Vec<i64>> {
     }
 }
 
-fn get_string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+fn get_string_column(batch: &RecordBatch, name: &str) -> Result<StringArray> {
     let schema = batch.schema();
     let idx = schema.index_of(name).map_err(|e| {
         datafusion::common::DataFusionError::Execution(format!(
             "Column '{name}' not found in batch: {e}"
         ))
     })?;
-    batch
-        .column(idx)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            datafusion::common::DataFusionError::Execution(format!(
-                "Column '{name}' is not StringArray"
-            ))
-        })
+    let column = batch.column(idx);
+    match column.data_type() {
+        DataType::Utf8 => column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .cloned()
+            .ok_or_else(|| {
+                datafusion::common::DataFusionError::Execution(format!(
+                    "Column '{name}' is not StringArray"
+                ))
+            }),
+        DataType::Utf8View => column
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .map(|array| StringArray::from_iter((0..array.len()).map(|i| {
+                (!array.is_null(i)).then(|| array.value(i))
+            })))
+            .ok_or_else(|| {
+                datafusion::common::DataFusionError::Execution(format!(
+                    "Column '{name}' is not StringViewArray"
+                ))
+            }),
+        DataType::LargeUtf8 => column
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|array| StringArray::from_iter((0..array.len()).map(|i| {
+                (!array.is_null(i)).then(|| array.value(i))
+            })))
+            .ok_or_else(|| {
+                datafusion::common::DataFusionError::Execution(format!(
+                    "Column '{name}' is not LargeStringArray"
+                ))
+            }),
+        other => Err(datafusion::common::DataFusionError::Execution(format!(
+            "Column '{name}' has unsupported string type: {other}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -763,6 +898,52 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let plugin_dir = temp.path().join("cadd");
+        std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        let fjall_dir = temp.path().join("cadd.fjall");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("phred_score", DataType::Float32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![123_i64])),
+                Arc::new(Int64Array::from(vec![123_i64])),
+                Arc::new(StringArray::from(vec!["A/G"])),
+                Arc::new(Float32Array::from(vec![17.5_f32])),
+            ],
+        )
+        .expect("batch");
+
+        let store = VepKvStore::create(&fjall_dir, schema).expect("store");
+        let value = serialize_position_entry(&[0], &batch, &[4], 3).expect("serialize");
+        store.put_position_entry("1", 123, &value).expect("put");
+        store.persist().expect("persist");
+        drop(store);
+
+        let index =
+            PluginIndex::load_fjall(PluginSourceKind::Cadd, plugin_dir.to_str().unwrap(), "1")
+                .expect("load")
+                .expect("present");
+
+        assert_eq!(index.csq_values_for_variant(123, "A", "G"), vec!["17.5"]);
+        assert_eq!(index.csq_values_for_variant(123, "A", "T"), vec![""]);
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[test]
+    fn load_fjall_plugin_from_cache_root_for_partitioned_layout() {
+        use crate::kv_cache::VepKvStore;
+        use crate::kv_cache::position_entry::serialize_position_entry;
+        use datafusion::arrow::array::StringArray;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = temp.path().join("parquet").join("115_GRCh38_vep").join("cadd");
         std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
         let fjall_dir = temp.path().join("cadd.fjall");
 
