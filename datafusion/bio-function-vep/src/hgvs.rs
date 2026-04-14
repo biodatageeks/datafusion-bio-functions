@@ -1658,6 +1658,7 @@ mod tests {
             gene_stable_id: None,
             gene_symbol: None,
             gene_symbol_source: None,
+            gene_hgnc_id_native: None,
             gene_hgnc_id: None,
             display_xref_id: None,
             source: None,

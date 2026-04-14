@@ -150,6 +150,12 @@ pub struct TranscriptFeature {
     pub gene_stable_id: Option<String>,
     pub gene_symbol: Option<String>,
     pub gene_symbol_source: Option<String>,
+    /// Native HGNC ID parsed directly from the raw VEP transcript object or
+    /// the dedicated parquet column when available. Never buffer-propagated.
+    pub gene_hgnc_id_native: Option<String>,
+    /// Effective HGNC ID used for annotation output. This is reset from
+    /// `gene_hgnc_id_native` for each VEP-style input buffer, then filled by
+    /// buffer-local merge_features propagation.
     pub gene_hgnc_id: Option<String>,
     /// Transcript display_xref ID used by VEP's RefSeq MT transcript filter.
     pub display_xref_id: Option<String>,
@@ -5901,6 +5907,7 @@ mod tests {
             gene_stable_id: None,
             gene_symbol: None,
             gene_symbol_source: None,
+            gene_hgnc_id_native: None,
             gene_hgnc_id: None,
             display_xref_id: None,
             source: None,

@@ -1235,6 +1235,7 @@ impl TranscriptSelectionFlags {
 struct TranscriptRawMetadata {
     display_xref_id: Option<String>,
     source: Option<String>,
+    gene_hgnc_id_native: Option<String>,
     refseq_match: Option<String>,
     refseq_edits: Vec<RefSeqEdit>,
     flags_str: Option<String>,
@@ -2315,8 +2316,8 @@ impl AnnotateProvider {
                 "gene_stable_id",
                 "gene_symbol",
                 "gene_symbol_source",
+                "gene_hgnc_id_native",
                 "gene_hgnc_id",
-                "refseq_id",
                 "source",
                 "version",
                 "raw_object_json",
@@ -2350,8 +2351,6 @@ impl AnnotateProvider {
         let batches = self.session.sql(&query).await?.collect().await?;
         let mut out = Vec::new();
         let mut translateable_seq_by_tx = HashMap::new();
-        let mut refseq_ids: Vec<Option<String>> = Vec::new();
-
         for batch in &batches {
             let schema = batch.schema();
             let tx_idx = schema
@@ -2394,8 +2393,8 @@ impl AnnotateProvider {
             let gene_stable_id_idx = schema.index_of("gene_stable_id").ok();
             let gene_symbol_idx = schema.index_of("gene_symbol").ok();
             let gene_symbol_source_idx = schema.index_of("gene_symbol_source").ok();
+            let gene_hgnc_id_native_idx = schema.index_of("gene_hgnc_id_native").ok();
             let gene_hgnc_id_idx = schema.index_of("gene_hgnc_id").ok();
-            let refseq_id_idx = schema.index_of("refseq_id").ok();
             let source_idx = schema.index_of("source").ok();
             let version_idx = schema.index_of("version").ok();
             let raw_object_json_idx = schema.index_of("raw_object_json").ok();
@@ -2497,6 +2496,7 @@ impl AnnotateProvider {
                 let TranscriptRawMetadata {
                     display_xref_id,
                     source: raw_source,
+                    gene_hgnc_id_native: raw_gene_hgnc_id_native,
                     refseq_match,
                     refseq_edits,
                     flags_str: raw_flags_str,
@@ -2514,10 +2514,12 @@ impl AnnotateProvider {
                     gene_symbol_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_symbol_source = gene_symbol_source_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let gene_hgnc_id =
+                let gene_hgnc_id_native = gene_hgnc_id_native_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or(raw_gene_hgnc_id_native);
+                let promoted_gene_hgnc_id =
                     gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let refseq_id =
-                    refseq_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let gene_hgnc_id = gene_hgnc_id_native.clone().or(promoted_gene_hgnc_id);
                 let source = raw_source.or_else(|| {
                     source_idx
                         .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
@@ -2580,6 +2582,7 @@ impl AnnotateProvider {
                     gene_stable_id,
                     gene_symbol,
                     gene_symbol_source,
+                    gene_hgnc_id_native,
                     gene_hgnc_id,
                     display_xref_id,
                     source,
@@ -2609,16 +2612,9 @@ impl AnnotateProvider {
                     appris,
                     ncrna_structure,
                 });
-                refseq_ids.push(refseq_id);
             }
         }
 
-        let hgnc_backfill = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_bool_option(opts, "hgnc_backfill"))
-            .unwrap_or(false);
-        backfill_missing_hgnc_ids(&mut out, &refseq_ids, hgnc_backfill);
         Ok((out, translateable_seq_by_tx))
     }
 
@@ -3350,6 +3346,13 @@ impl AnnotateProvider {
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_string_option(opts, "reference_fasta_path"));
+        let input_buffer_size = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "buffer_size"))
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(VEP_INPUT_BUFFER_SIZE);
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
 
@@ -3404,6 +3407,7 @@ impl AnnotateProvider {
             reference_fasta_path,
             upstream_distance,
             downstream_distance,
+            input_buffer_size,
             projection: projection.cloned(),
             fetch_limit,
             #[cfg(feature = "kv-cache")]
@@ -5129,6 +5133,11 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
         .get("_source_cache")
         .and_then(Value::as_str)
         .and_then(normalize_source_label);
+    let gene_hgnc_id_native = tx
+        .get("_gene_hgnc_id")
+        .or_else(|| tx.get("gene_hgnc_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     let mut refseq_match_codes = Vec::new();
     let mut seen_refseq_match_codes = HashSet::new();
@@ -5166,6 +5175,7 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
     TranscriptRawMetadata {
         display_xref_id,
         source,
+        gene_hgnc_id_native,
         refseq_match: (!refseq_match_codes.is_empty()).then(|| refseq_match_codes.join("&")),
         refseq_edits,
         flags_str: (!flags.is_empty()).then(|| flags.join("&")),
@@ -5317,101 +5327,6 @@ fn passes_transcript_selection(
                 selection.all_refseq || is_default_refseq_transcript_id(tx)
             } else {
                 is_ensembl_transcript(tx)
-            }
-        }
-    }
-}
-
-/// Fill missing merged-mode `HGNC_ID` values for RefSeq rows using the paired
-/// Ensembl transcript mapping in the merged cache, with a unique-gene-symbol
-/// fallback when no explicit `refseq_id -> HGNC_ID` link exists.
-///
-/// Traceability:
-/// - Ensembl VEP `OutputFactory::BaseTranscriptVariationAllele_to_output_hash()`
-///   emits transcript `_gene_hgnc_id` directly
-///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1474-L1484>
-///
-/// Our parquet cache materializes Ensembl and RefSeq transcript rows
-/// separately. RefSeq rows often lack promoted `gene_hgnc_id`, while the paired
-/// Ensembl row carries both `refseq_id` and `gene_hgnc_id`. This reconstructs
-/// the VEP-visible merged transcript state without heuristics.
-///
-/// When `hgnc_backfill` is `false` (default), the symbol-based fallback is
-/// restricted to transcripts whose `gene_symbol_source` is `"HGNC"`.  VEP
-/// derives `HGNC_ID` from each transcript's gene `display_xref`, which is a
-/// per-gene-object attribute.  Transcripts of the same gene symbol can have
-/// different symbol sources (e.g. LINC03025 has both HGNC and EntrezGene
-/// transcripts); VEP only emits `HGNC_ID` for those whose gene object carries
-/// the HGNC `display_xref`.  The cache's per-transcript `gene_hgnc_id` column
-/// reflects this correctly, so the symbol fallback must only fill gaps for
-/// HGNC-source transcripts.  Setting `hgnc_backfill` to `true` restores the
-/// previous behaviour which populates `HGNC_ID` for all transcripts where a
-/// unique mapping can be inferred — arguably more complete but not
-/// VEP-compatible.
-///
-/// See <https://github.com/biodatageeks/datafusion-bio-functions/issues/92>.
-fn backfill_missing_hgnc_ids(
-    transcripts: &mut [TranscriptFeature],
-    refseq_ids: &[Option<String>],
-    hgnc_backfill: bool,
-) {
-    let mut refseq_gene_hgnc_by_id: HashMap<String, (Option<String>, String)> = HashMap::new();
-    let mut symbol_to_hgnc_ids: HashMap<String, HashSet<String>> = HashMap::new();
-
-    for (tx, refseq_id) in transcripts.iter().zip(refseq_ids.iter()) {
-        let Some(hgnc_id) = tx.gene_hgnc_id.as_deref() else {
-            continue;
-        };
-        if let Some(refseq_id) = refseq_id.as_deref() {
-            refseq_gene_hgnc_by_id
-                .entry(refseq_id.to_string())
-                .or_insert_with(|| (tx.gene_symbol.clone(), hgnc_id.to_string()));
-        }
-        if let Some(symbol) = tx.gene_symbol.as_deref() {
-            symbol_to_hgnc_ids
-                .entry(symbol.to_string())
-                .or_default()
-                .insert(hgnc_id.to_string());
-        }
-    }
-
-    let unique_hgnc_by_symbol: HashMap<String, String> = symbol_to_hgnc_ids
-        .into_iter()
-        .filter_map(|(symbol, ids)| {
-            if ids.len() == 1 {
-                ids.into_iter().next().map(|id| (symbol, id))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for tx in transcripts.iter_mut() {
-        if tx.gene_hgnc_id.is_some() {
-            continue;
-        }
-        if let Some((mapped_symbol, hgnc_id)) =
-            refseq_gene_hgnc_by_id.get(tx.transcript_id.as_str())
-        {
-            if mapped_symbol.as_deref() == tx.gene_symbol.as_deref() || tx.gene_symbol.is_none() {
-                tx.gene_hgnc_id = Some(hgnc_id.clone());
-                continue;
-            }
-        }
-        // Symbol-based fallback: keep the strict default for Ensembl
-        // non-HGNC-source transcripts (issue #92), but allow RefSeq rows.
-        // VEP still exposes the gene object's HGNC display_xref on both
-        // coding and non-coding RefSeq transcripts such as XR_/NR_ rows.
-        let source_is_hgnc = tx
-            .gene_symbol_source
-            .as_deref()
-            .is_some_and(|s| s == "HGNC");
-        let source_is_refseq = is_refseq_transcript(tx);
-        if hgnc_backfill || source_is_hgnc || source_is_refseq {
-            if let Some(symbol) = tx.gene_symbol.as_deref() {
-                if let Some(hgnc_id) = unique_hgnc_by_symbol.get(symbol) {
-                    tx.gene_hgnc_id = Some(hgnc_id.clone());
-                }
             }
         }
     }
@@ -6341,6 +6256,7 @@ struct ContigAnnotationConfig {
     reference_fasta_path: Option<String>,
     upstream_distance: i64,
     downstream_distance: i64,
+    input_buffer_size: usize,
     projection: Option<Vec<usize>>,
     /// Maximum number of output rows (LIMIT pushdown).
     fetch_limit: Option<usize>,
@@ -6463,6 +6379,8 @@ impl ExecutionPlan for ContigAnnotationExec {
 /// Each window triggers a PreparedContext rebuild (~22ms).
 /// With ~30 rows/batch: 1000 batches ≈ 30K variants per window.
 const HYDRATION_WINDOW_SIZE: usize = 1000;
+/// Ensembl VEP release/115 default `buffer_size`.
+const VEP_INPUT_BUFFER_SIZE: usize = 5000;
 
 type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
 
@@ -6705,6 +6623,182 @@ fn hydrate_window(
     Ok(())
 }
 
+fn split_batches_by_row_limit(batches: &[RecordBatch], row_limit: usize) -> Vec<Vec<RecordBatch>> {
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    let mut current_rows = 0usize;
+
+    for batch in batches {
+        let mut offset = 0usize;
+        while offset < batch.num_rows() {
+            let remaining = row_limit.saturating_sub(current_rows);
+            let take = remaining.min(batch.num_rows() - offset);
+            current.push(batch.slice(offset, take));
+            current_rows += take;
+            offset += take;
+
+            if current_rows == row_limit {
+                out.push(std::mem::take(&mut current));
+                current_rows = 0;
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        out.push(current);
+    }
+
+    out
+}
+
+fn buffer_variant_bounds(batches: &[RecordBatch]) -> Result<Option<(String, i64, i64)>> {
+    let mut chrom: Option<String> = None;
+    let mut min_start = i64::MAX;
+    let mut max_end = i64::MIN;
+
+    for batch in batches {
+        let schema = batch.schema();
+        let chrom_idx = schema.index_of("chrom").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required chrom column".to_string(),
+            )
+        })?;
+        let start_idx = schema.index_of("start").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required start column".to_string(),
+            )
+        })?;
+        let end_idx = schema.index_of("end").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required end column".to_string(),
+            )
+        })?;
+
+        for row in 0..batch.num_rows() {
+            let Some(row_chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                continue;
+            };
+            if chrom.is_none() {
+                chrom = Some(row_chrom);
+            }
+            min_start = min_start.min(start.min(end));
+            max_end = max_end.max(start.max(end));
+        }
+    }
+
+    Ok(chrom.map(|chrom| (chrom, min_start, max_end)))
+}
+
+fn build_buffer_local_transcripts(
+    transcripts: &[TranscriptFeature],
+    chrom: &str,
+    min_start: i64,
+    max_end: i64,
+    upstream_distance: i64,
+    downstream_distance: i64,
+) -> Vec<TranscriptFeature> {
+    let chrom_norm = chrom.strip_prefix("chr").unwrap_or(chrom);
+    let query_start = min_start.saturating_sub(upstream_distance);
+    let query_end = max_end.saturating_add(downstream_distance);
+
+    let mut buffer_transcripts: Vec<TranscriptFeature> = transcripts
+        .iter()
+        .filter(|tx| {
+            let tx_chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
+            tx_chrom == chrom_norm && tx.end >= query_start && tx.start <= query_end
+        })
+        .cloned()
+        .collect();
+
+    apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
+    buffer_transcripts
+}
+
+/// Apply the HGNC-relevant parts of Ensembl VEP `merge_features()` to a single
+/// input buffer's transcript feature set.
+///
+/// Traceability:
+/// - Ensembl VEP `AnnotationType::Transcript::merge_features()`
+///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L246-L310>
+fn apply_buffer_local_hgnc_propagation(transcripts: &mut [TranscriptFeature]) {
+    #[derive(Default)]
+    struct GeneFill {
+        gene_symbol: Option<String>,
+        gene_symbol_source: Option<String>,
+        gene_hgnc_id_native: Option<String>,
+    }
+
+    let mut hgnc_by_symbol: HashMap<String, String> = HashMap::new();
+    let mut gene_fill_by_stable_id: HashMap<String, GeneFill> = HashMap::new();
+
+    for tx in transcripts.iter() {
+        if let (Some(symbol), Some(hgnc_id)) =
+            (tx.gene_symbol.as_deref(), tx.gene_hgnc_id_native.as_deref())
+        {
+            hgnc_by_symbol
+                .entry(symbol.to_string())
+                .or_insert_with(|| hgnc_id.to_string());
+        }
+
+        if let Some(gene_stable_id) = tx.gene_stable_id.as_deref() {
+            let fill = gene_fill_by_stable_id
+                .entry(gene_stable_id.to_string())
+                .or_default();
+            if fill.gene_symbol.is_none() {
+                fill.gene_symbol = tx.gene_symbol.clone();
+            }
+            if fill.gene_symbol_source.is_none() {
+                fill.gene_symbol_source = tx.gene_symbol_source.clone();
+            }
+            if fill.gene_hgnc_id_native.is_none() {
+                fill.gene_hgnc_id_native = tx.gene_hgnc_id_native.clone();
+            }
+        }
+    }
+
+    for tx in transcripts.iter_mut() {
+        tx.gene_hgnc_id = tx
+            .gene_hgnc_id_native
+            .clone()
+            .or_else(|| tx.gene_hgnc_id.clone());
+
+        if tx.gene_hgnc_id.is_none() {
+            if let Some(hgnc_id) = tx
+                .gene_symbol
+                .as_deref()
+                .and_then(|symbol| hgnc_by_symbol.get(symbol))
+            {
+                tx.gene_hgnc_id = Some(hgnc_id.clone());
+            }
+        }
+    }
+
+    for tx in transcripts.iter_mut() {
+        let Some(gene_stable_id) = tx.gene_stable_id.as_deref() else {
+            continue;
+        };
+        let Some(fill) = gene_fill_by_stable_id.get(gene_stable_id) else {
+            continue;
+        };
+
+        if tx.gene_symbol.is_none() {
+            tx.gene_symbol = fill.gene_symbol.clone();
+        }
+        if tx.gene_symbol_source.is_none() {
+            tx.gene_symbol_source = fill.gene_symbol_source.clone();
+        }
+        if tx.gene_hgnc_id.is_none() {
+            tx.gene_hgnc_id = fill.gene_hgnc_id_native.clone();
+        }
+    }
+}
+
 /// Annotate a window of batches: build PreparedContext, run SIFT loading,
 /// annotate each batch, apply projection.
 fn annotate_window(
@@ -6713,26 +6807,8 @@ fn annotate_window(
     projection: Option<&[usize]>,
 ) -> Result<VecDeque<RecordBatch>> {
     let engine = &ann.engine;
-    let ctx = PreparedContext::new(
-        &ann.transcripts,
-        &ann.exons,
-        &ann.translations,
-        &ann.regulatory,
-        &ann.motifs,
-        &ann.mirnas,
-        &ann.structural,
-    );
-
-    // CSQ is the first annotation column after VCF fields.
-    // When there is no projection, all columns are requested, so CSQ must be
-    // preserved. Only skip assembly when a projection exists and excludes it.
     let csq_col_idx = ann.tmp_provider.vcf_field_count();
     let skip_csq = projection.is_some_and(|indices| !indices.contains(&csq_col_idx));
-
-    // The 87 typed annotation columns start at vcf_field_count + 2 (after csq
-    // and most_severe_consequence). Skip building them when none are projected
-    // — this avoids per-row transcript extraction, AF parsing, and List building
-    // for VCF output paths that only need core columns + csq.
     let typed_cols_start = csq_col_idx + 2;
     let typed_cols_end = typed_cols_start + annotation_column_defs().len();
     let skip_typed_cols = projection.map_or(false, |indices| {
@@ -6740,94 +6816,132 @@ fn annotate_window(
             .iter()
             .any(|&i| i >= typed_cols_start && i < typed_cols_end)
     });
-
     let sift_enabled = ann.config.flags.everything;
     let mut out = VecDeque::with_capacity(window_batches.len());
 
-    for batch in window_batches {
-        // Lazy SIFT window loading (same pattern as before).
-        if sift_enabled && ann.sift_direct.is_some() {
-            let batch_has_miss = batch
-                .schema()
-                .index_of("cache_most_severe_consequence")
-                .ok()
-                .map_or(true, |idx| batch.column(idx).null_count() > 0);
-            if batch_has_miss {
-                let schema = batch.schema();
-                if let (Ok(ci), Ok(si), Ok(ei)) = (
-                    schema.index_of("chrom"),
-                    schema.index_of("start"),
-                    schema.index_of("end"),
-                ) {
-                    let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
-                    for row in 0..batch.num_rows() {
-                        if let (Some(c), Some(s), Some(e)) = (
-                            string_at(batch.column(ci).as_ref(), row),
-                            int64_at(batch.column(si).as_ref(), row),
-                            int64_at(batch.column(ei).as_ref(), row),
-                        ) {
-                            let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
-                            let entry = batch_chrom_bounds
-                                .entry(c_norm)
-                                .or_insert((i64::MAX, i64::MIN));
-                            entry.0 = entry.0.min(s);
-                            entry.1 = entry.1.max(e);
-                        }
-                    }
-                    for (ch, (batch_min, batch_max)) in &batch_chrom_bounds {
-                        let window_start = (batch_max / AnnotateProvider::SIFT_WINDOW_SIZE)
-                            * AnnotateProvider::SIFT_WINDOW_SIZE;
-                        let min_window_start = (batch_min / AnnotateProvider::SIFT_WINDOW_SIZE)
-                            * AnnotateProvider::SIFT_WINDOW_SIZE;
-                        let mut ws = min_window_start;
-                        while ws <= window_start + AnnotateProvider::SIFT_WINDOW_SIZE {
-                            let key = (ch.clone(), ws);
-                            if !ann.loaded_sift_windows.contains(&key) {
-                                if let Some(ref direct) = ann.sift_direct {
-                                    direct.load_window(
-                                        ch,
-                                        ws,
-                                        ws + AnnotateProvider::SIFT_WINDOW_SIZE,
-                                        &mut ann.sift_cache,
-                                    )?;
-                                }
-                                ann.loaded_sift_windows.insert(key);
+    for buffer_batches in split_batches_by_row_limit(window_batches, ann.config.input_buffer_size) {
+        let Some((chrom, min_start, max_end)) = buffer_variant_bounds(&buffer_batches)? else {
+            continue;
+        };
+        let buffer_transcripts = build_buffer_local_transcripts(
+            &ann.transcripts,
+            &chrom,
+            min_start,
+            max_end,
+            ann.config.upstream_distance,
+            ann.config.downstream_distance,
+        );
+        let buffer_tx_ids: HashSet<&str> = buffer_transcripts
+            .iter()
+            .map(|tx| tx.transcript_id.as_str())
+            .collect();
+        let buffer_exons: Vec<ExonFeature> = ann
+            .exons
+            .iter()
+            .filter(|exon| buffer_tx_ids.contains(exon.transcript_id.as_str()))
+            .cloned()
+            .collect();
+        let buffer_translations: Vec<TranslationFeature> = ann
+            .translations
+            .iter()
+            .filter(|translation| buffer_tx_ids.contains(translation.transcript_id.as_str()))
+            .cloned()
+            .collect();
+        let ctx = PreparedContext::new(
+            &buffer_transcripts,
+            &buffer_exons,
+            &buffer_translations,
+            &ann.regulatory,
+            &ann.motifs,
+            &ann.mirnas,
+            &ann.structural,
+        );
+
+        for batch in &buffer_batches {
+            // Lazy SIFT window loading (same pattern as before).
+            if sift_enabled && ann.sift_direct.is_some() {
+                let batch_has_miss = batch
+                    .schema()
+                    .index_of("cache_most_severe_consequence")
+                    .ok()
+                    .map_or(true, |idx| batch.column(idx).null_count() > 0);
+                if batch_has_miss {
+                    let schema = batch.schema();
+                    if let (Ok(ci), Ok(si), Ok(ei)) = (
+                        schema.index_of("chrom"),
+                        schema.index_of("start"),
+                        schema.index_of("end"),
+                    ) {
+                        let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
+                        for row in 0..batch.num_rows() {
+                            if let (Some(c), Some(s), Some(e)) = (
+                                string_at(batch.column(ci).as_ref(), row),
+                                int64_at(batch.column(si).as_ref(), row),
+                                int64_at(batch.column(ei).as_ref(), row),
+                            ) {
+                                let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
+                                let entry = batch_chrom_bounds
+                                    .entry(c_norm)
+                                    .or_insert((i64::MAX, i64::MIN));
+                                entry.0 = entry.0.min(s);
+                                entry.1 = entry.1.max(e);
                             }
-                            ws += AnnotateProvider::SIFT_WINDOW_SIZE;
                         }
-                        ann.sift_cache.evict_before(*batch_min);
+                        for (ch, (batch_min, batch_max)) in &batch_chrom_bounds {
+                            let window_start = (batch_max / AnnotateProvider::SIFT_WINDOW_SIZE)
+                                * AnnotateProvider::SIFT_WINDOW_SIZE;
+                            let min_window_start = (batch_min / AnnotateProvider::SIFT_WINDOW_SIZE)
+                                * AnnotateProvider::SIFT_WINDOW_SIZE;
+                            let mut ws = min_window_start;
+                            while ws <= window_start + AnnotateProvider::SIFT_WINDOW_SIZE {
+                                let key = (ch.clone(), ws);
+                                if !ann.loaded_sift_windows.contains(&key) {
+                                    if let Some(ref direct) = ann.sift_direct {
+                                        direct.load_window(
+                                            ch,
+                                            ws,
+                                            ws + AnnotateProvider::SIFT_WINDOW_SIZE,
+                                            &mut ann.sift_cache,
+                                        )?;
+                                    }
+                                    ann.loaded_sift_windows.insert(key);
+                                }
+                                ws += AnnotateProvider::SIFT_WINDOW_SIZE;
+                            }
+                            ann.sift_cache.evict_before(*batch_min);
+                        }
                     }
                 }
             }
-        }
 
-        #[cfg(not(feature = "kv-cache"))]
-        let sift_kv: Option<()> = None;
-        #[cfg(feature = "kv-cache")]
-        let sift_kv = &ann.sift_kv;
-
-        let annotated = ann.tmp_provider.annotate_batch_with_transcript_engine(
-            batch,
-            engine,
-            &ctx,
-            &ann.colocated_map,
-            &mut ann.sift_cache,
-            #[cfg(feature = "kv-cache")]
-            sift_kv,
             #[cfg(not(feature = "kv-cache"))]
-            &sift_kv,
-            skip_csq,
-            skip_typed_cols,
-            &ann.config.flags,
-            &ann.config.hgvs_flags,
-            ann.config.transcript_selection,
-            &mut ann.hgvs_reader,
-        )?;
+            let sift_kv: Option<()> = None;
+            #[cfg(feature = "kv-cache")]
+            let sift_kv = &ann.sift_kv;
 
-        if let Some(indices) = projection {
-            out.push_back(annotated.project(indices)?);
-        } else {
-            out.push_back(annotated);
+            let annotated = ann.tmp_provider.annotate_batch_with_transcript_engine(
+                batch,
+                engine,
+                &ctx,
+                &ann.colocated_map,
+                &mut ann.sift_cache,
+                #[cfg(feature = "kv-cache")]
+                sift_kv,
+                #[cfg(not(feature = "kv-cache"))]
+                &sift_kv,
+                skip_csq,
+                skip_typed_cols,
+                &ann.config.flags,
+                &ann.config.hgvs_flags,
+                ann.config.transcript_selection,
+                &mut ann.hgvs_reader,
+            )?;
+
+            if let Some(indices) = projection {
+                out.push_back(annotated.project(indices)?);
+            } else {
+                out.push_back(annotated);
+            }
         }
     }
     Ok(out)
@@ -7904,14 +8018,15 @@ mod tests {
         assert_eq!(value, 3);
     }
 
-    // ── backfill_missing_hgnc_ids ─────────────────────────────────────
+    // ── buffer-local HGNC propagation ────────────────────────────────
 
-    /// Minimal `TranscriptFeature` for backfill tests.
+    /// Minimal `TranscriptFeature` for HGNC propagation tests.
     fn make_tx(
         id: &str,
+        gene_stable_id: Option<&str>,
         symbol: Option<&str>,
         symbol_source: Option<&str>,
-        hgnc_id: Option<&str>,
+        native_hgnc_id: Option<&str>,
     ) -> TranscriptFeature {
         TranscriptFeature {
             transcript_id: id.to_string(),
@@ -7926,10 +8041,11 @@ mod tests {
             cdna_coding_end: None,
             cdna_mapper_segments: Vec::new(),
             mature_mirna_regions: Vec::new(),
-            gene_stable_id: None,
+            gene_stable_id: gene_stable_id.map(|s| s.to_string()),
             gene_symbol: symbol.map(|s| s.to_string()),
             gene_symbol_source: symbol_source.map(|s| s.to_string()),
-            gene_hgnc_id: hgnc_id.map(|s| s.to_string()),
+            gene_hgnc_id_native: native_hgnc_id.map(|s| s.to_string()),
+            gene_hgnc_id: native_hgnc_id.map(|s| s.to_string()),
             display_xref_id: None,
             source: None,
             refseq_match: None,
@@ -7961,7 +8077,7 @@ mod tests {
     }
 
     fn make_selection_tx(id: &str, source: Option<&str>) -> TranscriptFeature {
-        let mut tx = make_tx(id, None, None, None);
+        let mut tx = make_tx(id, None, None, None, None);
         tx.chrom = "1".to_string();
         tx.biotype = "protein_coding".to_string();
         tx.source = source.map(str::to_string);
@@ -7997,6 +8113,7 @@ mod tests {
           "__class":"Bio::EnsEMBL::Transcript",
           "__value":{
             "_source_cache":"RefSeq",
+            "_gene_hgnc_id":"HGNC:5",
             "display_xref":{"display_id":"NM_000001"},
             "attributes":[
               {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_basic","value":"1"}},
@@ -8015,6 +8132,7 @@ mod tests {
         let metadata = parse_transcript_raw_metadata(raw);
         assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
         assert_eq!(metadata.display_xref_id.as_deref(), Some("NM_000001"));
+        assert_eq!(metadata.gene_hgnc_id_native.as_deref(), Some("HGNC:5"));
         assert_eq!(metadata.refseq_match.as_deref(), Some("rseq_ens_match_cds"));
         assert_eq!(metadata.flags_str.as_deref(), Some("cds_start_NF"));
         assert!(metadata.is_gencode_basic);
@@ -8105,6 +8223,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_transcript_raw_metadata_reads_gene_hgnc_id_fallback_key() {
+        let raw = r#"{
+          "__class":"Bio::EnsEMBL::Transcript",
+          "__value":{
+            "gene_hgnc_id":"HGNC:1100"
+          }
+        }"#;
+
+        let metadata = parse_transcript_raw_metadata(raw);
+        assert_eq!(metadata.gene_hgnc_id_native.as_deref(), Some("HGNC:1100"));
+    }
+
+    #[test]
     fn test_passes_transcript_selection_matches_vep_refseq_filters() {
         let ensembl_tx = make_selection_tx("ENST00000311111", Some("Ensembl"));
         let nm_tx = make_selection_tx("NM_000001", Some("RefSeq"));
@@ -8173,195 +8304,115 @@ mod tests {
         ));
     }
 
-    /// Issue #92 — SNORA75 (snoRNA, SYMBOL_SOURCE=RFAM): VEP leaves HGNC_ID
-    /// empty, vepyr was backfilling it.  With `hgnc_backfill=false` (default)
-    /// the symbol-based fallback must be skipped for non-HGNC-source transcripts.
     #[test]
-    fn test_backfill_hgnc_rfam_source_suppressed_by_default() {
-        // Ensembl transcript with HGNC source carries the HGNC_ID.
-        let tx_hgnc = make_tx(
-            "ENST00000999999",
-            Some("SNORA75"),
-            Some("HGNC"),
-            Some("HGNC:32661"),
-        );
-        // RFAM snoRNA transcript — same gene symbol, no HGNC_ID.
-        let tx_rfam = make_tx("ENST00000391278", Some("SNORA75"), Some("RFAM"), None);
-
-        let mut transcripts = vec![tx_hgnc, tx_rfam];
-        let refseq_ids = vec![None, None];
-
-        // Default: hgnc_backfill = false → RFAM transcript stays empty.
-        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
-        assert_eq!(
-            transcripts[0].gene_hgnc_id.as_deref(),
-            Some("HGNC:32661"),
-            "HGNC-source transcript should keep its HGNC_ID"
-        );
-        assert_eq!(
-            transcripts[1].gene_hgnc_id, None,
-            "RFAM-source transcript should NOT get HGNC_ID when hgnc_backfill=false"
-        );
-    }
-
-    /// When `hgnc_backfill=true`, RFAM-source transcripts DO get the HGNC_ID
-    /// via the symbol fallback (the "improvement" behaviour from before issue #92).
-    #[test]
-    fn test_backfill_hgnc_rfam_source_filled_when_enabled() {
-        let tx_hgnc = make_tx(
-            "ENST00000999999",
-            Some("SNORA75"),
-            Some("HGNC"),
-            Some("HGNC:32661"),
-        );
-        let tx_rfam = make_tx("ENST00000391278", Some("SNORA75"), Some("RFAM"), None);
-
-        let mut transcripts = vec![tx_hgnc, tx_rfam];
-        let refseq_ids = vec![None, None];
-
-        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, true);
-        assert_eq!(
-            transcripts[1].gene_hgnc_id.as_deref(),
-            Some("HGNC:32661"),
-            "RFAM-source transcript SHOULD get HGNC_ID when hgnc_backfill=true"
-        );
-    }
-
-    /// Issue #92 — LINC03025 (lncRNA, SYMBOL_SOURCE absent): VEP leaves
-    /// HGNC_ID empty.  With `hgnc_backfill=false` the fallback must be skipped.
-    #[test]
-    fn test_backfill_hgnc_empty_source_suppressed_by_default() {
-        let tx_hgnc = make_tx(
-            "ENST00000888888",
-            Some("LINC03025"),
-            Some("HGNC"),
-            Some("HGNC:56158"),
-        );
-        // lncRNA transcript — same gene symbol, no symbol source, no HGNC_ID.
-        let tx_no_source = make_tx("ENST00000777777", Some("LINC03025"), None, None);
-
-        let mut transcripts = vec![tx_hgnc, tx_no_source];
-        let refseq_ids = vec![None, None];
-
-        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
-        assert_eq!(
-            transcripts[1].gene_hgnc_id, None,
-            "Transcript with no SYMBOL_SOURCE should NOT get HGNC_ID when hgnc_backfill=false"
-        );
-    }
-
-    /// HGNC-source transcripts still get backfilled even with `hgnc_backfill=false`.
-    #[test]
-    fn test_backfill_hgnc_source_always_filled() {
-        let tx_with = make_tx(
-            "ENST00000111111",
-            Some("BRCA1"),
-            Some("HGNC"),
-            Some("HGNC:1100"),
-        );
-        let tx_without = make_tx("ENST00000222222", Some("BRCA1"), Some("HGNC"), None);
-
-        let mut transcripts = vec![tx_with, tx_without];
-        let refseq_ids = vec![None, None];
-
-        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
-        assert_eq!(
-            transcripts[1].gene_hgnc_id.as_deref(),
-            Some("HGNC:1100"),
-            "HGNC-source transcript without HGNC_ID should still get backfilled"
-        );
-    }
-
-    /// EntrezGene-source transcripts are NOT backfilled with `hgnc_backfill=false`.
-    /// VEP derives HGNC_ID from the gene's display_xref; EntrezGene transcripts
-    /// may or may not carry it depending on the gene object, and the cache
-    /// reflects this accurately (LINC03025 has both HGNC and EntrezGene
-    /// transcripts with different HGNC_ID status).
-    #[test]
-    fn test_backfill_hgnc_entrezgene_source_not_filled_by_default() {
-        let tx_hgnc = make_tx(
-            "ENST00000619971",
-            Some("LINC03025"),
-            Some("HGNC"),
-            Some("HGNC:56158"),
-        );
-        let tx_entrez = make_tx(
-            "ENST00000414223",
-            Some("LINC03025"),
-            Some("EntrezGene"),
-            None,
-        );
-
-        let mut transcripts = vec![tx_hgnc, tx_entrez];
-        let refseq_ids = vec![None, None];
-
-        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
-        assert_eq!(
-            transcripts[1].gene_hgnc_id, None,
-            "EntrezGene-source transcript should NOT get HGNC_ID when hgnc_backfill=false"
-        );
-    }
-
-    /// RefSeq/Gnomon rows in the merged cache can carry EntrezGene
-    /// SYMBOL_SOURCE while VEP still emits the gene object's HGNC display_xref.
-    #[test]
-    fn test_backfill_hgnc_refseq_entrezgene_source_filled_by_default() {
-        let tx_hgnc = make_tx(
-            "ENST00000400906",
-            Some("SLC2A7"),
-            Some("HGNC"),
-            Some("HGNC:13445"),
-        );
-        let mut tx_refseq = make_tx("XM_011540824.3", Some("SLC2A7"), Some("EntrezGene"), None);
-        tx_refseq.source = Some("RefSeq".to_string());
-
-        let mut transcripts = vec![tx_hgnc, tx_refseq];
-        let refseq_ids = vec![None, None];
-
-        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
-        assert_eq!(transcripts[1].gene_hgnc_id.as_deref(), Some("HGNC:13445"));
-    }
-
-    #[test]
-    fn test_backfill_hgnc_refseq_noncoding_entrezgene_source_filled_by_default() {
-        let tx_hgnc = make_tx(
+    fn test_buffer_local_hgnc_propagation_uses_native_symbol_donor() {
+        let tx_donor = make_tx(
             "ENST00000919191",
+            Some("ENSG00000182158"),
             Some("NBAS"),
             Some("HGNC"),
             Some("HGNC:15625"),
         );
-        let mut tx_refseq = make_tx("XR_007076390.1", Some("NBAS"), Some("EntrezGene"), None);
+        let mut tx_refseq = make_tx(
+            "XR_007076390.1",
+            Some("GENE:NBAS"),
+            Some("NBAS"),
+            Some("EntrezGene"),
+            None,
+        );
         tx_refseq.source = Some("RefSeq".to_string());
 
-        let mut transcripts = vec![tx_hgnc, tx_refseq];
-        let refseq_ids = vec![None, None];
-
-        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
+        let mut transcripts = vec![tx_donor, tx_refseq];
+        apply_buffer_local_hgnc_propagation(&mut transcripts);
         assert_eq!(transcripts[1].gene_hgnc_id.as_deref(), Some("HGNC:15625"));
     }
 
-    /// RefSeq ID-based backfill still works regardless of `hgnc_backfill` flag.
     #[test]
-    fn test_backfill_refseq_id_mapping_unaffected() {
-        // Ensembl transcript with refseq_id and HGNC_ID.
-        let tx_ensembl = make_tx(
-            "ENST00000333333",
-            Some("TP53"),
+    fn test_buffer_local_hgnc_propagation_ignores_non_native_effective_values() {
+        let mut tx_promoted = make_tx(
+            "ENST00000426186",
+            Some("ENSG00000225475"),
+            Some("ANAPC1P1"),
             Some("HGNC"),
-            Some("HGNC:11998"),
+            None,
         );
-        // RefSeq transcript that should be linked via refseq_id.
-        let tx_refseq = make_tx("NM_000546", Some("TP53"), Some("EntrezGene"), None);
+        tx_promoted.gene_hgnc_id = Some("HGNC:44150".to_string());
+        let mut tx_refseq = make_tx(
+            "NR_037931.2",
+            Some("GENE:ANAPC1P1"),
+            Some("ANAPC1P1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_refseq.source = Some("RefSeq".to_string());
 
-        let mut transcripts = vec![tx_ensembl, tx_refseq];
-        let refseq_ids = vec![Some("NM_000546".to_string()), None];
-
-        backfill_missing_hgnc_ids(&mut transcripts, &refseq_ids, false);
+        let mut transcripts = vec![tx_promoted, tx_refseq];
+        apply_buffer_local_hgnc_propagation(&mut transcripts);
         assert_eq!(
-            transcripts[1].gene_hgnc_id.as_deref(),
-            Some("HGNC:11998"),
-            "RefSeq ID-based mapping should work regardless of hgnc_backfill flag"
+            transcripts[1].gene_hgnc_id, None,
+            "cache-promoted HGNC IDs must not seed VEP-style propagation"
         );
+    }
+
+    #[test]
+    fn test_buffer_local_hgnc_propagation_refills_same_gene_stable_id() {
+        let tx_with_symbol = make_tx(
+            "ENST00000111111",
+            Some("ENSG00000123456"),
+            Some("BRCA1"),
+            Some("HGNC"),
+            Some("HGNC:1100"),
+        );
+        let tx_missing = make_tx("ENST00000222222", Some("ENSG00000123456"), None, None, None);
+
+        let mut transcripts = vec![tx_with_symbol, tx_missing];
+        apply_buffer_local_hgnc_propagation(&mut transcripts);
+        assert_eq!(transcripts[1].gene_symbol.as_deref(), Some("BRCA1"));
+        assert_eq!(transcripts[1].gene_symbol_source.as_deref(), Some("HGNC"));
+        assert_eq!(transcripts[1].gene_hgnc_id.as_deref(), Some("HGNC:1100"));
+    }
+
+    #[test]
+    fn test_build_buffer_local_transcripts_scopes_to_expanded_range() {
+        let mut tx_before = make_tx(
+            "ENST00000000001",
+            Some("ENSG_BEFORE"),
+            Some("GENE1"),
+            Some("HGNC"),
+            Some("HGNC:1"),
+        );
+        tx_before.start = 10;
+        tx_before.end = 20;
+        let mut tx_inside = make_tx(
+            "ENST00000000002",
+            Some("ENSG_INSIDE"),
+            Some("GENE2"),
+            Some("HGNC"),
+            Some("HGNC:2"),
+        );
+        tx_inside.start = 120;
+        tx_inside.end = 180;
+        let mut tx_after = make_tx(
+            "ENST00000000003",
+            Some("ENSG_AFTER"),
+            Some("GENE3"),
+            Some("HGNC"),
+            Some("HGNC:3"),
+        );
+        tx_after.start = 400;
+        tx_after.end = 450;
+
+        let scoped = build_buffer_local_transcripts(
+            &[tx_before, tx_inside.clone(), tx_after],
+            "chr2",
+            140,
+            160,
+            50,
+            50,
+        );
+
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].transcript_id, tx_inside.transcript_id);
     }
 
     // ── csq_escape ────────────────────────────────────────────────────
