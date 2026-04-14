@@ -6381,6 +6381,43 @@ impl ExecutionPlan for ContigAnnotationExec {
 const HYDRATION_WINDOW_SIZE: usize = 1000;
 /// Ensembl VEP release/115 default `buffer_size`.
 const VEP_INPUT_BUFFER_SIZE: usize = 5000;
+/// Ensembl VEP transcript cache region size (`cache_region_size`).
+const VEP_TRANSCRIPT_CACHE_REGION_SIZE_BP: i64 = 1_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TranscriptCacheRegion {
+    chrom: String,
+    region_index: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PersistedTranscriptGeneFields {
+    gene_symbol: Option<String>,
+    gene_symbol_source: Option<String>,
+    gene_hgnc_id: Option<String>,
+}
+
+impl PersistedTranscriptGeneFields {
+    fn from_transcript(tx: &TranscriptFeature) -> Self {
+        Self {
+            gene_symbol: tx.gene_symbol.clone(),
+            gene_symbol_source: tx.gene_symbol_source.clone(),
+            gene_hgnc_id: tx.gene_hgnc_id.clone(),
+        }
+    }
+
+    fn apply_to_transcript(&self, tx: &mut TranscriptFeature) {
+        if self.gene_symbol.is_some() {
+            tx.gene_symbol = self.gene_symbol.clone();
+        }
+        if self.gene_symbol_source.is_some() {
+            tx.gene_symbol_source = self.gene_symbol_source.clone();
+        }
+        if self.gene_hgnc_id.is_some() {
+            tx.gene_hgnc_id = self.gene_hgnc_id.clone();
+        }
+    }
+}
 
 type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
 
@@ -6416,6 +6453,8 @@ struct ContigAnnotationState {
     motifs: Vec<MotifFeature>,
     mirnas: Vec<MirnaFeature>,
     structural: Vec<StructuralFeature>,
+    transcript_cache_regions: HashMap<String, Vec<TranscriptCacheRegion>>,
+    persisted_transcript_gene_fields: HashMap<String, PersistedTranscriptGeneFields>,
     // Colocated (built lazily from sink on first window).
     colocated_map: HashMap<ColocatedKey, ColocatedData>,
     colocated_map_built: bool,
@@ -6695,7 +6734,101 @@ fn buffer_variant_bounds(batches: &[RecordBatch]) -> Result<Option<(String, i64,
     Ok(chrom.map(|chrom| (chrom, min_start, max_end)))
 }
 
-fn build_buffer_local_transcripts(
+fn normalized_chrom_name(chrom: &str) -> &str {
+    chrom.strip_prefix("chr").unwrap_or(chrom)
+}
+
+fn cache_region_index(pos: i64) -> i64 {
+    pos.saturating_sub(1) / VEP_TRANSCRIPT_CACHE_REGION_SIZE_BP
+}
+
+fn cache_regions_for_coords(
+    chrom: &str,
+    start: i64,
+    end: i64,
+    upstream_distance: i64,
+    downstream_distance: i64,
+) -> Vec<TranscriptCacheRegion> {
+    let chrom = normalized_chrom_name(chrom).to_string();
+    let query_start = start.min(end).saturating_sub(upstream_distance);
+    let query_end = start.max(end).saturating_add(downstream_distance);
+    let region_start = cache_region_index(query_start);
+    let region_end = cache_region_index(query_end);
+
+    (region_start..=region_end)
+        .map(|region_index| TranscriptCacheRegion {
+            chrom: chrom.clone(),
+            region_index,
+        })
+        .collect()
+}
+
+fn transcript_cache_regions(transcript: &TranscriptFeature) -> Vec<TranscriptCacheRegion> {
+    cache_regions_for_coords(&transcript.chrom, transcript.start, transcript.end, 0, 0)
+}
+
+fn collect_buffer_cache_regions(
+    batches: &[RecordBatch],
+    upstream_distance: i64,
+    downstream_distance: i64,
+) -> Result<HashSet<TranscriptCacheRegion>> {
+    let mut regions = HashSet::new();
+
+    for batch in batches {
+        let schema = batch.schema();
+        let chrom_idx = schema.index_of("chrom").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required chrom column".to_string(),
+            )
+        })?;
+        let start_idx = schema.index_of("start").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required start column".to_string(),
+            )
+        })?;
+        let end_idx = schema.index_of("end").map_err(|_| {
+            DataFusionError::Execution(
+                "annotate_vep(): input VCF row is missing required end column".to_string(),
+            )
+        })?;
+
+        for row in 0..batch.num_rows() {
+            let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                continue;
+            };
+
+            regions.extend(cache_regions_for_coords(
+                &chrom,
+                start,
+                end,
+                upstream_distance,
+                downstream_distance,
+            ));
+        }
+    }
+
+    Ok(regions)
+}
+
+fn prune_persisted_transcript_gene_fields(
+    persisted_fields: &mut HashMap<String, PersistedTranscriptGeneFields>,
+    transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
+    active_regions: &HashSet<TranscriptCacheRegion>,
+) {
+    persisted_fields.retain(|transcript_id, _| {
+        transcript_cache_regions
+            .get(transcript_id)
+            .is_some_and(|regions| regions.iter().any(|region| active_regions.contains(region)))
+    });
+}
+
+fn select_buffer_local_transcripts(
     transcripts: &[TranscriptFeature],
     chrom: &str,
     min_start: i64,
@@ -6707,17 +6840,80 @@ fn build_buffer_local_transcripts(
     let query_start = min_start.saturating_sub(upstream_distance);
     let query_end = max_end.saturating_add(downstream_distance);
 
-    let mut buffer_transcripts: Vec<TranscriptFeature> = transcripts
+    transcripts
         .iter()
         .filter(|tx| {
             let tx_chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
             tx_chrom == chrom_norm && tx.end >= query_start && tx.start <= query_end
         })
         .cloned()
-        .collect();
+        .collect()
+}
 
+fn build_buffer_local_transcripts(
+    transcripts: &[TranscriptFeature],
+    chrom: &str,
+    min_start: i64,
+    max_end: i64,
+    upstream_distance: i64,
+    downstream_distance: i64,
+) -> Vec<TranscriptFeature> {
+    let mut buffer_transcripts = select_buffer_local_transcripts(
+        transcripts,
+        chrom,
+        min_start,
+        max_end,
+        upstream_distance,
+        downstream_distance,
+    );
     apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
     buffer_transcripts
+}
+
+fn build_stateful_buffer_local_transcripts(
+    transcripts: &[TranscriptFeature],
+    transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
+    persisted_fields: &mut HashMap<String, PersistedTranscriptGeneFields>,
+    buffer_batches: &[RecordBatch],
+    chrom: &str,
+    min_start: i64,
+    max_end: i64,
+    upstream_distance: i64,
+    downstream_distance: i64,
+) -> Result<Vec<TranscriptFeature>> {
+    let active_regions =
+        collect_buffer_cache_regions(buffer_batches, upstream_distance, downstream_distance)?;
+    prune_persisted_transcript_gene_fields(
+        persisted_fields,
+        transcript_cache_regions,
+        &active_regions,
+    );
+
+    let mut buffer_transcripts = select_buffer_local_transcripts(
+        transcripts,
+        chrom,
+        min_start,
+        max_end,
+        upstream_distance,
+        downstream_distance,
+    );
+
+    for tx in &mut buffer_transcripts {
+        if let Some(fields) = persisted_fields.get(&tx.transcript_id) {
+            fields.apply_to_transcript(tx);
+        }
+    }
+
+    apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
+
+    for tx in &buffer_transcripts {
+        persisted_fields.insert(
+            tx.transcript_id.clone(),
+            PersistedTranscriptGeneFields::from_transcript(tx),
+        );
+    }
+
+    Ok(buffer_transcripts)
 }
 
 /// Apply the HGNC-relevant parts of Ensembl VEP `merge_features()` to a single
@@ -6823,14 +7019,17 @@ fn annotate_window(
         let Some((chrom, min_start, max_end)) = buffer_variant_bounds(&buffer_batches)? else {
             continue;
         };
-        let buffer_transcripts = build_buffer_local_transcripts(
+        let buffer_transcripts = build_stateful_buffer_local_transcripts(
             &ann.transcripts,
+            &ann.transcript_cache_regions,
+            &mut ann.persisted_transcript_gene_fields,
+            &buffer_batches,
             &chrom,
             min_start,
             max_end,
             ann.config.upstream_distance,
             ann.config.downstream_distance,
-        );
+        )?;
         let buffer_tx_ids: HashSet<&str> = buffer_transcripts
             .iter()
             .map(|tx| tx.transcript_id.as_str())
@@ -7086,6 +7285,12 @@ impl Stream for ContigAnnotationStream {
 
                         self.state = StreamState::AnnotatingContig(ContigAnnotationState {
                             lookup_stream: Some(ready.lookup_stream),
+                            transcript_cache_regions: ready
+                                .transcripts
+                                .iter()
+                                .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+                                .collect(),
+                            persisted_transcript_gene_fields: HashMap::new(),
                             transcripts: ready.transcripts,
                             translateable_seq_by_tx: ready.translateable_seq_by_tx,
                             exons: ready.exons,
@@ -8084,6 +8289,23 @@ mod tests {
         tx
     }
 
+    fn make_buffer_batch(chrom: &str, start: i64, end: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![chrom])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![start])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![end])) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_transcript_selection_flags_reject_invalid_combinations() {
         let err =
@@ -8413,6 +8635,143 @@ mod tests {
 
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].transcript_id, tx_inside.transcript_id);
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_carry_hgnc_across_adjacent_buffers() {
+        let mut tx_donor = make_tx(
+            "ENST_DONOR",
+            Some("ENSG00000123456"),
+            Some("LINC02778"),
+            Some("HGNC"),
+            Some("HGNC:54298"),
+        );
+        tx_donor.start = 100;
+        tx_donor.end = 200;
+
+        let mut tx_recipient = make_tx(
+            "XR_RECIPIENT",
+            Some("105378760"),
+            Some("LINC02778"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.start = 100;
+        tx_recipient.end = 700_000;
+
+        let transcripts = vec![tx_donor, tx_recipient];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_fields = HashMap::new();
+
+        let first_buffer = vec![make_buffer_batch("chr2", 150, 150)];
+        let first_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_fields,
+            &first_buffer,
+            "chr2",
+            150,
+            150,
+            50,
+            50,
+        )
+        .unwrap();
+        let first_recipient = first_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "XR_RECIPIENT")
+            .unwrap();
+        assert_eq!(first_recipient.gene_hgnc_id.as_deref(), Some("HGNC:54298"));
+
+        let second_buffer = vec![make_buffer_batch("chr2", 650_000, 650_000)];
+        let second_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_fields,
+            &second_buffer,
+            "chr2",
+            650_000,
+            650_000,
+            50,
+            50,
+        )
+        .unwrap();
+        assert_eq!(second_scoped.len(), 1);
+        assert_eq!(second_scoped[0].transcript_id, "XR_RECIPIENT");
+        assert_eq!(second_scoped[0].gene_hgnc_id.as_deref(), Some("HGNC:54298"));
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_prune_hgnc_across_cache_regions() {
+        let mut tx_donor = make_tx(
+            "ENST_DONOR",
+            Some("ENSG00000123456"),
+            Some("PDK1"),
+            Some("HGNC"),
+            Some("HGNC:8809"),
+        );
+        tx_donor.start = 100;
+        tx_donor.end = 200;
+
+        let mut tx_region0 = make_tx(
+            "XR_REGION0",
+            Some("5163"),
+            Some("PDK1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_region0.start = 100;
+        tx_region0.end = 700_000;
+
+        let mut tx_region1 = make_tx(
+            "XR_REGION1",
+            Some("5163"),
+            Some("PDK1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_region1.start = 1_050_000;
+        tx_region1.end = 1_060_000;
+
+        let transcripts = vec![tx_donor, tx_region0, tx_region1];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_fields = HashMap::new();
+
+        let first_buffer = vec![make_buffer_batch("chr2", 150, 150)];
+        build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_fields,
+            &first_buffer,
+            "chr2",
+            150,
+            150,
+            50,
+            50,
+        )
+        .unwrap();
+
+        let second_buffer = vec![make_buffer_batch("chr2", 1_050_000, 1_050_000)];
+        let second_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_fields,
+            &second_buffer,
+            "chr2",
+            1_050_000,
+            1_050_000,
+            50,
+            50,
+        )
+        .unwrap();
+        assert_eq!(second_scoped.len(), 1);
+        assert_eq!(second_scoped[0].transcript_id, "XR_REGION1");
+        assert_eq!(second_scoped[0].gene_hgnc_id, None);
     }
 
     // ── csq_escape ────────────────────────────────────────────────────
