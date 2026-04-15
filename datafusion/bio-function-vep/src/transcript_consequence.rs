@@ -3441,6 +3441,94 @@ fn translated_alt_protein_for_hgvs(tx: &TranscriptFeature, mutated_cds: &[u8]) -
     translate_protein_from_cds(&alt_cds).map(|aas| aas.into_iter().collect())
 }
 
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_alternate_cds()`
+///   builds alternate CDS directly from `_translateable_seq`, local CDS
+///   coordinates, trimmed indel allele, then appends `_three_prime_utr()`
+///   before translation
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2323-L2499>
+fn alternate_translation_for_vep_hgvs(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    translation: &TranslationFeature,
+    variant: &VariantInput,
+) -> Option<String> {
+    let reference_cds_seq = reference_translateable_seq_for_vep(tx, Some(translation))?;
+    let leading_n_offset = reference_cds_seq
+        .bytes()
+        .take_while(|&b| b == b'N' || b == b'n')
+        .count();
+    let ref_genomic = normalize_allele_seq(&variant.ref_allele);
+    let alt_genomic = normalize_allele_seq(&variant.alt_allele);
+    let ref_len = ref_genomic.len();
+
+    let (cds_start_1based, cds_end_1based) = if ref_len == 0 {
+        let anchor_pos = if tx.strand >= 0 {
+            variant.start.saturating_sub(1)
+        } else {
+            variant.start
+        };
+        let raw_cds_idx = genomic_to_cds_index(tx, tx_exons, anchor_pos)
+            .or_else(|| {
+                let alt = if tx.strand >= 0 {
+                    variant.start
+                } else {
+                    variant.start.saturating_sub(1)
+                };
+                genomic_to_cds_index(tx, tx_exons, alt).and_then(|i| i.checked_sub(1))
+            })
+            .map(|i| i + leading_n_offset)?;
+        let cds_idx = adjust_refseq_cds_sequence_index(tx, raw_cds_idx, leading_n_offset)
+            .unwrap_or(raw_cds_idx);
+        (cds_idx + 1, cds_idx)
+    } else {
+        let genomic_positions = genomic_range(variant.start, variant.end)?;
+        if genomic_positions.len() != ref_len {
+            return None;
+        }
+        let mut cds_indices = Vec::with_capacity(genomic_positions.len());
+        for pos in &genomic_positions {
+            let raw_idx =
+                genomic_to_cds_index(tx, tx_exons, *pos)?.saturating_add(leading_n_offset);
+            cds_indices.push(
+                adjust_refseq_cds_sequence_index(tx, raw_idx, leading_n_offset).unwrap_or(raw_idx),
+            );
+        }
+        cds_indices.sort_unstable();
+        let start_idx = *cds_indices.first()?;
+        let end_idx = *cds_indices.last()?;
+        (start_idx + 1, end_idx + 1)
+    };
+
+    if cds_start_1based == 0 || cds_start_1based > reference_cds_seq.len().saturating_add(1) {
+        return None;
+    }
+    if cds_end_1based > reference_cds_seq.len() {
+        return None;
+    }
+
+    let upstream_seq = &reference_cds_seq[..cds_start_1based.saturating_sub(1)];
+    let downstream_seq = &reference_cds_seq[cds_end_1based..];
+    let alt_allele = if tx.strand >= 0 {
+        alt_genomic.to_ascii_uppercase()
+    } else {
+        reverse_complement(&alt_genomic)?.to_ascii_uppercase()
+    };
+    let alt_allele = alt_allele.replace('-', "");
+
+    let mut alternate_seq =
+        String::with_capacity(upstream_seq.len() + alt_allele.len() + downstream_seq.len());
+    alternate_seq.push_str(upstream_seq);
+    alternate_seq.push_str(&alt_allele);
+    alternate_seq.push_str(downstream_seq);
+    let keep_len = alternate_seq.len() - (alternate_seq.len() % 3);
+    alternate_seq.truncate(keep_len);
+    if let Some(utr) = three_prime_utr_seq(tx) {
+        alternate_seq.push_str(&utr);
+    }
+    translate_protein_from_cds(alternate_seq.as_bytes()).map(|aas| aas.into_iter().collect())
+}
+
 /// Build the local protein HGVS peptide alleles using the same codon-window
 /// extraction Ensembl uses in `TranscriptVariationAllele::codon()` and
 /// `TranscriptVariationAllele::peptide()`.
@@ -3620,7 +3708,8 @@ fn literal_indel_protein_hgvs_data(
         ref_peptide,
         alt_peptide,
         ref_translation: old_aas.iter().collect(),
-        alt_translation: translated_alt_protein_for_hgvs(tx, &mutated)
+        alt_translation: alternate_translation_for_vep_hgvs(tx, tx_exons, translation, variant)
+            .or_else(|| translated_alt_protein_for_hgvs(tx, &mutated))
             .unwrap_or_else(|| new_aas.iter().collect()),
         frameshift: !ref_len.abs_diff(alt_len).is_multiple_of(3),
         start_lost: class.start_lost,
@@ -3769,7 +3858,14 @@ fn classify_coding_change(
 
     // Handle pure insertions (ref = "-") separately.
     if ref_len == 0 {
-        return classify_insertion(tx, tx_exons, &cds_seq, variant, &alt_genomic);
+        return classify_insertion(
+            tx,
+            tx_exons,
+            tx_translation,
+            &cds_seq,
+            variant,
+            &alt_genomic,
+        );
     }
 
     let genomic_positions = genomic_range(variant.start, variant.end)?;
@@ -4309,8 +4405,12 @@ fn classify_coding_change(
     // - Ensembl Variation `TranscriptVariationAllele::_stop_loss_extra_AA()`
     //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2406-L2455
     let hgvs_new_aas = if class.stop_lost || frameshift {
-        translated_alt_protein_for_hgvs(tx, &mutated)
+        alternate_translation_for_vep_hgvs(tx, tx_exons, translation, variant)
             .map(|seq| seq.chars().collect::<Vec<_>>())
+            .or_else(|| {
+                translated_alt_protein_for_hgvs(tx, &mutated)
+                    .map(|seq| seq.chars().collect::<Vec<_>>())
+            })
             .unwrap_or_else(|| new_aas.clone())
     } else {
         new_aas.clone()
@@ -4362,6 +4462,7 @@ fn classify_coding_change(
 fn classify_insertion(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
     cds_seq: &str,
     variant: &VariantInput,
     alt_genomic: &str,
@@ -4751,8 +4852,15 @@ fn classify_insertion(
 
     // Extend with 3' UTR for HGVS stop-loss/frameshift extension distance.
     let hgvs_new_aas = if class.stop_lost || frameshift {
-        translated_alt_protein_for_hgvs(tx, &mutated)
+        tx_translation
+            .and_then(|translation| {
+                alternate_translation_for_vep_hgvs(tx, tx_exons, translation, variant)
+            })
             .map(|seq| seq.chars().collect::<Vec<_>>())
+            .or_else(|| {
+                translated_alt_protein_for_hgvs(tx, &mutated)
+                    .map(|seq| seq.chars().collect::<Vec<_>>())
+            })
             .unwrap_or_else(|| new_aas.clone())
     } else {
         new_aas.clone()
@@ -13338,7 +13446,7 @@ mod tests {
         let tr = translation("T1", Some(cds_len), Some(cds_len / 3), None, Some(cds));
         // Insert "C" after the last CDS base (position 1008, just past CDS)
         let v = var("22", 1008, 1008, "-", "C");
-        let c = classify_insertion(&t, &exons_ref, cds, &v, "C");
+        let c = classify_insertion(&t, &exons_ref, None, cds, &v, "C");
         assert!(c.is_some(), "classify_insertion should succeed");
         let c = c.unwrap();
         // CDS position: 8-9 (1-based, insertion between positions 8 and 9)
@@ -13873,7 +13981,7 @@ mod tests {
         let exons_ref: Vec<&ExonFeature> = vec![&e1, &e2];
         // Insert "C" at position 1009 (intron between exons)
         let v = var("1", 1009, 1009, "-", "C");
-        let c = classify_insertion(&t, &exons_ref, cds, &v, "C");
+        let c = classify_insertion(&t, &exons_ref, None, cds, &v, "C");
         assert!(
             c.is_some(),
             "classify_insertion must succeed with anchor fallback for neg strand"
