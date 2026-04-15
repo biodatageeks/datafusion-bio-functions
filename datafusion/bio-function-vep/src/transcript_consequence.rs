@@ -1969,8 +1969,14 @@ impl TranscriptConsequenceEngine {
                 terms.insert(SoTerm::ProteinAlteringVariant);
                 return Some(classification);
             } else {
-                let cds = tx_translation.and_then(|t| t.cds_sequence.as_deref());
-                self.add_start_stop_heuristic_terms(terms, variant, tx, tx_exons, cds);
+                let translateable_seq = reference_translateable_seq_for_vep(tx, tx_translation);
+                self.add_start_stop_heuristic_terms(
+                    terms,
+                    variant,
+                    tx,
+                    tx_exons,
+                    translateable_seq.as_deref(),
+                );
                 terms.insert(SoTerm::ProteinAlteringVariant);
                 if extends_into_utr {
                     return partial_coding_overlap_classification(
@@ -2010,8 +2016,14 @@ impl TranscriptConsequenceEngine {
         // No translation data available. Apply start/stop heuristics
         // (position + allele pattern based) but do NOT guess
         // missense/synonymous without codon evidence.
-        let cds = tx_translation.and_then(|t| t.cds_sequence.as_deref());
-        self.add_start_stop_heuristic_terms(terms, variant, tx, tx_exons, cds);
+        let translateable_seq = reference_translateable_seq_for_vep(tx, tx_translation);
+        self.add_start_stop_heuristic_terms(
+            terms,
+            variant,
+            tx,
+            tx_exons,
+            translateable_seq.as_deref(),
+        );
 
         // Detect premature stop gain from allele pattern (in-frame
         // substitution where alt is a stop codon but ref is not).
@@ -3327,6 +3339,41 @@ fn local_peptide_from_codon_window(codon: &[u8]) -> Option<String> {
 }
 
 /// Traceability:
+/// - Ensembl core `Transcript::translateable_seq()`
+///   builds the sequence from `spliced_seq()` plus `cdna_coding_start/end`,
+///   then prepends phase `N`s when the translation starts mid-codon
+///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Transcript.pm#L903-L924>
+/// - Ensembl Variation `BaseTranscriptVariation::_translateable_seq()`
+///   caches that transcript-derived value for HGVS/consequence work
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1083-L1092>
+fn reference_translateable_seq_for_vep(
+    tx: &TranscriptFeature,
+    translation: Option<&TranslationFeature>,
+) -> Option<String> {
+    let leading_n_count = translation
+        .and_then(|t| t.cds_sequence.as_deref())
+        .map(|seq| seq.bytes().take_while(|&b| b == b'N' || b == b'n').count())
+        .unwrap_or(0);
+
+    let full_seq = tx.spliced_seq.as_deref().or(tx.cdna_seq.as_deref());
+    if let (Some(seq), Some(start), Some(end)) =
+        (full_seq, tx.cdna_coding_start, tx.cdna_coding_end)
+    {
+        let start_idx = start.checked_sub(1)?;
+        if start_idx < end && end <= seq.len() {
+            let mut mrna = String::with_capacity(leading_n_count + (end - start_idx));
+            mrna.extend(std::iter::repeat_n('N', leading_n_count));
+            mrna.push_str(&seq[start_idx..end].to_ascii_uppercase());
+            return Some(mrna);
+        }
+    }
+
+    translation
+        .and_then(|t| t.cds_sequence.as_deref())
+        .map(|seq| seq.to_ascii_uppercase())
+}
+
+/// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_trim_incomplete_codon()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2463-L2469>
 /// - Ensembl Variation `TranscriptVariationAllele::_get_alternate_cds()`
@@ -3361,7 +3408,7 @@ fn literal_indel_protein_hgvs_data(
     class: &CodingClassification,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
     let translation = tx_translation?;
-    let cds_seq = translation.cds_sequence.as_deref()?.to_ascii_uppercase();
+    let cds_seq = reference_translateable_seq_for_vep(tx, Some(translation))?;
     let ref_genomic = normalize_allele_seq(&variant.ref_allele);
     let alt_genomic = normalize_allele_seq(&variant.alt_allele);
     let ref_len = ref_genomic.len();
@@ -3644,7 +3691,7 @@ fn classify_coding_change(
     variant: &VariantInput,
 ) -> Option<CodingClassification> {
     let translation = tx_translation?;
-    let cds_seq = translation.cds_sequence.as_deref()?.to_ascii_uppercase();
+    let cds_seq = reference_translateable_seq_for_vep(tx, Some(translation))?;
     let ref_genomic = normalize_allele_seq(&variant.ref_allele);
     let alt_genomic = normalize_allele_seq(&variant.alt_allele);
     let ref_len = ref_genomic.len();
@@ -3776,8 +3823,7 @@ fn classify_coding_change(
         //    is a frameshift, VEP's peptide-level check also fires start_lost
         //    (full affected peptide range differs) alongside start_retained.
         if ref_len != alt_len {
-            match ins_del_start_altered(tx, tx_exons, variant, translation.cds_sequence.as_deref())
-            {
+            match ins_del_start_altered(tx, tx_exons, variant, Some(cds_seq.as_str())) {
                 Some(false) => {
                     class.start_retained = true;
                     if !ref_len.abs_diff(alt_len).is_multiple_of(3) {
@@ -11255,6 +11301,30 @@ mod tests {
         t.cdna_coding_end = None;
         t.spliced_seq = Some("ATGATGATGCCC".into());
         assert!(three_prime_utr_seq(&t).is_none());
+    }
+
+    #[test]
+    fn reference_translateable_seq_for_vep_prefers_transcript_coding_slice() {
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(180),
+        );
+        t.cdna_coding_start = Some(4);
+        t.cdna_coding_end = Some(12);
+        t.spliced_seq = Some("AAAATGGCCCTTTAAA".into());
+
+        let tr = translation("ENST0001", Some(9), Some(3), None, Some("NCCCCCCCC"));
+
+        assert_eq!(
+            reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
+            Some("NATGGCCCTT")
+        );
     }
 
     #[test]
