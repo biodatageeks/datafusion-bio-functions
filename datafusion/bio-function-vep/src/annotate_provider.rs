@@ -5323,12 +5323,13 @@ fn refseq_misalignment_offset(tx: &TranscriptFeature, cdna_start: i64) -> Option
 
     let mut offset = 0_i64;
     for edit in &tx.refseq_edits {
-        if edit.skip_refseq_offset || cdna_start < edit.start {
+        if edit.skip_refseq_offset || edit.end >= cdna_start {
             continue;
         }
 
         if let Some(replacement_len) = edit.replacement_len {
-            offset += replacement_len as i64;
+            let replaced_len = edit.end.saturating_sub(edit.start).saturating_add(1);
+            offset += replacement_len as i64 - replaced_len;
         } else {
             offset += -1 - (edit.end - edit.start);
         }
@@ -5855,14 +5856,19 @@ where
     }
 
     for tx in transcripts.iter_mut() {
-        // Skip if we already have spliced_seq or cdna_seq.
+        // Prefer cache-native spliced_seq, which already matches the live
+        // transcript object Ensembl would use. For cdna_seq, only skip when
+        // it clearly contains explicit 3' UTR beyond any leading phase Ns;
+        // merged cache rows often store CDS-like `_translateable_seq` here.
         if tx.spliced_seq.is_some() {
             continue;
         }
-        // Only need UTR for coding transcripts.
         let Some(coding_end) = tx.cdna_coding_end else {
             continue;
         };
+        if cdna_seq_has_explicit_three_prime_utr(tx) {
+            continue;
+        }
         // Skip LoF biotype (VEP doesn't provide UTR for these).
         if tx.biotype.contains("LoF") {
             continue;
@@ -5964,6 +5970,17 @@ where
         tx.cdna_seq = Some(cdna);
     }
     Ok(())
+}
+
+fn cdna_seq_has_explicit_three_prime_utr(tx: &TranscriptFeature) -> bool {
+    let Some(seq) = tx.cdna_seq.as_deref() else {
+        return false;
+    };
+    let Some(coding_end) = tx.cdna_coding_end else {
+        return false;
+    };
+    let leading_n_count = seq.bytes().take_while(|&b| b == b'N' || b == b'n').count();
+    coding_end < seq.len().saturating_sub(leading_n_count)
 }
 
 fn apply_translateable_seq_overrides(
@@ -6501,6 +6518,9 @@ struct TranscriptCacheRegion {
     region_index: i64,
 }
 
+type PersistedBufferTranscripts =
+    HashMap<TranscriptCacheRegion, HashMap<String, TranscriptFeature>>;
+
 type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
 
 /// Everything needed to start streaming annotation for a contig.
@@ -6536,7 +6556,7 @@ struct ContigAnnotationState {
     mirnas: Vec<MirnaFeature>,
     structural: Vec<StructuralFeature>,
     transcript_cache_regions: HashMap<String, Vec<TranscriptCacheRegion>>,
-    persisted_buffer_transcripts: HashMap<String, TranscriptFeature>,
+    persisted_buffer_transcripts: PersistedBufferTranscripts,
     // Colocated (built lazily from sink on first window).
     colocated_map: HashMap<ColocatedKey, ColocatedData>,
     colocated_map_built: bool,
@@ -6909,15 +6929,10 @@ fn collect_buffer_cache_regions(
 /// - Ensembl VEP region cache population in `get_features_by_regions_uncached()`
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L109-L139>
 fn prune_persisted_buffer_transcripts(
-    persisted_transcripts: &mut HashMap<String, TranscriptFeature>,
-    transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
+    persisted_transcripts: &mut PersistedBufferTranscripts,
     active_regions: &HashSet<TranscriptCacheRegion>,
 ) {
-    persisted_transcripts.retain(|transcript_id, _| {
-        transcript_cache_regions
-            .get(transcript_id)
-            .is_some_and(|regions| regions.iter().any(|region| active_regions.contains(region)))
-    });
+    persisted_transcripts.retain(|region, _| active_regions.contains(region));
 }
 
 fn select_buffer_local_transcripts(
@@ -6965,7 +6980,7 @@ fn build_buffer_local_transcripts(
 fn build_stateful_buffer_local_transcripts(
     transcripts: &[TranscriptFeature],
     transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
-    persisted_transcripts: &mut HashMap<String, TranscriptFeature>,
+    persisted_transcripts: &mut PersistedBufferTranscripts,
     buffer_batches: &[RecordBatch],
     chrom: &str,
     min_start: i64,
@@ -6975,11 +6990,7 @@ fn build_stateful_buffer_local_transcripts(
 ) -> Result<Vec<TranscriptFeature>> {
     let active_regions =
         collect_buffer_cache_regions(buffer_batches, upstream_distance, downstream_distance)?;
-    prune_persisted_buffer_transcripts(
-        persisted_transcripts,
-        transcript_cache_regions,
-        &active_regions,
-    );
+    prune_persisted_buffer_transcripts(persisted_transcripts, &active_regions);
 
     let mut buffer_transcripts = select_buffer_local_transcripts(
         transcripts,
@@ -7002,7 +7013,12 @@ fn build_stateful_buffer_local_transcripts(
     //   mutates transcript objects in place
     //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L246-L310>
     for tx in &mut buffer_transcripts {
-        if let Some(persisted) = persisted_transcripts.get(&tx.transcript_id) {
+        let persisted = active_regions.iter().find_map(|region| {
+            persisted_transcripts
+                .get(region)
+                .and_then(|by_transcript| by_transcript.get(&tx.transcript_id))
+        });
+        if let Some(persisted) = persisted {
             *tx = persisted.clone();
         }
     }
@@ -7010,7 +7026,17 @@ fn build_stateful_buffer_local_transcripts(
     apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
 
     for tx in &buffer_transcripts {
-        persisted_transcripts.insert(tx.transcript_id.clone(), tx.clone());
+        if let Some(regions) = transcript_cache_regions.get(&tx.transcript_id) {
+            for region in regions
+                .iter()
+                .filter(|region| active_regions.contains(*region))
+            {
+                persisted_transcripts
+                    .entry(region.clone())
+                    .or_default()
+                    .insert(tx.transcript_id.clone(), tx.clone());
+            }
+        }
     }
 
     Ok(buffer_transcripts)
@@ -8548,9 +8574,26 @@ mod tests {
         assert_eq!(parse_cdna_position_start("35+2"), Some(35));
         assert_eq!(refseq_misalignment_offset(&tx, 35), Some(1));
         assert_eq!(refseq_misalignment_offset(&tx, 5), None);
+        assert_eq!(refseq_misalignment_offset(&tx, 10), Some(3));
 
         tx.transcript_id = "NR_000001".to_string();
         assert_eq!(refseq_misalignment_offset(&tx, 35), None);
+    }
+
+    #[test]
+    fn test_cdna_seq_has_explicit_three_prime_utr_ignores_phase_padding_only() {
+        let mut tx = make_selection_tx("ENST_PHASE.1", Some("Ensembl"));
+        tx.cdna_coding_end = Some(473);
+        tx.cdna_seq = Some(format!("N{}", "A".repeat(473)));
+        assert!(!cdna_seq_has_explicit_three_prime_utr(&tx));
+    }
+
+    #[test]
+    fn test_cdna_seq_has_explicit_three_prime_utr_detects_real_utr() {
+        let mut tx = make_selection_tx("ENST_UTR.1", Some("Ensembl"));
+        tx.cdna_coding_end = Some(473);
+        tx.cdna_seq = Some(format!("N{}TTAA", "A".repeat(473)));
+        assert!(cdna_seq_has_explicit_three_prime_utr(&tx));
     }
 
     #[test]
@@ -8941,6 +8984,74 @@ mod tests {
         .unwrap();
         assert_eq!(second_scoped.len(), 1);
         assert_eq!(second_scoped[0].transcript_id, "XR_REGION1");
+        assert_eq!(second_scoped[0].gene_hgnc_id, None);
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_do_not_carry_same_transcript_across_regions() {
+        let mut tx_donor = make_tx(
+            "ENST_DONOR",
+            Some("ENSG00000181143"),
+            Some("MUC16"),
+            Some("HGNC"),
+            Some("HGNC:15582"),
+        );
+        tx_donor.chrom = "chr19".to_string();
+        tx_donor.start = 8_848_844;
+        tx_donor.end = 9_010_390;
+
+        let mut tx_recipient = make_tx(
+            "NM_001414686.1",
+            Some("94025"),
+            Some("MUC16"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr19".to_string();
+        tx_recipient.start = 8_848_844;
+        tx_recipient.end = 9_065_751;
+
+        let transcripts = vec![tx_donor, tx_recipient];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        let first_buffer = vec![make_buffer_batch("chr19", 8_900_000, 8_900_000)];
+        let first_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &first_buffer,
+            "chr19",
+            8_900_000,
+            8_900_000,
+            50,
+            50,
+        )
+        .unwrap();
+        let first_recipient = first_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "NM_001414686.1")
+            .unwrap();
+        assert_eq!(first_recipient.gene_hgnc_id.as_deref(), Some("HGNC:15582"));
+
+        let second_buffer = vec![make_buffer_batch("chr19", 9_058_432, 9_058_432)];
+        let second_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &second_buffer,
+            "chr19",
+            9_058_432,
+            9_058_432,
+            50,
+            50,
+        )
+        .unwrap();
+        assert_eq!(second_scoped.len(), 1);
+        assert_eq!(second_scoped[0].transcript_id, "NM_001414686.1");
         assert_eq!(second_scoped[0].gene_hgnc_id, None);
     }
 

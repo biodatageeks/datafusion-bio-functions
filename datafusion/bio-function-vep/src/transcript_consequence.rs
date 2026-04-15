@@ -5390,6 +5390,8 @@ pub(crate) fn unshifted_cdna_bounds_for_hgvs_shift(
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1631-L1677>
 /// - Ensembl VEP `format_coords()`
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159>
+/// - Ensembl Variation `BaseTranscriptVariation::cdna_start()` / `cdna_end()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L785-L865>
 fn compute_cdna_position(
     variant: &VariantInput,
     tx: &TranscriptFeature,
@@ -5415,39 +5417,11 @@ fn compute_cdna_position(
         return None;
     }
     let cdna_position = if is_ins {
-        let a = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start.saturating_sub(1));
-        let b = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start);
-        match (a, b) {
-            (Some(a), Some(b)) => {
-                let lo = a.min(b);
-                let hi = a.max(b);
-                Some(format!("{lo}-{hi}"))
-            }
-            // Insertion at exon boundary: one flanking position is intronic.
-            // The two cDNA positions are always adjacent, so infer the missing
-            // one from the known one, accounting for strand direction.
-            (None, Some(b)) => {
-                let other = if tx.strand >= 0 {
-                    b.saturating_sub(1)
-                } else {
-                    b + 1
-                };
-                let lo = b.min(other);
-                let hi = b.max(other);
-                Some(format!("{lo}-{hi}"))
-            }
-            (Some(a), None) => {
-                let other = if tx.strand >= 0 {
-                    a + 1
-                } else {
-                    a.saturating_sub(1)
-                };
-                let lo = a.min(other);
-                let hi = a.max(other);
-                Some(format!("{lo}-{hi}"))
-            }
-            (None, None) => None,
-        }
+        genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start)
+            .or_else(|| {
+                genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start.saturating_sub(1))
+            })
+            .map(|position| position.to_string())
     } else {
         let start_cdna = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start);
         let end_cdna = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.end);
@@ -8861,7 +8835,7 @@ mod tests {
 
     #[test]
     fn compute_cdna_position_insertion_within_exon() {
-        // Insertion within a single exon → range "a-b"
+        // VEP exposes insertions through a single cDNA anchor coordinate.
         let t = tx(
             "tx1",
             "22",
@@ -8876,9 +8850,7 @@ mod tests {
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 150, 150, "-", "ACG");
         let pos = compute_cdna_position(&v, &t, &refs);
-        assert!(pos.is_some());
-        let s = pos.unwrap();
-        assert!(s.contains('-'), "Insertion cDNA should be a range: {s}");
+        assert_eq!(pos, Some("51".to_string()));
     }
 
     #[test]
@@ -8898,15 +8870,7 @@ mod tests {
         let exons = vec![exon("tx1", 1, 200, 300)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 200, 200, "-", "ACG");
-        let pos = compute_cdna_position(&v, &t, &refs);
-        assert!(
-            pos.is_some(),
-            "Insertion at exon left boundary should produce cDNA position"
-        );
-        let s = pos.unwrap();
-        assert!(s.contains('-'), "Should be a range: {s}");
-        // Should contain "1" since pos 200 is cDNA index 1
-        assert!(s.contains('1'), "Should reference cDNA position 1: {s}");
+        assert_eq!(compute_cdna_position(&v, &t, &refs), Some("1".to_string()));
     }
 
     #[test]
@@ -8926,16 +8890,9 @@ mod tests {
         let exons = vec![exon("tx1", 1, 100, 200)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 201, 201, "-", "ACG");
-        let pos = compute_cdna_position(&v, &t, &refs);
-        assert!(
-            pos.is_some(),
-            "Insertion at exon right boundary should produce cDNA position"
-        );
-        let s = pos.unwrap();
-        // pos 200 = cDNA index 101, inferred adjacent = 102
-        assert!(
-            s.contains("101"),
-            "Should reference last exonic cDNA position: {s}"
+        assert_eq!(
+            compute_cdna_position(&v, &t, &refs),
+            Some("101".to_string())
         );
     }
 
@@ -8956,10 +8913,9 @@ mod tests {
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         // Insertion at pos 200: left=199 (intronic), right=200 (exonic)
         let v = var("22", 200, 200, "-", "ACG");
-        let pos = compute_cdna_position(&v, &t, &refs);
-        assert!(
-            pos.is_some(),
-            "Insertion at exon boundary on minus strand should produce cDNA position"
+        assert_eq!(
+            compute_cdna_position(&v, &t, &refs),
+            Some("101".to_string())
         );
     }
 
@@ -11812,6 +11768,50 @@ mod tests {
             c
         );
         assert!(!c.synonymous);
+    }
+
+    #[test]
+    fn negative_strand_terminal_stop_snv_classifies_stop_lost_with_phase_padding() {
+        let mut t = tx(
+            "ENST00000609196",
+            "1",
+            147629652,
+            147659001,
+            -1,
+            "protein_coding",
+            Some(147631053),
+            Some(147659001),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(473);
+        t.cdna_seq = Some("NCCCGTTGTTTGCTGGCTGGGCTTTTCCAGTGTCAGAAAGAAGGACCCATCATCATCCACACTGATGAAGCAGATTCAGAAGTCTTGTATCCCAACTACCAAAGCTGCTGGAGCCTGAGGCAGAGAACCAGAGGCCGGAGGCAGACTGCCTCTTTACAGCCAGGAATCTCAGAGGATTTGAAAAAGGTGAAGGACAGGATGGGCATTGACAGTAGTGATAAAGTGGACTTCTTCATCCTCCTGGACAACGTGGCTGCCGAGCAGGCACACAACCTCCCAAGCTGCCCCATGCTGAAGAGATTTGCAAGGATGATCGAACAGAGAGCTGTGGACACATCCTTGTACATACTGCCCAAGGAAGACAGGGAAAGTCTTCAGATGGCAGTAGGCCCATTCCTCCACATCCTAGAGAGCAACCTGCTGAAAGCCATGGACTCTGCCACTGCCCCCGACAAGATCAGGACTTGCAGGTAG".to_string());
+        let exons = vec![
+            exon("ENST00000609196", 1, 147658960, 147659001),
+            exon("ENST00000609196", 2, 147655161, 147655248),
+            exon("ENST00000609196", 3, 147654194, 147654326),
+            exon("ENST00000609196", 4, 147652449, 147652549),
+            exon("ENST00000609196", 5, 147650143, 147650238),
+            exon("ENST00000609196", 6, 147629652, 147631065),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let tr = translation(
+            "ENST00000609196",
+            Some(473),
+            Some(157),
+            None,
+            Some(
+                "NCCCGTTGTTTGCTGGCTGGGCTTTTCCAGTGTCAGAAAGAAGGACCCATCATCATCCACACTGATGAAGCAGATTCAGAAGTCTTGTATCCCAACTACCAAAGCTGCTGGAGCCTGAGGCAGAGAACCAGAGGCCGGAGGCAGACTGCCTCTTTACAGCCAGGAATCTCAGAGGATTTGAAAAAGGTGAAGGACAGGATGGGCATTGACAGTAGTGATAAAGTGGACTTCTTCATCCTCCTGGACAACGTGGCTGCCGAGCAGGCACACAACCTCCCAAGCTGCCCCATGCTGAAGAGATTTGCAAGGATGATCGAACAGAGAGCTGTGGACACATCCTTGTACATACTGCCCAAGGAAGACAGGGAAAGTCTTCAGATGGCAGTAGGCCCATTCCTCCACATCCTAGAGAGCAACCTGCTGAAAGCCATGGACTCTGCCACTGCCCCCGACAAGATCAGGACTTGCAGGTAG",
+            ),
+        );
+        let v = var("1", 147631053, 147631053, "C", "G");
+
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v).unwrap();
+
+        assert!(c.stop_lost, "Expected stop_lost, got {c:?}");
+        assert_eq!(c.cds_position_start, Some(474));
+        assert_eq!(c.protein_position_start, Some(158));
+        assert_eq!(c.amino_acids.as_deref(), Some("*/Y"));
+        assert_eq!(c.codons.as_deref(), Some("taG/taC"));
     }
 
     // ── Issue #90 sub-pattern A: deletion stop_retained with shifted index ──
