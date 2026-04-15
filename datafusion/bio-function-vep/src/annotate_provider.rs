@@ -1238,6 +1238,7 @@ struct TranscriptRawMetadata {
     gene_hgnc_id_native: Option<String>,
     refseq_match: Option<String>,
     refseq_edits: Vec<RefSeqEdit>,
+    cdna_mapper_segments: Vec<TranscriptCdnaMapperSegment>,
     spliced_seq: Option<String>,
     five_prime_utr_seq: Option<String>,
     three_prime_utr_seq: Option<String>,
@@ -2498,6 +2499,7 @@ impl AnnotateProvider {
                     gene_hgnc_id_native: raw_gene_hgnc_id_native,
                     refseq_match,
                     refseq_edits,
+                    cdna_mapper_segments: raw_cdna_mapper_segments,
                     spliced_seq: raw_spliced_seq,
                     five_prime_utr_seq,
                     three_prime_utr_seq,
@@ -2506,6 +2508,11 @@ impl AnnotateProvider {
                     is_gencode_basic,
                     is_gencode_primary,
                 } = raw_metadata;
+                let cdna_mapper_segments = if cdna_mapper_segments.is_empty() {
+                    raw_cdna_mapper_segments
+                } else {
+                    cdna_mapper_segments
+                };
                 // Ensembl release/115 computes alternate CDS from the live
                 // transcript object's `_translateable_seq()` / 3'UTR rather
                 // than reconstructing from genomic exons when that state is
@@ -5200,6 +5207,91 @@ fn parse_refseq_edit_attribute(attribute: &Value) -> Option<RefSeqEdit> {
     })
 }
 
+fn parse_raw_cdna_mapper_segments(vef_cache: Option<&Value>) -> Vec<TranscriptCdnaMapperSegment> {
+    let Some(pairs) = vef_cache
+        .and_then(|cache| cache.get("mapper"))
+        .map(json_unwrap_value)
+        .and_then(|mapper| mapper.get("exon_coord_mapper"))
+        .map(json_unwrap_value)
+        .and_then(|mapper| mapper.get("_pair_cdna"))
+        .map(json_unwrap_value)
+        .and_then(|pairs| pairs.get("CDNA"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut segments = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        let pair = json_unwrap_value(pair);
+        let Some(from) = pair.get("from").map(json_unwrap_value) else {
+            continue;
+        };
+        let Some(to) = pair.get("to").map(json_unwrap_value) else {
+            continue;
+        };
+        let Some(ori) = pair
+            .get("ori")
+            .and_then(Value::as_i64)
+            .and_then(|v| i8::try_from(v).ok())
+        else {
+            continue;
+        };
+        let Some(cdna_start) = from
+            .get("start")
+            .and_then(Value::as_i64)
+            .and_then(|v| usize::try_from(v).ok())
+        else {
+            continue;
+        };
+        let Some(cdna_end) = from
+            .get("end")
+            .and_then(Value::as_i64)
+            .and_then(|v| usize::try_from(v).ok())
+        else {
+            continue;
+        };
+        let Some(genomic_start) = to.get("start").and_then(Value::as_i64) else {
+            continue;
+        };
+        let Some(genomic_end) = to.get("end").and_then(Value::as_i64) else {
+            continue;
+        };
+        segments.push(TranscriptCdnaMapperSegment {
+            genomic_start,
+            genomic_end,
+            cdna_start,
+            cdna_end,
+            ori,
+        });
+    }
+    segments.sort_by_key(|segment| {
+        (
+            segment.genomic_start,
+            segment.genomic_end,
+            segment.cdna_start,
+        )
+    });
+    // Ensembl TranscriptMapper can encode transcript-only insertions or other
+    // complex gap semantics as multiple adjacent genomic pairs with cDNA jumps.
+    // Our current fallback only replays simple monotonic pair mappings; if the
+    // serialized mapper contains an internal cDNA discontinuity across
+    // contiguous genomic bases, keep using the exon-based fallback until we
+    // implement full Mapper gap semantics.
+    // Traceability:
+    // - Ensembl `Bio::EnsEMBL::Mapper` stores both Pair and Gap units
+    // - VEP reuses the live TranscriptMapper via `genomic2cdna`
+    //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L478-L492
+    for window in segments.windows(2) {
+        let prev = &window[0];
+        let next = &window[1];
+        if next.genomic_start == prev.genomic_end + 1 && next.cdna_start != prev.cdna_end + 1 {
+            return Vec::new();
+        }
+    }
+    segments
+}
+
 fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata {
     let Ok(root) = serde_json::from_str::<Value>(raw_object_json) else {
         return TranscriptRawMetadata::default();
@@ -5218,6 +5310,7 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
         .get("_source_cache")
         .and_then(Value::as_str)
         .and_then(normalize_source_label);
+    let cdna_mapper_segments = parse_raw_cdna_mapper_segments(vef_cache);
     let gene_hgnc_id_native = tx
         .get("_gene_hgnc_id")
         .or_else(|| tx.get("gene_hgnc_id"))
@@ -5278,6 +5371,7 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
         gene_hgnc_id_native,
         refseq_match: (!refseq_match_codes.is_empty()).then(|| refseq_match_codes.join("&")),
         refseq_edits,
+        cdna_mapper_segments,
         spliced_seq,
         five_prime_utr_seq,
         three_prime_utr_seq,
@@ -8673,6 +8767,100 @@ mod tests {
         assert_eq!(metadata.three_prime_utr_seq.as_deref(), Some("GGGTTT"));
         assert_eq!(metadata.translateable_seq.as_deref(), Some("ATGGCC"));
         assert_eq!(metadata.spliced_seq.as_deref(), Some("AAACCCATGGCCGGGTTT"));
+    }
+
+    #[test]
+    fn test_parse_transcript_raw_metadata_reads_nested_cdna_mapper_segments() {
+        let raw = r#"{
+          "__class":"Bio::EnsEMBL::Transcript",
+          "__value":{
+            "_variation_effect_feature_cache":{
+              "mapper":{
+                "__class":"Bio::EnsEMBL::TranscriptMapper",
+                "__value":{
+                  "exon_coord_mapper":{
+                    "__class":"Bio::EnsEMBL::Mapper",
+                    "__value":{
+                      "_pair_cdna":{
+                        "CDNA":[
+                          {
+                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":1,"end":10,"id":"cdna"}},
+                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":101,"end":110,"id":"genome"}},
+                            "ori":1
+                          },
+                          {
+                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":11,"end":20,"id":"cdna"}},
+                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":201,"end":210,"id":"genome"}},
+                            "ori":1
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }"#;
+
+        let metadata = parse_transcript_raw_metadata(raw);
+        assert_eq!(
+            metadata.cdna_mapper_segments,
+            vec![
+                TranscriptCdnaMapperSegment {
+                    genomic_start: 101,
+                    genomic_end: 110,
+                    cdna_start: 1,
+                    cdna_end: 10,
+                    ori: 1,
+                },
+                TranscriptCdnaMapperSegment {
+                    genomic_start: 201,
+                    genomic_end: 210,
+                    cdna_start: 11,
+                    cdna_end: 20,
+                    ori: 1,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_transcript_raw_metadata_drops_complex_gapped_cdna_mapper_segments() {
+        let raw = r#"{
+          "__class":"Bio::EnsEMBL::Transcript",
+          "__value":{
+            "_variation_effect_feature_cache":{
+              "mapper":{
+                "__class":"Bio::EnsEMBL::TranscriptMapper",
+                "__value":{
+                  "exon_coord_mapper":{
+                    "__class":"Bio::EnsEMBL::Mapper",
+                    "__value":{
+                      "_pair_cdna":{
+                        "CDNA":[
+                          {
+                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":1,"end":10,"id":"cdna"}},
+                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":101,"end":110,"id":"genome"}},
+                            "ori":1
+                          },
+                          {
+                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":17,"end":20,"id":"cdna"}},
+                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":111,"end":114,"id":"genome"}},
+                            "ori":1
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }"#;
+
+        let metadata = parse_transcript_raw_metadata(raw);
+        assert!(metadata.cdna_mapper_segments.is_empty());
     }
 
     #[test]

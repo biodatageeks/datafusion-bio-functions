@@ -20,9 +20,11 @@ pub struct ProteinHgvsData {
     pub alt_peptide: String,
     pub ref_translation: String,
     pub alt_translation: String,
+    pub alt_translation_extension: Option<String>,
     pub frameshift: bool,
     pub start_lost: bool,
     pub stop_lost: bool,
+    pub native_refseq: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -933,11 +935,23 @@ fn hgvs_cdna_position_from_genomic(
     tx_exons: &[&ExonFeature],
     genomic_pos: i64,
 ) -> Option<String> {
-    let cdna_position = raw_cdna_position_from_genomic(tx, tx_exons, genomic_pos)?;
+    let mut cdna_position = raw_cdna_position_from_genomic(tx, tx_exons, genomic_pos)?;
     let has_intron_offset = cdna_position
         .char_indices()
         .skip(1)
         .any(|(_, ch)| matches!(ch, '+' | '-'));
+    if has_intron_offset {
+        if let Some(exon_geometry_position) =
+            native_refseq_pre_coding_intronic_exon_geometry_position(
+                tx,
+                tx_exons,
+                genomic_pos,
+                &cdna_position,
+            )
+        {
+            cdna_position = exon_geometry_position;
+        }
+    }
     let cdna_position = if has_intron_offset {
         cdna_position
     } else {
@@ -984,6 +998,39 @@ fn shift_to_hgvs_coding_coordinates(
         coord_text?,
         intron_offset.unwrap_or_default()
     ))
+}
+
+fn native_refseq_hgvs_intronic_anchor_uses_post_gap_numbering(tx: &TranscriptFeature) -> bool {
+    tx.source.as_deref() == Some("RefSeq")
+        && matches!(
+            tx.transcript_id.as_bytes().get(..2),
+            Some(b"NM") | Some(b"NR") | Some(b"XM") | Some(b"XR")
+        )
+}
+
+fn native_refseq_pre_coding_intronic_exon_geometry_position(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    genomic_pos: i64,
+    mapper_position: &str,
+) -> Option<String> {
+    if !native_refseq_hgvs_intronic_anchor_uses_post_gap_numbering(tx)
+        || tx.cdna_mapper_segments.is_empty()
+    {
+        return None;
+    }
+    let (mapper_coord, mapper_offset) = split_hgvs_coord(mapper_position)?;
+
+    let mut exon_geometry_tx = tx.clone();
+    exon_geometry_tx.cdna_mapper_segments.clear();
+    let exon_geometry_position =
+        raw_cdna_position_from_genomic(&exon_geometry_tx, tx_exons, genomic_pos)?;
+    let (exon_coord, exon_offset) = split_hgvs_coord(&exon_geometry_position)?;
+    if exon_offset == mapper_offset && exon_coord > mapper_coord {
+        Some(exon_geometry_position)
+    } else {
+        None
+    }
 }
 
 fn split_hgvs_coord(value: &str) -> Option<(i64, Option<String>)> {
@@ -1112,6 +1159,13 @@ pub fn format_hgvsp(
         if shift_hgvs && matches!(notation.kind.as_str(), "ins" | "del") {
             shift_peptides_post_var(&mut notation, &protein.ref_translation);
         }
+        if shift_hgvs && notation.kind == "ins" {
+            rewrite_shifted_insertion_at_homopolymer_edge(
+                &mut notation,
+                &protein.ref_translation,
+                protein.native_refseq,
+            );
+        }
         if notation.kind == "ins"
             && check_for_peptide_duplication(&mut notation, &protein.ref_translation)
         {
@@ -1124,6 +1178,11 @@ pub fn format_hgvsp(
                 Some(2),
             )?;
         }
+        maybe_rewrite_refseq_dup_at_repeat_boundary(
+            &mut notation,
+            &protein.ref_translation,
+            protein.native_refseq,
+        );
     }
 
     format_hgvsp_notation(&protein_id, &notation, protein)
@@ -1321,6 +1380,115 @@ fn shift_peptides_post_var(notation: &mut ProteinHgvsNotation, ref_translation: 
 }
 
 /// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
+///   right-shifts insertions before final protein formatting.
+/// - In the native RefSeq HTT repeat tract, VEP's final shifted HGVSp becomes
+///   `p.Pro39delinsGlnGlnGlnGln` even though the underlying consequence layer
+///   still reports `Amino_acids=-/QQQQQ`.
+///   This means the final HGVSp rewrite happens after peptide 3' shifting and
+///   before duplication formatting, at the edge of the homopolymer run.
+fn rewrite_shifted_insertion_at_homopolymer_edge(
+    notation: &mut ProteinHgvsNotation,
+    ref_translation: &str,
+    native_refseq: bool,
+) {
+    if !native_refseq {
+        return;
+    }
+    if notation.kind != "ins" || notation.alt_allele.len() < 2 {
+        return;
+    }
+    let mut chars = notation.alt_allele.chars();
+    let Some(repeat_aa) = chars.next() else {
+        return;
+    };
+    if !chars.all(|aa| aa == repeat_aa) {
+        return;
+    }
+
+    let left_flank = peptide_char(ref_translation, notation.start);
+    let right_flank = peptide_char(ref_translation, notation.end);
+    if left_flank != Some(repeat_aa) {
+        return;
+    }
+    let Some(right_flank) = right_flank else {
+        return;
+    };
+    if right_flank == repeat_aa {
+        return;
+    }
+
+    let replacement: String = notation.alt_allele.chars().skip(1).collect();
+    if replacement.is_empty() {
+        return;
+    }
+
+    notation.kind = "delins".to_string();
+    notation.start = notation.end;
+    notation.ref_allele = right_flank.to_string();
+    notation.alt_allele = replacement;
+    notation.original_ref = notation.ref_allele.clone();
+    notation.preseq.clear();
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_check_peptides_post_var()`
+///   right-shifts insertion peptides through the repeat tract before final
+///   protein formatting.
+/// - For native RefSeq HTT repeat insertions, VEP's final HGVSp is not `dup`
+///   after that shift; it is clipped at the repeat boundary to a single-residue
+///   `delins` on the following non-repeat amino acid:
+///   `NP_002102.4:p.Pro39delinsGlnGlnGlnGln`.
+///
+/// The repeated peptide block remains detectable as a duplication in our local
+/// peptide view, but the final HGVS output must be rewritten at the boundary
+/// residue for native RefSeq proteins (`NP_*/XP_*`).
+fn maybe_rewrite_refseq_dup_at_repeat_boundary(
+    notation: &mut ProteinHgvsNotation,
+    ref_translation: &str,
+    native_refseq: bool,
+) {
+    if notation.kind != "dup" {
+        return;
+    }
+    if !native_refseq {
+        return;
+    }
+    if notation.alt_allele.len() < 2 {
+        return;
+    }
+
+    let mut chars = notation.alt_allele.chars();
+    let Some(repeat_aa) = chars.next() else {
+        return;
+    };
+    if !chars.all(|aa| aa == repeat_aa) {
+        return;
+    }
+
+    let Some(boundary_ref) = peptide_char(ref_translation, notation.end.saturating_add(1)) else {
+        return;
+    };
+    if boundary_ref == repeat_aa {
+        return;
+    }
+
+    let replacement: String =
+        std::iter::repeat_n(repeat_aa, notation.alt_allele.len() - 1).collect();
+    if replacement.is_empty() {
+        return;
+    }
+
+    notation.kind = "delins".to_string();
+    notation.start = notation.end.saturating_sub(1);
+    notation.end = notation.start;
+    notation.ref_allele = boundary_ref.to_string();
+    notation.alt_allele = replacement;
+    notation.original_ref = notation.ref_allele.clone();
+    notation.preseq.clear();
+}
+
+/// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_check_for_peptide_duplication()`
 ///   builds upstream from `substr($reference_trans, 0, $start - 1)` + preseq, then
 ///   tests whether the alt peptide matches the upstream at `start - alt_len - 1`
@@ -1417,7 +1585,11 @@ fn stop_loss_extra_aa(
     ref_var_pos: usize,
     frameshift: bool,
 ) -> Option<usize> {
-    let stop_idx = protein.alt_translation.find('*')?;
+    let alt_translation = protein
+        .alt_translation_extension
+        .as_deref()
+        .unwrap_or(&protein.alt_translation);
+    let stop_idx = alt_translation.find('*')?;
     let extra = if frameshift {
         stop_idx.saturating_add(1).checked_sub(ref_var_pos)?
     } else {
@@ -1851,9 +2023,11 @@ mod tests {
             alt_peptide: "A".to_string(),
             ref_translation: "MA*".to_string(),
             alt_translation: "MA*".to_string(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -1871,9 +2045,11 @@ mod tests {
             alt_peptide: "X".to_string(),
             ref_translation: "XRVM".to_string(),
             alt_translation: "XRVM".to_string(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -1891,9 +2067,11 @@ mod tests {
             alt_peptide: "L".to_string(),
             ref_translation: "MA*".to_string(),
             alt_translation: "LA*".to_string(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: true,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -1911,9 +2089,11 @@ mod tests {
             alt_peptide: "Q".to_string(),
             ref_translation: "MKKKK".to_string(),
             alt_translation: "MKQW*".to_string(),
+            alt_translation_extension: None,
             frameshift: true,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -1933,9 +2113,11 @@ mod tests {
             alt_peptide: "Q".to_string(),
             ref_translation: "MA*".to_string(),
             alt_translation: "MAQW*".to_string(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: true,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -1955,9 +2137,11 @@ mod tests {
             alt_peptide: "Q".to_string(),
             ref_translation: "MA*".to_string(),
             alt_translation: "MAQ*".to_string(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: true,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -1975,9 +2159,11 @@ mod tests {
             alt_peptide: "A".to_string(),
             ref_translation: "MAA*".to_string(),
             alt_translation: "MAAA*".to_string(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -1995,9 +2181,11 @@ mod tests {
             alt_peptide: "EE".to_string(),
             ref_translation: "M".repeat(24) + "EEEEK",
             alt_translation: "M".repeat(24) + "EEEEK",
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -2015,9 +2203,11 @@ mod tests {
             alt_peptide: "Q".to_string(),
             ref_translation: "MAV*".to_string(),
             alt_translation: "MAQV*".to_string(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -2035,9 +2225,11 @@ mod tests {
             alt_peptide: "-".to_string(),
             ref_translation: "MAA*".to_string(),
             alt_translation: "MA*".to_string(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, false),
@@ -2731,6 +2923,57 @@ mod tests {
     }
 
     #[test]
+    fn test_hgvs_cdna_position_native_refseq_pre_coding_intronic_anchor_uses_post_gap_numbering() {
+        let mut tx = make_transcript("protein_coding", 1, Some(39044831), Some(39126233));
+        tx.transcript_id = "NM_001007075.2".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 39044831;
+        tx.end = 39126233;
+        tx.cdna_coding_start = Some(360);
+        tx.cdna_coding_end = Some(2489);
+        tx.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 39044831,
+                genomic_end: 39044966,
+                cdna_start: 1,
+                cdna_end: 136,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 39044968,
+                genomic_end: 39045096,
+                cdna_start: 137,
+                cdna_end: 265,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 39062559,
+                genomic_end: 39063035,
+                cdna_start: 266,
+                cdna_end: 742,
+                ori: 1,
+            },
+        ];
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 39044831,
+            end: 39045096,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 39062559,
+            end: 39063035,
+        };
+        let exons = [&exon1, &exon2];
+        assert_eq!(
+            hgvs_cdna_position_from_genomic(&tx, &exons, 39045450),
+            Some("-94+354".to_string())
+        );
+    }
+
+    #[test]
     fn test_shift_to_hgvs_coding_coordinates_prefers_cached_cdna_coding_bounds() {
         let mut tx = make_transcript("protein_coding", 1, Some(100), Some(108));
         tx.cdna_coding_start = Some(21);
@@ -2828,9 +3071,11 @@ mod tests {
             alt_peptide: "Q".into(),
             ref_translation: "MKKR*".into(),
             alt_translation: "MKKRQW*".into(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: true,
+            native_refseq: false,
         };
         assert_eq!(stop_loss_extra_aa(&protein, 4, false), Some(2));
     }
@@ -2849,9 +3094,11 @@ mod tests {
             alt_peptide: "Q".into(),
             ref_translation: "M*KR*".into(),
             alt_translation: "MQKRW*".into(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: true,
+            native_refseq: false,
         };
         assert_eq!(stop_loss_extra_aa(&protein, 1, false), Some(1));
     }
@@ -2866,9 +3113,11 @@ mod tests {
             alt_peptide: "Q".into(),
             ref_translation: "MA*".into(),
             alt_translation: "MAQ".into(), // no *
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: true,
+            native_refseq: false,
         };
         assert_eq!(stop_loss_extra_aa(&protein, 2, false), None);
     }
@@ -2889,9 +3138,11 @@ mod tests {
             alt_peptide: "Q".into(),
             ref_translation: "MAK*".into(),
             alt_translation: "MAQ*".into(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: true,
+            native_refseq: false,
         };
         assert_eq!(stop_loss_extra_aa(&protein, 2, false), None);
     }
@@ -2909,9 +3160,11 @@ mod tests {
             alt_peptide: "Q".into(),
             ref_translation: "MKKK*".into(),
             alt_translation: "MKQW*".into(),
+            alt_translation_extension: None,
             frameshift: true,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(stop_loss_extra_aa(&protein, 3, true), Some(2));
     }
@@ -3162,9 +3415,11 @@ mod tests {
             alt_peptide: "Q".into(),
             ref_translation: "MAK*".into(),
             alt_translation: "MQW*".into(),
+            alt_translation_extension: None,
             frameshift: true,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         resolve_frameshift_hgvs(&mut notation, &protein);
         assert_eq!(notation.kind, "fs");
@@ -3191,9 +3446,11 @@ mod tests {
             alt_peptide: "A".into(),
             ref_translation: "MA*".into(),
             alt_translation: "MA*".into(),
+            alt_translation_extension: None,
             frameshift: true,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         resolve_frameshift_hgvs(&mut notation, &protein);
         assert_eq!(notation.kind, "=");
@@ -3280,9 +3537,11 @@ mod tests {
             alt_peptide: "-".into(),
             ref_translation: "MA*".into(),
             alt_translation: "M*".into(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -3300,9 +3559,11 @@ mod tests {
             alt_peptide: "-".into(),
             ref_translation: "MAK*".into(),
             alt_translation: "M*".into(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -3320,9 +3581,11 @@ mod tests {
             alt_peptide: "V".into(),
             ref_translation: "MA*".into(),
             alt_translation: "MV*".into(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -3340,9 +3603,11 @@ mod tests {
             alt_peptide: "VW".into(),
             ref_translation: "MAK*".into(),
             alt_translation: "MVWK*".into(),
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -3360,9 +3625,11 @@ mod tests {
             alt_peptide: "*".into(),
             ref_translation: "MAK*".into(),
             alt_translation: "M*".into(),
+            alt_translation_extension: None,
             frameshift: true,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         assert_eq!(
             format_hgvsp(&translation, &protein, true),
@@ -3546,14 +3813,63 @@ mod tests {
                 alt.insert_str(39, "QQP"); // insert QQP after position 39
                 alt
             },
+            alt_translation_extension: None,
             frameshift: false,
             start_lost: false,
             stop_lost: false,
+            native_refseq: false,
         };
         let result = format_hgvsp(&translation, &protein, true);
         // VEP: p.Gln39_Pro40insGlnGlnPro — NOT a dup
         let r = result.unwrap();
         assert!(r.contains("ins"), "Expected ins notation, got: {r}");
+    }
+
+    #[test]
+    fn peptide_dup_chr4_3074876_refseq_should_delins_not_dup() {
+        let mut notation = ProteinHgvsNotation {
+            start: 36,
+            end: 40,
+            ref_allele: String::new(),
+            alt_allele: "QQQQQ".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "dup".into(),
+        };
+        let ref_translation = "MATLEKLMKAFESLKSFQQQQQQQQQQQQQQQQQQQQQQQPPPPPPPPPPPQLP".to_string();
+
+        maybe_rewrite_refseq_dup_at_repeat_boundary(&mut notation, &ref_translation, true);
+
+        assert_eq!(notation.kind, "delins");
+        assert_eq!(notation.start, 39);
+        assert_eq!(notation.end, 39);
+        assert_eq!(notation.ref_allele, "P");
+        assert_eq!(notation.alt_allele, "QQQQ");
+    }
+
+    #[test]
+    fn peptide_dup_non_refseq_stays_dup() {
+        let mut notation = ProteinHgvsNotation {
+            start: 6,
+            end: 6,
+            ref_allele: String::new(),
+            alt_allele: "E".into(),
+            original_ref: String::new(),
+            preseq: String::new(),
+            kind: "ins".into(),
+        };
+        let ref_translation = "MAAAEEEEK".to_string();
+
+        rewrite_shifted_insertion_at_homopolymer_edge(&mut notation, &ref_translation, false);
+        assert_eq!(notation.kind, "ins");
+
+        assert!(check_for_peptide_duplication(
+            &mut notation,
+            &ref_translation
+        ));
+        assert_eq!(notation.kind, "dup");
+        assert_eq!(notation.start, 5);
+        assert_eq!(notation.end, 5);
     }
 
     // ── HGVSc dup boundary revert tests (issue #88 remaining) ──────────
