@@ -3705,6 +3705,11 @@ fn protein_hgvs_for_output(
     classify_coding_change(tx, tx_exons, tx_translation, &shifted_variant).and_then(|class| {
         let literal =
             literal_indel_protein_hgvs_data(tx, tx_exons, tx_translation, &shifted_variant, &class);
+        if let Some(protein) = class.protein_hgvs.as_ref() {
+            if protein.ref_peptide == protein.alt_peptide {
+                return Some(protein.clone());
+            }
+        }
         // When the shifted indel is synonymous or stop-retained, Ensembl's
         // final protein HGVS comes from the shifted peptide-allele view
         // produced by `_get_peptide_alleles()` / `_get_fs_peptides()`, which
@@ -4323,6 +4328,25 @@ fn classify_coding_change(
         &hgvs_new_aas,
         frameshift,
     );
+    if frameshift
+        && class.stop_retained
+        && first_codon < old_aas.len()
+        && first_codon < hgvs_new_aas.len()
+        && old_aas[first_codon] == '*'
+        && hgvs_new_aas[first_codon] == '*'
+    {
+        class.protein_hgvs = Some(crate::hgvs::ProteinHgvsData {
+            start: first_codon + 1,
+            end: first_codon + 1,
+            ref_peptide: "*".to_string(),
+            alt_peptide: "*".to_string(),
+            ref_translation: old_aas.iter().collect(),
+            alt_translation: hgvs_new_aas.iter().collect(),
+            frameshift: false,
+            start_lost: class.start_lost,
+            stop_lost: class.stop_lost,
+        });
+    }
     Some(class)
 }
 
