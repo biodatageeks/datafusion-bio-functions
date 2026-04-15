@@ -5392,6 +5392,11 @@ pub(crate) fn unshifted_cdna_bounds_for_hgvs_shift(
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Utils.pm#L141-L159>
 /// - Ensembl Variation `BaseTranscriptVariation::cdna_start()` / `cdna_end()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L785-L865>
+/// - Ensembl Variation `BaseTranscriptVariation::cdna_coords()`
+///   maps the variation feature start/end through `genomic2cdna` directly;
+///   RefSeq mismatch offsets are surfaced separately via `REFSEQ_OFFSET`
+///   rather than applied to `cDNA_position`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L478-L489>
 fn compute_cdna_position(
     variant: &VariantInput,
     tx: &TranscriptFeature,
@@ -5416,12 +5421,37 @@ fn compute_cdna_position(
     if !in_exon {
         return None;
     }
-    let cdna_position = if is_ins {
-        genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start)
-            .or_else(|| {
-                genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start.saturating_sub(1))
-            })
-            .map(|position| position.to_string())
+    if is_ins {
+        let a = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start.saturating_sub(1));
+        let b = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start);
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                let lo = a.min(b);
+                let hi = a.max(b);
+                Some(format!("{lo}-{hi}"))
+            }
+            (None, Some(b)) => {
+                let other = if tx.strand >= 0 {
+                    b.saturating_sub(1)
+                } else {
+                    b + 1
+                };
+                let lo = b.min(other);
+                let hi = b.max(other);
+                Some(format!("{lo}-{hi}"))
+            }
+            (Some(a), None) => {
+                let other = if tx.strand >= 0 {
+                    a + 1
+                } else {
+                    a.saturating_sub(1)
+                };
+                let lo = a.min(other);
+                let hi = a.max(other);
+                Some(format!("{lo}-{hi}"))
+            }
+            (None, None) => None,
+        }
     } else {
         let start_cdna = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.start);
         let end_cdna = genomic_to_cdna_index_for_transcript(tx, tx_exons, variant.end);
@@ -5452,9 +5482,7 @@ fn compute_cdna_position(
             }
             (None, None) => None,
         }
-    };
-    cdna_position
-        .map(|position| adjust_refseq_cdna_output_position(tx, &position).unwrap_or(position))
+    }
 }
 
 fn given_ref_for_output(variant: &VariantInput) -> Option<String> {
@@ -5660,29 +5688,6 @@ pub(crate) fn adjust_refseq_cdna_component(tx: &TranscriptFeature, value: &str) 
     let coord = coord_part.parse::<i64>().ok()?;
     let offset = refseq_misalignment_offset_for_cdna(tx, coord)?;
     Some(format!("{}{suffix}", coord + offset))
-}
-
-fn adjust_refseq_cdna_output_position(tx: &TranscriptFeature, value: &str) -> Option<String> {
-    if !tx.cdna_mapper_segments.is_empty() {
-        return None;
-    }
-    if let Some((left, right)) = value.split_once('-') {
-        if !left.is_empty()
-            && !right.is_empty()
-            && !left.contains('+')
-            && !right.contains('+')
-            && !right.contains('-')
-        {
-            let adjusted_left = adjust_refseq_cdna_component(tx, left);
-            let adjusted_right = adjust_refseq_cdna_component(tx, right);
-            if adjusted_left.is_some() || adjusted_right.is_some() {
-                let left = adjusted_left.unwrap_or_else(|| left.to_string());
-                let right = adjusted_right.unwrap_or_else(|| right.to_string());
-                return Some(format!("{left}-{right}"));
-            }
-        }
-    }
-    adjust_refseq_cdna_component(tx, value)
 }
 
 /// Compute FLAGS field from transcript attributes.
@@ -8835,7 +8840,7 @@ mod tests {
 
     #[test]
     fn compute_cdna_position_insertion_within_exon() {
-        // VEP exposes insertions through a single cDNA anchor coordinate.
+        // Insertion within a single exon -> adjacent cDNA range.
         let t = tx(
             "tx1",
             "22",
@@ -8850,7 +8855,7 @@ mod tests {
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 150, 150, "-", "ACG");
         let pos = compute_cdna_position(&v, &t, &refs);
-        assert_eq!(pos, Some("51".to_string()));
+        assert_eq!(pos, Some("50-51".to_string()));
     }
 
     #[test]
@@ -8870,7 +8875,10 @@ mod tests {
         let exons = vec![exon("tx1", 1, 200, 300)];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("22", 200, 200, "-", "ACG");
-        assert_eq!(compute_cdna_position(&v, &t, &refs), Some("1".to_string()));
+        assert_eq!(
+            compute_cdna_position(&v, &t, &refs),
+            Some("0-1".to_string())
+        );
     }
 
     #[test]
@@ -8892,7 +8900,7 @@ mod tests {
         let v = var("22", 201, 201, "-", "ACG");
         assert_eq!(
             compute_cdna_position(&v, &t, &refs),
-            Some("101".to_string())
+            Some("101-102".to_string())
         );
     }
 
@@ -8915,7 +8923,7 @@ mod tests {
         let v = var("22", 200, 200, "-", "ACG");
         assert_eq!(
             compute_cdna_position(&v, &t, &refs),
-            Some("101".to_string())
+            Some("101-102".to_string())
         );
     }
 
@@ -9047,7 +9055,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_cdna_position_applies_refseq_offset_without_mapper_segments() {
+    fn compute_cdna_position_preserves_raw_mapper_coordinate_without_refseq_offset() {
         let mut t = tx(
             "NM_OFFSET.1",
             "1",
@@ -9070,7 +9078,7 @@ mod tests {
 
         assert_eq!(
             compute_cdna_position(&v, &t, &refs),
-            Some("2842".to_string())
+            Some("2641".to_string())
         );
     }
 
