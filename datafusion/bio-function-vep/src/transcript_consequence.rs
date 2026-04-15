@@ -3355,12 +3355,34 @@ fn reference_translateable_seq_for_vep(
         .map(|seq| seq.bytes().take_while(|&b| b == b'N' || b == b'n').count())
         .unwrap_or(0);
 
-    let full_seq = tx.spliced_seq.as_deref().or(tx.cdna_seq.as_deref());
-    if let (Some(seq), Some(start), Some(end)) =
-        (full_seq, tx.cdna_coding_start, tx.cdna_coding_end)
-    {
+    if let (Some(seq), Some(start), Some(end)) = (
+        tx.spliced_seq.as_deref(),
+        tx.cdna_coding_start,
+        tx.cdna_coding_end,
+    ) {
         let start_idx = start.checked_sub(1)?;
         if start_idx < end && end <= seq.len() {
+            let mut mrna = String::with_capacity(leading_n_count + (end - start_idx));
+            mrna.extend(std::iter::repeat_n('N', leading_n_count));
+            mrna.push_str(&seq[start_idx..end].to_ascii_uppercase());
+            return Some(mrna);
+        }
+    }
+
+    // `cdna_seq` is only safe to slice when it really looks like full
+    // transcript cDNA. In merged caches many Ensembl rows store a CDS-like
+    // sequence here already aligned to `_translateable_seq()`, often including
+    // the leading phase Ns. Re-slicing those values by cdna_coding_start/end
+    // shifts the frame and regresses HGVSc/HGVSp/codon parity.
+    if let (Some(seq), Some(start), Some(end)) = (
+        tx.cdna_seq.as_deref(),
+        tx.cdna_coding_start,
+        tx.cdna_coding_end,
+    ) {
+        let start_idx = start.checked_sub(1)?;
+        let has_explicit_utr_context =
+            start_idx > 0 || end < seq.len().saturating_sub(leading_n_count);
+        if has_explicit_utr_context && start_idx < end && end <= seq.len() {
             let mut mrna = String::with_capacity(leading_n_count + (end - start_idx));
             mrna.extend(std::iter::repeat_n('N', leading_n_count));
             mrna.push_str(&seq[start_idx..end].to_ascii_uppercase());
@@ -11324,6 +11346,30 @@ mod tests {
         assert_eq!(
             reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
             Some("NATGGCCCTT")
+        );
+    }
+
+    #[test]
+    fn reference_translateable_seq_for_vep_avoids_reslicing_cds_like_cdna_seq() {
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(180),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(10);
+        t.cdna_seq = Some("NATGGCCCTTA".into());
+
+        let tr = translation("ENST0001", Some(10), Some(3), None, Some("NCCCCCCCCCC"));
+
+        assert_eq!(
+            reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
+            Some("NCCCCCCCCCC")
         );
     }
 
