@@ -3398,6 +3398,14 @@ fn reference_translateable_seq_for_vep(
         tx.cdna_coding_start,
         tx.cdna_coding_end,
     ) {
+        if let Some(translateable_seq) = translation
+            .and_then(|t| t.cds_sequence.as_deref())
+            .map(|seq| seq.to_ascii_uppercase())
+        {
+            if seq.eq_ignore_ascii_case(&translateable_seq) {
+                return Some(translateable_seq);
+            }
+        }
         let start_idx = start.checked_sub(1)?;
         let has_explicit_utr_context =
             start_idx > 0 || end < seq.len().saturating_sub(leading_n_count);
@@ -3695,8 +3703,21 @@ fn protein_hgvs_for_output(
     };
 
     classify_coding_change(tx, tx_exons, tx_translation, &shifted_variant).and_then(|class| {
-        literal_indel_protein_hgvs_data(tx, tx_exons, tx_translation, &shifted_variant, &class)
-            .or(class.protein_hgvs)
+        let literal =
+            literal_indel_protein_hgvs_data(tx, tx_exons, tx_translation, &shifted_variant, &class);
+        // When the shifted indel is synonymous or stop-retained, Ensembl's
+        // final protein HGVS comes from the shifted peptide-allele view
+        // produced by `_get_peptide_alleles()` / `_get_fs_peptides()`, which
+        // can legitimately collapse to `=` at the shifted position. Prefer
+        // the classification-derived HGVS payload in that case instead of the
+        // local insertion/dup reconstruction.
+        // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1684-L1749
+        // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2249-L2295
+        if class.synonymous || class.stop_retained {
+            class.protein_hgvs.or(literal)
+        } else {
+            literal.or(class.protein_hgvs)
+        }
     })
 }
 
@@ -11428,6 +11449,30 @@ mod tests {
     }
 
     #[test]
+    fn reference_translateable_seq_for_vep_avoids_reslicing_cdna_seq_when_it_matches_cds_cache() {
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(180),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(5);
+        t.cdna_seq = Some("ATGTGA".into());
+
+        let tr = translation("ENST0001", Some(6), Some(2), None, Some("ATGTGA"));
+
+        assert_eq!(
+            reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
+            Some("ATGTGA")
+        );
+    }
+
+    #[test]
     fn reference_translateable_seq_for_vep_prefers_cached_translateable_seq_when_raw_utr_present() {
         let mut t = tx(
             "ENST0001",
@@ -11450,6 +11495,33 @@ mod tests {
             reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
             Some("ATGGAT")
         );
+    }
+
+    #[test]
+    fn classify_coding_change_keeps_terminal_stop_base_when_cdna_seq_matches_cds_cache() {
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            1000,
+            1005,
+            1,
+            "nonsense_mediated_decay",
+            Some(1000),
+            Some(1005),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(5);
+        t.cdna_seq = Some("ATGTGA".into());
+        t.translation_stable_id = Some("ENSPT1".to_string());
+        let e = exon("ENST0001", 1, 1000, 1005);
+        let exons_ref: Vec<&ExonFeature> = vec![&e];
+        let tr = translation("ENST0001", Some(6), Some(2), None, Some("ATGTGA"));
+        let v = var("1", 1004, 1004, "G", "-");
+
+        let c = classify_coding_change(&t, &exons_ref, Some(&tr), &v).expect("classification");
+        assert_eq!(c.codons.as_deref(), Some("tGa/ta"));
+        assert_eq!(c.amino_acids.as_deref(), Some("*/X"));
+        assert!(c.stop_lost, "expected stop_lost, got: {:?}", c);
     }
 
     #[test]
