@@ -3362,9 +3362,12 @@ fn reference_translateable_seq_for_vep(
     ) {
         let start_idx = start.checked_sub(1)?;
         if start_idx < end && end <= seq.len() {
-            let mut mrna = String::with_capacity(leading_n_count + (end - start_idx));
-            mrna.extend(std::iter::repeat_n('N', leading_n_count));
-            mrna.push_str(&seq[start_idx..end].to_ascii_uppercase());
+            let slice = seq[start_idx..end].to_ascii_uppercase();
+            let existing_n_count = slice.bytes().take_while(|&b| b == b'N').count();
+            let prefix_n_count = leading_n_count.saturating_sub(existing_n_count);
+            let mut mrna = String::with_capacity(prefix_n_count + slice.len());
+            mrna.extend(std::iter::repeat_n('N', prefix_n_count));
+            mrna.push_str(&slice);
             return Some(mrna);
         }
     }
@@ -3383,9 +3386,12 @@ fn reference_translateable_seq_for_vep(
         let has_explicit_utr_context =
             start_idx > 0 || end < seq.len().saturating_sub(leading_n_count);
         if has_explicit_utr_context && start_idx < end && end <= seq.len() {
-            let mut mrna = String::with_capacity(leading_n_count + (end - start_idx));
-            mrna.extend(std::iter::repeat_n('N', leading_n_count));
-            mrna.push_str(&seq[start_idx..end].to_ascii_uppercase());
+            let slice = seq[start_idx..end].to_ascii_uppercase();
+            let existing_n_count = slice.bytes().take_while(|&b| b == b'N').count();
+            let prefix_n_count = leading_n_count.saturating_sub(existing_n_count);
+            let mut mrna = String::with_capacity(prefix_n_count + slice.len());
+            mrna.extend(std::iter::repeat_n('N', prefix_n_count));
+            mrna.push_str(&slice);
             return Some(mrna);
         }
     }
@@ -11346,6 +11352,30 @@ mod tests {
         assert_eq!(
             reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
             Some("NATGGCCCTT")
+        );
+    }
+
+    #[test]
+    fn reference_translateable_seq_for_vep_does_not_double_prefix_phase_ns() {
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(180),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(8);
+        t.spliced_seq = Some("NATGGCCAACCC".into());
+
+        let tr = translation("ENST0001", Some(8), Some(2), None, Some("NATGGCCA"));
+
+        assert_eq!(
+            reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
+            Some("NATGGCCA")
         );
     }
 
