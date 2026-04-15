@@ -1669,6 +1669,7 @@ mod tests {
             bam_edit_status: None,
             has_non_polya_rna_edit: false,
             spliced_seq: None,
+            three_prime_utr_seq: None,
             cdna_seq: None,
             version: Some(1),
             cds_start_nf: false,
