@@ -3326,6 +3326,22 @@ fn local_peptide_from_codon_window(codon: &[u8]) -> Option<String> {
     Some(peptide)
 }
 
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_trim_incomplete_codon()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2463-L2469>
+/// - Ensembl Variation `TranscriptVariationAllele::_get_alternate_cds()`
+///   trims the alternate CDS before appending 3'UTR and translating for
+///   frameshift / stop-loss HGVS
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2470-L2499>
+fn translated_alt_protein_for_hgvs(tx: &TranscriptFeature, mutated_cds: &[u8]) -> Option<String> {
+    let keep_len = mutated_cds.len() - (mutated_cds.len() % 3);
+    let mut alt_cds = mutated_cds[..keep_len].to_vec();
+    if let Some(utr) = three_prime_utr_seq(tx) {
+        alt_cds.extend_from_slice(utr.as_bytes());
+    }
+    translate_protein_from_cds(&alt_cds).map(|aas| aas.into_iter().collect())
+}
+
 /// Build the local protein HGVS peptide alleles using the same codon-window
 /// extraction Ensembl uses in `TranscriptVariationAllele::codon()` and
 /// `TranscriptVariationAllele::peptide()`.
@@ -3505,7 +3521,8 @@ fn literal_indel_protein_hgvs_data(
         ref_peptide,
         alt_peptide,
         ref_translation: old_aas.iter().collect(),
-        alt_translation: new_aas.iter().collect(),
+        alt_translation: translated_alt_protein_for_hgvs(tx, &mutated)
+            .unwrap_or_else(|| new_aas.iter().collect()),
         frameshift: !ref_len.abs_diff(alt_len).is_multiple_of(3),
         start_lost: class.start_lost,
         stop_lost: class.stop_lost,
@@ -4176,11 +4193,9 @@ fn classify_coding_change(
     // - Ensembl Variation `TranscriptVariationAllele::_stop_loss_extra_AA()`
     //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2406-L2455
     let hgvs_new_aas = if class.stop_lost || frameshift {
-        let mut extended = mutated.clone();
-        if let Some(utr) = three_prime_utr_seq(tx) {
-            extended.extend_from_slice(utr.as_bytes());
-        }
-        translate_protein_from_cds(&extended).unwrap_or_else(|| new_aas.clone())
+        translated_alt_protein_for_hgvs(tx, &mutated)
+            .map(|seq| seq.chars().collect::<Vec<_>>())
+            .unwrap_or_else(|| new_aas.clone())
     } else {
         new_aas.clone()
     };
@@ -4601,11 +4616,9 @@ fn classify_insertion(
 
     // Extend with 3' UTR for HGVS stop-loss/frameshift extension distance.
     let hgvs_new_aas = if class.stop_lost || frameshift {
-        let mut extended = mutated.clone();
-        if let Some(utr) = three_prime_utr_seq(tx) {
-            extended.extend_from_slice(utr.as_bytes());
-        }
-        translate_protein_from_cds(&extended).unwrap_or_else(|| new_aas.clone())
+        translated_alt_protein_for_hgvs(tx, &mutated)
+            .map(|seq| seq.chars().collect::<Vec<_>>())
+            .unwrap_or_else(|| new_aas.clone())
     } else {
         new_aas.clone()
     };
@@ -11242,6 +11255,29 @@ mod tests {
         t.cdna_coding_end = None;
         t.spliced_seq = Some("ATGATGATGCCC".into());
         assert!(three_prime_utr_seq(&t).is_none());
+    }
+
+    #[test]
+    fn translated_alt_protein_for_hgvs_appends_utr_after_trimming_incomplete_codon() {
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(180),
+        );
+        t.cdna_coding_end = Some(7);
+        // CDS = ATGAAAT, UTR = TAA. Ensembl trims the incomplete trailing
+        // CDS base first (ATGAAA), then appends UTR and translates MK*.
+        t.spliced_seq = Some("ATGAAATTAA".into());
+
+        assert_eq!(
+            translated_alt_protein_for_hgvs(&t, b"ATGAAAT").as_deref(),
+            Some("MK*")
+        );
     }
 
     // ---------------------------------------------------------------
