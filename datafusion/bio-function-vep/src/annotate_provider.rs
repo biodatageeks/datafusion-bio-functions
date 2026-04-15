@@ -2411,6 +2411,8 @@ impl AnnotateProvider {
             let has_non_polya_rna_edit_idx = schema.index_of("has_non_polya_rna_edit").ok();
             let spliced_seq_idx = schema.index_of("spliced_seq").ok();
             let translateable_seq_idx = schema.index_of("translateable_seq").ok();
+            let five_prime_utr_seq_idx = schema.index_of("five_prime_utr_seq").ok();
+            let three_prime_utr_seq_idx = schema.index_of("three_prime_utr_seq").ok();
             let flags_str_idx = schema.index_of("flags_str").ok();
             let cdna_mapper_segments_idx = schema.index_of("cdna_mapper_segments").ok();
             // Batch 1 columns.
@@ -2512,6 +2514,12 @@ impl AnnotateProvider {
                 let translateable_seq = translateable_seq_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                     .or(raw_translateable_seq);
+                let five_prime_utr_seq = five_prime_utr_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or(five_prime_utr_seq);
+                let three_prime_utr_seq = three_prime_utr_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or(three_prime_utr_seq);
                 if let Some(seq) = translateable_seq.as_ref() {
                     translateable_seq_by_tx.insert(transcript_id.clone(), seq.clone());
                 }
