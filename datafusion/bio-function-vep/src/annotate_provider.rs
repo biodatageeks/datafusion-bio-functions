@@ -1238,6 +1238,10 @@ struct TranscriptRawMetadata {
     gene_hgnc_id_native: Option<String>,
     refseq_match: Option<String>,
     refseq_edits: Vec<RefSeqEdit>,
+    spliced_seq: Option<String>,
+    five_prime_utr_seq: Option<String>,
+    three_prime_utr_seq: Option<String>,
+    translateable_seq: Option<String>,
     flags_str: Option<String>,
     is_gencode_basic: bool,
     is_gencode_primary: bool,
@@ -2477,13 +2481,6 @@ impl AnnotateProvider {
                 let cds_end_nf = cds_end_nf_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                     .unwrap_or(false);
-                // Read from promoted top-level parquet columns
-                // (biodatageeks/datafusion-bio-formats#125, #126).
-                if let Some(translateable_seq) =
-                    translateable_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                {
-                    translateable_seq_by_tx.insert(transcript_id.clone(), translateable_seq);
-                }
                 let cdna_mapper_segments = cdna_mapper_segments_idx
                     .map(|idx| {
                         cdna_mapper_segments_from_list_column(batch.column(idx).as_ref(), row)
@@ -2499,10 +2496,25 @@ impl AnnotateProvider {
                     gene_hgnc_id_native: raw_gene_hgnc_id_native,
                     refseq_match,
                     refseq_edits,
+                    spliced_seq: raw_spliced_seq,
+                    five_prime_utr_seq,
+                    three_prime_utr_seq,
+                    translateable_seq: raw_translateable_seq,
                     flags_str: raw_flags_str,
                     is_gencode_basic,
                     is_gencode_primary,
                 } = raw_metadata;
+                // Ensembl release/115 computes alternate CDS from the live
+                // transcript object's `_translateable_seq()` / 3'UTR rather
+                // than reconstructing from genomic exons when that state is
+                // already cached on the transcript object.
+                // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2470-L2481
+                let translateable_seq = translateable_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or(raw_translateable_seq);
+                if let Some(seq) = translateable_seq.as_ref() {
+                    translateable_seq_by_tx.insert(transcript_id.clone(), seq.clone());
+                }
                 let flags_str = flags_str_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                     .or(raw_flags_str)
@@ -2530,10 +2542,21 @@ impl AnnotateProvider {
                 let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
                     .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
                     .unwrap_or(false);
-                let spliced_seq =
-                    spliced_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let cdna_seq =
                     cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let spliced_seq = spliced_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or(raw_spliced_seq)
+                    .or_else(|| {
+                        synthesize_spliced_seq(
+                            five_prime_utr_seq.as_deref(),
+                            translateable_seq.as_deref(),
+                            three_prime_utr_seq.as_deref(),
+                            cdna_coding_start,
+                            cdna_coding_end,
+                            cdna_seq.as_deref(),
+                        )
+                    });
                 let version = version_idx
                     .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
                     .and_then(|v| i32::try_from(v).ok());
@@ -5088,6 +5111,54 @@ fn json_unwrap_value(value: &Value) -> &Value {
     value.get("__value").unwrap_or(value)
 }
 
+fn json_extract_seq(value: &Value) -> Option<String> {
+    let value = json_unwrap_value(value);
+    value
+        .get("seq")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("primary_seq")
+                .map(json_unwrap_value)
+                .and_then(|seq| seq.get("seq"))
+                .and_then(Value::as_str)
+        })
+        .map(|seq| seq.to_ascii_uppercase())
+}
+
+fn synthesize_spliced_seq(
+    five_prime_utr_seq: Option<&str>,
+    translateable_seq: Option<&str>,
+    three_prime_utr_seq: Option<&str>,
+    cdna_coding_start: Option<usize>,
+    cdna_coding_end: Option<usize>,
+    cdna_seq: Option<&str>,
+) -> Option<String> {
+    let translateable_seq = translateable_seq.or_else(|| {
+        let cdna_seq = cdna_seq?;
+        let start = cdna_coding_start?.checked_sub(1)?;
+        let end = cdna_coding_end?;
+        if start >= end || end > cdna_seq.len() {
+            return None;
+        }
+        Some(&cdna_seq[start..end])
+    })?;
+
+    let mut spliced_seq = String::with_capacity(
+        five_prime_utr_seq.map_or(0, str::len)
+            + translateable_seq.len()
+            + three_prime_utr_seq.map_or(0, str::len),
+    );
+    if let Some(seq) = five_prime_utr_seq {
+        spliced_seq.push_str(seq);
+    }
+    spliced_seq.push_str(translateable_seq);
+    if let Some(seq) = three_prime_utr_seq {
+        spliced_seq.push_str(seq);
+    }
+    (!spliced_seq.is_empty()).then_some(spliced_seq.to_ascii_uppercase())
+}
+
 fn push_unique_string(out: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
     if seen.insert(value.to_string()) {
         out.push(value.to_string());
@@ -5138,6 +5209,17 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
         .or_else(|| tx.get("gene_hgnc_id"))
         .and_then(Value::as_str)
         .map(str::to_string);
+    let spliced_seq = tx.get("spliced_seq").and_then(json_extract_seq);
+    let five_prime_utr_seq = tx
+        .get("_variation_effect_feature_cache")
+        .map(json_unwrap_value)
+        .and_then(|cache| cache.get("five_prime_utr"))
+        .and_then(json_extract_seq);
+    let three_prime_utr_seq = tx.get("three_prime_utr").and_then(json_extract_seq);
+    let translateable_seq = tx.get("translateable_seq").and_then(|value| match value {
+        Value::String(seq) => Some(seq.to_ascii_uppercase()),
+        _ => json_extract_seq(value),
+    });
 
     let mut refseq_match_codes = Vec::new();
     let mut seen_refseq_match_codes = HashSet::new();
@@ -5178,6 +5260,10 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
         gene_hgnc_id_native,
         refseq_match: (!refseq_match_codes.is_empty()).then(|| refseq_match_codes.join("&")),
         refseq_edits,
+        spliced_seq,
+        five_prime_utr_seq,
+        three_prime_utr_seq,
+        translateable_seq,
         flags_str: (!flags.is_empty()).then(|| flags.join("&")),
         is_gencode_basic,
         is_gencode_primary,
@@ -5636,6 +5722,7 @@ fn hydrate_refseq_translation_cds_from_reference<R>(
     transcripts: &[TranscriptFeature],
     exons: &[ExonFeature],
     translations: &mut [TranslationFeature],
+    translateable_seq_by_tx: &HashMap<String, String>,
     input_variant_intervals: &HashMap<String, Vec<(i64, i64)>>,
 ) -> Result<HashSet<String>>
 where
@@ -5662,6 +5749,14 @@ where
             continue;
         }
         if !is_refseq_transcript_for_hydration(tx) {
+            continue;
+        }
+        // VEP keeps transcript-local sequence state on the Transcript object.
+        // If we already have `_translateable_seq`, do not overwrite it with a
+        // genomic reconstruction here.
+        // https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Transcript.pm
+        // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2470-L2481
+        if translateable_seq_by_tx.contains_key(&tx.transcript_id) {
             continue;
         }
         let chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
@@ -6622,6 +6717,7 @@ fn hydrate_window(
         transcripts,
         exons,
         translations,
+        translateable_seq_by_tx,
         &input_intervals,
     )?;
     // Merge newly hydrated IDs into cumulative set.
@@ -8483,6 +8579,52 @@ mod tests {
 
         let metadata = parse_transcript_raw_metadata(raw);
         assert_eq!(metadata.gene_hgnc_id_native.as_deref(), Some("HGNC:1100"));
+    }
+
+    #[test]
+    fn test_parse_transcript_raw_metadata_reads_nested_transcript_sequences() {
+        let raw = r#"{
+          "__class":"Bio::EnsEMBL::Transcript",
+          "__value":{
+            "_variation_effect_feature_cache":{
+              "five_prime_utr":{
+                "__class":"Bio::Seq",
+                "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"aaaccc"}}}
+              }
+            },
+            "three_prime_utr":{
+              "__class":"Bio::Seq",
+              "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"gggttt"}}}
+            },
+            "translateable_seq":"atggcc",
+            "spliced_seq":{
+              "__class":"Bio::Seq",
+              "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"aaacccatggccgggttt"}}}
+            }
+          }
+        }"#;
+
+        let metadata = parse_transcript_raw_metadata(raw);
+        assert_eq!(metadata.five_prime_utr_seq.as_deref(), Some("AAACCC"));
+        assert_eq!(metadata.three_prime_utr_seq.as_deref(), Some("GGGTTT"));
+        assert_eq!(metadata.translateable_seq.as_deref(), Some("ATGGCC"));
+        assert_eq!(metadata.spliced_seq.as_deref(), Some("AAACCCATGGCCGGGTTT"));
+    }
+
+    #[test]
+    fn test_synthesize_spliced_seq_rebuilds_full_transcript_from_utr_and_cds() {
+        assert_eq!(
+            synthesize_spliced_seq(
+                Some("AAACCC"),
+                Some("ATGGCC"),
+                Some("GGGTTT"),
+                Some(7),
+                Some(12),
+                None,
+            )
+            .as_deref(),
+            Some("AAACCCATGGCCGGGTTT")
+        );
     }
 
     #[test]

@@ -5435,9 +5435,21 @@ fn shifted_deleted_ref_for_used_ref(shift: &HgvsGenomicShift) -> Option<String> 
 }
 
 fn uses_refseq_transcript_reference(tx: &TranscriptFeature) -> bool {
-    tx.bam_edit_status
-        .as_deref()
-        .is_some_and(|status| status.eq_ignore_ascii_case("ok"))
+    let is_refseq = tx.source.as_deref() == Some("RefSeq")
+        || matches!(
+            tx.transcript_id.as_bytes().get(..2),
+            Some(b"NM") | Some(b"NR") | Some(b"XM") | Some(b"XR")
+        );
+    // Ensembl release/115 uses the live transcript object's mapper / sequence
+    // state for RefSeq HGVS and cDNA coordinate work; `bam_edit_status` is not
+    // the only signal that this state exists.
+    // https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Transcript.pm
+    // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
+    is_refseq
+        && (tx.bam_edit_status.is_some()
+            || !tx.refseq_edits.is_empty()
+            || !tx.cdna_mapper_segments.is_empty()
+            || tx.spliced_seq.is_some())
 }
 
 fn shifted_deletion_uses_protein_hgvs_reference(
@@ -9190,6 +9202,38 @@ mod tests {
         assert_eq!(
             used_ref_for_transcript_variant(&v, &t, &refs, None, false).as_deref(),
             Some("A")
+        );
+    }
+
+    #[test]
+    fn used_ref_uses_refseq_mapper_cache_even_when_bam_edit_failed() {
+        let mut t = tx(
+            "NM_FAILED.1",
+            "7",
+            100,
+            108,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(108),
+        );
+        t.source = Some("RefSeq".to_string());
+        t.bam_edit_status = Some("failed".to_string());
+        t.spliced_seq = Some("ACGATGTAA".to_string());
+        t.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 100,
+            genomic_end: 108,
+            cdna_start: 1,
+            cdna_end: 9,
+            ori: 1,
+        }];
+        let exons = vec![exon("NM_FAILED.1", 1, 100, 108)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let v = var("7", 101, 101, "T", "C");
+
+        assert_eq!(
+            used_ref_for_transcript_variant(&v, &t, &refs, None, false).as_deref(),
+            Some("C")
         );
     }
 
