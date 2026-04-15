@@ -178,8 +178,13 @@ pub struct TranscriptFeature {
     pub has_non_polya_rna_edit: bool,
     /// Edited transcript sequence cached on `_variation_effect_feature_cache`.
     pub spliced_seq: Option<String>,
+    /// Raw 5' UTR cached on the VEP transcript object.
+    pub five_prime_utr_seq: Option<String>,
     /// Raw 3' UTR cached on the VEP transcript object.
     pub three_prime_utr_seq: Option<String>,
+    /// Cached transcript `_translateable_seq()` value from the VEP transcript
+    /// object, when present.
+    pub translateable_seq: Option<String>,
     /// Full transcript cDNA sequence from the `cdna_seq` parquet column.
     /// Used as fallback for 3' UTR extraction when `spliced_seq` is absent.
     pub cdna_seq: Option<String>,
@@ -3348,31 +3353,61 @@ fn local_peptide_from_codon_window(codon: &[u8]) -> Option<String> {
 /// - Ensembl Variation `BaseTranscriptVariation::_translateable_seq()`
 ///   caches that transcript-derived value for HGVS/consequence work
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1083-L1092>
+fn cached_translateable_seq_for_vep(
+    tx: &TranscriptFeature,
+    translation: Option<&TranslationFeature>,
+) -> Option<String> {
+    tx.translateable_seq
+        .as_deref()
+        .or_else(|| translation.and_then(|t| t.cds_sequence.as_deref()))
+        .map(|seq| seq.to_ascii_uppercase())
+}
+
+fn cdna_seq_has_full_transcript_context_for_vep(tx: &TranscriptFeature, seq: &str) -> bool {
+    let Some(end) = tx.cdna_coding_end else {
+        return false;
+    };
+    if end > seq.len() {
+        return false;
+    }
+    let start_idx = tx
+        .cdna_coding_start
+        .and_then(|start| start.checked_sub(1))
+        .unwrap_or(0);
+    if start_idx > 0 {
+        return true;
+    }
+    let trailing_len = seq.len().saturating_sub(end);
+    trailing_len > 1
+}
+
+fn transcript_mrna_seq_for_vep(tx: &TranscriptFeature) -> Option<String> {
+    if let Some(seq) = tx.spliced_seq.as_deref() {
+        return Some(seq.to_ascii_uppercase());
+    }
+    let seq = tx.cdna_seq.as_deref()?;
+    if cdna_seq_has_full_transcript_context_for_vep(tx, seq) {
+        return Some(seq.to_ascii_uppercase());
+    }
+    None
+}
+
 fn reference_translateable_seq_for_vep(
     tx: &TranscriptFeature,
     translation: Option<&TranslationFeature>,
 ) -> Option<String> {
-    // When VEP has cached `_translateable_seq` / `_three_prime_utr` on the
-    // transcript variation object, consequence and HGVS code paths consume
-    // that cached CDS directly rather than re-slicing transcript cDNA.
-    // The merged parquet translation row is our closest replay of that
-    // `_translateable_seq` state, so prefer it whenever the transcript also
-    // carries explicit 3' UTR cache state.
-    // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1083-L1092
-    // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L1106-L1116
-    if tx.three_prime_utr_seq.is_some() {
-        if let Some(seq) = translation.and_then(|t| t.cds_sequence.as_deref()) {
-            return Some(seq.to_ascii_uppercase());
-        }
+    if let Some(seq) = tx.translateable_seq.as_deref() {
+        return Some(seq.to_ascii_uppercase());
     }
 
-    let leading_n_count = translation
-        .and_then(|t| t.cds_sequence.as_deref())
+    let cached_translateable_seq = cached_translateable_seq_for_vep(tx, translation);
+    let leading_n_count = cached_translateable_seq
+        .as_deref()
         .map(|seq| seq.bytes().take_while(|&b| b == b'N' || b == b'n').count())
         .unwrap_or(0);
 
     if let (Some(seq), Some(start), Some(end)) = (
-        tx.spliced_seq.as_deref(),
+        transcript_mrna_seq_for_vep(tx),
         tx.cdna_coding_start,
         tx.cdna_coding_end,
     ) {
@@ -3387,42 +3422,7 @@ fn reference_translateable_seq_for_vep(
             return Some(mrna);
         }
     }
-
-    // `cdna_seq` is only safe to slice when it really looks like full
-    // transcript cDNA. In merged caches many Ensembl rows store a CDS-like
-    // sequence here already aligned to `_translateable_seq()`, often including
-    // the leading phase Ns. Re-slicing those values by cdna_coding_start/end
-    // shifts the frame and regresses HGVSc/HGVSp/codon parity.
-    if let (Some(seq), Some(start), Some(end)) = (
-        tx.cdna_seq.as_deref(),
-        tx.cdna_coding_start,
-        tx.cdna_coding_end,
-    ) {
-        if let Some(translateable_seq) = translation
-            .and_then(|t| t.cds_sequence.as_deref())
-            .map(|seq| seq.to_ascii_uppercase())
-        {
-            if seq.eq_ignore_ascii_case(&translateable_seq) {
-                return Some(translateable_seq);
-            }
-        }
-        let start_idx = start.checked_sub(1)?;
-        let has_explicit_utr_context =
-            start_idx > 0 || end < seq.len().saturating_sub(leading_n_count);
-        if has_explicit_utr_context && start_idx < end && end <= seq.len() {
-            let slice = seq[start_idx..end].to_ascii_uppercase();
-            let existing_n_count = slice.bytes().take_while(|&b| b == b'N').count();
-            let prefix_n_count = leading_n_count.saturating_sub(existing_n_count);
-            let mut mrna = String::with_capacity(prefix_n_count + slice.len());
-            mrna.extend(std::iter::repeat_n('N', prefix_n_count));
-            mrna.push_str(&slice);
-            return Some(mrna);
-        }
-    }
-
-    translation
-        .and_then(|t| t.cds_sequence.as_deref())
-        .map(|seq| seq.to_ascii_uppercase())
+    cached_translateable_seq
 }
 
 /// Traceability:
@@ -6148,8 +6148,7 @@ fn three_prime_utr_seq(tx: &TranscriptFeature) -> Option<String> {
         return (!utr.is_empty()).then(|| utr.to_ascii_uppercase());
     }
     let coding_end = tx.cdna_coding_end?;
-    // Try spliced_seq first (for edited RefSeq transcripts), then cdna_seq.
-    let full_seq = tx.spliced_seq.as_deref().or(tx.cdna_seq.as_deref())?;
+    let full_seq = transcript_mrna_seq_for_vep(tx)?;
     if coding_end >= full_seq.len() {
         return None;
     }
@@ -6241,7 +6240,9 @@ mod tests {
             bam_edit_status: None,
             has_non_polya_rna_edit: false,
             spliced_seq: None,
+            five_prime_utr_seq: None,
             three_prime_utr_seq: None,
+            translateable_seq: None,
             cdna_seq: None,
             version: None,
             cds_start_nf: false,
@@ -11360,6 +11361,25 @@ mod tests {
     }
 
     #[test]
+    fn three_prime_utr_seq_does_not_infer_utr_from_cds_like_cdna_seq() {
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(180),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(5);
+        t.cdna_seq = Some("ATGTGA".into());
+        t.translateable_seq = Some("ATGTGA".into());
+        assert!(three_prime_utr_seq(&t).is_none());
+    }
+
+    #[test]
     fn three_prime_utr_seq_returns_none_when_no_coding_end() {
         let mut t = tx(
             "ENST0001",
@@ -11473,7 +11493,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_translateable_seq_for_vep_prefers_cached_translateable_seq_when_raw_utr_present() {
+    fn reference_translateable_seq_for_vep_derives_from_transcript_mrna_when_only_utr_is_cached() {
         let mut t = tx(
             "ENST0001",
             "1",
@@ -11490,6 +11510,32 @@ mod tests {
         t.three_prime_utr_seq = Some("TTTCCC".into());
 
         let tr = translation("ENST0001", Some(6), Some(2), None, Some("ATGGAT"));
+
+        assert_eq!(
+            reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),
+            Some("ATGGA")
+        );
+    }
+
+    #[test]
+    fn reference_translateable_seq_for_vep_prefers_transcript_cached_translateable_seq() {
+        let mut t = tx(
+            "ENST0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(110),
+            Some(180),
+        );
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(5);
+        t.spliced_seq = Some("ATGGATTTTCCC".into());
+        t.three_prime_utr_seq = Some("TTTCCC".into());
+        t.translateable_seq = Some("ATGGAT".into());
+
+        let tr = translation("ENST0001", Some(6), Some(2), None, Some("CCCCCC"));
 
         assert_eq!(
             reference_translateable_seq_for_vep(&t, Some(&tr)).as_deref(),

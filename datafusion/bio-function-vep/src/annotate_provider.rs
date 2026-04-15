@@ -2624,7 +2624,9 @@ impl AnnotateProvider {
                     bam_edit_status,
                     has_non_polya_rna_edit,
                     spliced_seq,
+                    five_prime_utr_seq,
                     three_prime_utr_seq,
+                    translateable_seq,
                     cdna_seq,
                     version,
                     cds_start_nf,
@@ -5203,6 +5205,9 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
         return TranscriptRawMetadata::default();
     };
     let tx = json_unwrap_value(&root);
+    let vef_cache = tx
+        .get("_variation_effect_feature_cache")
+        .map(json_unwrap_value);
     let display_xref_id = tx
         .get("display_xref")
         .map(json_unwrap_value)
@@ -5219,16 +5224,20 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
         .and_then(Value::as_str)
         .map(str::to_string);
     let spliced_seq = tx.get("spliced_seq").and_then(json_extract_seq);
-    let five_prime_utr_seq = tx
-        .get("_variation_effect_feature_cache")
-        .map(json_unwrap_value)
+    let five_prime_utr_seq = vef_cache
         .and_then(|cache| cache.get("five_prime_utr"))
         .and_then(json_extract_seq);
-    let three_prime_utr_seq = tx.get("three_prime_utr").and_then(json_extract_seq);
-    let translateable_seq = tx.get("translateable_seq").and_then(|value| match value {
-        Value::String(seq) => Some(seq.to_ascii_uppercase()),
-        _ => json_extract_seq(value),
-    });
+    let three_prime_utr_seq = tx
+        .get("three_prime_utr")
+        .or_else(|| vef_cache.and_then(|cache| cache.get("three_prime_utr")))
+        .and_then(json_extract_seq);
+    let translateable_seq = tx
+        .get("translateable_seq")
+        .or_else(|| vef_cache.and_then(|cache| cache.get("translateable_seq")))
+        .and_then(|value| match value {
+            Value::String(seq) => Some(seq.to_ascii_uppercase()),
+            _ => json_extract_seq(value),
+        });
 
     let mut refseq_match_codes = Vec::new();
     let mut seen_refseq_match_codes = HashSet::new();
@@ -8395,7 +8404,9 @@ mod tests {
             bam_edit_status: None,
             has_non_polya_rna_edit: false,
             spliced_seq: None,
+            five_prime_utr_seq: None,
             three_prime_utr_seq: None,
+            translateable_seq: None,
             cdna_seq: None,
             version: None,
             cds_start_nf: false,
@@ -8643,13 +8654,13 @@ mod tests {
               "five_prime_utr":{
                 "__class":"Bio::Seq",
                 "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"aaaccc"}}}
-              }
+              },
+              "three_prime_utr":{
+                "__class":"Bio::Seq",
+                "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"gggttt"}}}
+              },
+              "translateable_seq":"atggcc"
             },
-            "three_prime_utr":{
-              "__class":"Bio::Seq",
-              "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"gggttt"}}}
-            },
-            "translateable_seq":"atggcc",
             "spliced_seq":{
               "__class":"Bio::Seq",
               "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"aaacccatggccgggttt"}}}
