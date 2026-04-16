@@ -1188,6 +1188,41 @@ pub fn format_hgvsp(
     format_hgvsp_notation(&protein_id, &notation, protein)
 }
 
+pub(crate) fn shifted_insertion_would_format_as_dup(protein: &ProteinHgvsData) -> bool {
+    if protein.frameshift {
+        return false;
+    }
+
+    let mut notation = ProteinHgvsNotation::from_context(protein);
+    if notation.ref_allele != notation.alt_allele {
+        clip_protein_alleles(&mut notation);
+    } else {
+        notation.kind = "=".to_string();
+    }
+    if notation.kind.is_empty() {
+        notation.kind = protein_event_type(&notation.ref_allele, &notation.alt_allele, false);
+    }
+    if notation.kind != "ins" {
+        return false;
+    }
+
+    shift_peptides_post_var(&mut notation, &protein.ref_translation);
+    rewrite_shifted_insertion_at_homopolymer_edge(
+        &mut notation,
+        &protein.ref_translation,
+        protein.native_refseq,
+    );
+    if notation.kind == "ins" {
+        let _ = check_for_peptide_duplication(&mut notation, &protein.ref_translation);
+    }
+    maybe_rewrite_refseq_dup_at_repeat_boundary(
+        &mut notation,
+        &protein.ref_translation,
+        protein.native_refseq,
+    );
+    notation.kind == "dup"
+}
+
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2054-L2089>
@@ -3785,6 +3820,25 @@ mod tests {
         assert_eq!(notation.kind, "dup");
         assert_eq!(notation.start, 5);
         assert_eq!(notation.end, 5);
+    }
+
+    #[test]
+    fn shifted_insertion_would_format_as_dup_for_g_to_eg_repeat_case() {
+        let protein = ProteinHgvsData {
+            start: 7,
+            end: 7,
+            ref_peptide: "G".into(),
+            alt_peptide: "EG".into(),
+            ref_translation: "MAAEEEGK".into(),
+            alt_translation: "MAAEEEEGK".into(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+
+        assert!(shifted_insertion_would_format_as_dup(&protein));
     }
 
     #[test]

@@ -3802,12 +3802,9 @@ fn literal_shifted_indel_protein_hgvs_data(
         if cds_idx > reference_cds_seq.len() {
             return None;
         }
-        (
-            cds_idx,
-            cds_idx.saturating_sub(1),
-            0,
-            shift.shifted_output_allele.replace('-', ""),
-        )
+        let rotated_alt =
+            shifted_output_allele_for_transcript(tx.strand, &shift.shifted_output_allele)?;
+        (cds_idx, cds_idx.saturating_sub(1), 0, rotated_alt)
     } else if is_shift_deletion {
         let genomic_positions = genomic_range(shifted_start, shifted_end)?;
         if genomic_positions.is_empty() {
@@ -3915,6 +3912,15 @@ fn literal_shifted_indel_protein_hgvs_data(
     })
 }
 
+fn shifted_output_allele_for_transcript(strand: i8, shifted_output_allele: &str) -> Option<String> {
+    let shifted_output_allele = shifted_output_allele.replace('-', "");
+    if strand >= 0 {
+        Some(shifted_output_allele)
+    } else {
+        reverse_complement(&shifted_output_allele).map(|seq| seq.to_ascii_uppercase())
+    }
+}
+
 fn original_terms_allow_protein_hgvs(terms: &[SoTerm]) -> bool {
     terms.iter().any(|term| {
         matches!(
@@ -3934,26 +3940,6 @@ fn original_terms_allow_protein_hgvs(terms: &[SoTerm]) -> bool {
                 | SoTerm::CodingSequenceVariant
         )
     })
-}
-
-/// Traceability:
-/// - Ensembl Variation `TranscriptVariationAllele::_get_hgvs_peptides()`
-///   runs `_check_peptides_post_var()` and then `_check_for_peptide_duplication()`.
-/// - For plain Ensembl tandem peptide duplications, the original consequence
-///   peptide payload already carries the duplication candidate (`K/KK`,
-///   `QQ/QQQQ`, ...), and VEP ultimately formats that as `dup` rather than
-///   forcing a shifted delins view.
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2054-L2089>
-fn plain_tandem_duplication_candidate(protein: &crate::hgvs::ProteinHgvsData) -> bool {
-    if protein.frameshift || protein.native_refseq {
-        return false;
-    }
-    let ref_peptide = protein.ref_peptide.as_str();
-    let alt_peptide = protein.alt_peptide.as_str();
-    if ref_peptide.is_empty() || ref_peptide == "-" || alt_peptide.len() != ref_peptide.len() * 2 {
-        return false;
-    }
-    alt_peptide == format!("{ref_peptide}{ref_peptide}")
 }
 
 /// Traceability:
@@ -3994,7 +3980,13 @@ fn protein_hgvs_for_output(
     }
 
     if let Some(original) = fallback {
-        if is_insertion && plain_tandem_duplication_candidate(original) {
+        if is_insertion && original.ref_peptide == "*" && original.alt_peptide == "*" {
+            return None;
+        }
+        if is_insertion && !original.frameshift && !original.native_refseq {
+            return Some(original.clone());
+        }
+        if is_insertion && crate::hgvs::shifted_insertion_would_format_as_dup(original) {
             return Some(original.clone());
         }
         if !original.frameshift {
@@ -12292,6 +12284,76 @@ mod tests {
         assert_eq!(shifted.end, 3074935);
         assert_eq!(shifted.ref_allele, "CAGCCAG");
         assert_eq!(shifted.alt_allele, "CAGCCAGGCAGCAGCAGCAGCA");
+    }
+
+    #[test]
+    fn shifted_output_allele_for_transcript_uses_transcript_orientation() {
+        assert_eq!(
+            shifted_output_allele_for_transcript(1, "CCT"),
+            Some("CCT".to_string())
+        );
+        assert_eq!(
+            shifted_output_allele_for_transcript(-1, "CCT"),
+            Some("AGG".to_string())
+        );
+        assert_eq!(
+            shifted_output_allele_for_transcript(-1, "-"),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn protein_hgvs_for_output_suppresses_star_equal_insertions() {
+        let t = tx(
+            "ENSTSTARINS0001",
+            "1",
+            100,
+            200,
+            1,
+            "protein_coding",
+            Some(120),
+            Some(180),
+        );
+        let exons = vec![exon("ENSTSTARINS0001", 1, 100, 200)];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let tr = translation(
+            "ENSTSTARINS0001",
+            Some(60),
+            Some(20),
+            Some("MKKKKKKKKKKKKKKKKKK*"),
+            Some("ATGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATGA"),
+        );
+        let fallback = crate::hgvs::ProteinHgvsData {
+            start: 20,
+            end: 20,
+            ref_peptide: "*".into(),
+            alt_peptide: "*".into(),
+            ref_translation: "MKKKKKKKKKKKKKKKKKK*".into(),
+            alt_translation: "MKKKKKKKKKKKKKKKKKK*".into(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: false,
+        };
+        let mut v = VariantInput::from_vcf("1".into(), 181, 181, "A".into(), "AT".into());
+        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 0,
+            start: 181,
+            end: 180,
+            shifted_allele_string: "T".into(),
+            shifted_compare_allele: "-".into(),
+            shifted_output_allele: "T".into(),
+            alt_orig_allele_string: "T".into(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+
+        assert_eq!(
+            protein_hgvs_for_output(&t, &exons_ref, Some(&tr), &v, true, Some(&fallback), true),
+            None
+        );
     }
 
     #[test]
