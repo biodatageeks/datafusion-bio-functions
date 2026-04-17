@@ -5282,13 +5282,6 @@ fn parse_raw_cdna_mapper_segments(vef_cache: Option<&Value>) -> Vec<TranscriptCd
     // - Ensembl `Bio::EnsEMBL::Mapper` stores both Pair and Gap units
     // - VEP reuses the live TranscriptMapper via `genomic2cdna`
     //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L478-L492
-    for window in segments.windows(2) {
-        let prev = &window[0];
-        let next = &window[1];
-        if next.genomic_start == prev.genomic_end + 1 && next.cdna_start != prev.cdna_end + 1 {
-            return Vec::new();
-        }
-    }
     segments
 }
 
@@ -6965,8 +6958,19 @@ fn cache_regions_for_coords(
     downstream_distance: i64,
 ) -> Vec<TranscriptCacheRegion> {
     let chrom = normalized_chrom_name(chrom).to_string();
-    let query_start = start.min(end).saturating_sub(upstream_distance);
-    let query_end = start.max(end).saturating_add(downstream_distance);
+    // Traceability:
+    // - Ensembl VEP `AnnotationType::Transcript::up_down_size()` returns
+    //   max(UPSTREAM_DISTANCE, DOWNSTREAM_DISTANCE) — a single scalar used
+    //   symmetrically to bound the coarse cache-region fetch.
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L170-L177>
+    // - Ensembl VEP `AnnotationSource::get_regions_from_coords()` applies it as
+    //   `[start - up_down_size, end + up_down_size]`.
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L190>
+    // Strand-aware asymmetric upstream/downstream gating happens later in
+    // `upstream_downstream_term()`.
+    let up_down_size = upstream_distance.max(downstream_distance);
+    let query_start = start.min(end).saturating_sub(up_down_size);
+    let query_end = start.max(end).saturating_add(up_down_size);
     let region_start = cache_region_index(query_start);
     let region_end = cache_region_index(query_end);
 
@@ -7056,8 +7060,11 @@ fn select_buffer_local_transcripts(
     downstream_distance: i64,
 ) -> Vec<TranscriptFeature> {
     let chrom_norm = chrom.strip_prefix("chr").unwrap_or(chrom);
-    let query_start = min_start.saturating_sub(upstream_distance);
-    let query_end = max_end.saturating_add(downstream_distance);
+    // VEP's up_down_size = max(upstream, downstream), applied symmetrically.
+    // See collect_buffer_cache_regions above for the full traceability.
+    let up_down_size = upstream_distance.max(downstream_distance);
+    let query_start = min_start.saturating_sub(up_down_size);
+    let query_end = max_end.saturating_add(up_down_size);
 
     transcripts
         .iter()
@@ -8826,7 +8833,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_transcript_raw_metadata_drops_complex_gapped_cdna_mapper_segments() {
+    fn test_parse_transcript_raw_metadata_preserves_gapped_cdna_mapper_segments() {
         let raw = r#"{
           "__class":"Bio::EnsEMBL::Transcript",
           "__value":{
@@ -8860,7 +8867,25 @@ mod tests {
         }"#;
 
         let metadata = parse_transcript_raw_metadata(raw);
-        assert!(metadata.cdna_mapper_segments.is_empty());
+        assert_eq!(
+            metadata.cdna_mapper_segments,
+            vec![
+                TranscriptCdnaMapperSegment {
+                    genomic_start: 101,
+                    genomic_end: 110,
+                    cdna_start: 1,
+                    cdna_end: 10,
+                    ori: 1,
+                },
+                TranscriptCdnaMapperSegment {
+                    genomic_start: 111,
+                    genomic_end: 114,
+                    cdna_start: 17,
+                    cdna_end: 20,
+                    ori: 1,
+                }
+            ]
+        );
     }
 
     #[test]

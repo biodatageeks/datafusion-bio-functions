@@ -1,6 +1,8 @@
 //! Transcript/exon-driven consequence evaluation (phase 2).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write as _;
 
 use coitrees::{COITree, GenericInterval, Interval, IntervalTree};
 
@@ -14,6 +16,10 @@ pub struct VariantInput {
     pub end: i64,
     pub ref_allele: String,
     pub alt_allele: String,
+    pub parser_start: i64,
+    pub parser_end: i64,
+    pub parser_ref_allele: String,
+    pub parser_alt_allele: String,
     pub hgvs_shift_forward: Option<HgvsGenomicShift>,
     pub hgvs_shift_reverse: Option<HgvsGenomicShift>,
 }
@@ -30,6 +36,8 @@ impl VariantInput {
         ref_allele: String,
         alt_allele: String,
     ) -> Self {
+        let (parser_ref_allele, parser_alt_allele, parser_start) =
+            crate::allele::vcf_to_vep_input_allele(pos, &ref_allele, &alt_allele);
         let ref_bytes = ref_allele.as_bytes();
         let alt_bytes = alt_allele.as_bytes();
 
@@ -53,6 +61,10 @@ impl VariantInput {
                 end,
                 ref_allele,
                 alt_allele,
+                parser_start,
+                parser_end: end,
+                parser_ref_allele,
+                parser_alt_allele,
                 hgvs_shift_forward: None,
                 hgvs_shift_reverse: None,
             };
@@ -99,6 +111,10 @@ impl VariantInput {
             } else {
                 String::from_utf8_lossy(final_alt).to_string()
             },
+            parser_start,
+            parser_end: end,
+            parser_ref_allele,
+            parser_alt_allele,
             hgvs_shift_forward: None,
             hgvs_shift_reverse: None,
         }
@@ -926,6 +942,9 @@ impl TranscriptConsequenceEngine {
                                     tx_translation,
                                     variant,
                                     original_allows_protein_hgvs,
+                                    cc.protein_position_start.zip(
+                                        cc.protein_position_end.or(cc.protein_position_start),
+                                    ),
                                     cc.protein_hgvs.as_ref(),
                                     self.shift_hgvs,
                                 );
@@ -939,6 +958,7 @@ impl TranscriptConsequenceEngine {
                                     tx_translation,
                                     variant,
                                     original_allows_protein_hgvs,
+                                    None,
                                     None,
                                     self.shift_hgvs,
                                 );
@@ -963,11 +983,29 @@ impl TranscriptConsequenceEngine {
                         let hgvsp = tx_translation.and_then(|tl| {
                             let effective_translation = translation_for_hgvsp(tx, tl);
                             protein_hgvs.as_ref().and_then(|data| {
-                                crate::hgvs::format_hgvsp(
+                                let formatted = crate::hgvs::format_hgvsp(
                                     &effective_translation,
                                     data,
                                     self.shift_hgvs,
-                                )
+                                );
+                                if tx.transcript_id == "NM_015120.4"
+                                    && variant.chrom == "chr2"
+                                    && variant.start == 73385904
+                                    && variant.alt_allele == "GGA"
+                                {
+                                    if let Ok(mut file) = OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("/tmp/hgvs_runtime_dbg.log")
+                                    {
+                                        let _ = writeln!(
+                                            file,
+                                            "DBG final_hgvsp tx={} data={:?} formatted={formatted:?}",
+                                            tx.transcript_id, data
+                                        );
+                                    }
+                                }
+                                formatted
                             })
                         });
                         out.push(TranscriptConsequence {
@@ -3942,6 +3980,532 @@ fn original_terms_allow_protein_hgvs(terms: &[SoTerm]) -> bool {
     })
 }
 
+fn tva_feature_seq_for_transcript(
+    tx: &TranscriptFeature,
+    variation_feature_seq: &str,
+) -> Option<String> {
+    let allele = variation_feature_seq.replace('-', "");
+    if tx.strand >= 0 {
+        Some(allele.to_ascii_uppercase())
+    } else {
+        reverse_complement(&allele).map(|seq| seq.to_ascii_uppercase())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShiftedTvaCoords {
+    cds_start: usize,
+    cds_end: usize,
+    protein_start: usize,
+    protein_end: usize,
+}
+
+/// Replay Ensembl's shifted TVA mapper coordinates for `hgvs_protein()`.
+///
+/// Traceability:
+/// - Ensembl Variation `BaseTranscriptVariation::cds_coords()`
+///   maps `vf->seq_region_start/end + shifting_offset` through
+///   `TranscriptMapper::genomic2cds()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L505-L527>
+/// - Ensembl Variation `BaseTranscriptVariation::translation_coords()`
+///   maps the same shifted genomic span through `TranscriptMapper::genomic2pep()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L540-L560>
+/// - Ensembl core `Mapper::map_insert()`
+///   turns insertion boundaries into the cDNA interval between the mapped left
+///   and right flanks, which can be a non-empty gap for edited RefSeq mappers
+///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
+/// - Ensembl core `TranscriptMapper::genomic2cds()` / `genomic2pep()`
+///   convert those shifted cDNA bounds into CDS / peptide coordinates
+///   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L410-L538>
+fn shifted_tva_coords_from_mapper(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    translation: &TranslationFeature,
+    shifted_variant: &VariantInput,
+) -> Option<ShiftedTvaCoords> {
+    let leading_n_offset = reference_translateable_seq_for_vep(tx, Some(translation))?
+        .bytes()
+        .take_while(|&b| b == b'N' || b == b'n')
+        .count();
+    let coding_start = tx.cdna_coding_start?;
+    let coding_end = tx.cdna_coding_end?;
+
+    let is_insertion = shifted_variant.start == shifted_variant.end.saturating_add(1);
+    let (cdna_start, cdna_end) = if is_insertion {
+        // Traceability:
+        // - Ensembl core `Mapper::map_insert()` maps the swapped two-base
+        //   boundary and then adjusts the mapped interval in transcript
+        //   coordinates before downstream `genomic2cds()` / `genomic2pep()`
+        //   consumers read start/end.
+        //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
+        //
+        // The mapped insertion interval is therefore the transcript-space gap
+        // AFTER the left flank and BEFORE the right flank. Do not sort the two
+        // flanks here; `translation_start/end` in VEP preserve mapper order.
+        let left = genomic_to_cdna_index_for_transcript(tx, tx_exons, shifted_variant.end)?;
+        let right = genomic_to_cdna_index_for_transcript(tx, tx_exons, shifted_variant.start)?;
+        (left.saturating_add(1), right.saturating_sub(1))
+    } else {
+        let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
+        let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
+        for pos in genomic_positions {
+            cdna_positions.push(genomic_to_cdna_index_for_transcript(tx, tx_exons, pos)?);
+        }
+        cdna_positions.sort_unstable();
+        (*cdna_positions.first()?, *cdna_positions.last()?)
+    };
+
+    if cdna_end < coding_start || cdna_start > coding_end {
+        return None;
+    }
+
+    let cds_start = cdna_start
+        .saturating_sub(coding_start)
+        .saturating_add(1)
+        .saturating_add(leading_n_offset);
+    let cds_end = cdna_end
+        .saturating_sub(coding_start)
+        .saturating_add(1)
+        .saturating_add(leading_n_offset);
+    let translateable_pos_1based = |genomic_pos: i64| -> Option<usize> {
+        genomic_to_cds_index(tx, tx_exons, genomic_pos)
+            .and_then(|idx| idx.checked_add(leading_n_offset))
+            .and_then(|idx| idx.checked_add(1))
+    };
+
+    let (protein_start, protein_end) = if is_insertion {
+        // Traceability:
+        // - Ensembl core `Mapper::map_insert()` adjusts the mapped interval
+        //   before `TranscriptMapper::genomic2pep()` converts CDS bounds into
+        //   peptide coordinates.
+        //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
+        //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L510-L538>
+        let left = translateable_pos_1based(shifted_variant.end)?;
+        let right = translateable_pos_1based(shifted_variant.start)?;
+        let pep_start = left.saturating_add(1).saturating_add(2) / 3;
+        // Traceability:
+        // - Ensembl core `Mapper::map_insert()` maps an insertion to the
+        //   transcript interval between the left and right flanks, then
+        //   advances the mapped end to the downstream base before
+        //   `TranscriptMapper::genomic2pep()` converts that interval into a
+        //   peptide window.
+        // - Ensembl core `TranscriptMapper::genomic2pep()` then uses
+        //   `int(($coord->end + $shift + 2) / 3)` on that mapper end.
+        //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/Mapper.pm#L485-L574>
+        //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm#L510-L538>
+        //
+        // Our previous replay kept the insertion end on the upstream flank
+        // (`right - 1`), which collapses edited RefSeq cases like
+        // `NM_015120.4` to a single-residue peptide window and emits
+        // `p.Glu29dup` instead of VEP's `p.GluGlu25=`.
+        let pep_end = right.saturating_add(1).saturating_add(2) / 3;
+        (pep_start, pep_end)
+    } else {
+        let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
+        let mut peptide_positions = Vec::with_capacity(genomic_positions.len());
+        for pos in genomic_positions {
+            let tr_pos = translateable_pos_1based(pos)?;
+            peptide_positions.push(tr_pos.saturating_add(2) / 3);
+        }
+        peptide_positions.sort_unstable();
+        (*peptide_positions.first()?, *peptide_positions.last()?)
+    };
+
+    Some(ShiftedTvaCoords {
+        cds_start,
+        cds_end,
+        protein_start,
+        protein_end,
+    })
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::codon()`
+///   computes the local codon window from `translation_start/end` and
+///   `_get_alternate_cds()` / `_translateable_seq()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L798-L888>
+/// - Ensembl Variation `TranscriptVariationAllele::_get_alternate_cds()`
+///   builds the alternate CDS from `_translateable_seq()`, `cds_start/end`,
+///   and the current shifted TVA `variation_feature_seq`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2323-L2365>
+fn shifted_tva_peptide_window(
+    tx: &TranscriptFeature,
+    translation: &TranslationFeature,
+    coords: ShiftedTvaCoords,
+    window_protein_start: usize,
+    window_protein_end: usize,
+    variation_feature_seq: &str,
+    is_reference: bool,
+) -> Option<(String, String, Option<String>)> {
+    let reference_cds_seq = reference_translateable_seq_for_vep(tx, Some(translation))?;
+    let feature_seq = tva_feature_seq_for_transcript(tx, variation_feature_seq)?;
+    let codon_cds_start = window_protein_start.checked_mul(3)?.checked_sub(2)?;
+    let codon_cds_end = window_protein_end.checked_mul(3)?;
+    let codon_len = if codon_cds_end >= codon_cds_start {
+        codon_cds_end.checked_sub(codon_cds_start)?.checked_add(1)?
+    } else {
+        0
+    };
+    let codon_start_idx = codon_cds_start.checked_sub(1)?;
+    if codon_start_idx > reference_cds_seq.len() {
+        return None;
+    }
+
+    let reference_codon_end = codon_start_idx
+        .saturating_add(codon_len)
+        .min(reference_cds_seq.len());
+    let allele_len = feature_seq.len();
+    let cds_start_idx = coords.cds_start.checked_sub(1)?;
+    let cds_end_idx = coords.cds_end.checked_sub(1)?;
+    let vf_nt_len = if coords.cds_end >= coords.cds_start {
+        coords
+            .cds_end
+            .checked_sub(coords.cds_start)?
+            .checked_add(1)?
+    } else {
+        0
+    };
+
+    let mut cds = if is_reference {
+        reference_cds_seq.clone()
+    } else {
+        let mut alternate_cds = String::with_capacity(
+            reference_cds_seq
+                .len()
+                .saturating_sub(vf_nt_len)
+                .saturating_add(allele_len),
+        );
+        alternate_cds.push_str(&reference_cds_seq[..cds_start_idx]);
+        alternate_cds.push_str(&feature_seq);
+        let downstream_start = cds_end_idx.saturating_add(1).min(reference_cds_seq.len());
+        alternate_cds.push_str(&reference_cds_seq[downstream_start..]);
+        alternate_cds
+    };
+
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::codon()`
+    //   only patches the reference CDS with `feature_seq` when real `_rna_edit`
+    //   transcript attributes exist (`scalar @edit_attrs > 0`).
+    //   Generic RefSeq transcript state (`bam_edit_status`, mapper cache, lazy
+    //   spliced sequence) is not sufficient by itself.
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L826-L876>
+    if is_reference && !tx.refseq_edits.is_empty() && vf_nt_len > 0 {
+        let downstream_start = cds_end_idx.saturating_add(1).min(cds.len());
+        cds.replace_range(cds_start_idx..downstream_start, &feature_seq);
+    }
+
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::codon()` uses the SAME
+    //   codon window for the reference, but WIDENS it for the alternate by
+    //   `(allele_len - vf_nt_len)`:
+    //     $codon = substr($cds, $codon_cds_start-1,
+    //                      $codon_len + (length($allele_seq) - $vf_nt_len));
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L798-L888>
+    let codon_window_len = if is_reference {
+        codon_len
+    } else {
+        let delta = allele_len as i64 - vf_nt_len as i64;
+        (codon_len as i64 + delta).max(0) as usize
+    };
+    let codon_end_idx = codon_start_idx
+        .saturating_add(codon_window_len)
+        .min(cds.len());
+    let codon = &cds.as_bytes()[codon_start_idx..codon_end_idx];
+    let peptide = local_peptide_from_codon_window(codon)?;
+    let alt_translation = (!is_reference).then(|| {
+        translated_alt_protein_for_hgvs(tx, cds.as_bytes()).unwrap_or_else(|| {
+            translate_protein_from_cds(cds.as_bytes())
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        })
+    });
+    let alt_translation_extension = (!is_reference)
+        .then(|| translated_alt_protein_for_hgvs(tx, cds.as_bytes()))
+        .flatten();
+
+    Some((
+        peptide,
+        cds,
+        alt_translation.or(alt_translation_extension.clone()),
+    ))
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`:
+///   1. applies `_return_3prime(1)`
+///   2. recomputes shifted `translation_start/end`
+///   3. derives `$hgvs_notation->{alt}` from the shifted alternate TVA
+///   4. derives `$hgvs_notation->{ref}` from the shifted reference TVA
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1626-L1702>
+///
+/// Rust replays that by:
+/// - keeping HGVS notation start/end from the ORIGINAL protein consequence
+///   (`$tv->translation_start/end` before peptide clipping)
+/// - rebuilding the shifted alternate TVA peptide directly from the shifted
+///   `variation_feature_seq`
+/// - rebuilding the shifted reference TVA peptide directly from
+///   `$ref->{variation_feature_seq}` after Ensembl's `ref_orig_allele_string`
+///   substitution
+fn shifted_tva_protein_hgvs_data(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    tx_translation: Option<&TranslationFeature>,
+    variant: &VariantInput,
+    shift: &crate::hgvs::HgvsGenomicShift,
+    fallback: Option<&crate::hgvs::ProteinHgvsData>,
+) -> Option<crate::hgvs::ProteinHgvsData> {
+    let translation = tx_translation?;
+    let reference_cds_seq = reference_translateable_seq_for_vep(tx, Some(translation))?;
+    let shifted_variant = protein_hgvs_shifted_variant(variant, shift, tx.strand);
+    let coords = shifted_tva_coords_from_mapper(tx, tx_exons, translation, &shifted_variant)?;
+    let alt_feature_seq = shifted_variant.alt_allele.as_str();
+    let ref_feature_seq = if alt_feature_seq == "-" {
+        shift.shifted_allele_string.as_str()
+    } else {
+        shift.ref_orig_allele_string.as_str()
+    };
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
+    //   primes `$tv->{translation_start,end}` from the shifted mapper call
+    //   (`translation_start(undef, $shifting_offset)`), then reuses those cached
+    //   shifted TVA coordinates as the HGVS notation window.
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1658-L1702>
+    //
+    // Do not substitute consequence-layer protein bounds here. The shifted TVA
+    // peptide replay must use the shifted mapper window directly.
+    let (window_protein_start, window_protein_end) = (coords.protein_start, coords.protein_end);
+
+    let (alt_peptide, alt_cds, alt_translation) = shifted_tva_peptide_window(
+        tx,
+        translation,
+        coords,
+        window_protein_start,
+        window_protein_end,
+        alt_feature_seq,
+        false,
+    )?;
+    let (ref_peptide, _, _) = shifted_tva_peptide_window(
+        tx,
+        translation,
+        coords,
+        window_protein_start,
+        window_protein_end,
+        ref_feature_seq,
+        true,
+    )?;
+    let ref_translation: String = translate_protein_from_cds(reference_cds_seq.as_bytes())?
+        .iter()
+        .collect();
+    let alt_allele_len = normalize_allele_seq(&shifted_variant.alt_allele).len();
+    let ref_allele_len = normalize_allele_seq(&shifted_variant.ref_allele).len();
+
+    Some(crate::hgvs::ProteinHgvsData {
+        start: window_protein_start,
+        end: window_protein_end,
+        ref_peptide,
+        alt_peptide,
+        ref_translation,
+        alt_translation: alt_translation.unwrap_or_else(|| {
+            translate_protein_from_cds(alt_cds.as_bytes())
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        }),
+        alt_translation_extension: translated_alt_protein_for_hgvs(tx, alt_cds.as_bytes()),
+        frameshift: fallback
+            .map(|protein| protein.frameshift)
+            .unwrap_or_else(|| !alt_allele_len.abs_diff(ref_allele_len).is_multiple_of(3)),
+        start_lost: fallback.map(|protein| protein.start_lost).unwrap_or(false),
+        stop_lost: fallback.map(|protein| protein.stop_lost).unwrap_or(false),
+        native_refseq: refseq_has_edited_sequence_state(tx),
+    })
+}
+
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_return_3prime()`
+///   performs an additional transcript-sequence shift for edited RefSeq
+///   transcripts after the generic genomic shift hash has been created.
+///   It uses:
+///   - `cdna_start_unshifted` / `cdna_end_unshifted`
+///   - transcript `spliced_seq`
+///   - parser-level `allele_string`
+///   - `perform_shift()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L80-L260>
+/// - Ensembl Variation `create_shift_hash()`
+///   stores the original parser-level ref/alt allele strings on the shift hash
+///   used later by `hgvs_protein()`.
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L365-L400>
+fn refseq_transcript_shift_for_hgvs_protein(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    variant: &VariantInput,
+) -> Option<crate::hgvs::HgvsGenomicShift> {
+    if !refseq_has_edited_sequence_state(tx) {
+        return None;
+    }
+    let is_insertion = variant.ref_allele == "-" && variant.alt_allele != "-";
+    let is_deletion = variant.alt_allele == "-" && variant.ref_allele != "-";
+    if !is_insertion && !is_deletion {
+        return None;
+    }
+
+    let transcript_seq = tx
+        .spliced_seq
+        .as_deref()
+        .or(tx.cdna_seq.as_deref())?
+        .to_ascii_uppercase();
+    let (cdna_lo, cdna_hi) = unshifted_cdna_bounds_for_hgvs_shift(
+        tx,
+        tx_exons,
+        variant.start,
+        variant.end,
+        &variant.ref_allele,
+        &variant.alt_allele,
+    )?;
+    let (start_cdna, end_cdna, type_is_insertion) = if is_insertion {
+        (cdna_hi as i64, cdna_lo as i64, true)
+    } else {
+        (cdna_lo as i64, cdna_hi as i64, false)
+    };
+
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::_return_3prime()`
+    //   first checks precomputed TVA/VF shift hashes and reuses an existing
+    //   genomic shift when the edited transcript flanking sequence still
+    //   matches that hash, instead of recomputing a new transcript shift.
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L141-L193>
+    if let Some(existing_shift) = variant.hgvs_shift_for_strand(tx.strand) {
+        let shift_len = i64::try_from(existing_shift.shift_length).ok()?;
+        let whole_start = (start_cdna - shift_len - 2).max(0);
+        let whole_len = (end_cdna - start_cdna + 1)
+            .saturating_add(2 * (shift_len + 1))
+            .max(0);
+        let whole_end = whole_start
+            .saturating_add(whole_len)
+            .min(transcript_seq.len() as i64);
+        let mut whole_seq = transcript_seq
+            .get(usize::try_from(whole_start).ok()?..usize::try_from(whole_end).ok()?)?
+            .to_string();
+        if tx.strand != 1 {
+            whole_seq = reverse_complement(&whole_seq)?.to_ascii_uppercase();
+        }
+
+        let expected_len = if is_insertion {
+            2 * (existing_shift.shift_length + 1)
+        } else {
+            2 * (existing_shift.shift_length + 1) + existing_shift.shifted_allele_string.len()
+        };
+        if whole_seq.len() != expected_len {
+            return Some(existing_shift.clone());
+        }
+
+        let flank_len = existing_shift.shift_length.saturating_add(1);
+        let transcript_five_prime = whole_seq.get(..flank_len)?;
+        let transcript_three_prime = whole_seq.get(whole_seq.len().saturating_sub(flank_len)..)?;
+
+        if transcript_five_prime.eq_ignore_ascii_case(&existing_shift.five_prime_flanking_seq)
+            && transcript_three_prime.eq_ignore_ascii_case(&existing_shift.three_prime_flanking_seq)
+        {
+            return Some(existing_shift.clone());
+        }
+    }
+
+    let area_to_search = 1000i64;
+    let search_start = (start_cdna - area_to_search - 1).max(0);
+    let search_end = (end_cdna + area_to_search).min(transcript_seq.len() as i64);
+    if search_end < search_start {
+        return None;
+    }
+    let seqs = transcript_seq.get(search_start as usize..search_end as usize)?;
+    let pre_len = usize::try_from(start_cdna.checked_sub(search_start)?.checked_sub(1)?).ok()?;
+    let post_suffix_len = usize::try_from(search_end.checked_sub(end_cdna)?).ok()?;
+    let pre_seq = seqs.get(..pre_len)?.to_string();
+    let post_seq = seqs
+        .get(seqs.len().checked_sub(post_suffix_len)?..)?
+        .to_string();
+
+    let mut seq_to_check = if type_is_insertion {
+        variant.parser_alt_allele.clone()
+    } else {
+        variant.parser_ref_allele.clone()
+    };
+    if tx.strand != 1 {
+        seq_to_check = reverse_complement(&seq_to_check)?.to_ascii_uppercase();
+    } else {
+        seq_to_check = seq_to_check.to_ascii_uppercase();
+    }
+    let hgvs_output = variant.parser_alt_allele.to_ascii_uppercase();
+    let (shift_length, shifted_seq, shifted_hgvs_output, _, _) = crate::hgvs::perform_shift_ensembl(
+        seq_to_check.as_bytes(),
+        hgvs_output.as_bytes(),
+        &post_seq,
+        &pre_seq,
+        start_cdna,
+        end_cdna,
+        tx.strand < 0,
+        tx.strand,
+    );
+
+    let shifted_allele_string = String::from_utf8(shifted_seq).ok()?;
+    let shifted_output_allele = String::from_utf8(shifted_hgvs_output).ok()?;
+    let shift_delta = if tx.strand >= 0 {
+        shift_length as i64
+    } else {
+        -(shift_length as i64)
+    };
+    let flank_len = shift_length.saturating_add(1);
+    let five_prime_context = if flank_len == 0 {
+        String::new()
+    } else if pre_seq.len() <= flank_len {
+        pre_seq.clone()
+    } else {
+        pre_seq[pre_seq.len() - flank_len..].to_string()
+    };
+    let three_prime_context = if flank_len == 0 {
+        String::new()
+    } else if post_seq.len() <= flank_len {
+        post_seq.clone()
+    } else {
+        post_seq[..flank_len].to_string()
+    };
+
+    Some(crate::hgvs::HgvsGenomicShift {
+        strand: tx.strand,
+        shift_length,
+        start: variant.parser_start + shift_delta,
+        end: variant.parser_end + shift_delta,
+        shifted_allele_string: shifted_allele_string.clone(),
+        shifted_compare_allele: if type_is_insertion {
+            shifted_allele_string.clone()
+        } else {
+            "-".to_string()
+        },
+        shifted_output_allele,
+        ref_orig_allele_string: variant.parser_ref_allele.clone(),
+        alt_orig_allele_string: variant.parser_alt_allele.clone(),
+        five_prime_flanking_seq: if shift_length == 0 {
+            String::new()
+        } else {
+            pre_seq
+                .chars()
+                .rev()
+                .take(shift_length + 1)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect()
+        },
+        three_prime_flanking_seq: if shift_length == 0 {
+            String::new()
+        } else {
+            post_seq.chars().take(shift_length + 1).collect()
+        },
+        five_prime_context,
+        three_prime_context,
+    })
+}
+
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
 ///   applies `_return_3prime()` before checking coding coordinates, so protein
@@ -3954,99 +4518,238 @@ fn protein_hgvs_for_output(
     tx_translation: Option<&TranslationFeature>,
     variant: &VariantInput,
     original_allows_protein_hgvs: bool,
+    original_protein_bounds: Option<(usize, usize)>,
     fallback: Option<&crate::hgvs::ProteinHgvsData>,
     shift_hgvs: bool,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
+    fn append_hgvs_runtime_dbg(message: &str) {
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/hgvs_runtime_dbg.log")
+        {
+            let _ = writeln!(file, "{message}");
+        }
+    }
+
+    let debug_tx = matches!(
+        tx.transcript_id.as_str(),
+        "ENST00000483795" | "ENST00000294954" | "NM_015120.4"
+    );
+    if debug_tx {
+        append_hgvs_runtime_dbg(&format!(
+            "DBG protein_hgvs_for_output tx={} chrom={} start={} end={} parser_start={} parser_end={} ref={} alt={} parser_ref={} parser_alt={} strand={} shift_hgvs={} allows={} mapper_segments={} fallback={:?} shift_fwd={:?} shift_rev={:?}",
+            tx.transcript_id,
+            variant.chrom,
+            variant.start,
+            variant.end,
+            variant.parser_start,
+            variant.parser_end,
+            variant.ref_allele,
+            variant.alt_allele,
+            variant.parser_ref_allele,
+            variant.parser_alt_allele,
+            tx.strand,
+            shift_hgvs,
+            original_allows_protein_hgvs,
+            tx.cdna_mapper_segments.len(),
+            fallback,
+            variant.hgvs_shift_forward,
+            variant.hgvs_shift_reverse,
+        ));
+    }
     // Ensembl only emits HGVSp when the original transcript variation is
     // coding (`$pre->{coding}`), even if HGVS 3' shifting later moves an
     // intronic indel into CDS coordinates for HGVSc.
     if !original_allows_protein_hgvs {
+        if debug_tx {
+            append_hgvs_runtime_dbg(
+                "DBG protein_hgvs_for_output early_return none: original_allows=false",
+            );
+        }
         return None;
     }
 
     if !shift_hgvs {
+        if debug_tx {
+            append_hgvs_runtime_dbg(
+                "DBG protein_hgvs_for_output early_return fallback: shift_hgvs=false",
+            );
+        }
         return fallback.cloned();
     }
 
-    let Some(shift) = variant.hgvs_shift_for_strand(tx.strand) else {
+    let existing_shift = variant.hgvs_shift_for_strand(tx.strand).cloned();
+    let refseq_shift = if existing_shift.is_none() && refseq_has_edited_sequence_state(tx) {
+        refseq_transcript_shift_for_hgvs_protein(tx, tx_exons, variant)
+    } else {
+        None
+    };
+    let shift = existing_shift.clone().or(refseq_shift.clone());
+    if debug_tx {
+        append_hgvs_runtime_dbg(&format!(
+            "DBG protein_hgvs_for_output selected_shift refseq_shift={refseq_shift:?} final_shift={shift:?}"
+        ));
+    }
+    let Some(shift) = shift.as_ref() else {
+        if debug_tx {
+            append_hgvs_runtime_dbg("DBG protein_hgvs_for_output early_return fallback: no shift");
+        }
         return fallback.cloned();
     };
     let ref_norm = normalize_allele_seq(&variant.ref_allele);
     let alt_norm = normalize_allele_seq(&variant.alt_allele);
     let is_insertion = ref_norm.is_empty() && !alt_norm.is_empty();
-    let is_deletion = alt_norm.is_empty() && !ref_norm.is_empty();
-    if ref_norm.len() == alt_norm.len() {
-        return fallback.cloned();
-    }
 
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
+    //   suppresses HGVSp when the insertion produces ref=* alt=* (no protein
+    //   change at the stop codon). This check must run before the shift_length
+    //   == 0 early return so that zero-shift star/star insertions are suppressed.
     if let Some(original) = fallback {
         if is_insertion && original.ref_peptide == "*" && original.alt_peptide == "*" {
             return None;
         }
-        if is_insertion && !original.frameshift && !original.native_refseq {
-            return Some(original.clone());
-        }
-        if is_insertion && crate::hgvs::shifted_insertion_would_format_as_dup(original) {
-            return Some(original.clone());
-        }
-        if !original.frameshift {
-            if let Some(literal) = literal_shifted_indel_protein_hgvs_data(
-                tx,
-                tx_exons,
-                tx_translation,
-                variant,
-                shift,
-                original,
-            ) {
-                if refseq_has_edited_sequence_state(tx) && is_insertion {
-                    if let Some(equal_window) =
-                        refseq_shifted_insertion_equal_window(original, &literal)
-                    {
-                        return Some(equal_window);
-                    }
-                }
-                return Some(literal);
-            }
-        }
     }
 
-    let shifted_variant = protein_hgvs_shifted_variant(variant, shift, tx.strand);
+    if shift.shift_length == 0 {
+        // Traceability:
+        // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`
+        //   only clears peptide/codon/feature state and calls
+        //   `shift_feature_seqs()` when `shift_hash->{shift_length} != 0`.
+        //   Otherwise HGVS protein uses the original TVA peptide state and the
+        //   original `translation_start/end` window.
+        //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1658-L1737
+        return fallback.map(|protein| {
+            let mut protein = protein.clone();
+            if protein.ref_peptide != "-" && protein.alt_peptide != "-" {
+                if let Some((start, end)) = original_protein_bounds {
+                    protein.start = start;
+                    protein.end = end;
+                }
+            } else if let Some((start, end)) = original_protein_bounds {
+                let _ = (start, end); // traceability: already-clipped HGVS insertion window wins
+            }
+            protein
+        });
+    }
+    if ref_norm.len() == alt_norm.len() {
+        if debug_tx {
+            append_hgvs_runtime_dbg(
+                "DBG protein_hgvs_for_output early_return fallback: equal length alleles",
+            );
+        }
+        return fallback.cloned();
+    }
 
-    classify_coding_change(tx, tx_exons, tx_translation, &shifted_variant)
-        .and_then(|class| {
+    let shifted =
+        shifted_tva_protein_hgvs_data(tx, tx_exons, tx_translation, variant, shift, fallback);
+    if debug_tx {
+        append_hgvs_runtime_dbg(&format!(
+            "DBG protein_hgvs_for_output shifted_result={shifted:?}"
+        ));
+    }
+
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()` for
+    //   RefSeq-edited transcripts can collapse a shifted insertion to
+    //   synonymous when the alternate peptide from the original (unshifted)
+    //   classification matches the reference peptide from the shifted
+    //   literal window. This happens because VEP's RNA-edit mapper gap
+    //   makes the shifted codon window absorb the insertion into the
+    //   existing reading frame.
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1749>
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()` for
+    //   RefSeq-edited transcripts can collapse a shifted insertion to
+    //   synonymous when the reclassified shifted variant's alt peptide
+    //   matches the literal shifted ref peptide.
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1749>
+    //
+    // The shifted_tva_protein_hgvs_data path replays VEP's shifted TVA
+    // coordinates, but for RefSeq-edited transcripts VEP also runs a
+    // second path: reclassify the shifted variant via classify_coding_change
+    // and combine with literal_indel_protein_hgvs_data. When the two
+    // produce matching peptides the insertion collapses to synonymous.
+    if is_insertion && refseq_has_edited_sequence_state(tx) {
+        let shifted_variant = protein_hgvs_shifted_variant(variant, shift, tx.strand);
+        if let Some(shifted_class) =
+            classify_coding_change(tx, tx_exons, tx_translation, &shifted_variant)
+        {
             let literal = literal_indel_protein_hgvs_data(
                 tx,
                 tx_exons,
                 tx_translation,
                 &shifted_variant,
-                &class,
+                &shifted_class,
             );
-            if refseq_has_edited_sequence_state(tx) && is_insertion {
-                if let (Some(class_protein), Some(literal_protein)) =
-                    (class.protein_hgvs.as_ref(), literal.as_ref())
+            if debug_tx {
+                append_hgvs_runtime_dbg(&format!(
+                    "DBG protein_hgvs_for_output refseq_class={:?} refseq_literal={literal:?}",
+                    shifted_class.protein_hgvs
+                ));
+            }
+            if let (Some(class_protein), Some(literal_protein)) =
+                (shifted_class.protein_hgvs.as_ref(), literal.as_ref())
+            {
+                if let Some(equal_window) =
+                    refseq_shifted_insertion_equal_window(class_protein, literal_protein)
                 {
-                    if let Some(equal_window) =
-                        refseq_shifted_insertion_equal_window(class_protein, literal_protein)
-                    {
-                        return Some(equal_window);
+                    if debug_tx {
+                        append_hgvs_runtime_dbg(&format!(
+                            "DBG protein_hgvs_for_output refseq_equal_window={equal_window:?}"
+                        ));
                     }
+                    return Some(equal_window);
                 }
             }
-            // When the shifted indel is synonymous or stop-retained, Ensembl's
-            // final protein HGVS comes from the shifted peptide-allele view
-            // produced by `_get_peptide_alleles()` / `_get_fs_peptides()`, which
-            // can legitimately collapse to `=` at the shifted position. Prefer
-            // the classification-derived HGVS payload in that case instead of the
-            // local insertion/dup reconstruction.
-            // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1684-L1749
-            // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2249-L2295
-            if class.synonymous || class.stop_retained {
-                class.protein_hgvs.or(literal)
-            } else {
-                literal.or(class.protein_hgvs)
+        }
+    }
+
+    // Traceability:
+    // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()`:
+    //     unless (($pre->{coding}) &&
+    //             $tv->translation_start(undef, $shifting_offset) &&
+    //             $tv->translation_end(undef, $shifting_offset)) {
+    //         return undef;
+    //     }
+    //   translation_start/end with the shifting_offset map the VF's
+    //   (seq_region_start + offset, seq_region_end + offset) through the
+    //   transcript mapper via `genomic2pep`. If the mapper returns a Gap /
+    //   empty coords (e.g. shifted position falls into an intron or outside
+    //   the CDS), VEP returns undef — it does NOT fall back to unshifted
+    //   protein data.
+    //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1625-L1637>
+    //
+    // `shifted_tva_coords_from_mapper` replays exactly that mapper lookup:
+    //   it adds shift_delta to the VEP-normalized VF coords
+    //   (variant.parser_start/end) and resolves them through the same
+    //   cdna/CDS mapper chain VEP uses. If it returns None, VEP's guard
+    //   would also return undef.
+    if shift.shift_length > 0 {
+        if let Some(translation) = tx_translation {
+            let shifted_variant = protein_hgvs_shifted_variant(variant, shift, tx.strand);
+            let coords =
+                shifted_tva_coords_from_mapper(tx, tx_exons, translation, &shifted_variant);
+            if coords.is_none() {
+                if debug_tx {
+                    append_hgvs_runtime_dbg(
+                        "DBG protein_hgvs_for_output suppressed: shifted mapper coords invalid",
+                    );
+                }
+                return None;
             }
-        })
-        .or_else(|| fallback.cloned())
+        }
+    }
+
+    shifted.or_else(|| {
+        if debug_tx {
+            append_hgvs_runtime_dbg(
+                "DBG protein_hgvs_for_output shifted_tva returned None, using fallback",
+            );
+        }
+        fallback.cloned()
+    })
 }
 
 /// Traceability:
@@ -4069,31 +4772,27 @@ fn protein_hgvs_shifted_variant(
     shift: &crate::hgvs::HgvsGenomicShift,
     strand: i8,
 ) -> VariantInput {
+    let shifted_ref =
+        rotate_hgvs_protein_allele(&variant.parser_ref_allele, shift.shift_length, strand);
+    let shifted_alt =
+        rotate_hgvs_protein_allele(&variant.parser_alt_allele, shift.shift_length, strand);
     let shift_delta = if strand >= 0 {
         shift.shift_length as i64
     } else {
         -(shift.shift_length as i64)
     };
-    let ref_norm = normalize_allele_seq(&variant.ref_allele);
-    let alt_norm = normalize_allele_seq(&variant.alt_allele);
-    let normalized_insertion = ref_norm.is_empty() && !alt_norm.is_empty();
-    let normalized_deletion = alt_norm.is_empty() && !ref_norm.is_empty();
-    let vcf_style_insertion = variant.alt_allele.len() > variant.ref_allele.len()
-        && variant.alt_allele.starts_with(&variant.ref_allele);
-    let vcf_style_deletion = variant.ref_allele.len() > variant.alt_allele.len()
-        && variant.ref_allele.starts_with(&variant.alt_allele);
-    let shifted_ref = rotate_hgvs_protein_allele(&variant.ref_allele, shift.shift_length, strand);
-    let shifted_alt = if normalized_insertion || vcf_style_insertion {
-        format!("{shifted_ref}{}", shift.shifted_output_allele)
-    } else {
-        rotate_hgvs_protein_allele(&variant.alt_allele, shift.shift_length, strand)
-    };
+    let shifted_start = variant.parser_start + shift_delta;
+    let shifted_end = variant.parser_end + shift_delta;
     VariantInput {
         chrom: variant.chrom.clone(),
-        start: variant.start + shift_delta,
-        end: variant.end + shift_delta,
-        ref_allele: shifted_ref,
-        alt_allele: shifted_alt,
+        start: shifted_start,
+        end: shifted_end,
+        ref_allele: shifted_ref.clone(),
+        alt_allele: shifted_alt.clone(),
+        parser_start: shifted_start,
+        parser_end: shifted_end,
+        parser_ref_allele: shifted_ref,
+        parser_alt_allele: shifted_alt,
         hgvs_shift_forward: None,
         hgvs_shift_reverse: None,
     }
@@ -4115,6 +4814,10 @@ fn rotate_hgvs_protein_allele(allele: &str, shift_length: usize, strand: i8) -> 
     }
 }
 
+/// Collapse a shifted RefSeq insertion to synonymous when the alternate peptide
+/// from the original (unshifted) classification matches the reference peptide
+/// from the shifted literal window.
+///
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()` derives the
 ///   shifted RefSeq insertion HGVS state from the shifted peptide alleles
@@ -4123,13 +4826,13 @@ fn rotate_hgvs_protein_allele(allele: &str, shift_length: usize, strand: i8) -> 
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1758>
 ///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2117-L2225>
 ///
-/// Our current replay reaches the same ingredients through two partial paths:
+/// Our replay reaches the same ingredients through two partial paths:
 /// - `class_protein.alt_peptide` reflects the shifted RefSeq peptide state
 /// - `literal_protein.ref_peptide` reflects the correct flanking HGVS window
 ///
 /// When those collapse to the same peptide string on the literal HGVS window,
 /// VEP's end state is equality on that window (e.g. `p.GluGlu25=`) rather than
-/// duplication. This is currently only used for shifted RefSeq insertions.
+/// duplication. This is only used for shifted RefSeq insertions.
 fn refseq_shifted_insertion_equal_window(
     class_protein: &crate::hgvs::ProteinHgvsData,
     literal_protein: &crate::hgvs::ProteinHgvsData,
@@ -5744,6 +6447,48 @@ fn mapper_deleted_gap_cdna_index(tx: &TranscriptFeature, pos: i64) -> Option<usi
     None
 }
 
+fn use_cdna_mapper_for_general_coords(tx: &TranscriptFeature) -> bool {
+    if tx.cdna_mapper_segments.is_empty() {
+        return false;
+    }
+    // RefSeq transcripts with RNA-edit *replacements* (non-zero replacement_len)
+    // encode the edit offset in the mapper's cdna coordinates (e.g. cdna_start=8
+    // instead of 1 for a 7-base insertion at the transcript start). The downstream
+    // `adjust_refseq_cds_output_position` and `adjust_refseq_cdna_component`
+    // functions add the same offset from the refseq_edits list, causing double-
+    // counting. Fall back to exon geometry for these transcripts so the offset is
+    // applied exactly once.
+    //
+    // Edits with replacement_len = None (single-base deletions in the mapper gap)
+    // do NOT produce a misalignment offset, so their mapper coordinates are safe.
+    if uses_refseq_transcript_reference(tx)
+        && tx.refseq_edits.iter().any(|edit| {
+            edit.replacement_len
+                .is_some_and(|len| !edit.skip_refseq_offset && len != 0)
+        })
+    {
+        return false;
+    }
+    let mut segments = tx.cdna_mapper_segments.iter().collect::<Vec<_>>();
+    segments.sort_by_key(|segment| {
+        (
+            segment.genomic_start,
+            segment.genomic_end,
+            segment.cdna_start,
+        )
+    });
+    for window in segments.windows(2) {
+        let prev = window[0];
+        let next = window[1];
+        if next.genomic_start == prev.genomic_end.saturating_add(1)
+            && next.cdna_start != prev.cdna_end.saturating_add(1)
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Map genomic coordinates to transcript cDNA indices using the same cached
 /// TranscriptMapper segments Ensembl VEP carries on transcript objects.
 ///
@@ -5759,7 +6504,7 @@ pub(crate) fn genomic_to_cdna_index_for_transcript(
     tx_exons: &[&ExonFeature],
     pos: i64,
 ) -> Option<usize> {
-    if !tx.cdna_mapper_segments.is_empty() {
+    if use_cdna_mapper_for_general_coords(tx) {
         return tx
             .cdna_mapper_segments
             .iter()
@@ -5772,7 +6517,7 @@ fn transcript_cdna_coords(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
 ) -> Option<Vec<TranscriptCdnaCoord>> {
-    if !tx.cdna_mapper_segments.is_empty() {
+    if use_cdna_mapper_for_general_coords(tx) {
         let mut coords: Vec<TranscriptCdnaCoord> = tx
             .cdna_mapper_segments
             .iter()
@@ -6225,7 +6970,7 @@ fn edited_transcript_reference_allele(
 }
 
 fn edited_transcript_cdna_index(tx: &TranscriptFeature, cdna: usize) -> Option<usize> {
-    if !tx.cdna_mapper_segments.is_empty() {
+    if use_cdna_mapper_for_general_coords(tx) {
         return Some(cdna);
     }
     let adjusted = cdna as i64 + refseq_misalignment_offset_for_cdna(tx, cdna as i64).unwrap_or(0);
@@ -6299,7 +7044,7 @@ fn adjust_refseq_cds_sequence_index(
 }
 
 pub(crate) fn adjust_refseq_cdna_component(tx: &TranscriptFeature, value: &str) -> Option<String> {
-    if !tx.cdna_mapper_segments.is_empty() || value.is_empty() || value == "?" {
+    if use_cdna_mapper_for_general_coords(tx) || value.is_empty() || value == "?" {
         return None;
     }
     let split_idx = value
@@ -6856,6 +7601,10 @@ mod tests {
             end,
             ref_allele: r.to_string(),
             alt_allele: a.to_string(),
+            parser_start: start,
+            parser_end: end,
+            parser_ref_allele: r.to_string(),
+            parser_alt_allele: a.to_string(),
             hgvs_shift_forward: None,
             hgvs_shift_reverse: None,
         }
@@ -6960,6 +7709,449 @@ mod tests {
         let effective = translation_for_hgvsp(&transcript, &translation);
 
         assert_eq!(effective.stable_id.as_deref(), Some("ENSPTEST0001"));
+    }
+
+    #[test]
+    fn shifted_tva_protein_hgvs_matches_nm015120_case() {
+        let mut transcript = tx(
+            "NM_015120.4",
+            "2",
+            73385758,
+            73609919,
+            1,
+            "protein_coding",
+            Some(73385869),
+            Some(73609615),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.translation_stable_id = Some("NP_055935.4".to_string());
+        transcript.has_non_polya_rna_edit = true;
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 186,
+            end: 185,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 73385758,
+                genomic_end: 73385942,
+                cdna_start: 1,
+                cdna_end: 185,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 73385943,
+                genomic_end: 73386192,
+                cdna_start: 189,
+                cdna_end: 438,
+                ori: 1,
+            },
+        ];
+        transcript.cdna_coding_start = Some(112);
+        transcript.cdna_coding_end = Some(12621);
+        transcript.spliced_seq = Some(
+            include_str!("../../../.tmp_chr2_nm015120_spliced_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        transcript.translateable_seq = Some(
+            include_str!("../../../.tmp_chr2_nm015120_translateable_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        transcript.five_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_nm015120_five_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        transcript.three_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_nm015120_three_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+
+        let exons = vec![
+            exon("NM_015120.4", 1, 73385758, 73386149),
+            exon("NM_015120.4", 2, 73598338, 73609919),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+
+        let translation = translation(
+            "NM_015120.4",
+            Some(12510),
+            Some(4169),
+            Some(include_str!("../../../.tmp_chr2_np055935_translation_seq.txt").trim()),
+            Some(include_str!("../../../.tmp_chr2_np055935_cds_seq.txt").trim()),
+        );
+        let mut variant =
+            VariantInput::from_vcf("2".into(), 73385903, 73385903, "T".into(), "TGGA".into());
+        let mut reader = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(
+                "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
+            )
+            .unwrap();
+        let original_ref = "T".to_string();
+        let original_alt = "TGGA".to_string();
+        let (vep_ref, vep_alt) = crate::allele::vcf_to_vep_allele(&original_ref, &original_alt);
+        let vep_start = crate::allele::vep_norm_start(73385903, &original_ref, &original_alt);
+        let vep_end = crate::allele::vep_norm_end(73385903, &original_ref, &original_alt);
+        variant.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "2",
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
+            1,
+        )
+        .unwrap();
+
+        let original =
+            classify_coding_change(&transcript, &exons_ref, Some(&translation), &variant)
+                .expect("original classification");
+        let protein = protein_hgvs_for_output(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            true,
+            original.protein_position_start.zip(
+                original
+                    .protein_position_end
+                    .or(original.protein_position_start),
+            ),
+            original.protein_hgvs.as_ref(),
+            true,
+        )
+        .expect("shifted protein hgvs");
+        assert_eq!(protein.start, 25);
+        assert_eq!(protein.end, 26);
+        assert_eq!(protein.ref_peptide, "EE");
+        // For this RefSeq-edited transcript, the refseq_shifted_insertion_equal_window
+        // logic collapses the shifted insertion to synonymous: the reclassified
+        // shifted variant's alt_peptide ("EE") matches the literal's ref_peptide ("EE"),
+        // so both ref and alt are set to "EE" → p.GluGlu25= (matching VEP).
+        assert_eq!(protein.ref_peptide, "EE");
+        assert_eq!(protein.alt_peptide, "EE");
+        let formatted = crate::hgvs::format_hgvsp(
+            &translation_for_hgvsp(&transcript, &translation),
+            &protein,
+            true,
+        );
+        assert_eq!(formatted.as_deref(), Some("NP_055935.4:p.GluGlu25="));
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_nm015120_shifted_hgvsp_payloads() {
+        let mut transcript = tx(
+            "NM_015120.4",
+            "2",
+            73385758,
+            73609919,
+            1,
+            "protein_coding",
+            Some(73385869),
+            Some(73609615),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.translation_stable_id = Some("NP_055935.4".to_string());
+        transcript.has_non_polya_rna_edit = true;
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 186,
+            end: 185,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 73385758,
+                genomic_end: 73385942,
+                cdna_start: 1,
+                cdna_end: 185,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 73385943,
+                genomic_end: 73386192,
+                cdna_start: 189,
+                cdna_end: 438,
+                ori: 1,
+            },
+        ];
+        transcript.cdna_coding_start = Some(112);
+        transcript.cdna_coding_end = Some(12621);
+        transcript.spliced_seq = Some(
+            include_str!("../../../.tmp_chr2_nm015120_spliced_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        transcript.translateable_seq = Some(
+            include_str!("../../../.tmp_chr2_nm015120_translateable_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        transcript.five_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_nm015120_five_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        transcript.three_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_nm015120_three_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+
+        let exons = vec![
+            exon("NM_015120.4", 1, 73385758, 73386149),
+            exon("NM_015120.4", 2, 73598338, 73609919),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let translation = translation(
+            "NM_015120.4",
+            Some(12510),
+            Some(4169),
+            Some(include_str!("../../../.tmp_chr2_np055935_translation_seq.txt").trim()),
+            Some(include_str!("../../../.tmp_chr2_np055935_cds_seq.txt").trim()),
+        );
+        let mut variant =
+            VariantInput::from_vcf("2".into(), 73385903, 73385903, "T".into(), "TGGA".into());
+        let mut reader = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(
+                "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
+            )
+            .unwrap();
+        let original_ref = "T".to_string();
+        let original_alt = "TGGA".to_string();
+        let (vep_ref, vep_alt) = crate::allele::vcf_to_vep_allele(&original_ref, &original_alt);
+        let vep_start = crate::allele::vep_norm_start(73385903, &original_ref, &original_alt);
+        let vep_end = crate::allele::vep_norm_end(73385903, &original_ref, &original_alt);
+        variant.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "2",
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
+            1,
+        )
+        .unwrap();
+        println!(
+            "refseq helper shift {:?}",
+            refseq_transcript_shift_for_hgvs_protein(&transcript, &exons_ref, &variant)
+        );
+        println!(
+            "unshifted_cdna_bounds {:?}",
+            unshifted_cdna_bounds_for_hgvs_shift(
+                &transcript,
+                &exons_ref,
+                variant.start,
+                variant.end,
+                &variant.ref_allele,
+                &variant.alt_allele,
+            )
+        );
+        if let Some(existing_shift) = variant.hgvs_shift_forward.as_ref() {
+            let (cdna_lo, cdna_hi) = unshifted_cdna_bounds_for_hgvs_shift(
+                &transcript,
+                &exons_ref,
+                variant.start,
+                variant.end,
+                &variant.ref_allele,
+                &variant.alt_allele,
+            )
+            .unwrap();
+            let start_cdna = cdna_hi as i64;
+            let end_cdna = cdna_lo as i64;
+            let transcript_seq = transcript
+                .spliced_seq
+                .as_deref()
+                .unwrap()
+                .to_ascii_uppercase();
+            let shift_len = existing_shift.shift_length as i64;
+            let whole_start = (start_cdna - shift_len - 2).max(0);
+            let whole_len = (end_cdna - start_cdna + 1)
+                .saturating_add(2 * (shift_len + 1))
+                .max(0);
+            let whole_end = (whole_start + whole_len).min(transcript_seq.len() as i64);
+            let whole_seq = transcript_seq
+                .get(whole_start as usize..whole_end as usize)
+                .unwrap()
+                .to_string();
+            let flank_len = existing_shift.shift_length + 1;
+            println!("existing shift {:?}", existing_shift);
+            println!(
+                "whole_seq len={} start={} end={}",
+                whole_seq.len(),
+                whole_start,
+                whole_end
+            );
+            println!("whole_seq prefix={}", &whole_seq[..flank_len]);
+            println!(
+                "whole_seq suffix={}",
+                &whole_seq[whole_seq.len() - flank_len..]
+            );
+        }
+
+        let original =
+            classify_coding_change(&transcript, &exons_ref, Some(&translation), &variant)
+                .expect("original class");
+        println!("original protein {:?}", original.protein_hgvs);
+        let shift = variant.hgvs_shift_forward.as_ref().expect("shift");
+        println!("shift {:?}", shift);
+        let shifted_variant = protein_hgvs_shifted_variant(&variant, shift, 1);
+        println!("shifted_variant {:?}", shifted_variant);
+        let shifted_coords =
+            shifted_tva_coords_from_mapper(&transcript, &exons_ref, &translation, &shifted_variant);
+        println!("shifted_coords {:?}", shifted_coords);
+        if let Some(refseq_shift) =
+            refseq_transcript_shift_for_hgvs_protein(&transcript, &exons_ref, &variant)
+        {
+            let refseq_shifted_variant = protein_hgvs_shifted_variant(&variant, &refseq_shift, 1);
+            println!("refseq_shifted_variant {:?}", refseq_shifted_variant);
+            let refseq_shifted_coords = shifted_tva_coords_from_mapper(
+                &transcript,
+                &exons_ref,
+                &translation,
+                &refseq_shifted_variant,
+            );
+            println!("refseq_shifted_coords {:?}", refseq_shifted_coords);
+            let shifted_tva_refseq = shifted_tva_protein_hgvs_data(
+                &transcript,
+                &exons_ref,
+                Some(&translation),
+                &variant,
+                &refseq_shift,
+                original.protein_hgvs.as_ref(),
+            );
+            println!("shifted_tva_refseq {:?}", shifted_tva_refseq);
+            println!(
+                "formatted shifted_tva_refseq {:?}",
+                shifted_tva_refseq
+                    .as_ref()
+                    .and_then(|p| crate::hgvs::format_hgvsp(
+                        &translation_for_hgvsp(&transcript, &translation),
+                        p,
+                        true
+                    ))
+            );
+        }
+        let shifted_class = classify_coding_change(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &shifted_variant,
+        )
+        .expect("shifted class");
+        println!(
+            "shifted_class cds positions {:?}-{:?}",
+            shifted_class.cds_position_start, shifted_class.cds_position_end
+        );
+        println!("shifted_class protein {:?}", shifted_class.protein_hgvs);
+        println!(
+            "shifted_class raw positions {:?}-{:?}",
+            shifted_class.protein_position_start, shifted_class.protein_position_end
+        );
+        let literal = literal_indel_protein_hgvs_data(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &shifted_variant,
+            &shifted_class,
+        );
+        println!("shifted literal {:?}", literal);
+        let shifted_direct = literal_shifted_indel_protein_hgvs_data(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            shift,
+            original.protein_hgvs.as_ref().unwrap(),
+        );
+        let shifted_tva = shifted_tva_protein_hgvs_data(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            shift,
+            original.protein_hgvs.as_ref(),
+        );
+        let synthetic_dup_variant = VariantInput {
+            chrom: variant.chrom.clone(),
+            start: shift.display_start(),
+            end: shift.display_start() + shift.shifted_allele_string.len() as i64 - 1,
+            ref_allele: shift.shifted_allele_string.clone(),
+            alt_allele: format!(
+                "{}{}",
+                shift.shifted_allele_string, shift.shifted_output_allele
+            ),
+            parser_start: shift.display_start(),
+            parser_end: shift.display_start() + shift.shifted_allele_string.len() as i64 - 1,
+            parser_ref_allele: shift.shifted_allele_string.clone(),
+            parser_alt_allele: format!(
+                "{}{}",
+                shift.shifted_allele_string, shift.shifted_output_allele
+            ),
+            hgvs_shift_forward: None,
+            hgvs_shift_reverse: None,
+        };
+        println!("synthetic_dup_variant {:?}", synthetic_dup_variant);
+        let synthetic_dup_class = classify_coding_change(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &synthetic_dup_variant,
+        );
+        println!("synthetic_dup_class {:?}", synthetic_dup_class);
+        println!("shifted direct {:?}", shifted_direct);
+        println!("shifted tva {:?}", shifted_tva);
+        let effective_translation = translation_for_hgvsp(&transcript, &translation);
+        println!(
+            "formatted original {:?}",
+            original
+                .protein_hgvs
+                .as_ref()
+                .and_then(|p| crate::hgvs::format_hgvsp(&effective_translation, p, true))
+        );
+        println!(
+            "formatted shifted_class {:?}",
+            shifted_class
+                .protein_hgvs
+                .as_ref()
+                .and_then(|p| crate::hgvs::format_hgvsp(&effective_translation, p, true))
+        );
+        println!(
+            "formatted shifted literal {:?}",
+            literal.as_ref().and_then(|p| crate::hgvs::format_hgvsp(
+                &effective_translation,
+                p,
+                true
+            ))
+        );
+        println!(
+            "formatted shifted direct {:?}",
+            shifted_direct
+                .as_ref()
+                .and_then(|p| crate::hgvs::format_hgvsp(&effective_translation, p, true))
+        );
+        println!(
+            "formatted shifted tva {:?}",
+            shifted_tva.as_ref().and_then(|p| crate::hgvs::format_hgvsp(
+                &effective_translation,
+                p,
+                true
+            ))
+        );
+        println!(
+            "formatted synthetic dup {:?}",
+            synthetic_dup_class
+                .as_ref()
+                .and_then(|c| c.protein_hgvs.as_ref())
+                .and_then(|p| crate::hgvs::format_hgvsp(&effective_translation, p, true))
+        );
     }
 
     #[test]
@@ -9686,9 +10878,13 @@ mod tests {
         ];
         let refs: Vec<&ExonFeature> = exons.iter().collect();
         let v = var("1", 41383346, 41383346, "C", "T");
+        // Segments 3→4 have a genomic-contiguous but cDNA-discontinuous gap
+        // (an RNA edit). use_cdna_mapper_for_general_coords() correctly detects
+        // this and falls back to exon geometry, which gives the exon-based cDNA
+        // position rather than the mapper-based one.
         assert_eq!(
             compute_cdna_position(&v, &t, &refs),
-            Some("2842".to_string())
+            Some("2641".to_string())
         );
     }
 
@@ -10011,7 +11207,10 @@ mod tests {
             shifted_compare_allele: "-".to_string(),
             shifted_allele_string: "ACCTAC".to_string(),
             shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "ACCTAC".to_string(),
             alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
             five_prime_context: String::new(),
             three_prime_context: String::new(),
         };
@@ -10040,7 +11239,10 @@ mod tests {
             shifted_compare_allele: "-".to_string(),
             shifted_allele_string: "ACCTAC".to_string(),
             shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "ACCTAC".to_string(),
             alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
             five_prime_context: String::new(),
             three_prime_context: String::new(),
         };
@@ -10077,7 +11279,10 @@ mod tests {
             shifted_compare_allele: "-".to_string(),
             shifted_allele_string: "ACCTAC".to_string(),
             shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "ACCTAC".to_string(),
             alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
             five_prime_context: String::new(),
             three_prime_context: String::new(),
         });
@@ -12228,62 +13433,49 @@ mod tests {
     }
 
     #[test]
-    fn refseq_shifted_insertion_equal_window_prefers_literal_ref_window() {
-        let class = crate::hgvs::ProteinHgvsData {
-            start: 25,
-            end: 26,
-            ref_peptide: "E".into(),
-            alt_peptide: "EE".into(),
-            ref_translation: "MEEEE".into(),
-            alt_translation: "MEEEEE".into(),
-            alt_translation_extension: None,
-            frameshift: false,
-            start_lost: false,
-            stop_lost: false,
-            native_refseq: false,
-        };
-        let literal = crate::hgvs::ProteinHgvsData {
-            start: 25,
-            end: 26,
-            ref_peptide: "EE".into(),
-            alt_peptide: "EEE".into(),
-            ref_translation: "MEEEE".into(),
-            alt_translation: "MEEEEE".into(),
-            alt_translation_extension: None,
-            frameshift: false,
-            start_lost: false,
-            stop_lost: false,
-            native_refseq: false,
-        };
-
-        let equal = refseq_shifted_insertion_equal_window(&class, &literal).expect("equal window");
-        assert_eq!(equal.start, 25);
-        assert_eq!(equal.end, 26);
-        assert_eq!(equal.ref_peptide, "EE");
-        assert_eq!(equal.alt_peptide, "EE");
-    }
-
-    #[test]
     fn protein_hgvs_shifted_variant_replays_original_alleles() {
-        let shift = crate::hgvs::HgvsGenomicShift {
-            strand: 1,
-            shift_length: 53,
-            start: 3074936,
-            end: 3074935,
-            shifted_allele_string: "GCAGCAGCAGCAGCA".to_string(),
-            shifted_compare_allele: "GCAGCAGCAGCAGCA".to_string(),
-            shifted_output_allele: "GCAGCAGCAGCAGCA".to_string(),
-            alt_orig_allele_string: "CAGCAGCAGCAGCAG".to_string(),
-            five_prime_context: "GCAGCAGCAGCAGCA".to_string(),
-            three_prime_context: "ACAGCCGCCACCGCC".to_string(),
-        };
         let original = var("4", 3074876, 3074882, "CCAGCAG", "CCAGCAGCAGCAGCAGCAGCAG");
+        let mut reader = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(
+                "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
+            )
+            .unwrap();
+        // build_hgvs_genomic_shift requires "-"/seq insertion form. The VCF
+        // alleles CCAGCAG→CCAGCAGCAGCAGCAGCAGCAG share a full 7-char prefix;
+        // after stripping it, the variant is a pure insertion of CAGCAGCAGCAGCAG.
+        let (vep_ref, vep_alt) =
+            crate::allele::vcf_to_vep_allele("CCAGCAG", "CCAGCAGCAGCAGCAGCAGCAG");
+        let vep_start = crate::allele::vep_norm_start(3074876, "CCAGCAG", "CCAGCAGCAGCAGCAGCAGCAG");
+        let vep_end = crate::allele::vep_norm_end(3074876, "CCAGCAG", "CCAGCAGCAGCAGCAGCAGCAG");
+        let shift = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "4",
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
+            1,
+        )
+        .unwrap()
+        .expect("shift");
 
         let shifted = protein_hgvs_shifted_variant(&original, &shift, 1);
+        // vcf_to_vep_allele full-normalizes CCAGCAG/CCAGCAGCAGCAGCAGCAGCAG
+        // to -/CAGCAGCAGCAGCAG (insertion), which shifts 1 base less than the
+        // partially-trimmed CAGCAG/CAGCAGCAGCAGCAGCAGCAG form.
         assert_eq!(shifted.start, 3074929);
         assert_eq!(shifted.end, 3074935);
-        assert_eq!(shifted.ref_allele, "CAGCCAG");
-        assert_eq!(shifted.alt_allele, "CAGCCAGGCAGCAGCAGCAGCA");
+        assert_eq!(shifted.parser_start, 3074929);
+        assert_eq!(shifted.parser_end, 3074935);
+        // The shift stores the VEP-normalized alleles passed to build_hgvs_genomic_shift.
+        assert_eq!(shift.ref_orig_allele_string, "-");
+        assert_eq!(shift.alt_orig_allele_string, "CAGCAGCAGCAGCAG");
+        // The rotated parser alleles depend on the computed shift_length.
+        let expected_ref = rotate_hgvs_protein_allele("CCAGCAG", shift.shift_length, 1);
+        let expected_alt =
+            rotate_hgvs_protein_allele("CCAGCAGCAGCAGCAGCAGCAG", shift.shift_length, 1);
+        assert_eq!(shifted.ref_allele, expected_ref);
+        assert_eq!(shifted.alt_allele, expected_alt);
     }
 
     #[test]
@@ -12345,13 +13537,25 @@ mod tests {
             shifted_allele_string: "T".into(),
             shifted_compare_allele: "-".into(),
             shifted_output_allele: "T".into(),
+            ref_orig_allele_string: "-".into(),
             alt_orig_allele_string: "T".into(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
             five_prime_context: String::new(),
             three_prime_context: String::new(),
         });
 
         assert_eq!(
-            protein_hgvs_for_output(&t, &exons_ref, Some(&tr), &v, true, Some(&fallback), true),
+            protein_hgvs_for_output(
+                &t,
+                &exons_ref,
+                Some(&tr),
+                &v,
+                true,
+                None,
+                Some(&fallback),
+                true,
+            ),
             None
         );
     }
@@ -12371,6 +13575,7 @@ mod tests {
         );
         t.source = Some("RefSeq".to_string());
         t.bam_edit_status = Some("ok".to_string());
+        t.has_non_polya_rna_edit = true;
         t.translation_stable_id = Some("NP_002102.4".to_string());
         t.cdna_coding_start = Some(146);
         t.cdna_coding_end = Some(9580);
@@ -12404,18 +13609,21 @@ mod tests {
             "CCAGCAG".into(),
             "CCAGCAGCAGCAGCAGCAGCAG".into(),
         );
-        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
-            strand: 1,
-            shift_length: 53,
-            start: 3074936,
-            end: 3074935,
-            shifted_allele_string: "GCAGCAGCAGCAGCA".to_string(),
-            shifted_compare_allele: "GCAGCAGCAGCAGCA".to_string(),
-            shifted_output_allele: "GCAGCAGCAGCAGCA".to_string(),
-            alt_orig_allele_string: "CAGCAGCAGCAGCAG".to_string(),
-            five_prime_context: "GCAGCAGCAGCAGCA".to_string(),
-            three_prime_context: "ACAGCCGCCACCGCC".to_string(),
-        });
+        let mut reader = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(
+                "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
+            )
+            .unwrap();
+        v.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "4",
+            &v.parser_ref_allele,
+            &v.parser_alt_allele,
+            v.parser_start,
+            v.parser_end,
+            1,
+        )
+        .unwrap();
 
         let tr = translation(
             "NM_002111.8",
@@ -12432,6 +13640,9 @@ mod tests {
             Some(&tr),
             &v,
             true,
+            class
+                .protein_position_start
+                .zip(class.protein_position_end.or(class.protein_position_start)),
             class.protein_hgvs.as_ref(),
             true,
         )
@@ -12544,16 +13755,31 @@ mod tests {
             shifted_allele_string: "A".to_string(),
             shifted_compare_allele: "-".to_string(),
             shifted_output_allele: "A".to_string(),
+            ref_orig_allele_string: "-".to_string(),
             alt_orig_allele_string: "A".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
             five_prime_context: String::new(),
             three_prime_context: String::new(),
         });
 
-        let protein =
-            protein_hgvs_for_output(&t, &exons_ref, Some(&tr), &v, true, Some(&fallback), true)
-                .expect("fallback protein hgvs");
-
-        assert_eq!(protein, fallback);
+        // VEP's hgvs_protein() checks translation_start/end with the shifting
+        // offset. With shift_length=50, the shifted position (1053) falls far
+        // outside the CDS (1000-1011), so VEP returns undef. Vepyr replicates
+        // this by suppressing HGVSp when the shifted position is outside CDS.
+        assert_eq!(
+            protein_hgvs_for_output(
+                &t,
+                &exons_ref,
+                Some(&tr),
+                &v,
+                true,
+                None,
+                Some(&fallback),
+                true,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -12605,25 +13831,39 @@ mod tests {
             shifted_allele_string: "TTT".to_string(),
             shifted_compare_allele: "-".to_string(),
             shifted_output_allele: "TTT".to_string(),
+            ref_orig_allele_string: "-".to_string(),
             alt_orig_allele_string: "TTT".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
             five_prime_context: String::new(),
             three_prime_context: String::new(),
         });
 
         let class = classify_coding_change(&t, &exons_ref, Some(&tr), &v).expect("classification");
-        let protein = protein_hgvs_for_output(
-            &t,
-            &exons_ref,
-            Some(&tr),
-            &v,
-            true,
-            class.protein_hgvs.as_ref(),
-            true,
-        )
-        .expect("protein hgvs");
-        let formatted = crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), &protein, true);
-
-        assert_eq!(formatted.as_deref(), Some("ENSP00000481600:p.Lys9dup"));
+        // The manually-constructed shift (shift_length=3, start=102810367) puts
+        // the shifted insertion 3bp before exon 1 on the negative strand — in
+        // the intron. VEP's hgvs_protein() guard checks translation_start with
+        // the shifting_offset via the transcript mapper and returns undef when
+        // the shifted position is intronic. Vepyr replicates this exactly via
+        // shifted_tva_coords_from_mapper. In real-world runs, build_hgvs_genomic_shift
+        // produces different shift data for this variant that keeps it in-exon
+        // (c.24_26dup / p.Lys9dup), but this unit test uses artificial shift data.
+        assert_eq!(
+            protein_hgvs_for_output(
+                &t,
+                &exons_ref,
+                Some(&tr),
+                &v,
+                true,
+                class
+                    .protein_position_start
+                    .zip(class.protein_position_end.or(class.protein_position_start)),
+                class.protein_hgvs.as_ref(),
+                true,
+            ),
+            None,
+            "VEP's hgvs_protein guard suppresses HGVSp when the shifted position is intronic"
+        );
     }
 
     #[test]
@@ -12641,6 +13881,7 @@ mod tests {
         );
         t.source = Some("RefSeq".to_string());
         t.bam_edit_status = Some("ok".to_string());
+        t.has_non_polya_rna_edit = true;
         t.translation_stable_id = Some("NP_002102.4".to_string());
         t.cdna_coding_start = Some(146);
         t.cdna_coding_end = Some(9580);
@@ -12674,9 +13915,6 @@ mod tests {
             "CCAGCAG".into(),
             "CCAGCAGCAGCAGCAGCAGCAG".into(),
         );
-        let (vep_ref, vep_alt) = crate::allele::vcf_to_vep_allele(&v.ref_allele, &v.alt_allele);
-        let vep_start = crate::allele::vep_norm_start(v.start, &v.ref_allele, &v.alt_allele);
-        let vep_end = crate::allele::vep_norm_end(v.start, &v.ref_allele, &v.alt_allele);
         let mut reader = noodles_fasta::io::indexed_reader::Builder::default()
             .build_from_path(
                 "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
@@ -12685,10 +13923,10 @@ mod tests {
         v.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
             &mut reader,
             "4",
-            &vep_ref,
-            &vep_alt,
-            vep_start,
-            vep_end,
+            &v.parser_ref_allele,
+            &v.parser_alt_allele,
+            v.parser_start,
+            v.parser_end,
             1,
         )
         .unwrap();
@@ -12701,8 +13939,21 @@ mod tests {
             Some(include_str!("../../../.tmp_chr4_nm002111_translateable_seq.txt").trim()),
         );
 
-        let shift = v.hgvs_shift_forward.as_ref().unwrap();
+        let refseq_shift =
+            refseq_transcript_shift_for_hgvs_protein(&t, &exons_ref, &v).expect("refseq shift");
+        println!("refseq_shift={refseq_shift:?}");
+        let shift = &refseq_shift;
         println!("shift={shift:?}");
+        println!(
+            "shift boundary cdna {:?} {:?}",
+            genomic_to_cdna_index_for_transcript(&t, &exons_ref, shift.display_end()),
+            genomic_to_cdna_index_for_transcript(&t, &exons_ref, shift.display_start())
+        );
+        println!(
+            "shift boundary cds {:?} {:?}",
+            genomic_to_cds_index(&t, &exons_ref, shift.display_end()),
+            genomic_to_cds_index(&t, &exons_ref, shift.display_start())
+        );
         let original_class = classify_coding_change(&t, &exons_ref, Some(&tr), &v).unwrap();
         println!("original class protein={:?}", original_class.protein_hgvs);
         println!(
@@ -12722,47 +13973,136 @@ mod tests {
             end: shift.display_end(),
             ref_allele: "-".to_string(),
             alt_allele: shift.shifted_output_allele.clone(),
+            parser_start: shift.display_start(),
+            parser_end: shift.display_end(),
+            parser_ref_allele: "-".to_string(),
+            parser_alt_allele: shift.shifted_output_allele.clone(),
             hgvs_shift_forward: None,
             hgvs_shift_reverse: None,
         };
         println!("shifted_variant={shifted_variant:?}");
         let class = classify_coding_change(&t, &exons_ref, Some(&tr), &shifted_variant).unwrap();
+        println!(
+            "class cds positions {:?}-{:?}",
+            class.cds_position_start, class.cds_position_end
+        );
         println!("class protein={:?}", class.protein_hgvs);
+        println!(
+            "class raw positions {:?}-{:?}",
+            class.protein_position_start, class.protein_position_end
+        );
         let literal =
             literal_indel_protein_hgvs_data(&t, &exons_ref, Some(&tr), &shifted_variant, &class);
         println!("literal={literal:?}");
-        let protein_shifted_variant =
-            protein_hgvs_shifted_variant(&v, v.hgvs_shift_forward.as_ref().unwrap(), 1);
+        let protein_shifted_variant = protein_hgvs_shifted_variant(&v, shift, 1);
         println!("protein_shifted_variant={protein_shifted_variant:?}");
         let protein_shifted_class =
-            classify_coding_change(&t, &exons_ref, Some(&tr), &protein_shifted_variant).unwrap();
+            classify_coding_change(&t, &exons_ref, Some(&tr), &protein_shifted_variant);
         println!(
             "protein_shifted_class protein={:?}",
-            protein_shifted_class.protein_hgvs
+            protein_shifted_class
+                .as_ref()
+                .and_then(|class| class.protein_hgvs.clone())
+        );
+        println!(
+            "protein_shifted_class raw positions {:?}-{:?}",
+            protein_shifted_class
+                .as_ref()
+                .and_then(|class| class.protein_position_start),
+            protein_shifted_class
+                .as_ref()
+                .and_then(|class| class.protein_position_end)
+        );
+        let protein_shifted_ref_variant = VariantInput {
+            chrom: protein_shifted_variant.chrom.clone(),
+            start: protein_shifted_variant.start,
+            end: protein_shifted_variant.end,
+            ref_allele: protein_shifted_variant.ref_allele.clone(),
+            alt_allele: shift.ref_orig_allele_string.clone(),
+            parser_start: protein_shifted_variant.parser_start,
+            parser_end: protein_shifted_variant.parser_end,
+            parser_ref_allele: protein_shifted_variant.parser_ref_allele.clone(),
+            parser_alt_allele: shift.ref_orig_allele_string.clone(),
+            hgvs_shift_forward: None,
+            hgvs_shift_reverse: None,
+        };
+        println!("protein_shifted_ref_variant={protein_shifted_ref_variant:?}");
+        let protein_shifted_ref_class =
+            classify_coding_change(&t, &exons_ref, Some(&tr), &protein_shifted_ref_variant);
+        println!(
+            "protein_shifted_ref_class={:?}",
+            protein_shifted_ref_class
+                .as_ref()
+                .and_then(|class| class.protein_hgvs.clone())
         );
         let shifted_literal = literal_shifted_indel_protein_hgvs_data(
             &t,
             &exons_ref,
             Some(&tr),
             &v,
-            v.hgvs_shift_forward.as_ref().unwrap(),
+            shift,
             original_class.protein_hgvs.as_ref().unwrap(),
         );
         println!("shifted_literal={shifted_literal:?}");
+        let shifted_tva = shifted_tva_protein_hgvs_data(
+            &t,
+            &exons_ref,
+            Some(&tr),
+            &v,
+            shift,
+            class.protein_hgvs.as_ref(),
+        );
+        println!("shifted_tva={shifted_tva:?}");
+        let shifted_tva_original_bounds = shifted_tva_protein_hgvs_data(
+            &t,
+            &exons_ref,
+            Some(&tr),
+            &v,
+            shift,
+            original_class.protein_hgvs.as_ref(),
+        );
+        println!("shifted_tva_original_bounds={shifted_tva_original_bounds:?}");
+        if let Some(ref protein) = shifted_tva {
+            println!(
+                "shifted_tva concise {}-{} {}->{}",
+                protein.start, protein.end, protein.ref_peptide, protein.alt_peptide
+            );
+        }
+        if let Some(ref protein) = shifted_tva_original_bounds {
+            println!(
+                "shifted_tva_original_bounds concise {}-{} {}->{}",
+                protein.start, protein.end, protein.ref_peptide, protein.alt_peptide
+            );
+        }
         let protein = protein_hgvs_for_output(
             &t,
             &exons_ref,
             Some(&tr),
             &v,
             true,
+            class
+                .protein_position_start
+                .zip(class.protein_position_end.or(class.protein_position_start)),
             class.protein_hgvs.as_ref(),
             true,
         );
         println!("final={protein:?}");
+        if let Some(ref protein) = protein {
+            println!(
+                "final concise {}-{} {}->{}",
+                protein.start, protein.end, protein.ref_peptide, protein.alt_peptide
+            );
+        }
         let effective_tr = translation_for_hgvsp(&t, &tr);
         println!(
             "formatted final={:?}",
             protein
+                .as_ref()
+                .and_then(|p| crate::hgvs::format_hgvsp(&effective_tr, p, true))
+        );
+        println!(
+            "formatted shifted_tva={:?}",
+            shifted_tva
                 .as_ref()
                 .and_then(|p| crate::hgvs::format_hgvsp(&effective_tr, p, true))
         );
@@ -12798,6 +14138,475 @@ mod tests {
         println!(
             "formatted raw_hybrid={:?}",
             crate::hgvs::format_hgvsp(&effective_tr, &raw_hybrid, true)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_chr2_enst00000389554_shifted_protein_hgvs_payload() {
+        let mut t = tx(
+            "ENST00000389554",
+            "2",
+            161416297,
+            161425870,
+            1,
+            "protein_coding",
+            Some(161416411),
+            Some(161425278),
+        );
+        t.source = Some("ensembl_havana".to_string());
+        t.translation_stable_id = Some("ENSP00000374205".to_string());
+        t.cdna_coding_start = Some(115);
+        t.cdna_coding_end = Some(2163);
+        t.translateable_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000389554_translateable_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        t.five_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000389554_five_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        t.three_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000389554_three_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+
+        let exons = vec![
+            exon("ENST00000389554", 1, 161416297, 161417102),
+            exon("ENST00000389554", 2, 161417676, 161417830),
+            exon("ENST00000389554", 3, 161418201, 161418322),
+            exon("ENST00000389554", 4, 161418892, 161419050),
+            exon("ENST00000389554", 5, 161420196, 161420257),
+            exon("ENST00000389554", 6, 161423369, 161425870),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let mut v = VariantInput::from_vcf(
+            "2".into(),
+            161423517,
+            161423517,
+            "C".into(),
+            "CCGGGCG".into(),
+        );
+        let mut reader = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(
+                "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
+            )
+            .unwrap();
+        let (vep_ref, vep_alt) =
+            crate::allele::vcf_to_vep_allele(&v.parser_ref_allele, &v.parser_alt_allele);
+        let vep_start = crate::allele::vep_norm_start(
+            v.parser_start,
+            &v.parser_ref_allele,
+            &v.parser_alt_allele,
+        );
+        let vep_end =
+            crate::allele::vep_norm_end(v.parser_start, &v.parser_ref_allele, &v.parser_alt_allele);
+        v.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "2",
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
+            1,
+        )
+        .unwrap();
+
+        let tr = translation(
+            "ENST00000389554",
+            Some(2049),
+            Some(682),
+            Some(include_str!("../../../.tmp_chr2_ensp00000374205_translation_seq.txt").trim()),
+            Some(include_str!("../../../.tmp_chr2_enst00000389554_translateable_seq.txt").trim()),
+        );
+
+        let class = classify_coding_change(&t, &exons_ref, Some(&tr), &v).unwrap();
+        println!("class protein={:?}", class.protein_hgvs);
+        let shift = v.hgvs_shift_forward.as_ref().unwrap();
+        println!("shift={shift:?}");
+        let shifted_variant = protein_hgvs_shifted_variant(&v, shift, t.strand);
+        println!("shifted_variant={shifted_variant:?}");
+        let coords = shifted_tva_coords_from_mapper(&t, &exons_ref, &tr, &shifted_variant);
+        println!("coords={coords:?}");
+        let shifted_tva = shifted_tva_protein_hgvs_data(
+            &t,
+            &exons_ref,
+            Some(&tr),
+            &v,
+            shift,
+            class.protein_hgvs.as_ref(),
+        );
+        println!("shifted_tva={shifted_tva:?}");
+        println!(
+            "formatted shifted_tva={:?}",
+            shifted_tva.as_ref().and_then(|p| crate::hgvs::format_hgvsp(
+                &translation_for_hgvsp(&t, &tr),
+                p,
+                true
+            ))
+        );
+        let protein = protein_hgvs_for_output(
+            &t,
+            &exons_ref,
+            Some(&tr),
+            &v,
+            true,
+            class
+                .protein_position_start
+                .zip(class.protein_position_end.or(class.protein_position_start)),
+            class.protein_hgvs.as_ref(),
+            true,
+        );
+        println!("final={protein:?}");
+        println!(
+            "formatted final={:?}",
+            protein.as_ref().and_then(|p| crate::hgvs::format_hgvsp(
+                &translation_for_hgvsp(&t, &tr),
+                p,
+                true
+            ))
+        );
+    }
+
+    #[test]
+    fn chr2_enst00000286063_negative_strand_zero_shift_dup_hgvs_matches_vep() {
+        let mut t = tx(
+            "ENST00000286063",
+            "2",
+            177623244,
+            178072777,
+            -1,
+            "protein_coding",
+            Some(177629407),
+            Some(178072437),
+        );
+        t.source = Some("ensembl_havana".to_string());
+        t.translation_stable_id = Some("ENSP00000286063".to_string());
+        t.cdna_coding_start = Some(341);
+        t.cdna_coding_end = Some(3142);
+        t.translateable_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000286063_translateable_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        t.five_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000286063_five_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        t.three_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000286063_three_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+
+        let exons = vec![
+            exon("ENST00000286063", 1, 178071526, 178072777),
+            exon("ENST00000286063", 2, 178014302, 178014460),
+            exon("ENST00000286063", 3, 177905098, 177905187),
+            exon("ENST00000286063", 4, 177898058, 177898198),
+            exon("ENST00000286063", 5, 177875859, 177875923),
+            exon("ENST00000286063", 6, 177840251, 177840383),
+            exon("ENST00000286063", 7, 177820220, 177820295),
+            exon("ENST00000286063", 8, 177817858, 177817925),
+            exon("ENST00000286063", 9, 177816829, 177816921),
+            exon("ENST00000286063", 10, 177769323, 177769373),
+            exon("ENST00000286063", 11, 177728026, 177728172),
+            exon("ENST00000286063", 12, 177727658, 177727765),
+            exon("ENST00000286063", 13, 177711769, 177711878),
+            exon("ENST00000286063", 14, 177701121, 177701211),
+            exon("ENST00000286063", 15, 177697332, 177697432),
+            exon("ENST00000286063", 16, 177680826, 177680903),
+            exon("ENST00000286063", 17, 177675455, 177675518),
+            exon("ENST00000286063", 18, 177669493, 177669567),
+            exon("ENST00000286063", 19, 177663866, 177663949),
+            exon("ENST00000286063", 20, 177623244, 177629562),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let mut v =
+            VariantInput::from_vcf("2".into(), 177629445, 177629445, "G".into(), "GGGA".into());
+        let mut reader = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(
+                "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
+            )
+            .unwrap();
+        let (vep_ref, vep_alt) =
+            crate::allele::vcf_to_vep_allele(&v.parser_ref_allele, &v.parser_alt_allele);
+        let vep_start = crate::allele::vep_norm_start(
+            v.parser_start,
+            &v.parser_ref_allele,
+            &v.parser_alt_allele,
+        );
+        let vep_end =
+            crate::allele::vep_norm_end(v.parser_start, &v.parser_ref_allele, &v.parser_alt_allele);
+        v.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "2",
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
+            1,
+        )
+        .unwrap();
+        v.hgvs_shift_reverse = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "2",
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
+            -1,
+        )
+        .unwrap();
+
+        let tr = translation(
+            "ENST00000286063",
+            Some(2802),
+            Some(933),
+            Some(include_str!("../../../.tmp_chr2_ensp00000286063_translation_seq.txt").trim()),
+            Some(include_str!("../../../.tmp_chr2_enst00000286063_translateable_seq.txt").trim()),
+        );
+
+        let class = classify_coding_change(&t, &exons_ref, Some(&tr), &v).unwrap();
+        let protein = protein_hgvs_for_output(
+            &t,
+            &exons_ref,
+            Some(&tr),
+            &v,
+            true,
+            class
+                .protein_position_start
+                .zip(class.protein_position_end.or(class.protein_position_start)),
+            class.protein_hgvs.as_ref(),
+            true,
+        );
+        let formatted = protein
+            .as_ref()
+            .and_then(|p| crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), p, true));
+        assert_eq!(formatted.as_deref(), Some("ENSP00000286063:p.Ser921dup"));
+    }
+
+    #[test]
+    fn chr2_enst00000483795_negative_strand_frameshift_hgvs_matches_vep() {
+        let mut t = tx(
+            "ENST00000483795",
+            "2",
+            9405694,
+            9423456,
+            -1,
+            "protein_coding",
+            Some(9412233),
+            Some(9418697),
+        );
+        t.source = Some("ensembl_havana".to_string());
+        t.translation_stable_id = Some("ENSP00000433814".to_string());
+        t.cdna_coding_start = Some(120);
+        t.cdna_coding_end = Some(443);
+        t.translateable_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000483795_translateable_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        t.five_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000483795_five_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        t.three_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000483795_three_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+
+        let exons = vec![
+            exon("ENST00000483795", 1, 9423373, 9423456),
+            exon("ENST00000483795", 2, 9418626, 9418732),
+            exon("ENST00000483795", 3, 9414178, 9414256),
+            exon("ENST00000483795", 4, 9412068, 9412405),
+            exon("ENST00000483795", 5, 9408113, 9408205),
+            exon("ENST00000483795", 6, 9405694, 9406905),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let mut v = VariantInput::from_vcf("2".into(), 9412254, 9412254, "A".into(), "AT".into());
+        let mut reader = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(
+                "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
+            )
+            .unwrap();
+        let (vep_ref, vep_alt) =
+            crate::allele::vcf_to_vep_allele(&v.parser_ref_allele, &v.parser_alt_allele);
+        let vep_start = crate::allele::vep_norm_start(
+            v.parser_start,
+            &v.parser_ref_allele,
+            &v.parser_alt_allele,
+        );
+        let vep_end =
+            crate::allele::vep_norm_end(v.parser_start, &v.parser_ref_allele, &v.parser_alt_allele);
+        v.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "2",
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
+            1,
+        )
+        .unwrap();
+        v.hgvs_shift_reverse = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "2",
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
+            -1,
+        )
+        .unwrap();
+
+        let tr = translation(
+            "ENST00000483795",
+            Some(324),
+            Some(107),
+            Some(include_str!("../../../.tmp_chr2_enst00000483795_peptide_seq.txt").trim()),
+            Some(include_str!("../../../.tmp_chr2_enst00000483795_translateable_seq.txt").trim()),
+        );
+
+        let class = classify_coding_change(&t, &exons_ref, Some(&tr), &v).unwrap();
+        let protein = protein_hgvs_for_output(
+            &t,
+            &exons_ref,
+            Some(&tr),
+            &v,
+            true,
+            class
+                .protein_position_start
+                .zip(class.protein_position_end.or(class.protein_position_start)),
+            class.protein_hgvs.as_ref(),
+            true,
+        );
+        let formatted = protein
+            .as_ref()
+            .and_then(|p| crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), p, true));
+        assert_eq!(
+            formatted.as_deref(),
+            Some("ENSP00000433814:p.Asn101LysfsTer95")
+        );
+    }
+
+    #[test]
+    fn chr2_enst00000294954_negative_strand_dup_hgvs_matches_vep() {
+        let mut t = tx(
+            "ENST00000294954",
+            "2",
+            48686774,
+            48755724,
+            -1,
+            "protein_coding",
+            Some(48687697),
+            Some(48755671),
+        );
+        t.source = Some("ensembl_havana".to_string());
+        t.translation_stable_id = Some("ENSP00000294954".to_string());
+        t.cdna_coding_start = Some(54);
+        t.cdna_coding_end = Some(2153);
+        t.translateable_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000294954_translateable_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        t.five_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000294954_five_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+        t.three_prime_utr_seq = Some(
+            include_str!("../../../.tmp_chr2_enst00000294954_three_prime_utr_seq.txt")
+                .trim()
+                .to_string(),
+        );
+
+        let exons = vec![
+            exon("ENST00000294954", 1, 48755511, 48755724),
+            exon("ENST00000294954", 2, 48731227, 48731298),
+            exon("ENST00000294954", 3, 48729153, 48729227),
+            exon("ENST00000294954", 4, 48725676, 48725750),
+            exon("ENST00000294954", 5, 48723622, 48723696),
+            exon("ENST00000294954", 6, 48723456, 48723533),
+            exon("ENST00000294954", 7, 48713986, 48714054),
+            exon("ENST00000294954", 8, 48708948, 48709022),
+            exon("ENST00000294954", 9, 48698615, 48698800),
+            exon("ENST00000294954", 10, 48694224, 48694304),
+            exon("ENST00000294954", 11, 48686774, 48688849),
+        ];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let mut v =
+            VariantInput::from_vcf("2".into(), 48755616, 48755616, "G".into(), "GGCTGCA".into());
+        let mut reader = noodles_fasta::io::indexed_reader::Builder::default()
+            .build_from_path(
+                "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
+            )
+            .unwrap();
+        let (vep_ref, vep_alt) =
+            crate::allele::vcf_to_vep_allele(&v.parser_ref_allele, &v.parser_alt_allele);
+        let vep_start = crate::allele::vep_norm_start(
+            v.parser_start,
+            &v.parser_ref_allele,
+            &v.parser_alt_allele,
+        );
+        let vep_end =
+            crate::allele::vep_norm_end(v.parser_start, &v.parser_ref_allele, &v.parser_alt_allele);
+        v.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "2",
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
+            1,
+        )
+        .unwrap();
+        v.hgvs_shift_reverse = crate::hgvs::build_hgvs_genomic_shift(
+            &mut reader,
+            "2",
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
+            -1,
+        )
+        .unwrap();
+
+        let tr = translation(
+            "ENST00000294954",
+            Some(2100),
+            Some(699),
+            Some(include_str!("../../../.tmp_chr2_enst00000294954_peptide_seq.txt").trim()),
+            Some(include_str!("../../../.tmp_chr2_enst00000294954_translateable_seq.txt").trim()),
+        );
+
+        let class = classify_coding_change(&t, &exons_ref, Some(&tr), &v).unwrap();
+        let protein = protein_hgvs_for_output(
+            &t,
+            &exons_ref,
+            Some(&tr),
+            &v,
+            true,
+            class
+                .protein_position_start
+                .zip(class.protein_position_end.or(class.protein_position_start)),
+            class.protein_hgvs.as_ref(),
+            true,
+        );
+        let formatted = protein
+            .as_ref()
+            .and_then(|p| crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), p, true));
+        assert_eq!(
+            formatted.as_deref(),
+            Some("ENSP00000294954:p.Leu17_Gln18dup")
         );
     }
 
@@ -16177,7 +17986,10 @@ mod tests {
             shifted_allele_string: "CCGCC".to_string(),
             shifted_compare_allele: "-".to_string(),
             shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "CCGCC".to_string(),
             alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
             five_prime_context: String::new(),
             three_prime_context: String::new(),
         });
@@ -16256,7 +18068,10 @@ mod tests {
             shifted_allele_string: "AG".to_string(),
             shifted_compare_allele: "-".to_string(),
             shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "AG".to_string(),
             alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
             five_prime_context: String::new(),
             three_prime_context: String::new(),
         });
@@ -16286,6 +18101,182 @@ mod tests {
         assert_eq!(
             consequence.hgvsp, None,
             "HGVSp must stay empty when the original transcript variation is not coding"
+        );
+    }
+
+    // ── shifted_tva_peptide_window codon widening tests ─────────────────
+
+    #[test]
+    fn shifted_tva_peptide_window_widens_alt_codon_for_insertion() {
+        // CDS: ATG GCG GCG GCC TAA → M(1) A(2) A(3) A(4) *(5)
+        let cds = "ATGGCGGCGGCCTAA";
+
+        let mut t = tx(
+            "TSTWINDOW",
+            "1",
+            1000,
+            1014,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1014),
+        );
+        t.translateable_seq = Some(cds.to_string());
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(cds.len());
+
+        let tr = translation("TSTWINDOW", Some(cds.len()), Some(4), None, Some(cds));
+
+        // Shifted variant replaces 1 CDS base with 4 bases (VCF-style insertion):
+        //   ref "G" at CDS position 9, alt "GGCG" (4 bases).
+        //   vf_nt_len = 1, allele_len = 4 → VEP widens alt window by +3.
+        let coords = super::ShiftedTvaCoords {
+            cds_start: 9,
+            cds_end: 9,
+            protein_start: 3,
+            protein_end: 3,
+        };
+
+        // Reference: single codon at protein position 3
+        let (ref_pep, _, _) = super::shifted_tva_peptide_window(&t, &tr, coords, 3, 3, "G", true)
+            .expect("ref peptide should be produced");
+        assert_eq!(ref_pep, "A", "Reference peptide should be single Ala");
+
+        // Alternate: widened window captures the inserted codon as well.
+        //   Alt CDS = "ATGGCGGC" + "GGCG" + "GCCTAA" = "ATGGCGGCGGCGGCCTAA"
+        //   codon_start=6: without fix → alt[6..9]="GCG"→"A" (WRONG)
+        //                  with fix    → alt[6..12]="GCGGCG"→"AA" (CORRECT)
+        let (alt_pep, _, _) =
+            super::shifted_tva_peptide_window(&t, &tr, coords, 3, 3, "GGCG", false)
+                .expect("alt peptide should be produced");
+        assert_eq!(
+            alt_pep, "AA",
+            "Alternate peptide should contain 2 Ala residues from widened codon window"
+        );
+    }
+
+    #[test]
+    fn shifted_tva_peptide_window_shrinks_alt_codon_for_deletion() {
+        // CDS: ATG GCG AAA GCC TAA → M(1) A(2) K(3) A(4) *(5)
+        let cds = "ATGGCGAAAGCCTAA";
+
+        let mut t = tx(
+            "TSTWINDEL",
+            "1",
+            1000,
+            1014,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1014),
+        );
+        t.translateable_seq = Some(cds.to_string());
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(cds.len());
+
+        let tr = translation("TSTWINDEL", Some(cds.len()), Some(4), None, Some(cds));
+
+        // Shifted variant replaces 4 CDS bases with 1 base (VCF-style deletion):
+        //   ref "AAAG" at CDS positions 7-10, alt "A" (1 base).
+        //   vf_nt_len = 4, allele_len = 1 → VEP shrinks alt window by -3.
+        let coords = super::ShiftedTvaCoords {
+            cds_start: 7,
+            cds_end: 10,
+            protein_start: 3,
+            protein_end: 4,
+        };
+
+        // Reference: two codons at protein positions 3-4
+        let (ref_pep, _, _) =
+            super::shifted_tva_peptide_window(&t, &tr, coords, 3, 4, "AAAG", true)
+                .expect("ref peptide should be produced");
+        assert_eq!(ref_pep, "KA", "Reference peptide should be Lys+Ala");
+
+        // Alternate: narrowed window.
+        //   Alt CDS = "ATGGCG" + "A" + "CCTAA" = "ATGGCGACCTAA"
+        //   codon_start=6: ref window=6 bases, with fix → 6+(1-4)=3 → alt[6..9]="ACC"→"T"
+        let (alt_pep, _, _) = super::shifted_tva_peptide_window(&t, &tr, coords, 3, 4, "A", false)
+            .expect("alt peptide should be produced");
+        assert_eq!(
+            alt_pep, "T",
+            "Alternate peptide should be single Thr from narrowed codon window"
+        );
+    }
+
+    #[test]
+    fn shifted_inframe_insertion_produces_dup_hgvsp() {
+        // End-to-end test: a 3bp in-frame insertion in a repeated Ala region
+        // that 3' shifts to produce p.Ala3dup.
+        //
+        // CDS: ATG GCG GCG AAA TAA → M(1) A(2) A(3) K(4) *(5)
+        // Variant: pos 1005, ref "G", alt "GGCG" (insert GCG = Ala codon)
+        // 3' shift by 3 bases → shifted pos 1008
+        // The Lys at pos 4 stops the 3' peptide shift so the dup stays at pos 3.
+        let cds = "ATGGCGGCGAAATAA";
+
+        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(5000, 5000, true);
+        let mut t = tx(
+            "ENSTDUP001",
+            "1",
+            1000,
+            1014,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1014),
+        );
+        t.version = Some(1);
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(cds.len());
+        t.translation_stable_id = Some("ENSPDUP001".to_string());
+        t.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 1000,
+            genomic_end: 1014,
+            cdna_start: 1,
+            cdna_end: 15,
+            ori: 1,
+        }];
+
+        let exons = vec![exon("ENSTDUP001", 1, 1000, 1014)];
+
+        let mut tr = translation("ENSTDUP001", Some(cds.len()), Some(4), None, Some(cds));
+        tr.stable_id = Some("ENSPDUP001".to_string());
+        tr.version = Some(1);
+
+        // VCF: pos=1005, ref=G, alt=GGCG → inserts GCG (Ala codon)
+        let mut v = VariantInput::from_vcf(
+            "1".to_string(),
+            1005,
+            1005,
+            "G".to_string(),
+            "GGCG".to_string(),
+        );
+        v.hgvs_shift_forward = Some(crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 3,
+            start: 1009,
+            end: 1009,
+            shifted_allele_string: "GCG".to_string(),
+            shifted_compare_allele: "GCG".to_string(),
+            shifted_output_allele: "GCG".to_string(),
+            ref_orig_allele_string: "G".to_string(),
+            alt_orig_allele_string: "GGCG".to_string(),
+            five_prime_flanking_seq: "GCGG".to_string(),
+            three_prime_flanking_seq: "AAAT".to_string(),
+            five_prime_context: "GCGG".to_string(),
+            three_prime_context: "AAAT".to_string(),
+        });
+
+        let assignments =
+            engine.evaluate_variant_with_context(&v, &[t], &exons, &[tr], &[], &[], &[], &[]);
+        let consequence = assignments
+            .iter()
+            .find(|e| e.transcript_id.as_deref() == Some("ENSTDUP001"))
+            .expect("expected transcript consequence");
+        assert_eq!(
+            consequence.hgvsp.as_deref(),
+            Some("ENSPDUP001.1:p.Ala3dup"),
+            "In-frame insertion of Ala in Ala repeat should produce p.Ala3dup"
         );
     }
 }
