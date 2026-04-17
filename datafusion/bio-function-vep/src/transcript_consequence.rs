@@ -6451,46 +6451,20 @@ fn use_cdna_mapper_for_general_coords(tx: &TranscriptFeature) -> bool {
     if tx.cdna_mapper_segments.is_empty() {
         return false;
     }
-    // RefSeq transcripts with RNA-edit *replacements* that are encoded IN the
-    // mapper's cdna coordinates would cause double-counting: the mapper already
-    // shifts the cdna positions, and `adjust_refseq_cds_output_position` /
-    // `adjust_refseq_cdna_component` would add the same offset again from the
-    // refseq_edits list.
+    // Traceability:
+    // - Ensembl Core `TranscriptMapper` is the single canonical coordinate
+    //   mapper. If mapper segments are present, they represent VEP's
+    //   edit-adjusted transcript geometry — use them exclusively.
+    //   `refseq_misalignment_offset_for_cdna` is a no-op in this case
+    //   (see the guard at the top of that function) so there is no
+    //   double-counting to worry about.
     //
-    // However, the ubiquitous polyA-tail insertion edit (start > last mapper
-    // cdna_end) is NOT encoded in the mapper (the mapper segments stop at the
-    // transcript's biological 3' end, and the polyA tail is appended). Falling
-    // back to exon geometry for these trailing edits would defeat the mapper's
-    // handling of legitimate internal gaps (like 1bp RNA-edit deletions at
-    // cdna 137 in NM_001007075.2 that produce a systematic +1 offset).
-    //
-    // Only fall back when the edit's cdna position lies WITHIN the mapper's
-    // cdna range — i.e., where the mapper itself encodes the offset.
-    //
-    // Edits with replacement_len = None (single-base deletions in the mapper
-    // gap) do NOT produce a misalignment offset, so their mapper coordinates
-    // are safe.
-    if uses_refseq_transcript_reference(tx) {
-        let last_mapper_cdna_end = tx
-            .cdna_mapper_segments
-            .iter()
-            .map(|s| s.cdna_end)
-            .max()
-            .unwrap_or(0);
-        let has_internal_replacement_edit = tx.refseq_edits.iter().any(|edit| {
-            let triggers = edit
-                .replacement_len
-                .is_some_and(|len| !edit.skip_refseq_offset && len != 0);
-            // edit.start is the cdna position where the replacement begins.
-            // Trailing edits (polyA tail) have start > last_mapper_cdna_end;
-            // leading edits and internal replacements have start <= the end
-            // of the mapper's coverage.
-            triggers && edit.start as usize <= last_mapper_cdna_end
-        });
-        if has_internal_replacement_edit {
-            return false;
-        }
-    }
+    // The only remaining reason to reject the mapper is when adjacent
+    // segments encode a cdna gap we can't represent (genomic-contiguous
+    // but cdna-discontinuous). In that narrow case we fall back to exon
+    // geometry for positions downstream of the gap — the same workaround
+    // VEP applies when its mapper produces Gap entries for edit-inserted
+    // cdna bases that have no genomic mapping.
     let mut segments = tx.cdna_mapper_segments.iter().collect::<Vec<_>>();
     segments.sort_by_key(|segment| {
         (
@@ -7006,6 +6980,30 @@ pub(crate) fn refseq_misalignment_offset_for_cdna(
     cdna_start: i64,
 ) -> Option<i64> {
     if !(tx.transcript_id.starts_with("NM_") || tx.transcript_id.starts_with("XM_")) {
+        return None;
+    }
+    // Traceability:
+    // - Ensembl VEP / Ensembl Core `TranscriptMapper` is a single canonical
+    //   genomic↔cdna↔cds↔pep converter. When BAM edits are applied to a
+    //   transcript (`bam_edit_status=ok`), the mapper itself is rebuilt to
+    //   incorporate those edits — there is no separate offset arithmetic
+    //   applied on top of the mapper's results.
+    //   <https://github.com/Ensembl/ensembl/blob/release/115/modules/Bio/EnsEMBL/TranscriptMapper.pm>
+    //
+    // Our `cdna_mapper_segments` are cached directly from VEP's edit-adjusted
+    // mapper — they ALREADY encode every edit offset in their cdna coordinates
+    // (e.g. leading-insertion edits shift `cdna_start` of the first segment,
+    // internal deletions produce a genomic gap between adjacent segments).
+    // Applying `refseq_misalignment_offset_for_cdna` on top would double-count.
+    //
+    // This function is therefore only meaningful when the mapper is NOT
+    // being used for coordinate lookups — either because the cache row
+    // has no mapper segments, OR because `use_cdna_mapper_for_general_coords`
+    // rejected the mapper (e.g. genomic-contiguous but cdna-discontinuous
+    // segments that encode a cdna insertion the code can't represent).
+    // In either case the caller works with unedited exon-geometry cdna and
+    // the offset must be applied to shift positions into edited cdna space.
+    if use_cdna_mapper_for_general_coords(tx) {
         return None;
     }
     let mut offset = 0i64;
@@ -10911,13 +10909,12 @@ mod tests {
     }
 
     #[test]
-    fn use_cdna_mapper_for_general_coords_falls_back_for_leading_refseq_insertion() {
-        // Models NM_001177639.3-style edit: 7-base insertion AT THE START
-        // of the transcript ("1 0 ACCGCCC"). The mapper encodes this by
-        // starting exon 1 at cdna_start=8 (not 1). Because the edit is within
-        // the mapper's cdna range, `refseq_misalignment_offset_for_cdna` would
-        // double-count the +7 offset when applied on top of the mapper's
-        // already-shifted cdna. → fall back to exon geometry.
+    fn refseq_misalignment_offset_is_noop_when_mapper_encodes_leading_insertion() {
+        // Models NM_001177639.3-style edit: 7-base insertion AT THE START of
+        // the transcript. The mapper already encodes the +7 shift by starting
+        // exon 1 at cdna_start=8 (not 1). Under VEP's single-mapper model we
+        // trust the mapper exclusively — `refseq_misalignment_offset_for_cdna`
+        // must return None for this transcript so callers don't double-count.
         let mut t = tx(
             "NM_LEAD.1",
             "1",
@@ -10942,10 +10939,37 @@ mod tests {
             replacement_len: Some(7),
             skip_refseq_offset: false,
         }];
-        assert!(
-            !use_cdna_mapper_for_general_coords(&t),
-            "leading-insertion edit should force exon-geometry fallback"
+        // Mapper is trusted: general-coords path uses mapper cdna directly.
+        assert!(use_cdna_mapper_for_general_coords(&t));
+        // Offset is a no-op: mapper already encodes the +7 shift.
+        assert_eq!(refseq_misalignment_offset_for_cdna(&t, 100), None);
+    }
+
+    #[test]
+    fn refseq_misalignment_offset_applies_when_no_mapper_segments() {
+        // Without cached mapper segments, cdna comes from raw exon geometry.
+        // In that case the refseq offset MUST be applied to shift positions
+        // into edited cdna space.
+        let mut t = tx(
+            "NM_NOMAPPER.1",
+            "1",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
         );
+        t.source = Some("RefSeq".to_string());
+        // No cdna_mapper_segments.
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 1,
+            end: 0,
+            replacement_len: Some(7),
+            skip_refseq_offset: false,
+        }];
+        assert!(!use_cdna_mapper_for_general_coords(&t));
+        assert_eq!(refseq_misalignment_offset_for_cdna(&t, 100), Some(7));
     }
 
     #[test]
