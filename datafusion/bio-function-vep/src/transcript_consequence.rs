@@ -6451,23 +6451,45 @@ fn use_cdna_mapper_for_general_coords(tx: &TranscriptFeature) -> bool {
     if tx.cdna_mapper_segments.is_empty() {
         return false;
     }
-    // RefSeq transcripts with RNA-edit *replacements* (non-zero replacement_len)
-    // encode the edit offset in the mapper's cdna coordinates (e.g. cdna_start=8
-    // instead of 1 for a 7-base insertion at the transcript start). The downstream
-    // `adjust_refseq_cds_output_position` and `adjust_refseq_cdna_component`
-    // functions add the same offset from the refseq_edits list, causing double-
-    // counting. Fall back to exon geometry for these transcripts so the offset is
-    // applied exactly once.
+    // RefSeq transcripts with RNA-edit *replacements* that are encoded IN the
+    // mapper's cdna coordinates would cause double-counting: the mapper already
+    // shifts the cdna positions, and `adjust_refseq_cds_output_position` /
+    // `adjust_refseq_cdna_component` would add the same offset again from the
+    // refseq_edits list.
     //
-    // Edits with replacement_len = None (single-base deletions in the mapper gap)
-    // do NOT produce a misalignment offset, so their mapper coordinates are safe.
-    if uses_refseq_transcript_reference(tx)
-        && tx.refseq_edits.iter().any(|edit| {
-            edit.replacement_len
-                .is_some_and(|len| !edit.skip_refseq_offset && len != 0)
-        })
-    {
-        return false;
+    // However, the ubiquitous polyA-tail insertion edit (start > last mapper
+    // cdna_end) is NOT encoded in the mapper (the mapper segments stop at the
+    // transcript's biological 3' end, and the polyA tail is appended). Falling
+    // back to exon geometry for these trailing edits would defeat the mapper's
+    // handling of legitimate internal gaps (like 1bp RNA-edit deletions at
+    // cdna 137 in NM_001007075.2 that produce a systematic +1 offset).
+    //
+    // Only fall back when the edit's cdna position lies WITHIN the mapper's
+    // cdna range — i.e., where the mapper itself encodes the offset.
+    //
+    // Edits with replacement_len = None (single-base deletions in the mapper
+    // gap) do NOT produce a misalignment offset, so their mapper coordinates
+    // are safe.
+    if uses_refseq_transcript_reference(tx) {
+        let last_mapper_cdna_end = tx
+            .cdna_mapper_segments
+            .iter()
+            .map(|s| s.cdna_end)
+            .max()
+            .unwrap_or(0);
+        let has_internal_replacement_edit = tx.refseq_edits.iter().any(|edit| {
+            let triggers = edit
+                .replacement_len
+                .is_some_and(|len| !edit.skip_refseq_offset && len != 0);
+            // edit.start is the cdna position where the replacement begins.
+            // Trailing edits (polyA tail) have start > last_mapper_cdna_end;
+            // leading edits and internal replacements have start <= the end
+            // of the mapper's coverage.
+            triggers && edit.start as usize <= last_mapper_cdna_end
+        });
+        if has_internal_replacement_edit {
+            return false;
+        }
     }
     let mut segments = tx.cdna_mapper_segments.iter().collect::<Vec<_>>();
     segments.sort_by_key(|segment| {
@@ -10885,6 +10907,163 @@ mod tests {
         assert_eq!(
             compute_cdna_position(&v, &t, &refs),
             Some("2641".to_string())
+        );
+    }
+
+    #[test]
+    fn use_cdna_mapper_for_general_coords_falls_back_for_leading_refseq_insertion() {
+        // Models NM_001177639.3-style edit: 7-base insertion AT THE START
+        // of the transcript ("1 0 ACCGCCC"). The mapper encodes this by
+        // starting exon 1 at cdna_start=8 (not 1). Because the edit is within
+        // the mapper's cdna range, `refseq_misalignment_offset_for_cdna` would
+        // double-count the +7 offset when applied on top of the mapper's
+        // already-shifted cdna. → fall back to exon geometry.
+        let mut t = tx(
+            "NM_LEAD.1",
+            "1",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        t.source = Some("RefSeq".to_string());
+        t.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 1000,
+            genomic_end: 1500,
+            cdna_start: 8,
+            cdna_end: 508,
+            ori: 1,
+        }];
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 1,
+            end: 0,
+            replacement_len: Some(7),
+            skip_refseq_offset: false,
+        }];
+        assert!(
+            !use_cdna_mapper_for_general_coords(&t),
+            "leading-insertion edit should force exon-geometry fallback"
+        );
+    }
+
+    #[test]
+    fn use_cdna_mapper_for_general_coords_keeps_mapper_for_trailing_polya_edit() {
+        // Models NM_001007075.2-style polyA-tail edit: 10-base insertion at
+        // the transcript's 3' end (e.g. "7181 7180 AAAAAAAAAA"). The edit is
+        // BEYOND the mapper's cdna range (last_mapper_cdna_end < 7181), so
+        // the mapper does NOT encode it — there's no double-counting risk
+        // for variant positions within normal cdna coverage. The mapper
+        // correctly handles legitimate internal gaps (e.g. 1bp RNA-edit
+        // deletions at cdna 137). Must use mapper, not exon geometry.
+        let mut t = tx(
+            "NM_TAIL.1",
+            "1",
+            1000,
+            8000,
+            1,
+            "protein_coding",
+            Some(1100),
+            Some(3000),
+        );
+        t.source = Some("RefSeq".to_string());
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 1000,
+                genomic_end: 1135,
+                cdna_start: 1,
+                cdna_end: 136,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                // 1bp genomic gap at 1136 encodes a cdna-137 deletion edit.
+                genomic_start: 1137,
+                genomic_end: 8000,
+                cdna_start: 137,
+                cdna_end: 7000,
+                ori: 1,
+            },
+        ];
+        t.refseq_edits = vec![
+            // 1bp deletion at cdna 137 — replacement_len = None, no offset.
+            RefSeqEdit {
+                start: 137,
+                end: 137,
+                replacement_len: None,
+                skip_refseq_offset: false,
+            },
+            // PolyA-tail insertion AFTER the mapper's cdna range.
+            RefSeqEdit {
+                start: 7181,
+                end: 7180,
+                replacement_len: Some(10),
+                skip_refseq_offset: false,
+            },
+        ];
+        assert!(
+            use_cdna_mapper_for_general_coords(&t),
+            "trailing polyA-tail edit should not force exon-geometry fallback"
+        );
+    }
+
+    #[test]
+    fn compute_cdna_position_uses_mapper_with_internal_gap_ignoring_polya_tail() {
+        // End-to-end test: variant downstream of a 1bp mapper gap on a RefSeq
+        // transcript with a polyA-tail edit. The mapper encodes the internal
+        // deletion by having segment 2's cdna_start jump from 136→137 despite
+        // an adjacent genomic offset of +2. Using the mapper gives cdna 200;
+        // exon geometry would give 201 (+1 offset bug). VEP uses the mapper.
+        let mut t = tx(
+            "NM_POLYA.1",
+            "1",
+            1000,
+            8000,
+            1,
+            "protein_coding",
+            Some(1100),
+            Some(3000),
+        );
+        t.source = Some("RefSeq".to_string());
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 1000,
+                genomic_end: 1135,
+                cdna_start: 1,
+                cdna_end: 136,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 1137,
+                genomic_end: 8000,
+                cdna_start: 137,
+                cdna_end: 7000,
+                ori: 1,
+            },
+        ];
+        t.refseq_edits = vec![
+            RefSeqEdit {
+                start: 137,
+                end: 137,
+                replacement_len: None,
+                skip_refseq_offset: false,
+            },
+            RefSeqEdit {
+                start: 7181,
+                end: 7180,
+                replacement_len: Some(10),
+                skip_refseq_offset: false,
+            },
+        ];
+        let exons = vec![exon("NM_POLYA.1", 1, 1000, 8000)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        // Variant at genomic 1200 — after the cdna-137 deletion.
+        // Mapper: local = 1200 - 1137 = 63, cdna = 137 + 63 = 200.
+        // Exon geometry would give 201 (wrong).
+        let v = var("1", 1200, 1200, "C", "G");
+        assert_eq!(
+            compute_cdna_position(&v, &t, &refs),
+            Some("200".to_string())
         );
     }
 
