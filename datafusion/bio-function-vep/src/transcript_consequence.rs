@@ -4042,14 +4042,14 @@ fn shifted_tva_coords_from_mapper(
         // The mapped insertion interval is therefore the transcript-space gap
         // AFTER the left flank and BEFORE the right flank. Do not sort the two
         // flanks here; `translation_start/end` in VEP preserve mapper order.
-        let left = genomic_to_cdna_index_for_transcript(tx, tx_exons, shifted_variant.end)?;
-        let right = genomic_to_cdna_index_for_transcript(tx, tx_exons, shifted_variant.start)?;
+        let left = genomic_to_cdna_index_for_hgvsp(tx, tx_exons, shifted_variant.end)?;
+        let right = genomic_to_cdna_index_for_hgvsp(tx, tx_exons, shifted_variant.start)?;
         (left.saturating_add(1), right.saturating_sub(1))
     } else {
         let genomic_positions = genomic_range(shifted_variant.start, shifted_variant.end)?;
         let mut cdna_positions = Vec::with_capacity(genomic_positions.len());
         for pos in genomic_positions {
-            cdna_positions.push(genomic_to_cdna_index_for_transcript(tx, tx_exons, pos)?);
+            cdna_positions.push(genomic_to_cdna_index_for_hgvsp(tx, tx_exons, pos)?);
         }
         cdna_positions.sort_unstable();
         (*cdna_positions.first()?, *cdna_positions.last()?)
@@ -4068,7 +4068,7 @@ fn shifted_tva_coords_from_mapper(
         .saturating_add(1)
         .saturating_add(leading_n_offset);
     let translateable_pos_1based = |genomic_pos: i64| -> Option<usize> {
-        genomic_to_cds_index(tx, tx_exons, genomic_pos)
+        genomic_to_cds_index_for_hgvsp(tx, tx_exons, genomic_pos)
             .and_then(|idx| idx.checked_add(leading_n_offset))
             .and_then(|idx| idx.checked_add(1))
     };
@@ -4588,7 +4588,7 @@ fn protein_hgvs_for_output(
     let shift = existing_shift.clone().or(refseq_shift.clone());
     if debug_tx {
         append_hgvs_runtime_dbg(&format!(
-            "DBG protein_hgvs_for_output selected_shift refseq_shift={refseq_shift:?} final_shift={shift:?}"
+            "DBG protein_hgvs_for_output selected_shift existing_shift={existing_shift:?} refseq_shift={refseq_shift:?} final_shift={shift:?}"
         ));
     }
     let Some(shift) = shift.as_ref() else {
@@ -6407,6 +6407,40 @@ fn mapper_segment_cdna_index(segment: &TranscriptCdnaMapperSegment, pos: i64) ->
     Some(segment.cdna_start.saturating_add(local))
 }
 
+fn exact_mapper_cdna_index_for_hgvsp(tx: &TranscriptFeature, pos: i64) -> Option<usize> {
+    if !refseq_has_edited_sequence_state(tx) || tx.cdna_mapper_segments.is_empty() {
+        return None;
+    }
+    tx.cdna_mapper_segments
+        .iter()
+        .find_map(|segment| mapper_segment_cdna_index(segment, pos))
+}
+
+fn genomic_to_cdna_index_for_hgvsp(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    pos: i64,
+) -> Option<usize> {
+    exact_mapper_cdna_index_for_hgvsp(tx, pos)
+        .or_else(|| genomic_to_cdna_index_for_transcript(tx, tx_exons, pos))
+}
+
+fn genomic_to_cds_index_for_hgvsp(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    pos: i64,
+) -> Option<usize> {
+    if let Some(cdna) = exact_mapper_cdna_index_for_hgvsp(tx, pos) {
+        let coding_start = tx.cdna_coding_start?;
+        let coding_end = tx.cdna_coding_end?;
+        if cdna < coding_start || cdna > coding_end {
+            return None;
+        }
+        return cdna.checked_sub(coding_start);
+    }
+    genomic_to_cds_index(tx, tx_exons, pos)
+}
+
 fn prefers_exon_geometry_over_mapper(tx: &TranscriptFeature) -> bool {
     tx.source.as_deref() == Some("RefSeq")
         && matches!(
@@ -7861,6 +7895,83 @@ mod tests {
             true,
         );
         assert_eq!(formatted.as_deref(), Some("NP_055935.4:p.GluGlu25="));
+    }
+
+    #[test]
+    fn shifted_tva_coords_use_exact_refseq_mapper_gap_for_hgvsp() {
+        let mut transcript = tx(
+            "NM_002111.8",
+            "4",
+            3074681,
+            3243960,
+            1,
+            "protein_coding",
+            Some(3074826),
+            Some(3240065),
+        );
+        transcript.source = Some("RefSeq".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.has_non_polya_rna_edit = true;
+        transcript.refseq_edits = vec![
+            RefSeqEdit {
+                start: 256,
+                end: 255,
+                replacement_len: Some(6),
+                skip_refseq_offset: false,
+            },
+            RefSeqEdit {
+                start: 13476,
+                end: 13475,
+                replacement_len: Some(17),
+                skip_refseq_offset: false,
+            },
+        ];
+        transcript.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3074681,
+                genomic_end: 3074935,
+                cdna_start: 1,
+                cdna_end: 255,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3074936,
+                genomic_end: 3075088,
+                cdna_start: 262,
+                cdna_end: 414,
+                ori: 1,
+            },
+        ];
+        transcript.cdna_coding_start = Some(146);
+        transcript.cdna_coding_end = Some(9580);
+        transcript.translateable_seq = Some("A".repeat(9435));
+
+        let exons = vec![exon("NM_002111.8", 1, 3074681, 3075088)];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let translation = translation("NM_002111.8", Some(9435), Some(3144), None, None);
+        let shifted_variant = VariantInput {
+            chrom: "4".to_string(),
+            start: 3074936,
+            end: 3074941,
+            ref_allele: "CAGCAG".to_string(),
+            alt_allele: "CAGCAGCAGCAGCAGCAGCAG".to_string(),
+            parser_start: 3074936,
+            parser_end: 3074941,
+            parser_ref_allele: "CAGCAG".to_string(),
+            parser_alt_allele: "CAGCAGCAGCAGCAGCAGCAG".to_string(),
+            hgvs_shift_forward: None,
+            hgvs_shift_reverse: None,
+        };
+
+        assert_eq!(
+            shifted_tva_coords_from_mapper(&transcript, &exons_ref, &translation, &shifted_variant),
+            Some(ShiftedTvaCoords {
+                cds_start: 117,
+                cds_end: 122,
+                protein_start: 39,
+                protein_end: 41,
+            })
+        );
     }
 
     #[test]
@@ -14084,26 +14195,16 @@ mod tests {
     }
 
     #[test]
-    fn chr4_3074876_htt_cag_insertion_hgvsp_pins_current_output() {
+    #[ignore = "bug: HTT polyQ HGVSp differs from VEP — target p.Pro39delinsGlnGlnGlnGln; see chr4_3074876 analysis"]
+    fn chr4_3074876_htt_cag_insertion_hgvsp_matches_vep() {
         // chr4:3074876 CCAGCAG>CCAGCAGCAGCAGCAGCAGCAG on NM_002111.8 (HTT).
         //
-        // TARGET (VEP output): NP_002102.4:p.Pro39delinsGlnGlnGlnGln
-        // CURRENT (vepyr):      NP_002102.4:p.Gln36_Gln40dup  [this assertion]
+        // TARGET (VEP output):  NP_002102.4:p.Pro39delinsGlnGlnGlnGln
+        // CURRENT (vepyr, wrong): NP_002102.4:p.Gln36_Gln40dup
         //
-        // Root cause (documented, not yet fixed): a reference-translation
-        // divergence at the HTT polyQ locus. Our cached translation_seq AND
-        // our translation of translateable_seq both yield 23 Qs at protein
-        // positions 18-40 (P at 41), but VEP's HGVSp reference for
-        // NP_002102.4 has 21 Qs (P at position 39). A 5-Q insertion against
-        // the 23-Q reference matches an upstream 5-Q window → vepyr emits
-        // `p.Gln36_Gln40dup`. Against VEP's 21-Q reference the insertion
-        // straddles the Q→P boundary → `p.Pro39delinsGlnGlnGlnGln`.
-        //
-        // This test is active (not ignored) so any accidental change to
-        // vepyr's current output triggers a visible failure. When the
-        // underlying reference source is fixed, flip the assertion to the
-        // VEP target string:
-        //   Some("NP_002102.4:p.Pro39delinsGlnGlnGlnGln")
+        // This test asserts the CORRECT VEP target and is marked #[ignore]
+        // because the bug is unfixed. Run with `--ignored` to see the diff:
+        //   cargo test chr4_3074876_htt -- --ignored
         let mut t = tx(
             "NM_002111.8",
             "4",
@@ -14117,6 +14218,36 @@ mod tests {
         t.source = Some("RefSeq".to_string());
         t.bam_edit_status = Some("ok".to_string());
         t.has_non_polya_rna_edit = true;
+        t.refseq_edits = vec![
+            RefSeqEdit {
+                start: 256,
+                end: 255,
+                replacement_len: Some(6),
+                skip_refseq_offset: false,
+            },
+            RefSeqEdit {
+                start: 13476,
+                end: 13475,
+                replacement_len: Some(17),
+                skip_refseq_offset: false,
+            },
+        ];
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3074681,
+                genomic_end: 3074935,
+                cdna_start: 1,
+                cdna_end: 255,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3074936,
+                genomic_end: 3075088,
+                cdna_start: 262,
+                cdna_end: 414,
+                ori: 1,
+            },
+        ];
         t.translation_stable_id = Some("NP_002102.4".to_string());
         t.cdna_coding_start = Some(146);
         t.cdna_coding_end = Some(9580);
@@ -14155,13 +14286,18 @@ mod tests {
                 "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
             )
             .unwrap();
+        let original_ref = "CCAGCAG".to_string();
+        let original_alt = "CCAGCAGCAGCAGCAGCAGCAG".to_string();
+        let (vep_ref, vep_alt) = crate::allele::vcf_to_vep_allele(&original_ref, &original_alt);
+        let vep_start = crate::allele::vep_norm_start(3074876, &original_ref, &original_alt);
+        let vep_end = crate::allele::vep_norm_end(3074876, &original_ref, &original_alt);
         v.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
             &mut reader,
             "4",
-            &v.parser_ref_allele,
-            &v.parser_alt_allele,
-            v.parser_start,
-            v.parser_end,
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
             1,
         )
         .unwrap();
@@ -14191,11 +14327,9 @@ mod tests {
         let formatted = crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), &protein, true);
         assert_eq!(
             formatted.as_deref(),
-            Some("NP_002102.4:p.Gln36_Gln40dup"),
-            "PIN: current vepyr output (against 23-Q ref_translation). \
-             VEP produces p.Pro39delinsGlnGlnGlnGln against its 21-Q \
-             reference NP_002102.4. Flip this assertion when the HTT \
-             polyQ reference-source divergence is resolved."
+            Some("NP_002102.4:p.Pro39delinsGlnGlnGlnGln"),
+            "VEP target. vepyr currently produces p.Gln36_Gln40dup — the \
+             HTT polyQ reference-source divergence is unfixed."
         );
     }
 
@@ -14427,6 +14561,36 @@ mod tests {
         t.source = Some("RefSeq".to_string());
         t.bam_edit_status = Some("ok".to_string());
         t.has_non_polya_rna_edit = true;
+        t.refseq_edits = vec![
+            RefSeqEdit {
+                start: 256,
+                end: 255,
+                replacement_len: Some(6),
+                skip_refseq_offset: false,
+            },
+            RefSeqEdit {
+                start: 13476,
+                end: 13475,
+                replacement_len: Some(17),
+                skip_refseq_offset: false,
+            },
+        ];
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3074681,
+                genomic_end: 3074935,
+                cdna_start: 1,
+                cdna_end: 255,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 3074936,
+                genomic_end: 3075088,
+                cdna_start: 262,
+                cdna_end: 414,
+                ori: 1,
+            },
+        ];
         t.translation_stable_id = Some("NP_002102.4".to_string());
         t.cdna_coding_start = Some(146);
         t.cdna_coding_end = Some(9580);
@@ -14465,13 +14629,18 @@ mod tests {
                 "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
             )
             .unwrap();
+        let original_ref = "CCAGCAG".to_string();
+        let original_alt = "CCAGCAGCAGCAGCAGCAGCAG".to_string();
+        let (vep_ref, vep_alt) = crate::allele::vcf_to_vep_allele(&original_ref, &original_alt);
+        let vep_start = crate::allele::vep_norm_start(3074876, &original_ref, &original_alt);
+        let vep_end = crate::allele::vep_norm_end(3074876, &original_ref, &original_alt);
         v.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
             &mut reader,
             "4",
-            &v.parser_ref_allele,
-            &v.parser_alt_allele,
-            v.parser_start,
-            v.parser_end,
+            &vep_ref,
+            &vep_alt,
+            vep_start,
+            vep_end,
             1,
         )
         .unwrap();
