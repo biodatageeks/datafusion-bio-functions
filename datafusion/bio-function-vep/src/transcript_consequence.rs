@@ -11230,6 +11230,22 @@ mod tests {
             compute_cdna_position(&v, &t, &refs),
             Some("200".to_string())
         );
+
+        // Regression for chr4:39044966 CA>C style: a variant that DELETES
+        // the RNA-edit base (cdna 137 is the deleted base itself — genomic
+        // 1136 in this model, which sits in the 1bp gap between segments).
+        // Mapper returns None for genomic 1136 (no cdna mapping exists for
+        // a deleted base) → compute_cdna_position returns None, matching
+        // VEP's behavior of emitting an empty cDNA_position field for this
+        // variant. Before the single-mapper refactor, vepyr erroneously
+        // computed cdna 137 via the double-counted offset path.
+        let deletion_of_edit_base = var("1", 1136, 1136, "A", "-");
+        assert_eq!(
+            compute_cdna_position(&deletion_of_edit_base, &t, &refs),
+            None,
+            "VEP emits empty cDNA_position when the variant overlaps a \
+             deleted RNA-edit base (chr4:39044966 CA>C regression)"
+        );
     }
 
     #[test]
