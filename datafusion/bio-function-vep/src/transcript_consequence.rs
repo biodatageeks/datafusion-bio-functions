@@ -10972,6 +10972,266 @@ mod tests {
         assert_eq!(refseq_misalignment_offset_for_cdna(&t, 100), Some(7));
     }
 
+    // ── Single-mapper-model callers: the three scenarios ──────────────────
+    //
+    // After the VEP-parity refactor, every caller of
+    // `refseq_misalignment_offset_for_cdna` takes one of three paths depending
+    // on `use_cdna_mapper_for_general_coords(tx)` and `cdna_mapper_segments`:
+    //
+    //   (A) mapper present AND used     → offset MUST be no-op
+    //   (B) mapper present BUT rejected → offset MUST be applied
+    //       (triggered by genomic-contiguous cdna-discontinuous segments)
+    //   (C) mapper absent                → offset MUST be applied
+    //
+    // The three builder helpers below set up exactly those three transcripts
+    // and the test matrix below verifies each adjuster function in each case.
+
+    fn tx_mapper_used_encodes_leading_insertion() -> TranscriptFeature {
+        // NM_001177639.3-style: 7bp leading insertion encoded by mapper
+        // starting at cdna_start=8. Mapper accepted → offset is no-op.
+        let mut t = tx(
+            "NM_USED.1",
+            "1",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        t.source = Some("RefSeq".to_string());
+        t.cdna_coding_start = Some(112);
+        t.cdna_mapper_segments = vec![TranscriptCdnaMapperSegment {
+            genomic_start: 1000,
+            genomic_end: 1500,
+            cdna_start: 8,
+            cdna_end: 508,
+            ori: 1,
+        }];
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 1,
+            end: 0,
+            replacement_len: Some(7),
+            skip_refseq_offset: false,
+        }];
+        t
+    }
+
+    fn tx_mapper_rejected_adjacent_cdna_gap() -> TranscriptFeature {
+        // NM_015120.4-style: two genomic-contiguous mapper segments with a
+        // cdna-discontinuous boundary (185 → 189 = 3bp cdna insertion with
+        // no genomic mapping). use_cdna_mapper_for_general_coords rejects
+        // this layout → offset IS applied to exon-geometry cdna.
+        let mut t = tx(
+            "NM_REJECT.1",
+            "1",
+            73385758,
+            73609919,
+            1,
+            "protein_coding",
+            Some(73385869),
+            Some(73609615),
+        );
+        t.source = Some("RefSeq".to_string());
+        t.cdna_coding_start = Some(112);
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 73385758,
+                genomic_end: 73385942,
+                cdna_start: 1,
+                cdna_end: 185,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 73385943,
+                genomic_end: 73386192,
+                cdna_start: 189,
+                cdna_end: 438,
+                ori: 1,
+            },
+        ];
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 186,
+            end: 185,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        t
+    }
+
+    fn tx_mapper_absent_with_refseq_edit() -> TranscriptFeature {
+        // No mapper segments cached → exon geometry path, offset applied.
+        let mut t = tx(
+            "NM_ABSENT.1",
+            "1",
+            1000,
+            2000,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(2000),
+        );
+        t.source = Some("RefSeq".to_string());
+        t.cdna_coding_start = Some(112);
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 1,
+            end: 0,
+            replacement_len: Some(7),
+            skip_refseq_offset: false,
+        }];
+        t
+    }
+
+    #[test]
+    fn single_mapper_model_distinguishes_three_scenarios() {
+        let used = tx_mapper_used_encodes_leading_insertion();
+        let rejected = tx_mapper_rejected_adjacent_cdna_gap();
+        let absent = tx_mapper_absent_with_refseq_edit();
+
+        assert!(use_cdna_mapper_for_general_coords(&used));
+        assert!(!use_cdna_mapper_for_general_coords(&rejected));
+        assert!(!use_cdna_mapper_for_general_coords(&absent));
+    }
+
+    #[test]
+    fn refseq_misalignment_offset_matches_mapper_usage() {
+        // (A) mapper used  → None
+        let used = tx_mapper_used_encodes_leading_insertion();
+        assert_eq!(refseq_misalignment_offset_for_cdna(&used, 500), None);
+
+        // (B) mapper rejected → offset applied (3bp insertion before cdna 500)
+        let rejected = tx_mapper_rejected_adjacent_cdna_gap();
+        assert_eq!(refseq_misalignment_offset_for_cdna(&rejected, 500), Some(3));
+
+        // (C) mapper absent → offset applied
+        let absent = tx_mapper_absent_with_refseq_edit();
+        assert_eq!(refseq_misalignment_offset_for_cdna(&absent, 500), Some(7));
+    }
+
+    #[test]
+    fn adjust_refseq_cds_output_position_matches_mapper_usage() {
+        // raw_cds_position = 300, cdna_coding_start = 112 → cdna 411
+        let used = tx_mapper_used_encodes_leading_insertion();
+        let rejected = tx_mapper_rejected_adjacent_cdna_gap();
+        let absent = tx_mapper_absent_with_refseq_edit();
+
+        // (A) mapper used  → pass-through (no offset applied)
+        assert_eq!(adjust_refseq_cds_output_position(&used, 300, 0), Some(300));
+        // (B) mapper rejected → +3 offset applied
+        assert_eq!(
+            adjust_refseq_cds_output_position(&rejected, 300, 0),
+            Some(303)
+        );
+        // (C) mapper absent → +7 offset applied
+        assert_eq!(
+            adjust_refseq_cds_output_position(&absent, 300, 0),
+            Some(307)
+        );
+    }
+
+    #[test]
+    fn adjust_refseq_cdna_component_matches_mapper_usage() {
+        let used = tx_mapper_used_encodes_leading_insertion();
+        let rejected = tx_mapper_rejected_adjacent_cdna_gap();
+        let absent = tx_mapper_absent_with_refseq_edit();
+
+        // (A) mapper used → None (caller keeps the original string unchanged)
+        assert_eq!(adjust_refseq_cdna_component(&used, "500"), None);
+        // (B) mapper rejected → +3 shift ("500" → "503")
+        assert_eq!(
+            adjust_refseq_cdna_component(&rejected, "500"),
+            Some("503".to_string())
+        );
+        // (C) mapper absent → +7 shift ("500" → "507")
+        assert_eq!(
+            adjust_refseq_cdna_component(&absent, "500"),
+            Some("507".to_string())
+        );
+    }
+
+    #[test]
+    fn edited_transcript_cdna_index_matches_mapper_usage() {
+        let used = tx_mapper_used_encodes_leading_insertion();
+        let rejected = tx_mapper_rejected_adjacent_cdna_gap();
+        let absent = tx_mapper_absent_with_refseq_edit();
+
+        // (A) mapper used → identity (cdna is already in edited space)
+        assert_eq!(edited_transcript_cdna_index(&used, 500), Some(500));
+        // (B) mapper rejected → +3 shift
+        assert_eq!(edited_transcript_cdna_index(&rejected, 500), Some(503));
+        // (C) mapper absent → +7 shift
+        assert_eq!(edited_transcript_cdna_index(&absent, 500), Some(507));
+    }
+
+    #[test]
+    fn regression_chr4_nm_001007075_style_hgvsc_uses_mapper_cdna() {
+        // End-to-end regression for the chr4 bug: a RefSeq transcript with
+        // an internal 1bp mapper-encoded deletion AND a polyA-tail edit.
+        // Before the refactor, vepyr computed cdna = 201 (exon geometry + no
+        // offset from polyA) instead of 200 (mapper). This test pins the
+        // correct behavior: the mapper's cdna is authoritative.
+        let mut t = tx(
+            "NM_CHR4LIKE.1",
+            "1",
+            1000,
+            8000,
+            1,
+            "protein_coding",
+            Some(1100),
+            Some(3000),
+        );
+        t.source = Some("RefSeq".to_string());
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 1000,
+                genomic_end: 1135,
+                cdna_start: 1,
+                cdna_end: 136,
+                ori: 1,
+            },
+            // 1bp genomic gap at 1136 encodes a cdna-137 RNA-edit deletion.
+            TranscriptCdnaMapperSegment {
+                genomic_start: 1137,
+                genomic_end: 8000,
+                cdna_start: 137,
+                cdna_end: 7000,
+                ori: 1,
+            },
+        ];
+        t.refseq_edits = vec![
+            RefSeqEdit {
+                start: 137,
+                end: 137,
+                replacement_len: None,
+                skip_refseq_offset: false,
+            },
+            // PolyA tail insertion beyond the mapper's cdna range.
+            RefSeqEdit {
+                start: 7181,
+                end: 7180,
+                replacement_len: Some(10),
+                skip_refseq_offset: false,
+            },
+        ];
+        let exons = vec![exon("NM_CHR4LIKE.1", 1, 1000, 8000)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+
+        // Mapper is used (no adjacent-cdna-gap because segments have a
+        // genomic gap between them).
+        assert!(use_cdna_mapper_for_general_coords(&t));
+        // Offset is no-op because the mapper is authoritative.
+        assert_eq!(refseq_misalignment_offset_for_cdna(&t, 200), None);
+
+        // Variant downstream of the 1bp deletion. Mapper returns cdna 200;
+        // exon geometry would return 201. Before the refactor, exon geometry
+        // was forced (by the refseq_edits guard) → 201 (+1 bug).
+        let v = var("1", 1200, 1200, "C", "G");
+        assert_eq!(
+            compute_cdna_position(&v, &t, &refs),
+            Some("200".to_string())
+        );
+    }
+
     #[test]
     fn use_cdna_mapper_for_general_coords_keeps_mapper_for_trailing_polya_edit() {
         // Models NM_001007075.2-style polyA-tail edit: 10-base insertion at
