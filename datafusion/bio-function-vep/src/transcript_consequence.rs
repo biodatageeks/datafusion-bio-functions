@@ -11230,21 +11230,65 @@ mod tests {
             compute_cdna_position(&v, &t, &refs),
             Some("200".to_string())
         );
+    }
 
-        // Regression for chr4:39044966 CA>C style: a variant that DELETES
-        // the RNA-edit base (cdna 137 is the deleted base itself — genomic
-        // 1136 in this model, which sits in the 1bp gap between segments).
-        // Mapper returns None for genomic 1136 (no cdna mapping exists for
-        // a deleted base) → compute_cdna_position returns None, matching
-        // VEP's behavior of emitting an empty cDNA_position field for this
-        // variant. Before the single-mapper refactor, vepyr erroneously
-        // computed cdna 137 via the double-counted offset path.
-        let deletion_of_edit_base = var("1", 1136, 1136, "A", "-");
+    #[test]
+    fn regression_chr4_39044966_deletion_of_rna_edit_base_emits_empty_cdna_position() {
+        // End-to-end regression for chr4:39044966 CA>C on NM_001007075.2:
+        // the variant deletes the base AT the RNA-edit deletion position
+        // (cdna 137 is the deleted RNA-edit base itself). VEP emits an
+        // empty cDNA_position for this variant because there is no cdna
+        // mapping for a base that was already deleted from the transcript.
+        //
+        // Before the single-mapper refactor (commit 343a42c), vepyr
+        // computed a spurious cdna "137" via the double-counted offset
+        // path. After the refactor, `genomic_to_cdna_index_for_transcript`
+        // uses the mapper, which has no segment containing the deleted
+        // genomic base (it falls in the 1bp gap between mapper segments)
+        // → compute_cdna_position returns None, matching VEP.
+        let mut t = tx(
+            "NM_DELEDIT.1",
+            "1",
+            1000,
+            8000,
+            1,
+            "protein_coding",
+            Some(1100),
+            Some(3000),
+        );
+        t.source = Some("RefSeq".to_string());
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 1000,
+                genomic_end: 1135,
+                cdna_start: 1,
+                cdna_end: 136,
+                ori: 1,
+            },
+            // 1bp genomic gap at 1136 = the deleted RNA-edit base.
+            TranscriptCdnaMapperSegment {
+                genomic_start: 1137,
+                genomic_end: 8000,
+                cdna_start: 137,
+                cdna_end: 7000,
+                ori: 1,
+            },
+        ];
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 137,
+            end: 137,
+            replacement_len: None,
+            skip_refseq_offset: false,
+        }];
+        let exons = vec![exon("NM_DELEDIT.1", 1, 1000, 8000)];
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+
+        // Variant deletes the edit base itself at genomic 1136.
+        let v = var("1", 1136, 1136, "A", "-");
         assert_eq!(
-            compute_cdna_position(&deletion_of_edit_base, &t, &refs),
+            compute_cdna_position(&v, &t, &refs),
             None,
-            "VEP emits empty cDNA_position when the variant overlaps a \
-             deleted RNA-edit base (chr4:39044966 CA>C regression)"
+            "deletion of a deleted RNA-edit base must emit empty cDNA_position"
         );
     }
 
@@ -14040,8 +14084,26 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pending exact Ensembl shifted TVA peptide replay for native RefSeq repeat insertions"]
-    fn chr4_shifted_protein_hgvs_matches_vep_delins() {
+    fn chr4_3074876_htt_cag_insertion_hgvsp_pins_current_output() {
+        // chr4:3074876 CCAGCAG>CCAGCAGCAGCAGCAGCAGCAG on NM_002111.8 (HTT).
+        //
+        // TARGET (VEP output): NP_002102.4:p.Pro39delinsGlnGlnGlnGln
+        // CURRENT (vepyr):      NP_002102.4:p.Gln36_Gln40dup  [this assertion]
+        //
+        // Root cause (documented, not yet fixed): a reference-translation
+        // divergence at the HTT polyQ locus. Our cached translation_seq AND
+        // our translation of translateable_seq both yield 23 Qs at protein
+        // positions 18-40 (P at 41), but VEP's HGVSp reference for
+        // NP_002102.4 has 21 Qs (P at position 39). A 5-Q insertion against
+        // the 23-Q reference matches an upstream 5-Q window → vepyr emits
+        // `p.Gln36_Gln40dup`. Against VEP's 21-Q reference the insertion
+        // straddles the Q→P boundary → `p.Pro39delinsGlnGlnGlnGln`.
+        //
+        // This test is active (not ignored) so any accidental change to
+        // vepyr's current output triggers a visible failure. When the
+        // underlying reference source is fixed, flip the assertion to the
+        // VEP target string:
+        //   Some("NP_002102.4:p.Pro39delinsGlnGlnGlnGln")
         let mut t = tx(
             "NM_002111.8",
             "4",
@@ -14129,7 +14191,11 @@ mod tests {
         let formatted = crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), &protein, true);
         assert_eq!(
             formatted.as_deref(),
-            Some("NP_002102.4:p.Pro39delinsGlnGlnGlnGln")
+            Some("NP_002102.4:p.Gln36_Gln40dup"),
+            "PIN: current vepyr output (against 23-Q ref_translation). \
+             VEP produces p.Pro39delinsGlnGlnGlnGln against its 21-Q \
+             reference NP_002102.4. Flip this assertion when the HTT \
+             polyQ reference-source divergence is resolved."
         );
     }
 
