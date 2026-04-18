@@ -2842,14 +2842,15 @@ impl AnnotateProvider {
                     translation_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let cds_sequence =
                     cds_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                // Fall back to BAM-edited columns when canonical columns are
-                // absent (older parquet caches produced before upstream d26e370).
+                // Canonical columns (upstream d26e370). Strict: if the parquet
+                // doesn't carry them, `TranslationFeature.translation_seq_canonical`
+                // stays `None` and the HGVSp helper falls through to its
+                // caller-supplied fallback — no cache-level clone of the
+                // BAM-edited value. Legacy parquet caches must be regenerated.
                 let translation_seq_canonical = translation_seq_canonical_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or_else(|| translation_seq.clone());
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let cds_sequence_canonical = cds_seq_canonical_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or_else(|| cds_sequence.clone());
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let tl_stable_id =
                     tl_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let tl_version = tl_version_idx

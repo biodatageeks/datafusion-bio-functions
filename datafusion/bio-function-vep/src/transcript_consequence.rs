@@ -3464,8 +3464,11 @@ fn transcript_mrna_seq_for_vep(tx: &TranscriptFeature) -> Option<String> {
 /// - `translation_seq`            → BAM-edited (vef_cache.peptide)
 /// - `translation_seq_canonical`  → canonical (translation.primary_seq)
 ///
-/// Older parquet caches only expose the BAM-edited column; the loader mirrors
-/// it into the canonical slot so this helper falls back gracefully.
+/// Strict: if `translation_seq_canonical` is absent (`None`), we do NOT
+/// silently substitute the BAM-edited peptide — we use the caller-supplied
+/// `fallback` (locally translated from whatever CDS the caller has). Parquet
+/// and kv_cache loaders both populate `translation_seq_canonical` directly;
+/// legacy caches lacking the column must be regenerated.
 ///
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::_vep_cache_ref_translation()`
@@ -3475,11 +3478,7 @@ fn canonical_ref_translation_for_hgvsp(
     fallback: String,
 ) -> String {
     translation
-        .and_then(|t| {
-            t.translation_seq_canonical
-                .clone()
-                .or_else(|| t.translation_seq.clone())
-        })
+        .and_then(|t| t.translation_seq_canonical.clone())
         .unwrap_or(fallback)
 }
 
