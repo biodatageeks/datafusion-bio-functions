@@ -9,16 +9,20 @@
 //! [1B flags]
 //!   bit 0: has cds_len
 //!   bit 1: has protein_len
-//!   bit 2: has translation_seq
-//!   bit 3: has cds_sequence
+//!   bit 2: has translation_seq                   (BAM-edited / vef_cache.peptide)
+//!   bit 3: has cds_sequence                      (BAM-edited / vef_cache.translateable_seq)
 //!   bit 4: has stable_id
 //!   bit 5: has version
+//!   bit 6: has translation_seq_canonical         (upstream d26e370, translation.primary_seq)
+//!   bit 7: has cds_sequence_canonical            (upstream d26e370, transcript.translateable_seq)
 //! [optional 8B cds_len u64 LE]
 //! [optional 8B protein_len u64 LE]
 //! [optional 4B translation_seq_len u32 LE + bytes]
 //! [optional 4B cds_sequence_len u32 LE + bytes]
 //! [optional 4B stable_id_len u32 LE + bytes]
 //! [optional 4B version i32 LE]
+//! [optional 4B translation_seq_canonical_len u32 LE + bytes]
+//! [optional 4B cds_sequence_canonical_len u32 LE + bytes]
 //! [4B protein_features_count u32 LE]
 //! For each protein feature:
 //!   [1B flags: bit 0 = has analysis, bit 1 = has hseqname]
@@ -27,6 +31,13 @@
 //!   [8B start i64 LE]
 //!   [8B end i64 LE]
 //! ```
+//!
+//! Backward compatibility: entries written before bits 6/7 existed simply
+//! leave those bits clear. The reader then clones the BAM-edited value into
+//! the canonical slot (matching the prior mirror-on-read behavior), so legacy
+//! fjall databases keep working unchanged after the schema bump. Writers set
+//! the flags only when canonical differs from edited (see BAM-edited RefSeq
+//! transcripts such as HTT) to avoid doubling on-disk footprint.
 //!
 //! ## Exon entry binary format (per transcript_id)
 //!
@@ -203,6 +214,8 @@ const FLAG_HAS_TRANSLATION_SEQ: u8 = 1 << 2;
 const FLAG_HAS_CDS_SEQUENCE: u8 = 1 << 3;
 const FLAG_HAS_STABLE_ID: u8 = 1 << 4;
 const FLAG_HAS_VERSION: u8 = 1 << 5;
+const FLAG_HAS_TRANSLATION_SEQ_CANONICAL: u8 = 1 << 6;
+const FLAG_HAS_CDS_SEQUENCE_CANONICAL: u8 = 1 << 7;
 
 fn serialize_translation(t: &TranslationFeature) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
@@ -226,6 +239,18 @@ fn serialize_translation(t: &TranslationFeature) -> Vec<u8> {
     if t.version.is_some() {
         flags |= FLAG_HAS_VERSION;
     }
+    // Only set the canonical flags when the canonical value is present AND
+    // distinct from the BAM-edited value. For non-edited transcripts (the
+    // common case) both are identical and storing both would double the
+    // on-disk footprint of translation entries; readers see the cleared
+    // flag and fall back to translation_seq / cds_sequence via
+    // `canonical_ref_translation_for_hgvsp()`.
+    if t.translation_seq_canonical.is_some() && t.translation_seq_canonical != t.translation_seq {
+        flags |= FLAG_HAS_TRANSLATION_SEQ_CANONICAL;
+    }
+    if t.cds_sequence_canonical.is_some() && t.cds_sequence_canonical != t.cds_sequence {
+        flags |= FLAG_HAS_CDS_SEQUENCE_CANONICAL;
+    }
     buf.push(flags);
 
     if let Some(v) = t.cds_len {
@@ -245,6 +270,16 @@ fn serialize_translation(t: &TranslationFeature) -> Vec<u8> {
     }
     if let Some(v) = t.version {
         buf.extend_from_slice(&v.to_le_bytes());
+    }
+    if flags & FLAG_HAS_TRANSLATION_SEQ_CANONICAL != 0
+        && let Some(ref s) = t.translation_seq_canonical
+    {
+        write_str(&mut buf, s);
+    }
+    if flags & FLAG_HAS_CDS_SEQUENCE_CANONICAL != 0
+        && let Some(ref s) = t.cds_sequence_canonical
+    {
+        write_str(&mut buf, s);
     }
 
     // Protein features.
@@ -320,6 +355,22 @@ fn deserialize_translation(transcript_id: &str, data: &[u8]) -> Result<Translati
         None
     };
 
+    // Canonical fields (bits 6/7) are only written when they differ from the
+    // BAM-edited values. When a flag is clear, fall back to the BAM-edited
+    // value so that non-edited transcripts (the overwhelming majority) expose
+    // identical canonical/edited peptides without paying double storage.
+    let translation_seq_canonical = if flags & FLAG_HAS_TRANSLATION_SEQ_CANONICAL != 0 {
+        Some(read_string(data, &mut off)?)
+    } else {
+        translation_seq.clone()
+    };
+
+    let cds_sequence_canonical = if flags & FLAG_HAS_CDS_SEQUENCE_CANONICAL != 0 {
+        Some(read_string(data, &mut off)?)
+    } else {
+        cds_sequence.clone()
+    };
+
     let pf_count = read_u32(data, &mut off)? as usize;
     let mut protein_features = Vec::with_capacity(pf_count);
     for _ in 0..pf_count {
@@ -346,11 +397,6 @@ fn deserialize_translation(transcript_id: &str, data: &[u8]) -> Result<Translati
         });
     }
 
-    // kv_cache currently stores only the BAM-edited translation/CDS. For now,
-    // mirror them into the canonical slots so downstream code can read either
-    // field uniformly. A future schema bump should store both explicitly.
-    let translation_seq_canonical = translation_seq.clone();
-    let cds_sequence_canonical = cds_sequence.clone();
     Ok(TranslationFeature {
         transcript_id: transcript_id.to_string(),
         cds_len,
@@ -537,6 +583,55 @@ mod tests {
     fn test_translation_roundtrip_full() {
         let t = make_translation();
         let bytes = serialize_translation(&t);
+        let restored = deserialize_translation(&t.transcript_id, &bytes).unwrap();
+        assert_eq!(t, restored);
+    }
+
+    /// BAM-edited RefSeq transcripts: canonical ≠ edited. Both must survive
+    /// the roundtrip with their original values intact (no mirror collapse).
+    #[test]
+    fn test_translation_roundtrip_distinct_canonical() {
+        let t = TranslationFeature {
+            transcript_id: "NM_002111.8".to_string(),
+            cds_len: Some(9435),
+            protein_len: Some(3144),
+            translation_seq: Some("MATLEKLMKAFESLKSFQQQQQ".to_string()), // BAM-edited (5 Qs)
+            cds_sequence: Some(
+                "ATGGCGACCCTGGAAAAGCTGATGAAGGCCTTCGAGTCCCTCAAGTCCTTCCAGCAGCAGCAGCAG".to_string(),
+            ),
+            translation_seq_canonical: Some("MATLEKLMKAFESLKSFQQQ".to_string()), // canonical (3 Qs)
+            cds_sequence_canonical: Some(
+                "ATGGCGACCCTGGAAAAGCTGATGAAGGCCTTCGAGTCCCTCAAGTCCTTCCAGCAGCAG".to_string(),
+            ),
+            stable_id: Some("NP_002102.4".to_string()),
+            version: Some(4),
+            protein_features: Vec::new(),
+        };
+        let bytes = serialize_translation(&t);
+        let restored = deserialize_translation(&t.transcript_id, &bytes).unwrap();
+        assert_eq!(t, restored);
+        // Specifically guarantee canonical and edited stayed distinct.
+        assert_ne!(restored.translation_seq, restored.translation_seq_canonical);
+        assert_ne!(restored.cds_sequence, restored.cds_sequence_canonical);
+    }
+
+    /// When canonical matches BAM-edited (non-edited transcripts — the common
+    /// case), the serializer should leave the canonical flags clear to avoid
+    /// doubling on-disk footprint. The deserializer then falls back to the
+    /// BAM-edited values so the struct still compares equal.
+    #[test]
+    fn test_translation_roundtrip_equal_canonical_skips_redundant_write() {
+        let t = make_translation(); // canonical == edited
+        let bytes = serialize_translation(&t);
+
+        let flags = bytes[0];
+        assert_eq!(
+            flags & FLAG_HAS_TRANSLATION_SEQ_CANONICAL,
+            0,
+            "canonical flag must be clear when canonical == edited"
+        );
+        assert_eq!(flags & FLAG_HAS_CDS_SEQUENCE_CANONICAL, 0);
+
         let restored = deserialize_translation(&t.transcript_id, &bytes).unwrap();
         assert_eq!(t, restored);
     }

@@ -166,6 +166,11 @@ async fn load_translations_from_parquet(
             .or_else(|_| schema.index_of("cds_seq"))
             .or_else(|_| schema.index_of("coding_sequence"))
             .ok();
+        // Upstream d26e370 added canonical (pre-BAM-edit) translation/CDS
+        // columns used by VEP's HGVSp formatting. Older parquet caches lack
+        // them; fall back to the BAM-edited columns per row below.
+        let translation_seq_canonical_idx = schema.index_of("translation_seq_canonical").ok();
+        let cds_seq_canonical_idx = schema.index_of("cds_sequence_canonical").ok();
         let stable_id_idx = schema.index_of("stable_id").ok();
         let version_idx = schema.index_of("version").ok();
         let pf_idx = schema.index_of("protein_features").ok();
@@ -191,8 +196,12 @@ async fn load_translations_from_parquet(
                 .map(|i| read_protein_features(batch.column(i).as_ref(), row))
                 .unwrap_or_default();
 
-            let translation_seq_canonical = translation_seq.clone();
-            let cds_sequence_canonical = cds_sequence.clone();
+            let translation_seq_canonical = translation_seq_canonical_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .or_else(|| translation_seq.clone());
+            let cds_sequence_canonical = cds_seq_canonical_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row))
+                .or_else(|| cds_sequence.clone());
             out.push(TranslationFeature {
                 transcript_id,
                 cds_len,
