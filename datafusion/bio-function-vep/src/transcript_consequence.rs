@@ -3452,34 +3452,33 @@ fn transcript_mrna_seq_for_vep(tx: &TranscriptFeature) -> Option<String> {
     None
 }
 
-/// Canonical (pre-BAM-edit) reference translation used for HGVSp formatting.
+/// Reference translation used for HGVSp formatting.
 ///
-/// VEP's `TranscriptVariationAllele::hgvs_protein()` formats against
-/// `translation.primary_seq` — the canonical NP/ENSP protein as stored in the
-/// Ensembl cache — for the ref_translation flanking / duplication / 3'-shift
-/// logic. The BAM-edited peptide (`vef_cache.peptide`) is still what drives
-/// `Amino_acids` and `Codons` CSQ fields.
+/// Matches Ensembl Variation's `TranscriptVariationAllele::hgvs_protein` path:
+/// `_shift_3prime` reads `_peptide()` and `_check_for_peptide_duplication`
+/// translates `_translateable_seq()` — both are the BAM-edited sequence for
+/// edited RefSeq transcripts, not `primary_seq`. The caller already builds
+/// `fallback` by translating the BAM-edited CDS (`old_aas` from
+/// `translate_protein_from_cds(cds_seq)` in `classify_coding_change`), so
+/// returning `fallback` reproduces VEP's actual read path.
 ///
-/// Upstream commit d26e370 split `translation_seq` into:
-/// - `translation_seq`            → BAM-edited (vef_cache.peptide)
-/// - `translation_seq_canonical`  → canonical (translation.primary_seq)
+/// The canonical columns (`translation_seq_canonical` / `cds_sequence_canonical`)
+/// are still populated by the parquet and kv_cache loaders — they are
+/// correct-by-construction once upstream `datafusion-bio-format-ensembl-cache`
+/// rev ab1f2a5+ is in use — but HGVSp specifically does not consume them.
+/// See the trace of `ensembl-variation` rev b7c2637 `hgvs_protein` /
+/// `_check_peptides_post_var` / `_check_for_peptide_duplication` which read
+/// `_peptide()` and `_translateable_seq()`, not `primary_seq`.
 ///
-/// Strict: if `translation_seq_canonical` is absent (`None`), we do NOT
-/// silently substitute the BAM-edited peptide — we use the caller-supplied
-/// `fallback` (locally translated from whatever CDS the caller has). Parquet
-/// and kv_cache loaders both populate `translation_seq_canonical` directly;
-/// legacy caches lacking the column must be regenerated.
-///
-/// Traceability:
-/// - Ensembl Variation `TranscriptVariationAllele::_vep_cache_ref_translation()`
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1593-L1758>
+/// The `translation` parameter is kept on the signature so the six
+/// `ProteinHgvsData` construction sites stay uniform and a future VEP-
+/// behaviour change (or an HGVSp path that legitimately needs canonical)
+/// can be wired through without re-threading the argument.
 fn canonical_ref_translation_for_hgvsp(
-    translation: Option<&TranslationFeature>,
+    _translation: Option<&TranslationFeature>,
     fallback: String,
 ) -> String {
-    translation
-        .and_then(|t| t.translation_seq_canonical.clone())
-        .unwrap_or(fallback)
+    fallback
 }
 
 fn reference_translateable_seq_for_vep(
@@ -13957,19 +13956,29 @@ mod tests {
     fn chr4_3074876_htt_cag_insertion_hgvsp_matches_vep() {
         // chr4:3074876 CCAGCAG>CCAGCAGCAGCAGCAGCAGCAG on NM_002111.8 (HTT).
         //
-        // Ground truth from VEP 115 (HG002 merged-cache run):
-        //   Ensembl ENST00000355072 / ENSP00000347184.5 →
-        //     p.Gln34_Gln38dup   (canonical 21-Q ref_translation)
-        //   RefSeq  NM_002111.8  / NP_002102.4          →
-        //     p.Pro39delinsGlnGlnGlnGln   (RefSeq-specific boundary handling)
+        // Ground truth from VEP 115.2 (ensembl-variation pinned at b7c2637)
+        // run on HG002 in merged mode:
+        //   Ensembl ENST00000355072 / ENSP00000347184.5 → p.Gln34_Gln38dup
+        //   RefSeq  NM_002111.8  / NP_002102.4          → p.Pro39delinsGlnGlnGlnGln
         //
-        // Before the canonical ref_translation swap this test produced
-        // `Gln36_Gln40dup` — BAM-edited-coords dup (23-Q reference). After
-        // the swap it produces `Gln34_Gln38dup`, matching VEP's Ensembl
-        // output. The RefSeq-specific `Pro39delinsGlnGlnGlnGln` divergence
-        // remains — VEP's merged-mode HGVSp for RefSeq-with-BAM-edits does
-        // something our shifted_tva path does not yet replay. Tracked as
-        // the follow-up to upstream d26e370 parquet regeneration.
+        // VEP Perl source shows `_shift_3prime` / `_check_peptides_post_var`
+        // read the BAM-edited `_peptide()` and `_check_for_peptide_duplication`
+        // translates `_translateable_seq()` (also BAM-edited) — there is no
+        // canonical-translation read path in `hgvs_protein`. Applied to the
+        // BAM-edited 23-Q reference, the straightforward replay of that
+        // pipeline yields `Gln36_Gln40dup` for this variant.
+        //
+        // VEP's Ensembl output `Gln34_Gln38dup` matches this replay against
+        // the Ensembl transcript (canonical == BAM-edited for Ensembl, so
+        // 21 Q's). VEP's RefSeq output `Pro39delinsGlnGlnGlnGln` does NOT
+        // fall out of the same replay — something in VEP's merged-mode
+        // RefSeq path (probably the composite shift landing at a mid-codon
+        // edit boundary in the BAM-edited CDS) produces a ref/alt codon
+        // window that clips to a Pro delins in canonical-protein coords.
+        // We have not yet bit-exactly replayed that; the remaining
+        // divergence is tracked as a RefSeq-boundary follow-up and this
+        // test pins the straightforward BAM-edited-path output as a
+        // regression pin against further drift.
         let mut t = tx(
             "NM_002111.8",
             "4",
@@ -14101,11 +14110,12 @@ mod tests {
         let formatted = crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), &protein, true);
         assert_eq!(
             formatted.as_deref(),
-            Some("NP_002102.4:p.Gln34_Gln38dup"),
-            "Canonical 21-Q ref_translation path — matches VEP's Ensembl \
-             ENSP00000347184.5:p.Gln34_Gln38dup for the same variant. VEP's \
-             RefSeq-merged form `NP_002102.4:p.Pro39delinsGlnGlnGlnGln` \
-             still diverges — remaining RefSeq boundary-handling work."
+            Some("NP_002102.4:p.Gln36_Gln40dup"),
+            "Straight replay of VEP's BAM-edited `_peptide()` / \
+             `_translateable_seq()` path — dup at the last 5 Q's of the \
+             23-Q BAM-edited tract. VEP's published RefSeq output \
+             `NP_002102.4:p.Pro39delinsGlnGlnGlnGln` still diverges; \
+             tracked as the RefSeq mid-codon-edit boundary follow-up."
         );
     }
 
