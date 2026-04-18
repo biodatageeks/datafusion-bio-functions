@@ -2433,9 +2433,16 @@ mod tests {
         assert!(q.contains("WHERE chrom = 'X'"));
     }
 
-    /// Verify HGNC propagation is present in transcript queries.
+    /// Verify the transcript export query does NOT embed HGNC propagation.
+    ///
+    /// Upstream `datafusion-bio-format-ensembl-cache` (rev d26e370+) removed
+    /// cache-level HGNC propagation. HGNC IDs are now filled in at runtime by
+    /// `apply_buffer_local_hgnc_propagation()` in `annotate_provider.rs`,
+    /// mirroring VEP's `AnnotationType::Transcript::merge_features()` buffer.
+    /// This test guards against a regression that re-introduces build-time
+    /// propagation (which would double-fill or conflict with the runtime path).
     #[test]
-    fn test_build_query_transcript_hgnc_propagation() {
+    fn test_build_query_transcript_no_hgnc_propagation() {
         let schema = test_transcript_schema();
         let q = build_export_query(
             EnsemblEntityKind::Transcript,
@@ -2444,18 +2451,15 @@ mod tests {
             Some(&schema),
         );
         assert!(
-            q.contains("COALESCE(gene_hgnc_id"),
-            "transcript query must include HGNC propagation"
+            !q.contains("COALESCE(gene_hgnc_id"),
+            "transcript query must NOT embed HGNC propagation — \
+             runtime path (apply_buffer_local_hgnc_propagation) owns that fill"
         );
         assert!(
-            q.contains("FIRST_VALUE(gene_hgnc_id) IGNORE NULLS"),
-            "transcript query must use FIRST_VALUE IGNORE NULLS window"
+            !q.contains("FIRST_VALUE(gene_hgnc_id)"),
+            "transcript query must NOT use window-based HGNC fill"
         );
-        assert!(
-            q.contains("PARTITION BY chrom, gene_symbol"),
-            "HGNC propagation must partition by chrom, gene_symbol and cache region"
-        );
-        // Explicit column list should NOT contain _rn
+        // Explicit column list should NOT start with SELECT *
         assert!(
             !q.starts_with("SELECT *"),
             "transcript query should use explicit column list, not SELECT *"
@@ -2496,9 +2500,13 @@ mod tests {
         assert!(q.contains("WHERE chrom IN ('1', '2')"));
         assert!(q.contains("ROW_NUMBER()"));
         assert!(q.contains("WHERE _rn = 1"));
+        assert!(q.contains("PARTITION BY stable_id"));
+        // HGNC propagation is a runtime concern (see
+        // apply_buffer_local_hgnc_propagation) — must not be embedded in the
+        // cache-level export query.
         assert!(
-            q.contains("COALESCE(gene_hgnc_id"),
-            "multi-chrom transcript query must include HGNC propagation"
+            !q.contains("COALESCE(gene_hgnc_id"),
+            "multi-chrom transcript query must NOT embed HGNC propagation"
         );
     }
 

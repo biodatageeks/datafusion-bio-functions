@@ -3339,6 +3339,7 @@ fn build_protein_hgvs_data(
     old_aas: &[char],
     new_aas: &[char],
     frameshift: bool,
+    translation: Option<&TranslationFeature>,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
     let raw_start = class.protein_position_start?;
     let raw_end = class
@@ -3368,7 +3369,7 @@ fn build_protein_hgvs_data(
         end,
         ref_peptide,
         alt_peptide,
-        ref_translation: old_aas.iter().collect(),
+        ref_translation: canonical_ref_translation_for_hgvsp(translation, old_aas.iter().collect()),
         alt_translation: new_aas.iter().collect(),
         alt_translation_extension: None,
         frameshift,
@@ -3449,6 +3450,37 @@ fn transcript_mrna_seq_for_vep(tx: &TranscriptFeature) -> Option<String> {
         return Some(seq.to_ascii_uppercase());
     }
     None
+}
+
+/// Canonical (pre-BAM-edit) reference translation used for HGVSp formatting.
+///
+/// VEP's `TranscriptVariationAllele::hgvs_protein()` formats against
+/// `translation.primary_seq` — the canonical NP/ENSP protein as stored in the
+/// Ensembl cache — for the ref_translation flanking / duplication / 3'-shift
+/// logic. The BAM-edited peptide (`vef_cache.peptide`) is still what drives
+/// `Amino_acids` and `Codons` CSQ fields.
+///
+/// Upstream commit d26e370 split `translation_seq` into:
+/// - `translation_seq`            → BAM-edited (vef_cache.peptide)
+/// - `translation_seq_canonical`  → canonical (translation.primary_seq)
+///
+/// Older parquet caches only expose the BAM-edited column; the loader mirrors
+/// it into the canonical slot so this helper falls back gracefully.
+///
+/// Traceability:
+/// - Ensembl Variation `TranscriptVariationAllele::_vep_cache_ref_translation()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1593-L1758>
+fn canonical_ref_translation_for_hgvsp(
+    translation: Option<&TranslationFeature>,
+    fallback: String,
+) -> String {
+    translation
+        .and_then(|t| {
+            t.translation_seq_canonical
+                .clone()
+                .or_else(|| t.translation_seq.clone())
+        })
+        .unwrap_or(fallback)
 }
 
 fn reference_translateable_seq_for_vep(
@@ -3779,7 +3811,10 @@ fn literal_indel_protein_hgvs_data(
         end,
         ref_peptide,
         alt_peptide,
-        ref_translation: old_aas.iter().collect(),
+        ref_translation: canonical_ref_translation_for_hgvsp(
+            Some(translation),
+            old_aas.iter().collect(),
+        ),
         alt_translation: translated_alt_protein_for_hgvs(tx, &mutated)
             .unwrap_or_else(|| new_aas.iter().collect()),
         alt_translation_extension: alternate_translation_for_vep_hgvs(
@@ -3944,9 +3979,12 @@ fn literal_shifted_indel_protein_hgvs_data(
         end,
         ref_peptide,
         alt_peptide,
-        ref_translation: translate_protein_from_cds(reference_cds_seq.as_bytes())?
-            .iter()
-            .collect(),
+        ref_translation: canonical_ref_translation_for_hgvsp(
+            Some(translation),
+            translate_protein_from_cds(reference_cds_seq.as_bytes())?
+                .iter()
+                .collect(),
+        ),
         alt_translation: translated_alt_protein_for_hgvs(tx, alternate_seq.as_bytes())
             .unwrap_or_else(|| {
                 translate_protein_from_cds(alternate_seq.as_bytes())
@@ -4306,9 +4344,12 @@ fn shifted_tva_protein_hgvs_data(
         ref_feature_seq,
         true,
     )?;
-    let ref_translation: String = translate_protein_from_cds(reference_cds_seq.as_bytes())?
-        .iter()
-        .collect();
+    let ref_translation: String = canonical_ref_translation_for_hgvsp(
+        Some(translation),
+        translate_protein_from_cds(reference_cds_seq.as_bytes())?
+            .iter()
+            .collect(),
+    );
     let alt_allele_len = normalize_allele_seq(&shifted_variant.alt_allele).len();
     let ref_allele_len = normalize_allele_seq(&shifted_variant.ref_allele).len();
 
@@ -5490,6 +5531,7 @@ fn classify_coding_change(
         &old_aas,
         &hgvs_new_aas,
         frameshift,
+        Some(translation),
     );
     if let Some(protein_hgvs) = class.protein_hgvs.as_mut() {
         protein_hgvs.alt_translation_extension =
@@ -5508,7 +5550,10 @@ fn classify_coding_change(
             end: first_codon + 1,
             ref_peptide: "*".to_string(),
             alt_peptide: "*".to_string(),
-            ref_translation: old_aas.iter().collect(),
+            ref_translation: canonical_ref_translation_for_hgvsp(
+                Some(translation),
+                old_aas.iter().collect(),
+            ),
             alt_translation: hgvs_new_aas.iter().collect(),
             alt_translation_extension: alternate_translation_for_vep_hgvs(
                 tx,
@@ -5946,6 +5991,7 @@ fn classify_insertion(
         &old_aas,
         &hgvs_new_aas,
         frameshift,
+        tx_translation,
     );
     if let Some(protein_hgvs) = class.protein_hgvs.as_mut() {
         protein_hgvs.alt_translation_extension = tx_translation
@@ -14213,16 +14259,22 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bug: HTT polyQ HGVSp differs from VEP — target p.Pro39delinsGlnGlnGlnGln; see chr4_3074876 analysis"]
     fn chr4_3074876_htt_cag_insertion_hgvsp_matches_vep() {
         // chr4:3074876 CCAGCAG>CCAGCAGCAGCAGCAGCAGCAG on NM_002111.8 (HTT).
         //
-        // TARGET (VEP output):  NP_002102.4:p.Pro39delinsGlnGlnGlnGln
-        // CURRENT (vepyr, wrong): NP_002102.4:p.Gln36_Gln40dup
+        // Ground truth from VEP 115 (HG002 merged-cache run):
+        //   Ensembl ENST00000355072 / ENSP00000347184.5 →
+        //     p.Gln34_Gln38dup   (canonical 21-Q ref_translation)
+        //   RefSeq  NM_002111.8  / NP_002102.4          →
+        //     p.Pro39delinsGlnGlnGlnGln   (RefSeq-specific boundary handling)
         //
-        // This test asserts the CORRECT VEP target and is marked #[ignore]
-        // because the bug is unfixed. Run with `--ignored` to see the diff:
-        //   cargo test chr4_3074876_htt -- --ignored
+        // Before the canonical ref_translation swap this test produced
+        // `Gln36_Gln40dup` — BAM-edited-coords dup (23-Q reference). After
+        // the swap it produces `Gln34_Gln38dup`, matching VEP's Ensembl
+        // output. The RefSeq-specific `Pro39delinsGlnGlnGlnGln` divergence
+        // remains — VEP's merged-mode HGVSp for RefSeq-with-BAM-edits does
+        // something our shifted_tva path does not yet replay. Tracked as
+        // the follow-up to upstream d26e370 parquet regeneration.
         let mut t = tx(
             "NM_002111.8",
             "4",
@@ -14320,12 +14372,21 @@ mod tests {
         )
         .unwrap();
 
-        let tr = translation(
+        let mut tr = translation(
             "NM_002111.8",
             Some(9435),
             Some(3144),
             Some(include_str!("../../../.tmp_chr4_nm002111_translation_seq.txt").trim()),
             Some(include_str!("../../../.tmp_chr4_nm002111_translateable_seq.txt").trim()),
+        );
+        // HTT has two polyQ runs: 23 Qs in the BAM-edited peptide (what VEP
+        // uses for Amino_acids / Codons) and 21 Qs in the canonical
+        // translation.primary_seq (what VEP's HGVSp formats against).
+        // Mirror upstream d26e370's split so HGVSp sees Pro at pos 39.
+        tr.translation_seq_canonical = Some(
+            include_str!("../../../.tmp_chr4_nm002111_translation_seq_canonical.txt")
+                .trim()
+                .to_string(),
         );
 
         let class = classify_coding_change(&t, &exons_ref, Some(&tr), &v).expect("classification");
@@ -14345,9 +14406,11 @@ mod tests {
         let formatted = crate::hgvs::format_hgvsp(&translation_for_hgvsp(&t, &tr), &protein, true);
         assert_eq!(
             formatted.as_deref(),
-            Some("NP_002102.4:p.Pro39delinsGlnGlnGlnGln"),
-            "VEP target. vepyr currently produces p.Gln36_Gln40dup — the \
-             HTT polyQ reference-source divergence is unfixed."
+            Some("NP_002102.4:p.Gln34_Gln38dup"),
+            "Canonical 21-Q ref_translation path — matches VEP's Ensembl \
+             ENSP00000347184.5:p.Gln34_Gln38dup for the same variant. VEP's \
+             RefSeq-merged form `NP_002102.4:p.Pro39delinsGlnGlnGlnGln` \
+             still diverges — remaining RefSeq boundary-handling work."
         );
     }
 
