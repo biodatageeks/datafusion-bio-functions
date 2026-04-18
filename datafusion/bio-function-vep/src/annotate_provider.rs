@@ -2786,6 +2786,16 @@ impl AnnotateProvider {
                 "cds_sequence",
                 "cds_seq",
                 "coding_sequence",
+                // Upstream d26e370+fixup added canonical (pre-BAM-edit)
+                // counterparts that drive HGVSp flanking / dup / 3'-shift
+                // checks against VEP's canonical reference rather than the
+                // BAM-edited peptide. Must be explicitly projected here or
+                // the row-level `schema.index_of(...)` below misses them
+                // and `translation_seq_canonical` ends up None for every
+                // translation — the whole canonical pipeline silently
+                // degrades back to BAM-edited behavior.
+                "translation_seq_canonical",
+                "cds_sequence_canonical",
                 "version",
                 "protein_features",
             ],
