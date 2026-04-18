@@ -191,12 +191,16 @@ async fn load_translations_from_parquet(
                 .map(|i| read_protein_features(batch.column(i).as_ref(), row))
                 .unwrap_or_default();
 
+            let translation_seq_canonical = translation_seq.clone();
+            let cds_sequence_canonical = cds_sequence.clone();
             out.push(TranslationFeature {
                 transcript_id,
                 cds_len,
                 protein_len,
                 translation_seq,
                 cds_sequence,
+                translation_seq_canonical,
+                cds_sequence_canonical,
                 stable_id,
                 version,
                 protein_features,

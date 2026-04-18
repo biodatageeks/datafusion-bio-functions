@@ -256,6 +256,18 @@ pub struct TranslationFeature {
     pub protein_len: Option<usize>,
     pub translation_seq: Option<String>,
     pub cds_sequence: Option<String>,
+    /// Canonical (pre-BAM-edit) translation from upstream
+    /// `translation_seq_canonical` column. For non-edited RefSeq and all
+    /// Ensembl transcripts the upstream decoder populates this from the
+    /// same source as `translation_seq` (so they are equal). For
+    /// BAM-edited RefSeq transcripts this holds the canonical NP_... protein
+    /// that VEP uses for HGVSp, while `translation_seq` keeps the
+    /// BAM-edited variant used for Amino_acids / Codons.
+    /// See upstream `datafusion-bio-format-ensembl-cache` commit d26e370.
+    pub translation_seq_canonical: Option<String>,
+    /// Canonical (pre-BAM-edit) CDS from upstream `cds_sequence_canonical`
+    /// column. Used to build `ref_translation` for HGVSp.
+    pub cds_sequence_canonical: Option<String>,
     /// Translation stable ID (ENSP…) for HGVSp notation.
     pub stable_id: Option<String>,
     /// Translation version number.
@@ -7733,12 +7745,16 @@ mod tests {
         translation_seq: Option<&str>,
         cds_sequence: Option<&str>,
     ) -> TranslationFeature {
+        let translation_seq = translation_seq.map(|v| v.to_string());
+        let cds_sequence = cds_sequence.map(|v| v.to_string());
         TranslationFeature {
             transcript_id: tx_id.to_string(),
             cds_len,
             protein_len,
-            translation_seq: translation_seq.map(|v| v.to_string()),
-            cds_sequence: cds_sequence.map(|v| v.to_string()),
+            translation_seq: translation_seq.clone(),
+            cds_sequence: cds_sequence.clone(),
+            translation_seq_canonical: translation_seq,
+            cds_sequence_canonical: cds_sequence,
             stable_id: None,
             version: None,
             protein_features: Vec::new(),
@@ -11661,6 +11677,8 @@ mod tests {
             protein_len: Some(3),
             translation_seq: None,
             cds_sequence: Some("ATGATGTAA".to_string()),
+            translation_seq_canonical: None,
+            cds_sequence_canonical: Some("ATGATGTAA".to_string()),
             stable_id: Some("NP_EDIT.1".to_string()),
             version: None,
             protein_features: Vec::new(),

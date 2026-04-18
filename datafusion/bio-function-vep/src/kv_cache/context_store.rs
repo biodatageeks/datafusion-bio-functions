@@ -346,12 +346,19 @@ fn deserialize_translation(transcript_id: &str, data: &[u8]) -> Result<Translati
         });
     }
 
+    // kv_cache currently stores only the BAM-edited translation/CDS. For now,
+    // mirror them into the canonical slots so downstream code can read either
+    // field uniformly. A future schema bump should store both explicitly.
+    let translation_seq_canonical = translation_seq.clone();
+    let cds_sequence_canonical = cds_sequence.clone();
     Ok(TranslationFeature {
         transcript_id: transcript_id.to_string(),
         cds_len,
         protein_len,
         translation_seq,
         cds_sequence,
+        translation_seq_canonical,
+        cds_sequence_canonical,
         stable_id,
         version,
         protein_features,
@@ -467,6 +474,8 @@ mod tests {
             protein_len: Some(400),
             translation_seq: Some("MSEQ...".to_string()),
             cds_sequence: Some("ATGCDS...".to_string()),
+            translation_seq_canonical: Some("MSEQ...".to_string()),
+            cds_sequence_canonical: Some("ATGCDS...".to_string()),
             stable_id: Some("ENSP00000123456".to_string()),
             version: Some(3),
             protein_features: vec![
@@ -493,6 +502,8 @@ mod tests {
             protein_len: None,
             translation_seq: None,
             cds_sequence: None,
+            translation_seq_canonical: None,
+            cds_sequence_canonical: None,
             stable_id: None,
             version: None,
             protein_features: Vec::new(),

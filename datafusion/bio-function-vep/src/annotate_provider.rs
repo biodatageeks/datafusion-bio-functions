@@ -2811,11 +2811,17 @@ impl AnnotateProvider {
                 .ok();
             let protein_len_idx = schema.index_of("protein_len").ok();
             let translation_seq_idx = schema.index_of("translation_seq").ok();
+            // Upstream rev d26e370 added `translation_seq_canonical` and
+            // `cds_sequence_canonical`: canonical (pre-BAM-edit) values that
+            // VEP uses for HGVSp. Fall back to the BAM-edited columns when
+            // the canonical columns are absent (older parquet caches).
+            let translation_seq_canonical_idx = schema.index_of("translation_seq_canonical").ok();
             let cds_seq_idx = schema
                 .index_of("cds_sequence")
                 .or_else(|_| schema.index_of("cds_seq"))
                 .or_else(|_| schema.index_of("coding_sequence"))
                 .ok();
+            let cds_seq_canonical_idx = schema.index_of("cds_sequence_canonical").ok();
             let tl_stable_id_idx = schema.index_of("stable_id").ok();
             let tl_version_idx = schema.index_of("version").ok();
             // SIFT/PolyPhen predictions are NOT loaded here — they are loaded
@@ -2836,6 +2842,14 @@ impl AnnotateProvider {
                     translation_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let cds_sequence =
                     cds_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                // Fall back to BAM-edited columns when canonical columns are
+                // absent (older parquet caches produced before upstream d26e370).
+                let translation_seq_canonical = translation_seq_canonical_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or_else(|| translation_seq.clone());
+                let cds_sequence_canonical = cds_seq_canonical_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or_else(|| cds_sequence.clone());
                 let tl_stable_id =
                     tl_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let tl_version = tl_version_idx
@@ -2851,6 +2865,8 @@ impl AnnotateProvider {
                     protein_len,
                     translation_seq,
                     cds_sequence,
+                    translation_seq_canonical,
+                    cds_sequence_canonical,
                     stable_id: tl_stable_id,
                     version: tl_version,
                     protein_features,
@@ -8359,6 +8375,8 @@ mod tests {
             protein_len: None,
             translation_seq: None,
             cds_sequence: None,
+            translation_seq_canonical: None,
+            cds_sequence_canonical: None,
             stable_id: None,
             version: None,
             protein_features,

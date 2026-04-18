@@ -1758,6 +1758,8 @@ mod tests {
             protein_len: Some(3),
             translation_seq: None,
             cds_sequence: None,
+            translation_seq_canonical: None,
+            cds_sequence_canonical: None,
             stable_id: Some("ENSPHGVS000001".to_string()),
             version: Some(1),
             protein_features: Vec::new(),
