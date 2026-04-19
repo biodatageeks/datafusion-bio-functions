@@ -1155,7 +1155,7 @@ impl TranscriptConsequenceEngine {
         let deleted_refseq_gap = !is_ins
             && prefers_exon_geometry_over_mapper(tx)
             && (variant.start..=variant.end)
-                .any(|pos| mapper_deleted_gap_cdna_index(tx, pos).is_some());
+                .any(|pos| mapper_deleted_gap_cdna_index(tx, tx_exons, pos).is_some());
 
         // For pure insertions, VEP requires both flanking positions
         // (start-1 and start) to be within the exon.  An insertion at
@@ -6686,8 +6686,18 @@ fn prefers_exon_geometry_over_mapper(tx: &TranscriptFeature) -> bool {
         )
 }
 
-fn mapper_deleted_gap_cdna_index(tx: &TranscriptFeature, pos: i64) -> Option<usize> {
+fn mapper_deleted_gap_cdna_index(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    pos: i64,
+) -> Option<usize> {
     if tx.cdna_mapper_segments.len() < 2 {
+        return None;
+    }
+    if !tx_exons
+        .iter()
+        .any(|exon| pos >= exon.start && pos <= exon.end)
+    {
         return None;
     }
     let mut segments = tx.cdna_mapper_segments.iter().collect::<Vec<_>>();
@@ -6864,7 +6874,7 @@ pub(crate) fn raw_cdna_position_from_genomic(
     //   calls `genomic2cdna` on the live transcript mapper
     //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765
     if prefers_exon_geometry_over_mapper(tx) {
-        if let Some(cdna) = mapper_deleted_gap_cdna_index(tx, genomic_pos) {
+        if let Some(cdna) = mapper_deleted_gap_cdna_index(tx, tx_exons, genomic_pos) {
             return Some(cdna.to_string());
         }
     }
@@ -16332,6 +16342,43 @@ mod tests {
         (t, exons)
     }
 
+    fn native_refseq_one_bp_intron_tx() -> (TranscriptFeature, Vec<ExonFeature>) {
+        let mut t = tx(
+            "NM_INTRON.1",
+            "chr1",
+            100,
+            109,
+            1,
+            "protein_coding",
+            Some(100),
+            Some(109),
+        );
+        t.source = Some("RefSeq".to_string());
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(8);
+        t.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 100,
+                genomic_end: 103,
+                cdna_start: 1,
+                cdna_end: 4,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 105,
+                genomic_end: 109,
+                cdna_start: 5,
+                cdna_end: 9,
+                ori: 1,
+            },
+        ];
+        let exons = vec![
+            exon("NM_INTRON.1", 1, 100, 103),
+            exon("NM_INTRON.1", 2, 105, 109),
+        ];
+        (t, exons)
+    }
+
     #[test]
     fn raw_cdna_position_native_refseq_gap_uses_deleted_cdna_base() {
         let (t, exons) = native_refseq_gap_tx();
@@ -16367,6 +16414,24 @@ mod tests {
         let v = var("chr1", 104, 104, "A", "-");
         let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &refs, None);
         assert_eq!(terms, vec![SoTerm::IntergenicVariant]);
+    }
+
+    #[test]
+    fn mapper_deleted_gap_cdna_index_ignores_true_one_bp_intron() {
+        let (t, exons) = native_refseq_one_bp_intron_tx();
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        assert_eq!(mapper_deleted_gap_cdna_index(&t, &refs, 104), None);
+    }
+
+    #[test]
+    fn native_refseq_one_bp_intron_gap_keeps_frameshift_coding_consequence() {
+        let (t, exons) = native_refseq_one_bp_intron_tx();
+        let refs: Vec<&ExonFeature> = exons.iter().collect();
+        let engine = TranscriptConsequenceEngine::default();
+        let v = var("chr1", 104, 104, "A", "-");
+        let (terms, _) = engine.evaluate_transcript_overlap(&v, &t, &refs, None);
+        assert!(terms.contains(&SoTerm::CodingSequenceVariant));
+        assert!(!terms.contains(&SoTerm::IntergenicVariant));
     }
 
     #[test]

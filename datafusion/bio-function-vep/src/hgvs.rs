@@ -262,6 +262,19 @@ pub fn format_hgvsc(
     {
         let cds_pos = cds_position?.to_string();
         (cds_pos.clone(), cds_pos)
+    } else if uses_output_cdna_position_for_hgvsc_coords(
+        tx,
+        &notation,
+        cdna_position,
+        use_genomic_shift,
+    ) {
+        hgvsc_coords_from_output_cdna_position(
+            tx,
+            tx_exons,
+            &notation,
+            cdna_position?,
+            use_genomic_shift,
+        )?
     } else {
         notation_to_hgvsc_coords(tx, tx_exons, &notation)?
     };
@@ -824,6 +837,69 @@ fn notation_to_hgvsc_coords(
         hgvs_cdna_position_from_genomic(tx, tx_exons, notation.start)?,
         hgvs_cdna_position_from_genomic(tx, tx_exons, notation.end)?,
     ))
+}
+
+fn hgvsc_coords_from_output_cdna_position(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    notation: &HgvsNotation,
+    cdna_position: &str,
+    genomic_shift: Option<&HgvsGenomicShift>,
+) -> Option<(String, String)> {
+    if cdna_position.is_empty() || cdna_position.contains('?') {
+        return None;
+    }
+    let (start_text, end_text) = match cdna_position.split_once('-') {
+        Some((start, end)) => (start.trim(), end.trim()),
+        None => (cdna_position.trim(), cdna_position.trim()),
+    };
+    let shifted_delta = if matches!(notation.kind.as_str(), "ins" | "dup") {
+        genomic_shift
+            .and_then(|shift| i64::try_from(shift.shift_length).ok())
+            .map(|delta| if tx.strand < 0 { -delta } else { delta })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if notation.kind == "dup" && notation.alt_allele.len() == 1 {
+        let chosen = if shifted_delta == 0 {
+            start_text.to_string()
+        } else {
+            (start_text.parse::<i64>().ok()? + shifted_delta).to_string()
+        };
+        let coord = shift_to_hgvs_coding_coordinates(tx, tx_exons, &chosen)?;
+        return Some((coord.clone(), coord));
+    }
+    let shifted_start = if shifted_delta == 0 {
+        start_text.to_string()
+    } else {
+        (start_text.parse::<i64>().ok()? + shifted_delta).to_string()
+    };
+    let shifted_end = if shifted_delta == 0 {
+        end_text.to_string()
+    } else {
+        (end_text.parse::<i64>().ok()? + shifted_delta).to_string()
+    };
+    Some((
+        shift_to_hgvs_coding_coordinates(tx, tx_exons, &shifted_start)?,
+        shift_to_hgvs_coding_coordinates(tx, tx_exons, &shifted_end)?,
+    ))
+}
+
+fn uses_output_cdna_position_for_hgvsc_coords(
+    tx: &TranscriptFeature,
+    notation: &HgvsNotation,
+    cdna_position: Option<&str>,
+    genomic_shift: Option<&HgvsGenomicShift>,
+) -> bool {
+    is_native_refseq_transcript(tx)
+        && !tx.refseq_edits.is_empty()
+        && cdna_position.is_some_and(|value| !value.is_empty() && !value.contains('?'))
+        && match notation.kind.as_str() {
+            "dup" => notation.alt_allele.len() == 1,
+            "ins" => genomic_shift.is_some_and(|shift| shift.shift_length > 0),
+            _ => false,
+        }
 }
 
 fn apply_shifted_insertion_duplication(
@@ -3463,6 +3539,143 @@ mod tests {
         (tx, exons)
     }
 
+    fn make_nm_001025076_refseq_utr_insertion_boundary_transcript()
+    -> (TranscriptFeature, [ExonFeature; 1]) {
+        let mut tx = make_transcript("protein_coding", 1, Some(11_328_939), Some(11_330_410));
+        tx.transcript_id = "NM_001025076.2".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 11_328_632;
+        tx.end = 11_336_675;
+        tx.cdna_coding_start = Some(308);
+        tx.cdna_coding_end = Some(1780);
+        tx.has_non_polya_rna_edit = true;
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 2826,
+            end: 2825,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let exons = [ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: tx.start,
+            end: tx.end,
+        }];
+        (tx, exons)
+    }
+
+    fn make_refseq_noncoding_dup_output_coord_transcript(
+        transcript_id: &str,
+    ) -> (TranscriptFeature, [ExonFeature; 1]) {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = transcript_id.to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 1;
+        tx.end = 5000;
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 4000,
+            end: 3999,
+            replacement_len: Some(1),
+            skip_refseq_offset: false,
+        }];
+        let exons = [ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: tx.start,
+            end: tx.end,
+        }];
+        (tx, exons)
+    }
+
+    fn make_nm_001242413_single_base_dup_transcript() -> (TranscriptFeature, [ExonFeature; 1]) {
+        let mut tx = make_transcript("protein_coding", 1, Some(101), Some(2032));
+        tx.transcript_id = "NM_001242413.2".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 1;
+        tx.end = 5000;
+        tx.cdna_coding_start = Some(101);
+        tx.cdna_coding_end = Some(2032);
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 3097,
+            end: 3096,
+            replacement_len: Some(10),
+            skip_refseq_offset: false,
+        }];
+        let exons = [ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: tx.start,
+            end: tx.end,
+        }];
+        (tx, exons)
+    }
+
+    fn make_nm_001143773_refseq_utr_dup_boundary_transcript()
+    -> (TranscriptFeature, [ExonFeature; 1]) {
+        let mut tx = make_transcript("protein_coding", -1, Some(59_247_614), Some(59_249_122));
+        tx.transcript_id = "NM_001143773.1".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 59_246_129;
+        tx.end = 59_249_676;
+        tx.cdna_coding_start = Some(555);
+        tx.cdna_coding_end = Some(2063);
+        tx.has_non_polya_rna_edit = true;
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 2635,
+            end: 2634,
+            replacement_len: Some(1),
+            skip_refseq_offset: false,
+        }];
+        let exons = [ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: tx.start,
+            end: tx.end,
+        }];
+        (tx, exons)
+    }
+
+    fn make_nm_001304717_one_bp_intron_transcript() -> (TranscriptFeature, [ExonFeature; 2]) {
+        let mut tx = make_transcript("protein_coding", 1, Some(87_863_950), Some(87_864_548));
+        tx.transcript_id = "NM_001304717.5".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 87_863_625;
+        tx.end = 87_864_548;
+        tx.cdna_coding_start = Some(326);
+        tx.cdna_coding_end = Some(923);
+        tx.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 87_863_625,
+                genomic_end: 87_864_103,
+                cdna_start: 1,
+                cdna_end: 479,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 87_864_105,
+                genomic_end: 87_864_548,
+                cdna_start: 480,
+                cdna_end: 923,
+                ori: 1,
+            },
+        ];
+        let exons = [
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 1,
+                start: 87_863_625,
+                end: 87_864_103,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 2,
+                start: 87_864_105,
+                end: 87_864_548,
+            },
+        ];
+        (tx, exons)
+    }
+
     fn make_nr_170302_noncoding_refseq_edit_transcript() -> (TranscriptFeature, [ExonFeature; 1]) {
         let mut tx = make_transcript("lncRNA", 1, None, None);
         tx.transcript_id = "NR_170302.1".to_string();
@@ -3544,6 +3757,228 @@ mod tests {
         let hgvsc = format_hgvsc(&tx, &exons, None, None, "T", "C", 2768, 2768, None);
 
         assert_eq!(hgvsc.as_deref(), Some("NM_001172437.2:c.*153C>C"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_refseq_utr_insertion_uses_output_cdna_boundary_coords() {
+        let (tx, exons_owned) = make_nm_001025076_refseq_utr_insertion_boundary_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 1,
+            start: 11_331_456,
+            end: 11_331_455,
+            shifted_compare_allele: "TC".to_string(),
+            shifted_allele_string: "TC".to_string(),
+            shifted_output_allele: "TC".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "TC".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+
+        let hgvsc = format_hgvsc(
+            &tx,
+            &exons,
+            Some("2824-2825"),
+            None,
+            "-",
+            "TC",
+            11_331_456,
+            11_331_455,
+            Some(&shift),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001025076.2:c.*1045_*1046insTC"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_refseq_utr_dup_uses_output_cdna_boundary_coords() {
+        let (tx, exons_owned) = make_nm_001143773_refseq_utr_dup_boundary_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let shift = HgvsGenomicShift {
+            strand: -1,
+            shift_length: 0,
+            start: 59_247_043,
+            end: 59_247_042,
+            shifted_compare_allele: "A".to_string(),
+            shifted_allele_string: "A".to_string(),
+            shifted_output_allele: "A".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "A".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: "A".to_string(),
+            three_prime_context: String::new(),
+        };
+
+        let hgvsc = format_hgvsc(
+            &tx,
+            &exons,
+            Some("2635"),
+            None,
+            "-",
+            "A",
+            59_247_043,
+            59_247_042,
+            Some(&shift),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001143773.1:c.*572dup"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_refseq_single_base_noncoding_dup_uses_upstream_output_coordinate() {
+        let (tx, exons_owned) = make_refseq_noncoding_dup_output_coord_transcript("NR_038884.1");
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 0,
+            start: 1205,
+            end: 1204,
+            shifted_compare_allele: "T".to_string(),
+            shifted_allele_string: "T".to_string(),
+            shifted_output_allele: "T".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "T".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: "T".to_string(),
+            three_prime_context: String::new(),
+        };
+
+        let hgvsc = format_hgvsc(
+            &tx,
+            &exons,
+            Some("1204-1205"),
+            None,
+            "-",
+            "T",
+            1205,
+            1204,
+            Some(&shift),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NR_038884.1:n.1204dup"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_refseq_multi_base_noncoding_dup_ignores_output_insert_coords() {
+        let (tx, exons_owned) = make_refseq_noncoding_dup_output_coord_transcript("NR_038884.1");
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 0,
+            start: 282,
+            end: 281,
+            shifted_compare_allele: "TGTGTGTGTGTG".to_string(),
+            shifted_allele_string: "TGTGTGTGTGTG".to_string(),
+            shifted_output_allele: "TGTGTGTGTGTG".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "TGTGTGTGTGTG".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: "TGTGTGTGTGTG".to_string(),
+            three_prime_context: String::new(),
+        };
+
+        let hgvsc = format_hgvsc(
+            &tx,
+            &exons,
+            Some("281-282"),
+            None,
+            "-",
+            "TGTGTGTGTGTG",
+            282,
+            281,
+            Some(&shift),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NR_038884.1:n.270_281dup"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_refseq_five_prime_single_base_dup_uses_downstream_output_coordinate() {
+        let (tx, exons_owned) = make_nm_001025076_refseq_utr_insertion_boundary_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 2,
+            start: 11_328_807,
+            end: 11_328_806,
+            shifted_compare_allele: "C".to_string(),
+            shifted_allele_string: "C".to_string(),
+            shifted_output_allele: "C".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "C".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: "C".to_string(),
+            three_prime_context: String::new(),
+        };
+
+        let hgvsc = format_hgvsc(
+            &tx,
+            &exons,
+            Some("174-175"),
+            None,
+            "-",
+            "C",
+            11_328_807,
+            11_328_806,
+            Some(&shift),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001025076.2:c.-132dup"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_refseq_three_prime_single_base_dup_uses_upstream_output_coordinate() {
+        let (tx, exons_owned) = make_nm_001242413_single_base_dup_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 0,
+            start: 3079,
+            end: 3078,
+            shifted_compare_allele: "A".to_string(),
+            shifted_allele_string: "A".to_string(),
+            shifted_output_allele: "A".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "A".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: "A".to_string(),
+            three_prime_context: String::new(),
+        };
+
+        let hgvsc = format_hgvsc(
+            &tx,
+            &exons,
+            Some("3078-3079"),
+            None,
+            "-",
+            "A",
+            3079,
+            3078,
+            Some(&shift),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001242413.2:c.*1046dup"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_refseq_one_bp_intron_uses_intronic_coordinate_not_deleted_gap() {
+        let (tx, exons_owned) = make_nm_001304717_one_bp_intron_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+
+        let hgvsc = format_hgvsc(
+            &tx, &exons, None, None, "T", "-", 87_864_104, 87_864_104, None,
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001304717.5:c.154+1del"));
     }
 
     #[test]
