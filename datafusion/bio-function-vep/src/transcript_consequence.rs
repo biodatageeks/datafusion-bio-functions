@@ -4486,7 +4486,7 @@ fn refseq_transcript_shift_for_hgvs_protein(
     tx_exons: &[&ExonFeature],
     variant: &VariantInput,
 ) -> Option<crate::hgvs::HgvsGenomicShift> {
-    if !refseq_has_edited_sequence_state(tx) {
+    if !refseq_uses_transcript_shift_for_hgvsp(tx) {
         return None;
     }
     let is_insertion = variant.ref_allele == "-" && variant.alt_allele != "-";
@@ -4683,7 +4683,7 @@ fn protein_hgvs_for_output(
     let is_insertion = ref_norm.is_empty() && !alt_norm.is_empty();
 
     let existing_shift = variant.hgvs_shift_for_strand(tx.strand).cloned();
-    let refseq_shift = if refseq_has_edited_sequence_state(tx) {
+    let refseq_shift = if refseq_uses_transcript_shift_for_hgvsp(tx) {
         refseq_transcript_shift_for_hgvs_protein(tx, tx_exons, variant)
     } else {
         None
@@ -4758,7 +4758,7 @@ fn protein_hgvs_for_output(
     // and combine with literal_indel_protein_hgvs_data. When the two
     // produce matching peptides the insertion collapses to synonymous.
     let mut shifted_preferred = shifted.clone();
-    if is_insertion && refseq_has_edited_sequence_state(tx) {
+    if is_insertion && refseq_uses_transcript_shift_for_hgvsp(tx) {
         let shifted_variant =
             protein_hgvs_shifted_variant_for_reference(tx, tx_translation, variant, shift);
         let literal_shifted = fallback.and_then(|original| {
@@ -4902,7 +4902,7 @@ fn protein_hgvs_shifted_variant_for_reference(
 ) -> VariantInput {
     let mut shifted_variant = protein_hgvs_shifted_variant(variant, shift, tx.strand);
     if !uses_canonical_reference_for_hgvsp(translation)
-        || !refseq_has_edited_sequence_state(tx)
+        || !refseq_uses_transcript_shift_for_hgvsp(tx)
         || shift.ref_orig_allele_string.is_empty()
     {
         return shifted_variant;
@@ -7099,6 +7099,39 @@ fn refseq_has_edited_sequence_state(tx: &TranscriptFeature) -> bool {
         && (tx.bam_edit_status.is_some()
             || tx.has_non_polya_rna_edit
             || !tx.refseq_edits.is_empty())
+}
+
+fn refseq_edit_overlaps_coding_sequence(tx: &TranscriptFeature, edit: &RefSeqEdit) -> bool {
+    let (Some(cds_start), Some(cds_end)) = (
+        tx.cdna_coding_start.map(|pos| pos as i64),
+        tx.cdna_coding_end.map(|pos| pos as i64),
+    ) else {
+        return true;
+    };
+
+    if edit.end < edit.start {
+        // RefSeq insertions are encoded as start = end + 1. For protein HGVS
+        // they matter only when inserted BETWEEN coding bases, not when the
+        // edit sits wholly in UTR space before the first or after the last
+        // coding nucleotide.
+        edit.end >= cds_start && edit.start <= cds_end
+    } else {
+        edit.start <= cds_end && edit.end >= cds_start
+    }
+}
+
+fn refseq_uses_transcript_shift_for_hgvsp(tx: &TranscriptFeature) -> bool {
+    if !uses_refseq_transcript_reference(tx) {
+        return false;
+    }
+
+    if tx.refseq_edits.is_empty() {
+        return tx.has_non_polya_rna_edit;
+    }
+
+    tx.refseq_edits
+        .iter()
+        .any(|edit| refseq_edit_overlaps_coding_sequence(tx, edit))
 }
 
 fn shifted_deletion_uses_protein_hgvs_reference(
@@ -14669,6 +14702,120 @@ mod tests {
 
         assert!(uses_refseq_transcript_reference(&t));
         assert!(refseq_has_edited_sequence_state(&t));
+    }
+
+    #[test]
+    fn refseq_uses_transcript_shift_for_hgvsp_requires_actual_edit_evidence() {
+        let mut t = tx(
+            "NM_001198995.1",
+            "1",
+            1752747,
+            1760640,
+            1,
+            "protein_coding",
+            Some(1752904),
+            Some(1758531),
+        );
+        t.source = Some("BestRefSeq".to_string());
+        t.bam_edit_status = Some("ok".to_string());
+
+        assert!(uses_refseq_transcript_reference(&t));
+        assert!(refseq_has_edited_sequence_state(&t));
+        assert!(!refseq_uses_transcript_shift_for_hgvsp(&t));
+    }
+
+    #[test]
+    fn refseq_transcript_shift_for_hgvs_protein_ignores_bam_only_refseq_status() {
+        let mut t = tx(
+            "NM_001198995.1",
+            "1",
+            1752904,
+            1752910,
+            1,
+            "protein_coding",
+            Some(1752904),
+            Some(1752910),
+        );
+        t.source = Some("BestRefSeq".to_string());
+        t.bam_edit_status = Some("ok".to_string());
+        t.spliced_seq = Some("ATGGAGG".to_string());
+
+        let exons = vec![exon("NM_001198995.1", 1, 1752904, 1752910)];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let variant =
+            VariantInput::from_vcf("1".into(), 1752908, 1752908, "C".into(), "CCCT".into());
+
+        assert_eq!(
+            refseq_transcript_shift_for_hgvs_protein(&t, &exons_ref, &variant),
+            None
+        );
+    }
+
+    #[test]
+    fn refseq_uses_transcript_shift_for_hgvsp_ignores_trailing_utr_edit() {
+        let mut transcript = tx(
+            "NM_001198995.1",
+            "1",
+            1751232,
+            1758642,
+            -1,
+            "protein_coding",
+            Some(1752904),
+            Some(1758531),
+        );
+        transcript.source = Some("BestRefSeq".to_string());
+        transcript.translation_stable_id = Some("NP_001185924.1".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.cdna_coding_start = Some(112);
+        transcript.cdna_coding_end = Some(1356);
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 3029,
+            end: 3028,
+            replacement_len: Some(9),
+            skip_refseq_offset: false,
+        }];
+
+        assert!(uses_refseq_transcript_reference(&transcript));
+        assert!(refseq_has_edited_sequence_state(&transcript));
+        assert!(
+            !refseq_uses_transcript_shift_for_hgvsp(&transcript),
+            "3' UTR polyA-tail edits must not trigger RefSeq protein HGVS shifting"
+        );
+    }
+
+    #[test]
+    fn refseq_transcript_shift_for_hgvs_protein_ignores_trailing_utr_edit() {
+        let mut t = tx(
+            "NM_001198995.1",
+            "1",
+            1000,
+            1038,
+            1,
+            "protein_coding",
+            Some(1000),
+            Some(1011),
+        );
+        t.source = Some("BestRefSeq".to_string());
+        t.bam_edit_status = Some("ok".to_string());
+        t.cdna_coding_start = Some(1);
+        t.cdna_coding_end = Some(12);
+        t.spliced_seq = Some("ATGGAGGAGGGCTTTTTTTTTTTTTTTTTTTTTTTTTTT".to_string());
+        t.refseq_edits = vec![RefSeqEdit {
+            start: 30,
+            end: 29,
+            replacement_len: Some(9),
+            skip_refseq_offset: false,
+        }];
+
+        let exons = vec![exon("NM_001198995.1", 1, 1000, 1038)];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+        let variant = VariantInput::from_vcf("1".into(), 1005, 1005, "G".into(), "GGGA".into());
+
+        assert_eq!(
+            refseq_transcript_shift_for_hgvs_protein(&t, &exons_ref, &variant),
+            None,
+            "protein HGVS shift must ignore RefSeq edits that sit wholly after the CDS"
+        );
     }
 
     #[test]

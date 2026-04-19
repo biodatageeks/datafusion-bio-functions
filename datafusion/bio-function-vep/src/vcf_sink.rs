@@ -32,6 +32,18 @@ pub struct AnnotateVcfConfig {
     pub use_fjall: bool,
     /// Enable HGVS notation.
     pub hgvs: bool,
+    /// Enable transcript HGVS notation explicitly.
+    pub hgvsc: bool,
+    /// Enable protein HGVS notation explicitly.
+    pub hgvsp: bool,
+    /// Enable 3' HGVS shifting explicitly.
+    pub shift_hgvs: Option<bool>,
+    /// Don't URI-escape HGVS output.
+    pub no_escape: bool,
+    /// Remove version from HGVSp IDs.
+    pub remove_hgvsp_version: bool,
+    /// Format HGVSp using prediction-style parentheses.
+    pub hgvsp_use_prediction: bool,
     /// Use RefSeq cache/transcripts in place of Ensembl transcripts.
     pub refseq: bool,
     /// Use merged Ensembl+RefSeq cache.
@@ -66,6 +78,12 @@ impl Default for AnnotateVcfConfig {
             reference_fasta_path: None,
             use_fjall: false,
             hgvs: false,
+            hgvsc: false,
+            hgvsp: false,
+            shift_hgvs: None,
+            no_escape: false,
+            remove_hgvsp_version: false,
+            hgvsp_use_prediction: false,
             refseq: false,
             merged: false,
             gencode_basic: false,
@@ -113,6 +131,24 @@ impl AnnotateVcfConfig {
         }
         if self.hgvs {
             opts.insert("hgvs".into(), serde_json::Value::Bool(true));
+        }
+        if self.hgvsc {
+            opts.insert("hgvsc".into(), serde_json::Value::Bool(true));
+        }
+        if self.hgvsp {
+            opts.insert("hgvsp".into(), serde_json::Value::Bool(true));
+        }
+        if let Some(shift_hgvs) = self.shift_hgvs {
+            opts.insert("shift_hgvs".into(), serde_json::Value::Bool(shift_hgvs));
+        }
+        if self.no_escape {
+            opts.insert("no_escape".into(), serde_json::Value::Bool(true));
+        }
+        if self.remove_hgvsp_version {
+            opts.insert("remove_hgvsp_version".into(), serde_json::Value::Bool(true));
+        }
+        if self.hgvsp_use_prediction {
+            opts.insert("hgvsp_use_prediction".into(), serde_json::Value::Bool(true));
         }
         if self.refseq {
             opts.insert("refseq".into(), serde_json::Value::Bool(true));
