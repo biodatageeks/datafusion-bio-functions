@@ -4749,7 +4749,7 @@ fn protein_hgvs_for_output(
     // - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()` for
     //   RefSeq-edited transcripts can collapse a shifted insertion to
     //   synonymous when the reclassified shifted variant's alt peptide
-    //   matches the literal shifted ref peptide.
+    //   matches the HGVS window ref peptide that VEP ultimately formats.
     //   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L1700-L1749>
     //
     // The shifted_tva_protein_hgvs_data path replays VEP's shifted TVA
@@ -4757,13 +4757,42 @@ fn protein_hgvs_for_output(
     // second path: reclassify the shifted variant via classify_coding_change
     // and combine with literal_indel_protein_hgvs_data. When the two
     // produce matching peptides the insertion collapses to synonymous.
-    let mut shifted_preferred = shifted;
+    let mut shifted_preferred = shifted.clone();
     if is_insertion && refseq_has_edited_sequence_state(tx) {
         let shifted_variant =
             protein_hgvs_shifted_variant_for_reference(tx, tx_translation, variant, shift);
+        let literal_shifted = fallback.and_then(|original| {
+            literal_shifted_indel_protein_hgvs_data(
+                tx,
+                tx_exons,
+                tx_translation,
+                variant,
+                shift,
+                original,
+            )
+        });
         if let Some(shifted_class) =
             classify_coding_change(tx, tx_exons, tx_translation, &shifted_variant)
         {
+            if let (Some(class_protein), Some(literal_shifted_protein)) = (
+                shifted_class.protein_hgvs.as_ref(),
+                literal_shifted.as_ref(),
+            ) {
+                if let Some(equal_window) =
+                    refseq_shifted_insertion_equal_window(class_protein, literal_shifted_protein)
+                {
+                    return Some(equal_window);
+                }
+            }
+            if let (Some(class_protein), Some(shifted_protein)) =
+                (shifted_class.protein_hgvs.as_ref(), shifted.as_ref())
+            {
+                if let Some(equal_window) =
+                    refseq_shifted_insertion_equal_window(class_protein, shifted_protein)
+                {
+                    return Some(equal_window);
+                }
+            }
             let literal = literal_indel_protein_hgvs_data(
                 tx,
                 tx_exons,
@@ -4781,17 +4810,6 @@ fn protein_hgvs_for_output(
                 }
             }
         }
-
-        let literal_shifted = fallback.and_then(|original| {
-            literal_shifted_indel_protein_hgvs_data(
-                tx,
-                tx_exons,
-                tx_translation,
-                variant,
-                shift,
-                original,
-            )
-        });
         shifted_preferred = maybe_prefer_literal_shifted_refseq_insertion_candidate(
             tx,
             tx_translation,
@@ -4891,11 +4909,7 @@ fn protein_hgvs_shifted_variant_for_reference(
     }
 
     let canonical_alt_len = normalize_allele_seq(&variant.alt_allele).len();
-    let trim_len = shift
-        .alt_orig_allele_string
-        .len()
-        .saturating_sub(canonical_alt_len);
-    if trim_len == 0 {
+    if canonical_alt_len == 0 {
         return shifted_variant;
     }
 
@@ -4903,7 +4917,11 @@ fn protein_hgvs_shifted_variant_for_reference(
         &mut shifted_variant.alt_allele,
         &mut shifted_variant.parser_alt_allele,
     ] {
-        if allele == "-" || allele.len() <= trim_len {
+        if allele == "-" {
+            continue;
+        }
+        let trim_len = allele.len().saturating_sub(canonical_alt_len);
+        if trim_len == 0 || allele.len() <= trim_len {
             continue;
         }
         allele.replace_range(..trim_len, "");
@@ -4930,7 +4948,7 @@ fn rotate_hgvs_protein_allele(allele: &str, shift_length: usize, strand: i8) -> 
 
 /// Collapse a shifted RefSeq insertion to synonymous when the alternate peptide
 /// from the original (unshifted) classification matches the reference peptide
-/// from the shifted literal window.
+/// from the shifted HGVS protein window.
 ///
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_protein()` derives the
@@ -4942,38 +4960,63 @@ fn rotate_hgvs_protein_allele(allele: &str, shift_length: usize, strand: i8) -> 
 ///
 /// Our replay reaches the same ingredients through two partial paths:
 /// - `class_protein.alt_peptide` reflects the shifted RefSeq peptide state
-/// - `literal_protein.ref_peptide` reflects the correct flanking HGVS window
+/// - `window_protein.ref_peptide` reflects the HGVS peptide window VEP
+///   ultimately formats (generic shifted TVA window or literal shifted window)
 ///
-/// When those collapse to the same peptide string on the literal HGVS window,
+/// When those collapse to the same peptide string on that HGVS window,
 /// VEP's end state is equality on that window (e.g. `p.GluGlu25=`) rather than
 /// duplication. This is only used for shifted RefSeq insertions.
 fn refseq_shifted_insertion_equal_window(
     class_protein: &crate::hgvs::ProteinHgvsData,
-    literal_protein: &crate::hgvs::ProteinHgvsData,
+    window_protein: &crate::hgvs::ProteinHgvsData,
 ) -> Option<crate::hgvs::ProteinHgvsData> {
     if class_protein.frameshift
         || class_protein.start_lost
         || class_protein.stop_lost
-        || literal_protein.frameshift
-        || literal_protein.start_lost
-        || literal_protein.stop_lost
+        || window_protein.frameshift
+        || window_protein.start_lost
+        || window_protein.stop_lost
     {
         return None;
     }
     if class_protein.alt_peptide.is_empty()
-        || literal_protein.ref_peptide.is_empty()
-        || class_protein.alt_peptide != literal_protein.ref_peptide
+        || window_protein.ref_peptide.is_empty()
+        || class_protein.alt_peptide != window_protein.ref_peptide
     {
         return None;
     }
-    if literal_protein.alt_peptide == literal_protein.ref_peptide {
+    if window_protein.alt_peptide == window_protein.ref_peptide {
         return None;
     }
+    let peptide_len = class_protein.alt_peptide.len();
+    if peptide_len > 0 && class_protein.start > peptide_len {
+        let upstream_start = class_protein.start.checked_sub(peptide_len)?;
+        let upstream_end = class_protein.start.checked_sub(1)?;
+        let upstream_ref = class_protein
+            .ref_translation
+            .get(upstream_start.checked_sub(1)?..upstream_end)?
+            .to_string();
+        if upstream_ref == class_protein.alt_peptide {
+            return Some(crate::hgvs::ProteinHgvsData {
+                start: upstream_start,
+                end: upstream_end,
+                ref_peptide: upstream_ref.clone(),
+                alt_peptide: upstream_ref,
+                ref_translation: class_protein.ref_translation.clone(),
+                alt_translation: class_protein.alt_translation.clone(),
+                alt_translation_extension: class_protein.alt_translation_extension.clone(),
+                frameshift: false,
+                start_lost: false,
+                stop_lost: false,
+                native_refseq: class_protein.native_refseq,
+            });
+        }
+    }
     Some(crate::hgvs::ProteinHgvsData {
-        start: literal_protein.start,
-        end: literal_protein.end,
-        ref_peptide: literal_protein.ref_peptide.clone(),
-        alt_peptide: literal_protein.ref_peptide.clone(),
+        start: window_protein.start,
+        end: window_protein.end,
+        ref_peptide: window_protein.ref_peptide.clone(),
+        alt_peptide: window_protein.ref_peptide.clone(),
         ref_translation: class_protein.ref_translation.clone(),
         alt_translation: class_protein.alt_translation.clone(),
         alt_translation_extension: class_protein.alt_translation_extension.clone(),
@@ -8156,6 +8199,125 @@ mod tests {
                 protein_end: 43,
             })
         );
+    }
+
+    #[test]
+    fn nm_015120_no_mapper_shifted_insertion_matches_vep_equal_window() {
+        let five_prime_utr = "AGGCGGGCGGCACTGCGCCTAAGCTGGGCCACAACCGCCAGTCAGGGCTCTCCCCTTCCCCTCCCTCCCCCCCTCCTCCTCCTCCTCTGCCGCCCAGAGCGAGACACCAAC";
+        let edited_cds = "ATGGAGCCCGAGGATCTGCCATGGCCGGGCGAGCTGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAAGAGGAGGAGGCTGCAGCGGCGGCGGCGGCGAACGTGGACGACGTAGTGGTCGTGGAGGAGGTGGAGGAAGAGGCGGGGCGGGAGTTGGACTCCGACTCTCACTACGGGCCCCAGCATCTGGAAAGTATAGACGACGAGGAGGACGAGGAGGCCAAGGCCTGG";
+        let canonical_cds = "ATGGAGCCCGAGGATCTGCCATGGCCGGGCGAGCTGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAGGAAGAGGAGGAGGCTGCAGCGGCGGCGGCGGCGAACGTGGACGACGTAGTGGTCGTGGAGGAGGTGGAGGAAGAGGCGGGGCGGGAGTTGGACTCCGACTCTCACTACGGGCCCCAGCATCTGGAAAGTATAGACGACGAGGAGGACGAGGAGGCCAAGGCCTGGCTG";
+        let edited_translation =
+            "MEPEDLPWPGELEEEEEEEEEEEEEEEEEAAAAAAANVDDVVVVEEVEEEAGRELDSDSHYGPQHLESIDDEEDEEAKAW";
+        let canonical_translation =
+            "MEPEDLPWPGELEEEEEEEEEEEEEEEEAAAAAAANVDDVVVVEEVEEEAGRELDSDSHYGPQHLESIDDEEDEEAKAWL";
+        let spliced_seq = format!("{five_prime_utr}{edited_cds}");
+
+        let mut transcript = tx(
+            "NM_015120.4",
+            "2",
+            73385758,
+            73386108,
+            1,
+            "protein_coding",
+            Some(73385869),
+            Some(73386108),
+        );
+        transcript.source = Some("BestRefSeq".to_string());
+        transcript.translation_stable_id = Some("NP_055935.4".to_string());
+        transcript.bam_edit_status = Some("ok".to_string());
+        transcript.has_non_polya_rna_edit = true;
+        transcript.refseq_edits = vec![RefSeqEdit {
+            start: 186,
+            end: 185,
+            replacement_len: Some(3),
+            skip_refseq_offset: false,
+        }];
+        transcript.cdna_coding_start = Some(112);
+        transcript.cdna_coding_end = Some(351);
+        transcript.five_prime_utr_seq = Some(five_prime_utr.to_string());
+        transcript.translateable_seq = Some(edited_cds.to_string());
+        transcript.spliced_seq = Some(spliced_seq);
+
+        let exons = vec![exon("NM_015120.4", 1, 73385758, 73386108)];
+        let exons_ref: Vec<&ExonFeature> = exons.iter().collect();
+
+        let mut translation = translation(
+            "NM_015120.4",
+            Some(edited_cds.len()),
+            Some(edited_translation.len()),
+            Some(edited_translation),
+            Some(edited_cds),
+        );
+        translation.stable_id = Some("NP_055935.4".to_string());
+        translation.translation_seq_canonical = Some(canonical_translation.to_string());
+        translation.cds_sequence_canonical = Some(canonical_cds.to_string());
+
+        let variant =
+            VariantInput::from_vcf("2".into(), 73385903, 73385903, "T".into(), "TGGA".into());
+
+        let original =
+            classify_coding_change(&transcript, &exons_ref, Some(&translation), &variant)
+                .expect("original classification");
+        let protein = protein_hgvs_for_output(
+            &transcript,
+            &exons_ref,
+            Some(&translation),
+            &variant,
+            true,
+            original.protein_position_start.zip(
+                original
+                    .protein_position_end
+                    .or(original.protein_position_start),
+            ),
+            original.protein_hgvs.as_ref(),
+            true,
+        )
+        .expect("shifted protein hgvs");
+        let formatted = crate::hgvs::format_hgvsp(
+            &translation_for_hgvsp(&transcript, &translation),
+            &protein,
+            true,
+        );
+
+        assert_eq!(formatted.as_deref(), Some("NP_055935.4:p.GluGlu25="));
+    }
+
+    #[test]
+    fn refseq_shifted_insertion_equal_window_prefers_upstream_repeat_block() {
+        let class_protein = crate::hgvs::ProteinHgvsData {
+            start: 27,
+            end: 27,
+            ref_peptide: "E".to_string(),
+            alt_peptide: "EE".to_string(),
+            ref_translation: format!("M{}", "E".repeat(40)),
+            alt_translation: format!("M{}", "E".repeat(41)),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: true,
+        };
+        let window_protein = crate::hgvs::ProteinHgvsData {
+            start: 26,
+            end: 27,
+            ref_peptide: "EE".to_string(),
+            alt_peptide: "EEE".to_string(),
+            ref_translation: class_protein.ref_translation.clone(),
+            alt_translation: class_protein.alt_translation.clone(),
+            alt_translation_extension: None,
+            frameshift: false,
+            start_lost: false,
+            stop_lost: false,
+            native_refseq: true,
+        };
+
+        let equal_window = refseq_shifted_insertion_equal_window(&class_protein, &window_protein)
+            .expect("equal window");
+
+        assert_eq!(equal_window.start, 25);
+        assert_eq!(equal_window.end, 26);
+        assert_eq!(equal_window.ref_peptide, "EE");
+        assert_eq!(equal_window.alt_peptide, "EE");
     }
 
     #[test]
@@ -14196,8 +14358,11 @@ mod tests {
             shifted_allele_string: "GCAGCAGCAGCAGCAGCAGCA".to_string(),
             shifted_compare_allele: "GCAGCAGCAGCAGCAGCAGCA".to_string(),
             shifted_output_allele: "GCAGCAGCAGCAGCAGCAGCA".to_string(),
-            ref_orig_allele_string: "CAGCAG".to_string(),
-            alt_orig_allele_string: "CAGCAGCAGCAGCAGCAGCAG".to_string(),
+            // build_hgvs_genomic_shift stores VEP-normalized insertion alleles,
+            // not the raw parser alleles. The canonical HGVSp trim therefore has
+            // to derive from the rotated shifted allele length itself.
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "CAGCAGCAGCAGCAG".to_string(),
             five_prime_flanking_seq: String::new(),
             three_prime_flanking_seq: String::new(),
             five_prime_context: String::new(),
