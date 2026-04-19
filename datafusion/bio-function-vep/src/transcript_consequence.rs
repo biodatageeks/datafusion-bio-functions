@@ -8147,10 +8147,13 @@ mod tests {
         assert_eq!(
             shifted_tva_coords_from_mapper(&transcript, &exons_ref, &translation, &shifted_variant),
             Some(ShiftedTvaCoords {
-                cds_start: 117,
-                cds_end: 122,
-                protein_start: 39,
-                protein_end: 41,
+                // HGVSp now uses canonical RefSeq CDS coordinates when available,
+                // so the exact mapper gap is projected across the leading 6 bp
+                // transcript-start edit before peptide coordinates are derived.
+                cds_start: 123,
+                cds_end: 128,
+                protein_start: 41,
+                protein_end: 43,
             })
         );
     }

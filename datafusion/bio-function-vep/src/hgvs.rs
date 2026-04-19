@@ -1006,6 +1006,17 @@ fn native_refseq_hgvs_intronic_anchor_uses_post_gap_numbering(tx: &TranscriptFea
         )
 }
 
+fn native_refseq_has_leading_insertion_edit(tx: &TranscriptFeature) -> bool {
+    tx.refseq_edits.iter().any(|edit| {
+        !edit.skip_refseq_offset
+            && edit.start <= 1
+            && edit.end < edit.start
+            && edit
+                .replacement_len
+                .is_some_and(|replacement_len| replacement_len > 0)
+    })
+}
+
 fn native_refseq_pre_coding_intronic_exon_geometry_position(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
@@ -1024,7 +1035,16 @@ fn native_refseq_pre_coding_intronic_exon_geometry_position(
     let exon_geometry_position =
         raw_cdna_position_from_genomic(&exon_geometry_tx, tx_exons, genomic_pos)?;
     let (exon_coord, exon_offset) = split_hgvs_coord(&exon_geometry_position)?;
-    if exon_offset == mapper_offset && exon_coord > mapper_coord {
+    // Native RefSeq transcripts with a leading `_rna_edit` insertion (for
+    // example NM_001177639.3) keep HGVS intronic anchors on the pre-edit exon
+    // boundary even though the cached mapper cDNA coordinates are shifted by
+    // the inserted bases. Other native RefSeq mapper/exon disagreements, such
+    // as one-base deleted gaps, still follow the larger exon-geometry anchor.
+    let leading_insertion_prefers_pre_edit_exon_geometry =
+        native_refseq_has_leading_insertion_edit(tx) && exon_coord < mapper_coord;
+    if exon_offset == mapper_offset
+        && (exon_coord > mapper_coord || leading_insertion_prefers_pre_edit_exon_geometry)
+    {
         Some(exon_geometry_position)
     } else {
         None
@@ -2892,6 +2912,73 @@ mod tests {
             hgvs_cdna_position_from_genomic(&tx, &exons, 39045450),
             Some("-94+354".to_string())
         );
+    }
+
+    fn make_nm_001177639_leading_edit_transcript() -> (TranscriptFeature, [ExonFeature; 2]) {
+        let mut tx = make_transcript("protein_coding", 1, Some(49510542), Some(49533206));
+        tx.transcript_id = "NM_001177639.3".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 49510418;
+        tx.end = 49535615;
+        tx.cdna_coding_start = Some(125);
+        tx.cdna_coding_end = Some(2812);
+        tx.bam_edit_status = Some("ok".to_string());
+        tx.has_non_polya_rna_edit = true;
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 1,
+            end: 0,
+            replacement_len: Some(7),
+            skip_refseq_offset: false,
+        }];
+        tx.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 49510418,
+                genomic_end: 49510819,
+                cdna_start: 8,
+                cdna_end: 409,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 49530797,
+                genomic_end: 49535615,
+                cdna_start: 410,
+                cdna_end: 5228,
+                ori: 1,
+            },
+        ];
+        let exon1 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 49510418,
+            end: 49510819,
+        };
+        let exon2 = ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 2,
+            start: 49530797,
+            end: 49535615,
+        };
+        (tx, [exon1, exon2])
+    }
+
+    #[test]
+    fn test_format_hgvsc_native_refseq_leading_insertion_uses_pre_edit_upstream_anchor() {
+        let (tx, exons_owned) = make_nm_001177639_leading_edit_transcript();
+        let exons = [&exons_owned[0], &exons_owned[1]];
+
+        let hgvsc = format_hgvsc(&tx, &exons, None, None, "T", "C", 49510861, 49510861, None);
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001177639.3:c.278+42T>C"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_native_refseq_leading_insertion_uses_pre_edit_downstream_anchor() {
+        let (tx, exons_owned) = make_nm_001177639_leading_edit_transcript();
+        let exons = [&exons_owned[0], &exons_owned[1]];
+
+        let hgvsc = format_hgvsc(&tx, &exons, None, None, "C", "T", 49521283, 49521283, None);
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001177639.3:c.279-9514C>T"));
     }
 
     #[test]
