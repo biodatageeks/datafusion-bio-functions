@@ -4,9 +4,10 @@ use std::cmp::Ordering;
 use std::io::{BufRead, Seek};
 
 use crate::transcript_consequence::{
-    ExonFeature, TranscriptCdnaMapperSegment, TranscriptFeature, TranslationFeature,
-    adjust_refseq_cdna_component, genomic_to_cdna_index_for_transcript,
-    raw_cdna_position_from_genomic,
+    ExonFeature, TranscriptCdnaMapperSegment, TranscriptFeature, TranslationFeature, VariantInput,
+    adjust_refseq_cdna_component, edited_transcript_sequence_cdna_index,
+    genomic_to_cdna_index_for_transcript, raw_cdna_position_from_genomic,
+    refseq_sequence_offset_for_cdna,
 };
 use datafusion::common::{DataFusionError, Result};
 use noodles_core::{Position, Region};
@@ -177,7 +178,8 @@ pub fn format_hgvsc(
     } else {
         'n'
     };
-    let use_genomic_shift = genomic_shift.filter(|_| ref_allele == "-" || alt_allele == "-");
+    let use_genomic_shift = genomic_shift
+        .filter(|shift| hgvsc_uses_genomic_shift(tx, ref_allele, alt_allele, Some(shift)));
     let edited_shifted_output_allele = use_genomic_shift
         .and_then(|_| edited_transcript_insertion_allele(tx, ref_allele, alt_allele));
     let dup_context = use_genomic_shift.filter(|shift| {
@@ -202,7 +204,16 @@ pub fn format_hgvsc(
         } else {
             (ref_allele, alt_allele, variant_start, variant_end)
         };
-    let (feature_ref, feature_alt) = hgvs_feature_strand_alleles(tx, ref_allele, alt_allele)?;
+    let (mut feature_ref, feature_alt) = hgvs_feature_strand_alleles(tx, ref_allele, alt_allele)?;
+    if let Some(transcript_ref) = edited_transcript_reference_allele_for_hgvsc(
+        tx,
+        tx_exons,
+        ref_allele,
+        variant_start,
+        variant_end,
+    ) {
+        feature_ref = transcript_ref;
+    }
     let mut notation =
         hgvs_variant_notation(&feature_ref, &feature_alt, variant_start, variant_end)?;
     if let Some(shift) = dup_context {
@@ -261,6 +272,60 @@ pub fn format_hgvsc(
         std::mem::swap(&mut start, &mut end);
     }
     format_hgvs_string(&tx_id, numbering, &start, &end, &notation)
+}
+
+fn is_native_refseq_transcript(tx: &TranscriptFeature) -> bool {
+    tx.source.as_deref() == Some("RefSeq")
+        || matches!(
+            tx.transcript_id.as_bytes().get(..2),
+            Some(b"NM") | Some(b"NR") | Some(b"XM") | Some(b"XR")
+        )
+}
+
+pub(crate) fn hgvsc_uses_genomic_shift(
+    tx: &TranscriptFeature,
+    ref_allele: &str,
+    alt_allele: &str,
+    genomic_shift: Option<&HgvsGenomicShift>,
+) -> bool {
+    if ref_allele != "-" && alt_allele != "-" {
+        return false;
+    }
+
+    let Some(shift) = genomic_shift else {
+        return false;
+    };
+
+    // When RefSeq BAM edit replay failed, VEP only suppresses transcript HGVS
+    // shifting when the transcript-space HGVS alleles no longer match the
+    // original shifted allele payload. Failed BAM-edit rows whose HGVS alleles
+    // still match the original genomic payload keep the shift.
+    if is_native_refseq_transcript(tx) && tx.bam_edit_status.as_deref() == Some("failed") {
+        return ref_allele.eq_ignore_ascii_case(&shift.ref_orig_allele_string)
+            && alt_allele.eq_ignore_ascii_case(&shift.alt_orig_allele_string);
+    }
+
+    true
+}
+
+pub(crate) fn hgvsc_offset_for_output(
+    tx: &TranscriptFeature,
+    variant: &VariantInput,
+    ref_allele: &str,
+    hgvsc: Option<&str>,
+) -> Option<i64> {
+    let shift = variant.hgvs_shift_for_strand(tx.strand)?;
+    if hgvsc.is_none()
+        || !hgvsc_uses_genomic_shift(tx, ref_allele, &variant.alt_allele, Some(shift))
+    {
+        return None;
+    }
+    if shift.shift_length == 0 {
+        return None;
+    }
+
+    let signed = shift.shift_length as i64;
+    Some(if tx.strand < 0 { -signed } else { signed })
 }
 
 #[derive(Clone, Copy)]
@@ -453,6 +518,66 @@ fn hgvs_feature_strand_alleles(
     };
 
     Some((orient(ref_allele)?, orient(alt_allele)?))
+}
+
+fn transcript_reference_sequence_for_hgvsc(tx: &TranscriptFeature) -> Option<String> {
+    if let Some(seq) = tx.spliced_seq.as_ref().or(tx.cdna_seq.as_ref()) {
+        return Some(seq.clone());
+    }
+
+    match (
+        tx.five_prime_utr_seq.as_deref(),
+        tx.translateable_seq.as_deref(),
+        tx.three_prime_utr_seq.as_deref(),
+    ) {
+        (Some(five_prime), Some(translateable), Some(three_prime)) => {
+            Some(format!("{five_prime}{translateable}{three_prime}"))
+        }
+        _ => None,
+    }
+}
+
+fn edited_transcript_reference_allele_for_hgvsc(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    ref_allele: &str,
+    variant_start: i64,
+    variant_end: i64,
+) -> Option<String> {
+    if tx.refseq_edits.is_empty() || ref_allele.is_empty() || ref_allele == "-" {
+        return None;
+    }
+
+    let transcript_seq = transcript_reference_sequence_for_hgvsc(tx)?;
+    let (start, end) = if variant_start <= variant_end {
+        (variant_start, variant_end)
+    } else {
+        (variant_end, variant_start)
+    };
+    let mut cdna_positions = Vec::new();
+    for genomic_pos in start..=end {
+        let raw_cdna = raw_cdna_position_from_genomic(tx, tx_exons, genomic_pos)?;
+        if raw_cdna.contains('+') || raw_cdna.contains('-') {
+            return None;
+        }
+        let raw_cdna = raw_cdna.parse::<usize>().ok()?;
+        let cdna = edited_transcript_sequence_cdna_index(tx, raw_cdna).unwrap_or(raw_cdna);
+        if cdna == 0 || cdna > transcript_seq.len() {
+            return None;
+        }
+        cdna_positions.push(cdna);
+    }
+    if cdna_positions.len() != ref_allele.len() {
+        return None;
+    }
+
+    cdna_positions.sort_unstable();
+    let bytes = transcript_seq.as_bytes();
+    let mut transcript_ref = String::with_capacity(cdna_positions.len());
+    for cdna in cdna_positions {
+        transcript_ref.push((bytes[cdna - 1] as char).to_ascii_uppercase());
+    }
+    Some(transcript_ref)
 }
 
 fn parse_shiftable_indel<'a>(
@@ -953,7 +1078,19 @@ fn hgvs_cdna_position_from_genomic(
     let cdna_position = if has_intron_offset {
         cdna_position
     } else {
-        adjust_refseq_cdna_component(tx, &cdna_position).unwrap_or(cdna_position)
+        let absolute_cdna = cdna_position.parse::<i64>().ok()?;
+        if tx
+            .cdna_coding_end
+            .is_some_and(|cdna_coding_end| absolute_cdna > cdna_coding_end as i64)
+        {
+            refseq_sequence_offset_for_cdna(tx, absolute_cdna)
+                .map(|offset| (absolute_cdna + offset).to_string())
+                .unwrap_or_else(|| {
+                    adjust_refseq_cdna_component(tx, &cdna_position).unwrap_or(cdna_position)
+                })
+        } else {
+            adjust_refseq_cdna_component(tx, &cdna_position).unwrap_or(cdna_position)
+        }
     };
     shift_to_hgvs_coding_coordinates(tx, tx_exons, &cdna_position)
 }
@@ -1006,15 +1143,24 @@ fn native_refseq_hgvs_intronic_anchor_uses_post_gap_numbering(tx: &TranscriptFea
         )
 }
 
-fn native_refseq_has_leading_insertion_edit(tx: &TranscriptFeature) -> bool {
-    tx.refseq_edits.iter().any(|edit| {
-        !edit.skip_refseq_offset
-            && edit.start <= 1
-            && edit.end < edit.start
-            && edit
-                .replacement_len
-                .is_some_and(|replacement_len| replacement_len > 0)
-    })
+fn native_refseq_insertion_shift_at_anchor(
+    tx: &TranscriptFeature,
+    exon_coord: i64,
+    mapper_coord: i64,
+) -> bool {
+    let mut offset = 0i64;
+    for edit in &tx.refseq_edits {
+        if edit.skip_refseq_offset || edit.end >= exon_coord {
+            continue;
+        }
+        let Some(replacement_len) = edit.replacement_len else {
+            continue;
+        };
+        let replaced_len = edit.end.saturating_sub(edit.start).saturating_add(1);
+        offset += replacement_len as i64 - replaced_len;
+    }
+
+    offset > 0 && exon_coord.saturating_add(offset) == mapper_coord
 }
 
 fn native_refseq_pre_coding_intronic_exon_geometry_position(
@@ -1040,10 +1186,10 @@ fn native_refseq_pre_coding_intronic_exon_geometry_position(
     // boundary even though the cached mapper cDNA coordinates are shifted by
     // the inserted bases. Other native RefSeq mapper/exon disagreements, such
     // as one-base deleted gaps, still follow the larger exon-geometry anchor.
-    let leading_insertion_prefers_pre_edit_exon_geometry =
-        native_refseq_has_leading_insertion_edit(tx) && exon_coord < mapper_coord;
+    let insertion_shift_prefers_pre_edit_exon_geometry = exon_coord < mapper_coord
+        && native_refseq_insertion_shift_at_anchor(tx, exon_coord, mapper_coord);
     if exon_offset == mapper_offset
-        && (exon_coord > mapper_coord || leading_insertion_prefers_pre_edit_exon_geometry)
+        && (exon_coord > mapper_coord || insertion_shift_prefers_pre_edit_exon_geometry)
     {
         Some(exon_geometry_position)
     } else {
@@ -2961,6 +3107,395 @@ mod tests {
         (tx, [exon1, exon2])
     }
 
+    fn make_nm_001137668_internal_edit_transcript() -> (TranscriptFeature, [ExonFeature; 10]) {
+        let mut tx = make_transcript("protein_coding", 1, Some(89829880), Some(89874436));
+        tx.transcript_id = "NM_001137668.2".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 89829880;
+        tx.end = 89874436;
+        tx.cdna_coding_start = Some(84);
+        tx.cdna_coding_end = Some(6032);
+        tx.bam_edit_status = Some("ok".to_string());
+        tx.has_non_polya_rna_edit = true;
+        tx.refseq_edits = vec![
+            crate::transcript_consequence::RefSeqEdit {
+                start: 5976,
+                end: 5975,
+                replacement_len: Some(48),
+                skip_refseq_offset: false,
+            },
+            crate::transcript_consequence::RefSeqEdit {
+                start: 5977,
+                end: 5977,
+                replacement_len: Some(1),
+                skip_refseq_offset: true,
+            },
+        ];
+        tx.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89829880,
+                genomic_end: 89829934,
+                cdna_start: 1,
+                cdna_end: 55,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89846562,
+                genomic_end: 89846644,
+                cdna_start: 56,
+                cdna_end: 138,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89853166,
+                genomic_end: 89853234,
+                cdna_start: 139,
+                cdna_end: 207,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89854817,
+                genomic_end: 89854917,
+                cdna_start: 208,
+                cdna_end: 308,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89855470,
+                genomic_end: 89855544,
+                cdna_start: 309,
+                cdna_end: 383,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89857084,
+                genomic_end: 89857199,
+                cdna_start: 384,
+                cdna_end: 499,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89862126,
+                genomic_end: 89864371,
+                cdna_start: 500,
+                cdna_end: 2745,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89865953,
+                genomic_end: 89869082,
+                cdna_start: 2746,
+                cdna_end: 5875,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89871289,
+                genomic_end: 89871388,
+                cdna_start: 5876,
+                cdna_end: 5975,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89873801,
+                genomic_end: 89874436,
+                cdna_start: 6024,
+                cdna_end: 6659,
+                ori: 1,
+            },
+        ];
+        let exons = [
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 1,
+                start: 89829880,
+                end: 89829934,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 2,
+                start: 89846562,
+                end: 89846644,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 3,
+                start: 89853166,
+                end: 89853234,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 4,
+                start: 89854817,
+                end: 89854917,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 5,
+                start: 89855470,
+                end: 89855544,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 6,
+                start: 89857084,
+                end: 89857199,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 7,
+                start: 89862126,
+                end: 89864371,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 8,
+                start: 89865953,
+                end: 89869082,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 9,
+                start: 89871289,
+                end: 89871388,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 10,
+                start: 89873801,
+                end: 89874436,
+            },
+        ];
+        (tx, exons)
+    }
+
+    fn make_nm_012115_internal_edit_transcript() -> (TranscriptFeature, [ExonFeature; 10]) {
+        let mut tx = make_transcript("protein_coding", 1, Some(89829880), Some(89874436));
+        tx.transcript_id = "NM_012115.4".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 89829880;
+        tx.end = 89874436;
+        tx.cdna_coding_start = Some(256);
+        tx.cdna_coding_end = Some(6204);
+        tx.bam_edit_status = Some("ok".to_string());
+        tx.has_non_polya_rna_edit = true;
+        tx.refseq_edits = vec![
+            crate::transcript_consequence::RefSeqEdit {
+                start: 6148,
+                end: 6147,
+                replacement_len: Some(48),
+                skip_refseq_offset: false,
+            },
+            crate::transcript_consequence::RefSeqEdit {
+                start: 6149,
+                end: 6149,
+                replacement_len: Some(1),
+                skip_refseq_offset: true,
+            },
+        ];
+        tx.cdna_mapper_segments = vec![
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89829880,
+                genomic_end: 89830106,
+                cdna_start: 1,
+                cdna_end: 227,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89846562,
+                genomic_end: 89846644,
+                cdna_start: 228,
+                cdna_end: 310,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89853166,
+                genomic_end: 89853234,
+                cdna_start: 311,
+                cdna_end: 379,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89854817,
+                genomic_end: 89854917,
+                cdna_start: 380,
+                cdna_end: 480,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89855470,
+                genomic_end: 89855544,
+                cdna_start: 481,
+                cdna_end: 555,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89857084,
+                genomic_end: 89857199,
+                cdna_start: 556,
+                cdna_end: 671,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89862126,
+                genomic_end: 89864371,
+                cdna_start: 672,
+                cdna_end: 2917,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89865953,
+                genomic_end: 89869082,
+                cdna_start: 2918,
+                cdna_end: 6047,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89871289,
+                genomic_end: 89871388,
+                cdna_start: 6048,
+                cdna_end: 6147,
+                ori: 1,
+            },
+            TranscriptCdnaMapperSegment {
+                genomic_start: 89873801,
+                genomic_end: 89874436,
+                cdna_start: 6196,
+                cdna_end: 6831,
+                ori: 1,
+            },
+        ];
+        let exons = [
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 1,
+                start: 89829880,
+                end: 89830106,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 2,
+                start: 89846562,
+                end: 89846644,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 3,
+                start: 89853166,
+                end: 89853234,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 4,
+                start: 89854817,
+                end: 89854917,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 5,
+                start: 89855470,
+                end: 89855544,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 6,
+                start: 89857084,
+                end: 89857199,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 7,
+                start: 89862126,
+                end: 89864371,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 8,
+                start: 89865953,
+                end: 89869082,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 9,
+                start: 89871289,
+                end: 89871388,
+            },
+            ExonFeature {
+                transcript_id: tx.transcript_id.clone(),
+                exon_number: 10,
+                start: 89873801,
+                end: 89874436,
+            },
+        ];
+        (tx, exons)
+    }
+
+    fn make_nm_001172437_same_coordinate_multibase_edit_transcript()
+    -> (TranscriptFeature, [ExonFeature; 1]) {
+        let mut tx = make_transcript("protein_coding", 1, Some(1), Some(2355));
+        tx.transcript_id = "NM_001172437.2".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 1;
+        tx.end = 7000;
+        tx.cdna_coding_start = Some(263);
+        tx.cdna_coding_end = Some(2617);
+        tx.refseq_edits = vec![crate::transcript_consequence::RefSeqEdit {
+            start: 1447,
+            end: 1447,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+        let mut transcript_seq = vec![b'A'; 7000];
+        transcript_seq[2768] = b'T';
+        transcript_seq[2769] = b'C';
+        tx.spliced_seq = Some(String::from_utf8(transcript_seq).expect("ASCII transcript"));
+        let exons = [ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 1,
+            end: 7000,
+        }];
+        (tx, exons)
+    }
+
+    fn make_nm_001172437_failed_bam_edit_transcript() -> (TranscriptFeature, [ExonFeature; 1]) {
+        let (mut tx, exons) = make_nm_001172437_same_coordinate_multibase_edit_transcript();
+        tx.bam_edit_status = Some("failed".to_string());
+        (tx, exons)
+    }
+
+    fn make_nr_170302_noncoding_refseq_edit_transcript() -> (TranscriptFeature, [ExonFeature; 1]) {
+        let mut tx = make_transcript("lncRNA", 1, None, None);
+        tx.transcript_id = "NR_170302.1".to_string();
+        tx.source = Some("RefSeq".to_string());
+        tx.start = 1;
+        tx.end = 200;
+        tx.refseq_edits = vec![
+            crate::transcript_consequence::RefSeqEdit {
+                start: 7,
+                end: 6,
+                replacement_len: Some(6),
+                skip_refseq_offset: false,
+            },
+            crate::transcript_consequence::RefSeqEdit {
+                start: 14,
+                end: 14,
+                replacement_len: None,
+                skip_refseq_offset: false,
+            },
+        ];
+        let mut transcript_seq = vec![b'A'; 200];
+        transcript_seq[36] = b'T';
+        transcript_seq[41] = b'C';
+        tx.spliced_seq = Some(String::from_utf8(transcript_seq).expect("ASCII transcript"));
+        let exons = [ExonFeature {
+            transcript_id: tx.transcript_id.clone(),
+            exon_number: 1,
+            start: 1,
+            end: 200,
+        }];
+        (tx, exons)
+    }
+
     #[test]
     fn test_format_hgvsc_native_refseq_leading_insertion_uses_pre_edit_upstream_anchor() {
         let (tx, exons_owned) = make_nm_001177639_leading_edit_transcript();
@@ -2979,6 +3514,199 @@ mod tests {
         let hgvsc = format_hgvsc(&tx, &exons, None, None, "C", "T", 49521283, 49521283, None);
 
         assert_eq!(hgvsc.as_deref(), Some("NM_001177639.3:c.279-9514C>T"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_internal_refseq_insertion_uses_pre_edit_downstream_anchor() {
+        let (tx, exons_owned) = make_nm_001137668_internal_edit_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+
+        let hgvsc = format_hgvsc(&tx, &exons, None, None, "T", "C", 89873677, 89873677, None);
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001137668.2:c.5893-124T>C"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_internal_refseq_insertion_uses_pre_edit_downstream_anchor_alt_tx() {
+        let (tx, exons_owned) = make_nm_012115_internal_edit_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+
+        let hgvsc = format_hgvsc(&tx, &exons, None, None, "T", "C", 89873677, 89873677, None);
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_012115.4:c.5893-124T>C"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_same_coordinate_multibase_refseq_edit_uses_full_inserted_offset() {
+        let (tx, exons_owned) = make_nm_001172437_same_coordinate_multibase_edit_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+
+        let hgvsc = format_hgvsc(&tx, &exons, None, None, "T", "C", 2768, 2768, None);
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001172437.2:c.*153C>C"));
+    }
+
+    #[test]
+    fn test_format_hgvsc_refseq_failed_bam_edit_suppresses_shifted_utr_deletion() {
+        let (tx, exons_owned) = make_nm_001172437_failed_bam_edit_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let variant = crate::transcript_consequence::VariantInput::from_vcf(
+            "7".to_string(),
+            5859,
+            5863,
+            "TACAG".to_string(),
+            "T".to_string(),
+        );
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 4,
+            start: 5864,
+            end: 5867,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: "ACAG".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "ACAG".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+
+        let hgvsc = format_hgvsc(
+            &tx,
+            &exons,
+            None,
+            None,
+            "CAGA",
+            "-",
+            variant.start,
+            variant.end,
+            Some(&shift),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001172437.2:c.*3245_*3248del"));
+    }
+
+    #[test]
+    fn test_hgvsc_offset_refseq_failed_bam_edit_suppresses_shifted_utr_deletion() {
+        let (tx, _) = make_nm_001172437_failed_bam_edit_transcript();
+        let mut variant = crate::transcript_consequence::VariantInput::from_vcf(
+            "7".to_string(),
+            5859,
+            5863,
+            "TACAG".to_string(),
+            "T".to_string(),
+        );
+        variant.hgvs_shift_forward = Some(HgvsGenomicShift {
+            strand: 1,
+            shift_length: 4,
+            start: 5864,
+            end: 5867,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: "ACAG".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "ACAG".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+
+        assert_eq!(
+            hgvsc_offset_for_output(
+                &tx,
+                &variant,
+                "CAGA",
+                Some("NM_001172437.2:c.*3245_*3248del"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_refseq_failed_bam_edit_keeps_shift_when_alleles_match() {
+        let (tx, exons_owned) = make_nm_001172437_failed_bam_edit_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let variant = crate::transcript_consequence::VariantInput::from_vcf(
+            "7".to_string(),
+            4915,
+            4916,
+            "GT".to_string(),
+            "G".to_string(),
+        );
+        let shift = HgvsGenomicShift {
+            strand: 1,
+            shift_length: 6,
+            start: 4922,
+            end: 4922,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: "T".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "T".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+
+        let hgvsc = format_hgvsc(
+            &tx,
+            &exons,
+            None,
+            None,
+            "T",
+            "-",
+            variant.start,
+            variant.end,
+            Some(&shift),
+        );
+
+        assert_eq!(hgvsc.as_deref(), Some("NM_001172437.2:c.*2307del"));
+    }
+
+    #[test]
+    fn test_hgvsc_offset_refseq_failed_bam_edit_keeps_shift_when_alleles_match() {
+        let (tx, _) = make_nm_001172437_failed_bam_edit_transcript();
+        let mut variant = crate::transcript_consequence::VariantInput::from_vcf(
+            "7".to_string(),
+            4915,
+            4916,
+            "GT".to_string(),
+            "G".to_string(),
+        );
+        variant.hgvs_shift_forward = Some(HgvsGenomicShift {
+            strand: 1,
+            shift_length: 6,
+            start: 4922,
+            end: 4922,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: "T".to_string(),
+            shifted_output_allele: "-".to_string(),
+            ref_orig_allele_string: "T".to_string(),
+            alt_orig_allele_string: "-".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        });
+
+        assert_eq!(
+            hgvsc_offset_for_output(&tx, &variant, "T", Some("NM_001172437.2:c.*2307del"),),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn test_format_hgvsc_noncoding_refseq_keeps_raw_coordinate_but_uses_edited_reference() {
+        let (tx, exons_owned) = make_nr_170302_noncoding_refseq_edit_transcript();
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+
+        let hgvsc = format_hgvsc(&tx, &exons, None, None, "C", "T", 37, 37, None);
+
+        assert_eq!(hgvsc.as_deref(), Some("NR_170302.1:n.37C>T"));
     }
 
     #[test]

@@ -94,6 +94,7 @@ use crate::transcript_consequence::{
     ProteinDomainFeature, RefSeqEdit, RegulatoryFeature, SiftPolyphenCache, StructuralFeature,
     SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequence,
     TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature, VariantInput,
+    refseq_edit_offset_delta,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -4121,27 +4122,26 @@ impl AnnotateProvider {
                             .unwrap_or("");
 
                         if flags.everything {
-                            // HGVS_OFFSET: shift_length for the transcript's strand.
-                            // VEP only emits HGVS_OFFSET when HGVSc was actually computed
-                            // for this transcript variant allele. Non-transcript features
-                            // (regulatory, intergenic) never get HGVS_OFFSET.
-                            let hgvs_offset = if hgvs_flags.hgvsc && tc.hgvsc.is_some() {
-                                let tx_strand = tx_opt.map(|tx| tx.strand).unwrap_or(1);
-                                row_variant
-                                    .as_ref()
-                                    .unwrap()
-                                    .hgvs_shift_for_strand(tx_strand)
-                                    .filter(|s| s.shift_length > 0)
-                                    .map(|s| {
-                                        // VEP emits negative HGVS_OFFSET for reverse-strand
-                                        // transcripts (the shift direction is opposite).
-                                        let signed = s.shift_length as i64;
-                                        if tx_strand < 0 {
-                                            (-signed).to_string()
-                                        } else {
-                                            signed.to_string()
-                                        }
+                            // HGVS_OFFSET mirrors the transcript-level HGVSc shift
+                            // decision. RefSeq rows with failed BAM edit replay can
+                            // still emit transcript-space HGVSc, but VEP suppresses
+                            // the exposed genomic shift for those transcripts.
+                            let hgvs_offset = if hgvs_flags.hgvsc {
+                                tx_opt
+                                    .zip(row_variant.as_ref())
+                                    .and_then(|(tx, variant)| {
+                                        let ref_allele = tc
+                                            .used_ref
+                                            .as_deref()
+                                            .unwrap_or(variant.ref_allele.as_str());
+                                        crate::hgvs::hgvsc_offset_for_output(
+                                            tx,
+                                            variant,
+                                            ref_allele,
+                                            tc.hgvsc.as_deref(),
+                                        )
                                     })
+                                    .map(|offset| offset.to_string())
                                     .unwrap_or_default()
                             } else {
                                 String::new()
@@ -5455,16 +5455,10 @@ fn refseq_misalignment_offset(tx: &TranscriptFeature, cdna_start: i64) -> Option
 
     let mut offset = 0_i64;
     for edit in &tx.refseq_edits {
-        if edit.skip_refseq_offset || edit.end >= cdna_start {
+        if edit.end >= cdna_start {
             continue;
         }
-
-        if let Some(replacement_len) = edit.replacement_len {
-            let replaced_len = edit.end.saturating_sub(edit.start).saturating_add(1);
-            offset += replacement_len as i64 - replaced_len;
-        } else {
-            offset += -1 - (edit.end - edit.start);
-        }
+        offset += refseq_edit_offset_delta(edit).unwrap_or(0);
     }
 
     (offset != 0).then_some(offset)
@@ -8729,6 +8723,21 @@ mod tests {
 
         tx.transcript_id = "NR_000001".to_string();
         assert_eq!(refseq_misalignment_offset(&tx, 35), None);
+    }
+
+    #[test]
+    fn test_refseq_misalignment_offset_counts_same_coordinate_multibase_edit_as_full_insertion() {
+        let mut tx = make_selection_tx("NM_001172437.2", Some("RefSeq"));
+        tx.refseq_edits = vec![RefSeqEdit {
+            start: 1447,
+            end: 1447,
+            replacement_len: Some(2),
+            skip_refseq_offset: false,
+        }];
+
+        assert_eq!(refseq_misalignment_offset(&tx, 1447), None);
+        assert_eq!(refseq_misalignment_offset(&tx, 1448), Some(2));
+        assert_eq!(refseq_misalignment_offset(&tx, 2768), Some(2));
     }
 
     #[test]
