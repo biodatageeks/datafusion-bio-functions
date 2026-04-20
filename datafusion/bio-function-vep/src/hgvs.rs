@@ -303,7 +303,7 @@ pub(crate) fn hgvsc_uses_genomic_shift(
     alt_allele: &str,
     genomic_shift: Option<&HgvsGenomicShift>,
 ) -> bool {
-    if ref_allele != "-" && alt_allele != "-" {
+    if shiftable_indel_kind_for_hgvsc(ref_allele, alt_allele, tx.strand).is_none() {
         return false;
     }
 
@@ -614,6 +614,33 @@ fn parse_shiftable_indel<'a>(
     None
 }
 
+fn shiftable_indel_kind_for_hgvsc(
+    ref_allele: &str,
+    alt_allele: &str,
+    strand: i8,
+) -> Option<GenomicShiftKind> {
+    if let Some((_, kind)) = parse_shiftable_indel(ref_allele, alt_allele) {
+        return Some(kind);
+    }
+    if ref_allele.is_empty() || alt_allele.is_empty() || ref_allele == alt_allele {
+        return None;
+    }
+
+    let mut notation = HgvsNotation {
+        start: 1,
+        end: i64::try_from(ref_allele.len()).ok()?,
+        ref_allele: ref_allele.to_ascii_uppercase(),
+        alt_allele: alt_allele.to_ascii_uppercase(),
+        kind: "delins".to_string(),
+    };
+    clip_alleles(&mut notation, strand);
+    match notation.kind.as_str() {
+        "ins" => Some(GenomicShiftKind::Insertion),
+        "del" => Some(GenomicShiftKind::Deletion),
+        _ => None,
+    }
+}
+
 /// Traceability:
 /// - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
 ///   replaces HGVS `alt` with transcript-space `feature_seq` when `_rna_edit`
@@ -861,10 +888,9 @@ fn hgvsc_coords_from_output_cdna_position(
         Some((start, end)) => (start.trim(), end.trim()),
         None => (cdna_position.trim(), cdna_position.trim()),
     };
-    let shifted_delta = if matches!(notation.kind.as_str(), "ins" | "dup") {
+    let shifted_delta = if notation.kind == "ins" {
         genomic_shift
             .and_then(|shift| i64::try_from(shift.shift_length).ok())
-            .map(|delta| if tx.strand < 0 { -delta } else { delta })
             .unwrap_or(0)
     } else {
         0
@@ -2574,6 +2600,33 @@ mod tests {
             format_hgvsc(&tx, &exons, None, None, "AA", "-", 104, 105, Some(&shift)),
             Some("ENSTHGVS000001.1:c.11-3_11-2del".to_string())
         );
+    }
+
+    #[test]
+    fn test_hgvsc_uses_genomic_shift_for_anchored_insertions_after_clipping() {
+        let tx = make_transcript("lncRNA", -1, None, None);
+        let shift = HgvsGenomicShift {
+            strand: -1,
+            shift_length: 3,
+            start: 1239,
+            end: 1236,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: "TTGCTG".to_string(),
+            shifted_output_allele: "TTGCTG".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "TTGCTG".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+
+        assert!(hgvsc_uses_genomic_shift(
+            &tx,
+            "TCTG",
+            "TCTGTTGCTG",
+            Some(&shift)
+        ));
     }
 
     #[test]
@@ -4578,6 +4631,46 @@ mod tests {
         );
 
         assert_eq!(hgvsc.as_deref(), Some("NR_132989.1:n.653dup"));
+    }
+
+    #[test]
+    fn test_hgvsc_coords_from_output_cdna_position_refseq_minus_strand_insertion_shifts_forward() {
+        let (tx, exons_owned) =
+            make_refseq_noncoding_dup_output_coord_transcript("NR_024448.2", -1);
+        let exons = exons_owned.iter().collect::<Vec<_>>();
+        let shift = HgvsGenomicShift {
+            strand: -1,
+            shift_length: 3,
+            start: 1239,
+            end: 1236,
+            shifted_compare_allele: "-".to_string(),
+            shifted_allele_string: "TTGCTG".to_string(),
+            shifted_output_allele: "TTGCTG".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "TTGCTG".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
+        let coord_notation = HgvsNotation {
+            start: 1236,
+            end: 1235,
+            ref_allele: String::new(),
+            alt_allele: "CAGCAA".to_string(),
+            kind: "ins".to_string(),
+        };
+
+        assert_eq!(
+            hgvsc_coords_from_output_cdna_position(
+                &tx,
+                &exons,
+                &coord_notation,
+                "1238-1239",
+                Some(&shift)
+            ),
+            Some(("1241".to_string(), "1242".to_string()))
+        );
     }
 
     #[test]
