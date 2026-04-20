@@ -170,33 +170,27 @@ impl PluginIndex {
         }
 
         let store = VepKvStore::open(&path)?;
-        let store_value_fields = store
+        let stored_entry_indices = store
             .schema()
             .fields()
             .iter()
-            .filter(|field| {
-                !["chrom", "start", "end", "allele_string"].contains(&field.name().as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let store_value_indices = store_value_fields
-            .iter()
             .enumerate()
-            .map(|(idx, field)| (field.name().to_string(), idx))
+            .filter(|(_, field)| !["chrom", "start"].contains(&field.name().as_str()))
+            .map(|(idx, field)| (field.name().to_string(), idx - 2))
             .collect::<HashMap<_, _>>();
         let value_fields: Vec<Arc<Field>> = kind
             .plugin_kind()
             .output_fields()
             .into_iter()
             .map(Arc::new)
-            .filter(|field| store_value_indices.contains_key(field.name()))
+            .filter(|field| stored_entry_indices.contains_key(field.name()))
             .collect();
         let value_schema = Arc::new(Schema::new(value_fields));
         let value_col_indices = value_schema
             .fields()
             .iter()
             .map(|field| {
-                store_value_indices
+                stored_entry_indices
                     .get(field.name())
                     .copied()
                     .ok_or_else(|| {
@@ -478,10 +472,37 @@ impl ContigPlugins {
 
     /// Return a pipe-delimited CSQ suffix for the given variant.
     pub fn csq_suffix_for_variant(&self, pos: i64, ref_allele: &str, alt_allele: &str) -> String {
+        self.csq_suffix_for_consequence(pos, ref_allele, alt_allele, true)
+    }
+
+    /// Return a pipe-delimited CSQ suffix for a specific consequence row.
+    ///
+    /// Some plugins are consequence-type-specific in VEP output even when the
+    /// source lookup itself is variant-level. AlphaMissense is emitted only on
+    /// `missense_variant` rows, so callers can suppress it for non-missense
+    /// consequences while keeping field positions stable.
+    pub fn csq_suffix_for_consequence(
+        &self,
+        pos: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+        include_alphamissense: bool,
+    ) -> String {
         let mut values = Vec::new();
         for plugin_cfg in &self.active_plugins.configs {
             if plugin_cfg.kind == PluginKind::Cadd {
-                values.extend(self.cadd_values_for_variant(pos, ref_allele, alt_allele));
+                values.extend(
+                    self.cadd_values_for_variant(pos, ref_allele, alt_allele)
+                        .into_iter()
+                        .map(|value| sanitize_csq_plugin_value(&value)),
+                );
+                continue;
+            }
+
+            if plugin_cfg.kind == PluginKind::AlphaMissense && !include_alphamissense {
+                for _ in 0..plugin_cfg.kind.output_fields().len() {
+                    values.push(String::new());
+                }
                 continue;
             }
 
@@ -490,7 +511,12 @@ impl ContigPlugins {
                 .iter()
                 .find(|index| index.kind.plugin_kind() == plugin_cfg.kind)
             {
-                values.extend(index.csq_values_for_variant(pos, ref_allele, alt_allele));
+                values.extend(
+                    index
+                        .csq_values_for_variant(pos, ref_allele, alt_allele)
+                        .into_iter()
+                        .map(|value| sanitize_csq_plugin_value(&value)),
+                );
             } else {
                 for _ in 0..plugin_cfg.kind.output_fields().len() {
                     values.push(String::new());
@@ -498,6 +524,32 @@ impl ContigPlugins {
             }
         }
         values.join("|")
+    }
+
+    pub fn alphamissense_matches_transcript_consequence(
+        &self,
+        pos: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+        protein_position: Option<&str>,
+        amino_acids: Option<&str>,
+    ) -> bool {
+        let Some(index) = self
+            .indexes
+            .iter()
+            .find(|index| index.kind == PluginSourceKind::AlphaMissense)
+        else {
+            return false;
+        };
+        let values = index.csq_values_for_variant(pos, ref_allele, alt_allele);
+        let Some(plugin_protein_variant) = values.get(3).map(String::as_str) else {
+            return false;
+        };
+        protein_variant_matches(
+            plugin_protein_variant,
+            protein_position,
+            amino_acids,
+        )
     }
 
     fn append_cadd_columns(
@@ -536,6 +588,39 @@ impl ContigPlugins {
             .map(|index| index.csq_values_for_variant(pos, ref_allele, alt_allele))
             .unwrap_or_else(|| vec![String::new(), String::new()])
     }
+}
+
+fn sanitize_csq_plugin_value(value: &str) -> String {
+    value.replace('|', "&")
+}
+
+fn protein_variant_matches(
+    plugin_protein_variant: &str,
+    protein_position: Option<&str>,
+    amino_acids: Option<&str>,
+) -> bool {
+    let Some((ref_aa, alt_aa)) = amino_acids.and_then(|value| value.split_once('/')) else {
+        return false;
+    };
+    let Some(position) = protein_position.filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    if plugin_protein_variant.len() < 3 {
+        return false;
+    }
+    let mut chars = plugin_protein_variant.chars();
+    let Some(plugin_ref) = chars.next() else {
+        return false;
+    };
+    let Some(plugin_alt) = plugin_protein_variant.chars().last() else {
+        return false;
+    };
+    let plugin_pos = &plugin_protein_variant[1..plugin_protein_variant.len() - 1];
+    plugin_pos == position
+        && ref_aa.len() == 1
+        && alt_aa.len() == 1
+        && ref_aa.starts_with(plugin_ref)
+        && alt_aa.starts_with(plugin_alt)
 }
 
 fn append_optional_f32(builder: &mut Float32Builder, value: Option<&str>) {
@@ -885,6 +970,7 @@ fn get_string_column(batch: &RecordBatch, name: &str) -> Result<StringArray> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::PluginConfig;
     use datafusion::arrow::array::{Float32Array, Int64Array};
     use datafusion::arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
@@ -1011,5 +1097,51 @@ mod tests {
 
         assert_eq!(plugins.cadd_values_for_variant(101, "A", "G"), vec!["11"]);
         assert_eq!(plugins.cadd_values_for_variant(202, "A", "AT"), vec!["22"]);
+    }
+
+    #[test]
+    fn csq_suffix_escapes_inner_pipe_characters_in_plugin_values() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ClinVar", DataType::Utf8, true),
+            Field::new("ClinVar_CLNSIG", DataType::Utf8, true),
+            Field::new("ClinVar_CLNREVSTAT", DataType::Utf8, true),
+            Field::new("ClinVar_CLNDN", DataType::Utf8, true),
+            Field::new("ClinVar_CLNVC", DataType::Utf8, true),
+            Field::new("ClinVar_CLNVI", DataType::Utf8, true),
+        ]));
+        let clinvar_index = PluginIndex {
+            kind: PluginSourceKind::ClinVar,
+            backend: PluginBackend::Parquet(ParquetPluginIndex {
+                lookup: HashMap::from([((101_i64, Box::<str>::from("A"), Box::<str>::from("G")), 0)]),
+                data: RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(vec!["12345"])),
+                        Arc::new(StringArray::from(vec!["Benign"])),
+                        Arc::new(StringArray::from(vec!["criteria_provided|_multiple_submitters|_no_conflicts"])),
+                        Arc::new(StringArray::from(vec!["Disease_A|Disease_B"])),
+                        Arc::new(StringArray::from(vec!["single_nucleotide_variant"])),
+                        Arc::new(StringArray::from(vec!["ClinGen:CA1|Other:2"])),
+                    ],
+                )
+                .expect("clinvar batch"),
+                value_schema: schema,
+            }),
+        };
+
+        let plugins = ContigPlugins {
+            active_plugins: ActivePlugins {
+                configs: vec![PluginConfig {
+                    kind: PluginKind::ClinVar,
+                    source_dirs: vec![],
+                }],
+            },
+            indexes: vec![clinvar_index],
+        };
+
+        assert_eq!(
+            plugins.csq_suffix_for_variant(101, "A", "G"),
+            "12345|Benign|criteria_provided&_multiple_submitters&_no_conflicts|Disease_A&Disease_B|single_nucleotide_variant|ClinGen:CA1&Other:2"
+        );
     }
 }

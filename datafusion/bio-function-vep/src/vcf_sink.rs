@@ -331,7 +331,9 @@ pub async fn annotate_to_vcf(
             } else if name == "CSQ" {
                 let active_plugins = config.active_plugins();
                 let mut field_names: Vec<&str> = if config.everything {
-                    crate::golden_benchmark::CSQ_FIELD_NAMES_EVERYTHING.to_vec()
+                    crate::golden_benchmark::csq_field_names_everything(
+                        active_plugins.has_kind(crate::plugin::PluginKind::ClinVar),
+                    )
                 } else {
                     crate::golden_benchmark::CSQ_FIELD_NAMES.to_vec()
                 };

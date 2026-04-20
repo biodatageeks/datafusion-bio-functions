@@ -703,14 +703,12 @@ mod tests {
     #[test]
     fn clinvar_query_uses_quoted_vcf_info_fields() {
         let query = plugin_select_query("clinvar").expect("query");
-        assert!(query.contains("array_to_string(\"CLNSIG\", '|') AS clnsig"));
-        assert!(query.contains("array_to_string(\"CLNDN\", '|') AS clndn"));
-        assert!(query.contains("array_to_string(\"CLNREVSTAT\", '|') AS clnrevstat"));
-        assert!(query.contains("\"CLNVC\" AS clnvc"));
-        assert!(query.contains(" AS clnvi"));
-        assert!(query.contains(" AS af_esp"));
-        assert!(query.contains(" AS af_exac"));
-        assert!(query.contains(" AS af_tgp"));
+        assert!(query.contains("CAST(id AS VARCHAR) AS \"ClinVar\""));
+        assert!(query.contains("array_to_string(\"CLNSIG\", '|') AS \"ClinVar_CLNSIG\""));
+        assert!(query.contains("array_to_string(\"CLNDN\", '|') AS \"ClinVar_CLNDN\""));
+        assert!(query.contains("array_to_string(\"CLNREVSTAT\", '|') AS \"ClinVar_CLNREVSTAT\""));
+        assert!(query.contains("\"CLNVC\" AS \"ClinVar_CLNVC\""));
+        assert!(query.contains(" AS \"ClinVar_CLNVI\""));
     }
 
     #[test]
@@ -771,6 +769,7 @@ mod tests {
             32,
             None,
             false,
+            None,
         )
         .expect("convert");
         assert_eq!(results.len(), 1);
@@ -822,6 +821,7 @@ mod tests {
             32,
             None,
             false,
+            None,
         )
         .expect("convert");
         assert_eq!(results[0].1, 1);
@@ -879,6 +879,7 @@ mod tests {
             32,
             None,
             false,
+            None,
         )
         .expect("convert");
         assert_eq!(results[0].1, 1);
@@ -910,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn clinvar_round_trip_includes_extended_columns() {
+    fn clinvar_round_trip_includes_vep_compatible_columns() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("clinvar.vcf.gz");
         write_gzip_text(
@@ -926,7 +927,7 @@ mod tests {
                 "##INFO=<ID=AF_EXAC,Number=1,Type=Float,Description=\"ExAC AF\">\n",
                 "##INFO=<ID=AF_TGP,Number=1,Type=Float,Description=\"TGP AF\">\n",
                 "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
-                "1\t100\t.\tA\tG\t.\t.\tCLNSIG=Pathogenic;CLNDN=Disease;CLNREVSTAT=criteria_provided;CLNVC=single_nucleotide_variant;CLNVI=RCV:1;AF_ESP=0.1;AF_EXAC=0.2;AF_TGP=0.3\n",
+                "1\t100\t12345\tA\tG\t.\t.\tCLNSIG=Pathogenic;CLNDN=Disease;CLNREVSTAT=criteria_provided;CLNVC=single_nucleotide_variant;CLNVI=RCV:1;AF_ESP=0.1;AF_EXAC=0.2;AF_TGP=0.3\n",
             ),
         );
 
@@ -940,6 +941,7 @@ mod tests {
             32,
             None,
             false,
+            None,
         )
         .expect("convert");
         assert_eq!(results[0].1, 1);
@@ -955,14 +957,12 @@ mod tests {
         });
         let batch = &batches[0];
         for column in [
-            "clnsig",
-            "clndn",
-            "clnrevstat",
-            "clnvc",
-            "clnvi",
-            "af_esp",
-            "af_exac",
-            "af_tgp",
+            "ClinVar",
+            "ClinVar_CLNSIG",
+            "ClinVar_CLNDN",
+            "ClinVar_CLNREVSTAT",
+            "ClinVar_CLNVC",
+            "ClinVar_CLNVI",
         ] {
             assert!(batch.schema().index_of(column).is_ok(), "{column}");
         }
@@ -999,6 +999,7 @@ mod tests {
             32,
             None,
             false,
+            None,
         )
         .expect("convert");
         assert_eq!(results[0].1, 2);

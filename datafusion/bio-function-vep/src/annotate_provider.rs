@@ -88,7 +88,7 @@ use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::partitioned_cache::PartitionedParquetCache;
-use crate::plugin::ActivePlugins;
+use crate::plugin::{ActivePlugins, PluginKind};
 use crate::plugin_lookup::{ContigPlugins, PluginIndex};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
@@ -3656,7 +3656,7 @@ impl AnnotateProvider {
                 variant_fields.pheno,
                 variant_fields.pubmed,
             );
-            let plugin_csq_segment = contig_plugins
+            let variant_plugin_csq_segment = contig_plugins
                 .filter(|plugins| !plugins.active_plugins.is_empty())
                 .map(|plugins| {
                     format!(
@@ -3682,12 +3682,38 @@ impl AnnotateProvider {
                     let impact = SoTerm::from_str(most_val)
                         .map(|t| impact_label(t.impact()))
                         .unwrap_or_else(|| impact_label(SoImpact::Modifier));
+                    let plugin_csq_segment = contig_plugins
+                        .filter(|plugins| !plugins.active_plugins.is_empty())
+                        .map(|plugins| {
+                            format!(
+                                "|{}",
+                                plugins.csq_suffix_for_consequence(
+                                    start_val,
+                                    &ref_al,
+                                    &alt_allele,
+                                    false,
+                                )
+                            )
+                        })
+                        .unwrap_or_else(|| variant_plugin_csq_segment.clone());
                     if flags.everything {
+                        let include_source = self.active_plugins.has_kind(PluginKind::ClinVar);
                         let _ = write!(
                             csq_buf,
-                            "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
-                             {variant_class}|||||||||||||||||||||\
-                             {batch3_suffix}|||||{plugin_csq_segment}"
+                            "{}",
+                            if include_source {
+                                format!(
+                                    "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
+                                     {variant_class}|||||||||||||||||||||\
+                                     {batch3_suffix}|||||{plugin_csq_segment}"
+                                )
+                            } else {
+                                format!(
+                                    "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
+                                     {variant_class}||||||||||||||||||||\
+                                     {batch3_suffix}|||||{plugin_csq_segment}"
+                                )
+                            }
                         );
                     } else {
                         let _ = write!(
@@ -3844,6 +3870,30 @@ impl AnnotateProvider {
                             String::new()
                         };
                         let source_val = if merged { source } else { "" };
+                        let include_source = flags.everything
+                            && self.active_plugins.has_kind(PluginKind::ClinVar);
+                        let plugin_csq_segment = contig_plugins
+                            .filter(|plugins| !plugins.active_plugins.is_empty())
+                            .map(|plugins| {
+                                let include_alphamissense = tc.terms.contains(&SoTerm::MissenseVariant)
+                                    && plugins.alphamissense_matches_transcript_consequence(
+                                        start_val,
+                                        &ref_al,
+                                        &alt_allele,
+                                        tc.protein_position.as_deref(),
+                                        tc.amino_acids.as_deref(),
+                                    );
+                                format!(
+                                    "|{}",
+                                    plugins.csq_suffix_for_consequence(
+                                        start_val,
+                                        &ref_al,
+                                        &alt_allele,
+                                        include_alphamissense,
+                                    )
+                                )
+                            })
+                            .unwrap_or_default();
 
                         // Batch 1 fields from transcript metadata.
                         let canonical = tx_opt
@@ -3983,23 +4033,39 @@ impl AnnotateProvider {
                                     String::new()
                                 }
                             };
-                            // 80-field CSQ: 22 base + 20 Batch 1 + 33 Batch 3 + 5 motif.
+                            // 81-field CSQ: 22 base + 21 Batch 1 + 33 Batch 3 + 5 motif.
                             // Traceability:
                             // - VEP Constants.pm CSQ field order for --everything
                             //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
-                             {exon}|{intron}|{hgvsc}|{hgvsp}|\
-                             {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                             {existing_var}|{distance}|{strand_str}|{tc_flags}|\
-                             {variant_class}|{symbol_source}|{hgnc_id}|\
-                             {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                             {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{gene_pheno}|\
-                             {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
-                             {hgvs_offset}|\
-                             {batch3_suffix}|||||{plugin_csq_segment}"
-                            );
+                            if include_source {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|\
+                                 {variant_class}|{symbol_source}|{hgnc_id}|\
+                                 {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
+                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{source_val}|{gene_pheno}|\
+                                 {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
+                                 {hgvs_offset}|\
+                                 {batch3_suffix}|||||{plugin_csq_segment}"
+                                );
+                            } else {
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|\
+                                 {variant_class}|{symbol_source}|{hgnc_id}|\
+                                 {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
+                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{gene_pheno}|\
+                                 {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
+                                 {hgvs_offset}|\
+                                 {batch3_suffix}|||||{plugin_csq_segment}"
+                                );
+                            }
                         } else {
                             // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
                             let _ = write!(
@@ -4018,17 +4084,65 @@ impl AnnotateProvider {
                     if csq_buf.is_empty() {
                         let impact = impact_label(SoImpact::Modifier);
                         if flags.everything {
+                            let include_source = self.active_plugins.has_kind(PluginKind::ClinVar);
                             let _ = write!(
                                 csq_buf,
-                                "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
-                             {variant_class}|||||||||||||||||||||\
-                             {batch3_suffix}|||||{plugin_csq_segment}"
+                                "{}",
+                                if include_source {
+                                    format!(
+                                        "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
+                                         {variant_class}||||||||||||||||||||||\
+                                         {batch3_suffix}|||||{}",
+                                        contig_plugins
+                                            .filter(|plugins| !plugins.active_plugins.is_empty())
+                                            .map(|plugins| format!(
+                                                "|{}",
+                                                plugins.csq_suffix_for_consequence(
+                                                    start_val,
+                                                    &ref_al,
+                                                    &alt_allele,
+                                                    false,
+                                                )
+                                            ))
+                                            .unwrap_or_default()
+                                    )
+                                } else {
+                                    format!(
+                                        "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
+                                         {variant_class}|||||||||||||||||||||\
+                                         {batch3_suffix}|||||{}",
+                                        contig_plugins
+                                            .filter(|plugins| !plugins.active_plugins.is_empty())
+                                            .map(|plugins| format!(
+                                                "|{}",
+                                                plugins.csq_suffix_for_consequence(
+                                                    start_val,
+                                                    &ref_al,
+                                                    &alt_allele,
+                                                    false,
+                                                )
+                                            ))
+                                            .unwrap_or_default()
+                                    )
+                                }
                             );
                         } else {
                             let _ = write!(
                                 csq_buf,
                                 "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
-                             {variant_class}||||||||||||{batch3_suffix}{plugin_csq_segment}"
+                             {variant_class}||||||||||||{batch3_suffix}{}",
+                                contig_plugins
+                                    .filter(|plugins| !plugins.active_plugins.is_empty())
+                                    .map(|plugins| format!(
+                                        "|{}",
+                                        plugins.csq_suffix_for_consequence(
+                                            start_val,
+                                            &ref_al,
+                                            &alt_allele,
+                                            false,
+                                        )
+                                    ))
+                                    .unwrap_or_default()
                             );
                         }
                     }

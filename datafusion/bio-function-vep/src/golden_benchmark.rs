@@ -16,9 +16,13 @@ use flate2::read::MultiGzDecoder;
 
 use crate::so_terms::SoTerm;
 
+pub const DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ: &str =
+    "/Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/data/HG002_chr22.vcf.gz";
+pub const DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI: &str = "/Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/data/HG002_chr22.vcf.gz.tbi";
 pub const DEFAULT_LOCAL_HG002_CHR22_VCF_GZ: &str = "vep-benchmark/data/HG002_chr22.vcf.gz";
 pub const DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI: &str = "vep-benchmark/data/HG002_chr22.vcf.gz.tbi";
-pub const DEFAULT_LOCAL_VEP_CACHE_DIR: &str = "vep-benchmark/cache";
+pub const DEFAULT_EXTERNAL_VEP_CACHE_DIR: &str =
+    "/Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/cache";
 
 #[derive(Debug, Clone, Eq)]
 pub struct VariantKey {
@@ -540,14 +544,13 @@ pub const CSQ_FIELD_NAMES: &[&str] = &[
     "PUBMED",
 ];
 
-/// CSQ field names for `--everything` mode (80 fields).
+/// CSQ field names for baseline `--everything` mode (80 fields).
 ///
 /// Traceability:
 /// - VEP Constants.pm CSQ field order
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138>
 ///
 /// Key differences from 74-field layout:
-/// - `SOURCE` removed (only present in `--merged` mode)
 /// - `VARIANT_CLASS` moved from after SOURCE to after FLAGS
 /// - `MANE` generic field added (separate from MANE_SELECT/MANE_PLUS_CLINICAL)
 /// - `APPRIS`, `SIFT`, `PolyPhen`, `DOMAINS`, `miRNA`, `HGVS_OFFSET` added
@@ -638,81 +641,11 @@ pub const CSQ_FIELD_NAMES_EVERYTHING: &[&str] = &[
     "TRANSCRIPTION_FACTORS",
 ];
 
-/// Return the CSQ field names for the selected transcript source mode.
-///
-/// The non-`everything` profile preserves the existing explicit benchmark field
-/// order and swaps the transcript-source block near `SOURCE`:
-/// - default Ensembl: `SOURCE`
-/// - RefSeq: `REFSEQ_MATCH`, `REFSEQ_OFFSET`, `GIVEN_REF`, `USED_REF`, `BAM_EDIT`
-/// - merged: `REFSEQ_MATCH`, `SOURCE`, `REFSEQ_OFFSET`, `GIVEN_REF`, `USED_REF`, `BAM_EDIT`
-///
-/// The `everything` profile inserts the RefSeq-specific fields next to the
-/// transcript metadata block, after `UNIPROT_ISOFORM`, matching VEP's flag
-/// expansion order more closely.
-pub fn csq_field_names_for_mode(everything: bool, refseq: bool, merged: bool) -> Vec<&'static str> {
-    let mut fields = if everything {
-        CSQ_FIELD_NAMES_EVERYTHING.to_vec()
-    } else {
-        CSQ_FIELD_NAMES.to_vec()
-    };
-
-    if everything {
-        if let Some(insert_at) = fields.iter().position(|field| *field == "GENE_PHENO") {
-            if merged {
-                fields.splice(
-                    insert_at..insert_at,
-                    [
-                        "REFSEQ_MATCH",
-                        "SOURCE",
-                        "REFSEQ_OFFSET",
-                        "GIVEN_REF",
-                        "USED_REF",
-                        "BAM_EDIT",
-                    ],
-                );
-            } else if refseq {
-                fields.splice(
-                    insert_at..insert_at,
-                    [
-                        "REFSEQ_MATCH",
-                        "REFSEQ_OFFSET",
-                        "GIVEN_REF",
-                        "USED_REF",
-                        "BAM_EDIT",
-                    ],
-                );
-            }
-        }
-        return fields;
+pub fn csq_field_names_everything(include_source: bool) -> Vec<&'static str> {
+    let mut fields = CSQ_FIELD_NAMES_EVERYTHING.to_vec();
+    if include_source {
+        fields.insert(36, "SOURCE");
     }
-
-    if let Some(source_idx) = fields.iter().position(|field| *field == "SOURCE") {
-        if merged {
-            fields.splice(
-                source_idx..=source_idx,
-                [
-                    "REFSEQ_MATCH",
-                    "SOURCE",
-                    "REFSEQ_OFFSET",
-                    "GIVEN_REF",
-                    "USED_REF",
-                    "BAM_EDIT",
-                ],
-            );
-        } else if refseq {
-            fields.splice(
-                source_idx..=source_idx,
-                [
-                    "REFSEQ_MATCH",
-                    "REFSEQ_OFFSET",
-                    "GIVEN_REF",
-                    "USED_REF",
-                    "BAM_EDIT",
-                ],
-            );
-        }
-    }
-
     fields
 }
 
@@ -1297,6 +1230,7 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[25], "MANE");
         assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[29], "APPRIS");
         assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[35], "UNIPROT_ISOFORM");
+        assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[36], "GENE_PHENO");
         assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[37], "SIFT");
         assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[38], "PolyPhen");
         assert_eq!(CSQ_FIELD_NAMES_EVERYTHING[39], "DOMAINS");
@@ -1312,44 +1246,13 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
     }
 
     #[test]
-    fn csq_field_names_for_refseq_and_merged_modes_insert_expected_fields() {
-        let refseq = csq_field_names_for_mode(false, true, false);
-        assert_eq!(refseq.len(), 78);
-        assert_eq!(refseq[28], "REFSEQ_MATCH");
-        assert_eq!(refseq[29], "REFSEQ_OFFSET");
-        assert_eq!(refseq[30], "GIVEN_REF");
-        assert_eq!(refseq[31], "USED_REF");
-        assert_eq!(refseq[32], "BAM_EDIT");
-        assert_eq!(refseq[33], "VARIANT_CLASS");
-
-        let merged = csq_field_names_for_mode(false, false, true);
-        assert_eq!(merged.len(), 79);
-        assert_eq!(merged[28], "REFSEQ_MATCH");
-        assert_eq!(merged[29], "SOURCE");
-        assert_eq!(merged[30], "REFSEQ_OFFSET");
-        assert_eq!(merged[31], "GIVEN_REF");
-        assert_eq!(merged[32], "USED_REF");
-        assert_eq!(merged[33], "BAM_EDIT");
-        assert_eq!(merged[34], "VARIANT_CLASS");
-
-        let everything_refseq = csq_field_names_for_mode(true, true, false);
-        assert_eq!(everything_refseq.len(), 85);
-        assert_eq!(everything_refseq[36], "REFSEQ_MATCH");
-        assert_eq!(everything_refseq[37], "REFSEQ_OFFSET");
-        assert_eq!(everything_refseq[38], "GIVEN_REF");
-        assert_eq!(everything_refseq[39], "USED_REF");
-        assert_eq!(everything_refseq[40], "BAM_EDIT");
-        assert_eq!(everything_refseq[41], "GENE_PHENO");
-
-        let everything_merged = csq_field_names_for_mode(true, false, true);
-        assert_eq!(everything_merged.len(), 86);
-        assert_eq!(everything_merged[36], "REFSEQ_MATCH");
-        assert_eq!(everything_merged[37], "SOURCE");
-        assert_eq!(everything_merged[38], "REFSEQ_OFFSET");
-        assert_eq!(everything_merged[39], "GIVEN_REF");
-        assert_eq!(everything_merged[40], "USED_REF");
-        assert_eq!(everything_merged[41], "BAM_EDIT");
-        assert_eq!(everything_merged[42], "GENE_PHENO");
+    fn csq_field_names_everything_with_source_inserts_source_after_uniprot_isoform() {
+        let fields = csq_field_names_everything(true);
+        assert_eq!(fields.len(), 81);
+        assert_eq!(fields[35], "UNIPROT_ISOFORM");
+        assert_eq!(fields[36], "SOURCE");
+        assert_eq!(fields[37], "GENE_PHENO");
+        assert_eq!(fields[80], "TRANSCRIPTION_FACTORS");
     }
 
     #[test]

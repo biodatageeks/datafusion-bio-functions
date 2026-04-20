@@ -52,14 +52,12 @@ impl PluginKind {
     pub fn output_fields(&self) -> Vec<Field> {
         match self {
             Self::ClinVar => vec![
-                Field::new("clnsig", DataType::Utf8, true),
-                Field::new("clnrevstat", DataType::Utf8, true),
-                Field::new("clndn", DataType::Utf8, true),
-                Field::new("clnvc", DataType::Utf8, true),
-                Field::new("clnvi", DataType::Utf8, true),
-                Field::new("af_esp", DataType::Float32, true),
-                Field::new("af_exac", DataType::Float32, true),
-                Field::new("af_tgp", DataType::Float32, true),
+                Field::new("ClinVar", DataType::Utf8, true),
+                Field::new("ClinVar_CLNSIG", DataType::Utf8, true),
+                Field::new("ClinVar_CLNREVSTAT", DataType::Utf8, true),
+                Field::new("ClinVar_CLNDN", DataType::Utf8, true),
+                Field::new("ClinVar_CLNVC", DataType::Utf8, true),
+                Field::new("ClinVar_CLNVI", DataType::Utf8, true),
             ],
             Self::Cadd => vec![
                 Field::new("raw_score", DataType::Float32, true),
@@ -124,14 +122,12 @@ impl PluginKind {
     pub fn csq_field_names(&self) -> Vec<&'static str> {
         match self {
             Self::ClinVar => vec![
-                "clnsig",
-                "clnrevstat",
-                "clndn",
-                "clnvc",
-                "clnvi",
-                "af_esp",
-                "af_exac",
-                "af_tgp",
+                "ClinVar",
+                "ClinVar_CLNSIG",
+                "ClinVar_CLNREVSTAT",
+                "ClinVar_CLNDN",
+                "ClinVar_CLNVC",
+                "ClinVar_CLNVI",
             ],
             Self::Cadd => vec!["raw_score", "phred_score"],
             Self::SpliceAI => vec![
@@ -275,6 +271,10 @@ impl ActivePlugins {
         self.configs.is_empty()
     }
 
+    pub fn has_kind(&self, kind: PluginKind) -> bool {
+        self.configs.iter().any(|cfg| cfg.kind == kind)
+    }
+
     /// Collect all output fields from active plugins.
     pub fn output_fields(&self) -> Vec<Field> {
         self.configs
@@ -332,5 +332,21 @@ mod tests {
         assert_eq!(plugins.configs.len(), 1);
         assert_eq!(plugins.configs[0].kind, PluginKind::Cadd);
         assert_eq!(plugins.configs[0].source_dirs.len(), 1);
+    }
+
+    #[test]
+    fn active_plugins_has_kind_matches_enabled_plugins() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("spliceai")).expect("spliceai dir");
+        std::fs::create_dir_all(temp.path().join("clinvar")).expect("clinvar dir");
+
+        let plugins = ActivePlugins::from_names(
+            &["spliceai".to_string(), "clinvar".to_string()],
+            temp.path(),
+        );
+
+        assert!(plugins.has_kind(PluginKind::ClinVar));
+        assert!(plugins.has_kind(PluginKind::SpliceAI));
+        assert!(!plugins.has_kind(PluginKind::Cadd));
     }
 }
