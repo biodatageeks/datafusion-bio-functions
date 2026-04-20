@@ -85,11 +85,14 @@ impl PartitionedParquetCache {
     /// Path to a per-chromosome parquet file for a given context type.
     /// Returns `None` if the file does not exist.
     pub fn context_path(&self, context_type: &str, chrom: &str) -> Option<PathBuf> {
-        let path = self
-            .base_dir
-            .join(context_type)
-            .join(format!("{chrom}.parquet"));
-        if path.exists() { Some(path) } else { None }
+        let context_dir = self.base_dir.join(context_type);
+        for candidate in chrom_path_candidates(chrom) {
+            let path = context_dir.join(format!("{candidate}.parquet"));
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
     }
 
     /// Whether a per-chromosome parquet file exists for a given context type.
@@ -165,6 +168,19 @@ fn sanitize_identifier_component(value: &str) -> String {
         }
     }
     out
+}
+
+fn chrom_path_candidates(chrom: &str) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(3);
+    candidates.push(chrom.to_string());
+    if let Some(bare) = chrom.strip_prefix("chr") {
+        candidates.push(bare.to_string());
+        candidates.push(format!("chr{bare}"));
+    } else {
+        candidates.push(format!("chr{chrom}"));
+    }
+    candidates.dedup();
+    candidates
 }
 
 /// Natural chromosome ordering: numeric chroms first (sorted numerically),
@@ -272,7 +288,9 @@ mod tests {
         let cache = PartitionedParquetCache::detect(tmp.path().to_str().unwrap()).unwrap();
 
         assert!(cache.has_chrom("variation", "chr1"));
+        assert!(cache.has_chrom("variation", "1"));
         assert!(cache.has_chrom("transcript", "chr1"));
+        assert!(cache.has_chrom("transcript", "1"));
         assert!(!cache.has_chrom("transcript", "chr99"));
         assert!(!cache.has_chrom("nonexistent", "chr1"));
     }
