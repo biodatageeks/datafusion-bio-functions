@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use async_trait::async_trait;
 use datafusion::arrow::array::{Int64Builder, RecordBatch, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -261,7 +261,7 @@ impl ExecutionPlan for ComplementExec {
             group_idx: 0,
             trailing_iter_idx: 0,
             trailing_contigs: Vec::new(),
-            seen_contigs: Vec::new(),
+            seen_contigs: AHashSet::new(),
             contig_builder: StringBuilder::new(),
             start_builder: Int64Builder::new(),
             end_builder: Int64Builder::new(),
@@ -290,7 +290,7 @@ struct ComplementStream {
     group_idx: usize,
     trailing_iter_idx: usize,
     trailing_contigs: Vec<String>,
-    seen_contigs: Vec<String>,
+    seen_contigs: AHashSet<String>,
     contig_builder: StringBuilder,
     start_builder: Int64Builder,
     end_builder: Int64Builder,
@@ -337,6 +337,7 @@ impl ComplementStream {
     }
 
     /// Compute complement of merged intervals against view intervals for a contig.
+    /// Uses a merge_cursor to avoid re-scanning from the start for each view interval.
     fn emit_contig_complement(
         contig: &str,
         merged_intervals: &[(i64, i64)],
@@ -346,12 +347,18 @@ impl ComplementStream {
         end_builder: &mut Int64Builder,
     ) -> usize {
         let mut rows = 0;
+        let mut merge_cursor = 0;
         for &(view_start, view_end) in view_intervals {
             let mut cursor = view_start;
-            for &(ms, me) in merged_intervals {
-                if me <= view_start {
-                    continue;
-                }
+            // Advance merge_cursor past intervals entirely before this view
+            while merge_cursor < merged_intervals.len()
+                && merged_intervals[merge_cursor].1 <= view_start
+            {
+                merge_cursor += 1;
+            }
+            let mut j = merge_cursor;
+            while j < merged_intervals.len() {
+                let (ms, me) = merged_intervals[j];
                 if ms >= view_end {
                     break;
                 }
@@ -364,6 +371,7 @@ impl ComplementStream {
                     rows += 1;
                 }
                 cursor = interval_end;
+                j += 1;
             }
             if cursor < view_end {
                 contig_builder.append_value(contig);
@@ -436,7 +444,7 @@ impl Stream for ComplementStream {
                             &mut this.end_builder,
                         );
 
-                        this.seen_contigs.push(contig.clone());
+                        this.seen_contigs.insert(contig.clone());
                         this.group_idx += 1;
 
                         if this.pending_rows >= this.batch_size {
