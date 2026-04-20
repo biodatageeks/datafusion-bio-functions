@@ -15603,34 +15603,27 @@ mod tests {
     #[test]
     fn protein_hgvs_shifted_variant_replays_original_alleles() {
         let original = var("4", 3074876, 3074882, "CCAGCAG", "CCAGCAGCAGCAGCAGCAGCAG");
-        let mut reader = noodles_fasta::io::indexed_reader::Builder::default()
-            .build_from_path(
-                "/Users/mwiewior/workspace/data_vepyr/Homo_sapiens.GRCh38.dna.primary_assembly.fa",
-            )
-            .unwrap();
-        // build_hgvs_genomic_shift requires "-"/seq insertion form. The VCF
-        // alleles CCAGCAG→CCAGCAGCAGCAGCAGCAGCAG share a full 7-char prefix;
-        // after stripping it, the variant is a pure insertion of CAGCAGCAGCAGCAG.
-        let (vep_ref, vep_alt) =
-            crate::allele::vcf_to_vep_allele("CCAGCAG", "CCAGCAGCAGCAGCAGCAGCAG");
-        let vep_start = crate::allele::vep_norm_start(3074876, "CCAGCAG", "CCAGCAGCAGCAGCAGCAGCAG");
-        let vep_end = crate::allele::vep_norm_end(3074876, "CCAGCAG", "CCAGCAGCAGCAGCAGCAGCAG");
-        let shift = crate::hgvs::build_hgvs_genomic_shift(
-            &mut reader,
-            "4",
-            &vep_ref,
-            &vep_alt,
-            vep_start,
-            vep_end,
-            1,
-        )
-        .unwrap()
-        .expect("shift");
+        // This test only exercises the protein-space replay logic, so keep it
+        // self-contained instead of depending on a machine-local reference
+        // FASTA. These values match the VEP-normalized insertion shift for the
+        // HTT repeat expansion case.
+        let shift = crate::hgvs::HgvsGenomicShift {
+            strand: 1,
+            shift_length: 53,
+            start: 3_074_929,
+            end: 3_074_935,
+            shifted_allele_string: "CAGCAGCAGCAGCAG".to_string(),
+            shifted_compare_allele: "CAGCAGCAGCAGCAG".to_string(),
+            shifted_output_allele: "CAGCAGCAGCAGCAG".to_string(),
+            ref_orig_allele_string: "-".to_string(),
+            alt_orig_allele_string: "CAGCAGCAGCAGCAG".to_string(),
+            five_prime_flanking_seq: String::new(),
+            three_prime_flanking_seq: String::new(),
+            five_prime_context: String::new(),
+            three_prime_context: String::new(),
+        };
 
         let shifted = protein_hgvs_shifted_variant(&original, &shift, 1);
-        // vcf_to_vep_allele full-normalizes CCAGCAG/CCAGCAGCAGCAGCAGCAGCAG
-        // to -/CAGCAGCAGCAGCAG (insertion), which shifts 1 base less than the
-        // partially-trimmed CAGCAG/CAGCAGCAGCAGCAGCAGCAG form.
         assert_eq!(shifted.start, 3074929);
         assert_eq!(shifted.end, 3074935);
         assert_eq!(shifted.parser_start, 3074929);
