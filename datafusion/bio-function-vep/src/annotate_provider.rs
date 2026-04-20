@@ -94,7 +94,7 @@ use crate::transcript_consequence::{
     ProteinDomainFeature, RefSeqEdit, RegulatoryFeature, SiftPolyphenCache, StructuralFeature,
     SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequence,
     TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature, VariantInput,
-    refseq_edit_offset_delta,
+    infer_refseq_deletion_edits_from_sequences, refseq_edit_offset_delta,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -5384,6 +5384,12 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
             }
         }
     }
+    refseq_edits.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then(left.end.cmp(&right.end))
+            .then(left.replacement_len.cmp(&right.replacement_len))
+    });
 
     TranscriptRawMetadata {
         display_xref_id,
@@ -5982,11 +5988,35 @@ where
     }
 
     for tx in transcripts.iter_mut() {
+        let Some(tx_exons) = exons_by_tx.get(tx.transcript_id.as_str()) else {
+            continue;
+        };
+
+        let should_infer_implicit_refseq_deletions = tx.spliced_seq.is_some()
+            && is_refseq_transcript_for_hydration(tx)
+            && tx.bam_edit_status.as_deref() == Some("ok")
+            && tx.refseq_edits.is_empty()
+            && tx.cdna_mapper_segments.is_empty();
+
         // Prefer cache-native spliced_seq, which already matches the live
         // transcript object Ensembl would use. For cdna_seq, only skip when
         // it clearly contains explicit 3' UTR beyond any leading phase Ns;
         // merged cache rows often store CDS-like `_translateable_seq` here.
         if tx.spliced_seq.is_some() {
+            if should_infer_implicit_refseq_deletions {
+                let Some(genomic_cdna) =
+                    read_spliced_transcript_cdna_from_reference(reader, tx, tx_exons)?
+                else {
+                    continue;
+                };
+                let inferred = infer_refseq_deletion_edits_from_sequences(
+                    &genomic_cdna,
+                    tx.spliced_seq.as_deref().unwrap_or_default(),
+                );
+                if !inferred.is_empty() {
+                    tx.refseq_edits = inferred;
+                }
+            }
             continue;
         }
         let Some(coding_end) = tx.cdna_coding_end else {
@@ -6021,9 +6051,6 @@ where
         if !indel_overlaps_cds && !any_overlaps_stop {
             continue;
         }
-        let Some(tx_exons) = exons_by_tx.get(tx.transcript_id.as_str()) else {
-            continue;
-        };
         // Only hydrate if exons extend past CDS (i.e., there IS a 3' UTR).
         // If total exonic length <= coding_end, there's no UTR to hydrate.
         let total_exonic: usize = tx_exons
@@ -6033,69 +6060,65 @@ where
         if total_exonic <= coding_end {
             continue;
         }
-        // Read the entire transcript span in ONE FASTA query and extract
-        // exon subsequences from it. This reduces ~8.7 FASTA reads per
-        // transcript to just 1, cutting hydration I/O by ~8x.
-        // For very large transcripts (>500KB), fall back to per-exon reads
-        // to avoid excessive memory allocation.
-        let tx_span_size = tx.end - tx.start + 1;
-        if tx_span_size > 500_000 {
-            // Per-exon fallback for large transcripts
-            let mut genomic_cdna = String::new();
-            let mut ok = true;
-            for exon in tx_exons {
-                let segment = read_reference_sequence(reader, chrom, exon.start, exon.end)?;
-                let expected = usize::try_from(exon.end - exon.start + 1).unwrap_or_default();
-                if segment.len() != expected {
-                    ok = false;
-                    break;
-                }
-                genomic_cdna.push_str(&segment);
-            }
-            if !ok || genomic_cdna.is_empty() {
-                continue;
-            }
-            let cdna = if tx.strand >= 0 {
-                genomic_cdna.to_ascii_uppercase()
-            } else {
-                let Some(rc) = reverse_complement_dna(&genomic_cdna) else {
-                    continue;
-                };
-                rc
-            };
-            tx.cdna_seq = Some(cdna);
+        let Some(cdna) = read_spliced_transcript_cdna_from_reference(reader, tx, tx_exons)? else {
             continue;
-        }
-        let tx_span = read_reference_sequence(reader, chrom, tx.start, tx.end)?;
-        let tx_span_len = usize::try_from(tx_span_size).unwrap_or_default();
-        if tx_span.len() != tx_span_len {
-            continue;
-        }
-        let mut genomic_cdna = String::new();
-        let mut ok = true;
-        for exon in tx_exons {
-            let local_start = usize::try_from(exon.start - tx.start).unwrap_or(0);
-            let local_end = usize::try_from(exon.end - tx.start + 1).unwrap_or(0);
-            let Some(segment) = tx_span.get(local_start..local_end) else {
-                ok = false;
-                break;
-            };
-            genomic_cdna.push_str(segment);
-        }
-        if !ok || genomic_cdna.is_empty() {
-            continue;
-        }
-        let cdna = if tx.strand >= 0 {
-            genomic_cdna.to_ascii_uppercase()
-        } else {
-            let Some(rc) = reverse_complement_dna(&genomic_cdna) else {
-                continue;
-            };
-            rc
         };
         tx.cdna_seq = Some(cdna);
     }
     Ok(())
+}
+
+fn read_spliced_transcript_cdna_from_reference<R>(
+    reader: &mut fasta::io::indexed_reader::IndexedReader<R>,
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+) -> Result<Option<String>>
+where
+    R: BufRead + Seek,
+{
+    let chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
+
+    // Read the entire transcript span in ONE FASTA query and extract exon
+    // subsequences from it. This reduces repeated per-exon FASTA reads.
+    // For very large transcripts (>500KB), fall back to per-exon reads.
+    let tx_span_size = tx.end - tx.start + 1;
+    let genomic_cdna = if tx_span_size > 500_000 {
+        let mut genomic_cdna = String::new();
+        for exon in tx_exons {
+            let segment = read_reference_sequence(reader, chrom, exon.start, exon.end)?;
+            let expected = usize::try_from(exon.end - exon.start + 1).unwrap_or_default();
+            if segment.len() != expected {
+                return Ok(None);
+            }
+            genomic_cdna.push_str(&segment);
+        }
+        genomic_cdna
+    } else {
+        let tx_span = read_reference_sequence(reader, chrom, tx.start, tx.end)?;
+        let tx_span_len = usize::try_from(tx_span_size).unwrap_or_default();
+        if tx_span.len() != tx_span_len {
+            return Ok(None);
+        }
+        let mut genomic_cdna = String::new();
+        for exon in tx_exons {
+            let local_start = usize::try_from(exon.start - tx.start).unwrap_or(0);
+            let local_end = usize::try_from(exon.end - tx.start + 1).unwrap_or(0);
+            let Some(segment) = tx_span.get(local_start..local_end) else {
+                return Ok(None);
+            };
+            genomic_cdna.push_str(segment);
+        }
+        genomic_cdna
+    };
+    if genomic_cdna.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(if tx.strand >= 0 {
+        Some(genomic_cdna.to_ascii_uppercase())
+    } else {
+        reverse_complement_dna(&genomic_cdna)
+    })
 }
 
 fn cdna_seq_has_explicit_three_prime_utr(tx: &TranscriptFeature) -> bool {
@@ -7113,6 +7136,7 @@ fn build_buffer_local_transcripts(
         upstream_distance,
         downstream_distance,
     );
+    reset_buffer_local_hgnc_effective_values(&mut buffer_transcripts);
     apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
     buffer_transcripts
 }
@@ -7163,6 +7187,11 @@ fn build_stateful_buffer_local_transcripts(
         }
     }
 
+    reset_persisted_hgnc_effective_values_outside_start_region(
+        &mut buffer_transcripts,
+        transcript_cache_regions,
+        &active_regions,
+    );
     apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
 
     for tx in &buffer_transcripts {
@@ -7180,6 +7209,31 @@ fn build_stateful_buffer_local_transcripts(
     }
 
     Ok(buffer_transcripts)
+}
+
+fn reset_buffer_local_hgnc_effective_values(transcripts: &mut [TranscriptFeature]) {
+    for tx in transcripts {
+        tx.gene_hgnc_id = tx.gene_hgnc_id_native.clone();
+    }
+}
+
+fn reset_persisted_hgnc_effective_values_outside_start_region(
+    transcripts: &mut [TranscriptFeature],
+    transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
+    active_regions: &HashSet<TranscriptCacheRegion>,
+) {
+    for tx in transcripts {
+        let Some(regions) = transcript_cache_regions.get(&tx.transcript_id) else {
+            continue;
+        };
+        let Some(start_region) = regions.first() else {
+            continue;
+        };
+        let spans_multiple_regions = regions.len() > 1;
+        if spans_multiple_regions && !active_regions.contains(start_region) {
+            tx.gene_hgnc_id = tx.gene_hgnc_id_native.clone();
+        }
+    }
 }
 
 /// Apply the HGNC-relevant parts of Ensembl VEP `merge_features()` to a single
@@ -8726,6 +8780,48 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_transcript_raw_metadata_sorts_refseq_edits_by_cdna_position() {
+        let raw = r#"{
+          "__class":"Bio::EnsEMBL::Transcript",
+          "__value":{
+            "_source_cache":"BestRefSeq",
+            "attributes":[
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"3723 3723 "}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"3228 3228 A"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"1258 1258 "}}
+            ]
+          }
+        }"#;
+
+        let metadata = parse_transcript_raw_metadata(raw);
+
+        assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
+        assert_eq!(
+            metadata.refseq_edits,
+            vec![
+                RefSeqEdit {
+                    start: 1258,
+                    end: 1258,
+                    replacement_len: None,
+                    skip_refseq_offset: false,
+                },
+                RefSeqEdit {
+                    start: 3228,
+                    end: 3228,
+                    replacement_len: Some(1),
+                    skip_refseq_offset: true,
+                },
+                RefSeqEdit {
+                    start: 3723,
+                    end: 3723,
+                    replacement_len: None,
+                    skip_refseq_offset: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn test_refseq_misalignment_offset_counts_same_coordinate_multibase_edit_as_full_insertion() {
         let mut tx = make_selection_tx("NM_001172437.2", Some("RefSeq"));
         tx.refseq_edits = vec![RefSeqEdit {
@@ -9189,6 +9285,74 @@ mod tests {
     }
 
     #[test]
+    fn test_stateful_buffer_local_transcripts_keep_hgnc_within_start_cache_region() {
+        let mut tx_donor = make_tx(
+            "ENST_DONOR",
+            Some("ENSG00000175463"),
+            Some("SUGCT"),
+            Some("HGNC"),
+            Some("HGNC:16001"),
+        );
+        tx_donor.chrom = "chr7".to_string();
+        tx_donor.start = 40_134_044;
+        tx_donor.end = 40_861_613;
+
+        let mut tx_recipient = make_tx(
+            "XR_007060157.1",
+            Some("79690"),
+            Some("SUGCT"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr7".to_string();
+        tx_recipient.start = 40_135_005;
+        tx_recipient.end = 41_038_816;
+
+        let transcripts = vec![tx_donor, tx_recipient];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        let first_buffer = vec![make_buffer_batch("chr7", 40_500_000, 40_500_000)];
+        let first_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &first_buffer,
+            "chr7",
+            40_500_000,
+            40_500_000,
+            50,
+            50,
+        )
+        .unwrap();
+        let first_recipient = first_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "XR_007060157.1")
+            .unwrap();
+        assert_eq!(first_recipient.gene_hgnc_id.as_deref(), Some("HGNC:16001"));
+
+        let second_buffer = vec![make_buffer_batch("chr7", 40_986_831, 40_986_831)];
+        let second_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &second_buffer,
+            "chr7",
+            40_986_831,
+            40_986_831,
+            50,
+            50,
+        )
+        .unwrap();
+        assert_eq!(second_scoped.len(), 1);
+        assert_eq!(second_scoped[0].transcript_id, "XR_007060157.1");
+        assert_eq!(second_scoped[0].gene_hgnc_id.as_deref(), Some("HGNC:16001"));
+    }
+
+    #[test]
     fn test_stateful_buffer_local_transcripts_prune_hgnc_across_cache_regions() {
         let mut tx_donor = make_tx(
             "ENST_DONOR",
@@ -9299,6 +9463,77 @@ mod tests {
             "chr19",
             8_900_000,
             8_900_000,
+            50,
+            50,
+        )
+        .unwrap();
+        let first_recipient = first_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "NM_001414686.1")
+            .unwrap();
+        assert_eq!(first_recipient.gene_hgnc_id.as_deref(), Some("HGNC:15582"));
+
+        let second_buffer = vec![make_buffer_batch("chr19", 9_058_432, 9_058_432)];
+        let second_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &second_buffer,
+            "chr19",
+            9_058_432,
+            9_058_432,
+            50,
+            50,
+        )
+        .unwrap();
+        assert_eq!(second_scoped.len(), 1);
+        assert_eq!(second_scoped[0].transcript_id, "NM_001414686.1");
+        assert_eq!(second_scoped[0].gene_hgnc_id, None);
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_clears_promoted_hgnc_before_later_muc16_buffer() {
+        let mut tx_donor = make_tx(
+            "ENST_DONOR",
+            Some("ENSG00000181143"),
+            Some("MUC16"),
+            Some("HGNC"),
+            Some("HGNC:15582"),
+        );
+        tx_donor.chrom = "chr19".to_string();
+        tx_donor.start = 8_848_844;
+        tx_donor.end = 9_010_390;
+
+        let mut tx_recipient = make_tx(
+            "NM_001414686.1",
+            Some("94025"),
+            Some("MUC16"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr19".to_string();
+        tx_recipient.start = 8_848_844;
+        tx_recipient.end = 9_065_751;
+
+        let transcripts = vec![tx_donor, tx_recipient];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        let first_buffer = vec![
+            make_buffer_batch("chr19", 8_900_000, 8_900_000),
+            make_buffer_batch("chr19", 9_058_364, 9_058_364),
+        ];
+        let first_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &first_buffer,
+            "chr19",
+            8_900_000,
+            9_058_364,
             50,
             50,
         )
