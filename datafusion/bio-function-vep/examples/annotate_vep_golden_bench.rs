@@ -20,19 +20,26 @@ use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::golden_benchmark::{
     ComparisonReport, CsqFieldReport, CsqMultiplicityReport, CsqUnmatchedReport,
-    DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ, DEFAULT_EXTERNAL_VEP_CACHE_DIR,
-    DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, TermComparisonReport, VariantAnnotation, VariantDiscrepancy,
-    VariantKey, collect_discrepancies, compare_annotation_terms, compare_annotations,
-    compare_csq_fields_with_names, csq_field_names_for_mode, diagnose_csq_multiplicity,
-    diagnose_unmatched_csq, ensure_local_copy, normalize_chrom, parse_vep_vcf_annotations,
-    sample_gz_vcf_first_n,
+    DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, DEFAULT_LOCAL_VEP_CACHE_DIR, TermComparisonReport,
+    VariantAnnotation, VariantDiscrepancy, VariantKey, collect_discrepancies,
+    compare_annotation_terms, compare_annotations, compare_csq_fields_with_names,
+    csq_field_names_for_mode, diagnose_csq_multiplicity, diagnose_unmatched_csq, ensure_local_copy,
+    normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
 };
 use datafusion_bio_function_vep::register_vep_functions;
 
-const DEFAULT_CACHE_SOURCE: &str = "/Users/mwiewior/research/data/vep/115_GRCh38_variants.parquet";
 const DEFAULT_BACKEND: &str = "parquet";
 const DEFAULT_SAMPLE_LIMIT: usize = 1000;
 const DEFAULT_WORK_DIR: &str = "/tmp/annotate_vep_golden_bench";
+const ENV_SOURCE_VCF_GZ: &str = "ANNOTATE_VEP_SOURCE_VCF_GZ";
+const ENV_CACHE_SOURCE: &str = "ANNOTATE_VEP_CACHE_SOURCE";
+const ENV_BACKEND: &str = "ANNOTATE_VEP_BACKEND";
+const ENV_SAMPLE_LIMIT: &str = "ANNOTATE_VEP_SAMPLE_LIMIT";
+const ENV_VEP_CACHE_DIR: &str = "ANNOTATE_VEP_VEP_CACHE_DIR";
+const ENV_LOCAL_COPY_VCF_GZ: &str = "ANNOTATE_VEP_LOCAL_COPY_VCF_GZ";
+const ENV_WORK_DIR: &str = "ANNOTATE_VEP_WORK_DIR";
+const ENV_CONTEXT_DIR: &str = "ANNOTATE_VEP_CONTEXT_DIR";
+
 #[derive(Debug, Clone)]
 struct Args {
     source_vcf_gz: PathBuf,
@@ -82,8 +89,25 @@ fn parse_cli_bool(raw: &str) -> Option<bool> {
     }
 }
 
+fn env_string(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
+fn positional_or_env_string(
+    positional: &[&String],
+    index: usize,
+    env_key: &str,
+    default: Option<&str>,
+) -> Option<String> {
+    positional
+        .get(index)
+        .map(|s| s.to_string())
+        .or_else(|| env_string(env_key))
+        .or_else(|| default.map(str::to_string))
+}
+
 impl Args {
-    fn parse() -> Self {
+    fn parse() -> Result<Self> {
         let args: Vec<String> = std::env::args().collect();
 
         let refseq = args.iter().any(|a| a == "--refseq");
@@ -125,45 +149,57 @@ impl Args {
             .map(PathBuf::from);
         // Filter out flags for positional parsing.
         let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+        let cache_source = positional_or_env_string(&positional, 2, ENV_CACHE_SOURCE, None)
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep_golden_bench requires positional arg #2 cache_source or {ENV_CACHE_SOURCE}"
+                ))
+            })?;
 
-        Self {
+        Ok(Self {
             source_vcf_gz: PathBuf::from(
-                positional
-                    .get(1)
-                    .map(|s| s.as_str())
-                    .unwrap_or(DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ),
+                positional_or_env_string(
+                    &positional,
+                    1,
+                    ENV_SOURCE_VCF_GZ,
+                    Some(DEFAULT_LOCAL_HG002_CHR22_VCF_GZ),
+                )
+                .unwrap(),
             ),
-            cache_source: positional
-                .get(2)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| DEFAULT_CACHE_SOURCE.to_string()),
-            backend: positional
-                .get(3)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| DEFAULT_BACKEND.to_string()),
+            cache_source,
+            backend: positional_or_env_string(&positional, 3, ENV_BACKEND, Some(DEFAULT_BACKEND))
+                .unwrap(),
             sample_limit: positional
                 .get(4)
                 .and_then(|s| s.parse::<usize>().ok())
+                .or_else(|| {
+                    env_string(ENV_SAMPLE_LIMIT).and_then(|value| value.parse::<usize>().ok())
+                })
                 .unwrap_or(DEFAULT_SAMPLE_LIMIT),
             vep_cache_dir: PathBuf::from(
-                positional
-                    .get(5)
-                    .map(|s| s.as_str())
-                    .unwrap_or(DEFAULT_EXTERNAL_VEP_CACHE_DIR),
+                positional_or_env_string(
+                    &positional,
+                    5,
+                    ENV_VEP_CACHE_DIR,
+                    Some(DEFAULT_LOCAL_VEP_CACHE_DIR),
+                )
+                .unwrap(),
             ),
             local_copy_vcf_gz: PathBuf::from(
-                positional
-                    .get(6)
-                    .map(|s| s.as_str())
-                    .unwrap_or(DEFAULT_LOCAL_HG002_CHR22_VCF_GZ),
+                positional_or_env_string(
+                    &positional,
+                    6,
+                    ENV_LOCAL_COPY_VCF_GZ,
+                    Some(DEFAULT_LOCAL_HG002_CHR22_VCF_GZ),
+                )
+                .unwrap(),
             ),
             work_dir: PathBuf::from(
-                positional
-                    .get(7)
-                    .map(|s| s.as_str())
-                    .unwrap_or(DEFAULT_WORK_DIR),
+                positional_or_env_string(&positional, 7, ENV_WORK_DIR, Some(DEFAULT_WORK_DIR))
+                    .unwrap(),
             ),
-            context_dir: positional.get(8).map(|s| PathBuf::from(s.as_str())),
+            context_dir: positional_or_env_string(&positional, 8, ENV_CONTEXT_DIR, None)
+                .map(PathBuf::from),
             refseq,
             merged,
             gencode_basic: args
@@ -185,7 +221,7 @@ impl Args {
             reference_fasta_path,
             everything: args.iter().any(|a| a == "--everything"),
             use_fjall: args.iter().any(|a| a == "--use-fjall"),
-        }
+        })
     }
 
     fn run_ensembl(&self) -> bool {
@@ -203,7 +239,7 @@ fn sql_literal(value: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = Args::parse()?;
 
     println!("annotate_vep golden benchmark");
     println!("  source_vcf_gz: {}", args.source_vcf_gz.display());

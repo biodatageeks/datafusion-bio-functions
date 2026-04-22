@@ -1207,6 +1207,17 @@ impl TranscriptSelectionFlags {
             TranscriptSourceMode::Ensembl
         };
 
+        if source_mode == TranscriptSourceMode::Ensembl && all_refseq {
+            return Err(DataFusionError::Execution(
+                "annotate_vep(): --all_refseq requires --refseq or --merged".to_string(),
+            ));
+        }
+        if source_mode == TranscriptSourceMode::Ensembl && exclude_predicted {
+            return Err(DataFusionError::Execution(
+                "annotate_vep(): --exclude_predicted requires --refseq or --merged".to_string(),
+            ));
+        }
+
         Ok(Self {
             source_mode,
             gencode_basic,
@@ -1230,6 +1241,131 @@ impl TranscriptSelectionFlags {
     fn source_field(self) -> bool {
         self.source_mode == TranscriptSourceMode::Merged
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CsqPlaceholderField {
+    Empty,
+    Allele,
+    Consequence,
+    Impact,
+    ExistingVariation,
+    VariantClass,
+    AfValue(usize),
+    MaxAf,
+    MaxAfPops,
+    ClinSig,
+    Somatic,
+    Pheno,
+    Pubmed,
+}
+
+impl CsqPlaceholderField {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "Allele" => Self::Allele,
+            "Consequence" => Self::Consequence,
+            "IMPACT" => Self::Impact,
+            "Existing_variation" => Self::ExistingVariation,
+            "VARIANT_CLASS" => Self::VariantClass,
+            "AF" => Self::AfValue(0),
+            "AFR_AF" => Self::AfValue(1),
+            "AMR_AF" => Self::AfValue(2),
+            "EAS_AF" => Self::AfValue(3),
+            "EUR_AF" => Self::AfValue(4),
+            "SAS_AF" => Self::AfValue(5),
+            "gnomADe_AF" => Self::AfValue(6),
+            "gnomADe_AFR" | "gnomADe_AFR_AF" => Self::AfValue(7),
+            "gnomADe_AMR" | "gnomADe_AMR_AF" => Self::AfValue(8),
+            "gnomADe_ASJ" | "gnomADe_ASJ_AF" => Self::AfValue(9),
+            "gnomADe_EAS" | "gnomADe_EAS_AF" => Self::AfValue(10),
+            "gnomADe_FIN" | "gnomADe_FIN_AF" => Self::AfValue(11),
+            "gnomADe_MID" | "gnomADe_MID_AF" => Self::AfValue(12),
+            "gnomADe_NFE" | "gnomADe_NFE_AF" => Self::AfValue(13),
+            "gnomADe_REMAINING" | "gnomADe_REMAINING_AF" => Self::AfValue(14),
+            "gnomADe_SAS" | "gnomADe_SAS_AF" => Self::AfValue(15),
+            "gnomADg_AF" => Self::AfValue(16),
+            "gnomADg_AFR" | "gnomADg_AFR_AF" => Self::AfValue(17),
+            "gnomADg_AMI" | "gnomADg_AMI_AF" => Self::AfValue(18),
+            "gnomADg_AMR" | "gnomADg_AMR_AF" => Self::AfValue(19),
+            "gnomADg_ASJ" | "gnomADg_ASJ_AF" => Self::AfValue(20),
+            "gnomADg_EAS" | "gnomADg_EAS_AF" => Self::AfValue(21),
+            "gnomADg_FIN" | "gnomADg_FIN_AF" => Self::AfValue(22),
+            "gnomADg_MID" | "gnomADg_MID_AF" => Self::AfValue(23),
+            "gnomADg_NFE" | "gnomADg_NFE_AF" => Self::AfValue(24),
+            "gnomADg_REMAINING" | "gnomADg_REMAINING_AF" => Self::AfValue(25),
+            "gnomADg_SAS" | "gnomADg_SAS_AF" => Self::AfValue(26),
+            "MAX_AF" => Self::MaxAf,
+            "MAX_AF_POPS" => Self::MaxAfPops,
+            "CLIN_SIG" => Self::ClinSig,
+            "SOMATIC" => Self::Somatic,
+            "PHENO" => Self::Pheno,
+            "PUBMED" => Self::Pubmed,
+            _ => Self::Empty,
+        }
+    }
+
+    fn value<'a>(self, entry: &'a CsqPlaceholderEntry<'a>) -> &'a str {
+        match self {
+            Self::Empty => "",
+            Self::Allele => entry.allele,
+            Self::Consequence => entry.consequence,
+            Self::Impact => entry.impact,
+            Self::ExistingVariation => entry.existing_variation,
+            Self::VariantClass => entry.variant_class,
+            Self::AfValue(idx) => entry
+                .frequency_fields
+                .af_values
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or(""),
+            Self::MaxAf => entry.frequency_fields.max_af.as_str(),
+            Self::MaxAfPops => entry.frequency_fields.max_af_pops.as_str(),
+            Self::ClinSig => entry.variant_fields.clin_sig.as_str(),
+            Self::Somatic => entry.variant_fields.somatic.as_str(),
+            Self::Pheno => entry.variant_fields.pheno.as_str(),
+            Self::Pubmed => entry.variant_fields.pubmed.as_str(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CsqPlaceholderLayout {
+    fields: Vec<CsqPlaceholderField>,
+}
+
+impl CsqPlaceholderLayout {
+    fn for_mode(everything: bool, transcript_selection: TranscriptSelectionFlags) -> Self {
+        let fields = crate::golden_benchmark::csq_field_names_for_mode(
+            everything,
+            transcript_selection.source_mode == TranscriptSourceMode::RefSeq,
+            transcript_selection.source_mode == TranscriptSourceMode::Merged,
+        )
+        .into_iter()
+        .map(CsqPlaceholderField::from_name)
+        .collect();
+        Self { fields }
+    }
+
+    fn append_entry(&self, buf: &mut String, entry: &CsqPlaceholderEntry<'_>) {
+        for (idx, field) in self.fields.iter().enumerate() {
+            if idx > 0 {
+                buf.push('|');
+            }
+            buf.push_str(field.value(entry));
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CsqPlaceholderEntry<'a> {
+    allele: &'a str,
+    consequence: &'a str,
+    impact: &'a str,
+    existing_variation: &'a str,
+    variant_class: &'a str,
+    frequency_fields: &'a ColocatedFrequencyFields,
+    variant_fields: &'a ColocatedVariantFields,
 }
 
 #[derive(Debug, Default)]
@@ -3721,6 +3857,8 @@ impl AnnotateProvider {
         let mut sorted_indices: Vec<usize> = Vec::new();
         let include_refseq_fields = transcript_selection.refseq_fields();
         let include_source_field = transcript_selection.source_field();
+        let placeholder_layout =
+            CsqPlaceholderLayout::for_mode(flags.everything, transcript_selection);
 
         for row in 0..batch.num_rows() {
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
@@ -3840,55 +3978,20 @@ impl AnnotateProvider {
             if let Some(most_val) = &cached_most {
                 // Cache hit — produce single CSQ entry with empty transcript fields.
                 if !skip_csq {
-                    use std::fmt::Write;
                     let csq_val = cached_csq.unwrap_or_default();
                     let impact = SoTerm::from_str(most_val)
                         .map(|t| impact_label(t.impact()))
                         .unwrap_or_else(|| impact_label(SoImpact::Modifier));
-                    if flags.everything {
-                        if include_source_field {
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
-                                 {variant_class}||||||||||||||||\
-                                 {batch3_suffix}|||||"
-                            );
-                        } else if include_refseq_fields {
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
-                                 {variant_class}|||||||||||||||\
-                                 {batch3_suffix}|||||"
-                            );
-                        } else {
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||\
-                                 {variant_class}|||||||||||||||||||||\
-                                 {batch3_suffix}|||||"
-                            );
-                        }
-                    } else {
-                        if include_source_field {
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
-                                 {variant_class}||||||||||||{batch3_suffix}"
-                            );
-                        } else if include_refseq_fields {
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}|||||||||||\
-                                 {variant_class}||||||||||||{batch3_suffix}"
-                            );
-                        } else {
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{csq_val}|{impact}|||||||||||||||{existing_var}||||||||||||\
-                                 {variant_class}||||||||||||{batch3_suffix}"
-                            );
-                        }
+                    let entry = CsqPlaceholderEntry {
+                        allele: &vep_allele,
+                        consequence: csq_val.as_str(),
+                        impact,
+                        existing_variation: existing_var,
+                        variant_class,
+                        frequency_fields: &frequency_fields,
+                        variant_fields: &variant_fields,
                     };
+                    placeholder_layout.append_entry(&mut csq_buf, &entry);
                 }
                 most_str = most_val.clone();
             } else {
@@ -4319,50 +4422,16 @@ impl AnnotateProvider {
                     }
                     if csq_buf.is_empty() {
                         let impact = impact_label(SoImpact::Modifier);
-                        if flags.everything {
-                            if include_source_field {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
-                                 {variant_class}||||||||||||||||\
-                                 {batch3_suffix}|||||"
-                                );
-                            } else if include_refseq_fields {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
-                                 {variant_class}|||||||||||||||\
-                                 {batch3_suffix}|||||"
-                                );
-                            } else {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||\
-                                 {variant_class}|||||||||||||||||||||\
-                                 {batch3_suffix}|||||"
-                                );
-                            }
-                        } else {
-                            if include_source_field {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
-                                 {variant_class}||||||||||||{batch3_suffix}"
-                                );
-                            } else if include_refseq_fields {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}|||||||||||\
-                                 {variant_class}||||||||||||{batch3_suffix}"
-                                );
-                            } else {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|sequence_variant|{impact}|||||||||||||||{existing_var}||||||||||||\
-                                 {variant_class}||||||||||||{batch3_suffix}"
-                                );
-                            }
-                        }
+                        let entry = CsqPlaceholderEntry {
+                            allele: &vep_allele,
+                            consequence: "sequence_variant",
+                            impact,
+                            existing_variation: existing_var,
+                            variant_class,
+                            frequency_fields: &frequency_fields,
+                            variant_fields: &variant_fields,
+                        };
+                        placeholder_layout.append_entry(&mut csq_buf, &entry);
                     }
                 } // end if !skip_csq (cache-miss CSQ formatting)
             };
@@ -8676,6 +8745,135 @@ mod tests {
         .expect_err("gencode_basic+gencode_primary should be rejected")
         .to_string();
         assert!(err.contains("--gencode_basic and --gencode_primary"));
+
+        let err = TranscriptSelectionFlags::from_options_json(Some("{\"all_refseq\":true}"))
+            .expect_err("all_refseq without refseq/merged should be rejected")
+            .to_string();
+        assert!(err.contains("--all_refseq requires --refseq or --merged"));
+
+        let err = TranscriptSelectionFlags::from_options_json(Some("{\"exclude_predicted\":true}"))
+            .expect_err("exclude_predicted without refseq/merged should be rejected")
+            .to_string();
+        assert!(err.contains("--exclude_predicted requires --refseq or --merged"));
+    }
+
+    #[test]
+    fn test_csq_placeholder_layout_matches_schema_width_for_all_modes() {
+        for (everything, selection, expected_len) in [
+            (false, TranscriptSelectionFlags::default(), 74usize),
+            (
+                false,
+                TranscriptSelectionFlags {
+                    source_mode: TranscriptSourceMode::RefSeq,
+                    ..Default::default()
+                },
+                78,
+            ),
+            (
+                false,
+                TranscriptSelectionFlags {
+                    source_mode: TranscriptSourceMode::Merged,
+                    ..Default::default()
+                },
+                79,
+            ),
+            (true, TranscriptSelectionFlags::default(), 80),
+            (
+                true,
+                TranscriptSelectionFlags {
+                    source_mode: TranscriptSourceMode::RefSeq,
+                    ..Default::default()
+                },
+                85,
+            ),
+            (
+                true,
+                TranscriptSelectionFlags {
+                    source_mode: TranscriptSourceMode::Merged,
+                    ..Default::default()
+                },
+                86,
+            ),
+        ] {
+            let layout = CsqPlaceholderLayout::for_mode(everything, selection);
+            assert_eq!(layout.fields.len(), expected_len);
+        }
+    }
+
+    #[test]
+    fn test_csq_placeholder_layout_aligns_refseq_and_merged_fields() {
+        let mut frequency_fields = ColocatedFrequencyFields {
+            af_values: vec![String::new(); AF_COLUMNS.len()],
+            max_af: "0.9".to_string(),
+            max_af_pops: "gnomADg_AFR".to_string(),
+        };
+        frequency_fields.af_values[0] = "0.1".to_string();
+        frequency_fields.af_values[7] = "0.7".to_string();
+        frequency_fields.af_values[17] = "0.17".to_string();
+        let variant_fields = ColocatedVariantFields {
+            existing_variation: "rs123".to_string(),
+            clin_sig: "pathogenic".to_string(),
+            somatic: "1".to_string(),
+            pheno: "1".to_string(),
+            pubmed: "12345".to_string(),
+        };
+        let entry = CsqPlaceholderEntry {
+            allele: "G",
+            consequence: "sequence_variant",
+            impact: "MODIFIER",
+            existing_variation: variant_fields.existing_variation.as_str(),
+            variant_class: "SNV",
+            frequency_fields: &frequency_fields,
+            variant_fields: &variant_fields,
+        };
+
+        let refseq_selection = TranscriptSelectionFlags {
+            source_mode: TranscriptSourceMode::RefSeq,
+            ..Default::default()
+        };
+        let refseq_layout = CsqPlaceholderLayout::for_mode(false, refseq_selection);
+        let mut refseq_row = String::new();
+        refseq_layout.append_entry(&mut refseq_row, &entry);
+        let refseq_values: Vec<&str> = refseq_row.split('|').collect();
+        let refseq_fields = crate::golden_benchmark::csq_field_names_for_mode(false, true, false);
+        assert_eq!(refseq_values.len(), refseq_fields.len());
+        let refseq_index = |name: &str| {
+            refseq_fields
+                .iter()
+                .position(|field| *field == name)
+                .unwrap()
+        };
+        assert_eq!(refseq_values[refseq_index("REFSEQ_MATCH")], "");
+        assert_eq!(refseq_values[refseq_index("REFSEQ_OFFSET")], "");
+        assert_eq!(refseq_values[refseq_index("VARIANT_CLASS")], "SNV");
+        assert_eq!(refseq_values[refseq_index("AF")], "0.1");
+        assert_eq!(refseq_values[refseq_index("gnomADe_AFR")], "0.7");
+        assert_eq!(refseq_values[refseq_index("gnomADg_AFR")], "0.17");
+        assert_eq!(refseq_values[refseq_index("MAX_AF_POPS")], "gnomADg_AFR");
+
+        let merged_selection = TranscriptSelectionFlags {
+            source_mode: TranscriptSourceMode::Merged,
+            ..Default::default()
+        };
+        let merged_layout = CsqPlaceholderLayout::for_mode(true, merged_selection);
+        let mut merged_row = String::new();
+        merged_layout.append_entry(&mut merged_row, &entry);
+        let merged_values: Vec<&str> = merged_row.split('|').collect();
+        let merged_fields = crate::golden_benchmark::csq_field_names_for_mode(true, false, true);
+        assert_eq!(merged_values.len(), merged_fields.len());
+        let merged_index = |name: &str| {
+            merged_fields
+                .iter()
+                .position(|field| *field == name)
+                .unwrap()
+        };
+        assert_eq!(merged_values[merged_index("SOURCE")], "");
+        assert_eq!(merged_values[merged_index("REFSEQ_MATCH")], "");
+        assert_eq!(merged_values[merged_index("VARIANT_CLASS")], "SNV");
+        assert_eq!(merged_values[merged_index("CLIN_SIG")], "pathogenic");
+        assert_eq!(merged_values[merged_index("PUBMED")], "12345");
+        assert_eq!(merged_values[merged_index("MOTIF_NAME")], "");
+        assert_eq!(merged_values[merged_index("TRANSCRIPTION_FACTORS")], "");
     }
 
     #[test]

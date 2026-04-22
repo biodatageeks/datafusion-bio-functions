@@ -16,13 +16,9 @@ use flate2::read::MultiGzDecoder;
 
 use crate::so_terms::SoTerm;
 
-pub const DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ: &str =
-    "/Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/data/HG002_chr22.vcf.gz";
-pub const DEFAULT_EXTERNAL_HG002_CHR22_VCF_GZ_TBI: &str = "/Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/data/HG002_chr22.vcf.gz.tbi";
 pub const DEFAULT_LOCAL_HG002_CHR22_VCF_GZ: &str = "vep-benchmark/data/HG002_chr22.vcf.gz";
 pub const DEFAULT_LOCAL_HG002_CHR22_VCF_GZ_TBI: &str = "vep-benchmark/data/HG002_chr22.vcf.gz.tbi";
-pub const DEFAULT_EXTERNAL_VEP_CACHE_DIR: &str =
-    "/Users/mwiewior/research/git/polars-bio-vep-benchmark/vep-benchmark/cache";
+pub const DEFAULT_LOCAL_VEP_CACHE_DIR: &str = "vep-benchmark/cache";
 
 #[derive(Debug, Clone, Eq)]
 pub struct VariantKey {
