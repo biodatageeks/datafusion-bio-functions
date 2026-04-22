@@ -648,8 +648,11 @@ mod tests {
         PLUGIN_ROW_GROUP_SIZE, convert_plugin_to_parquet, group_requested_chromosomes,
         normalize_chrom, plugin_select_query, plugin_writer_properties,
     };
-    use datafusion::arrow::array::{Float32Array, Int32Array, StringArray, UInt32Array};
+    use datafusion::arrow::array::{
+        Float32Array, Int32Array, LargeStringArray, StringArray, StringViewArray, UInt32Array,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::parquet::basic::Compression;
     use datafusion::parquet::schema::types::ColumnPath;
     use flate2::Compression as GzipCompression;
@@ -677,11 +680,16 @@ mod tests {
 
     #[test]
     fn requested_chromosomes_expand_chr_aliases_without_scan() {
-        let grouped = group_requested_chromosomes(
-            &["Y".to_string(), "MT".to_string()].into_iter().collect(),
-        );
-        assert!(grouped.contains(&(String::from("MT"), vec![String::from("MT"), String::from("chrMT")])));
-        assert!(grouped.contains(&(String::from("Y"), vec![String::from("Y"), String::from("chrY")])));
+        let grouped =
+            group_requested_chromosomes(&["Y".to_string(), "MT".to_string()].into_iter().collect());
+        assert!(grouped.contains(&(
+            String::from("MT"),
+            vec![String::from("MT"), String::from("chrMT")]
+        )));
+        assert!(grouped.contains(&(
+            String::from("Y"),
+            vec![String::from("Y"), String::from("chrY")]
+        )));
     }
 
     #[test]
@@ -727,6 +735,10 @@ mod tests {
         assert!(query.contains("polyphen2_hdiv_score"));
         assert!(query.contains("phylop100way"));
         assert!(query.contains("cadd_phred"));
+        assert!(query.contains("CAST(revel_score AS VARCHAR) AS revel_score"));
+        assert!(query.contains("CAST(cadd_phred AS VARCHAR) AS cadd_phred"));
+        assert!(query.contains("CAST(aapos AS VARCHAR) AS __vepyr_dbnsfp_aapos"));
+        assert!(!query.contains("LIKE '%;%'"));
     }
 
     #[test]
@@ -864,8 +876,8 @@ mod tests {
         write_gzip_text(
             &source,
             concat!(
-                "#chr\tpos(1-based)\tref\talt\tSIFT4G_score\tSIFT4G_pred\tPolyphen2_HDIV_score\tPolyphen2_HVAR_score\tMutationTaster_score\tMutationTaster_pred\tPROVEAN_score\tPROVEAN_pred\tVEST4_score\tMetaSVM_score\tMetaSVM_pred\tMetaLR_score\tMetaLR_pred\tREVEL_score\tGERP++_RS\tphyloP100way_vertebrate\tphastCons100way_vertebrate\tCADD_raw\tCADD_phred\n",
-                "X\t100\tA\tG\t0.1\tT\t0.2\t0.3\t0.5\tD\tN\tD\t0.7\t0.8\tD\t0.9\tD\t0.6\t1.0\t1.1\t1.3\t1.6\t10.0\n",
+                "#chr\tpos(1-based)\tref\talt\taaref\taaalt\taapos\tSIFT4G_score\tSIFT4G_pred\tPolyphen2_HDIV_score\tPolyphen2_HVAR_score\tMutationTaster_score\tMutationTaster_pred\tPROVEAN_score\tPROVEAN_pred\tVEST4_score\tMetaSVM_score\tMetaSVM_pred\tMetaLR_score\tMetaLR_pred\tREVEL_score\tGERP++_RS\tphyloP100way_vertebrate\tphastCons100way_vertebrate\tCADD_raw\tCADD_phred\n",
+                "X\t100\tA\tG\tA\tG\t10\t0.1;0.2\tT\t0.2\t0.3\t0.5\tD\tN\tD\t0.7\t0.8\tD\t0.9\tD\t0.6;0.7\t1.0\t1.1\t1.3\t1.6\t10.0\n",
             ),
         );
 
@@ -905,8 +917,45 @@ mod tests {
             "phylop30way",
             "phastcons30way",
             "siphy_29way",
+            "__vepyr_dbnsfp_aapos",
+            "__vepyr_dbnsfp_aaref",
+            "__vepyr_dbnsfp_aaalt",
         ] {
             assert!(batch.schema().index_of(column).is_ok(), "{column}");
+        }
+
+        assert_eq!(
+            string_value(batch, batch.schema().index_of("revel_score").unwrap(), 0),
+            "0.6;0.7"
+        );
+        assert_eq!(
+            string_value(batch, batch.schema().index_of("sift4g_score").unwrap(), 0),
+            "0.1;0.2"
+        );
+    }
+
+    fn string_value(batch: &RecordBatch, column_index: usize, row: usize) -> String {
+        let column = batch.column(column_index);
+        match column.data_type() {
+            DataType::Utf8 => column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("StringArray")
+                .value(row)
+                .to_string(),
+            DataType::Utf8View => column
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("StringViewArray")
+                .value(row)
+                .to_string(),
+            DataType::LargeUtf8 => column
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeStringArray")
+                .value(row)
+                .to_string(),
+            other => panic!("expected string-like column, got {other:?}"),
         }
     }
 

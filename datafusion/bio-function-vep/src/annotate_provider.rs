@@ -89,7 +89,7 @@ use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::partitioned_cache::PartitionedParquetCache;
 use crate::plugin::{ActivePlugins, PluginKind};
-use crate::plugin_lookup::{ContigPlugins, PluginIndex};
+use crate::plugin_lookup::{ContigPlugins, PluginIndex, PluginTargetKey};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
@@ -3692,6 +3692,10 @@ impl AnnotateProvider {
                                     &ref_al,
                                     &alt_allele,
                                     false,
+                                    false,
+                                    None,
+                                    None,
+                                    None,
                                 )
                             )
                         })
@@ -3870,19 +3874,24 @@ impl AnnotateProvider {
                             String::new()
                         };
                         let source_val = if merged { source } else { "" };
-                        let include_source = flags.everything
-                            && self.active_plugins.has_kind(PluginKind::ClinVar);
+                        let include_source =
+                            flags.everything && self.active_plugins.has_kind(PluginKind::ClinVar);
                         let plugin_csq_segment = contig_plugins
                             .filter(|plugins| !plugins.active_plugins.is_empty())
                             .map(|plugins| {
-                                let include_alphamissense = tc.terms.contains(&SoTerm::MissenseVariant)
-                                    && plugins.alphamissense_matches_transcript_consequence(
-                                        start_val,
-                                        &ref_al,
-                                        &alt_allele,
-                                        tc.protein_position.as_deref(),
-                                        tc.amino_acids.as_deref(),
-                                    );
+                                let include_alphamissense =
+                                    tc.terms.contains(&SoTerm::MissenseVariant)
+                                        && plugins.alphamissense_matches_transcript_consequence(
+                                            start_val,
+                                            &ref_al,
+                                            &alt_allele,
+                                            tc.protein_position.as_deref(),
+                                            tc.amino_acids.as_deref(),
+                                        );
+                                let include_dbnsfp = tc.terms.contains(&SoTerm::MissenseVariant)
+                                    || tc.terms.contains(&SoTerm::StopLost)
+                                    || tc.terms.contains(&SoTerm::StopGained)
+                                    || tc.terms.contains(&SoTerm::StartLost);
                                 format!(
                                     "|{}",
                                     plugins.csq_suffix_for_consequence(
@@ -3890,6 +3899,10 @@ impl AnnotateProvider {
                                         &ref_al,
                                         &alt_allele,
                                         include_alphamissense,
+                                        include_dbnsfp,
+                                        Some(symbol),
+                                        tc.protein_position.as_deref(),
+                                        tc.amino_acids.as_deref(),
                                     )
                                 )
                             })
@@ -4102,6 +4115,10 @@ impl AnnotateProvider {
                                                     &ref_al,
                                                     &alt_allele,
                                                     false,
+                                                    false,
+                                                    None,
+                                                    None,
+                                                    None,
                                                 )
                                             ))
                                             .unwrap_or_default()
@@ -4120,6 +4137,10 @@ impl AnnotateProvider {
                                                     &ref_al,
                                                     &alt_allele,
                                                     false,
+                                                    false,
+                                                    None,
+                                                    None,
+                                                    None,
                                                 )
                                             ))
                                             .unwrap_or_default()
@@ -4140,6 +4161,10 @@ impl AnnotateProvider {
                                             &ref_al,
                                             &alt_allele,
                                             false,
+                                            false,
+                                            None,
+                                            None,
+                                            None,
                                         )
                                     ))
                                     .unwrap_or_default()
@@ -6834,6 +6859,43 @@ impl Stream for ContigAnnotationStream {
 // Per-contig setup: parallel context loading + lookup stream creation
 // ---------------------------------------------------------------------------
 
+async fn collect_plugin_target_keys(
+    session: &SessionContext,
+    vcf_table: &str,
+    chrom: &str,
+) -> Result<HashSet<PluginTargetKey>> {
+    let df = session
+        .table(vcf_table)
+        .await?
+        .filter(col("chrom").eq(lit(chrom.to_string())))?;
+    let batches = df.collect().await?;
+    let mut keys = HashSet::new();
+
+    for batch in batches {
+        let schema = batch.schema();
+        let start_idx = schema.index_of("start")?;
+        let ref_idx = schema.index_of("ref")?;
+        let alt_idx = schema.index_of("alt")?;
+
+        for row in 0..batch.num_rows() {
+            let Some(pos) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(ref_allele) = string_at(batch.column(ref_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(raw_alt) = string_at(batch.column(alt_idx).as_ref(), row) else {
+                continue;
+            };
+            for alt_allele in raw_alt.split([',', '|']).filter(|value| !value.is_empty()) {
+                keys.insert((pos, ref_allele.clone(), alt_allele.to_string()));
+            }
+        }
+    }
+
+    Ok(keys)
+}
+
 /// Register ephemeral tables, load context data, and create the variation
 /// lookup stream — all in preparation for window-based streaming annotation.
 ///
@@ -6972,6 +7034,7 @@ async fn prepare_contig_context(
         None
     } else {
         let chrom_key = chrom.strip_prefix("chr").unwrap_or(&chrom);
+        let target_keys = collect_plugin_target_keys(&session, &config.vcf_table, &chrom).await?;
         let mut indexes = Vec::new();
         for plugin in &config.active_plugins.configs {
             for source in &plugin.source_dirs {
@@ -6980,6 +7043,7 @@ async fn prepare_contig_context(
                     source.kind,
                     &source.source_dir.to_string_lossy(),
                     chrom_key,
+                    Some(&target_keys),
                 )
                 .await?
                 {

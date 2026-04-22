@@ -3,7 +3,7 @@
 //! Runtime prefers plugin fjall stores for point lookups and falls back to the
 //! older per-contig parquet-in-memory indexes when no fjall store is present.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -12,7 +12,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result;
-use datafusion::prelude::{ParquetReadOptions, SessionContext};
+use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext, col, lit};
 
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::VepKvStore;
@@ -21,6 +21,8 @@ use crate::kv_cache::key_encoding::chrom_to_code;
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::position_entry::PositionEntryReader;
 use crate::plugin::{ActivePlugins, PluginKind, PluginSourceKind};
+
+pub type PluginTargetKey = (i64, String, String);
 
 enum PluginBackend {
     Parquet(ParquetPluginIndex),
@@ -36,12 +38,24 @@ pub struct PluginIndex {
 
 /// In-memory Parquet index for a single plugin on a single contig.
 struct ParquetPluginIndex {
-    /// Map from (pos, ref, alt) → row index in `data`.
-    lookup: HashMap<(i64, Box<str>, Box<str>), u32>,
+    /// Map from (pos, ref, alt) → row indices in `data`.
+    lookup: HashMap<(i64, Box<str>, Box<str>), Vec<u32>>,
     /// Plugin value columns only (no chrom/pos/ref/alt).
     data: RecordBatch,
     /// Schema of the value columns.
     value_schema: SchemaRef,
+    dbnsfp_match_data: Option<DbnsfpMatchData>,
+    spliceai_match_data: Option<SpliceAiMatchData>,
+}
+
+struct DbnsfpMatchData {
+    aapos: StringArray,
+    aaref: StringArray,
+    aaalt: StringArray,
+}
+
+struct SpliceAiMatchData {
+    symbol: StringArray,
 }
 
 impl PluginIndex {
@@ -50,12 +64,13 @@ impl PluginIndex {
         kind: PluginSourceKind,
         plugin_dir: &str,
         chrom: &str,
+        target_keys: Option<&HashSet<PluginTargetKey>>,
     ) -> Result<Option<Self>> {
         #[cfg(feature = "kv-cache")]
         if let Some(index) = Self::load_fjall(kind, plugin_dir, chrom)? {
             return Ok(Some(index));
         }
-        Self::load_parquet(ctx, kind, plugin_dir, chrom).await
+        Self::load_parquet(ctx, kind, plugin_dir, chrom, target_keys).await
     }
 
     /// Load a plugin index from a per-chromosome parquet file.
@@ -65,15 +80,32 @@ impl PluginIndex {
         kind: PluginSourceKind,
         plugin_dir: &str,
         chrom: &str,
+        target_keys: Option<&HashSet<PluginTargetKey>>,
     ) -> Result<Option<Self>> {
         let path = format!("{plugin_dir}/chr{chrom}.parquet");
         if !std::path::Path::new(&path).exists() {
             return Ok(None);
         }
+        if target_keys.is_some_and(|keys| keys.is_empty()) {
+            return Ok(None);
+        }
 
-        let df = ctx
+        let mut df = ctx
             .read_parquet(&path, ParquetReadOptions::default())
             .await?;
+        if let Some(keys) = target_keys {
+            let pos_exprs = keys
+                .iter()
+                .filter_map(|(pos, _, _)| u32::try_from(*pos).ok())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .map(|pos| lit(pos))
+                .collect::<Vec<Expr>>();
+            if pos_exprs.is_empty() {
+                return Ok(None);
+            }
+            df = df.filter(col("pos").in_list(pos_exprs, false))?;
+        }
         let batches = df.collect().await?;
         if batches.is_empty() {
             return Ok(None);
@@ -103,6 +135,22 @@ impl PluginIndex {
         // Build lookup map and collect value columns.
         let mut lookup = HashMap::new();
         let mut value_batches: Vec<RecordBatch> = Vec::new();
+        let dbnsfp_match_schema = (kind == PluginSourceKind::DbNSFP).then(|| {
+            Arc::new(Schema::new(vec![
+                Field::new("__vepyr_dbnsfp_aapos", DataType::Utf8, true),
+                Field::new("__vepyr_dbnsfp_aaref", DataType::Utf8, true),
+                Field::new("__vepyr_dbnsfp_aaalt", DataType::Utf8, true),
+            ]))
+        });
+        let mut dbnsfp_match_batches: Vec<RecordBatch> = Vec::new();
+        let spliceai_match_schema = (kind == PluginSourceKind::SpliceAI).then(|| {
+            Arc::new(Schema::new(vec![Field::new(
+                "symbol",
+                DataType::Utf8,
+                true,
+            )]))
+        });
+        let mut spliceai_match_batches: Vec<RecordBatch> = Vec::new();
         let mut global_offset: u32 = 0;
 
         for batch in &batches {
@@ -112,9 +160,21 @@ impl PluginIndex {
 
             for row in 0..batch.num_rows() {
                 let pos = pos_col[row];
+                if target_keys.is_some_and(|keys| {
+                    !keys.contains(&(
+                        pos,
+                        ref_col.value(row).to_string(),
+                        alt_col.value(row).to_string(),
+                    ))
+                }) {
+                    continue;
+                }
                 let ref_allele: Box<str> = ref_col.value(row).into();
                 let alt_allele: Box<str> = alt_col.value(row).into();
-                lookup.insert((pos, ref_allele, alt_allele), global_offset + row as u32);
+                lookup
+                    .entry((pos, ref_allele, alt_allele))
+                    .or_insert_with(Vec::new)
+                    .push(global_offset + row as u32);
             }
             global_offset += batch.num_rows() as u32;
 
@@ -128,10 +188,54 @@ impl PluginIndex {
                 })
                 .collect::<Result<_>>()?;
             value_batches.push(RecordBatch::try_new(value_schema.clone(), value_cols)?);
+
+            if let Some(match_schema) = &dbnsfp_match_schema {
+                let match_cols: Vec<ArrayRef> = match_schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        let idx = full_schema.index_of(f.name()).unwrap();
+                        normalize_array_to_field(batch.column(idx), f)
+                    })
+                    .collect::<Result<_>>()?;
+                dbnsfp_match_batches.push(RecordBatch::try_new(match_schema.clone(), match_cols)?);
+            }
+            if let Some(match_schema) = &spliceai_match_schema {
+                let match_cols: Vec<ArrayRef> = match_schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        let idx = full_schema.index_of(f.name()).unwrap();
+                        normalize_array_to_field(batch.column(idx), f)
+                    })
+                    .collect::<Result<_>>()?;
+                spliceai_match_batches
+                    .push(RecordBatch::try_new(match_schema.clone(), match_cols)?);
+            }
         }
 
         // Concatenate all value batches into one.
         let data = datafusion::arrow::compute::concat_batches(&value_schema, &value_batches)?;
+        let dbnsfp_match_data = if let Some(match_schema) = &dbnsfp_match_schema {
+            let batch =
+                datafusion::arrow::compute::concat_batches(match_schema, &dbnsfp_match_batches)?;
+            Some(DbnsfpMatchData {
+                aapos: get_string_column(&batch, "__vepyr_dbnsfp_aapos")?,
+                aaref: get_string_column(&batch, "__vepyr_dbnsfp_aaref")?,
+                aaalt: get_string_column(&batch, "__vepyr_dbnsfp_aaalt")?,
+            })
+        } else {
+            None
+        };
+        let spliceai_match_data = if let Some(match_schema) = &spliceai_match_schema {
+            let batch =
+                datafusion::arrow::compute::concat_batches(match_schema, &spliceai_match_batches)?;
+            Some(SpliceAiMatchData {
+                symbol: get_string_column(&batch, "symbol")?,
+            })
+        } else {
+            None
+        };
 
         Ok(Some(Self {
             kind,
@@ -139,6 +243,8 @@ impl PluginIndex {
                 lookup,
                 data,
                 value_schema,
+                dbnsfp_match_data,
+                spliceai_match_data,
             }),
         }))
     }
@@ -274,6 +380,31 @@ impl PluginIndex {
             }
         }
     }
+
+    pub fn csq_values_for_consequence(
+        &self,
+        pos: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+        consequence_symbol: Option<&str>,
+        protein_position: Option<&str>,
+        amino_acids: Option<&str>,
+    ) -> Vec<String> {
+        match &self.backend {
+            PluginBackend::Parquet(index) => index.csq_values_for_consequence(
+                pos,
+                ref_allele,
+                alt_allele,
+                consequence_symbol,
+                protein_position,
+                amino_acids,
+            ),
+            #[cfg(feature = "kv-cache")]
+            PluginBackend::Fjall(index) => {
+                index.csq_values_for_variant(pos, ref_allele, alt_allele)
+            }
+        }
+    }
 }
 
 impl ParquetPluginIndex {
@@ -283,7 +414,16 @@ impl ParquetPluginIndex {
             Box::<str>::from(ref_allele),
             Box::<str>::from(alt_allele),
         );
-        self.lookup.get(&key).copied()
+        self.lookup.get(&key).and_then(|rows| rows.last()).copied()
+    }
+
+    fn get_candidates(&self, pos: i64, ref_allele: &str, alt_allele: &str) -> Option<&[u32]> {
+        let key = (
+            pos,
+            Box::<str>::from(ref_allele),
+            Box::<str>::from(alt_allele),
+        );
+        self.lookup.get(&key).map(Vec::as_slice)
     }
 
     fn csq_values_for_variant(&self, pos: i64, ref_allele: &str, alt_allele: &str) -> Vec<String> {
@@ -295,6 +435,72 @@ impl ParquetPluginIndex {
                     .unwrap_or_default()
             })
             .collect()
+    }
+
+    fn csq_values_for_consequence(
+        &self,
+        pos: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+        consequence_symbol: Option<&str>,
+        protein_position: Option<&str>,
+        amino_acids: Option<&str>,
+    ) -> Vec<String> {
+        let row_idx = if self.spliceai_match_data.is_some() {
+            self.matching_spliceai_row(pos, ref_allele, alt_allele, consequence_symbol)
+        } else {
+            self.matching_dbnsfp_row(pos, ref_allele, alt_allele, protein_position, amino_acids)
+                .or_else(|| self.get(pos, ref_allele, alt_allele))
+        };
+        (0..self.data.num_columns())
+            .map(|col_idx| {
+                row_idx
+                    .and_then(|row| string_value(self.data.column(col_idx), row as usize))
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn matching_dbnsfp_row(
+        &self,
+        pos: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+        protein_position: Option<&str>,
+        amino_acids: Option<&str>,
+    ) -> Option<u32> {
+        let match_data = self.dbnsfp_match_data.as_ref()?;
+        let candidates = self.get_candidates(pos, ref_allele, alt_allele)?;
+        if candidates.len() <= 1 {
+            return candidates.first().copied();
+        }
+        let (aa_ref, aa_alt) = amino_acids.and_then(|value| value.split_once('/'))?;
+        let protein_position = protein_position.filter(|value| !value.is_empty())?;
+        candidates.iter().copied().find(|row| {
+            dbnsfp_row_matches_consequence(
+                match_data.aapos.value(*row as usize),
+                match_data.aaref.value(*row as usize),
+                match_data.aaalt.value(*row as usize),
+                protein_position,
+                aa_ref,
+                aa_alt,
+            )
+        })
+    }
+
+    fn matching_spliceai_row(
+        &self,
+        pos: i64,
+        ref_allele: &str,
+        alt_allele: &str,
+        consequence_symbol: Option<&str>,
+    ) -> Option<u32> {
+        let match_data = self.spliceai_match_data.as_ref()?;
+        let consequence_symbol = consequence_symbol.filter(|value| !value.is_empty())?;
+        self.get_candidates(pos, ref_allele, alt_allele)?
+            .iter()
+            .copied()
+            .find(|row| match_data.symbol.value(*row as usize) == consequence_symbol)
     }
 }
 
@@ -472,21 +678,25 @@ impl ContigPlugins {
 
     /// Return a pipe-delimited CSQ suffix for the given variant.
     pub fn csq_suffix_for_variant(&self, pos: i64, ref_allele: &str, alt_allele: &str) -> String {
-        self.csq_suffix_for_consequence(pos, ref_allele, alt_allele, true)
+        self.csq_suffix_for_consequence(pos, ref_allele, alt_allele, true, true, None, None, None)
     }
 
     /// Return a pipe-delimited CSQ suffix for a specific consequence row.
     ///
     /// Some plugins are consequence-type-specific in VEP output even when the
     /// source lookup itself is variant-level. AlphaMissense is emitted only on
-    /// `missense_variant` rows, so callers can suppress it for non-missense
-    /// consequences while keeping field positions stable.
+    /// matched missense rows. dbNSFP's VEP plugin defaults to a consequence
+    /// filter for missense, stop-lost, stop-gained, and start-lost rows.
     pub fn csq_suffix_for_consequence(
         &self,
         pos: i64,
         ref_allele: &str,
         alt_allele: &str,
         include_alphamissense: bool,
+        include_dbnsfp: bool,
+        consequence_symbol: Option<&str>,
+        protein_position: Option<&str>,
+        amino_acids: Option<&str>,
     ) -> String {
         let mut values = Vec::new();
         for plugin_cfg in &self.active_plugins.configs {
@@ -506,16 +716,36 @@ impl ContigPlugins {
                 continue;
             }
 
+            if plugin_cfg.kind == PluginKind::DbNSFP && !include_dbnsfp {
+                for _ in 0..plugin_cfg.kind.output_fields().len() {
+                    values.push(String::new());
+                }
+                continue;
+            }
+
             if let Some(index) = self
                 .indexes
                 .iter()
                 .find(|index| index.kind.plugin_kind() == plugin_cfg.kind)
             {
+                let plugin_values = if plugin_cfg.kind == PluginKind::DbNSFP
+                    || plugin_cfg.kind == PluginKind::SpliceAI
+                {
+                    index.csq_values_for_consequence(
+                        pos,
+                        ref_allele,
+                        alt_allele,
+                        consequence_symbol,
+                        protein_position,
+                        amino_acids,
+                    )
+                } else {
+                    index.csq_values_for_variant(pos, ref_allele, alt_allele)
+                };
                 values.extend(
-                    index
-                        .csq_values_for_variant(pos, ref_allele, alt_allele)
+                    plugin_values
                         .into_iter()
-                        .map(|value| sanitize_csq_plugin_value(&value)),
+                        .map(|value| sanitize_plugin_value_for_kind(plugin_cfg.kind, &value)),
                 );
             } else {
                 for _ in 0..plugin_cfg.kind.output_fields().len() {
@@ -545,11 +775,7 @@ impl ContigPlugins {
         let Some(plugin_protein_variant) = values.get(3).map(String::as_str) else {
             return false;
         };
-        protein_variant_matches(
-            plugin_protein_variant,
-            protein_position,
-            amino_acids,
-        )
+        protein_variant_matches(plugin_protein_variant, protein_position, amino_acids)
     }
 
     fn append_cadd_columns(
@@ -592,6 +818,44 @@ impl ContigPlugins {
 
 fn sanitize_csq_plugin_value(value: &str) -> String {
     value.replace('|', "&")
+}
+
+fn sanitize_dbnsfp_csq_plugin_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch == '|' || ch == ';' { '&' } else { ch })
+        .collect()
+}
+
+fn sanitize_plugin_value_for_kind(kind: PluginKind, value: &str) -> String {
+    if kind == PluginKind::DbNSFP {
+        sanitize_dbnsfp_csq_plugin_value(value)
+    } else {
+        sanitize_csq_plugin_value(value)
+    }
+}
+
+fn dbnsfp_row_matches_consequence(
+    aapos_values: &str,
+    aaref_values: &str,
+    aaalt_values: &str,
+    protein_position: &str,
+    aa_ref: &str,
+    aa_alt: &str,
+) -> bool {
+    let mut positions = aapos_values.split(';');
+    let mut refs = aaref_values.split(';');
+    let mut alts = aaalt_values.split(';');
+    loop {
+        let (Some(pos), Some(row_ref), Some(row_alt)) =
+            (positions.next(), refs.next(), alts.next())
+        else {
+            return false;
+        };
+        if pos == protein_position && row_ref == aa_ref && row_alt == aa_alt {
+            return true;
+        }
+    }
 }
 
 fn protein_variant_matches(
@@ -837,9 +1101,9 @@ fn normalize_array_to_field(source: &ArrayRef, field: &Field) -> Result<ArrayRef
                         "expected StringViewArray".into(),
                     )
                 })?;
-            Ok(Arc::new(StringArray::from_iter((0..array.len()).map(|i| {
-                (!array.is_null(i)).then(|| array.value(i))
-            }))))
+            Ok(Arc::new(StringArray::from_iter(
+                (0..array.len()).map(|i| (!array.is_null(i)).then(|| array.value(i))),
+            )))
         }
         (DataType::LargeUtf8, DataType::Utf8) => {
             let array = source
@@ -850,9 +1114,9 @@ fn normalize_array_to_field(source: &ArrayRef, field: &Field) -> Result<ArrayRef
                         "expected LargeStringArray".into(),
                     )
                 })?;
-            Ok(Arc::new(StringArray::from_iter((0..array.len()).map(|i| {
-                (!array.is_null(i)).then(|| array.value(i))
-            }))))
+            Ok(Arc::new(StringArray::from_iter(
+                (0..array.len()).map(|i| (!array.is_null(i)).then(|| array.value(i))),
+            )))
         }
         (source_ty, field_ty) if source_ty == field_ty => Ok(source.clone()),
         (source_ty, field_ty) => Err(datafusion::common::DataFusionError::Execution(format!(
@@ -942,9 +1206,11 @@ fn get_string_column(batch: &RecordBatch, name: &str) -> Result<StringArray> {
         DataType::Utf8View => column
             .as_any()
             .downcast_ref::<StringViewArray>()
-            .map(|array| StringArray::from_iter((0..array.len()).map(|i| {
-                (!array.is_null(i)).then(|| array.value(i))
-            })))
+            .map(|array| {
+                StringArray::from_iter(
+                    (0..array.len()).map(|i| (!array.is_null(i)).then(|| array.value(i))),
+                )
+            })
             .ok_or_else(|| {
                 datafusion::common::DataFusionError::Execution(format!(
                     "Column '{name}' is not StringViewArray"
@@ -953,9 +1219,11 @@ fn get_string_column(batch: &RecordBatch, name: &str) -> Result<StringArray> {
         DataType::LargeUtf8 => column
             .as_any()
             .downcast_ref::<LargeStringArray>()
-            .map(|array| StringArray::from_iter((0..array.len()).map(|i| {
-                (!array.is_null(i)).then(|| array.value(i))
-            })))
+            .map(|array| {
+                StringArray::from_iter(
+                    (0..array.len()).map(|i| (!array.is_null(i)).then(|| array.value(i))),
+                )
+            })
             .ok_or_else(|| {
                 datafusion::common::DataFusionError::Execution(format!(
                     "Column '{name}' is not LargeStringArray"
@@ -971,9 +1239,71 @@ fn get_string_column(batch: &RecordBatch, name: &str) -> Result<StringArray> {
 mod tests {
     use super::*;
     use crate::plugin::PluginConfig;
-    use datafusion::arrow::array::{Float32Array, Int64Array};
+    use datafusion::arrow::array::{
+        Float32Array, Int32Array, Int64Array, StringArray, UInt32Array,
+    };
     use datafusion::arrow::datatypes::{Field, Schema};
+    use datafusion::parquet::arrow::ArrowWriter;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn load_parquet_plugin_filters_to_requested_target_keys() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = temp.path().join("spliceai");
+        std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        let path = plugin_dir.join("chr1.parquet");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("pos", DataType::UInt32, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+            Field::new("symbol", DataType::Utf8, true),
+            Field::new("ds_ag", DataType::Float32, true),
+            Field::new("dp_ag", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(UInt32Array::from(vec![65_420_u32, 65_421_u32])),
+                Arc::new(StringArray::from(vec!["C", "G"])),
+                Arc::new(StringArray::from(vec!["A", "T"])),
+                Arc::new(StringArray::from(vec!["OR4F5", "SKIP"])),
+                Arc::new(Float32Array::from(vec![0.12_f32, 0.99_f32])),
+                Arc::new(Int32Array::from(vec![7_i32, 99_i32])),
+            ],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(path).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let mut target_keys = HashSet::new();
+        target_keys.insert((65_420_i64, "C".to_string(), "A".to_string()));
+
+        let ctx = SessionContext::new();
+        let index = PluginIndex::load_parquet(
+            &ctx,
+            PluginSourceKind::SpliceAI,
+            plugin_dir.to_str().unwrap(),
+            "1",
+            Some(&target_keys),
+        )
+        .await
+        .expect("load")
+        .expect("present");
+
+        assert_eq!(
+            index.csq_values_for_variant(65_420, "C", "A"),
+            vec!["OR4F5", "0.12", "7"]
+        );
+        assert_eq!(
+            index.csq_values_for_variant(65_421, "G", "T"),
+            vec!["", "", ""]
+        );
+    }
 
     #[cfg(feature = "kv-cache")]
     #[test]
@@ -1029,7 +1359,11 @@ mod tests {
         use datafusion::arrow::array::StringArray;
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let plugin_dir = temp.path().join("parquet").join("115_GRCh38_vep").join("cadd");
+        let plugin_dir = temp
+            .path()
+            .join("parquet")
+            .join("115_GRCh38_vep")
+            .join("cadd");
         std::fs::create_dir_all(&plugin_dir).expect("plugin dir");
         let fjall_dir = temp.path().join("cadd.fjall");
 
@@ -1078,8 +1412,14 @@ mod tests {
             kind: PluginSourceKind::Cadd,
             backend: PluginBackend::Parquet(ParquetPluginIndex {
                 lookup: HashMap::from([
-                    ((101_i64, Box::<str>::from("A"), Box::<str>::from("G")), 0),
-                    ((202_i64, Box::<str>::from("A"), Box::<str>::from("AT")), 1),
+                    (
+                        (101_i64, Box::<str>::from("A"), Box::<str>::from("G")),
+                        vec![0],
+                    ),
+                    (
+                        (202_i64, Box::<str>::from("A"), Box::<str>::from("AT")),
+                        vec![1],
+                    ),
                 ]),
                 data: RecordBatch::try_new(
                     schema.clone(),
@@ -1087,6 +1427,8 @@ mod tests {
                 )
                 .expect("cadd batch"),
                 value_schema: schema.clone(),
+                dbnsfp_match_data: None,
+                spliceai_match_data: None,
             }),
         };
 
@@ -1112,13 +1454,18 @@ mod tests {
         let clinvar_index = PluginIndex {
             kind: PluginSourceKind::ClinVar,
             backend: PluginBackend::Parquet(ParquetPluginIndex {
-                lookup: HashMap::from([((101_i64, Box::<str>::from("A"), Box::<str>::from("G")), 0)]),
+                lookup: HashMap::from([(
+                    (101_i64, Box::<str>::from("A"), Box::<str>::from("G")),
+                    vec![0],
+                )]),
                 data: RecordBatch::try_new(
                     schema.clone(),
                     vec![
                         Arc::new(StringArray::from(vec!["12345"])),
                         Arc::new(StringArray::from(vec!["Benign"])),
-                        Arc::new(StringArray::from(vec!["criteria_provided|_multiple_submitters|_no_conflicts"])),
+                        Arc::new(StringArray::from(vec![
+                            "criteria_provided|_multiple_submitters|_no_conflicts",
+                        ])),
                         Arc::new(StringArray::from(vec!["Disease_A|Disease_B"])),
                         Arc::new(StringArray::from(vec!["single_nucleotide_variant"])),
                         Arc::new(StringArray::from(vec!["ClinGen:CA1|Other:2"])),
@@ -1126,6 +1473,8 @@ mod tests {
                 )
                 .expect("clinvar batch"),
                 value_schema: schema,
+                dbnsfp_match_data: None,
+                spliceai_match_data: None,
             }),
         };
 
@@ -1142,6 +1491,185 @@ mod tests {
         assert_eq!(
             plugins.csq_suffix_for_variant(101, "A", "G"),
             "12345|Benign|criteria_provided&_multiple_submitters&_no_conflicts|Disease_A&Disease_B|single_nucleotide_variant|ClinGen:CA1&Other:2"
+        );
+    }
+
+    #[test]
+    fn dbnsfp_csq_suffix_escapes_vep_style_inner_separators() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sift4g_score", DataType::Utf8, true),
+            Field::new("sift4g_pred", DataType::Utf8, true),
+        ]));
+        let dbnsfp_index = PluginIndex {
+            kind: PluginSourceKind::DbNSFP,
+            backend: PluginBackend::Parquet(ParquetPluginIndex {
+                lookup: HashMap::from([(
+                    (101_i64, Box::<str>::from("A"), Box::<str>::from("G")),
+                    vec![0],
+                )]),
+                data: RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(vec![".;0.354;0.471"])),
+                        Arc::new(StringArray::from(vec!["T|D"])),
+                    ],
+                )
+                .expect("dbnsfp batch"),
+                value_schema: schema,
+                dbnsfp_match_data: None,
+                spliceai_match_data: None,
+            }),
+        };
+
+        let plugins = ContigPlugins {
+            active_plugins: ActivePlugins {
+                configs: vec![PluginConfig {
+                    kind: PluginKind::DbNSFP,
+                    source_dirs: vec![],
+                }],
+            },
+            indexes: vec![dbnsfp_index],
+        };
+
+        assert_eq!(
+            plugins.csq_suffix_for_variant(101, "A", "G"),
+            ".&0.354&0.471|T&D"
+        );
+    }
+
+    #[test]
+    fn dbnsfp_csq_suffix_selects_duplicate_row_by_protein_change() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sift4g_score", DataType::Utf8, true),
+            Field::new("revel_score", DataType::Utf8, true),
+        ]));
+        let dbnsfp_index = PluginIndex {
+            kind: PluginSourceKind::DbNSFP,
+            backend: PluginBackend::Parquet(ParquetPluginIndex {
+                lookup: HashMap::from([(
+                    (254484_i64, Box::<str>::from("A"), Box::<str>::from("C")),
+                    vec![0, 1],
+                )]),
+                data: RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(vec!["0.021", ".;.;0.136"])),
+                        Arc::new(StringArray::from(vec!["0.238", ".;.;0.533"])),
+                    ],
+                )
+                .expect("dbnsfp batch"),
+                value_schema: schema,
+                dbnsfp_match_data: Some(DbnsfpMatchData {
+                    aapos: StringArray::from(vec!["112", "450;581;647"]),
+                    aaref: StringArray::from(vec!["M", "Y;Y;Y"]),
+                    aaalt: StringArray::from(vec!["L", "S;S;S"]),
+                }),
+                spliceai_match_data: None,
+            }),
+        };
+
+        let plugins = ContigPlugins {
+            active_plugins: ActivePlugins {
+                configs: vec![PluginConfig {
+                    kind: PluginKind::DbNSFP,
+                    source_dirs: vec![],
+                }],
+            },
+            indexes: vec![dbnsfp_index],
+        };
+
+        assert_eq!(
+            plugins.csq_suffix_for_consequence(
+                254484,
+                "A",
+                "C",
+                true,
+                true,
+                None,
+                Some("112"),
+                Some("M/L"),
+            ),
+            "0.021|0.238"
+        );
+        assert_eq!(
+            plugins.csq_suffix_for_consequence(
+                254484,
+                "A",
+                "C",
+                true,
+                true,
+                None,
+                Some("647"),
+                Some("Y/S"),
+            ),
+            ".&.&0.136|.&.&0.533"
+        );
+    }
+
+    #[test]
+    fn spliceai_csq_suffix_selects_row_by_consequence_symbol() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, true),
+            Field::new("ds_ag", DataType::Utf8, true),
+        ]));
+        let spliceai_index = PluginIndex {
+            kind: PluginSourceKind::SpliceAI,
+            backend: PluginBackend::Parquet(ParquetPluginIndex {
+                lookup: HashMap::from([(
+                    (1029699_i64, Box::<str>::from("A"), Box::<str>::from("T")),
+                    vec![0],
+                )]),
+                data: RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(vec!["C7orf50"])),
+                        Arc::new(StringArray::from(vec!["0.12"])),
+                    ],
+                )
+                .expect("spliceai batch"),
+                value_schema: schema,
+                dbnsfp_match_data: None,
+                spliceai_match_data: Some(SpliceAiMatchData {
+                    symbol: StringArray::from(vec!["C7orf50"]),
+                }),
+            }),
+        };
+
+        let plugins = ContigPlugins {
+            active_plugins: ActivePlugins {
+                configs: vec![PluginConfig {
+                    kind: PluginKind::SpliceAI,
+                    source_dirs: vec![],
+                }],
+            },
+            indexes: vec![spliceai_index],
+        };
+
+        assert_eq!(
+            plugins.csq_suffix_for_consequence(
+                1029699,
+                "A",
+                "T",
+                true,
+                true,
+                Some("C7orf50"),
+                None,
+                None,
+            ),
+            "C7orf50|0.12"
+        );
+        assert_eq!(
+            plugins.csq_suffix_for_consequence(
+                1029699,
+                "A",
+                "T",
+                true,
+                true,
+                Some("CHL1"),
+                None,
+                None,
+            ),
+            "|"
         );
     }
 }
