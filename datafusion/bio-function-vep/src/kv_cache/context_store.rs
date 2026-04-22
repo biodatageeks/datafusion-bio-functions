@@ -9,16 +9,20 @@
 //! [1B flags]
 //!   bit 0: has cds_len
 //!   bit 1: has protein_len
-//!   bit 2: has translation_seq
-//!   bit 3: has cds_sequence
+//!   bit 2: has translation_seq                   (BAM-edited / vef_cache.peptide)
+//!   bit 3: has cds_sequence                      (BAM-edited / vef_cache.translateable_seq)
 //!   bit 4: has stable_id
 //!   bit 5: has version
+//!   bit 6: has translation_seq_canonical         (upstream d26e370, translation.primary_seq)
+//!   bit 7: has cds_sequence_canonical            (upstream d26e370, transcript.translateable_seq)
 //! [optional 8B cds_len u64 LE]
 //! [optional 8B protein_len u64 LE]
 //! [optional 4B translation_seq_len u32 LE + bytes]
 //! [optional 4B cds_sequence_len u32 LE + bytes]
 //! [optional 4B stable_id_len u32 LE + bytes]
 //! [optional 4B version i32 LE]
+//! [optional 4B translation_seq_canonical_len u32 LE + bytes]
+//! [optional 4B cds_sequence_canonical_len u32 LE + bytes]
 //! [4B protein_features_count u32 LE]
 //! For each protein feature:
 //!   [1B flags: bit 0 = has analysis, bit 1 = has hseqname]
@@ -27,6 +31,11 @@
 //!   [8B start i64 LE]
 //!   [8B end i64 LE]
 //! ```
+//!
+//! The canonical bits are driven purely off `Option::is_some`: writers emit
+//! the payload whenever the field is populated, readers deliver `Some(_)`
+//! iff the flag is set and `None` otherwise. There is no legacy fallback
+//! path — fjall databases written by earlier versions must be regenerated.
 //!
 //! ## Exon entry binary format (per transcript_id)
 //!
@@ -203,6 +212,8 @@ const FLAG_HAS_TRANSLATION_SEQ: u8 = 1 << 2;
 const FLAG_HAS_CDS_SEQUENCE: u8 = 1 << 3;
 const FLAG_HAS_STABLE_ID: u8 = 1 << 4;
 const FLAG_HAS_VERSION: u8 = 1 << 5;
+const FLAG_HAS_TRANSLATION_SEQ_CANONICAL: u8 = 1 << 6;
+const FLAG_HAS_CDS_SEQUENCE_CANONICAL: u8 = 1 << 7;
 
 fn serialize_translation(t: &TranslationFeature) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
@@ -226,6 +237,12 @@ fn serialize_translation(t: &TranslationFeature) -> Vec<u8> {
     if t.version.is_some() {
         flags |= FLAG_HAS_VERSION;
     }
+    if t.translation_seq_canonical.is_some() {
+        flags |= FLAG_HAS_TRANSLATION_SEQ_CANONICAL;
+    }
+    if t.cds_sequence_canonical.is_some() {
+        flags |= FLAG_HAS_CDS_SEQUENCE_CANONICAL;
+    }
     buf.push(flags);
 
     if let Some(v) = t.cds_len {
@@ -245,6 +262,12 @@ fn serialize_translation(t: &TranslationFeature) -> Vec<u8> {
     }
     if let Some(v) = t.version {
         buf.extend_from_slice(&v.to_le_bytes());
+    }
+    if let Some(ref s) = t.translation_seq_canonical {
+        write_str(&mut buf, s);
+    }
+    if let Some(ref s) = t.cds_sequence_canonical {
+        write_str(&mut buf, s);
     }
 
     // Protein features.
@@ -320,6 +343,18 @@ fn deserialize_translation(transcript_id: &str, data: &[u8]) -> Result<Translati
         None
     };
 
+    let translation_seq_canonical = if flags & FLAG_HAS_TRANSLATION_SEQ_CANONICAL != 0 {
+        Some(read_string(data, &mut off)?)
+    } else {
+        None
+    };
+
+    let cds_sequence_canonical = if flags & FLAG_HAS_CDS_SEQUENCE_CANONICAL != 0 {
+        Some(read_string(data, &mut off)?)
+    } else {
+        None
+    };
+
     let pf_count = read_u32(data, &mut off)? as usize;
     let mut protein_features = Vec::with_capacity(pf_count);
     for _ in 0..pf_count {
@@ -352,6 +387,8 @@ fn deserialize_translation(transcript_id: &str, data: &[u8]) -> Result<Translati
         protein_len,
         translation_seq,
         cds_sequence,
+        translation_seq_canonical,
+        cds_sequence_canonical,
         stable_id,
         version,
         protein_features,
@@ -467,6 +504,8 @@ mod tests {
             protein_len: Some(400),
             translation_seq: Some("MSEQ...".to_string()),
             cds_sequence: Some("ATGCDS...".to_string()),
+            translation_seq_canonical: Some("MSEQ...".to_string()),
+            cds_sequence_canonical: Some("ATGCDS...".to_string()),
             stable_id: Some("ENSP00000123456".to_string()),
             version: Some(3),
             protein_features: vec![
@@ -493,6 +532,8 @@ mod tests {
             protein_len: None,
             translation_seq: None,
             cds_sequence: None,
+            translation_seq_canonical: None,
+            cds_sequence_canonical: None,
             stable_id: None,
             version: None,
             protein_features: Vec::new(),
@@ -527,6 +568,63 @@ mod tests {
         let t = make_translation();
         let bytes = serialize_translation(&t);
         let restored = deserialize_translation(&t.transcript_id, &bytes).unwrap();
+        assert_eq!(t, restored);
+    }
+
+    /// BAM-edited RefSeq transcripts: canonical ≠ edited. Both must survive
+    /// the roundtrip with their original values intact (no mirror collapse).
+    #[test]
+    fn test_translation_roundtrip_distinct_canonical() {
+        let t = TranslationFeature {
+            transcript_id: "NM_002111.8".to_string(),
+            cds_len: Some(9435),
+            protein_len: Some(3144),
+            translation_seq: Some("MATLEKLMKAFESLKSFQQQQQ".to_string()), // BAM-edited (5 Qs)
+            cds_sequence: Some(
+                "ATGGCGACCCTGGAAAAGCTGATGAAGGCCTTCGAGTCCCTCAAGTCCTTCCAGCAGCAGCAGCAG".to_string(),
+            ),
+            translation_seq_canonical: Some("MATLEKLMKAFESLKSFQQQ".to_string()), // canonical (3 Qs)
+            cds_sequence_canonical: Some(
+                "ATGGCGACCCTGGAAAAGCTGATGAAGGCCTTCGAGTCCCTCAAGTCCTTCCAGCAGCAG".to_string(),
+            ),
+            stable_id: Some("NP_002102.4".to_string()),
+            version: Some(4),
+            protein_features: Vec::new(),
+        };
+        let bytes = serialize_translation(&t);
+        let restored = deserialize_translation(&t.transcript_id, &bytes).unwrap();
+        assert_eq!(t, restored);
+        // Specifically guarantee canonical and edited stayed distinct.
+        assert_ne!(restored.translation_seq, restored.translation_seq_canonical);
+        assert_ne!(restored.cds_sequence, restored.cds_sequence_canonical);
+    }
+
+    /// Absent canonical sequences must serialize with the flag bits cleared
+    /// and deserialize back to `None`. Guards against a regression that would
+    /// synthesize canonical values from the BAM-edited ones.
+    #[test]
+    fn test_translation_roundtrip_absent_canonical_stays_none() {
+        let t = TranslationFeature {
+            transcript_id: "ENSTNOCANON0001".to_string(),
+            cds_len: Some(900),
+            protein_len: Some(300),
+            translation_seq: Some("MSEQ...".to_string()),
+            cds_sequence: Some("ATGCDS...".to_string()),
+            translation_seq_canonical: None,
+            cds_sequence_canonical: None,
+            stable_id: Some("ENSPNOCANON0001".to_string()),
+            version: Some(1),
+            protein_features: Vec::new(),
+        };
+        let bytes = serialize_translation(&t);
+
+        let flags = bytes[0];
+        assert_eq!(flags & FLAG_HAS_TRANSLATION_SEQ_CANONICAL, 0);
+        assert_eq!(flags & FLAG_HAS_CDS_SEQUENCE_CANONICAL, 0);
+
+        let restored = deserialize_translation(&t.transcript_id, &bytes).unwrap();
+        assert_eq!(restored.translation_seq_canonical, None);
+        assert_eq!(restored.cds_sequence_canonical, None);
         assert_eq!(t, restored);
     }
 

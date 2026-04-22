@@ -166,6 +166,11 @@ async fn load_translations_from_parquet(
             .or_else(|_| schema.index_of("cds_seq"))
             .or_else(|_| schema.index_of("coding_sequence"))
             .ok();
+        // Canonical (pre-BAM-edit) translation/CDS columns added upstream
+        // in d26e370. Strict: absent columns propagate as `None` — legacy
+        // parquet caches must be regenerated.
+        let translation_seq_canonical_idx = schema.index_of("translation_seq_canonical").ok();
+        let cds_seq_canonical_idx = schema.index_of("cds_sequence_canonical").ok();
         let stable_id_idx = schema.index_of("stable_id").ok();
         let version_idx = schema.index_of("version").ok();
         let pf_idx = schema.index_of("protein_features").ok();
@@ -191,12 +196,18 @@ async fn load_translations_from_parquet(
                 .map(|i| read_protein_features(batch.column(i).as_ref(), row))
                 .unwrap_or_default();
 
+            let translation_seq_canonical = translation_seq_canonical_idx
+                .and_then(|i| string_at(batch.column(i).as_ref(), row));
+            let cds_sequence_canonical =
+                cds_seq_canonical_idx.and_then(|i| string_at(batch.column(i).as_ref(), row));
             out.push(TranslationFeature {
                 transcript_id,
                 cds_len,
                 protein_len,
                 translation_seq,
                 cds_sequence,
+                translation_seq_canonical,
+                cds_sequence_canonical,
                 stable_id,
                 version,
                 protein_features,

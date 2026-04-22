@@ -1343,11 +1343,101 @@ Merged chr1 benchmark with `--hgvs --merged`:
 - 72/74 fields at zero mismatches
 - HGVSc: ~100 mismatches (RefSeq-specific: edited transcript shifting, cdna_mapper_segments differences)
 - HGVSp: ~5 mismatches (RefSeq transcripts missing spliced_seq)
-- All non-HGVS fields: zero mismatches
+- All non-HGVS fields: zero mismatches for this chr1 merged benchmark profile. The chr2 merged-cache `HGNC_ID` parity issue below is a separate validation surface.
 
 Remaining merged mismatches are ALL on RefSeq transcripts (NM_, NR_, XM_, XR_) and require:
 - Porting VEP's transcript-level `_return_3prime()` shifting with correct pre/post sequence extraction
 - Resolving `cdna_mapper_segments` differences for 3 specific RefSeq transcripts
+
+### Merged `HGNC_ID` buffer-scope update (April 13, 2026)
+
+The chr2 merged-cache report at `/Users/mwiewior/research/git/vepyr/e2e-testing/reports/fast_chr2_merged_report.json` shows 294 residual `HGNC_ID` false positives:
+
+- 281 RefSeq entries on `XR_007076390.1` / `NBAS` / `HGNC:15625`
+- 13 RefSeq entries on `NR_037931.2` / `ANAPC1P1` / `HGNC:44150`
+- all are DataFusion-only extras where Ensembl VEP emits an empty `HGNC_ID`
+
+The investigation changes the diagnosis. This is not a per-variant propagation bug. Ensembl VEP propagation is broader than one variant but narrower than chromosome/cache-wide propagation.
+
+Confirmed Ensembl VEP release/115 behavior:
+
+- Input buffers are count-bounded variant chunks. `Config.pm` exposes `buffer_size=i` as the number of variations read before analysis and defaults `buffer_size` to `5000`.
+- `InputBuffer::next()` fills up to `buffer_size` variants, preserves input order, carries a pre-buffer for chromosome transitions, and does not annotate one buffer across a chromosome boundary.
+- Transcript features for a buffer come from `get_all_features_by_InputBuffer()`: compute cache regions touched by every variant in the current buffer, expand by the configured upstream/downstream distance, fetch/clean cache features, filter to the buffer `min_max` range expanded by that same distance, then call `merge_features()`.
+- `AnnotationType::Transcript::merge_features()` builds an HGNC map keyed by `_gene_symbol` from any feature in the current buffer feature set with native `_gene_hgnc_id`, then assigns `_gene_hgnc_id` to same-symbol features in that feature set. For `refseq`/`merged`, it also fills missing `_gene_symbol`, `_gene_symbol_source`, and `_gene_hgnc_id` from same `_gene->stable_id` features.
+
+Traceability:
+
+- `buffer_size` option/default: [Config.pm#L118-L119](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L118-L119), [Config.pm#L290-L296](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L290-L296)
+- input-buffer fill/chromosome-boundary behavior: [InputBuffer.pm#L160-L266](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/InputBuffer.pm#L160-L266)
+- buffer `min_max`: [InputBuffer.pm#L437-L471](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/InputBuffer.pm#L437-L471)
+- buffer feature fetch/filter: [AnnotationSource.pm#L109-L139](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L109-L139), [AnnotationSource.pm#L154-L260](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L154-L260), [AnnotationSource.pm#L289-L340](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource.pm#L289-L340)
+- transcript HGNC propagation: [Transcript.pm#L246-L310](https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L246-L310)
+
+#### Required upstream cache fix
+
+`datafusion-bio-format-ensembl-cache` must expose native HGNC provenance so this crate does not seed VEP propagation from cache-propagated values.
+
+Preferred upstream shape:
+
+- add `gene_hgnc_id_native` to transcript parquet, populated only from the raw VEP object keys `gene_hgnc_id` / `_gene_hgnc_id`
+- remove export-time `gene_hgnc_id` propagation, or at minimum stop using propagated `gene_hgnc_id` as a seed in this crate
+- keep `gene_hgnc_id_native` as a plain pass-through column with no `COALESCE` / window backfill
+
+Short-term compatibility:
+
+- if `gene_hgnc_id_native` is absent, parse `_gene_hgnc_id` / `gene_hgnc_id` from `raw_object_json`
+- do not use promoted `gene_hgnc_id` as a donor when native provenance is unavailable unless explicitly running a legacy non-strict mode
+
+#### Downstream implementation plan
+
+1. Extend transcript hydration:
+   - add native HGNC storage to `TranscriptFeature`, e.g. `gene_hgnc_id_native`
+   - carry `gene_symbol`, `gene_symbol_source`, `gene_stable_id`, transcript `source`, and stable feature ID needed by VEP's `merge_features()` logic
+   - prefer `gene_hgnc_id_native`; fall back to raw JSON parsing until the upstream parquet dependency is updated
+
+2. Remove chromosome/global HGNC backfill:
+   - delete or bypass `backfill_missing_hgnc_ids()` for strict VEP parity
+   - never mutate all loaded transcripts from a whole-chromosome symbol map
+   - reset any working HGNC value to the native value before applying buffer-local propagation
+
+3. Add VEP-style input-buffer chunking:
+   - default `buffer_size` to `5000`
+   - chunk the logical input variant stream at the same level VEP buffers `VariationFeature` objects, not CSQ output rows
+   - preserve input order and do not cross chromosome boundaries
+   - compute per-buffer `min_max` from the variants in that buffer
+   - add a config surface for overriding `buffer_size` to match VEP CLI behavior
+
+4. Compute the buffer-local transcript feature set:
+   - use the buffer `min_max` range expanded by the same upstream/downstream distance used for consequence annotation
+   - if transcripts are already loaded per chromosome, filter the in-memory feature set by that expanded range
+   - if transcript loading becomes lazy later, load only the 1 Mb cache regions touched by the buffer before applying the same `min_max` filter
+   - use this buffer-local feature set as both the HGNC donor set and the recipient set
+
+5. Port the `merge_features()` HGNC parts:
+   - build `hgnc_by_symbol` from native `_gene_hgnc_id` values on features in the current buffer feature set
+   - apply same-symbol HGNC propagation only inside that feature set
+   - for `refseq`/`merged`, build the same-gene refill map keyed by `gene_stable_id` for `gene_symbol`, `gene_symbol_source`, and native HGNC
+   - apply the refill only to features in the current buffer feature set
+   - do not carry propagated values into the next buffer
+
+6. Keep the propagation as an overlay:
+   - either mutate a per-buffer working copy of selected transcripts or maintain `transcript_id -> propagated_hgnc_id` overlay state for the current buffer
+   - avoid permanent mutation of the shared per-contig transcript cache
+   - ensure downstream CSQ serialization reads the buffer-local effective HGNC, not the globally loaded promoted value
+
+7. Acceptance tests:
+   - unit-test the symbol-keyed `merge_features()` HGNC propagation with native donors and null recipients
+   - unit-test the `refseq`/`merged` same-`gene_stable_id` refill path
+   - regression-test chr2 NBAS: variants before the 5000-record buffer boundary stay empty, variants in the next buffer can receive `HGNC:15625`
+   - regression-test chr2 ANAPC1P1: variants before the boundary stay empty, variants in the next buffer can receive `HGNC:44150`
+   - rerun `/Users/mwiewior/research/git/vepyr/e2e-testing/reports/fast_chr2_merged_report.json`; expected result is the 294 `HGNC_ID` false positives drop to zero without introducing post-boundary false negatives
+
+Performance guard:
+
+- do not re-query parquet per buffer if the current execution path already hydrates transcripts per contig
+- build a coordinate-sorted transcript index or interval index if repeated per-buffer scans show up in profiles
+- the semantic requirement is buffer-local propagation; the implementation should be O(number of candidate transcripts near the buffer), not O(all chromosome transcripts * number of buffers)
 
 ### Test coverage
 

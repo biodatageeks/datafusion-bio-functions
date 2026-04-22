@@ -412,6 +412,106 @@ mod tests {
         .expect("valid exon batch")
     }
 
+    fn refseq_vcf_table() -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![101])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .expect("valid refseq vcf batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("valid refseq vcf memtable")
+    }
+
+    fn refseq_cache_batch() -> RecordBatch {
+        use crate::annotate_provider::cache_lookup_column_names;
+
+        let mut fields = vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("failed", DataType::Int64, false),
+        ];
+        let mut columns: Vec<Arc<dyn datafusion::arrow::array::Array>> = vec![
+            Arc::new(StringArray::from(vec!["1"])),
+            Arc::new(Int64Array::from(vec![100])),
+            Arc::new(Int64Array::from(vec![101])),
+            Arc::new(StringArray::from(vec!["A/G"])),
+            Arc::new(Int64Array::from(vec![0_i64])),
+        ];
+        for col in cache_lookup_column_names() {
+            fields.push(Field::new(col, DataType::Utf8, true));
+            columns.push(Arc::new(StringArray::from(vec![None::<&str>])));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns).expect("valid refseq cache batch")
+    }
+
+    fn refseq_transcripts_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("strand", DataType::Int64, false),
+            Field::new("biotype", DataType::Utf8, false),
+            Field::new("cds_start", DataType::Int64, true),
+            Field::new("cds_end", DataType::Int64, true),
+            Field::new("source", DataType::Utf8, true),
+            Field::new("bam_edit_status", DataType::Utf8, true),
+            Field::new("raw_object_json", DataType::Utf8, true),
+        ]));
+        let raw = r#"{"__class":"Bio::EnsEMBL::Transcript","__value":{"_source_cache":"RefSeq","display_xref":{"display_id":"NM_000001"},"attributes":[{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only"}},{"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"rseq_ens_match_cds","value":"1"}}]}}"#;
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["NM_000001"])),
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![50])),
+                Arc::new(Int64Array::from(vec![200])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["lncRNA"])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(StringArray::from(vec![Some("BestRefSeq")])),
+                Arc::new(StringArray::from(vec![Some("ok")])),
+                Arc::new(StringArray::from(vec![Some(raw)])),
+            ],
+        )
+        .expect("valid refseq transcript batch")
+    }
+
+    fn refseq_exons_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("exon_number", DataType::Int64, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["NM_000001"])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![50])),
+                Arc::new(Int64Array::from(vec![200])),
+            ],
+        )
+        .expect("valid refseq exon batch")
+    }
+
     fn synonymous_vcf_table() -> MemTable {
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -2674,6 +2774,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_refseq_and_merged_modes_emit_refseq_specific_csq_fields() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_refseq", Arc::new(refseq_vcf_table()))
+            .expect("register refseq vcf table");
+        let tmpdir = TempDir::new().expect("create tmpdir");
+        write_batch_to_cache(&tmpdir, "variation", &refseq_cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &refseq_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &refseq_exons_batch());
+        let cache_path = tmpdir.path().display().to_string();
+
+        let default_sql = format!(
+            "SELECT \"CSQ\" FROM annotate_vep('vcf_refseq', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
+        );
+        let default_batches = ctx
+            .sql(&default_sql)
+            .await
+            .expect("default query should parse")
+            .collect()
+            .await
+            .expect("collect default annotate_vep");
+        let default_csq = string_values(
+            default_batches[0]
+                .column_by_name("CSQ")
+                .expect("default csq column"),
+        );
+        let default_entry = csq_entries(default_csq[0].as_deref().expect("default csq present"))
+            .into_iter()
+            .next()
+            .expect("default CSQ entry");
+        assert_eq!(default_entry.len(), 74);
+        assert_eq!(default_entry[1], "intergenic_variant");
+
+        let refseq_sql = format!(
+            "SELECT \"CSQ\" FROM annotate_vep('vcf_refseq', '{cache_path}', 'parquet', '{{\"partitioned\":true,\"refseq\":true}}')"
+        );
+        let refseq_batches = ctx
+            .sql(&refseq_sql)
+            .await
+            .expect("refseq query should parse")
+            .collect()
+            .await
+            .expect("collect refseq annotate_vep");
+        let refseq_csq = string_values(
+            refseq_batches[0]
+                .column_by_name("CSQ")
+                .expect("refseq csq column"),
+        );
+        let refseq_entry = csq_entries(refseq_csq[0].as_deref().expect("refseq csq present"))
+            .into_iter()
+            .find(|fields| fields.len() == 78 && fields[5] == "Transcript")
+            .expect("expected transcript CSQ entry in refseq mode");
+        assert_eq!(refseq_entry[6], "NM_000001");
+        assert_eq!(refseq_entry[28], "rseq_ens_match_cds");
+        assert_eq!(refseq_entry[29], "");
+        assert_eq!(refseq_entry[30], "A");
+        assert_eq!(refseq_entry[31], "A");
+        assert_eq!(refseq_entry[32], "OK");
+
+        let merged_sql = format!(
+            "SELECT \"CSQ\" FROM annotate_vep('vcf_refseq', '{cache_path}', 'parquet', '{{\"partitioned\":true,\"merged\":true}}')"
+        );
+        let merged_batches = ctx
+            .sql(&merged_sql)
+            .await
+            .expect("merged query should parse")
+            .collect()
+            .await
+            .expect("collect merged annotate_vep");
+        let merged_csq = string_values(
+            merged_batches[0]
+                .column_by_name("CSQ")
+                .expect("merged csq column"),
+        );
+        let merged_entry = csq_entries(merged_csq[0].as_deref().expect("merged csq present"))
+            .into_iter()
+            .find(|fields| fields.len() == 79 && fields[5] == "Transcript")
+            .expect("expected transcript CSQ entry in merged mode");
+        assert_eq!(merged_entry[6], "NM_000001");
+        assert_eq!(merged_entry[28], "rseq_ens_match_cds");
+        assert_eq!(merged_entry[29], "RefSeq");
+        assert_eq!(merged_entry[30], "");
+        assert_eq!(merged_entry[31], "A");
+        assert_eq!(merged_entry[32], "A");
+        assert_eq!(merged_entry[33], "OK");
     }
 
     #[tokio::test(flavor = "multi_thread")]

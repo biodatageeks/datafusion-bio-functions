@@ -25,8 +25,8 @@ serde_json = "1"
 noodles-core = "0.16"
 noodles-fasta = "0.49"
 parquet = { version = "56", features = ["arrow"] }
-datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "7ccaa58" }
-datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "25fe271dd92f67640af8e8bfb9a8198c168c7ab4", optional = true }
+datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "5fc6a6fc26c4300402d9283d69d9d521e96abc60" }
+datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "ab1f2a5", optional = true }
 indicatif = "0.18.4"
 
 [dev-dependencies]
@@ -84,3 +84,19 @@ required-features = []
 default = ["kv-cache"]
 kv-cache = ["dep:fjall", "dep:arrow-ipc", "dep:lz4_flex", "dep:zstd", "dep:ahash"]
 cache-builder = ["kv-cache", "dep:datafusion-bio-format-ensembl-cache"]
+
+# Regression tests that bake per-transcript sequence fixtures via
+# `include_str!(".tmp_*.txt")` are gated behind the raw `cfg(dev_fixtures)`
+# flag (see `[lints.rust]` below), not a Cargo feature. The raw cfg flag is
+# used deliberately so `--all-features` (e.g. the project's
+# `cargo clippy --all-targets --all-features` pre-commit) does NOT enable it:
+# the `.tmp_*` files are regenerated on demand by a local VEP-cache export
+# script and are intentionally not checked in.
+#
+# To run them, regenerate the fixtures locally and pass the cfg through
+# RUSTFLAGS:
+#   RUSTFLAGS="--cfg dev_fixtures" \
+#     cargo test -p datafusion-bio-function-vep --features cache-builder --lib
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(dev_fixtures)'] }
