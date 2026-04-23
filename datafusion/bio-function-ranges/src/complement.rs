@@ -13,7 +13,7 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
@@ -190,6 +190,20 @@ impl ExecutionPlan for ComplementExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.cache
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        let mut distributions = vec![Distribution::HashPartitioned(vec![Arc::new(Column::new(
+            self.columns.0.as_str(),
+            0,
+        ))])];
+        if self.view.is_some() {
+            distributions.push(Distribution::HashPartitioned(vec![Arc::new(Column::new(
+                self.view_columns.0.as_str(),
+                0,
+            ))]));
+        }
+        distributions
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

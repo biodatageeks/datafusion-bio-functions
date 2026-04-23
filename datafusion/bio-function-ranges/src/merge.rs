@@ -12,7 +12,7 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
@@ -165,6 +165,13 @@ impl ExecutionPlan for MergeExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.cache
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::HashPartitioned(vec![Arc::new(Column::new(
+            self.columns.0.as_str(),
+            0,
+        ))])]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

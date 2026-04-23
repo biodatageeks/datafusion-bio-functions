@@ -14,7 +14,7 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
@@ -196,6 +196,7 @@ impl TableProvider for SubtractProvider {
             right: right_plan,
             left_columns: Arc::new(self.left_columns.clone()),
             right_columns: Arc::new(self.right_columns.clone()),
+            left_contig_col_idx: contig_col_idx,
             strict: self.filter_op == FilterOp::Strict,
             has_extra_cols: self.has_extra_cols,
             cache: PlanProperties::new(
@@ -215,6 +216,7 @@ struct SubtractExec {
     right: Arc<dyn ExecutionPlan>,
     left_columns: Arc<(String, String, String)>,
     right_columns: Arc<(String, String, String)>,
+    left_contig_col_idx: usize,
     strict: bool,
     has_extra_cols: bool,
     cache: PlanProperties,
@@ -239,6 +241,19 @@ impl ExecutionPlan for SubtractExec {
         &self.cache
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![
+            Distribution::HashPartitioned(vec![Arc::new(Column::new(
+                self.left_columns.0.as_str(),
+                self.left_contig_col_idx,
+            ))]),
+            Distribution::HashPartitioned(vec![Arc::new(Column::new(
+                self.right_columns.0.as_str(),
+                0,
+            ))]),
+        ]
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.left, &self.right]
     }
@@ -259,6 +274,7 @@ impl ExecutionPlan for SubtractExec {
             right: Arc::clone(&children[1]),
             left_columns: Arc::clone(&self.left_columns),
             right_columns: Arc::clone(&self.right_columns),
+            left_contig_col_idx: self.left_contig_col_idx,
             strict: self.strict,
             has_extra_cols: self.has_extra_cols,
             cache: PlanProperties::new(
