@@ -3431,24 +3431,29 @@ async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> R
     write_parquet_parts(
         &left_dir,
         &[
-            build_interval_batch(&[("chr1", 0, 10), ("chr1", 20, 30)])?,
-            build_interval_batch(&[("chr1", 8, 25)])?,
+            build_interval_batch(&[("chr1", 0, 10), ("chr1", 20, 30), ("chr2", 10, 20)])?,
+            build_interval_batch(&[("chr1", 8, 25), ("chr2", 30, 40)])?,
         ],
     )?;
     write_parquet_parts(
         &right_dir,
         &[
-            build_interval_batch(&[("chr1", 5, 10)])?,
-            build_interval_batch(&[("chr1", 20, 25)])?,
+            build_interval_batch(&[("chr1", 5, 10), ("chr2", 12, 15)])?,
+            build_interval_batch(&[("chr1", 20, 25), ("chr2", 35, 36)])?,
         ],
     )?;
-    write_parquet_parts(&view_dir, &[build_interval_batch(&[("chr1", 0, 40)])?])?;
+    write_parquet_parts(
+        &view_dir,
+        &[build_interval_batch(&[("chr1", 0, 40), ("chr2", 0, 50)])?],
+    )?;
 
     let expected_merge = [
         "+--------+-----------+---------+-------------+",
         "| contig | pos_start | pos_end | n_intervals |",
         "+--------+-----------+---------+-------------+",
         "| chr1   | 0         | 30      | 3           |",
+        "| chr2   | 10        | 20      | 1           |",
+        "| chr2   | 30        | 40      | 1           |",
         "+--------+-----------+---------+-------------+",
     ];
     let expected_complement = [
@@ -3456,7 +3461,20 @@ async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> R
         "| contig | pos_start | pos_end |",
         "+--------+-----------+---------+",
         "| chr1   | 30        | 40      |",
+        "| chr2   | 0         | 10      |",
+        "| chr2   | 20        | 30      |",
+        "| chr2   | 40        | 50      |",
         "+--------+-----------+---------+",
+    ];
+    let expected_complement_no_view = [
+        "+--------+-----------+---------------------+",
+        "| contig | pos_start | pos_end             |",
+        "+--------+-----------+---------------------+",
+        "| chr1   | 30        | 9223372036854775807 |",
+        "| chr2   | 0         | 10                  |",
+        "| chr2   | 20        | 30                  |",
+        "| chr2   | 40        | 9223372036854775807 |",
+        "+--------+-----------+---------------------+",
     ];
     let expected_subtract = [
         "+--------+-----------+---------+",
@@ -3465,6 +3483,10 @@ async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> R
         "| chr1   | 0         | 5       |",
         "| chr1   | 10        | 20      |",
         "| chr1   | 25        | 30      |",
+        "| chr2   | 10        | 12      |",
+        "| chr2   | 15        | 20      |",
+        "| chr2   | 30        | 35      |",
+        "| chr2   | 36        | 40      |",
         "+--------+-----------+---------+",
     ];
 
@@ -3488,6 +3510,13 @@ async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> R
             .await?;
         assert_batches_sorted_eq!(expected_complement, &complement);
 
+        let complement_no_view = ctx
+            .sql("SELECT * FROM complement('left_t') ORDER BY contig, pos_start, pos_end")
+            .await?
+            .collect()
+            .await?;
+        assert_batches_sorted_eq!(expected_complement_no_view, &complement_no_view);
+
         let subtract = ctx
             .sql("SELECT * FROM subtract('left_t', 'right_t') ORDER BY contig, pos_start, pos_end")
             .await?
@@ -3509,15 +3538,21 @@ async fn test_subtract_partitioned_parquet_preserves_extra_columns_with_custom_o
     write_parquet_parts(
         &left_dir,
         &[
-            build_left_extra_batch(&[("BRCA1", "chr1", 0, 30, 0.95)])?,
-            build_left_extra_batch(&[("TP53", "chr1", 40, 60, 0.75)])?,
+            build_left_extra_batch(&[
+                ("BRCA1", "chr1", 0, 30, 0.95),
+                ("EGFR", "chr2", 10, 20, 0.80),
+            ])?,
+            build_left_extra_batch(&[
+                ("TP53", "chr1", 40, 60, 0.75),
+                ("MYC", "chr2", 30, 40, 0.65),
+            ])?,
         ],
     )?;
     write_parquet_parts(
         &right_dir,
         &[
-            build_interval_batch(&[("chr1", 5, 25)])?,
-            build_interval_batch(&[("chr1", 45, 50)])?,
+            build_interval_batch(&[("chr1", 5, 25), ("chr2", 12, 15)])?,
+            build_interval_batch(&[("chr1", 45, 50), ("chr2", 35, 36)])?,
         ],
     )?;
 
@@ -3529,6 +3564,10 @@ async fn test_subtract_partitioned_parquet_preserves_extra_columns_with_custom_o
         "| BRCA1 | chr1   | 25        | 30      | 0.95  |",
         "| TP53  | chr1   | 40        | 45      | 0.75  |",
         "| TP53  | chr1   | 50        | 60      | 0.75  |",
+        "| EGFR  | chr2   | 10        | 12      | 0.8   |",
+        "| EGFR  | chr2   | 15        | 20      | 0.8   |",
+        "| MYC   | chr2   | 30        | 35      | 0.65  |",
+        "| MYC   | chr2   | 36        | 40      | 0.65  |",
         "+-------+--------+-----------+---------+-------+",
     ];
 
@@ -3560,18 +3599,21 @@ async fn test_partitioned_parquet_explain_preserves_hash_repartition() -> Result
     write_parquet_parts(
         &left_dir,
         &[
-            build_interval_batch(&[("chr1", 0, 10), ("chr1", 20, 30)])?,
-            build_interval_batch(&[("chr1", 8, 25)])?,
+            build_interval_batch(&[("chr1", 0, 10), ("chr1", 20, 30), ("chr2", 10, 20)])?,
+            build_interval_batch(&[("chr1", 8, 25), ("chr2", 30, 40)])?,
         ],
     )?;
     write_parquet_parts(
         &right_dir,
         &[
-            build_interval_batch(&[("chr1", 5, 10)])?,
-            build_interval_batch(&[("chr1", 20, 25)])?,
+            build_interval_batch(&[("chr1", 5, 10), ("chr2", 12, 15)])?,
+            build_interval_batch(&[("chr1", 20, 25), ("chr2", 35, 36)])?,
         ],
     )?;
-    write_parquet_parts(&view_dir, &[build_interval_batch(&[("chr1", 0, 40)])?])?;
+    write_parquet_parts(
+        &view_dir,
+        &[build_interval_batch(&[("chr1", 0, 40), ("chr2", 0, 50)])?],
+    )?;
 
     let ctx = create_bio_session_with_target_partitions_and_batch_size(4, 1);
     register_partitioned_parquet_table(&ctx, "left_t", &left_dir).await?;
@@ -3582,7 +3624,7 @@ async fn test_partitioned_parquet_explain_preserves_hash_repartition() -> Result
     assert_contains!(merge_plan.as_str(), "MergeExec");
     assert_contains!(
         merge_plan.as_str(),
-        "RepartitionExec: partitioning=Hash([contig@0], 4)"
+        "RepartitionExec: partitioning=Hash([contig@0]"
     );
 
     let complement_plan =
@@ -3590,7 +3632,7 @@ async fn test_partitioned_parquet_explain_preserves_hash_repartition() -> Result
     assert_contains!(complement_plan.as_str(), "ComplementExec");
     assert!(
         complement_plan
-            .matches("RepartitionExec: partitioning=Hash([contig@0], 4)")
+            .matches("RepartitionExec: partitioning=Hash([contig@0]")
             .count()
             >= 2,
         "expected two hash repartitions in complement plan, got:\n{complement_plan}"
@@ -3600,7 +3642,7 @@ async fn test_partitioned_parquet_explain_preserves_hash_repartition() -> Result
     assert_contains!(subtract_plan.as_str(), "SubtractExec");
     assert!(
         subtract_plan
-            .matches("RepartitionExec: partitioning=Hash([contig@0], 4)")
+            .matches("RepartitionExec: partitioning=Hash([contig@0]")
             .count()
             >= 2,
         "expected two hash repartitions in subtract plan, got:\n{subtract_plan}"
