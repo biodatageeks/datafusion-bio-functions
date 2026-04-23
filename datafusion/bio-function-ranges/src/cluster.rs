@@ -2,8 +2,9 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
+use ahash::AHashMap;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Int64Array, Int64Builder, RecordBatch, StringBuilder, UInt32Array};
 use datafusion::arrow::compute::take;
@@ -20,6 +21,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{Stream, ready};
+use parking_lot::Mutex;
 
 use crate::filter_op::FilterOp;
 use crate::grouped_stream::{FullBatchCollector, IndexedGroups, StreamCollector};
@@ -132,6 +134,7 @@ impl TableProvider for ClusterProvider {
             schema: self.schema.clone(),
             input: input_plan,
             columns: Arc::new(self.columns.clone()),
+            cluster_id_coordinator: Arc::new(ClusterIdCoordinator::new(output_partitions)),
             contig_col_idx,
             min_dist: self.min_dist,
             strict: self.filter_op == FilterOp::Strict,
@@ -151,6 +154,7 @@ struct ClusterExec {
     schema: SchemaRef,
     input: Arc<dyn ExecutionPlan>,
     columns: Arc<(String, String, String)>,
+    cluster_id_coordinator: Arc<ClusterIdCoordinator>,
     contig_col_idx: usize,
     min_dist: i64,
     strict: bool,
@@ -206,6 +210,9 @@ impl ExecutionPlan for ClusterExec {
             schema: self.schema.clone(),
             input: Arc::clone(&children[0]),
             columns: Arc::clone(&self.columns),
+            cluster_id_coordinator: Arc::new(ClusterIdCoordinator::new(
+                children[0].output_partitioning().partition_count(),
+            )),
             contig_col_idx: self.contig_col_idx,
             min_dist: self.min_dist,
             strict: self.strict,
@@ -228,17 +235,22 @@ impl ExecutionPlan for ClusterExec {
     ) -> Result<SendableRecordBatchStream> {
         let batch_size = context.session_config().batch_size();
         let input = self.input.execute(partition, context)?;
+        let cluster_id_coordinator = Arc::clone(&self.cluster_id_coordinator);
 
         if self.has_extra_cols {
             let input_schema = input.schema();
             Ok(Box::pin(ClusterStreamExtra {
                 schema: self.schema.clone(),
                 collector: FullBatchCollector::new(input, Arc::clone(&self.columns), input_schema),
+                cluster_id_coordinator,
+                cluster_counts: None,
+                cluster_offsets: None,
                 min_dist: self.min_dist,
                 strict: self.strict,
                 phase: ClusterPhase::Collecting,
                 groups: Vec::new(),
                 concatenated: None,
+                partition,
                 group_idx: 0,
                 interval_idx: 0,
                 cluster_id: 0,
@@ -256,10 +268,14 @@ impl ExecutionPlan for ClusterExec {
             Ok(Box::pin(ClusterStream {
                 schema: self.schema.clone(),
                 collector: StreamCollector::new(input, Arc::clone(&self.columns)),
+                cluster_id_coordinator,
+                cluster_counts: None,
+                cluster_offsets: None,
                 min_dist: self.min_dist,
                 strict: self.strict,
                 phase: ClusterPhase::Collecting,
                 groups: Vec::new(),
+                partition,
                 group_idx: 0,
                 interval_idx: 0,
                 cluster_id: 0,
@@ -281,8 +297,217 @@ impl ExecutionPlan for ClusterExec {
 
 enum ClusterPhase {
     Collecting,
+    AwaitingOffsets,
     Emitting,
     Done,
+}
+
+struct ClusterIdCoordinator {
+    state: Mutex<ClusterIdCoordinatorState>,
+}
+
+impl ClusterIdCoordinator {
+    fn new(partition_count: usize) -> Self {
+        Self {
+            state: Mutex::new(ClusterIdCoordinatorState {
+                reports: vec![None; partition_count],
+                registered: 0,
+                offsets: None,
+                error: None,
+                wakers: Vec::new(),
+            }),
+        }
+    }
+
+    fn poll_cluster_offsets(
+        &self,
+        partition: usize,
+        counts: &[(String, usize)],
+        cx: &Context<'_>,
+    ) -> Poll<Result<Arc<AHashMap<String, i64>>>> {
+        let mut state = self.state.lock();
+
+        if let Some(offsets) = &state.offsets {
+            return Poll::Ready(Ok(Arc::clone(offsets)));
+        }
+
+        if let Some(error) = &state.error {
+            return Poll::Ready(Err(DataFusionError::Internal(error.clone())));
+        }
+
+        if partition >= state.reports.len() {
+            return Poll::Ready(Err(DataFusionError::Internal(format!(
+                "cluster partition {partition} out of range for {} output partitions",
+                state.reports.len()
+            ))));
+        }
+
+        if let Some(existing) = &state.reports[partition] {
+            if existing.as_slice() != counts {
+                return Poll::Ready(Err(DataFusionError::Internal(format!(
+                    "cluster partition {partition} reported inconsistent cluster counts"
+                ))));
+            }
+        } else {
+            state.reports[partition] = Some(counts.to_vec());
+            state.registered += 1;
+        }
+
+        if state.registered == state.reports.len() {
+            match Self::build_offsets(&state.reports) {
+                Ok(offsets) => {
+                    let offsets = Arc::new(offsets);
+                    state.offsets = Some(Arc::clone(&offsets));
+                    for waker in state.wakers.drain(..) {
+                        waker.wake();
+                    }
+                    return Poll::Ready(Ok(offsets));
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    state.error = Some(message.clone());
+                    for waker in state.wakers.drain(..) {
+                        waker.wake();
+                    }
+                    return Poll::Ready(Err(DataFusionError::Internal(message)));
+                }
+            }
+        }
+
+        state.wakers.push(cx.waker().clone());
+        Poll::Pending
+    }
+
+    fn build_offsets(reports: &[Option<Vec<(String, usize)>>]) -> Result<AHashMap<String, i64>> {
+        let mut contig_counts = Vec::with_capacity(reports.iter().flatten().map(Vec::len).sum());
+        for report in reports {
+            let report = report.as_ref().ok_or_else(|| {
+                DataFusionError::Internal(
+                    "cluster offset coordinator finalized before all partitions reported"
+                        .to_string(),
+                )
+            })?;
+            contig_counts.extend(report.iter().cloned());
+        }
+
+        contig_counts.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+        let mut offsets = AHashMap::with_capacity(contig_counts.len());
+        let mut next_cluster_id = 0_i64;
+
+        for (contig, cluster_count) in contig_counts {
+            if offsets.contains_key(&contig) {
+                return Err(DataFusionError::Internal(format!(
+                    "cluster offset coordinator received duplicate contig '{contig}' across partitions"
+                )));
+            }
+
+            offsets.insert(contig, next_cluster_id);
+            let cluster_count = i64::try_from(cluster_count).map_err(|_| {
+                DataFusionError::Internal(
+                    "cluster count exceeded i64::MAX while computing global offsets".to_string(),
+                )
+            })?;
+            next_cluster_id = next_cluster_id.checked_add(cluster_count).ok_or_else(|| {
+                DataFusionError::Internal(
+                    "cluster id overflow while computing global offsets".to_string(),
+                )
+            })?;
+        }
+
+        Ok(offsets)
+    }
+}
+
+impl Debug for ClusterIdCoordinator {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock();
+        f.debug_struct("ClusterIdCoordinator")
+            .field("partition_count", &state.reports.len())
+            .field("registered", &state.registered)
+            .field("ready", &state.offsets.is_some())
+            .finish()
+    }
+}
+
+struct ClusterIdCoordinatorState {
+    reports: Vec<Option<Vec<(String, usize)>>>,
+    registered: usize,
+    offsets: Option<Arc<AHashMap<String, i64>>>,
+    error: Option<String>,
+    wakers: Vec<Waker>,
+}
+
+fn count_clusters<I>(intervals: I, min_dist: i64, strict: bool) -> usize
+where
+    I: Iterator<Item = (i64, i64)>,
+{
+    let mut cluster_count = 0;
+    let mut cluster_end = None;
+
+    for (start, end) in intervals {
+        match cluster_end {
+            None => {
+                cluster_count += 1;
+                cluster_end = Some(end);
+            }
+            Some(current_end) => {
+                let boundary = current_end.saturating_add(min_dist);
+                let merge_condition = if strict {
+                    start < boundary
+                } else {
+                    start <= boundary
+                };
+
+                if merge_condition {
+                    if end > current_end {
+                        cluster_end = Some(end);
+                    }
+                } else {
+                    cluster_count += 1;
+                    cluster_end = Some(end);
+                }
+            }
+        }
+    }
+
+    cluster_count
+}
+
+fn collect_cluster_counts(
+    groups: &[(String, Vec<(i64, i64)>)],
+    min_dist: i64,
+    strict: bool,
+) -> Vec<(String, usize)> {
+    groups
+        .iter()
+        .map(|(contig, intervals)| {
+            (
+                contig.clone(),
+                count_clusters(intervals.iter().copied(), min_dist, strict),
+            )
+        })
+        .collect()
+}
+
+fn collect_indexed_cluster_counts(
+    groups: &IndexedGroups,
+    min_dist: i64,
+    strict: bool,
+) -> Vec<(String, usize)> {
+    groups
+        .iter()
+        .map(|(contig, intervals)| {
+            (
+                contig.clone(),
+                count_clusters(
+                    intervals.iter().map(|&(start, end, _)| (start, end)),
+                    min_dist,
+                    strict,
+                ),
+            )
+        })
+        .collect()
 }
 
 // ─── Fast path: 3-column input (no extra columns) ───────────────────────────
@@ -290,10 +515,14 @@ enum ClusterPhase {
 struct ClusterStream {
     schema: SchemaRef,
     collector: StreamCollector,
+    cluster_id_coordinator: Arc<ClusterIdCoordinator>,
+    cluster_counts: Option<Vec<(String, usize)>>,
+    cluster_offsets: Option<Arc<AHashMap<String, i64>>>,
     min_dist: i64,
     strict: bool,
     phase: ClusterPhase,
     groups: Vec<(String, Vec<(i64, i64)>)>,
+    partition: usize,
     group_idx: usize,
     interval_idx: usize,
     cluster_id: i64,
@@ -328,6 +557,18 @@ impl ClusterStream {
         self.cluster_id += 1;
     }
 
+    fn set_group_cluster_base(&mut self, contig: &str) -> Result<()> {
+        let cluster_offsets = self.cluster_offsets.as_ref().ok_or_else(|| {
+            DataFusionError::Internal("cluster stream missing global cluster offsets".to_string())
+        })?;
+        self.cluster_id = *cluster_offsets.get(contig).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "cluster stream missing global cluster offset for contig '{contig}'"
+            ))
+        })?;
+        Ok(())
+    }
+
     fn flush_builders(&mut self) -> Result<RecordBatch> {
         self.pending_rows = 0;
         RecordBatch::try_new(
@@ -356,9 +597,12 @@ impl Stream for ClusterStream {
                 ClusterPhase::Collecting => match ready!(this.collector.poll_collect(cx)) {
                     Ok(true) => {
                         this.groups = this.collector.take_groups();
-                        this.group_idx = 0;
-                        this.interval_idx = 0;
-                        this.phase = ClusterPhase::Emitting;
+                        this.cluster_counts = Some(collect_cluster_counts(
+                            &this.groups,
+                            this.min_dist,
+                            this.strict,
+                        ));
+                        this.phase = ClusterPhase::AwaitingOffsets;
                     }
                     Ok(false) => unreachable!(),
                     Err(e) => {
@@ -366,10 +610,50 @@ impl Stream for ClusterStream {
                         return Poll::Ready(Some(Err(e)));
                     }
                 },
+                ClusterPhase::AwaitingOffsets => {
+                    let cluster_counts = this.cluster_counts.as_deref().ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "cluster stream missing local cluster counts".to_string(),
+                        )
+                    });
+                    let cluster_counts = match cluster_counts {
+                        Ok(cluster_counts) => cluster_counts,
+                        Err(error) => {
+                            this.phase = ClusterPhase::Done;
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    };
+
+                    match this.cluster_id_coordinator.poll_cluster_offsets(
+                        this.partition,
+                        cluster_counts,
+                        cx,
+                    ) {
+                        Poll::Ready(Ok(cluster_offsets)) => {
+                            this.cluster_offsets = Some(cluster_offsets);
+                            this.group_idx = 0;
+                            this.interval_idx = 0;
+                            this.phase = ClusterPhase::Emitting;
+                        }
+                        Poll::Ready(Err(error)) => {
+                            this.phase = ClusterPhase::Done;
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
                 ClusterPhase::Emitting => {
                     while this.group_idx < this.groups.len() {
                         let contig = this.groups[this.group_idx].0.clone();
                         let interval_count = this.groups[this.group_idx].1.len();
+
+                        if this.interval_idx == 0
+                            && this.pending_intervals.is_empty()
+                            && let Err(error) = this.set_group_cluster_base(&contig)
+                        {
+                            this.phase = ClusterPhase::Done;
+                            return Poll::Ready(Some(Err(error)));
+                        }
 
                         while this.interval_idx < interval_count {
                             let (s, e) = this.groups[this.group_idx].1[this.interval_idx];
@@ -442,11 +726,15 @@ impl RecordBatchStream for ClusterStream {
 struct ClusterStreamExtra {
     schema: SchemaRef,
     collector: FullBatchCollector,
+    cluster_id_coordinator: Arc<ClusterIdCoordinator>,
+    cluster_counts: Option<Vec<(String, usize)>>,
+    cluster_offsets: Option<Arc<AHashMap<String, i64>>>,
     min_dist: i64,
     strict: bool,
     phase: ClusterPhase,
     groups: IndexedGroups,
     concatenated: Option<RecordBatch>,
+    partition: usize,
     group_idx: usize,
     interval_idx: usize,
     cluster_id: i64,
@@ -479,6 +767,20 @@ impl ClusterStreamExtra {
         self.pending_rows += self.pending_intervals.len();
         self.pending_intervals.clear();
         self.cluster_id += 1;
+    }
+
+    fn set_group_cluster_base(&mut self, contig: &str) -> Result<()> {
+        let cluster_offsets = self.cluster_offsets.as_ref().ok_or_else(|| {
+            DataFusionError::Internal(
+                "cluster stream with extra columns missing global cluster offsets".to_string(),
+            )
+        })?;
+        self.cluster_id = *cluster_offsets.get(contig).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "cluster stream with extra columns missing global cluster offset for contig '{contig}'"
+            ))
+        })?;
+        Ok(())
     }
 
     fn flush_builders(&mut self) -> Result<RecordBatch> {
@@ -521,9 +823,12 @@ impl Stream for ClusterStreamExtra {
                     Ok(true) => {
                         this.groups = this.collector.take_groups();
                         this.concatenated = this.collector.take_concatenated();
-                        this.group_idx = 0;
-                        this.interval_idx = 0;
-                        this.phase = ClusterPhase::Emitting;
+                        this.cluster_counts = Some(collect_indexed_cluster_counts(
+                            &this.groups,
+                            this.min_dist,
+                            this.strict,
+                        ));
+                        this.phase = ClusterPhase::AwaitingOffsets;
                     }
                     Ok(false) => unreachable!(),
                     Err(e) => {
@@ -531,9 +836,51 @@ impl Stream for ClusterStreamExtra {
                         return Poll::Ready(Some(Err(e)));
                     }
                 },
+                ClusterPhase::AwaitingOffsets => {
+                    let cluster_counts = this.cluster_counts.as_deref().ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "cluster stream with extra columns missing local cluster counts"
+                                .to_string(),
+                        )
+                    });
+                    let cluster_counts = match cluster_counts {
+                        Ok(cluster_counts) => cluster_counts,
+                        Err(error) => {
+                            this.phase = ClusterPhase::Done;
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    };
+
+                    match this.cluster_id_coordinator.poll_cluster_offsets(
+                        this.partition,
+                        cluster_counts,
+                        cx,
+                    ) {
+                        Poll::Ready(Ok(cluster_offsets)) => {
+                            this.cluster_offsets = Some(cluster_offsets);
+                            this.group_idx = 0;
+                            this.interval_idx = 0;
+                            this.phase = ClusterPhase::Emitting;
+                        }
+                        Poll::Ready(Err(error)) => {
+                            this.phase = ClusterPhase::Done;
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
                 ClusterPhase::Emitting => {
                     while this.group_idx < this.groups.len() {
+                        let contig = this.groups[this.group_idx].0.clone();
                         let interval_count = this.groups[this.group_idx].1.len();
+
+                        if this.interval_idx == 0
+                            && this.pending_intervals.is_empty()
+                            && let Err(error) = this.set_group_cluster_base(&contig)
+                        {
+                            this.phase = ClusterPhase::Done;
+                            return Poll::Ready(Some(Err(error)));
+                        }
 
                         while this.interval_idx < interval_count {
                             let (s, e, row_idx) = this.groups[this.group_idx].1[this.interval_idx];

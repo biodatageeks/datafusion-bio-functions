@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2524,6 +2525,66 @@ async fn test_cluster_udtf_reads_csv() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cluster_issue_146_target_partitions_preserve_ids() -> Result<()> {
+    let query = "SELECT * FROM cluster('reads') ORDER BY contig, pos_start, pos_end, cluster, cluster_start, cluster_end";
+
+    let result_1 = collect_udtf_query_with_partitions(1, query).await?;
+    let result_4 = collect_udtf_query_with_partitions(4, query).await?;
+
+    assert_eq!(
+        pretty_format_batches(&result_1)?.to_string(),
+        pretty_format_batches(&result_4)?.to_string()
+    );
+
+    let mut cluster_extents = BTreeMap::new();
+    for batch in &result_4 {
+        let contig = batch
+            .column_by_name("contig")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let cluster = batch
+            .column_by_name("cluster")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let cluster_start = batch
+            .column_by_name("cluster_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let cluster_end = batch
+            .column_by_name("cluster_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        for row_idx in 0..batch.num_rows() {
+            let extent = (
+                contig.value(row_idx).to_string(),
+                cluster_start.value(row_idx),
+                cluster_end.value(row_idx),
+            );
+            if let Some(existing) = cluster_extents.insert(cluster.value(row_idx), extent.clone()) {
+                assert_eq!(
+                    existing,
+                    extent,
+                    "cluster id {} reused for different extents",
+                    cluster.value(row_idx)
+                );
+            }
+        }
+    }
+
+    assert_eq!(cluster_extents.len(), 7);
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Complement UDTF tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3421,7 +3482,7 @@ async fn test_range_udtfs_target_partitions_invariant() -> Result<()> {
         ),
         (
             "cluster",
-            "SELECT contig, pos_start, pos_end, cluster_start, cluster_end FROM (SELECT * FROM cluster('reads')) cluster_rows ORDER BY contig, pos_start, pos_end, cluster_start, cluster_end",
+            "SELECT * FROM cluster('reads') ORDER BY contig, pos_start, pos_end, cluster, cluster_start, cluster_end",
         ),
         (
             "complement",
@@ -3442,6 +3503,7 @@ async fn test_range_udtfs_target_partitions_invariant() -> Result<()> {
                 "contig",
                 "pos_start",
                 "pos_end",
+                "cluster",
                 "cluster_start",
                 "cluster_end",
             ];
@@ -3496,15 +3558,15 @@ async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> R
         "+--------+-----------+---------+-------------+",
     ];
     let expected_cluster = [
-        "+--------+-----------+---------+---------------+-------------+",
-        "| contig | pos_start | pos_end | cluster_start | cluster_end |",
-        "+--------+-----------+---------+---------------+-------------+",
-        "| chr1   | 0         | 10      | 0             | 30          |",
-        "| chr1   | 8         | 25      | 0             | 30          |",
-        "| chr1   | 20        | 30      | 0             | 30          |",
-        "| chr2   | 10        | 20      | 10            | 20          |",
-        "| chr2   | 30        | 40      | 30            | 40          |",
-        "+--------+-----------+---------+---------------+-------------+",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| contig | pos_start | pos_end | cluster | cluster_start | cluster_end |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| chr1   | 0         | 10      | 0       | 0             | 30          |",
+        "| chr1   | 8         | 25      | 0       | 0             | 30          |",
+        "| chr1   | 20        | 30      | 0       | 0             | 30          |",
+        "| chr2   | 10        | 20      | 1       | 10            | 20          |",
+        "| chr2   | 30        | 40      | 2       | 30            | 40          |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
     ];
     let expected_complement = [
         "+--------+-----------+---------+",
@@ -3555,7 +3617,7 @@ async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> R
 
         let cluster = ctx
             .sql(
-                "SELECT contig, pos_start, pos_end, cluster_start, cluster_end FROM (SELECT * FROM cluster('left_t')) cluster_rows ORDER BY contig, pos_start, pos_end, cluster_start, cluster_end",
+                "SELECT * FROM cluster('left_t') ORDER BY contig, pos_start, pos_end, cluster, cluster_start, cluster_end",
             )
             .await?
             .collect()
@@ -3566,6 +3628,7 @@ async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> R
                 "contig",
                 "pos_start",
                 "pos_end",
+                "cluster",
                 "cluster_start",
                 "cluster_end",
             ],
