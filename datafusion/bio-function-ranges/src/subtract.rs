@@ -14,9 +14,8 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -120,14 +119,6 @@ impl TableProvider for SubtractProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let target_partitions = self
-            .session
-            .state()
-            .config()
-            .options()
-            .execution
-            .target_partitions;
-
         let left_df = if self.has_extra_cols {
             self.session.table(&self.left_table).await?
         } else {
@@ -148,22 +139,6 @@ impl TableProvider for SubtractProvider {
             0
         };
 
-        let left_partitions = left_plan.output_partitioning().partition_count();
-        let left_plan: Arc<dyn ExecutionPlan> = if left_partitions > 1 || target_partitions > 1 {
-            Arc::new(RepartitionExec::try_new(
-                left_plan,
-                Partitioning::Hash(
-                    vec![Arc::new(Column::new(
-                        self.left_columns.0.as_str(),
-                        contig_col_idx,
-                    ))],
-                    target_partitions.max(1),
-                ),
-            )?)
-        } else {
-            left_plan
-        };
-
         // Right table always selects only 3 range columns
         let right_df = self
             .session
@@ -175,18 +150,6 @@ impl TableProvider for SubtractProvider {
                 &self.right_columns.2,
             ])?;
         let right_plan = right_df.create_physical_plan().await?;
-        let right_partitions = right_plan.output_partitioning().partition_count();
-        let right_plan: Arc<dyn ExecutionPlan> = if right_partitions > 1 || target_partitions > 1 {
-            Arc::new(RepartitionExec::try_new(
-                right_plan,
-                Partitioning::Hash(
-                    vec![Arc::new(Column::new(self.right_columns.0.as_str(), 0))],
-                    target_partitions.max(1),
-                ),
-            )?)
-        } else {
-            right_plan
-        };
 
         let output_partitions = left_plan.output_partitioning().partition_count();
 
@@ -196,6 +159,7 @@ impl TableProvider for SubtractProvider {
             right: right_plan,
             left_columns: Arc::new(self.left_columns.clone()),
             right_columns: Arc::new(self.right_columns.clone()),
+            left_contig_col_idx: contig_col_idx,
             strict: self.filter_op == FilterOp::Strict,
             has_extra_cols: self.has_extra_cols,
             cache: PlanProperties::new(
@@ -215,6 +179,7 @@ struct SubtractExec {
     right: Arc<dyn ExecutionPlan>,
     left_columns: Arc<(String, String, String)>,
     right_columns: Arc<(String, String, String)>,
+    left_contig_col_idx: usize,
     strict: bool,
     has_extra_cols: bool,
     cache: PlanProperties,
@@ -239,6 +204,19 @@ impl ExecutionPlan for SubtractExec {
         &self.cache
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![
+            Distribution::HashPartitioned(vec![Arc::new(Column::new(
+                self.left_columns.0.as_str(),
+                self.left_contig_col_idx,
+            ))]),
+            Distribution::HashPartitioned(vec![Arc::new(Column::new(
+                self.right_columns.0.as_str(),
+                0,
+            ))]),
+        ]
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.left, &self.right]
     }
@@ -259,6 +237,7 @@ impl ExecutionPlan for SubtractExec {
             right: Arc::clone(&children[1]),
             left_columns: Arc::clone(&self.left_columns),
             right_columns: Arc::clone(&self.right_columns),
+            left_contig_col_idx: self.left_contig_col_idx,
             strict: self.strict,
             has_extra_cols: self.has_extra_cols,
             cache: PlanProperties::new(

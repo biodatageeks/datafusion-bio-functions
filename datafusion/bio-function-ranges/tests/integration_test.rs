@@ -1,11 +1,16 @@
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use datafusion::arrow::array::{Int64Array, RecordBatch};
+use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::assert_batches_sorted_eq;
 use datafusion::common::assert_contains;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
+use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use datafusion_bio_function_ranges::session_context::{Algorithm, BioConfig, BioSessionExt};
@@ -437,6 +442,21 @@ fn create_bio_session_with_target_partitions(target_partitions: usize) -> Sessio
     ctx
 }
 
+fn create_bio_session_with_target_partitions_and_batch_size(
+    target_partitions: usize,
+    batch_size: usize,
+) -> SessionContext {
+    let config = SessionConfig::from(ConfigOptions::new())
+        .with_option_extension(BioConfig::default())
+        .with_information_schema(true)
+        .with_repartition_joins(false)
+        .with_target_partitions(target_partitions)
+        .with_batch_size(batch_size);
+    let ctx = SessionContext::new_with_bio(config);
+    register_ranges_functions(&ctx);
+    ctx
+}
+
 async fn collect_udtf_query_with_partitions(
     target_partitions: usize,
     query: &str,
@@ -444,6 +464,114 @@ async fn collect_udtf_query_with_partitions(
     let ctx = create_bio_session_with_target_partitions(target_partitions);
     init_ranges_tables(&ctx).await?;
     ctx.sql(query).await?.collect().await
+}
+
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl TempDirGuard {
+    fn new(prefix: &str) -> Result<Self> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn build_interval_batch(rows: &[(&str, i64, i64)]) -> Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Arc::new(Field::new("contig", DataType::Utf8, false)),
+        Arc::new(Field::new("pos_start", DataType::Int64, false)),
+        Arc::new(Field::new("pos_end", DataType::Int64, false)),
+    ]));
+    let contigs = StringArray::from_iter_values(rows.iter().map(|(contig, _, _)| *contig));
+    let starts = Int64Array::from(rows.iter().map(|(_, start, _)| *start).collect::<Vec<_>>());
+    let ends = Int64Array::from(rows.iter().map(|(_, _, end)| *end).collect::<Vec<_>>());
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![Arc::new(contigs), Arc::new(starts), Arc::new(ends)],
+    )?)
+}
+
+fn build_left_extra_batch(rows: &[(&str, &str, i64, i64, f64)]) -> Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Arc::new(Field::new("gene", DataType::Utf8, false)),
+        Arc::new(Field::new("contig", DataType::Utf8, false)),
+        Arc::new(Field::new("pos_start", DataType::Int64, false)),
+        Arc::new(Field::new("pos_end", DataType::Int64, false)),
+        Arc::new(Field::new("score", DataType::Float64, false)),
+    ]));
+    let genes = StringArray::from_iter_values(rows.iter().map(|(gene, _, _, _, _)| *gene));
+    let contigs = StringArray::from_iter_values(rows.iter().map(|(_, contig, _, _, _)| *contig));
+    let starts = Int64Array::from(
+        rows.iter()
+            .map(|(_, _, start, _, _)| *start)
+            .collect::<Vec<_>>(),
+    );
+    let ends = Int64Array::from(
+        rows.iter()
+            .map(|(_, _, _, end, _)| *end)
+            .collect::<Vec<_>>(),
+    );
+    let scores = Float64Array::from(
+        rows.iter()
+            .map(|(_, _, _, _, score)| *score)
+            .collect::<Vec<_>>(),
+    );
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(genes),
+            Arc::new(contigs),
+            Arc::new(starts),
+            Arc::new(ends),
+            Arc::new(scores),
+        ],
+    )?)
+}
+
+fn write_parquet_parts(dir: &Path, batches: &[RecordBatch]) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    for (idx, batch) in batches.iter().enumerate() {
+        let file = File::create(dir.join(format!("part-{idx:02}.parquet")))?;
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
+        writer.write(batch)?;
+        writer.close()?;
+    }
+    Ok(())
+}
+
+async fn register_partitioned_parquet_table(
+    ctx: &SessionContext,
+    name: &str,
+    dir: &Path,
+) -> Result<()> {
+    let create = format!(
+        "CREATE EXTERNAL TABLE {name} STORED AS PARQUET LOCATION '{}'",
+        dir.display()
+    );
+    ctx.sql(&create).await?;
+    Ok(())
+}
+
+async fn explain_query(ctx: &SessionContext, query: &str) -> Result<String> {
+    let explain = format!("EXPLAIN VERBOSE {query}");
+    let plan = ctx.sql(&explain).await?.collect().await?;
+    Ok(pretty_format_batches(&plan)?.to_string())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3289,6 +3417,236 @@ async fn test_range_udtfs_target_partitions_invariant() -> Result<()> {
             "partition-invariance failed for {name}"
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> Result<()> {
+    let tmp = TempDirGuard::new("df-bio-issue-372")?;
+    let left_dir = tmp.path().join("left");
+    let right_dir = tmp.path().join("right");
+    let view_dir = tmp.path().join("view");
+
+    write_parquet_parts(
+        &left_dir,
+        &[
+            build_interval_batch(&[("chr1", 0, 10), ("chr1", 20, 30), ("chr2", 10, 20)])?,
+            build_interval_batch(&[("chr1", 8, 25), ("chr2", 30, 40)])?,
+        ],
+    )?;
+    write_parquet_parts(
+        &right_dir,
+        &[
+            build_interval_batch(&[("chr1", 5, 10), ("chr2", 12, 15)])?,
+            build_interval_batch(&[("chr1", 20, 25), ("chr2", 35, 36)])?,
+        ],
+    )?;
+    write_parquet_parts(
+        &view_dir,
+        &[build_interval_batch(&[("chr1", 0, 40), ("chr2", 0, 50)])?],
+    )?;
+
+    let expected_merge = [
+        "+--------+-----------+---------+-------------+",
+        "| contig | pos_start | pos_end | n_intervals |",
+        "+--------+-----------+---------+-------------+",
+        "| chr1   | 0         | 30      | 3           |",
+        "| chr2   | 10        | 20      | 1           |",
+        "| chr2   | 30        | 40      | 1           |",
+        "+--------+-----------+---------+-------------+",
+    ];
+    let expected_complement = [
+        "+--------+-----------+---------+",
+        "| contig | pos_start | pos_end |",
+        "+--------+-----------+---------+",
+        "| chr1   | 30        | 40      |",
+        "| chr2   | 0         | 10      |",
+        "| chr2   | 20        | 30      |",
+        "| chr2   | 40        | 50      |",
+        "+--------+-----------+---------+",
+    ];
+    let expected_complement_no_view = [
+        "+--------+-----------+---------------------+",
+        "| contig | pos_start | pos_end             |",
+        "+--------+-----------+---------------------+",
+        "| chr1   | 30        | 9223372036854775807 |",
+        "| chr2   | 0         | 10                  |",
+        "| chr2   | 20        | 30                  |",
+        "| chr2   | 40        | 9223372036854775807 |",
+        "+--------+-----------+---------------------+",
+    ];
+    let expected_subtract = [
+        "+--------+-----------+---------+",
+        "| contig | pos_start | pos_end |",
+        "+--------+-----------+---------+",
+        "| chr1   | 0         | 5       |",
+        "| chr1   | 10        | 20      |",
+        "| chr1   | 25        | 30      |",
+        "| chr2   | 10        | 12      |",
+        "| chr2   | 15        | 20      |",
+        "| chr2   | 30        | 35      |",
+        "| chr2   | 36        | 40      |",
+        "+--------+-----------+---------+",
+    ];
+
+    for target_partitions in [1, 2, 4] {
+        let ctx = create_bio_session_with_target_partitions_and_batch_size(target_partitions, 1);
+        register_partitioned_parquet_table(&ctx, "left_t", &left_dir).await?;
+        register_partitioned_parquet_table(&ctx, "right_t", &right_dir).await?;
+        register_partitioned_parquet_table(&ctx, "view_t", &view_dir).await?;
+
+        let merge = ctx
+            .sql("SELECT * FROM merge('left_t') ORDER BY contig, pos_start, pos_end, n_intervals")
+            .await?
+            .collect()
+            .await?;
+        assert_batches_sorted_eq!(expected_merge, &merge);
+
+        let complement = ctx
+            .sql("SELECT * FROM complement('left_t', 'view_t') ORDER BY contig, pos_start, pos_end")
+            .await?
+            .collect()
+            .await?;
+        assert_batches_sorted_eq!(expected_complement, &complement);
+
+        let complement_no_view = ctx
+            .sql("SELECT * FROM complement('left_t') ORDER BY contig, pos_start, pos_end")
+            .await?
+            .collect()
+            .await?;
+        assert_batches_sorted_eq!(expected_complement_no_view, &complement_no_view);
+
+        let subtract = ctx
+            .sql("SELECT * FROM subtract('left_t', 'right_t') ORDER BY contig, pos_start, pos_end")
+            .await?
+            .collect()
+            .await?;
+        assert_batches_sorted_eq!(expected_subtract, &subtract);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_subtract_partitioned_parquet_preserves_extra_columns_with_custom_order() -> Result<()>
+{
+    let tmp = TempDirGuard::new("df-bio-issue-372-extra-cols")?;
+    let left_dir = tmp.path().join("left-extra");
+    let right_dir = tmp.path().join("right-mask");
+
+    write_parquet_parts(
+        &left_dir,
+        &[
+            build_left_extra_batch(&[
+                ("BRCA1", "chr1", 0, 30, 0.95),
+                ("EGFR", "chr2", 10, 20, 0.80),
+            ])?,
+            build_left_extra_batch(&[
+                ("TP53", "chr1", 40, 60, 0.75),
+                ("MYC", "chr2", 30, 40, 0.65),
+            ])?,
+        ],
+    )?;
+    write_parquet_parts(
+        &right_dir,
+        &[
+            build_interval_batch(&[("chr1", 5, 25), ("chr2", 12, 15)])?,
+            build_interval_batch(&[("chr1", 45, 50), ("chr2", 35, 36)])?,
+        ],
+    )?;
+
+    let expected = [
+        "+-------+--------+-----------+---------+-------+",
+        "| gene  | contig | pos_start | pos_end | score |",
+        "+-------+--------+-----------+---------+-------+",
+        "| BRCA1 | chr1   | 0         | 5       | 0.95  |",
+        "| BRCA1 | chr1   | 25        | 30      | 0.95  |",
+        "| TP53  | chr1   | 40        | 45      | 0.75  |",
+        "| TP53  | chr1   | 50        | 60      | 0.75  |",
+        "| EGFR  | chr2   | 10        | 12      | 0.8   |",
+        "| EGFR  | chr2   | 15        | 20      | 0.8   |",
+        "| MYC   | chr2   | 30        | 35      | 0.65  |",
+        "| MYC   | chr2   | 36        | 40      | 0.65  |",
+        "+-------+--------+-----------+---------+-------+",
+    ];
+
+    for target_partitions in [1, 2, 4] {
+        let ctx = create_bio_session_with_target_partitions_and_batch_size(target_partitions, 1);
+        register_partitioned_parquet_table(&ctx, "left_extra", &left_dir).await?;
+        register_partitioned_parquet_table(&ctx, "right_mask", &right_dir).await?;
+
+        let result = ctx
+            .sql(
+                "SELECT * FROM subtract('left_extra', 'right_mask', 'contig', 'pos_start', 'pos_end') ORDER BY contig, pos_start, gene",
+            )
+            .await?
+            .collect()
+            .await?;
+        assert_batches_sorted_eq!(expected, &result);
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_partitioned_parquet_explain_preserves_hash_repartition() -> Result<()> {
+    let tmp = TempDirGuard::new("df-bio-issue-372-explain")?;
+    let left_dir = tmp.path().join("left");
+    let right_dir = tmp.path().join("right");
+    let view_dir = tmp.path().join("view");
+
+    write_parquet_parts(
+        &left_dir,
+        &[
+            build_interval_batch(&[("chr1", 0, 10), ("chr1", 20, 30), ("chr2", 10, 20)])?,
+            build_interval_batch(&[("chr1", 8, 25), ("chr2", 30, 40)])?,
+        ],
+    )?;
+    write_parquet_parts(
+        &right_dir,
+        &[
+            build_interval_batch(&[("chr1", 5, 10), ("chr2", 12, 15)])?,
+            build_interval_batch(&[("chr1", 20, 25), ("chr2", 35, 36)])?,
+        ],
+    )?;
+    write_parquet_parts(
+        &view_dir,
+        &[build_interval_batch(&[("chr1", 0, 40), ("chr2", 0, 50)])?],
+    )?;
+
+    let ctx = create_bio_session_with_target_partitions_and_batch_size(4, 1);
+    register_partitioned_parquet_table(&ctx, "left_t", &left_dir).await?;
+    register_partitioned_parquet_table(&ctx, "right_t", &right_dir).await?;
+    register_partitioned_parquet_table(&ctx, "view_t", &view_dir).await?;
+
+    let merge_plan = explain_query(&ctx, "SELECT * FROM merge('left_t')").await?;
+    assert_contains!(merge_plan.as_str(), "MergeExec");
+    assert_contains!(
+        merge_plan.as_str(),
+        "RepartitionExec: partitioning=Hash([contig@0]"
+    );
+
+    let complement_plan =
+        explain_query(&ctx, "SELECT * FROM complement('left_t', 'view_t')").await?;
+    assert_contains!(complement_plan.as_str(), "ComplementExec");
+    assert!(
+        complement_plan
+            .matches("RepartitionExec: partitioning=Hash([contig@0]")
+            .count()
+            >= 2,
+        "expected two hash repartitions in complement plan, got:\n{complement_plan}"
+    );
+
+    let subtract_plan = explain_query(&ctx, "SELECT * FROM subtract('left_t', 'right_t')").await?;
+    assert_contains!(subtract_plan.as_str(), "SubtractExec");
+    assert!(
+        subtract_plan
+            .matches("RepartitionExec: partitioning=Hash([contig@0]")
+            .count()
+            >= 2,
+        "expected two hash repartitions in subtract plan, got:\n{subtract_plan}"
+    );
 
     Ok(())
 }
