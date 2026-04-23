@@ -15,7 +15,6 @@ use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskCo
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -92,32 +91,12 @@ impl TableProvider for ComplementProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let target_partitions = self
-            .session
-            .state()
-            .config()
-            .options()
-            .execution
-            .target_partitions;
-
         let input_df = self.session.table(&self.table).await?.select_columns(&[
             &self.columns.0,
             &self.columns.1,
             &self.columns.2,
         ])?;
         let input_plan = input_df.create_physical_plan().await?;
-        let input_partitions = input_plan.output_partitioning().partition_count();
-        let input_plan: Arc<dyn ExecutionPlan> = if input_partitions > 1 || target_partitions > 1 {
-            Arc::new(RepartitionExec::try_new(
-                input_plan,
-                Partitioning::Hash(
-                    vec![Arc::new(Column::new(self.columns.0.as_str(), 0))],
-                    target_partitions.max(1),
-                ),
-            )?)
-        } else {
-            input_plan
-        };
 
         let view_plan = if let Some(view_name) = &self.view_table {
             let view_df = self.session.table(view_name).await?.select_columns(&[
@@ -126,18 +105,6 @@ impl TableProvider for ComplementProvider {
                 &self.view_columns.2,
             ])?;
             let plan = view_df.create_physical_plan().await?;
-            let view_partitions = plan.output_partitioning().partition_count();
-            let plan: Arc<dyn ExecutionPlan> = if view_partitions > 1 || target_partitions > 1 {
-                Arc::new(RepartitionExec::try_new(
-                    plan,
-                    Partitioning::Hash(
-                        vec![Arc::new(Column::new(self.view_columns.0.as_str(), 0))],
-                        target_partitions.max(1),
-                    ),
-                )?)
-            } else {
-                plan
-            };
             Some(plan)
         } else {
             None
