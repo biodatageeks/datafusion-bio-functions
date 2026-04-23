@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-function-pileup"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-function-ranges"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "ahash",
  "async-trait",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-bio-function-vep"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "ahash",
  "arrow-ipc",
@@ -5361,7 +5361,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "superintervals"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "aligned-vec",
  "serde",
