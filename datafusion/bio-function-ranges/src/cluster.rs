@@ -374,7 +374,9 @@ impl ClusterIdCoordinator {
             }
         }
 
-        state.wakers.push(cx.waker().clone());
+        if !state.wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
+            state.wakers.push(cx.waker().clone());
+        }
         Poll::Pending
     }
 
@@ -945,5 +947,31 @@ impl Stream for ClusterStreamExtra {
 impl RecordBatchStream for ClusterStreamExtra {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::task::noop_waker;
+
+    #[test]
+    fn poll_cluster_offsets_deduplicates_repeated_wakers() {
+        let coordinator = ClusterIdCoordinator::new(2);
+        let counts = vec![("chr1".to_string(), 1)];
+        let waker = noop_waker();
+        let cx = &mut Context::from_waker(&waker);
+
+        assert!(matches!(
+            coordinator.poll_cluster_offsets(0, &counts, cx),
+            Poll::Pending
+        ));
+        assert_eq!(coordinator.state.lock().wakers.len(), 1);
+
+        assert!(matches!(
+            coordinator.poll_cluster_offsets(0, &counts, cx),
+            Poll::Pending
+        ));
+        assert_eq!(coordinator.state.lock().wakers.len(), 1);
     }
 }
