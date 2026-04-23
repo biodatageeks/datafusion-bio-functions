@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -572,6 +573,33 @@ async fn explain_query(ctx: &SessionContext, query: &str) -> Result<String> {
     let explain = format!("EXPLAIN VERBOSE {query}");
     let plan = ctx.sql(&explain).await?.collect().await?;
     Ok(pretty_format_batches(&plan)?.to_string())
+}
+
+fn project_batches_by_name(
+    batches: &[RecordBatch],
+    column_names: &[&str],
+) -> Result<Vec<RecordBatch>> {
+    batches
+        .iter()
+        .map(|batch| {
+            let indices = column_names
+                .iter()
+                .map(|name| batch.schema().index_of(name))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let fields = indices
+                .iter()
+                .map(|&idx| batch.schema().field(idx).clone())
+                .collect::<Vec<_>>();
+            let columns = indices
+                .iter()
+                .map(|&idx| batch.column(idx).clone())
+                .collect::<Vec<_>>();
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(fields)),
+                columns,
+            )?)
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2497,6 +2525,66 @@ async fn test_cluster_udtf_reads_csv() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cluster_issue_146_target_partitions_preserve_ids() -> Result<()> {
+    let query = "SELECT * FROM cluster('reads') ORDER BY contig, pos_start, pos_end, cluster, cluster_start, cluster_end";
+
+    let result_1 = collect_udtf_query_with_partitions(1, query).await?;
+    let result_4 = collect_udtf_query_with_partitions(4, query).await?;
+
+    assert_eq!(
+        pretty_format_batches(&result_1)?.to_string(),
+        pretty_format_batches(&result_4)?.to_string()
+    );
+
+    let mut cluster_extents = BTreeMap::new();
+    for batch in &result_4 {
+        let contig = batch
+            .column_by_name("contig")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let cluster = batch
+            .column_by_name("cluster")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let cluster_start = batch
+            .column_by_name("cluster_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let cluster_end = batch
+            .column_by_name("cluster_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        for row_idx in 0..batch.num_rows() {
+            let extent = (
+                contig.value(row_idx).to_string(),
+                cluster_start.value(row_idx),
+                cluster_end.value(row_idx),
+            );
+            if let Some(existing) = cluster_extents.insert(cluster.value(row_idx), extent.clone()) {
+                assert_eq!(
+                    existing,
+                    extent,
+                    "cluster id {} reused for different extents",
+                    cluster.value(row_idx)
+                );
+            }
+        }
+    }
+
+    assert_eq!(cluster_extents.len(), 7);
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Complement UDTF tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3394,7 +3482,7 @@ async fn test_range_udtfs_target_partitions_invariant() -> Result<()> {
         ),
         (
             "cluster",
-            "SELECT * FROM cluster('reads') ORDER BY contig, pos_start, pos_end, cluster",
+            "SELECT * FROM cluster('reads') ORDER BY contig, pos_start, pos_end, cluster, cluster_start, cluster_end",
         ),
         (
             "complement",
@@ -3407,8 +3495,21 @@ async fn test_range_udtfs_target_partitions_invariant() -> Result<()> {
     ];
 
     for (name, query) in cases {
-        let result_1 = collect_udtf_query_with_partitions(1, query).await?;
-        let result_4 = collect_udtf_query_with_partitions(4, query).await?;
+        let mut result_1 = collect_udtf_query_with_partitions(1, query).await?;
+        let mut result_4 = collect_udtf_query_with_partitions(4, query).await?;
+
+        if name == "cluster" {
+            let semantic_cols = [
+                "contig",
+                "pos_start",
+                "pos_end",
+                "cluster",
+                "cluster_start",
+                "cluster_end",
+            ];
+            result_1 = project_batches_by_name(&result_1, &semantic_cols)?;
+            result_4 = project_batches_by_name(&result_4, &semantic_cols)?;
+        }
 
         let formatted_1 = pretty_format_batches(&result_1)?.to_string();
         let formatted_4 = pretty_format_batches(&result_4)?.to_string();
@@ -3456,6 +3557,17 @@ async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> R
         "| chr2   | 30        | 40      | 1           |",
         "+--------+-----------+---------+-------------+",
     ];
+    let expected_cluster = [
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| contig | pos_start | pos_end | cluster | cluster_start | cluster_end |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+        "| chr1   | 0         | 10      | 0       | 0             | 30          |",
+        "| chr1   | 8         | 25      | 0       | 0             | 30          |",
+        "| chr1   | 20        | 30      | 0       | 0             | 30          |",
+        "| chr2   | 10        | 20      | 1       | 10            | 20          |",
+        "| chr2   | 30        | 40      | 2       | 30            | 40          |",
+        "+--------+-----------+---------+---------+---------------+-------------+",
+    ];
     let expected_complement = [
         "+--------+-----------+---------+",
         "| contig | pos_start | pos_end |",
@@ -3502,6 +3614,26 @@ async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> R
             .collect()
             .await?;
         assert_batches_sorted_eq!(expected_merge, &merge);
+
+        let cluster = ctx
+            .sql(
+                "SELECT * FROM cluster('left_t') ORDER BY contig, pos_start, pos_end, cluster, cluster_start, cluster_end",
+            )
+            .await?
+            .collect()
+            .await?;
+        let cluster = project_batches_by_name(
+            &cluster,
+            &[
+                "contig",
+                "pos_start",
+                "pos_end",
+                "cluster",
+                "cluster_start",
+                "cluster_end",
+            ],
+        )?;
+        assert_batches_sorted_eq!(expected_cluster, &cluster);
 
         let complement = ctx
             .sql("SELECT * FROM complement('left_t', 'view_t') ORDER BY contig, pos_start, pos_end")
@@ -3627,6 +3759,13 @@ async fn test_partitioned_parquet_explain_preserves_hash_repartition() -> Result
         "RepartitionExec: partitioning=Hash([contig@0]"
     );
 
+    let cluster_plan = explain_query(&ctx, "SELECT * FROM cluster('left_t')").await?;
+    assert_contains!(cluster_plan.as_str(), "ClusterExec");
+    assert_contains!(
+        cluster_plan.as_str(),
+        "RepartitionExec: partitioning=Hash([contig@0]"
+    );
+
     let complement_plan =
         explain_query(&ctx, "SELECT * FROM complement('left_t', 'view_t')").await?;
     assert_contains!(complement_plan.as_str(), "ComplementExec");
@@ -3647,6 +3786,65 @@ async fn test_partitioned_parquet_explain_preserves_hash_repartition() -> Result
             >= 2,
         "expected two hash repartitions in subtract plan, got:\n{subtract_plan}"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cluster_exons_issue_373_target_partitions_preserve_boundaries() -> Result<()> {
+    let query = r#"
+        SELECT contig, pos_start, pos_end, cluster_start, cluster_end
+        FROM (SELECT * FROM cluster('exons')) cluster_rows
+        WHERE
+            (contig = 'chr11' AND pos_start = 62379907 AND pos_end = 62380237) OR
+            (contig = 'chr11' AND pos_start = 62380212 AND pos_end = 62381343) OR
+            (contig = 'chr12' AND pos_start = 53776037 AND pos_end = 53777406) OR
+            (contig = 'chr15' AND pos_start = 89074843 AND pos_end = 89074946) OR
+            (contig = 'chr18' AND pos_start = 52946781 AND pos_end = 52946887)
+        ORDER BY contig, pos_start, pos_end, cluster_start, cluster_end
+    "#;
+
+    let expected = [
+        "+--------+-----------+----------+---------------+-------------+",
+        "| contig | pos_start | pos_end  | cluster_start | cluster_end |",
+        "+--------+-----------+----------+---------------+-------------+",
+        "| chr11  | 62379907  | 62380237 | 62379907      | 62381343    |",
+        "| chr11  | 62380212  | 62381343 | 62379907      | 62381343    |",
+        "| chr12  | 53776037  | 53777406 | 53775893      | 53777406    |",
+        "| chr15  | 89074843  | 89074946 | 89073853      | 89074946    |",
+        "| chr18  | 52946781  | 52946887 | 52946781      | 52946905    |",
+        "| chr18  | 52946781  | 52946887 | 52946781      | 52946905    |",
+        "| chr18  | 52946781  | 52946887 | 52946781      | 52946905    |",
+        "| chr18  | 52946781  | 52946887 | 52946781      | 52946905    |",
+        "| chr18  | 52946781  | 52946887 | 52946781      | 52946905    |",
+        "| chr18  | 52946781  | 52946887 | 52946781      | 52946905    |",
+        "| chr18  | 52946781  | 52946887 | 52946781      | 52946905    |",
+        "| chr18  | 52946781  | 52946887 | 52946781      | 52946905    |",
+        "| chr18  | 52946781  | 52946887 | 52946781      | 52946905    |",
+        "| chr18  | 52946781  | 52946887 | 52946781      | 52946905    |",
+        "| chr18  | 52946781  | 52946887 | 52946781      | 52946905    |",
+        "+--------+-----------+----------+---------------+-------------+",
+    ];
+
+    for target_partitions in [1, 4] {
+        let ctx = create_bio_session_with_target_partitions(target_partitions);
+        let exons =
+            format!("CREATE EXTERNAL TABLE exons STORED AS PARQUET LOCATION '{EXONS_PATH}'");
+        ctx.sql(exons.as_str()).await?;
+
+        let result = ctx.sql(query).await?.collect().await?;
+        let result = project_batches_by_name(
+            &result,
+            &[
+                "contig",
+                "pos_start",
+                "pos_end",
+                "cluster_start",
+                "cluster_end",
+            ],
+        )?;
+        assert_batches_sorted_eq!(expected, &result);
+    }
 
     Ok(())
 }
