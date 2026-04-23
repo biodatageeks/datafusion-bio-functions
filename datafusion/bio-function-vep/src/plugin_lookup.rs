@@ -24,6 +24,36 @@ use crate::plugin::{ActivePlugins, PluginKind, PluginSourceKind};
 
 pub type PluginTargetKey = (i64, String, String);
 
+pub(crate) fn single_base_substitution_key(
+    pos: i64,
+    ref_allele: &str,
+    alt_allele: &str,
+) -> Option<PluginTargetKey> {
+    let ref_bytes = ref_allele.as_bytes();
+    let alt_bytes = alt_allele.as_bytes();
+    if ref_bytes.len() <= 1 || ref_bytes.len() != alt_bytes.len() {
+        return None;
+    }
+
+    let mut mismatch = None;
+    for (idx, (&ref_base, &alt_base)) in ref_bytes.iter().zip(alt_bytes.iter()).enumerate() {
+        if ref_base == alt_base {
+            continue;
+        }
+        if mismatch.is_some() {
+            return None;
+        }
+        mismatch = Some((idx, ref_base, alt_base));
+    }
+
+    let (idx, ref_base, alt_base) = mismatch?;
+    Some((
+        pos + idx as i64,
+        (ref_base as char).to_string(),
+        (alt_base as char).to_string(),
+    ))
+}
+
 enum PluginBackend {
     Parquet(ParquetPluginIndex),
     #[cfg(feature = "kv-cache")]
@@ -808,11 +838,24 @@ impl ContigPlugins {
     }
 
     fn cadd_values_for_variant(&self, pos: i64, ref_allele: &str, alt_allele: &str) -> Vec<String> {
-        self.indexes
+        let Some(index) = self
+            .indexes
             .iter()
             .find(|index| index.kind == PluginSourceKind::Cadd)
-            .map(|index| index.csq_values_for_variant(pos, ref_allele, alt_allele))
-            .unwrap_or_else(|| vec![String::new(), String::new()])
+        else {
+            return vec![String::new(), String::new()];
+        };
+
+        let exact = index.csq_values_for_variant(pos, ref_allele, alt_allele);
+        if exact.iter().any(|value| !value.is_empty()) {
+            return exact;
+        }
+
+        single_base_substitution_key(pos, ref_allele, alt_allele)
+            .map(|(snv_pos, snv_ref, snv_alt)| {
+                index.csq_values_for_variant(snv_pos, &snv_ref, &snv_alt)
+            })
+            .unwrap_or(exact)
     }
 }
 
@@ -1420,10 +1463,16 @@ mod tests {
                         (202_i64, Box::<str>::from("A"), Box::<str>::from("AT")),
                         vec![1],
                     ),
+                    (
+                        (303_i64, Box::<str>::from("G"), Box::<str>::from("T")),
+                        vec![2],
+                    ),
                 ]),
                 data: RecordBatch::try_new(
                     schema.clone(),
-                    vec![Arc::new(Float32Array::from(vec![11.0_f32, 22.0_f32]))],
+                    vec![Arc::new(Float32Array::from(vec![
+                        11.0_f32, 22.0_f32, 33.0_f32,
+                    ]))],
                 )
                 .expect("cadd batch"),
                 value_schema: schema.clone(),
@@ -1439,6 +1488,10 @@ mod tests {
 
         assert_eq!(plugins.cadd_values_for_variant(101, "A", "G"), vec!["11"]);
         assert_eq!(plugins.cadd_values_for_variant(202, "A", "AT"), vec!["22"]);
+        assert_eq!(
+            plugins.cadd_values_for_variant(303, "GATT", "TATT"),
+            vec!["33"]
+        );
     }
 
     #[test]

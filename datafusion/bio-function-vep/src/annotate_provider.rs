@@ -89,7 +89,9 @@ use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::partitioned_cache::PartitionedParquetCache;
 use crate::plugin::{ActivePlugins, PluginKind};
-use crate::plugin_lookup::{ContigPlugins, PluginIndex, PluginTargetKey};
+use crate::plugin_lookup::{
+    ContigPlugins, PluginIndex, PluginTargetKey, single_base_substitution_key,
+};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
@@ -6889,6 +6891,9 @@ async fn collect_plugin_target_keys(
             };
             for alt_allele in raw_alt.split([',', '|']).filter(|value| !value.is_empty()) {
                 keys.insert((pos, ref_allele.clone(), alt_allele.to_string()));
+                if let Some(snv_key) = single_base_substitution_key(pos, &ref_allele, alt_allele) {
+                    keys.insert(snv_key);
+                }
             }
         }
     }
