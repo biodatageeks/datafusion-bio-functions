@@ -13,9 +13,8 @@ use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -110,14 +109,6 @@ impl TableProvider for ClusterProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let target_partitions = self
-            .session
-            .state()
-            .config()
-            .options()
-            .execution
-            .target_partitions;
-
         let input_df = if self.has_extra_cols {
             self.session.table(&self.table).await?
         } else {
@@ -135,28 +126,13 @@ impl TableProvider for ClusterProvider {
             0
         };
 
-        let input_partitions = input_plan.output_partitioning().partition_count();
-        let input_plan: Arc<dyn ExecutionPlan> = if input_partitions > 1 || target_partitions > 1 {
-            Arc::new(RepartitionExec::try_new(
-                input_plan,
-                Partitioning::Hash(
-                    vec![Arc::new(Column::new(
-                        self.columns.0.as_str(),
-                        contig_col_idx,
-                    ))],
-                    target_partitions.max(1),
-                ),
-            )?)
-        } else {
-            input_plan
-        };
-
         let output_partitions = input_plan.output_partitioning().partition_count();
 
         Ok(Arc::new(ClusterExec {
             schema: self.schema.clone(),
             input: input_plan,
             columns: Arc::new(self.columns.clone()),
+            contig_col_idx,
             min_dist: self.min_dist,
             strict: self.filter_op == FilterOp::Strict,
             has_extra_cols: self.has_extra_cols,
@@ -175,6 +151,7 @@ struct ClusterExec {
     schema: SchemaRef,
     input: Arc<dyn ExecutionPlan>,
     columns: Arc<(String, String, String)>,
+    contig_col_idx: usize,
     min_dist: i64,
     strict: bool,
     has_extra_cols: bool,
@@ -204,6 +181,13 @@ impl ExecutionPlan for ClusterExec {
         &self.cache
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::HashPartitioned(vec![Arc::new(Column::new(
+            self.columns.0.as_str(),
+            self.contig_col_idx,
+        ))])]
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -222,6 +206,7 @@ impl ExecutionPlan for ClusterExec {
             schema: self.schema.clone(),
             input: Arc::clone(&children[0]),
             columns: Arc::clone(&self.columns),
+            contig_col_idx: self.contig_col_idx,
             min_dist: self.min_dist,
             strict: self.strict,
             has_extra_cols: self.has_extra_cols,
