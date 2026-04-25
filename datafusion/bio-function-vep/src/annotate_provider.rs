@@ -9040,12 +9040,12 @@ mod tests {
 
     #[test]
     fn test_mark_flag_pick_allele_gene_requires_exact_source_match() {
-        let mut tx_havana = make_tx("ENST00000001", Some("GENE1"), Some("HGNC"), None);
+        let mut tx_havana = make_tx("ENST00000001", Some("GENE1"), Some("HGNC"), None, None);
         tx_havana.gene_stable_id = Some("ENSG00000001".to_string());
         tx_havana.biotype = "protein_coding".to_string();
         tx_havana.source = Some("ensembl_havana".to_string());
 
-        let mut tx_ensembl = make_tx("ENST00000002", Some("GENE1"), Some("HGNC"), None);
+        let mut tx_ensembl = make_tx("ENST00000002", Some("GENE1"), Some("HGNC"), None, None);
         tx_ensembl.gene_stable_id = Some("ENSG00000001".to_string());
         tx_ensembl.biotype = "protein_coding".to_string();
         tx_ensembl.source = Some("Ensembl".to_string());
@@ -9080,11 +9080,11 @@ mod tests {
 
     #[test]
     fn test_mark_flag_pick_allele_gene_prefers_cds_length_over_protein_length() {
-        let mut tx_shorter_cds = make_tx("ENST00000011", Some("GENE1"), Some("HGNC"), None);
+        let mut tx_shorter_cds = make_tx("ENST00000011", Some("GENE1"), Some("HGNC"), None, None);
         tx_shorter_cds.gene_stable_id = Some("ENSG00000011".to_string());
         tx_shorter_cds.biotype = "protein_coding".to_string();
 
-        let mut tx_longer_cds = make_tx("ENST00000012", Some("GENE1"), Some("HGNC"), None);
+        let mut tx_longer_cds = make_tx("ENST00000012", Some("GENE1"), Some("HGNC"), None, None);
         tx_longer_cds.gene_stable_id = Some("ENSG00000011".to_string());
         tx_longer_cds.biotype = "protein_coding".to_string();
 
@@ -9096,6 +9096,8 @@ mod tests {
                 protein_len: Some(100),
                 translation_seq: None,
                 cds_sequence: Some("A".repeat(90)),
+                translation_seq_canonical: None,
+                cds_sequence_canonical: None,
                 stable_id: None,
                 version: None,
                 protein_features: Vec::new(),
@@ -9106,6 +9108,8 @@ mod tests {
                 protein_len: Some(20),
                 translation_seq: None,
                 cds_sequence: Some("A".repeat(99)),
+                translation_seq_canonical: None,
+                cds_sequence_canonical: None,
                 stable_id: None,
                 version: None,
                 protein_features: Vec::new(),
@@ -9140,11 +9144,11 @@ mod tests {
 
     #[test]
     fn test_mark_flag_pick_allele_gene_skips_candidates_without_gene_stable_id() {
-        let mut tx_a = make_tx("ENST00000021", Some("GENE1"), Some("HGNC"), None);
+        let mut tx_a = make_tx("ENST00000021", Some("GENE1"), Some("HGNC"), None, None);
         tx_a.biotype = "protein_coding".to_string();
         tx_a.is_canonical = false;
 
-        let mut tx_b = make_tx("ENST00000022", Some("GENE1"), Some("HGNC"), None);
+        let mut tx_b = make_tx("ENST00000022", Some("GENE1"), Some("HGNC"), None, None);
         tx_b.biotype = "protein_coding".to_string();
         tx_b.is_canonical = true;
 
