@@ -91,11 +91,11 @@ use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::partitioned_cache::PartitionedParquetCache;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
-    CachedPredictions, CompactPrediction, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
-    ProteinDomainFeature, RefSeqEdit, RegulatoryFeature, SiftPolyphenCache, StructuralFeature,
-    SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequence,
-    TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature, VariantInput,
-    infer_refseq_deletion_edits_from_sequences, refseq_edit_offset_delta,
+    CachedPredictions, CompactPrediction, ExonFeature, FeatureType, MirnaFeature, MotifFeature,
+    PreparedContext, ProteinDomainFeature, RefSeqEdit, RegulatoryFeature, SiftPolyphenCache,
+    StructuralFeature, SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment,
+    TranscriptConsequence, TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature,
+    VariantInput, infer_refseq_deletion_edits_from_sequences, refseq_edit_offset_delta,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -2245,6 +2245,19 @@ fn pick_assignment_gene_key(
     tx.gene_stable_id.clone()
 }
 
+fn pick_assignment_feature_id<'a>(
+    assignment_idx: usize,
+    assignments: &'a [TranscriptConsequence],
+    ctx: &'a PreparedContext<'_>,
+) -> &'a str {
+    assignments
+        .get(assignment_idx)
+        .and_then(|tc| tc.transcript_idx)
+        .and_then(|idx| ctx.transcripts.get(idx))
+        .map(|tx| tx.transcript_id.as_str())
+        .unwrap_or("")
+}
+
 fn pick_assignment_source_rank(tx: Option<&TranscriptFeature>, wanted: &str) -> u8 {
     let Some(tx) = tx else {
         return 1;
@@ -2375,14 +2388,27 @@ fn mark_flag_pick_allele_gene(
     }
 
     let mut grouped: HashMap<String, Vec<usize>> = HashMap::new();
-    for (idx, tc) in assignments.iter().enumerate() {
-        let Some(gene_key) = pick_assignment_gene_key(tc, ctx) else {
+    for idx in 0..assignments.len() {
+        if assignments[idx].feature_type != FeatureType::Transcript {
+            // VEP's per-gene picker returns non-transcript overlap alleles
+            // unchanged, and the flagging path marks every returned item.
+            assignments[idx].picked = true;
+            continue;
+        }
+        let Some(gene_key) = pick_assignment_gene_key(&assignments[idx], ctx) else {
             continue;
         };
         grouped.entry(gene_key).or_default().push(idx);
     }
 
-    for candidate_indices in grouped.values() {
+    for candidate_indices in grouped.values_mut() {
+        candidate_indices.sort_by(|&a, &b| {
+            pick_assignment_feature_id(a, assignments, ctx).cmp(pick_assignment_feature_id(
+                b,
+                assignments,
+                ctx,
+            ))
+        });
         let Some(winner) =
             pick_worst_assignment(candidate_indices, assignments, ctx, &pick_flags.pick_order)
         else {
@@ -9039,6 +9065,79 @@ mod tests {
     }
 
     #[test]
+    fn test_mark_flag_pick_allele_gene_marks_non_transcript_assignments() {
+        let ctx = PreparedContext::new(&[], &[], &[], &[], &[], &[], &[]);
+        let mut assignments = vec![
+            TranscriptConsequence {
+                feature_type: FeatureType::RegulatoryFeature,
+                terms: vec![SoTerm::RegulatoryRegionVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                feature_type: FeatureType::MotifFeature,
+                terms: vec![SoTerm::TfBindingSiteVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                feature_type: FeatureType::None,
+                terms: vec![SoTerm::IntergenicVariant],
+                ..Default::default()
+            },
+        ];
+
+        mark_flag_pick_allele_gene(
+            &mut assignments,
+            &ctx,
+            &PickFlags {
+                flag_pick_allele_gene: true,
+                pick_order: vec![PickCriterion::Rank],
+            },
+        );
+
+        assert!(assignments.iter().all(|assignment| assignment.picked));
+    }
+
+    #[test]
+    fn test_mark_flag_pick_allele_gene_tie_breaks_by_feature_id_order() {
+        let mut tx_a = make_tx("ENST00000031", Some("GENE1"), Some("HGNC"), None, None);
+        tx_a.gene_stable_id = Some("ENSG00000031".to_string());
+        tx_a.biotype = "protein_coding".to_string();
+
+        let mut tx_b = make_tx("ENST00000032", Some("GENE1"), Some("HGNC"), None, None);
+        tx_b.gene_stable_id = Some("ENSG00000031".to_string());
+        tx_b.biotype = "protein_coding".to_string();
+
+        let transcripts = vec![tx_b, tx_a];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let mut assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::IntronVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::IntronVariant],
+                ..Default::default()
+            },
+        ];
+
+        mark_flag_pick_allele_gene(
+            &mut assignments,
+            &ctx,
+            &PickFlags {
+                flag_pick_allele_gene: true,
+                pick_order: vec![PickCriterion::Rank],
+            },
+        );
+
+        assert!(!assignments[0].picked);
+        assert!(assignments[1].picked);
+    }
+
+    #[test]
     fn test_mark_flag_pick_allele_gene_requires_exact_source_match() {
         let mut tx_havana = make_tx("ENST00000001", Some("GENE1"), Some("HGNC"), None, None);
         tx_havana.gene_stable_id = Some("ENSG00000001".to_string());
@@ -9144,11 +9243,11 @@ mod tests {
 
     #[test]
     fn test_mark_flag_pick_allele_gene_skips_candidates_without_gene_stable_id() {
-        let mut tx_a = make_tx("ENST00000021", Some("GENE1"), Some("HGNC"), None, None);
+        let mut tx_a = make_tx("ENST00000021", None, Some("GENE1"), Some("HGNC"), None);
         tx_a.biotype = "protein_coding".to_string();
         tx_a.is_canonical = false;
 
-        let mut tx_b = make_tx("ENST00000022", Some("GENE1"), Some("HGNC"), None, None);
+        let mut tx_b = make_tx("ENST00000022", None, Some("GENE1"), Some("HGNC"), None);
         tx_b.biotype = "protein_coding".to_string();
         tx_b.is_canonical = true;
 
