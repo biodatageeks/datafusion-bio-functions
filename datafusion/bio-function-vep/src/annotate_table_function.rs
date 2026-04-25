@@ -89,7 +89,7 @@ impl TableFunctionImpl for AnnotateFunction {
             backend,
             options_json,
             vcf_schema,
-        )))
+        )?))
     }
 }
 
@@ -3032,6 +3032,8 @@ mod tests {
             list_string_values(merged_batch, "SOURCE", 0)[tx_idx].as_deref(),
             Some("RefSeq")
         );
+        // The synthetic fixture does not enable HGVS/reference hydration, so no
+        // REFSEQ_OFFSET value is expected even though the typed column exists.
         assert_eq!(
             list_i64_values(merged_batch, "REFSEQ_OFFSET", 0)[tx_idx],
             None

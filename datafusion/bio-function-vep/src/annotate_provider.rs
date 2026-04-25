@@ -100,7 +100,7 @@ use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
 };
 
-/// Column categories for the 87 non-meta annotation columns.
+/// Column categories for typed non-meta annotation columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnnotationCategory {
     /// Transcript-level fields from the most-severe transcript (42 columns).
@@ -2249,6 +2249,7 @@ pub struct AnnotateProvider {
     cache_source: String,
     backend: AnnotationBackend,
     options_json: Option<String>,
+    transcript_selection: TranscriptSelectionFlags,
     annotation_column_defs: Vec<AnnotationColumnDef>,
     schema: SchemaRef,
 }
@@ -2261,10 +2262,9 @@ impl AnnotateProvider {
         backend: AnnotationBackend,
         options_json: Option<String>,
         vcf_schema: Schema,
-    ) -> Self {
+    ) -> Result<Self> {
         let transcript_selection =
-            TranscriptSelectionFlags::from_options_json(options_json.as_deref())
-                .unwrap_or_default();
+            TranscriptSelectionFlags::from_options_json(options_json.as_deref())?;
         let annotation_column_defs = annotation_column_defs_for_selection(transcript_selection);
 
         // Output schema starts with all VCF columns and appends annotation fields.
@@ -2294,15 +2294,16 @@ impl AnnotateProvider {
             )));
         }
 
-        Self {
+        Ok(Self {
             session,
             vcf_table,
             cache_source,
             backend,
             options_json,
+            transcript_selection,
             annotation_column_defs,
             schema: Arc::new(Schema::new(fields)),
-        }
+        })
     }
 
     fn escaped_sql_literal(value: &str) -> String {
@@ -3613,8 +3614,7 @@ impl AnnotateProvider {
 
         let flags = VepFlags::from_options_json(self.options_json.as_deref());
         let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
-        let transcript_selection =
-            TranscriptSelectionFlags::from_options_json(self.options_json.as_deref())?;
+        let transcript_selection = self.transcript_selection;
         let allowed_failed = self
             .options_json
             .as_deref()
@@ -5212,7 +5212,7 @@ impl AnnotateProvider {
         out_cols.push(Arc::new(csq_builder.finish()));
         out_cols.push(Arc::new(most_builder.finish()));
 
-        // 87 typed annotation columns — skip building when not projected.
+        // Typed annotation columns are mode-dependent; skip building when not projected.
         if skip_typed_cols {
             for col_def in &self.annotation_column_defs {
                 out_cols.push(new_null_array(&col_def.data_type, batch.num_rows()));
@@ -7774,14 +7774,20 @@ impl Stream for ContigAnnotationStream {
                         let vcf_only_schema =
                             Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
 
-                        let tmp_provider = AnnotateProvider::new(
+                        let tmp_provider = match AnnotateProvider::new(
                             Arc::clone(&session),
                             config.vcf_table.clone(),
                             String::new(),
                             AnnotationBackend::Parquet,
                             config.options_json.clone(),
                             vcf_only_schema,
-                        );
+                        ) {
+                            Ok(provider) => provider,
+                            Err(e) => {
+                                self.state = StreamState::Done;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                        };
                         let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
                             config.upstream_distance,
                             config.downstream_distance,
@@ -8242,7 +8248,7 @@ async fn prepare_contig_context(
         AnnotationBackend::Parquet,
         config.options_json.clone(),
         vcf_only_schema,
-    );
+    )?;
 
     let tx = if let Some(ref table) = tx_table {
         let (tx, seq) = tmp_provider.load_transcripts(table, &worklist).await?;
