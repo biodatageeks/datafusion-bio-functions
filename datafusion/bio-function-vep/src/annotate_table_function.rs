@@ -2693,14 +2693,14 @@ mod tests {
                '{{\"partitioned\":true,\"flag_pick_allele_gene\":true,\"pick_order\":\"mane_select,bogus\"}}' \
              )"
         );
-        let err = ctx
-            .sql(&sql)
-            .await
-            .expect("invalid pick-order query should parse")
-            .collect()
-            .await
-            .expect_err("invalid pick_order should fail")
-            .to_string();
+        let err = match ctx.sql(&sql).await {
+            Ok(df) => df
+                .collect()
+                .await
+                .expect_err("invalid pick_order should fail")
+                .to_string(),
+            Err(err) => err.to_string(),
+        };
         assert!(err.contains("unsupported pick_order criterion 'bogus'"));
     }
 

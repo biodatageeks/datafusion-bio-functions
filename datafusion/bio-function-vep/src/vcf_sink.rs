@@ -24,7 +24,8 @@ pub type OnBatchWritten = Box<dyn Fn(usize, usize, usize) + Send + Sync>;
 pub struct AnnotateVcfConfig {
     /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
     pub everything: bool,
-    /// Add standalone `PICK=1` markers for the chosen transcript per allele+gene.
+    /// Add standalone `PICK=1` markers for VEP `--flag_pick_allele_gene`.
+    /// VEP also marks retained non-transcript regulatory/motif/intergenic rows.
     pub flag_pick_allele_gene: bool,
     /// Override Ensembl VEP's default pick-order ranking.
     pub pick_order: Option<String>,
@@ -200,14 +201,14 @@ impl AnnotateVcfConfig {
 }
 
 fn csq_header_description(config: &AnnotateVcfConfig) -> String {
-    let field_names = crate::golden_benchmark::csq_field_names_for_mode(
+    let field_names = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
         config.everything,
         config.refseq,
         config.merged,
         config.flag_pick_allele_gene,
     );
     let format_list = field_names.join("|");
-    format!("Consequence annotations from Ensembl VEP. Format: {format_list}")
+    format!("Consequence annotations from annotate_vep. Format: {format_list}")
 }
 
 /// Annotate a VCF file and write results to an output VCF.
@@ -472,7 +473,7 @@ mod tests {
         };
 
         let description = csq_header_description(&config);
-        assert!(description.starts_with("Consequence annotations from Ensembl VEP. Format: "));
+        assert!(description.starts_with("Consequence annotations from annotate_vep. Format: "));
         assert!(description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
     }
 }

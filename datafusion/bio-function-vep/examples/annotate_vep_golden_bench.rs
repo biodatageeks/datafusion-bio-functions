@@ -23,8 +23,8 @@ use datafusion_bio_function_vep::golden_benchmark::{
     DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, DEFAULT_LOCAL_VEP_CACHE_DIR, TermComparisonReport,
     VariantAnnotation, VariantDiscrepancy, VariantKey, collect_discrepancies,
     compare_annotation_terms, compare_annotations, compare_csq_fields_with_names,
-    csq_field_names_for_mode, diagnose_csq_multiplicity, diagnose_unmatched_csq, ensure_local_copy,
-    normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
+    csq_field_names_for_mode_with_pick, diagnose_csq_multiplicity, diagnose_unmatched_csq,
+    ensure_local_copy, normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
 };
 use datafusion_bio_function_vep::register_vep_functions;
 
@@ -77,6 +77,7 @@ struct Args {
     /// Use VEP --everything flag (enables all features, 80-field CSQ schema).
     everything: bool,
     /// Add standalone PICK field using VEP --flag_pick_allele_gene.
+    /// VEP also marks retained non-transcript regulatory/motif/intergenic rows.
     flag_pick_allele_gene: bool,
     /// Override VEP's pick ranking order.
     pick_order: Option<String>,
@@ -480,7 +481,7 @@ async fn main() -> Result<()> {
     if let (Some(golden), Some(ours)) = (&golden_annotations, &ours_annotations) {
         let report = compare_annotations(golden, ours);
         let term_report = compare_annotation_terms(golden, ours);
-        let csq_field_names = csq_field_names_for_mode(
+        let csq_field_names = csq_field_names_for_mode_with_pick(
             args.everything,
             args.refseq,
             args.merged,
@@ -1020,7 +1021,8 @@ fn run_vep_docker(
         cmd.arg("--pubmed");
 
         let fields =
-            csq_field_names_for_mode(false, refseq, merged, flag_pick_allele_gene).join(",");
+            csq_field_names_for_mode_with_pick(false, refseq, merged, flag_pick_allele_gene)
+                .join(",");
         cmd.arg("--fields").arg(fields);
     }
 

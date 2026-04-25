@@ -1527,7 +1527,7 @@ impl CsqPlaceholderLayout {
         transcript_selection: TranscriptSelectionFlags,
         include_pick: bool,
     ) -> Self {
-        let fields = crate::golden_benchmark::csq_field_names_for_mode(
+        let fields = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
             everything,
             transcript_selection.source_mode == TranscriptSourceMode::RefSeq,
             transcript_selection.source_mode == TranscriptSourceMode::Merged,
@@ -1564,6 +1564,7 @@ struct CsqPlaceholderEntry<'a> {
 struct TranscriptRawMetadata {
     display_xref_id: Option<String>,
     source: Option<String>,
+    source_cache: Option<String>,
     gene_hgnc_id_native: Option<String>,
     refseq_match: Option<String>,
     refseq_edits: Vec<RefSeqEdit>,
@@ -2285,11 +2286,8 @@ fn pick_assignment_source_rank(tx: Option<&TranscriptFeature>, wanted: &str) -> 
     // - Ensembl VEP release 115 sets `$info->{lc($tr->{_source_cache})} = 0`
     //   and only exact `ensembl` / `refseq` keys influence those categories
     //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L734-L741>
-    if tx
-        .source
-        .as_deref()
-        .is_some_and(|source| source.eq_ignore_ascii_case(wanted))
-    {
+    let source = tx.source_cache.as_deref().or(tx.source.as_deref());
+    if source.is_some_and(|source| source.eq_ignore_ascii_case(wanted)) {
         0
     } else {
         1
@@ -2310,6 +2308,9 @@ where
     T: Ord + Copy,
     F: FnMut(&PickCandidateInfo) -> T,
 {
+    if candidates.is_empty() {
+        return None;
+    }
     candidates.sort_by_key(|candidate| key(candidate));
     let best = key(&candidates[0]);
     let keep = candidates
@@ -2715,6 +2716,7 @@ pub struct AnnotateProvider {
     backend: AnnotationBackend,
     options_json: Option<String>,
     transcript_selection: TranscriptSelectionFlags,
+    pick_flags: PickFlags,
     include_pick_output: bool,
     annotation_column_defs: Vec<AnnotationColumnDef>,
     schema: SchemaRef,
@@ -2731,10 +2733,8 @@ impl AnnotateProvider {
     ) -> Result<Self> {
         let transcript_selection =
             TranscriptSelectionFlags::from_options_json(options_json.as_deref())?;
-        let include_pick_output = options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_bool_option(opts, "flag_pick_allele_gene"))
-            .unwrap_or(false);
+        let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
+        let include_pick_output = pick_flags.flag_pick_allele_gene;
         let annotation_column_defs =
             annotation_column_defs_for_selection(transcript_selection, include_pick_output);
         // Output schema starts with all VCF columns and appends annotation fields.
@@ -2771,6 +2771,7 @@ impl AnnotateProvider {
             backend,
             options_json,
             transcript_selection,
+            pick_flags,
             include_pick_output,
             annotation_column_defs,
             schema: Arc::new(Schema::new(fields)),
@@ -3178,6 +3179,7 @@ impl AnnotateProvider {
                 let TranscriptRawMetadata {
                     display_xref_id,
                     source: raw_source,
+                    source_cache: raw_source_cache,
                     gene_hgnc_id_native: raw_gene_hgnc_id_native,
                     refseq_match,
                     refseq_edits,
@@ -3232,11 +3234,11 @@ impl AnnotateProvider {
                 let promoted_gene_hgnc_id =
                     gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_hgnc_id = gene_hgnc_id_native.clone().or(promoted_gene_hgnc_id);
-                let source = raw_source.or_else(|| {
-                    source_idx
-                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                        .and_then(|value| normalize_source_label(&value))
+                let source_cache = raw_source_cache.or_else(|| {
+                    source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 });
+                let source =
+                    raw_source.or_else(|| source_cache.as_deref().and_then(normalize_source_label));
                 let bam_edit_status =
                     bam_edit_status_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
@@ -3309,6 +3311,7 @@ impl AnnotateProvider {
                     gene_hgnc_id,
                     display_xref_id,
                     source,
+                    source_cache,
                     refseq_match,
                     refseq_edits,
                     is_gencode_basic,
@@ -4089,7 +4092,7 @@ impl AnnotateProvider {
         let flags = VepFlags::from_options_json(self.options_json.as_deref());
         let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
         let transcript_selection = self.transcript_selection;
-        let pick_flags = PickFlags::from_options_json(self.options_json.as_deref())?;
+        let pick_flags = self.pick_flags.clone();
         let allowed_failed = self
             .options_json
             .as_deref()
@@ -4215,7 +4218,7 @@ impl AnnotateProvider {
         hgvs_reference_reader: &mut Option<FastaReader>,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
-        let include_pick_output = pick_flags.flag_pick_allele_gene;
+        let include_pick_output = self.include_pick_output;
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
             DataFusionError::Execution(
                 "annotate_vep(): input VCF row is missing required chrom column".to_string(),
@@ -6055,10 +6058,12 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
         .and_then(|xref| xref.get("display_id"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let source = tx
+    let source_cache = tx
         .get("_source_cache")
         .and_then(Value::as_str)
-        .and_then(normalize_source_label);
+        .filter(|value| !value.is_empty() && *value != "-")
+        .map(str::to_string);
+    let source = source_cache.as_deref().and_then(normalize_source_label);
     let cdna_mapper_segments = parse_raw_cdna_mapper_segments(vef_cache);
     let gene_hgnc_id_native = tx
         .get("_gene_hgnc_id")
@@ -6123,6 +6128,7 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
     TranscriptRawMetadata {
         display_xref_id,
         source,
+        source_cache,
         gene_hgnc_id_native,
         refseq_match: (!refseq_match_codes.is_empty()).then(|| refseq_match_codes.join("&")),
         refseq_edits,
@@ -9160,12 +9166,14 @@ mod tests {
         let mut tx_havana = make_tx("ENST00000001", Some("GENE1"), Some("HGNC"), None, None);
         tx_havana.gene_stable_id = Some("ENSG00000001".to_string());
         tx_havana.biotype = "protein_coding".to_string();
-        tx_havana.source = Some("ensembl_havana".to_string());
+        tx_havana.source = Some("Ensembl".to_string());
+        tx_havana.source_cache = Some("ensembl_havana".to_string());
 
         let mut tx_ensembl = make_tx("ENST00000002", Some("GENE1"), Some("HGNC"), None, None);
         tx_ensembl.gene_stable_id = Some("ENSG00000001".to_string());
         tx_ensembl.biotype = "protein_coding".to_string();
         tx_ensembl.source = Some("Ensembl".to_string());
+        tx_ensembl.source_cache = Some("Ensembl".to_string());
 
         let transcripts = vec![tx_havana, tx_ensembl];
         let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
@@ -9265,6 +9273,7 @@ mod tests {
             make_tx("ENST00000041", Some("GENE1"), Some("HGNC"), None, None);
         tx_shorter_spliced.gene_stable_id = Some("ENSG00000041".to_string());
         tx_shorter_spliced.biotype = "lncRNA".to_string();
+        // Genomic span is intentionally larger; exon length drives the pick.
         tx_shorter_spliced.start = 1;
         tx_shorter_spliced.end = 1000;
 
@@ -9653,6 +9662,7 @@ mod tests {
             gene_hgnc_id: native_hgnc_id.map(|s| s.to_string()),
             display_xref_id: None,
             source: None,
+            source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
             is_gencode_basic: false,
@@ -9689,6 +9699,7 @@ mod tests {
         tx.chrom = "1".to_string();
         tx.biotype = "protein_coding".to_string();
         tx.source = source.map(str::to_string);
+        tx.source_cache = source.map(str::to_string);
         tx
     }
 
@@ -9845,7 +9856,7 @@ mod tests {
         refseq_layout.append_entry(&mut refseq_row, &entry);
         let refseq_values: Vec<&str> = refseq_row.split('|').collect();
         let refseq_fields =
-            crate::golden_benchmark::csq_field_names_for_mode(false, true, false, false);
+            crate::golden_benchmark::csq_field_names_for_mode_with_pick(false, true, false, false);
         assert_eq!(refseq_values.len(), refseq_fields.len());
         let refseq_index = |name: &str| {
             refseq_fields
@@ -9870,7 +9881,7 @@ mod tests {
         merged_layout.append_entry(&mut merged_row, &entry);
         let merged_values: Vec<&str> = merged_row.split('|').collect();
         let merged_fields =
-            crate::golden_benchmark::csq_field_names_for_mode(true, false, true, false);
+            crate::golden_benchmark::csq_field_names_for_mode_with_pick(true, false, true, false);
         assert_eq!(merged_values.len(), merged_fields.len());
         let merged_index = |name: &str| {
             merged_fields
@@ -9911,6 +9922,7 @@ mod tests {
 
         let metadata = parse_transcript_raw_metadata(raw);
         assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
+        assert_eq!(metadata.source_cache.as_deref(), Some("RefSeq"));
         assert_eq!(metadata.display_xref_id.as_deref(), Some("NM_000001"));
         assert_eq!(metadata.gene_hgnc_id_native.as_deref(), Some("HGNC:5"));
         assert_eq!(metadata.refseq_match.as_deref(), Some("rseq_ens_match_cds"));
@@ -10005,6 +10017,7 @@ mod tests {
         let metadata = parse_transcript_raw_metadata(raw);
 
         assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
+        assert_eq!(metadata.source_cache.as_deref(), Some("BestRefSeq"));
         assert_eq!(
             metadata.refseq_edits,
             vec![

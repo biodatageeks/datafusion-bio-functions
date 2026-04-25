@@ -221,6 +221,8 @@ pub struct TranscriptFeature {
     /// Transcript source normalized to VEP-facing labels (`Ensembl` / `RefSeq`)
     /// when available.
     pub source: Option<String>,
+    /// Raw VEP `_source_cache` label used for exact pick-order source ranking.
+    pub source_cache: Option<String>,
     /// Pre-formatted REFSEQ_MATCH field, joined with `&` like VEP's VCF output.
     pub refseq_match: Option<String>,
     /// Parsed `_rna_edit*` transcript attributes used for VEP `REFSEQ_OFFSET`.
@@ -8307,6 +8309,7 @@ mod tests {
             gene_hgnc_id: None,
             display_xref_id: None,
             source: None,
+            source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
             is_gencode_basic: false,
