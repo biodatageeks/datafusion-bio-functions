@@ -24,13 +24,13 @@ jobs:
           toolchain: '1.91.0'
           components: 'clippy, rustfmt'
 
-      - name: Cache Cargo registry and build
+      # Avoid caching target: restored build artifacts can exhaust runner disk.
+      - name: Cache Cargo registry and git deps
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
