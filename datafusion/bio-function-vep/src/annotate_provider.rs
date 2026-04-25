@@ -2166,18 +2166,7 @@ fn build_pick_candidate_info(
             //   initializes transcript criteria from transcript attributes,
             //   translation/CDS length, and `_source_cache`
             //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L702-L767>
-            let length =
-                if let Some(translation) = ctx.translation_by_tx.get(tx.transcript_id.as_str()) {
-                    let cds_len = translation
-                        .cds_sequence
-                        .as_ref()
-                        .map(|sequence| sequence.len())
-                        .or(translation.cds_len)
-                        .unwrap_or(0);
-                    -i64::try_from(cds_len).unwrap_or(i64::MAX)
-                } else {
-                    -tx.end.saturating_sub(tx.start).saturating_add(1)
-                };
+            let length = -i64::try_from(pick_transcript_length(tx, ctx)).unwrap_or(i64::MAX);
             (
                 if tx
                     .mane_select
@@ -2230,6 +2219,35 @@ fn build_pick_candidate_info(
         refseq: pick_assignment_source_rank(tx, "refseq"),
         rank: pick_assignment_rank(tc),
     }
+}
+
+fn pick_transcript_length(tx: &TranscriptFeature, ctx: &PreparedContext<'_>) -> usize {
+    if let Some(translation) = ctx.translation_by_tx.get(tx.transcript_id.as_str()) {
+        return translation
+            .cds_sequence
+            .as_ref()
+            .map(|sequence| sequence.len())
+            .or_else(|| tx.translateable_seq.as_ref().map(|sequence| sequence.len()))
+            .or(translation.cds_len)
+            .unwrap_or(0);
+    }
+
+    tx.spliced_seq
+        .as_ref()
+        .map(|sequence| sequence.len())
+        .or_else(|| tx.cdna_seq.as_ref().map(|sequence| sequence.len()))
+        .or_else(|| {
+            ctx.exons_by_tx.get(tx.transcript_id.as_str()).map(|exons| {
+                exons
+                    .iter()
+                    .map(|exon| exon.end.saturating_sub(exon.start).saturating_add(1))
+                    .filter_map(|len| usize::try_from(len).ok())
+                    .sum()
+            })
+        })
+        .unwrap_or_else(|| {
+            usize::try_from(tx.end.saturating_sub(tx.start).saturating_add(1)).unwrap_or(0)
+        })
 }
 
 fn pick_assignment_gene_key(
@@ -9215,6 +9233,64 @@ mod tests {
             },
         ];
         let ctx = PreparedContext::new(&transcripts, &[], &translations, &[], &[], &[], &[]);
+        let mut assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        mark_flag_pick_allele_gene(
+            &mut assignments,
+            &ctx,
+            &PickFlags {
+                flag_pick_allele_gene: true,
+                pick_order: vec![PickCriterion::Length],
+            },
+        );
+
+        assert!(!assignments[0].picked);
+        assert!(assignments[1].picked);
+    }
+
+    #[test]
+    fn test_mark_flag_pick_allele_gene_uses_spliced_length_for_noncoding_transcripts() {
+        let mut tx_shorter_spliced =
+            make_tx("ENST00000041", Some("GENE1"), Some("HGNC"), None, None);
+        tx_shorter_spliced.gene_stable_id = Some("ENSG00000041".to_string());
+        tx_shorter_spliced.biotype = "lncRNA".to_string();
+        tx_shorter_spliced.start = 1;
+        tx_shorter_spliced.end = 1000;
+
+        let mut tx_longer_spliced =
+            make_tx("ENST00000042", Some("GENE1"), Some("HGNC"), None, None);
+        tx_longer_spliced.gene_stable_id = Some("ENSG00000041".to_string());
+        tx_longer_spliced.biotype = "lncRNA".to_string();
+        tx_longer_spliced.start = 1;
+        tx_longer_spliced.end = 500;
+
+        let transcripts = vec![tx_shorter_spliced, tx_longer_spliced];
+        let exons = vec![
+            ExonFeature {
+                transcript_id: "ENST00000041".to_string(),
+                exon_number: 1,
+                start: 1,
+                end: 100,
+            },
+            ExonFeature {
+                transcript_id: "ENST00000042".to_string(),
+                exon_number: 1,
+                start: 1,
+                end: 200,
+            },
+        ];
+        let ctx = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
         let mut assignments = vec![
             TranscriptConsequence {
                 transcript_idx: Some(0),
