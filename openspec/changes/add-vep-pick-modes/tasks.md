@@ -57,4 +57,4 @@
 - [x] 7.2 Run `cargo test -p datafusion-bio-function-vep --lib`
 - [x] 7.3 Run `cargo check -p datafusion-bio-function-vep --all-targets`
 - [x] 7.4 Run downstream `cargo check` in `/Users/mwiewior/research/git/vepyr`
-- [ ] 7.5 Push upstream and downstream commits
+- [x] 7.5 Push upstream and downstream commits
