@@ -3051,6 +3051,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_merged_typed_columns_handle_rows_without_transcript_assignments() {
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &cache_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .expect("register vcf table");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', '{backend}', '{{\"partitioned\":true,\"merged\":true}}')"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("merged query should parse")
+            .collect()
+            .await
+            .expect("collect merged annotate_vep");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+        for batch in &batches {
+            for col_name in [
+                "REFSEQ_MATCH",
+                "SOURCE",
+                "REFSEQ_OFFSET",
+                "GIVEN_REF",
+                "USED_REF",
+                "BAM_EDIT",
+            ] {
+                assert!(
+                    batch.schema().index_of(col_name).is_ok(),
+                    "merged schema should expose {col_name}"
+                );
+                assert_eq!(
+                    batch
+                        .column_by_name(col_name)
+                        .expect("merged typed column should exist")
+                        .len(),
+                    batch.num_rows(),
+                    "{col_name} should append exactly one outer list per output row"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_rejects_unknown_backend() {
         let ctx = create_vep_session();
         ctx.register_table("vcf_data", Arc::new(vcf_table()))

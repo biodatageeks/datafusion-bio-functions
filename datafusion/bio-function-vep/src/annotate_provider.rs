@@ -5000,6 +5000,16 @@ impl AnnotateProvider {
                     b_trembl.append(false);
                     b_uniparc.append(false);
                     b_uniprot_isoform.append(false);
+                    if include_refseq_fields {
+                        b_refseq_match.append(false);
+                        if include_source_field {
+                            b_source.append(false);
+                        }
+                        b_refseq_offset.append(false);
+                        b_given_ref.append(false);
+                        b_used_ref.append(false);
+                        b_bam_edit.append(false);
+                    }
                     b_gene_pheno.append(false);
                     b_sift.append(false);
                     b_polyphen.append(false);
@@ -5286,6 +5296,12 @@ impl AnnotateProvider {
             out_cols.push(Arc::new(b_cosmic_ids.finish()));
             out_cols.push(Arc::new(b_dbsnp_ids.finish()));
         }
+
+        debug_assert_eq!(
+            out_cols.len(),
+            self.schema.fields().len(),
+            "annotate_vep(): output column builder order is out of sync with provider schema"
+        );
 
         Ok(RecordBatch::try_new(self.schema.clone(), out_cols)?)
     }
