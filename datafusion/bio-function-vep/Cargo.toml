@@ -1,6 +1,6 @@
 [package]
 name = "datafusion-bio-function-vep"
-version = "0.6.3"
+version = "0.4.0"
 description = "VEP (Variant Effect Predictor) annotation functions for Apache DataFusion"
 license.workspace = true
 authors.workspace = true
@@ -16,17 +16,20 @@ log.workspace = true
 async-trait = "0.1.88"
 fjall = { version = "3.1.1", optional = true }
 arrow-ipc = { version = "56", features = ["lz4", "zstd"], optional = true }
-lz4_flex = { version = "0.12.1", optional = true }
+lz4_flex = { version = "0.12.0", optional = true }
 zstd = { version = "0.13.3", optional = true }
 ahash = { version = "0.8.6", optional = true }
 flate2 = "1.1.0"
+once_cell = "1.17"
+tempfile = "3"
 coitrees = "0.4.0"
 serde_json = "1"
 noodles-core = "0.16"
 noodles-fasta = "0.49"
 parquet = { version = "56", features = ["arrow"] }
-datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "5fc6a6fc26c4300402d9283d69d9d521e96abc60" }
-datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "ab1f2a5", optional = true }
+datafusion-bio-format-vcf = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "7ccaa58" }
+datafusion-bio-format-ensembl-cache = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "c7cad33b50235bd9a460f103a2ae7a41653f9ad3", optional = true }
+datafusion-bio-format-vep-plugin = { path = "../../../datafusion-bio-formats/datafusion/bio-format-vep-plugin" }
 indicatif = "0.18.4"
 
 [dev-dependencies]
@@ -34,7 +37,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 datafusion-bio-function-ranges = { path = "../bio-function-ranges" }
 noodles-vcf = { git = "https://github.com/biodatageeks/noodles.git", rev = "9b7b2c5b6531373918302d4c07410e583f1b5b5c" }
 env_logger = "0.11"
-tempfile = "3"
 
 [[example]]
 name = "vcf_batch_stats"
@@ -84,19 +86,3 @@ required-features = []
 default = ["kv-cache"]
 kv-cache = ["dep:fjall", "dep:arrow-ipc", "dep:lz4_flex", "dep:zstd", "dep:ahash"]
 cache-builder = ["kv-cache", "dep:datafusion-bio-format-ensembl-cache"]
-
-# Regression tests that bake per-transcript sequence fixtures via
-# `include_str!(".tmp_*.txt")` are gated behind the raw `cfg(dev_fixtures)`
-# flag (see `[lints.rust]` below), not a Cargo feature. The raw cfg flag is
-# used deliberately so `--all-features` (e.g. the project's
-# `cargo clippy --all-targets --all-features` pre-commit) does NOT enable it:
-# the `.tmp_*` files are regenerated on demand by a local VEP-cache export
-# script and are intentionally not checked in.
-#
-# To run them, regenerate the fixtures locally and pass the cfg through
-# RUSTFLAGS:
-#   RUSTFLAGS="--cfg dev_fixtures" \
-#     cargo test -p datafusion-bio-function-vep --features cache-builder --lib
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(dev_fixtures)'] }

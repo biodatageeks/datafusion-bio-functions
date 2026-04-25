@@ -104,6 +104,7 @@ pub struct CacheBuilder {
     overwrite: bool,
     zstd_level: i32,
     dict_size_kb: u32,
+    selected_chromosomes: Option<Vec<String>>,
     on_progress: Option<Arc<OnProgress>>,
 }
 
@@ -117,6 +118,7 @@ impl CacheBuilder {
             overwrite: false,
             zstd_level: 3,
             dict_size_kb: 112,
+            selected_chromosomes: None,
             on_progress: None,
         }
     }
@@ -143,6 +145,25 @@ impl CacheBuilder {
 
     pub fn with_dict_size_kb(mut self, size: u32) -> Self {
         self.dict_size_kb = size;
+        self
+    }
+
+    pub fn with_chromosomes<I, S>(mut self, chromosomes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut selected = Vec::new();
+        for chrom in chromosomes {
+            let chrom = chrom.as_ref().trim();
+            if chrom.is_empty() {
+                continue;
+            }
+            if !selected.iter().any(|existing| existing == chrom) {
+                selected.push(chrom.to_string());
+            }
+        }
+        self.selected_chromosomes = (!selected.is_empty()).then_some(selected);
         self
     }
 
@@ -212,8 +233,20 @@ impl CacheBuilder {
             && kind != EnsemblEntityKind::Variation
             && kind != EnsemblEntityKind::Translation
         {
-            let entity_dir = format!("{}/{}", self.output_dir, subdir);
-            if dir_has_parquet_files(&entity_dir) {
+            let table_name = entity_table_name(kind);
+            let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, 1)?;
+            let provider_schema = {
+                let table = init_ctx.table(table_name).await?;
+                table.schema().inner().clone()
+            };
+            let chroms = resolve_requested_chroms(
+                &chroms_from_schema(&provider_schema),
+                self.selected_chromosomes.as_deref(),
+            )?;
+            let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
+            let (main_chroms, other_chroms) = split_chroms(&chroms, &main_set);
+
+            if requested_outputs_exist(&self.output_dir, subdir, &main_chroms, &other_chroms) {
                 info!("{entity}: parquet already exists, skipping (use overwrite to rebuild)");
                 return Ok(vec![EntityStats {
                     entity: subdir.to_string(),
@@ -247,14 +280,30 @@ impl CacheBuilder {
     async fn build_variation(&self) -> Result<Vec<EntityStats>> {
         let kind = EnsemblEntityKind::Variation;
         let table_name = "var";
-        let parquet_dir = format!("{}/variation", self.output_dir);
-        let parquet_exists = dir_has_parquet_files(&parquet_dir);
-        let fjall_dir_path = format!("{}/variation.fjall", self.output_dir);
-        let fjall_exists = Path::new(&fjall_dir_path).exists();
+
+        // Discover chromosomes from schema metadata
+        let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let provider_schema = {
+            let table = init_ctx.table(table_name).await?;
+            table.schema().inner().clone()
+        };
+        let chroms = resolve_requested_chroms(
+            &chroms_from_schema(&provider_schema),
+            self.selected_chromosomes.as_deref(),
+        )?;
+        drop(init_ctx);
+
+        let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
+        let (main_chroms, other_chroms) = split_chroms(&chroms, &main_set);
 
         if !self.overwrite {
+            let parquet_exists =
+                requested_outputs_exist(&self.output_dir, "variation", &main_chroms, &other_chroms);
+            let selection_active = self.selected_chromosomes.is_some();
+            let fjall_dir_path = format!("{}/variation.fjall", self.output_dir);
+            let fjall_exists = Path::new(&fjall_dir_path).exists();
             let need_parquet = !parquet_exists;
-            let need_fjall = self.build_fjall && !fjall_exists;
+            let need_fjall = self.build_fjall && (!fjall_exists || selection_active);
 
             if !need_parquet && !need_fjall {
                 info!("variation: all outputs exist, skipping (use overwrite to rebuild)");
@@ -265,24 +314,11 @@ impl CacheBuilder {
                 }]);
             }
 
-            // Parquet exists but fjall missing → rebuild fjall from parquet
             if !need_parquet && need_fjall {
                 info!("variation: parquet exists, building fjall from existing parquet files");
                 return self.build_variation_fjall_from_parquet().await;
             }
         }
-
-        // Discover chromosomes from schema metadata
-        let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
-        let provider_schema = {
-            let table = init_ctx.table(table_name).await?;
-            table.schema().inner().clone()
-        };
-        let chroms = chroms_from_schema(&provider_schema);
-        drop(init_ctx);
-
-        let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
-        let (main_chroms, other_chroms) = split_chroms(&chroms, &main_set);
 
         info!(
             "variation: {} main chroms, {} other contigs",
@@ -637,6 +673,12 @@ impl CacheBuilder {
             } else {
                 chrom_to_code(chrom)
             };
+            if let Some(selected) = self.selected_chromosomes.as_deref()
+                && chrom != "other"
+                && !requested_chrom_matches(chrom, selected)
+            {
+                continue;
+            }
             parquet_files.push((code, path.to_string_lossy().to_string()));
         }
         parquet_files.sort_by_key(|(code, _)| *code);
@@ -706,7 +748,12 @@ impl CacheBuilder {
                     let chrom_col = batch.column(0);
                     for row in 0..batch.num_rows() {
                         let chrom = string_value(chrom_col.as_ref(), row);
-                        if !CHROM_TO_CODE_SET.contains(&chrom) {
+                        if !CHROM_TO_CODE_SET.contains(&chrom)
+                            && self
+                                .selected_chromosomes
+                                .as_deref()
+                                .is_none_or(|selected| requested_chrom_matches(chrom, selected))
+                        {
                             all_contigs.insert(chrom.to_string());
                         }
                     }
@@ -747,6 +794,7 @@ impl CacheBuilder {
         let mut total_variants = 0u64;
         let mut total_bytes = 0u64;
         let start_time = Instant::now();
+        let selected_chromosomes = self.selected_chromosomes.clone();
 
         // Process each parquet file as a separate ingestion session.
         // After each session: finish() + major_compact() to reclaim disk space.
@@ -763,6 +811,7 @@ impl CacheBuilder {
             let parquet_path_clone = parquet_path.clone();
             let chrom_col_idx_c = chrom_col_idx;
             let start_col_idx_c = start_col_idx;
+            let selected_chromosomes = selected_chromosomes.clone();
 
             // Start a new ingestion session for this file
             let mut ing = store
@@ -804,6 +853,11 @@ impl CacheBuilder {
                         for row in 0..batch.num_rows() {
                             let start = starts.value(row);
                             let row_chrom = string_value(chrom_col.as_ref(), row);
+                            if selected_chromosomes.as_deref().is_some_and(|selected| {
+                                !requested_chrom_matches(row_chrom, selected)
+                            }) {
+                                continue;
+                            }
                             let chrom_code = chrom_to_code(row_chrom);
 
                             let should_flush = accum
@@ -1041,14 +1095,37 @@ impl CacheBuilder {
 
         // Skip if all outputs exist
         if !self.overwrite {
-            let core_exists =
-                dir_has_parquet_files(&format!("{}/translation_core", self.output_dir));
-            let sift_parquet_exists =
-                dir_has_parquet_files(&format!("{}/translation_sift", self.output_dir));
+            let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, 1)?;
+            let provider_schema = {
+                let table = init_ctx.table(table_name).await?;
+                table.schema().inner().clone()
+            };
+            let chroms = resolve_requested_chroms(
+                &chroms_from_schema(&provider_schema),
+                self.selected_chromosomes.as_deref(),
+            )?;
+            drop(init_ctx);
+            let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
+            let (main_chroms, other_chroms) = split_chroms(&chroms, &main_set);
+            let core_exists = requested_outputs_exist(
+                &self.output_dir,
+                "translation_core",
+                &main_chroms,
+                &other_chroms,
+            );
+            let sift_parquet_exists = requested_outputs_exist(
+                &self.output_dir,
+                "translation_sift",
+                &main_chroms,
+                &other_chroms,
+            );
             let sift_fjall_exists =
                 Path::new(&format!("{}/translation_sift.fjall", self.output_dir)).exists();
 
-            if core_exists && sift_parquet_exists && (sift_fjall_exists || !self.build_fjall) {
+            if core_exists
+                && sift_parquet_exists
+                && (!self.build_fjall || (sift_fjall_exists && self.selected_chromosomes.is_none()))
+            {
                 info!("translation: all outputs exist, skipping (use overwrite to rebuild)");
                 return Ok(vec![EntityStats {
                     entity: "translation".to_string(),
@@ -1064,7 +1141,10 @@ impl CacheBuilder {
             let table = init_ctx.table(table_name).await?;
             table.schema().inner().clone()
         };
-        let chroms = chroms_from_schema(&provider_schema);
+        let chroms = resolve_requested_chroms(
+            &chroms_from_schema(&provider_schema),
+            self.selected_chromosomes.as_deref(),
+        )?;
         drop(init_ctx);
 
         let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
@@ -1538,7 +1618,10 @@ impl CacheBuilder {
             let table = init_ctx.table(table_name).await?;
             Arc::new(table.schema().as_arrow().clone())
         };
-        let chroms = chroms_from_schema(&provider_schema);
+        let chroms = resolve_requested_chroms(
+            &chroms_from_schema(&provider_schema),
+            self.selected_chromosomes.as_deref(),
+        )?;
         drop(init_ctx);
 
         let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
@@ -2009,6 +2092,74 @@ fn dir_has_parquet_files(dir: &str) -> bool {
                     .any(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("parquet"))
             })
             .unwrap_or(false)
+}
+
+fn requested_chrom_matches(chrom: &str, requested: &[String]) -> bool {
+    let stripped = chrom.strip_prefix("chr").unwrap_or(chrom);
+    requested.iter().any(|candidate| {
+        candidate == chrom
+            || candidate == stripped
+            || candidate
+                .strip_prefix("chr")
+                .is_some_and(|candidate_stripped| {
+                    candidate_stripped == chrom || candidate_stripped == stripped
+                })
+    })
+}
+
+fn resolve_requested_chroms(
+    chroms: &Option<Vec<String>>,
+    selected: Option<&[String]>,
+) -> Result<Option<Vec<String>>> {
+    match selected {
+        None => Ok(chroms.clone()),
+        Some(selected) => {
+            let selected: Vec<String> = selected
+                .iter()
+                .filter(|chrom| !chrom.trim().is_empty())
+                .cloned()
+                .collect();
+            if selected.is_empty() {
+                return Ok(None);
+            }
+
+            match chroms {
+                Some(discovered) => {
+                    let filtered: Vec<String> = discovered
+                        .iter()
+                        .filter(|chrom| requested_chrom_matches(chrom, &selected))
+                        .cloned()
+                        .collect();
+                    if filtered.is_empty() {
+                        return Err(DataFusionError::Execution(format!(
+                            "Requested chromosomes {:?} do not match discovered cache chromosomes {:?}",
+                            selected, discovered
+                        )));
+                    }
+                    Ok(Some(filtered))
+                }
+                None => Ok(Some(selected)),
+            }
+        }
+    }
+}
+
+fn requested_outputs_exist(
+    output_dir: &str,
+    subdir: &str,
+    main_chroms: &[String],
+    other_chroms: &[String],
+) -> bool {
+    if main_chroms.is_empty() && other_chroms.is_empty() {
+        return false;
+    }
+
+    let entity_dir = Path::new(output_dir).join(subdir);
+    let main_exist = main_chroms
+        .iter()
+        .all(|chrom| entity_dir.join(format!("chr{chrom}.parquet")).exists());
+    let other_exists = other_chroms.is_empty() || entity_dir.join("other.parquet").exists();
+    main_exist && other_exists
 }
 
 fn make_ctx_and_register(
@@ -2732,6 +2883,7 @@ mod tests {
         assert!(builder.build_fjall);
         assert_eq!(builder.zstd_level, 3);
         assert_eq!(builder.dict_size_kb, 112);
+        assert!(builder.selected_chromosomes.is_none());
         assert!(builder.on_progress.is_none());
     }
 
@@ -2741,11 +2893,16 @@ mod tests {
             .with_partitions(4)
             .with_build_fjall(false)
             .with_zstd_level(9)
-            .with_dict_size_kb(256);
+            .with_dict_size_kb(256)
+            .with_chromosomes(["1", "X"]);
         assert_eq!(builder.partitions, 4);
         assert!(!builder.build_fjall);
         assert_eq!(builder.zstd_level, 9);
         assert_eq!(builder.dict_size_kb, 256);
+        assert_eq!(
+            builder.selected_chromosomes,
+            Some(vec!["1".to_string(), "X".to_string()])
+        );
     }
 
     #[test]
@@ -4036,6 +4193,52 @@ mod tests {
             vec!["1", "2", "3", "10", "11", "20", "X", "Y", "MT"],
             "main chroms should be in CHROM_CODE_ORDER, not alphabetical"
         );
+    }
+
+    #[test]
+    fn test_requested_chrom_matches_accepts_prefixed_alias() {
+        let requested = vec!["chr1".to_string(), "X".to_string()];
+        assert!(requested_chrom_matches("1", &requested));
+        assert!(requested_chrom_matches("chr1", &requested));
+        assert!(requested_chrom_matches("X", &requested));
+        assert!(!requested_chrom_matches("2", &requested));
+    }
+
+    #[test]
+    fn test_resolve_requested_chroms_filters_discovered() {
+        let chroms = Some(vec!["1".to_string(), "2".to_string(), "X".to_string()]);
+        let selected = vec!["chr1".to_string(), "X".to_string()];
+        let resolved = resolve_requested_chroms(&chroms, Some(&selected)).unwrap();
+        assert_eq!(resolved, Some(vec!["1".to_string(), "X".to_string()]));
+    }
+
+    #[test]
+    fn test_resolve_requested_chroms_uses_selection_when_metadata_missing() {
+        let selected = vec!["1".to_string(), "GL000220.1".to_string()];
+        let resolved = resolve_requested_chroms(&None, Some(&selected)).unwrap();
+        assert_eq!(resolved, Some(selected));
+    }
+
+    #[test]
+    fn test_requested_outputs_exist_checks_target_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let entity_dir = dir.path().join("variation");
+        std::fs::create_dir_all(&entity_dir).unwrap();
+        std::fs::write(entity_dir.join("chr1.parquet"), b"PAR1").unwrap();
+        std::fs::write(entity_dir.join("chr2.parquet"), b"PAR2").unwrap();
+
+        assert!(requested_outputs_exist(
+            dir.path().to_str().unwrap(),
+            "variation",
+            &["1".to_string()],
+            &[],
+        ));
+        assert!(!requested_outputs_exist(
+            dir.path().to_str().unwrap(),
+            "variation",
+            &["1".to_string(), "X".to_string()],
+            &[],
+        ));
     }
 
     // -----------------------------------------------------------------------
