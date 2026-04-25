@@ -76,6 +76,18 @@ struct Args {
     reference_fasta_path: Option<PathBuf>,
     /// Use VEP --everything flag (enables all features, 80-field CSQ schema).
     everything: bool,
+    /// Select one consequence per variant using VEP --pick.
+    pick: bool,
+    /// Select one consequence per allele using VEP --pick_allele.
+    pick_allele: bool,
+    /// Select one consequence per gene using VEP --per_gene.
+    per_gene: bool,
+    /// Select one consequence per allele and gene using VEP --pick_allele_gene.
+    pick_allele_gene: bool,
+    /// Add standalone PICK field using VEP --flag_pick.
+    flag_pick: bool,
+    /// Add standalone PICK field using VEP --flag_pick_allele.
+    flag_pick_allele: bool,
     /// Add standalone PICK field using VEP --flag_pick_allele_gene.
     /// VEP also marks retained non-transcript regulatory/motif/intergenic rows.
     flag_pick_allele_gene: bool,
@@ -173,6 +185,20 @@ impl Args {
                     PathBuf::from(value)
                 },
             );
+        let pick = args.iter().any(|a| a == "--pick");
+        let pick_allele = args
+            .iter()
+            .any(|a| a == "--pick-allele" || a == "--pick_allele");
+        let per_gene = args.iter().any(|a| a == "--per-gene" || a == "--per_gene");
+        let pick_allele_gene = args
+            .iter()
+            .any(|a| a == "--pick-allele-gene" || a == "--pick_allele_gene");
+        let flag_pick = args
+            .iter()
+            .any(|a| a == "--flag-pick" || a == "--flag_pick");
+        let flag_pick_allele = args
+            .iter()
+            .any(|a| a == "--flag-pick-allele" || a == "--flag_pick_allele");
         let flag_pick_allele_gene = args
             .iter()
             .any(|a| a == "--flag-pick-allele-gene" || a == "--flag_pick_allele_gene");
@@ -259,6 +285,12 @@ impl Args {
             shift_hgvs,
             reference_fasta_path,
             everything: args.iter().any(|a| a == "--everything"),
+            pick,
+            pick_allele,
+            per_gene,
+            pick_allele_gene,
+            flag_pick,
+            flag_pick_allele,
             flag_pick_allele_gene,
             pick_order,
             use_fjall: args.iter().any(|a| a == "--use-fjall"),
@@ -271,6 +303,22 @@ impl Args {
 
     fn run_datafusion(&self) -> bool {
         self.steps.iter().any(|s| s == "datafusion")
+    }
+
+    fn pick_options(&self) -> [(&'static str, bool); 7] {
+        [
+            ("pick", self.pick),
+            ("pick_allele", self.pick_allele),
+            ("per_gene", self.per_gene),
+            ("pick_allele_gene", self.pick_allele_gene),
+            ("flag_pick", self.flag_pick),
+            ("flag_pick_allele", self.flag_pick_allele),
+            ("flag_pick_allele_gene", self.flag_pick_allele_gene),
+        ]
+    }
+
+    fn include_pick_output(&self) -> bool {
+        self.flag_pick || self.flag_pick_allele || self.flag_pick_allele_gene
     }
 }
 
@@ -320,7 +368,9 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "(none)".to_string())
     );
     println!("  everything: {}", args.everything);
-    println!("  flag_pick_allele_gene: {}", args.flag_pick_allele_gene);
+    for (name, enabled) in args.pick_options() {
+        println!("  {name}: {enabled}");
+    }
     println!(
         "  pick_order: {}",
         args.pick_order.as_deref().unwrap_or("(default)")
@@ -427,7 +477,7 @@ async fn main() -> Result<()> {
                 args.shift_hgvs,
                 args.reference_fasta_path.as_deref(),
                 args.everything,
-                args.flag_pick_allele_gene,
+                args.pick_options(),
                 args.pick_order.as_deref(),
             )?;
             let elapsed = docker_start.elapsed().as_secs_f64();
@@ -485,7 +535,7 @@ async fn main() -> Result<()> {
             args.everything,
             args.refseq,
             args.merged,
-            args.flag_pick_allele_gene,
+            args.include_pick_output(),
         );
         let csq_field_report = compare_csq_fields_with_names(golden, ours, &csq_field_names);
         let discrepancies = collect_discrepancies(golden, ours);
@@ -602,8 +652,10 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
         if args.use_fjall {
             entries.push("\"use_fjall\":true".to_string());
         }
-        if args.flag_pick_allele_gene {
-            entries.push("\"flag_pick_allele_gene\":true".to_string());
+        for (name, enabled) in args.pick_options() {
+            if enabled {
+                entries.push(format!("\"{name}\":true"));
+            }
         }
         if let Some(pick_order) = &args.pick_order {
             entries.push(format!("\"pick_order\":\"{}\"", sql_literal(pick_order)));
@@ -806,8 +858,10 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
         entries.push("\"exclude_predicted\":true".to_string());
     }
 
-    if args.flag_pick_allele_gene {
-        entries.push("\"flag_pick_allele_gene\":true".to_string());
+    for (name, enabled) in args.pick_options() {
+        if enabled {
+            entries.push(format!("\"{name}\":true"));
+        }
     }
 
     if let Some(pick_order) = &args.pick_order {
@@ -909,7 +963,7 @@ fn run_vep_docker(
     shift_hgvs: Option<bool>,
     reference_fasta_path: Option<&Path>,
     everything: bool,
-    flag_pick_allele_gene: bool,
+    pick_options: [(&'static str, bool); 7],
     pick_order: Option<&str>,
 ) -> Result<()> {
     let sampled_name = sampled_vcf
@@ -1020,9 +1074,11 @@ fn run_vep_docker(
         cmd.arg("--max_af");
         cmd.arg("--pubmed");
 
-        let fields =
-            csq_field_names_for_mode_with_pick(false, refseq, merged, flag_pick_allele_gene)
-                .join(",");
+        let include_pick_output = pick_options
+            .iter()
+            .any(|(name, enabled)| *enabled && name.starts_with("flag_"));
+        let fields = csq_field_names_for_mode_with_pick(false, refseq, merged, include_pick_output)
+            .join(",");
         cmd.arg("--fields").arg(fields);
     }
 
@@ -1048,8 +1104,10 @@ fn run_vep_docker(
     if exclude_predicted {
         cmd.arg("--exclude_predicted");
     }
-    if flag_pick_allele_gene {
-        cmd.arg("--flag_pick_allele_gene");
+    for (name, enabled) in pick_options {
+        if enabled {
+            cmd.arg(format!("--{name}"));
+        }
     }
     if let Some(pick_order) = pick_order {
         cmd.arg("--pick_order").arg(pick_order);

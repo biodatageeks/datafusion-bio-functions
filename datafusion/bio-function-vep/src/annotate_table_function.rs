@@ -2469,6 +2469,68 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_filter_pick_modes_reduce_csq_and_typed_columns() {
+        let backend = "parquet";
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_batch_to_cache(&tmpdir, "variation", &pick_cache_batch(None, None));
+        write_batch_to_cache(&tmpdir, "transcript", &pick_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &pick_exons_batch());
+
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_pick_filter", Arc::new(pick_vcf_table()))
+            .expect("register pick-filter vcf");
+
+        let cache_path = tmpdir.path().to_str().expect("utf8 path");
+        let (_fasta_dir, fasta_path) = write_test_indexed_fasta("1", &"N".repeat(512));
+        for (mode_key, expected_features) in [
+            ("pick", vec!["ENSTPICK0001"]),
+            ("pick_allele", vec!["ENSTPICK0001"]),
+            ("per_gene", vec!["ENSTPICK0001", "ENSTPICK0003"]),
+            ("pick_allele_gene", vec!["ENSTPICK0001", "ENSTPICK0003"]),
+        ] {
+            let expected_features: Vec<String> =
+                expected_features.into_iter().map(str::to_string).collect();
+            let sql = format!(
+                "SELECT \"CSQ\", \"Feature\" \
+                 FROM annotate_vep( \
+                   'vcf_pick_filter', \
+                   '{cache_path}', \
+                   '{backend}', \
+                   '{{\"partitioned\":true,\"everything\":true,\"{mode_key}\":true,\
+                      \"pick_order\":\"mane_select,tsl,canonical\",\"reference_fasta_path\":\"{}\"}}' \
+                 )",
+                fasta_path.replace('\'', "''")
+            );
+            let batches = ctx
+                .sql(&sql)
+                .await
+                .expect("filter pick query should parse")
+                .collect()
+                .await
+                .expect("collect filter pick annotate_vep");
+            let batch = &batches[0];
+
+            let csq = string_values(batch.column_by_name("CSQ").expect("csq column exists"));
+            let csq0 = csq[0].as_ref().expect("csq should be present");
+            let transcript_features: Vec<String> = csq_entries(csq0)
+                .into_iter()
+                .filter(|fields| fields.len() == 80 && fields[5] == "Transcript")
+                .map(|fields| fields[6].to_string())
+                .collect();
+            assert_eq!(transcript_features, expected_features);
+
+            let typed_features = list_row_string_values(
+                batch
+                    .column_by_name("Feature")
+                    .expect("feature column exists"),
+                0,
+            );
+            let typed_features: Vec<String> = typed_features.into_iter().flatten().collect();
+            assert_eq!(typed_features, expected_features);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_annotate_vep_pick_order_changes_transcript_winner() {
         let backend = "parquet";
         let tmpdir = TempDir::new().expect("create temp dir");

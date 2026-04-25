@@ -24,6 +24,18 @@ pub type OnBatchWritten = Box<dyn Fn(usize, usize, usize) + Send + Sync>;
 pub struct AnnotateVcfConfig {
     /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
     pub everything: bool,
+    /// Emit one consequence per variant (`--pick`).
+    pub pick: bool,
+    /// Emit one consequence per allele (`--pick_allele`).
+    pub pick_allele: bool,
+    /// Emit one consequence per gene and retain non-transcript rows (`--per_gene`).
+    pub per_gene: bool,
+    /// Emit one consequence per allele and gene (`--pick_allele_gene`).
+    pub pick_allele_gene: bool,
+    /// Add standalone `PICK=1` marker for one consequence per variant.
+    pub flag_pick: bool,
+    /// Add standalone `PICK=1` marker for one consequence per allele.
+    pub flag_pick_allele: bool,
     /// Add standalone `PICK=1` markers for VEP `--flag_pick_allele_gene`.
     /// VEP also marks retained non-transcript regulatory/motif/intergenic rows.
     pub flag_pick_allele_gene: bool,
@@ -79,6 +91,12 @@ impl Default for AnnotateVcfConfig {
     fn default() -> Self {
         Self {
             everything: false,
+            pick: false,
+            pick_allele: false,
+            per_gene: false,
+            pick_allele_gene: false,
+            flag_pick: false,
+            flag_pick_allele: false,
             flag_pick_allele_gene: false,
             pick_order: None,
             extended_probes: false,
@@ -124,11 +142,18 @@ impl AnnotateVcfConfig {
         if self.everything {
             opts.insert("everything".into(), serde_json::Value::Bool(true));
         }
-        if self.flag_pick_allele_gene {
-            opts.insert(
-                "flag_pick_allele_gene".into(),
-                serde_json::Value::Bool(true),
-            );
+        for (key, enabled) in [
+            ("pick", self.pick),
+            ("pick_allele", self.pick_allele),
+            ("per_gene", self.per_gene),
+            ("pick_allele_gene", self.pick_allele_gene),
+            ("flag_pick", self.flag_pick),
+            ("flag_pick_allele", self.flag_pick_allele),
+            ("flag_pick_allele_gene", self.flag_pick_allele_gene),
+        ] {
+            if enabled {
+                opts.insert(key.into(), serde_json::Value::Bool(true));
+            }
         }
         if let Some(ref pick_order) = self.pick_order {
             opts.insert(
@@ -198,6 +223,10 @@ impl AnnotateVcfConfig {
         }
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
+
+    fn include_pick_output(&self) -> bool {
+        self.flag_pick || self.flag_pick_allele || self.flag_pick_allele_gene
+    }
 }
 
 fn csq_header_description(config: &AnnotateVcfConfig) -> String {
@@ -205,7 +234,7 @@ fn csq_header_description(config: &AnnotateVcfConfig) -> String {
         config.everything,
         config.refseq,
         config.merged,
-        config.flag_pick_allele_gene,
+        config.include_pick_output(),
     );
     let format_list = field_names.join("|");
     format!("Consequence annotations from annotate_vep. Format: {format_list}")
@@ -453,6 +482,12 @@ mod tests {
     fn test_to_options_json_emits_pick_flags() {
         let config = AnnotateVcfConfig {
             everything: true,
+            pick: true,
+            pick_allele: true,
+            per_gene: true,
+            pick_allele_gene: true,
+            flag_pick: true,
+            flag_pick_allele: true,
             flag_pick_allele_gene: true,
             pick_order: Some("mane_select,tsl,canonical".to_string()),
             ..Default::default()
@@ -460,6 +495,12 @@ mod tests {
 
         let json = config.to_options_json();
         assert!(json.contains("\"everything\":true"));
+        assert!(json.contains("\"pick\":true"));
+        assert!(json.contains("\"pick_allele\":true"));
+        assert!(json.contains("\"per_gene\":true"));
+        assert!(json.contains("\"pick_allele_gene\":true"));
+        assert!(json.contains("\"flag_pick\":true"));
+        assert!(json.contains("\"flag_pick_allele\":true"));
         assert!(json.contains("\"flag_pick_allele_gene\":true"));
         assert!(json.contains("\"pick_order\":\"mane_select,tsl,canonical\""));
     }
@@ -475,5 +516,17 @@ mod tests {
         let description = csq_header_description(&config);
         assert!(description.starts_with("Consequence annotations from annotate_vep. Format: "));
         assert!(description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
+    }
+
+    #[test]
+    fn test_csq_header_description_omits_pick_for_filter_modes() {
+        let config = AnnotateVcfConfig {
+            everything: true,
+            pick_allele_gene: true,
+            ..Default::default()
+        };
+
+        let description = csq_header_description(&config);
+        assert!(!description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
     }
 }

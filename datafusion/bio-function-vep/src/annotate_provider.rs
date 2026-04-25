@@ -1215,16 +1215,41 @@ impl PickCriterion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickMode {
+    None,
+    Pick,
+    PickAllele,
+    PerGene,
+    PickAlleleGene,
+    FlagPick,
+    FlagPickAllele,
+    FlagPickAlleleGene,
+}
+
+impl PickMode {
+    fn is_enabled(self) -> bool {
+        self != Self::None
+    }
+
+    fn is_flag(self) -> bool {
+        matches!(
+            self,
+            Self::FlagPick | Self::FlagPickAllele | Self::FlagPickAlleleGene
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PickFlags {
-    flag_pick_allele_gene: bool,
+    mode: PickMode,
     pick_order: Vec<PickCriterion>,
 }
 
 impl Default for PickFlags {
     fn default() -> Self {
         Self {
-            flag_pick_allele_gene: false,
+            mode: PickMode::None,
             // Traceability:
             // - Ensembl VEP release 115 default `pick_order`
             //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L300-L307>
@@ -1253,8 +1278,26 @@ impl PickFlags {
                 .unwrap_or(false)
         };
 
+        let mode = if parse("pick") {
+            PickMode::Pick
+        } else if parse("pick_allele") {
+            PickMode::PickAllele
+        } else if parse("per_gene") {
+            PickMode::PerGene
+        } else if parse("pick_allele_gene") {
+            PickMode::PickAlleleGene
+        } else if parse("flag_pick") {
+            PickMode::FlagPick
+        } else if parse("flag_pick_allele") {
+            PickMode::FlagPickAllele
+        } else if parse("flag_pick_allele_gene") {
+            PickMode::FlagPickAlleleGene
+        } else {
+            PickMode::None
+        };
+
         let mut out = Self {
-            flag_pick_allele_gene: parse("flag_pick_allele_gene"),
+            mode,
             ..Self::default()
         };
 
@@ -1263,6 +1306,7 @@ impl PickFlags {
         {
             let parsed: Vec<PickCriterion> = raw_order
                 .split(',')
+                .filter(|part| !part.trim().is_empty())
                 .map(PickCriterion::from_str)
                 .collect::<Result<Vec<_>>>()?;
             if parsed.is_empty() {
@@ -1277,7 +1321,11 @@ impl PickFlags {
     }
 
     fn requires_transcript_annotations(&self, skip_csq: bool, skip_typed_cols: bool) -> bool {
-        self.flag_pick_allele_gene && (!skip_csq || !skip_typed_cols)
+        self.mode.is_enabled() && (!skip_csq || !skip_typed_cols)
+    }
+
+    fn include_pick_output(&self) -> bool {
+        self.mode.is_flag()
     }
 }
 
@@ -2397,44 +2445,159 @@ fn pick_worst_assignment(
     candidates.first().map(|candidate| candidate.assignment_idx)
 }
 
-fn mark_flag_pick_allele_gene(
-    assignments: &mut [TranscriptConsequence],
+fn pick_assignment_allele_key<'a>(_tc: &'a TranscriptConsequence, row_allele: &'a str) -> &'a str {
+    row_allele
+}
+
+fn sort_pick_candidates_by_feature_id(
+    candidate_indices: &mut [usize],
+    assignments: &[TranscriptConsequence],
+    ctx: &PreparedContext<'_>,
+) {
+    candidate_indices.sort_by(|&a, &b| {
+        pick_assignment_feature_id(a, assignments, ctx).cmp(pick_assignment_feature_id(
+            b,
+            assignments,
+            ctx,
+        ))
+    });
+}
+
+fn insert_pick_winner(
+    selected: &mut HashSet<usize>,
+    candidate_indices: &mut [usize],
+    assignments: &[TranscriptConsequence],
     ctx: &PreparedContext<'_>,
     pick_flags: &PickFlags,
 ) {
-    if !pick_flags.flag_pick_allele_gene {
+    let Some(winner) =
+        pick_worst_assignment(candidate_indices, assignments, ctx, &pick_flags.pick_order)
+    else {
         return;
-    }
+    };
+    selected.insert(winner);
+}
 
-    let mut grouped: HashMap<String, Vec<usize>> = HashMap::new();
-    for idx in 0..assignments.len() {
-        if assignments[idx].feature_type != FeatureType::Transcript {
-            // VEP's per-gene picker returns non-transcript overlap alleles
-            // unchanged, and the flagging path marks every returned item.
-            assignments[idx].picked = true;
-            continue;
+fn select_pick_indices(
+    assignments: &[TranscriptConsequence],
+    ctx: &PreparedContext<'_>,
+    pick_flags: &PickFlags,
+    row_allele: &str,
+) -> HashSet<usize> {
+    let mut selected = HashSet::new();
+
+    match pick_flags.mode {
+        PickMode::None => {}
+        PickMode::Pick | PickMode::FlagPick => {
+            let mut candidates: Vec<usize> = (0..assignments.len()).collect();
+            insert_pick_winner(&mut selected, &mut candidates, assignments, ctx, pick_flags);
         }
-        let Some(gene_key) = pick_assignment_gene_key(&assignments[idx], ctx) else {
-            continue;
-        };
-        grouped.entry(gene_key).or_default().push(idx);
+        PickMode::PickAllele | PickMode::FlagPickAllele => {
+            let mut grouped: HashMap<String, Vec<usize>> = HashMap::new();
+            for (idx, assignment) in assignments.iter().enumerate() {
+                let allele = pick_assignment_allele_key(assignment, row_allele).to_string();
+                grouped.entry(allele).or_default().push(idx);
+            }
+            for candidate_indices in grouped.values_mut() {
+                insert_pick_winner(
+                    &mut selected,
+                    candidate_indices,
+                    assignments,
+                    ctx,
+                    pick_flags,
+                );
+            }
+        }
+        PickMode::PerGene => {
+            let mut grouped: HashMap<String, Vec<usize>> = HashMap::new();
+            for (idx, assignment) in assignments.iter().enumerate() {
+                if assignment.feature_type != FeatureType::Transcript {
+                    continue;
+                }
+                let Some(gene_key) = pick_assignment_gene_key(assignment, ctx) else {
+                    continue;
+                };
+                grouped.entry(gene_key).or_default().push(idx);
+            }
+            for candidate_indices in grouped.values_mut() {
+                sort_pick_candidates_by_feature_id(candidate_indices, assignments, ctx);
+                insert_pick_winner(
+                    &mut selected,
+                    candidate_indices,
+                    assignments,
+                    ctx,
+                    pick_flags,
+                );
+            }
+        }
+        PickMode::PickAlleleGene | PickMode::FlagPickAlleleGene => {
+            let mut grouped: HashMap<(String, String), Vec<usize>> = HashMap::new();
+            for (idx, assignment) in assignments.iter().enumerate() {
+                if assignment.feature_type != FeatureType::Transcript {
+                    continue;
+                }
+                let Some(gene_key) = pick_assignment_gene_key(assignment, ctx) else {
+                    continue;
+                };
+                let allele = pick_assignment_allele_key(assignment, row_allele).to_string();
+                grouped.entry((allele, gene_key)).or_default().push(idx);
+            }
+            for candidate_indices in grouped.values_mut() {
+                sort_pick_candidates_by_feature_id(candidate_indices, assignments, ctx);
+                insert_pick_winner(
+                    &mut selected,
+                    candidate_indices,
+                    assignments,
+                    ctx,
+                    pick_flags,
+                );
+            }
+        }
     }
 
-    for candidate_indices in grouped.values_mut() {
-        candidate_indices.sort_by(|&a, &b| {
-            pick_assignment_feature_id(a, assignments, ctx).cmp(pick_assignment_feature_id(
-                b,
-                assignments,
-                ctx,
-            ))
-        });
-        let Some(winner) =
-            pick_worst_assignment(candidate_indices, assignments, ctx, &pick_flags.pick_order)
-        else {
-            continue;
-        };
-        assignments[winner].picked = true;
+    selected
+}
+
+fn apply_pick_mode(
+    mut assignments: Vec<TranscriptConsequence>,
+    ctx: &PreparedContext<'_>,
+    pick_flags: &PickFlags,
+    row_allele: &str,
+) -> Vec<TranscriptConsequence> {
+    if !pick_flags.mode.is_enabled() {
+        return assignments;
     }
+
+    let selected = select_pick_indices(&assignments, ctx, pick_flags, row_allele);
+    if pick_flags.mode.is_flag() {
+        for (idx, assignment) in assignments.iter_mut().enumerate() {
+            if selected.contains(&idx)
+                || (pick_flags.mode == PickMode::FlagPickAlleleGene
+                    && assignment.feature_type != FeatureType::Transcript)
+            {
+                assignment.picked = true;
+            }
+        }
+        return assignments;
+    }
+
+    let retain_non_transcript = matches!(
+        pick_flags.mode,
+        PickMode::PerGene | PickMode::PickAlleleGene
+    );
+    assignments
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, assignment)| {
+            if selected.contains(&idx)
+                || (retain_non_transcript && assignment.feature_type != FeatureType::Transcript)
+            {
+                Some(assignment)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Compute miRNA CSQ field from ncRNA secondary structure and variant cDNA position.
@@ -2734,7 +2897,7 @@ impl AnnotateProvider {
         let transcript_selection =
             TranscriptSelectionFlags::from_options_json(options_json.as_deref())?;
         let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
-        let include_pick_output = pick_flags.flag_pick_allele_gene;
+        let include_pick_output = pick_flags.include_pick_output();
         let annotation_column_defs =
             annotation_column_defs_for_selection(transcript_selection, include_pick_output);
         // Output schema starts with all VCF columns and appends annotation fields.
@@ -4640,7 +4803,11 @@ impl AnnotateProvider {
                 }
                 let assignments = engine.evaluate_variant_prepared(&variant, ctx);
 
-                // Derive most_severe from all assignments.
+                // Derive the local scalar `most_severe_consequence` from all
+                // computed assignments, even when pick filtering later reduces
+                // emitted CSQ/typed entries. Ensembl VEP VCF output has no
+                // equivalent scalar field, so this preserves the existing
+                // annotate_vep API contract.
                 let mut all_terms =
                     TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
                 if all_terms.is_empty() {
@@ -4648,9 +4815,8 @@ impl AnnotateProvider {
                 }
                 let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
                 most_str = most.as_str().to_string();
-                row_assignments = assignments;
+                row_assignments = apply_pick_mode(assignments, ctx, pick_flags, &vep_allele);
                 row_variant = Some(variant);
-                mark_flag_pick_allele_gene(&mut row_assignments, ctx, pick_flags);
 
                 // Build VEP-compatible sorted permutation index.
                 // Used by both CSQ serialization and typed annotation columns
@@ -9036,7 +9202,7 @@ mod tests {
         ))
         .expect("pick flags should parse");
 
-        assert!(flags.flag_pick_allele_gene);
+        assert_eq!(flags.mode, PickMode::FlagPickAlleleGene);
         assert_eq!(
             flags.pick_order,
             vec![
@@ -9061,6 +9227,42 @@ mod tests {
         .to_string();
 
         assert!(err.contains("unsupported pick_order criterion 'bogus'"));
+    }
+
+    #[test]
+    fn test_pick_flags_default_mode_is_none() {
+        let flags = PickFlags::from_options_json(Some("{}")).expect("pick flags should parse");
+        assert_eq!(flags.mode, PickMode::None);
+        assert!(!flags.include_pick_output());
+    }
+
+    #[test]
+    fn test_pick_flags_use_vep_precedence() {
+        let flags = PickFlags::from_options_json(Some(
+            "{\"flag_pick_allele_gene\":true,\"flag_pick\":true,\"pick_allele\":true,\"pick\":true}",
+        ))
+        .expect("pick flags should parse");
+
+        assert_eq!(flags.mode, PickMode::Pick);
+        assert!(!flags.include_pick_output());
+
+        let flags = PickFlags::from_options_json(Some(
+            "{\"flag_pick_allele_gene\":true,\"flag_pick\":true}",
+        ))
+        .expect("pick flags should parse");
+        assert_eq!(flags.mode, PickMode::FlagPick);
+        assert!(flags.include_pick_output());
+    }
+
+    #[test]
+    fn test_pick_flags_reject_empty_pick_order() {
+        let err = PickFlags::from_options_json(Some(
+            "{\"flag_pick_allele_gene\":true,\"pick_order\":\" , \"}",
+        ))
+        .expect_err("empty pick_order should fail")
+        .to_string();
+
+        assert!(err.contains("pick_order must contain at least one criterion"));
     }
 
     #[test]
@@ -9091,7 +9293,7 @@ mod tests {
     #[test]
     fn test_mark_flag_pick_allele_gene_marks_non_transcript_assignments() {
         let ctx = PreparedContext::new(&[], &[], &[], &[], &[], &[], &[]);
-        let mut assignments = vec![
+        let assignments = vec![
             TranscriptConsequence {
                 feature_type: FeatureType::RegulatoryFeature,
                 terms: vec![SoTerm::RegulatoryRegionVariant],
@@ -9109,16 +9311,154 @@ mod tests {
             },
         ];
 
-        mark_flag_pick_allele_gene(
-            &mut assignments,
+        let assignments = apply_pick_mode(
+            assignments,
             &ctx,
             &PickFlags {
-                flag_pick_allele_gene: true,
+                mode: PickMode::FlagPickAlleleGene,
                 pick_order: vec![PickCriterion::Rank],
             },
+            "A",
         );
 
         assert!(assignments.iter().all(|assignment| assignment.picked));
+    }
+
+    #[test]
+    fn test_apply_pick_mode_filters_variant_and_allele_modes() {
+        let mut tx_a = make_tx("ENST00000051", None, Some("GENE1"), Some("HGNC"), None);
+        tx_a.biotype = "protein_coding".to_string();
+        tx_a.is_canonical = false;
+
+        let mut tx_b = make_tx("ENST00000052", None, Some("GENE1"), Some("HGNC"), None);
+        tx_b.biotype = "protein_coding".to_string();
+        tx_b.is_canonical = true;
+
+        let transcripts = vec![tx_a, tx_b];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        for mode in [PickMode::Pick, PickMode::PickAllele] {
+            let picked = apply_pick_mode(
+                assignments.clone(),
+                &ctx,
+                &PickFlags {
+                    mode,
+                    pick_order: vec![PickCriterion::Canonical],
+                },
+                "A",
+            );
+            assert_eq!(picked.len(), 1);
+            assert_eq!(picked[0].transcript_idx, Some(1));
+            assert!(!picked[0].picked);
+        }
+    }
+
+    #[test]
+    fn test_apply_pick_mode_filters_per_gene_modes_and_retains_non_transcripts() {
+        let mut tx_a = make_tx("ENST00000061", Some("GENE1"), Some("HGNC"), None, None);
+        tx_a.biotype = "protein_coding".to_string();
+        tx_a.is_canonical = false;
+
+        let mut tx_b = make_tx("ENST00000062", Some("GENE1"), Some("HGNC"), None, None);
+        tx_b.biotype = "protein_coding".to_string();
+        tx_b.is_canonical = true;
+
+        let mut tx_c = make_tx("ENST00000063", Some("GENE2"), Some("HGNC"), None, None);
+        tx_c.biotype = "protein_coding".to_string();
+
+        let transcripts = vec![tx_a, tx_b, tx_c];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(2),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                feature_type: FeatureType::RegulatoryFeature,
+                terms: vec![SoTerm::RegulatoryRegionVariant],
+                ..Default::default()
+            },
+        ];
+
+        for mode in [PickMode::PerGene, PickMode::PickAlleleGene] {
+            let picked = apply_pick_mode(
+                assignments.clone(),
+                &ctx,
+                &PickFlags {
+                    mode,
+                    pick_order: vec![PickCriterion::Canonical],
+                },
+                "A",
+            );
+            assert_eq!(picked.len(), 3);
+            assert_eq!(picked[0].transcript_idx, Some(1));
+            assert_eq!(picked[1].transcript_idx, Some(2));
+            assert_eq!(picked[2].feature_type, FeatureType::RegulatoryFeature);
+        }
+    }
+
+    #[test]
+    fn test_apply_pick_mode_marks_flag_modes_without_filtering() {
+        let mut tx_a = make_tx("ENST00000071", Some("GENE1"), Some("HGNC"), None, None);
+        tx_a.biotype = "protein_coding".to_string();
+        tx_a.is_canonical = false;
+
+        let mut tx_b = make_tx("ENST00000072", Some("GENE1"), Some("HGNC"), None, None);
+        tx_b.biotype = "protein_coding".to_string();
+        tx_b.is_canonical = true;
+
+        let transcripts = vec![tx_a, tx_b];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        for mode in [PickMode::FlagPick, PickMode::FlagPickAllele] {
+            let picked = apply_pick_mode(
+                assignments.clone(),
+                &ctx,
+                &PickFlags {
+                    mode,
+                    pick_order: vec![PickCriterion::Canonical],
+                },
+                "A",
+            );
+            assert_eq!(picked.len(), 2);
+            assert!(!picked[0].picked);
+            assert!(picked[1].picked);
+        }
     }
 
     #[test]
@@ -9133,7 +9473,7 @@ mod tests {
 
         let transcripts = vec![tx_b, tx_a];
         let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
-        let mut assignments = vec![
+        let assignments = vec![
             TranscriptConsequence {
                 transcript_idx: Some(1),
                 feature_type: FeatureType::Transcript,
@@ -9148,13 +9488,14 @@ mod tests {
             },
         ];
 
-        mark_flag_pick_allele_gene(
-            &mut assignments,
+        let assignments = apply_pick_mode(
+            assignments,
             &ctx,
             &PickFlags {
-                flag_pick_allele_gene: true,
+                mode: PickMode::FlagPickAlleleGene,
                 pick_order: vec![PickCriterion::Rank],
             },
+            "A",
         );
 
         assert!(!assignments[0].picked);
@@ -9177,7 +9518,7 @@ mod tests {
 
         let transcripts = vec![tx_havana, tx_ensembl];
         let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
-        let mut assignments = vec![
+        let assignments = vec![
             TranscriptConsequence {
                 transcript_idx: Some(0),
                 feature_type: FeatureType::Transcript,
@@ -9190,13 +9531,14 @@ mod tests {
             },
         ];
 
-        mark_flag_pick_allele_gene(
-            &mut assignments,
+        let assignments = apply_pick_mode(
+            assignments,
             &ctx,
             &PickFlags {
-                flag_pick_allele_gene: true,
+                mode: PickMode::FlagPickAlleleGene,
                 pick_order: vec![PickCriterion::Ensembl],
             },
+            "A",
         );
 
         assert!(!assignments[0].picked);
@@ -9241,7 +9583,7 @@ mod tests {
             },
         ];
         let ctx = PreparedContext::new(&transcripts, &[], &translations, &[], &[], &[], &[]);
-        let mut assignments = vec![
+        let assignments = vec![
             TranscriptConsequence {
                 transcript_idx: Some(0),
                 feature_type: FeatureType::Transcript,
@@ -9254,13 +9596,14 @@ mod tests {
             },
         ];
 
-        mark_flag_pick_allele_gene(
-            &mut assignments,
+        let assignments = apply_pick_mode(
+            assignments,
             &ctx,
             &PickFlags {
-                flag_pick_allele_gene: true,
+                mode: PickMode::FlagPickAlleleGene,
                 pick_order: vec![PickCriterion::Length],
             },
+            "A",
         );
 
         assert!(!assignments[0].picked);
@@ -9300,7 +9643,7 @@ mod tests {
             },
         ];
         let ctx = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
-        let mut assignments = vec![
+        let assignments = vec![
             TranscriptConsequence {
                 transcript_idx: Some(0),
                 feature_type: FeatureType::Transcript,
@@ -9313,13 +9656,14 @@ mod tests {
             },
         ];
 
-        mark_flag_pick_allele_gene(
-            &mut assignments,
+        let assignments = apply_pick_mode(
+            assignments,
             &ctx,
             &PickFlags {
-                flag_pick_allele_gene: true,
+                mode: PickMode::FlagPickAlleleGene,
                 pick_order: vec![PickCriterion::Length],
             },
+            "A",
         );
 
         assert!(!assignments[0].picked);
@@ -9338,7 +9682,7 @@ mod tests {
 
         let transcripts = vec![tx_a, tx_b];
         let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
-        let mut assignments = vec![
+        let assignments = vec![
             TranscriptConsequence {
                 transcript_idx: Some(0),
                 feature_type: FeatureType::Transcript,
@@ -9351,13 +9695,14 @@ mod tests {
             },
         ];
 
-        mark_flag_pick_allele_gene(
-            &mut assignments,
+        let assignments = apply_pick_mode(
+            assignments,
             &ctx,
             &PickFlags {
-                flag_pick_allele_gene: true,
+                mode: PickMode::FlagPickAlleleGene,
                 pick_order: vec![PickCriterion::Canonical],
             },
+            "A",
         );
 
         assert!(!assignments[0].picked);
