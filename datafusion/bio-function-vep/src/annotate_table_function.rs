@@ -177,7 +177,9 @@ mod tests {
     #[cfg(feature = "kv-cache")]
     use crate::kv_cache::{VepKvStore, position_entry::serialize_position_entry};
     use crate::so_terms::SoTerm;
-    use datafusion::arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
+    use datafusion::arrow::array::{
+        Array, Float64Array, Int64Array, ListArray, RecordBatch, StringArray,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::MemTable;
     use parquet::arrow::ArrowWriter;
@@ -1601,6 +1603,62 @@ mod tests {
             .collect()
     }
 
+    fn list_string_values(
+        batch: &RecordBatch,
+        column_name: &str,
+        row: usize,
+    ) -> Vec<Option<String>> {
+        let list = batch
+            .column_by_name(column_name)
+            .unwrap_or_else(|| panic!("column {column_name} should exist"))
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap_or_else(|| panic!("column {column_name} should be ListArray"));
+        if list.is_null(row) {
+            return Vec::new();
+        }
+        let values = list.value(row);
+        let strings = values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("column {column_name} values should be StringArray"));
+        (0..strings.len())
+            .map(|idx| {
+                if strings.is_null(idx) {
+                    None
+                } else {
+                    Some(strings.value(idx).to_string())
+                }
+            })
+            .collect()
+    }
+
+    fn list_i64_values(batch: &RecordBatch, column_name: &str, row: usize) -> Vec<Option<i64>> {
+        let list = batch
+            .column_by_name(column_name)
+            .unwrap_or_else(|| panic!("column {column_name} should exist"))
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap_or_else(|| panic!("column {column_name} should be ListArray"));
+        if list.is_null(row) {
+            return Vec::new();
+        }
+        let values = list.value(row);
+        let ints = values
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap_or_else(|| panic!("column {column_name} values should be Int64Array"));
+        (0..ints.len())
+            .map(|idx| {
+                if ints.is_null(idx) {
+                    None
+                } else {
+                    Some(ints.value(idx))
+                }
+            })
+            .collect()
+    }
+
     fn find_csq_entry<'a>(csq: &'a str, feature_type: &str, feature: &str) -> Vec<&'a str> {
         csq_entries(csq)
             .into_iter()
@@ -2861,6 +2919,135 @@ mod tests {
         assert_eq!(merged_entry[31], "A");
         assert_eq!(merged_entry[32], "A");
         assert_eq!(merged_entry[33], "OK");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_refseq_and_merged_modes_expose_typed_columns() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_refseq_schema", Arc::new(refseq_vcf_table()))
+            .expect("register refseq vcf table");
+        let tmpdir = TempDir::new().expect("create tmpdir");
+        write_batch_to_cache(&tmpdir, "variation", &refseq_cache_batch());
+        write_batch_to_cache(&tmpdir, "transcript", &refseq_transcripts_batch());
+        write_batch_to_chrom(&tmpdir, "exon", "1", &refseq_exons_batch());
+        let cache_path = tmpdir.path().display().to_string();
+
+        let default_sql = format!(
+            "SELECT * FROM annotate_vep('vcf_refseq_schema', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
+        );
+        let default_batches = ctx
+            .sql(&default_sql)
+            .await
+            .expect("default query should parse")
+            .collect()
+            .await
+            .expect("collect default annotate_vep");
+        let default_schema = default_batches[0].schema();
+        for col_name in [
+            "REFSEQ_MATCH",
+            "SOURCE",
+            "REFSEQ_OFFSET",
+            "GIVEN_REF",
+            "USED_REF",
+            "BAM_EDIT",
+        ] {
+            assert!(
+                default_schema.index_of(col_name).is_err(),
+                "default schema should not expose {col_name}"
+            );
+        }
+
+        let refseq_sql = format!(
+            "SELECT * FROM annotate_vep('vcf_refseq_schema', '{cache_path}', 'parquet', '{{\"partitioned\":true,\"refseq\":true}}')"
+        );
+        let refseq_batches = ctx
+            .sql(&refseq_sql)
+            .await
+            .expect("refseq query should parse")
+            .collect()
+            .await
+            .expect("collect refseq annotate_vep");
+        let refseq_schema = refseq_batches[0].schema();
+        assert_eq!(
+            refseq_schema.fields().len(),
+            default_schema.fields().len() + 5
+        );
+        for col_name in [
+            "REFSEQ_MATCH",
+            "REFSEQ_OFFSET",
+            "GIVEN_REF",
+            "USED_REF",
+            "BAM_EDIT",
+        ] {
+            assert!(
+                refseq_schema.index_of(col_name).is_ok(),
+                "refseq schema should expose {col_name}"
+            );
+        }
+        assert!(
+            refseq_schema.index_of("SOURCE").is_err(),
+            "refseq-only schema should not expose SOURCE"
+        );
+
+        let merged_sql = format!(
+            "SELECT * FROM annotate_vep('vcf_refseq_schema', '{cache_path}', 'parquet', '{{\"partitioned\":true,\"merged\":true}}')"
+        );
+        let merged_batches = ctx
+            .sql(&merged_sql)
+            .await
+            .expect("merged query should parse")
+            .collect()
+            .await
+            .expect("collect merged annotate_vep");
+        let merged_batch = &merged_batches[0];
+        let merged_schema = merged_batch.schema();
+        assert_eq!(
+            merged_schema.fields().len(),
+            default_schema.fields().len() + 6
+        );
+        for col_name in [
+            "REFSEQ_MATCH",
+            "SOURCE",
+            "REFSEQ_OFFSET",
+            "GIVEN_REF",
+            "USED_REF",
+            "BAM_EDIT",
+        ] {
+            assert!(
+                merged_schema.index_of(col_name).is_ok(),
+                "merged schema should expose {col_name}"
+            );
+        }
+
+        let feature_values = list_string_values(merged_batch, "Feature", 0);
+        let tx_idx = feature_values
+            .iter()
+            .position(|value| value.as_deref() == Some("NM_000001"))
+            .expect("merged typed Feature list should contain NM_000001");
+        assert_eq!(
+            list_string_values(merged_batch, "REFSEQ_MATCH", 0)[tx_idx].as_deref(),
+            Some("rseq_ens_match_cds")
+        );
+        assert_eq!(
+            list_string_values(merged_batch, "SOURCE", 0)[tx_idx].as_deref(),
+            Some("RefSeq")
+        );
+        assert_eq!(
+            list_i64_values(merged_batch, "REFSEQ_OFFSET", 0)[tx_idx],
+            None
+        );
+        assert_eq!(
+            list_string_values(merged_batch, "GIVEN_REF", 0)[tx_idx].as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            list_string_values(merged_batch, "USED_REF", 0)[tx_idx].as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            list_string_values(merged_batch, "BAM_EDIT", 0)[tx_idx].as_deref(),
+            Some("OK")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

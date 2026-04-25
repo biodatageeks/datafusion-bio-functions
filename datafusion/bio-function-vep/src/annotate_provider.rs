@@ -127,14 +127,23 @@ struct AnnotationColumnDef {
     cache_col: Option<&'static str>,
 }
 
-/// Full annotation output column definitions (87 columns, excluding csq and most_severe_consequence).
+fn list_utf8_data_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+}
+
+fn list_i8_data_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Int8, true)))
+}
+
+fn list_i64_data_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+}
+
+/// Full default annotation output column definitions (87 columns, excluding csq and most_severe_consequence).
 ///
 /// Order matches the README schema: transcript-level (42), frequency (29), variant-level (9), cache-only (7).
 fn annotation_column_defs() -> Vec<AnnotationColumnDef> {
     use AnnotationCategory::*;
-    let list_utf8 = || DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
-    let list_i8 = || DataType::List(Arc::new(Field::new("item", DataType::Int8, true)));
-    let list_i64 = || DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
     vec![
         // ── Transcript-level (42) ──
         AnnotationColumnDef {
@@ -145,121 +154,121 @@ fn annotation_column_defs() -> Vec<AnnotationColumnDef> {
         },
         AnnotationColumnDef {
             name: "Consequence",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "IMPACT",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "SYMBOL",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "Gene",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "Feature_type",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "Feature",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "BIOTYPE",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "EXON",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "INTRON",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "HGVSc",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "HGVSp",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "cDNA_position",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "CDS_position",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "Protein_position",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "Amino_acids",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "Codons",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "Existing_variation",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "DISTANCE",
-            data_type: list_i64(),
+            data_type: list_i64_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "STRAND",
-            data_type: list_i8(),
+            data_type: list_i8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "FLAGS",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
@@ -271,121 +280,121 @@ fn annotation_column_defs() -> Vec<AnnotationColumnDef> {
         },
         AnnotationColumnDef {
             name: "SYMBOL_SOURCE",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "HGNC_ID",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "CANONICAL",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "MANE",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "MANE_SELECT",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "MANE_PLUS_CLINICAL",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "TSL",
-            data_type: list_i8(),
+            data_type: list_i8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "APPRIS",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "CCDS",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "ENSP",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "SWISSPROT",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "TREMBL",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "UNIPARC",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "UNIPROT_ISOFORM",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "GENE_PHENO",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "SIFT",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "PolyPhen",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "DOMAINS",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "miRNA",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Transcript,
             cache_col: None,
         },
         AnnotationColumnDef {
             name: "HGVS_OFFSET",
-            data_type: list_i64(),
+            data_type: list_i64_data_type(),
             category: Transcript,
             cache_col: None,
         },
@@ -567,7 +576,7 @@ fn annotation_column_defs() -> Vec<AnnotationColumnDef> {
         // ── Variant-level (9) ──
         AnnotationColumnDef {
             name: "CLIN_SIG",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Variant,
             cache_col: None,
         },
@@ -585,7 +594,7 @@ fn annotation_column_defs() -> Vec<AnnotationColumnDef> {
         },
         AnnotationColumnDef {
             name: "PUBMED",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Variant,
             cache_col: None,
         },
@@ -615,14 +624,14 @@ fn annotation_column_defs() -> Vec<AnnotationColumnDef> {
         },
         AnnotationColumnDef {
             name: "TRANSCRIPTION_FACTORS",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: Variant,
             cache_col: None,
         },
         // ── Cache-only (7) ──
         AnnotationColumnDef {
             name: "clin_sig_allele",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: CacheOnly,
             cache_col: Some("clin_sig_allele"),
         },
@@ -646,23 +655,85 @@ fn annotation_column_defs() -> Vec<AnnotationColumnDef> {
         },
         AnnotationColumnDef {
             name: "clinvar_ids",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: CacheOnly,
             cache_col: Some("clinvar_ids"),
         },
         AnnotationColumnDef {
             name: "cosmic_ids",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: CacheOnly,
             cache_col: Some("cosmic_ids"),
         },
         AnnotationColumnDef {
             name: "dbsnp_ids",
-            data_type: list_utf8(),
+            data_type: list_utf8_data_type(),
             category: CacheOnly,
             cache_col: Some("dbsnp_ids"),
         },
     ]
+}
+
+fn refseq_annotation_column_defs(include_source: bool) -> Vec<AnnotationColumnDef> {
+    use AnnotationCategory::Transcript;
+
+    let mut defs = annotation_column_defs();
+    let insert_at = defs
+        .iter()
+        .position(|def| def.name == "GENE_PHENO")
+        .unwrap_or(defs.len());
+    let mut refseq_defs = vec![AnnotationColumnDef {
+        name: "REFSEQ_MATCH",
+        data_type: list_utf8_data_type(),
+        category: Transcript,
+        cache_col: None,
+    }];
+    if include_source {
+        refseq_defs.push(AnnotationColumnDef {
+            name: "SOURCE",
+            data_type: list_utf8_data_type(),
+            category: Transcript,
+            cache_col: None,
+        });
+    }
+    refseq_defs.extend([
+        AnnotationColumnDef {
+            name: "REFSEQ_OFFSET",
+            data_type: list_i64_data_type(),
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "GIVEN_REF",
+            data_type: list_utf8_data_type(),
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "USED_REF",
+            data_type: list_utf8_data_type(),
+            category: Transcript,
+            cache_col: None,
+        },
+        AnnotationColumnDef {
+            name: "BAM_EDIT",
+            data_type: list_utf8_data_type(),
+            category: Transcript,
+            cache_col: None,
+        },
+    ]);
+    defs.splice(insert_at..insert_at, refseq_defs);
+    defs
+}
+
+fn annotation_column_defs_for_selection(
+    transcript_selection: TranscriptSelectionFlags,
+) -> Vec<AnnotationColumnDef> {
+    if transcript_selection.refseq_fields() {
+        refseq_annotation_column_defs(transcript_selection.source_field())
+    } else {
+        annotation_column_defs()
+    }
 }
 
 /// Returns the list of cache column names needed for the variation lookup query.
@@ -719,10 +790,6 @@ pub fn cache_lookup_column_names() -> Vec<&'static str> {
         "dbsnp_ids",
     ]
 }
-
-/// Number of annotation columns appended after VCF fields by `AnnotateProvider::new`:
-/// `csq` + `most_severe_consequence` + 87 structured annotation columns.
-const ANNOTATION_COLUMN_COUNT: usize = 89;
 
 /// AF column definition: how to read, emit, and name each frequency population.
 struct AfColumn {
@@ -2182,6 +2249,7 @@ pub struct AnnotateProvider {
     cache_source: String,
     backend: AnnotationBackend,
     options_json: Option<String>,
+    annotation_column_defs: Vec<AnnotationColumnDef>,
     schema: SchemaRef,
 }
 
@@ -2194,11 +2262,11 @@ impl AnnotateProvider {
         options_json: Option<String>,
         vcf_schema: Schema,
     ) -> Self {
-        debug_assert_eq!(
-            annotation_column_defs().len() + 2,
-            ANNOTATION_COLUMN_COUNT,
-            "ANNOTATION_COLUMN_COUNT out of sync with annotation_column_defs()"
-        );
+        let transcript_selection =
+            TranscriptSelectionFlags::from_options_json(options_json.as_deref())
+                .unwrap_or_default();
+        let annotation_column_defs = annotation_column_defs_for_selection(transcript_selection);
+
         // Output schema starts with all VCF columns and appends annotation fields.
         let mut fields: Vec<Arc<Field>> = vcf_schema
             .fields()
@@ -2218,7 +2286,7 @@ impl AnnotateProvider {
             DataType::Utf8,
             true,
         )));
-        for col_def in annotation_column_defs() {
+        for col_def in &annotation_column_defs {
             fields.push(Arc::new(Field::new(
                 col_def.name,
                 col_def.data_type.clone(),
@@ -2232,6 +2300,7 @@ impl AnnotateProvider {
             cache_source,
             backend,
             options_json,
+            annotation_column_defs,
             schema: Arc::new(Schema::new(fields)),
         }
     }
@@ -2244,7 +2313,11 @@ impl AnnotateProvider {
         self.schema
             .fields()
             .len()
-            .saturating_sub(ANNOTATION_COLUMN_COUNT)
+            .saturating_sub(self.annotation_column_count())
+    }
+
+    fn annotation_column_count(&self) -> usize {
+        self.annotation_column_defs.len() + 2
     }
 
     fn vcf_field_names(&self) -> Vec<String> {
@@ -3614,6 +3687,7 @@ impl AnnotateProvider {
             downstream_distance,
             input_buffer_size,
             projection: projection.cloned(),
+            annotation_column_count: self.annotation_column_count(),
             fetch_limit,
             #[cfg(feature = "kv-cache")]
             use_fjall: kv_store.is_some(),
@@ -3741,6 +3815,12 @@ impl AnnotateProvider {
         let mut b_trembl = ListBuilder::new(StringBuilder::new());
         let mut b_uniparc = ListBuilder::new(StringBuilder::new());
         let mut b_uniprot_isoform = ListBuilder::new(StringBuilder::new());
+        let mut b_refseq_match = ListBuilder::new(StringBuilder::new());
+        let mut b_source = ListBuilder::new(StringBuilder::new());
+        let mut b_refseq_offset = ListBuilder::new(Int64Builder::new());
+        let mut b_given_ref = ListBuilder::new(StringBuilder::new());
+        let mut b_used_ref = ListBuilder::new(StringBuilder::new());
+        let mut b_bam_edit = ListBuilder::new(StringBuilder::new());
         let mut b_gene_pheno = ListBuilder::new(StringBuilder::new());
         let mut b_sift = ListBuilder::new(StringBuilder::new());
         let mut b_polyphen = ListBuilder::new(StringBuilder::new());
@@ -3775,8 +3855,10 @@ impl AnnotateProvider {
         let mut b_clinvar_ids = ListBuilder::new(StringBuilder::new());
         let mut b_cosmic_ids = ListBuilder::new(StringBuilder::new());
         let mut b_dbsnp_ids = ListBuilder::new(StringBuilder::new());
+        let include_refseq_fields = transcript_selection.refseq_fields();
+        let include_source_field = transcript_selection.source_field();
 
-        /// Append NULL to all 87 annotation column builders.
+        /// Append NULL to all annotation column builders for the selected mode.
         macro_rules! append_null_annotation_row {
             () => {
                 b_allele.append_null();
@@ -3815,6 +3897,16 @@ impl AnnotateProvider {
                 b_trembl.append(false);
                 b_uniparc.append(false);
                 b_uniprot_isoform.append(false);
+                if include_refseq_fields {
+                    b_refseq_match.append(false);
+                    if include_source_field {
+                        b_source.append(false);
+                    }
+                    b_refseq_offset.append(false);
+                    b_given_ref.append(false);
+                    b_used_ref.append(false);
+                    b_bam_edit.append(false);
+                }
                 b_gene_pheno.append(false);
                 b_sift.append(false);
                 b_polyphen.append(false);
@@ -3855,8 +3947,6 @@ impl AnnotateProvider {
         // Reusable permutation index for VEP-compatible CSQ ordering.
         // Allocated once, reused across all rows in the batch.
         let mut sorted_indices: Vec<usize> = Vec::new();
-        let include_refseq_fields = transcript_selection.refseq_fields();
-        let include_source_field = transcript_selection.source_field();
         let placeholder_layout =
             CsqPlaceholderLayout::for_mode(flags.everything, transcript_selection);
 
@@ -4178,7 +4268,7 @@ impl AnnotateProvider {
                             .map(str::to_ascii_uppercase)
                             .unwrap_or_default();
                         let source_val = if include_source_field { source } else { "" };
-                        let refseq_offset = tx_opt
+                        let refseq_offset_value = tx_opt
                             .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
                             .and_then(|tx| {
                                 tc.cdna_position
@@ -4187,7 +4277,8 @@ impl AnnotateProvider {
                                     .and_then(|cdna_start| {
                                         refseq_misalignment_offset(tx, cdna_start)
                                     })
-                            })
+                            });
+                        let refseq_offset = refseq_offset_value
                             .map(|offset| offset.to_string())
                             .unwrap_or_default();
                         let given_ref = tc.given_ref.as_deref().unwrap_or("");
@@ -4471,6 +4562,26 @@ impl AnnotateProvider {
                     for &si in &sorted_indices {
                         let tc = &row_assignments[si];
                         let tx_opt = tc.transcript_idx.map(|idx| &ctx.transcripts[idx]);
+                        let refseq_match = tx_opt
+                            .and_then(|tx| tx.refseq_match.as_deref())
+                            .unwrap_or("");
+                        let source_val = tx_opt.and_then(|tx| tx.source.as_deref()).unwrap_or("");
+                        let refseq_offset_value = tx_opt
+                            .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
+                            .and_then(|tx| {
+                                tc.cdna_position
+                                    .as_deref()
+                                    .and_then(parse_cdna_position_start)
+                                    .and_then(|cdna_start| {
+                                        refseq_misalignment_offset(tx, cdna_start)
+                                    })
+                            });
+                        let given_ref = tc.given_ref.as_deref().unwrap_or("");
+                        let used_ref = tc.used_ref.as_deref().unwrap_or("");
+                        let bam_edit = tx_opt
+                            .and_then(|tx| tx.bam_edit_status.as_deref())
+                            .map(str::to_ascii_uppercase)
+                            .unwrap_or_default();
 
                         // Consequence: "&"-joined terms for this transcript
                         {
@@ -4670,6 +4781,20 @@ impl AnnotateProvider {
                             tx_opt.and_then(|tx| tx.uniprot_isoform.as_deref()),
                         );
 
+                        if include_refseq_fields {
+                            append_opt_str(b_refseq_match.values(), Some(refseq_match));
+                            if include_source_field {
+                                append_opt_str(b_source.values(), Some(source_val));
+                            }
+                            match refseq_offset_value {
+                                Some(offset) => b_refseq_offset.values().append_value(offset),
+                                None => b_refseq_offset.values().append_null(),
+                            }
+                            append_opt_str(b_given_ref.values(), Some(given_ref));
+                            append_opt_str(b_used_ref.values(), Some(used_ref));
+                            append_opt_str(b_bam_edit.values(), Some(bam_edit.as_str()));
+                        }
+
                         // GENE_PHENO
                         match tx_opt {
                             Some(tx) if tx.gene_phenotype => {
@@ -4824,6 +4949,16 @@ impl AnnotateProvider {
                     b_trembl.append(true);
                     b_uniparc.append(true);
                     b_uniprot_isoform.append(true);
+                    if include_refseq_fields {
+                        b_refseq_match.append(true);
+                        if include_source_field {
+                            b_source.append(true);
+                        }
+                        b_refseq_offset.append(true);
+                        b_given_ref.append(true);
+                        b_used_ref.append(true);
+                        b_bam_edit.append(true);
+                    }
                     b_gene_pheno.append(true);
                     b_sift.append(true);
                     b_polyphen.append(true);
@@ -5054,7 +5189,8 @@ impl AnnotateProvider {
         } // end per-row loop
 
         // --- Build output columns ---
-        let mut out_cols = Vec::with_capacity(self.vcf_field_count() + ANNOTATION_COLUMN_COUNT);
+        let mut out_cols =
+            Vec::with_capacity(self.vcf_field_count() + self.annotation_column_count());
         for name in self.vcf_field_names() {
             let idx = schema.index_of(&name).map_err(|_| {
                 DataFusionError::Execution(format!(
@@ -5068,7 +5204,7 @@ impl AnnotateProvider {
 
         // 87 typed annotation columns — skip building when not projected.
         if skip_typed_cols {
-            for col_def in annotation_column_defs() {
+            for col_def in &self.annotation_column_defs {
                 out_cols.push(new_null_array(&col_def.data_type, batch.num_rows()));
             }
         } else {
@@ -5109,6 +5245,16 @@ impl AnnotateProvider {
             out_cols.push(Arc::new(b_trembl.finish()));
             out_cols.push(Arc::new(b_uniparc.finish()));
             out_cols.push(Arc::new(b_uniprot_isoform.finish()));
+            if include_refseq_fields {
+                out_cols.push(Arc::new(b_refseq_match.finish()));
+                if include_source_field {
+                    out_cols.push(Arc::new(b_source.finish()));
+                }
+                out_cols.push(Arc::new(b_refseq_offset.finish()));
+                out_cols.push(Arc::new(b_given_ref.finish()));
+                out_cols.push(Arc::new(b_used_ref.finish()));
+                out_cols.push(Arc::new(b_bam_edit.finish()));
+            }
             out_cols.push(Arc::new(b_gene_pheno.finish()));
             out_cols.push(Arc::new(b_sift.finish()));
             out_cols.push(Arc::new(b_polyphen.finish()));
@@ -6604,6 +6750,7 @@ struct ContigAnnotationConfig {
     downstream_distance: i64,
     input_buffer_size: usize,
     projection: Option<Vec<usize>>,
+    annotation_column_count: usize,
     /// Maximum number of output rows (LIMIT pushdown).
     fetch_limit: Option<usize>,
     /// When true, use fjall KV store for variation lookup + SIFT instead of parquet.
@@ -7395,7 +7542,7 @@ fn annotate_window(
     let csq_col_idx = ann.tmp_provider.vcf_field_count();
     let skip_csq = projection.is_some_and(|indices| !indices.contains(&csq_col_idx));
     let typed_cols_start = csq_col_idx + 2;
-    let typed_cols_end = typed_cols_start + annotation_column_defs().len();
+    let typed_cols_end = typed_cols_start + ann.tmp_provider.annotation_column_defs.len();
     let skip_typed_cols = projection.map_or(false, |indices| {
         !indices
             .iter()
@@ -7607,7 +7754,7 @@ impl Stream for ContigAnnotationStream {
                         let vcf_field_count = full_schema
                             .fields()
                             .len()
-                            .saturating_sub(ANNOTATION_COLUMN_COUNT);
+                            .saturating_sub(config.annotation_column_count);
                         let vcf_only_schema =
                             Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
 
@@ -7958,7 +8105,7 @@ async fn prepare_contig_context(
     let vcf_field_count = full_schema
         .fields()
         .len()
-        .saturating_sub(ANNOTATION_COLUMN_COUNT);
+        .saturating_sub(config.annotation_column_count);
     let vcf_only_schema = Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
 
     // 1. Register ALL ephemeral tables upfront (variation + context).
