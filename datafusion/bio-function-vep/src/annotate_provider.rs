@@ -4953,14 +4953,14 @@ impl AnnotateProvider {
                             };
                             let source_block = if include_source_field {
                                 format!(
-                                    "||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                    "|||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
                                 )
                             } else if include_refseq_fields {
                                 format!(
-                                    "||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                    "|||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
                                 )
                             } else {
-                                format!("||||{source_val}")
+                                format!("|||||{source_val}")
                             };
                             let _ = write!(
                                 csq_buf,
