@@ -36,16 +36,16 @@
 
 ## 5. Downstream vepyr Integration
 
-- [ ] 5.1 Update `/Users/mwiewior/research/git/vepyr` dependency pin after upstream commit lands
-- [ ] 5.2 Add `pick`, `pick_allele`, `per_gene`, `pick_allele_gene`, `flag_pick`, and `flag_pick_allele` parameters to `vepyr.annotate`
-- [ ] 5.3 Keep existing `flag_pick_allele_gene` and `pick_order` downstream API behavior
-- [ ] 5.4 Pass all new parameters through to `AnnotateVcfConfig`
-- [ ] 5.5 Add or update downstream tests/checks for Python API parameter forwarding
+- [x] 5.1 Update `/Users/mwiewior/research/git/vepyr` dependency pin after upstream commit lands
+- [x] 5.2 Add `pick`, `pick_allele`, `per_gene`, `pick_allele_gene`, `flag_pick`, and `flag_pick_allele` parameters to `vepyr.annotate`
+- [x] 5.3 Keep existing `flag_pick_allele_gene` and `pick_order` downstream API behavior
+- [x] 5.4 Pass all new parameters through to `AnnotateVcfConfig`
+- [x] 5.5 Add or update downstream tests/checks for Python API parameter forwarding
 
 ## 6. E2E Validation
 
-- [ ] 6.1 Add `run_annotation_fast.py` cache profiles for at least `merged_pick`, `merged_pick_allele`, `merged_per_gene`, and `merged_pick_allele_gene`
-- [ ] 6.2 Document that the fast e2e runner normalizes input with `bcftools norm -m -both`
+- [x] 6.1 Add `run_annotation_fast.py` cache profiles for at least `merged_pick`, `merged_pick_allele`, `merged_per_gene`, and `merged_pick_allele_gene`
+- [x] 6.2 Document that the fast e2e runner normalizes input with `bcftools norm -m -both`
 - [ ] 6.3 Run `chr22` normalized comparisons against Ensembl VEP for flag and filtering modes
 - [ ] 6.4 Verify `PICK` field parity for flag modes
 - [ ] 6.5 Verify selected CSQ entry parity for filtering modes
@@ -53,8 +53,8 @@
 
 ## 7. Final Verification
 
-- [ ] 7.1 Run `cargo fmt --all -- --check`
+- [x] 7.1 Run `cargo fmt --all -- --check`
 - [x] 7.2 Run `cargo test -p datafusion-bio-function-vep --lib`
-- [ ] 7.3 Run `cargo check -p datafusion-bio-function-vep --all-targets`
-- [ ] 7.4 Run downstream `cargo check` in `/Users/mwiewior/research/git/vepyr`
+- [x] 7.3 Run `cargo check -p datafusion-bio-function-vep --all-targets`
+- [x] 7.4 Run downstream `cargo check` in `/Users/mwiewior/research/git/vepyr`
 - [ ] 7.5 Push upstream and downstream commits
