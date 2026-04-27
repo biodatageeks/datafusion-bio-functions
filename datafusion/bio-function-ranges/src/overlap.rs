@@ -18,6 +18,7 @@ use crate::filter_op::FilterOp;
 pub enum OverlapOutputMode {
     Join,
     Left,
+    LeftDistinct,
 }
 
 fn wrap_with_projection(
@@ -123,7 +124,9 @@ impl OverlapProvider {
                 }));
                 Arc::new(Schema::new(fields))
             }
-            OverlapOutputMode::Left => Arc::new(left_schema.clone()),
+            OverlapOutputMode::Left | OverlapOutputMode::LeftDistinct => {
+                Arc::new(left_schema.clone())
+            }
         };
 
         Self {
@@ -191,6 +194,28 @@ impl OverlapProvider {
 
         format!(
             "SELECT {select_left} \
+             FROM `{}` AS b, `{}` AS a \
+             WHERE a.`{c1}` = b.`{c2}` \
+             AND CAST(a.`{e1}` AS INTEGER) >{sign} CAST(b.`{s2}` AS INTEGER) \
+             AND CAST(a.`{s1}` AS INTEGER) <{sign} CAST(b.`{e2}` AS INTEGER)",
+            self.right_table, self.left_table,
+        )
+    }
+
+    fn left_distinct_query(&self, sign: &str) -> String {
+        let select_left = self
+            .left_schema
+            .fields()
+            .iter()
+            .map(|f| format!("a.`{}`", f.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let (c1, s1, e1) = (&self.columns_1.0, &self.columns_1.1, &self.columns_1.2);
+        let (c2, s2, e2) = (&self.columns_2.0, &self.columns_2.1, &self.columns_2.2);
+
+        format!(
+            "SELECT {select_left} \
              FROM `{}` AS b \
              RIGHT SEMI JOIN `{}` AS a \
              ON a.`{c1}` = b.`{c2}` \
@@ -241,6 +266,7 @@ impl TableProvider for OverlapProvider {
         let query = match self.output_mode {
             OverlapOutputMode::Join => self.join_query(sign),
             OverlapOutputMode::Left => self.left_query(sign),
+            OverlapOutputMode::LeftDistinct => self.left_distinct_query(sign),
         };
 
         let df = self.session.sql(&query).await?;

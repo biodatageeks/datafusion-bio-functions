@@ -1902,6 +1902,65 @@ async fn test_overlap_udtf_left_output_preserves_left_rows() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_overlap_udtf_left_all_output_preserves_overlap_multiplicity() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER, name TEXT) AS VALUES
+        ('chr1', 100, 200, 'dup'),
+        ('chr1', 100, 200, 'dup'),
+        ('chr1', 1000, 1100, 'miss'),
+        ('chr2', 50, 60, 'other')
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('chr1', 90, 150),
+        ('chr1', 120, 180),
+        ('chr2', 55, 56)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql(
+            r#"
+            SELECT * FROM overlap('reads', 'targets', 'left_all')
+            ORDER BY contig, pos_start, pos_end, name
+        "#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | name  |",
+        "+--------+-----------+---------+-------+",
+        "| chr1   | 100       | 200     | dup   |",
+        "| chr1   | 100       | 200     | dup   |",
+        "| chr1   | 100       | 200     | dup   |",
+        "| chr1   | 100       | 200     | dup   |",
+        "| chr2   | 50        | 60      | other |",
+        "+--------+-----------+---------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+
+    let plan = ctx
+        .sql("EXPLAIN SELECT * FROM overlap('reads', 'targets', 'left_all')")
+        .await?
+        .collect()
+        .await?;
+    assert_contains!(pretty_format_batches(&plan)?.to_string(), "join_type=Inner");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_overlap_udtf_left_output_custom_columns_and_strict() -> Result<()> {
     let ctx = create_bio_session();
 

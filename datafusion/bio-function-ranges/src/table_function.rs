@@ -122,7 +122,12 @@ fn parse_overlap_args(
                 has_filter_op = true;
                 end -= 1;
             }
-            "left" if !has_output_mode => {
+            "left" | "left_distinct" if !has_output_mode => {
+                output_mode = OverlapOutputMode::LeftDistinct;
+                has_output_mode = true;
+                end -= 1;
+            }
+            "left_all" | "left_multiple" if !has_output_mode => {
                 output_mode = OverlapOutputMode::Left;
                 has_output_mode = true;
                 end -= 1;
