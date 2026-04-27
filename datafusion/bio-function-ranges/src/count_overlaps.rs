@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ use log::warn;
 use crate::count_overlaps_apple_gpu::{AppleGpuCountOverlapsBackend, get_apple_gpu_stream};
 #[cfg(all(feature = "apple-gpu", target_os = "macos"))]
 use crate::count_overlaps_rank::CountOverlapsRankIndex;
+use crate::count_overlaps_rank::OutputColumnSource;
 use crate::filter_op::FilterOp;
 use crate::interval_tree::{build_coitree_from_batches, get_stream};
 use crate::session_context::{BioConfig, CountOverlapsBackendMode};
@@ -140,7 +142,63 @@ impl TableProvider for CountOverlapsProvider {
             .unwrap_or(&default);
         let backend = self.select_backend(left_table, bio_config.count_overlaps_backend)?;
 
-        let right_df = self.session.table(self.right_table.clone()).await?;
+        let full_schema = self.schema();
+        let full_field_count = full_schema.fields().len();
+        let count_index = full_field_count.checked_sub(1).ok_or_else(|| {
+            DataFusionError::Internal("count_overlaps schema has no fields".to_string())
+        })?;
+        let requested_projection = projection
+            .cloned()
+            .unwrap_or_else(|| (0..full_field_count).collect());
+        let output_schema = Arc::new(full_schema.project(&requested_projection)?);
+
+        let interval_indices = [
+            full_schema.index_of(&self.columns_2.0)?,
+            full_schema.index_of(&self.columns_2.1)?,
+            full_schema.index_of(&self.columns_2.2)?,
+        ];
+        let mut right_projection = BTreeSet::new();
+        for &idx in &requested_projection {
+            if idx < count_index {
+                right_projection.insert(idx);
+            }
+        }
+        for idx in interval_indices {
+            right_projection.insert(idx);
+        }
+        let right_projection = right_projection.into_iter().collect::<Vec<_>>();
+        let mut full_to_right_input = vec![None; count_index];
+        for (input_idx, &full_idx) in right_projection.iter().enumerate() {
+            full_to_right_input[full_idx] = Some(input_idx);
+        }
+        let output_sources = requested_projection
+            .iter()
+            .map(|&idx| {
+                if idx == count_index {
+                    Ok(OutputColumnSource::Count)
+                } else if idx < count_index {
+                    full_to_right_input[idx].map(OutputColumnSource::Input).ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "count_overlaps missing right input column for projected field {idx}"
+                        ))
+                    })
+                } else {
+                    Err(DataFusionError::Internal(format!(
+                        "count_overlaps projection index {idx} exceeds schema field count {full_field_count}"
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let right_projection_names = right_projection
+            .iter()
+            .map(|&idx| full_schema.field(idx).name().as_str())
+            .collect::<Vec<_>>();
+
+        let right_df = self
+            .session
+            .table(self.right_table.clone())
+            .await?
+            .select_columns(&right_projection_names)?;
         let right_plan = right_df.create_physical_plan().await?;
         let right_plan: Arc<dyn ExecutionPlan> =
             if right_plan.output_partitioning().partition_count() == target_partitions {
@@ -152,17 +210,10 @@ impl TableProvider for CountOverlapsProvider {
                 )?)
             };
         let output_partitions = right_plan.output_partitioning().partition_count();
-        let full_schema = self.schema();
-        let projection = projection.cloned().map(Arc::new);
-        let output_schema = match projection.as_deref() {
-            Some(projection) => Arc::new(full_schema.project(projection)?),
-            None => full_schema.clone(),
-        };
 
         Ok(Arc::new(CountOverlapsExec {
-            full_schema,
             output_schema: output_schema.clone(),
-            projection,
+            output_sources: Arc::new(output_sources),
             backend,
             right: right_plan,
             columns_2: Arc::new(self.columns_2.clone()),
@@ -254,9 +305,8 @@ impl CountOverlapsProvider {
 }
 
 struct CountOverlapsExec {
-    full_schema: SchemaRef,
     output_schema: SchemaRef,
-    projection: Option<Arc<Vec<usize>>>,
+    output_sources: Arc<Vec<OutputColumnSource>>,
     backend: CountOverlapsBackendKind,
     right: Arc<dyn ExecutionPlan>,
     columns_2: Arc<(String, String, String)>,
@@ -309,9 +359,8 @@ impl ExecutionPlan for CountOverlapsExec {
         }
 
         Ok(Arc::new(CountOverlapsExec {
-            full_schema: self.full_schema.clone(),
             output_schema: self.output_schema.clone(),
-            projection: self.projection.clone(),
+            output_sources: self.output_sources.clone(),
             backend: self.backend.clone(),
             right: Arc::clone(&children[0]),
             columns_2: Arc::clone(&self.columns_2),
@@ -337,9 +386,8 @@ impl ExecutionPlan for CountOverlapsExec {
             CountOverlapsBackendKind::Cpu { trees } => get_stream(
                 Arc::clone(&self.right),
                 Arc::clone(trees),
-                self.full_schema.clone(),
                 self.output_schema.clone(),
-                self.projection.clone(),
+                self.output_sources.clone(),
                 Arc::clone(&self.columns_2),
                 self.filter_op.clone(),
                 self.coverage,
@@ -350,9 +398,8 @@ impl ExecutionPlan for CountOverlapsExec {
             CountOverlapsBackendKind::AppleGpu { backend } => get_apple_gpu_stream(
                 Arc::clone(&self.right),
                 Arc::clone(backend),
-                self.full_schema.clone(),
                 self.output_schema.clone(),
-                self.projection.clone(),
+                self.output_sources.clone(),
                 Arc::clone(&self.columns_2),
                 self.filter_op.clone(),
                 partition,

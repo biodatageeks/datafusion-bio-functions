@@ -1505,6 +1505,36 @@ async fn test_count_overlaps_supports_count_projection_and_aggregate() -> Result
         "+-------+",
     ];
     assert_batches_sorted_eq!(count_only_expected, &count_only);
+
+    let projected_right_column = ctx
+        .sql(r#"SELECT pos_end, "count" FROM count_overlaps('reads', 'targets') ORDER BY pos_end"#)
+        .await?
+        .collect()
+        .await?;
+    let projected_right_column_expected = [
+        "+---------+-------+",
+        "| pos_end | count |",
+        "+---------+-------+",
+        "| 2       | 1     |",
+        "| 20      | 2     |",
+        "| 110     | 0     |",
+        "+---------+-------+",
+    ];
+    assert_batches_sorted_eq!(projected_right_column_expected, &projected_right_column);
+
+    let row_count_only = ctx
+        .sql(r#"SELECT COUNT(*) AS n_rows FROM count_overlaps('reads', 'targets')"#)
+        .await?
+        .collect()
+        .await?;
+    let row_count_only_expected = [
+        "+--------+",
+        "| n_rows |",
+        "+--------+",
+        "| 3      |",
+        "+--------+",
+    ];
+    assert_batches_sorted_eq!(row_count_only_expected, &row_count_only);
     Ok(())
 }
 

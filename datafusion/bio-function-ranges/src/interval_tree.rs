@@ -13,7 +13,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use crate::array_utils::get_join_col_arrays;
-use crate::count_overlaps_rank::{append_count_column, project_batch};
+use crate::count_overlaps_rank::{OutputColumnSource, build_output_batch};
 use crate::filter_op::FilterOp;
 
 type IntervalHashMap = AHashMap<String, Vec<Interval<()>>>;
@@ -90,9 +90,8 @@ pub fn get_coverage(tree: &COITree<(), u32>, start: i32, end: i32) -> i32 {
 pub fn get_stream(
     right_plan: Arc<dyn ExecutionPlan>,
     trees: Arc<AHashMap<String, COITree<(), u32>>>,
-    full_schema: SchemaRef,
     output_schema: SchemaRef,
-    projection: Option<Arc<Vec<usize>>>,
+    output_sources: Arc<Vec<OutputColumnSource>>,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
     coverage: bool,
@@ -100,9 +99,8 @@ pub fn get_stream(
     context: Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
     let partition_stream = right_plan.execute(partition, context)?;
-    let full_schema_for_closure = full_schema.clone();
     let output_schema_for_closure = output_schema.clone();
-    let projection_for_closure = projection.clone();
+    let output_sources_for_closure = output_sources.clone();
     let strict_filter = filter_op == FilterOp::Strict;
 
     let iter = partition_stream.map(move |rb| match rb {
@@ -145,11 +143,11 @@ pub fn get_stream(
                 };
                 count_arr.push(count as i64);
             }
-            let batch = append_count_column(&rb, full_schema_for_closure.clone(), count_arr)?;
-            project_batch(
-                batch,
+            build_output_batch(
+                &rb,
                 output_schema_for_closure.clone(),
-                projection_for_closure.as_deref().map(Vec::as_slice),
+                output_sources_for_closure.as_ref(),
+                count_arr,
             )
         }
         Err(e) => Err(e),

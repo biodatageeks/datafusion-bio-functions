@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use datafusion::arrow::array::{Int64Array, RecordBatch, RecordBatchOptions};
+use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, RecordBatchOptions};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
 
@@ -33,6 +33,12 @@ pub struct EncodedQueryBatch {
     pub query_contigs: Vec<u32>,
     pub query_starts: Vec<i64>,
     pub query_ends: Vec<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputColumnSource {
+    Input(usize),
+    Count,
 }
 
 impl CountOverlapsRankIndex {
@@ -212,19 +218,25 @@ pub fn append_count_column(
     RecordBatch::try_new(schema, columns).map_err(Into::into)
 }
 
-pub fn project_batch(
-    batch: RecordBatch,
+pub fn build_output_batch(
+    batch: &RecordBatch,
     output_schema: SchemaRef,
-    projection: Option<&[usize]>,
+    sources: &[OutputColumnSource],
+    counts: Vec<i64>,
 ) -> Result<RecordBatch> {
-    let Some(projection) = projection else {
-        return Ok(batch);
-    };
-
-    let columns = projection
+    let mut count_array = None::<ArrayRef>;
+    let mut counts = Some(counts);
+    let columns = sources
         .iter()
-        .map(|&idx| batch.column(idx).clone())
-        .collect::<Vec<_>>();
+        .map(|source| match source {
+            OutputColumnSource::Input(idx) => Ok(batch.column(*idx).clone()),
+            OutputColumnSource::Count => Ok(count_array
+                .get_or_insert_with(|| {
+                    Arc::new(Int64Array::from(counts.take().unwrap_or_default())) as ArrayRef
+                })
+                .clone()),
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     if columns.is_empty() {
         RecordBatch::try_new_with_options(
