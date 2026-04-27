@@ -1828,6 +1828,235 @@ async fn test_overlap_udtf_custom_columns() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_overlap_udtf_custom_column_names_can_match_mode_tokens() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE a (chr TEXT, start INTEGER, "join" INTEGER) AS VALUES
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE b (chr TEXT, start INTEGER, "join" INTEGER) AS VALUES
+        ('a', 150, 250)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql(r#"SELECT * FROM overlap('a', 'b', 'chr', 'start', 'join')"#)
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert_eq!(result[0].schema().field(2).name(), "left_join");
+    assert_eq!(result[0].schema().field(5).name(), "right_join");
+
+    ctx.sql(
+        r#"
+        CREATE TABLE c (chr TEXT, start INTEGER, "left" INTEGER) AS VALUES
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE d (chr TEXT, start INTEGER, "left" INTEGER) AS VALUES
+        ('a', 200, 300)
+    "#,
+    )
+    .await?;
+
+    let strict = ctx
+        .sql(r#"SELECT * FROM overlap('c', 'd', 'chr', 'start', 'left', 'strict')"#)
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(strict.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_overlap_udtf_left_output_preserves_left_rows() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER, name TEXT) AS VALUES
+        ('chr1', 100, 200, 'dup'),
+        ('chr1', 100, 200, 'dup'),
+        ('chr1', 1000, 1100, 'miss'),
+        ('chr2', 50, 60, 'other')
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('chr1', 90, 150),
+        ('chr1', 120, 180),
+        ('chr2', 55, 56)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql(
+            r#"
+            SELECT * FROM overlap('reads', 'targets', 'left')
+            ORDER BY contig, pos_start, pos_end, name
+        "#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | name  |",
+        "+--------+-----------+---------+-------+",
+        "| chr1   | 100       | 200     | dup   |",
+        "| chr1   | 100       | 200     | dup   |",
+        "| chr2   | 50        | 60      | other |",
+        "+--------+-----------+---------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+
+    let plan = ctx
+        .sql("EXPLAIN SELECT * FROM overlap('reads', 'targets', 'left')")
+        .await?
+        .collect()
+        .await?;
+    assert_contains!(
+        pretty_format_batches(&plan)?.to_string(),
+        "join_type=RightSemi"
+    );
+
+    ctx.sql("SET bio.interval_join_low_memory = true").await?;
+    let low_memory_result = ctx
+        .sql(
+            r#"
+            SELECT * FROM overlap('reads', 'targets', 'left')
+            ORDER BY contig, pos_start, pos_end, name
+        "#,
+        )
+        .await?
+        .collect()
+        .await?;
+    assert_batches_sorted_eq!(expected, &low_memory_result);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_overlap_udtf_left_all_output_preserves_overlap_multiplicity() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER, name TEXT) AS VALUES
+        ('chr1', 100, 200, 'dup'),
+        ('chr1', 100, 200, 'dup'),
+        ('chr1', 1000, 1100, 'miss'),
+        ('chr2', 50, 60, 'other')
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('chr1', 90, 150),
+        ('chr1', 120, 180),
+        ('chr2', 55, 56)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql(
+            r#"
+            SELECT * FROM overlap('reads', 'targets', 'left_all')
+            ORDER BY contig, pos_start, pos_end, name
+        "#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | name  |",
+        "+--------+-----------+---------+-------+",
+        "| chr1   | 100       | 200     | dup   |",
+        "| chr1   | 100       | 200     | dup   |",
+        "| chr1   | 100       | 200     | dup   |",
+        "| chr1   | 100       | 200     | dup   |",
+        "| chr2   | 50        | 60      | other |",
+        "+--------+-----------+---------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+
+    let plan = ctx
+        .sql("EXPLAIN SELECT * FROM overlap('reads', 'targets', 'left_all')")
+        .await?
+        .collect()
+        .await?;
+    assert_contains!(pretty_format_batches(&plan)?.to_string(), "join_type=Inner");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_overlap_udtf_left_output_custom_columns_and_strict() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE a (chr TEXT, s INTEGER, e INTEGER, label TEXT) AS VALUES
+        ('a', 100, 200, 'touching'),
+        ('a', 100, 201, 'overlap')
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE b (chr TEXT, s INTEGER, e INTEGER) AS VALUES
+        ('a', 200, 300)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql(
+            r#"
+            SELECT * FROM overlap('a', 'b', 'chr', 's', 'e', 'strict', 'left')
+            ORDER BY label
+        "#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+-----+-----+-----+---------+",
+        "| chr | s   | e   | label   |",
+        "+-----+-----+-----+---------+",
+        "| a   | 100 | 201 | overlap |",
+        "+-----+-----+-----+---------+",
+    ];
+
+    assert_batches_sorted_eq!(expected, &result);
+
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Merge UDTF tests
 // ─────────────────────────────────────────────────────────────────────────────

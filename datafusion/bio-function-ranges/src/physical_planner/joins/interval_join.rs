@@ -1011,6 +1011,42 @@ impl IntervalJoinStreamState {
 }
 
 impl IntervalJoinStream {
+    fn is_probe_existence_join(join_type: JoinType) -> bool {
+        matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
+    }
+
+    fn should_emit_probe_row(join_type: JoinType, has_match: bool) -> bool {
+        match join_type {
+            JoinType::RightSemi => has_match,
+            JoinType::RightAnti => !has_match,
+            _ => false,
+        }
+    }
+
+    fn build_probe_only_batch(
+        schema: SchemaRef,
+        column_indices: &[ColumnIndex],
+        batch: &RecordBatch,
+        right_indices: Vec<u32>,
+    ) -> Result<RecordBatch> {
+        let right_indexes = PrimitiveArray::<UInt32Type>::from(right_indices);
+        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
+
+        for column_index in column_indices {
+            if column_index.side != JoinSide::Right {
+                return internal_err!(
+                    "Expected probe-only join output column to come from right side, got {:?}",
+                    column_index.side
+                );
+            }
+
+            let array = batch.column(column_index.index);
+            columns.push(compute::take(array, &right_indexes, None)?);
+        }
+
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+
     fn poll_next_impl(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -1117,6 +1153,8 @@ impl IntervalJoinStream {
     fn process_probe_batch_streaming(
         &mut self,
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+        let join_type = self.join_type;
+        let probe_existence_join = Self::is_probe_existence_join(join_type);
         let state = self.state.try_as_process_probe_batch_mut()?;
         let build_side = match self.build_side.as_ref() {
             Some(build_side) => Ok(build_side),
@@ -1135,9 +1173,47 @@ impl IntervalJoinStream {
         let chunk_end = std::cmp::min(start_row_idx + self.max_output_batch_size / 100, batch_size);
 
         let mut temp_matches = Vec::with_capacity(64);
-        let mut total_output_rows = state.accumulated_left_matches.len();
+        let mut total_output_rows = if probe_existence_join {
+            state.accumulated_right_indices.len()
+        } else {
+            state.accumulated_left_matches.len()
+        };
 
         for i in start_row_idx..chunk_end {
+            if probe_existence_join {
+                let mut has_match = false;
+                build_side.hash_map.get(
+                    self.hashes_buffer[i],
+                    start.value(i),
+                    end.value(i),
+                    |_| {
+                        has_match = true;
+                    },
+                );
+
+                if Self::should_emit_probe_row(join_type, has_match) {
+                    state.accumulated_right_indices.push(i as u32);
+                    total_output_rows += 1;
+                }
+
+                if total_output_rows >= self.max_output_batch_size {
+                    state.probe_row_idx = i + 1;
+                    self.state =
+                        IntervalJoinStreamState::EmitAccumulatedMatches(ProcessProbeBatchState {
+                            batch: state.batch.clone(),
+                            probe_row_idx: state.probe_row_idx,
+                            accumulated_left_matches: Vec::new(),
+                            accumulated_right_indices: std::mem::take(
+                                &mut state.accumulated_right_indices,
+                            ),
+                        });
+                    timer.done();
+                    return self.emit_accumulated_matches();
+                }
+
+                continue;
+            }
+
             temp_matches.clear();
 
             build_side
@@ -1191,7 +1267,13 @@ impl IntervalJoinStream {
         state.probe_row_idx = chunk_end;
 
         if chunk_end >= batch_size {
-            if !state.accumulated_left_matches.is_empty() {
+            let has_accumulated_output = if probe_existence_join {
+                !state.accumulated_right_indices.is_empty()
+            } else {
+                !state.accumulated_left_matches.is_empty()
+            };
+
+            if has_accumulated_output {
                 self.state =
                     IntervalJoinStreamState::EmitAccumulatedMatches(ProcessProbeBatchState {
                         batch: state.batch.clone(),
@@ -1217,6 +1299,9 @@ impl IntervalJoinStream {
     }
 
     fn emit_accumulated_matches(&mut self) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+        let probe_existence_join = Self::is_probe_existence_join(self.join_type);
+        let schema = self.schema.clone();
+        let column_indices = self.column_indices.clone();
         let state = match &mut self.state {
             IntervalJoinStreamState::EmitAccumulatedMatches(state) => state,
             _ => return internal_err!("Expected EmitAccumulatedMatches state"),
@@ -1227,7 +1312,13 @@ impl IntervalJoinStream {
             None => internal_err!("Expected build side in ready state"),
         }?;
 
-        if state.accumulated_left_matches.is_empty() {
+        let has_pending_output = if probe_existence_join {
+            !state.accumulated_right_indices.is_empty()
+        } else {
+            !state.accumulated_left_matches.is_empty()
+        };
+
+        if !has_pending_output {
             if state.probe_row_idx >= state.batch.num_rows() {
                 self.state = IntervalJoinStreamState::FetchProbeBatch;
             } else {
@@ -1239,6 +1330,31 @@ impl IntervalJoinStream {
                 });
             }
             return Ok(StatefulStreamResult::Continue);
+        }
+
+        if probe_existence_join {
+            let result = Self::build_probe_only_batch(
+                schema,
+                &column_indices,
+                &state.batch,
+                std::mem::take(&mut state.accumulated_right_indices),
+            )?;
+
+            self.join_metrics.output_batches.add(1);
+            self.join_metrics.output_rows.add(result.num_rows());
+
+            if state.probe_row_idx >= state.batch.num_rows() {
+                self.state = IntervalJoinStreamState::FetchProbeBatch;
+            } else {
+                self.state = IntervalJoinStreamState::ProcessProbeBatch(ProcessProbeBatchState {
+                    batch: state.batch.clone(),
+                    probe_row_idx: state.probe_row_idx,
+                    accumulated_left_matches: Vec::new(),
+                    accumulated_right_indices: Vec::new(),
+                });
+            }
+
+            return Ok(StatefulStreamResult::Ready(Some(result)));
         }
 
         // Build left indexes, handling null markers
@@ -1300,6 +1416,9 @@ impl IntervalJoinStream {
         Ok(StatefulStreamResult::Ready(Some(result)))
     }
     fn process_probe_batch(&mut self) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+        let join_type = self.join_type;
+        let schema = self.schema.clone();
+        let column_indices = self.column_indices.clone();
         let state = self.state.try_as_process_probe_batch_mut()?;
         let build_side = match self.build_side.as_ref() {
             Some(build_side) => Ok(build_side),
@@ -1310,6 +1429,39 @@ impl IntervalJoinStream {
 
         let start = evaluate_as_i32(self.right_interval.start(), &state.batch)?;
         let end = evaluate_as_i32(self.right_interval.end(), &state.batch)?;
+
+        if Self::is_probe_existence_join(join_type) {
+            let mut right_indices = Vec::with_capacity(state.batch.num_rows());
+
+            for (i, hash_val) in self.hashes_buffer.iter().enumerate() {
+                let mut has_match = false;
+                build_side
+                    .hash_map
+                    .get(*hash_val, start.value(i), end.value(i), |_| {
+                        has_match = true;
+                    });
+
+                if Self::should_emit_probe_row(join_type, has_match) {
+                    right_indices.push(i as u32);
+                }
+            }
+
+            if right_indices.is_empty() {
+                self.state = IntervalJoinStreamState::FetchProbeBatch;
+                timer.done();
+                return Ok(StatefulStreamResult::Continue);
+            }
+
+            let result =
+                Self::build_probe_only_batch(schema, &column_indices, &state.batch, right_indices)?;
+
+            self.join_metrics.output_batches.add(1);
+            self.join_metrics.output_rows.add(result.num_rows());
+            timer.done();
+            self.state = IntervalJoinStreamState::FetchProbeBatch;
+            return Ok(StatefulStreamResult::Ready(Some(result)));
+        }
+
         // Two modes: low-memory (streaming/capped) vs. full-batch (pre-streaming behavior)
         if self.low_memory {
             // Output-size limited processing to prevent memory explosion

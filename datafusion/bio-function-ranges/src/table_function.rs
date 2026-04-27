@@ -13,7 +13,7 @@ use crate::count_overlaps::CountOverlapsProvider;
 use crate::filter_op::FilterOp;
 use crate::merge::MergeProvider;
 use crate::nearest::NearestProvider;
-use crate::overlap::OverlapProvider;
+use crate::overlap::{OverlapOutputMode, OverlapProvider};
 use crate::subtract::SubtractProvider;
 
 /// Resolve a table's Arrow schema synchronously, handling both inside and
@@ -91,6 +91,66 @@ fn parse_col_args_extra(extra: &[Expr], fn_name: &str) -> Result<(ColTriple, Col
             (extra, FilterOp::Weak)
         };
 
+    parse_col_triples(col_args, filter_op, fn_name)
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_overlap_args(
+    args: &[Expr],
+    fn_name: &str,
+) -> Result<(ColTriple, ColTriple, FilterOp, OverlapOutputMode)> {
+    let extra = &args[2..];
+    let mut col_args = extra;
+    let mut filter_op = FilterOp::Weak;
+    let mut output_mode = OverlapOutputMode::Join;
+    let mut has_filter_op = false;
+    let mut has_output_mode = false;
+
+    while !matches!(col_args.len(), 0 | 3 | 6) {
+        let Expr::Literal(ScalarValue::Utf8(Some(val)), _) = &col_args[col_args.len() - 1] else {
+            break;
+        };
+
+        match val.to_lowercase().as_str() {
+            "strict" if !has_filter_op => {
+                filter_op = FilterOp::Strict;
+                has_filter_op = true;
+                col_args = &col_args[..col_args.len() - 1];
+            }
+            "weak" if !has_filter_op => {
+                filter_op = FilterOp::Weak;
+                has_filter_op = true;
+                col_args = &col_args[..col_args.len() - 1];
+            }
+            "left" | "left_distinct" if !has_output_mode => {
+                output_mode = OverlapOutputMode::LeftDistinct;
+                has_output_mode = true;
+                col_args = &col_args[..col_args.len() - 1];
+            }
+            "left_all" | "left_multiple" if !has_output_mode => {
+                output_mode = OverlapOutputMode::Left;
+                has_output_mode = true;
+                col_args = &col_args[..col_args.len() - 1];
+            }
+            "join" if !has_output_mode => {
+                output_mode = OverlapOutputMode::Join;
+                has_output_mode = true;
+                col_args = &col_args[..col_args.len() - 1];
+            }
+            _ => break,
+        }
+    }
+
+    let (cols_left, cols_right, filter_op) = parse_col_triples(col_args, filter_op, fn_name)?;
+    Ok((cols_left, cols_right, filter_op, output_mode))
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_col_triples(
+    col_args: &[Expr],
+    filter_op: FilterOp,
+    fn_name: &str,
+) -> Result<(ColTriple, ColTriple, FilterOp)> {
     match col_args.len() {
         0 => {
             let cols = (
@@ -329,7 +389,7 @@ impl TableFunctionImpl for OverlapTableFunction {
 
         let left_table = extract_string_arg(&args[0], "left_table", self.name)?;
         let right_table = extract_string_arg(&args[1], "right_table", self.name)?;
-        let (cols_left, cols_right, filter_op) = parse_col_args(args, self.name)?;
+        let (cols_left, cols_right, filter_op, output_mode) = parse_overlap_args(args, self.name)?;
 
         let (left_schema, right_schema) = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
@@ -352,7 +412,7 @@ impl TableFunctionImpl for OverlapTableFunction {
             }
         }?;
 
-        Ok(Arc::new(OverlapProvider::new(
+        Ok(Arc::new(OverlapProvider::new_with_output_mode(
             Arc::clone(&self.session),
             left_table,
             right_table,
@@ -361,6 +421,7 @@ impl TableFunctionImpl for OverlapTableFunction {
             vec![cols_left.0, cols_left.1, cols_left.2],
             vec![cols_right.0, cols_right.1, cols_right.2],
             filter_op,
+            output_mode,
         )))
     }
 }
