@@ -52,11 +52,15 @@ impl CountOverlapsRankIndex {
         for batch in batches {
             let (contig_arr, start_arr, end_arr) =
                 get_join_col_arrays(batch, (columns.0, columns.1, columns.2))?;
+            let start_values = start_arr.resolve_i64()?;
+            let end_values = end_arr.resolve_i64()?;
+            let starts = &*start_values;
+            let ends = &*end_values;
 
             for i in 0..batch.num_rows() {
                 let contig = contig_arr.value(i);
-                let start = i64::from(start_arr.value(i)?);
-                let end = i64::from(end_arr.value(i)?);
+                let start = starts[i];
+                let end = ends[i];
                 if let Some((starts, ends)) = by_contig.get_mut(contig) {
                     starts.push(start);
                     ends.push(end);
@@ -149,6 +153,10 @@ impl CountOverlapsRankIndex {
     ) -> Result<EncodedQueryBatch> {
         let (contig_arr, start_arr, end_arr) =
             get_join_col_arrays(batch, (columns.0, columns.1, columns.2))?;
+        let start_values = start_arr.resolve_i64()?;
+        let end_values = end_arr.resolve_i64()?;
+        let starts = &*start_values;
+        let ends = &*end_values;
         let mut query_contigs = Vec::with_capacity(batch.num_rows());
         let mut query_starts = Vec::with_capacity(batch.num_rows());
         let mut query_ends = Vec::with_capacity(batch.num_rows());
@@ -156,8 +164,8 @@ impl CountOverlapsRankIndex {
 
         for i in 0..batch.num_rows() {
             let contig = contig_arr.value(i);
-            let mut start = i64::from(start_arr.value(i)?);
-            let mut end = i64::from(end_arr.value(i)?);
+            let mut start = starts[i];
+            let mut end = ends[i];
             if strict {
                 start += 1;
                 end -= 1;
