@@ -21,7 +21,7 @@ pub use count_overlaps::CountOverlapsProvider;
 pub use filter_op::FilterOp;
 pub use merge::MergeProvider;
 pub use nearest::NearestProvider;
-pub use overlap::OverlapProvider;
+pub use overlap::{OverlapOutputMode, OverlapProvider};
 pub use physical_planner::BioQueryPlanner;
 pub use physical_planner::IntervalJoinPhysicalOptimizationRule;
 pub use physical_planner::joins::interval_join::IntervalJoinExec;
