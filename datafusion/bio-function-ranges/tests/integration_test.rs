@@ -1450,6 +1450,64 @@ async fn test_count_overlaps_backend_config_cpu_display() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_supports_count_projection_and_aggregate() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 10, 20),
+        ('a', 15, 25),
+        ('b', 1, 2)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 20, 20),
+        ('a', 100, 110),
+        ('b', 2, 2)
+    "#,
+    )
+    .await?;
+
+    let aggregate = ctx
+        .sql(
+            r#"SELECT COUNT(*) AS n_rows, SUM("count") AS total_overlaps
+               FROM count_overlaps('reads', 'targets')"#,
+        )
+        .await?
+        .collect()
+        .await?;
+    let aggregate_expected = [
+        "+--------+----------------+",
+        "| n_rows | total_overlaps |",
+        "+--------+----------------+",
+        "| 3      | 3              |",
+        "+--------+----------------+",
+    ];
+    assert_batches_sorted_eq!(aggregate_expected, &aggregate);
+
+    let count_only = ctx
+        .sql(r#"SELECT "count" FROM count_overlaps('reads', 'targets') ORDER BY "count""#)
+        .await?
+        .collect()
+        .await?;
+    let count_only_expected = [
+        "+-------+",
+        "| count |",
+        "+-------+",
+        "| 0     |",
+        "| 1     |",
+        "| 2     |",
+        "+-------+",
+    ];
+    assert_batches_sorted_eq!(count_only_expected, &count_only);
+    Ok(())
+}
+
 #[cfg(not(all(feature = "apple-gpu", target_os = "macos")))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_count_overlaps_apple_gpu_config_falls_back_without_metal_build() -> Result<()> {

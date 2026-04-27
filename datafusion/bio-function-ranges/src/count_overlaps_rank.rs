@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use datafusion::arrow::array::{Int64Array, RecordBatch};
+use datafusion::arrow::array::{Int64Array, RecordBatch, RecordBatchOptions};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
 
@@ -210,6 +210,32 @@ pub fn append_count_column(
     columns.extend_from_slice(batch.columns());
     columns.push(count_arr);
     RecordBatch::try_new(schema, columns).map_err(Into::into)
+}
+
+pub fn project_batch(
+    batch: RecordBatch,
+    output_schema: SchemaRef,
+    projection: Option<&[usize]>,
+) -> Result<RecordBatch> {
+    let Some(projection) = projection else {
+        return Ok(batch);
+    };
+
+    let columns = projection
+        .iter()
+        .map(|&idx| batch.column(idx).clone())
+        .collect::<Vec<_>>();
+
+    if columns.is_empty() {
+        RecordBatch::try_new_with_options(
+            output_schema,
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+        )
+        .map_err(Into::into)
+    } else {
+        RecordBatch::try_new(output_schema, columns).map_err(Into::into)
+    }
 }
 
 fn lower_bound(values: &[i64], needle: i64) -> usize {

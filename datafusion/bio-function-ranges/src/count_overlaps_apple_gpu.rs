@@ -19,7 +19,9 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize,
 };
 
-use crate::count_overlaps_rank::{CountOverlapsRankIndex, MISSING_CONTIG_ID, append_count_column};
+use crate::count_overlaps_rank::{
+    CountOverlapsRankIndex, MISSING_CONTIG_ID, append_count_column, project_batch,
+};
 use crate::filter_op::FilterOp;
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -152,13 +154,16 @@ impl AppleGpuCountOverlapsBackend {
     fn execute_batch(
         &self,
         batch: &datafusion::arrow::array::RecordBatch,
-        schema: SchemaRef,
+        full_schema: SchemaRef,
+        output_schema: SchemaRef,
+        projection: Option<&[usize]>,
         columns: (&str, &str, &str),
         filter_op: FilterOp,
     ) -> Result<datafusion::arrow::array::RecordBatch> {
         let queries = self.index.encode_query_batch(batch, columns, filter_op)?;
         if queries.query_contigs.is_empty() {
-            return append_count_column(batch, schema, Vec::new());
+            let batch = append_count_column(batch, full_schema, Vec::new())?;
+            return project_batch(batch, output_schema, projection);
         }
 
         let query_contigs = self.runtime.new_buffer_from_slice(&queries.query_contigs)?;
@@ -218,7 +223,8 @@ impl AppleGpuCountOverlapsBackend {
             let ptr = output.contents().as_ptr().cast::<i64>();
             std::slice::from_raw_parts(ptr, queries.query_contigs.len()).to_vec()
         };
-        append_count_column(batch, schema, counts)
+        let batch = append_count_column(batch, full_schema, counts)?;
+        project_batch(batch, output_schema, projection)
     }
 }
 
@@ -314,26 +320,32 @@ impl MetalRuntime {
 pub fn get_apple_gpu_stream(
     right_plan: Arc<dyn ExecutionPlan>,
     backend: Arc<AppleGpuCountOverlapsBackend>,
-    new_schema: SchemaRef,
+    full_schema: SchemaRef,
+    output_schema: SchemaRef,
+    projection: Option<Arc<Vec<usize>>>,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
     partition: usize,
     context: Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
     let partition_stream = right_plan.execute(partition, context)?;
-    let schema_for_closure = new_schema.clone();
+    let full_schema_for_closure = full_schema.clone();
+    let output_schema_for_closure = output_schema.clone();
+    let projection_for_closure = projection.clone();
     let iter = partition_stream.map(move |rb| {
         rb.and_then(|rb| {
             backend.execute_batch(
                 &rb,
-                schema_for_closure.clone(),
+                full_schema_for_closure.clone(),
+                output_schema_for_closure.clone(),
+                projection_for_closure.as_deref().map(Vec::as_slice),
                 (&columns_2.0, &columns_2.1, &columns_2.2),
                 filter_op.clone(),
             )
         })
     });
     Ok(Box::pin(RecordBatchStreamAdapter::new(
-        new_schema,
+        output_schema,
         Box::pin(iter) as BoxStream<'static, Result<datafusion::arrow::array::RecordBatch>>,
     )))
 }

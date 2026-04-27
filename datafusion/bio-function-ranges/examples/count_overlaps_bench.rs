@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
 
-use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::array::{Array, Int64Array, UInt64Array};
 use datafusion::config::ConfigOptions;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_bio_function_ranges::{
@@ -81,28 +81,41 @@ async fn run_once(args: &Args) -> Result<RunResult, Box<dyn Error>> {
 
     let start = Instant::now();
     let batches = ctx
-        .sql("SELECT * FROM count_overlaps('reads', 'targets')")
+        .sql(
+            r#"SELECT COUNT(*) AS n_rows, SUM("count") AS total_overlaps
+               FROM count_overlaps('reads', 'targets')"#,
+        )
         .await?
         .collect()
         .await?;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let n_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
-    let total_overlaps = batches
-        .iter()
-        .map(|batch| -> Result<i64, Box<dyn Error>> {
-            let count = batch
-                .column_by_name("count")
-                .ok_or_else(|| "count column not found in count_overlaps output".to_string())?;
-            let count = count
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "count column is not Int64".to_string())?;
-            Ok(count.values().iter().sum::<i64>())
-        })
-        .sum::<Result<i64, Box<dyn Error>>>()?;
+    let batch = batches
+        .first()
+        .ok_or_else(|| "benchmark query returned no batches".to_string())?;
+    let n_rows = batch
+        .column_by_name("n_rows")
+        .ok_or_else(|| "n_rows column not found in benchmark output".to_string())
+        .and_then(|array| scalar_i64(array.as_ref(), "n_rows"))?;
+    let total_overlaps = batch
+        .column_by_name("total_overlaps")
+        .ok_or_else(|| "total_overlaps column not found in benchmark output".to_string())
+        .and_then(|array| scalar_i64(array.as_ref(), "total_overlaps"))?;
     let result = format!("n_rows={n_rows},total_overlaps={total_overlaps}");
 
     Ok(RunResult { elapsed_ms, result })
+}
+
+fn scalar_i64(array: &dyn Array, name: &str) -> Result<i64, String> {
+    if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
+        return Ok(array.value(0));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
+        return i64::try_from(array.value(0)).map_err(|_| format!("{name} value overflows i64"));
+    }
+    Err(format!(
+        "{name} column has unsupported type {}",
+        array.data_type()
+    ))
 }
 
 async fn register_parquet(

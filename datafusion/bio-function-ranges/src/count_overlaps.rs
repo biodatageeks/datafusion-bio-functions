@@ -110,7 +110,7 @@ impl TableProvider for CountOverlapsProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -152,16 +152,24 @@ impl TableProvider for CountOverlapsProvider {
                 )?)
             };
         let output_partitions = right_plan.output_partitioning().partition_count();
+        let full_schema = self.schema();
+        let projection = projection.cloned().map(Arc::new);
+        let output_schema = match projection.as_deref() {
+            Some(projection) => Arc::new(full_schema.project(projection)?),
+            None => full_schema.clone(),
+        };
 
         Ok(Arc::new(CountOverlapsExec {
-            schema: self.schema().clone(),
+            full_schema,
+            output_schema: output_schema.clone(),
+            projection,
             backend,
             right: right_plan,
             columns_2: Arc::new(self.columns_2.clone()),
             filter_op: self.filter_op.clone(),
             coverage: self.coverage,
             cache: PlanProperties::new(
-                EquivalenceProperties::new(self.schema().clone()),
+                EquivalenceProperties::new(output_schema),
                 Partitioning::UnknownPartitioning(output_partitions),
                 EmissionType::Final,
                 Boundedness::Bounded,
@@ -246,7 +254,9 @@ impl CountOverlapsProvider {
 }
 
 struct CountOverlapsExec {
-    schema: SchemaRef,
+    full_schema: SchemaRef,
+    output_schema: SchemaRef,
+    projection: Option<Arc<Vec<usize>>>,
     backend: CountOverlapsBackendKind,
     right: Arc<dyn ExecutionPlan>,
     columns_2: Arc<(String, String, String)>,
@@ -299,14 +309,16 @@ impl ExecutionPlan for CountOverlapsExec {
         }
 
         Ok(Arc::new(CountOverlapsExec {
-            schema: self.schema.clone(),
+            full_schema: self.full_schema.clone(),
+            output_schema: self.output_schema.clone(),
+            projection: self.projection.clone(),
             backend: self.backend.clone(),
             right: Arc::clone(&children[0]),
             columns_2: Arc::clone(&self.columns_2),
             filter_op: self.filter_op.clone(),
             coverage: self.coverage,
             cache: PlanProperties::new(
-                EquivalenceProperties::new(self.schema.clone()),
+                EquivalenceProperties::new(self.output_schema.clone()),
                 Partitioning::UnknownPartitioning(
                     children[0].output_partitioning().partition_count(),
                 ),
@@ -325,7 +337,9 @@ impl ExecutionPlan for CountOverlapsExec {
             CountOverlapsBackendKind::Cpu { trees } => get_stream(
                 Arc::clone(&self.right),
                 Arc::clone(trees),
-                self.schema.clone(),
+                self.full_schema.clone(),
+                self.output_schema.clone(),
+                self.projection.clone(),
                 Arc::clone(&self.columns_2),
                 self.filter_op.clone(),
                 self.coverage,
@@ -336,7 +350,9 @@ impl ExecutionPlan for CountOverlapsExec {
             CountOverlapsBackendKind::AppleGpu { backend } => get_apple_gpu_stream(
                 Arc::clone(&self.right),
                 Arc::clone(backend),
-                self.schema.clone(),
+                self.full_schema.clone(),
+                self.output_schema.clone(),
+                self.projection.clone(),
                 Arc::clone(&self.columns_2),
                 self.filter_op.clone(),
                 partition,

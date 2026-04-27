@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use coitrees::{COITree, Interval, IntervalTree};
-use datafusion::arrow::array::{Int64Array, RecordBatch};
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -13,6 +13,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use crate::array_utils::get_join_col_arrays;
+use crate::count_overlaps_rank::{append_count_column, project_batch};
 use crate::filter_op::FilterOp;
 
 type IntervalHashMap = AHashMap<String, Vec<Interval<()>>>;
@@ -89,7 +90,9 @@ pub fn get_coverage(tree: &COITree<(), u32>, start: i32, end: i32) -> i32 {
 pub fn get_stream(
     right_plan: Arc<dyn ExecutionPlan>,
     trees: Arc<AHashMap<String, COITree<(), u32>>>,
-    new_schema: SchemaRef,
+    full_schema: SchemaRef,
+    output_schema: SchemaRef,
+    projection: Option<Arc<Vec<usize>>>,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
     coverage: bool,
@@ -97,7 +100,9 @@ pub fn get_stream(
     context: Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
     let partition_stream = right_plan.execute(partition, context)?;
-    let schema_for_closure = new_schema.clone();
+    let full_schema_for_closure = full_schema.clone();
+    let output_schema_for_closure = output_schema.clone();
+    let projection_for_closure = projection.clone();
     let strict_filter = filter_op == FilterOp::Strict;
 
     let iter = partition_stream.map(move |rb| match rb {
@@ -140,17 +145,18 @@ pub fn get_stream(
                 };
                 count_arr.push(count as i64);
             }
-            let count_arr = Arc::new(Int64Array::from(count_arr));
-            let mut columns = Vec::with_capacity(rb.num_columns() + 1);
-            columns.extend_from_slice(rb.columns());
-            columns.push(count_arr);
-            RecordBatch::try_new(schema_for_closure.clone(), columns)
-                .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))
+            let batch = append_count_column(&rb, full_schema_for_closure.clone(), count_arr)?;
+            project_batch(
+                batch,
+                output_schema_for_closure.clone(),
+                projection_for_closure.as_deref().map(Vec::as_slice),
+            )
         }
         Err(e) => Err(e),
     });
 
-    let adapted_stream = RecordBatchStreamAdapter::new(new_schema, Box::pin(iter) as BoxStream<_>);
+    let adapted_stream =
+        RecordBatchStreamAdapter::new(output_schema, Box::pin(iter) as BoxStream<_>);
     Ok(Box::pin(adapted_stream))
 }
 
