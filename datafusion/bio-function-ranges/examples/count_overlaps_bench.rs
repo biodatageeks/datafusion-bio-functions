@@ -19,6 +19,7 @@ struct Args {
     repeats: usize,
     warmups: usize,
     batch_size: Option<usize>,
+    timings: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -32,6 +33,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "warmup={},backend={},threads={},elapsed_ms={:.3}",
             warmup, args.backend, args.threads, run.elapsed_ms
         );
+        if args.timings {
+            eprintln!("{}", run.timing_line("warmup", warmup, &args));
+        }
     }
 
     for repeat in 0..args.repeats {
@@ -41,6 +45,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "repeat={},backend={},threads={},elapsed_ms={:.3}",
             repeat, args.backend, args.threads, run.elapsed_ms
         );
+        if args.timings {
+            println!("{}", run.timing_line("repeat", repeat, &args));
+        }
         println!("{}", run.result);
     }
 
@@ -58,10 +65,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[derive(Debug)]
 struct RunResult {
     elapsed_ms: f64,
+    setup_ms: f64,
+    sql_ms: f64,
+    collect_ms: f64,
+    result_ms: f64,
     result: String,
 }
 
 async fn run_once(args: &Args) -> Result<RunResult, Box<dyn Error>> {
+    let setup_start = Instant::now();
     let mut bio_config = BioConfig::default();
     bio_config.count_overlaps_backend = args.backend;
 
@@ -78,17 +90,23 @@ async fn run_once(args: &Args) -> Result<RunResult, Box<dyn Error>> {
     register_ranges_functions(&ctx);
     register_parquet(&ctx, "reads", &args.left).await?;
     register_parquet(&ctx, "targets", &args.right).await?;
+    let setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
 
     let start = Instant::now();
-    let batches = ctx
+    let dataframe = ctx
         .sql(
             r#"SELECT COUNT(*) AS n_rows, SUM("count") AS total_overlaps
                FROM count_overlaps('reads', 'targets')"#,
         )
-        .await?
-        .collect()
         .await?;
+    let sql_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    let collect_start = Instant::now();
+    let batches = dataframe.collect().await?;
+    let collect_ms = collect_start.elapsed().as_secs_f64() * 1000.0;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    let result_start = Instant::now();
     let batch = batches
         .first()
         .ok_or_else(|| "benchmark query returned no batches".to_string())?;
@@ -101,8 +119,16 @@ async fn run_once(args: &Args) -> Result<RunResult, Box<dyn Error>> {
         .ok_or_else(|| "total_overlaps column not found in benchmark output".to_string())
         .and_then(|array| scalar_i64(array.as_ref(), "total_overlaps"))?;
     let result = format!("n_rows={n_rows},total_overlaps={total_overlaps}");
+    let result_ms = result_start.elapsed().as_secs_f64() * 1000.0;
 
-    Ok(RunResult { elapsed_ms, result })
+    Ok(RunResult {
+        elapsed_ms,
+        setup_ms,
+        sql_ms,
+        collect_ms,
+        result_ms,
+        result,
+    })
 }
 
 fn scalar_i64(array: &dyn Array, name: &str) -> Result<i64, String> {
@@ -143,6 +169,7 @@ impl Args {
         let mut repeats = 3usize;
         let mut warmups = 1usize;
         let mut batch_size = None;
+        let mut timings = false;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -159,6 +186,7 @@ impl Args {
                 "--batch-size" => {
                     batch_size = Some(next_value(&mut args, "--batch-size")?.parse()?)
                 }
+                "--timings" => timings = true,
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -179,7 +207,23 @@ impl Args {
             repeats,
             warmups,
             batch_size,
+            timings,
         })
+    }
+}
+
+impl RunResult {
+    fn timing_line(&self, phase: &str, iteration: usize, args: &Args) -> String {
+        format!(
+            "timings,{phase}={iteration},backend={},threads={},setup_ms={:.3},sql_ms={:.3},collect_ms={:.3},result_ms={:.3},elapsed_ms={:.3}",
+            args.backend,
+            args.threads,
+            self.setup_ms,
+            self.sql_ms,
+            self.collect_ms,
+            self.result_ms,
+            self.elapsed_ms
+        )
     }
 }
 
@@ -193,6 +237,6 @@ fn next_value(
 
 fn print_usage() {
     println!(
-        "Usage: count_overlaps_bench [--left PATH] [--right PATH] [--backend auto|cpu|apple_gpu] [--threads N] [--repeats N] [--warmups N] [--batch-size N]"
+        "Usage: count_overlaps_bench [--left PATH] [--right PATH] [--backend auto|cpu|apple_gpu] [--threads N] [--repeats N] [--warmups N] [--batch-size N] [--timings]"
     );
 }
