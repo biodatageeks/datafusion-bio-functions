@@ -124,13 +124,17 @@ pub fn get_stream(
                     cached_tree = trees.get(contig);
                     cached_tree
                 };
-                let count = match tree {
-                    None => 0,
-                    Some(tree) => {
-                        if coverage {
-                            get_coverage(tree, query_start, query_end)
-                        } else {
-                            tree.query_count(query_start, query_end) as i32
+                let count = if strict_filter && query_start > query_end {
+                    0
+                } else {
+                    match tree {
+                        None => 0,
+                        Some(tree) => {
+                            if coverage {
+                                get_coverage(tree, query_start, query_end)
+                            } else {
+                                tree.query_count(query_start, query_end) as i32
+                            }
                         }
                     }
                 };

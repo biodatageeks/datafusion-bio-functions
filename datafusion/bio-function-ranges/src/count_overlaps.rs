@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use async_trait::async_trait;
 use coitrees::COITree;
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
@@ -17,9 +18,20 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, SessionContext};
+use log::warn;
 
+#[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+use crate::count_overlaps_apple_gpu::{AppleGpuCountOverlapsBackend, get_apple_gpu_stream};
+#[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+use crate::count_overlaps_rank::CountOverlapsRankIndex;
 use crate::filter_op::FilterOp;
 use crate::interval_tree::{build_coitree_from_batches, get_stream};
+use crate::session_context::{BioConfig, CountOverlapsBackendMode};
+
+// Initial Auto threshold from the local Apple M3 Max 8-7 release benchmark:
+// ex-rna (9,944,559 left intervals) vs ex-anno (1,194,285 right intervals).
+// Keep this conservative until a broader size/distribution matrix is measured.
+const AUTO_APPLE_GPU_MIN_LEFT_INTERVALS: usize = 5_000_000;
 
 pub struct CountOverlapsProvider {
     session: Arc<SessionContext>,
@@ -118,11 +130,15 @@ impl TableProvider for CountOverlapsProvider {
             .collect()
             .await?;
 
-        let trees = Arc::new(build_coitree_from_batches(
-            left_table,
-            (&self.columns_1.0, &self.columns_1.1, &self.columns_1.2),
-            self.coverage,
-        )?);
+        let default = BioConfig::default();
+        let state = self.session.state();
+        let config = state.config();
+        let bio_config = config
+            .options()
+            .extensions
+            .get::<BioConfig>()
+            .unwrap_or(&default);
+        let backend = self.select_backend(left_table, bio_config.count_overlaps_backend)?;
 
         let right_df = self.session.table(self.right_table.clone()).await?;
         let right_plan = right_df.create_physical_plan().await?;
@@ -139,7 +155,7 @@ impl TableProvider for CountOverlapsProvider {
 
         Ok(Arc::new(CountOverlapsExec {
             schema: self.schema().clone(),
-            trees,
+            backend,
             right: right_plan,
             columns_2: Arc::new(self.columns_2.clone()),
             filter_op: self.filter_op.clone(),
@@ -154,9 +170,84 @@ impl TableProvider for CountOverlapsProvider {
     }
 }
 
+#[derive(Clone)]
+enum CountOverlapsBackendKind {
+    Cpu {
+        trees: Arc<AHashMap<String, COITree<(), u32>>>,
+    },
+    #[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+    AppleGpu {
+        backend: Arc<AppleGpuCountOverlapsBackend>,
+    },
+}
+
+impl CountOverlapsBackendKind {
+    fn name(&self) -> &'static str {
+        match self {
+            CountOverlapsBackendKind::Cpu { .. } => "cpu-coitree",
+            #[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+            CountOverlapsBackendKind::AppleGpu { .. } => "apple-gpu-rank",
+        }
+    }
+}
+
+impl CountOverlapsProvider {
+    fn select_backend(
+        &self,
+        left_table: Vec<RecordBatch>,
+        backend_mode: CountOverlapsBackendMode,
+    ) -> Result<CountOverlapsBackendKind> {
+        let left_interval_count = left_table.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let try_apple_gpu = !self.coverage
+            && match backend_mode {
+                CountOverlapsBackendMode::AppleGpu => true,
+                CountOverlapsBackendMode::Auto => {
+                    left_interval_count >= AUTO_APPLE_GPU_MIN_LEFT_INTERVALS
+                }
+                CountOverlapsBackendMode::Cpu => false,
+            };
+
+        if try_apple_gpu {
+            #[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+            {
+                let rank_index = CountOverlapsRankIndex::build_from_batches(
+                    &left_table,
+                    (&self.columns_1.0, &self.columns_1.1, &self.columns_1.2),
+                )?;
+                match AppleGpuCountOverlapsBackend::try_new(rank_index) {
+                    Ok(backend) => {
+                        return Ok(CountOverlapsBackendKind::AppleGpu {
+                            backend: Arc::new(backend),
+                        });
+                    }
+                    Err(error) => {
+                        warn!(
+                            "falling back to CPU count_overlaps backend after Apple GPU initialization failed: {error}"
+                        );
+                    }
+                }
+            }
+
+            #[cfg(not(all(feature = "apple-gpu", target_os = "macos")))]
+            if backend_mode == CountOverlapsBackendMode::AppleGpu {
+                warn!(
+                    "falling back to CPU count_overlaps backend because apple-gpu feature is not active on macOS"
+                );
+            }
+        }
+
+        let trees = Arc::new(build_coitree_from_batches(
+            left_table,
+            (&self.columns_1.0, &self.columns_1.1, &self.columns_1.2),
+            self.coverage,
+        )?);
+        Ok(CountOverlapsBackendKind::Cpu { trees })
+    }
+}
+
 struct CountOverlapsExec {
     schema: SchemaRef,
-    trees: Arc<AHashMap<String, COITree<(), u32>>>,
+    backend: CountOverlapsBackendKind,
     right: Arc<dyn ExecutionPlan>,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
@@ -166,13 +257,17 @@ struct CountOverlapsExec {
 
 impl Debug for CountOverlapsExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CountOverlapsExec")
+        write!(
+            f,
+            "CountOverlapsExec {{ backend: {} }}",
+            self.backend.name()
+        )
     }
 }
 
 impl DisplayAs for CountOverlapsExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "CountOverlapsExec")
+        write!(f, "CountOverlapsExec: backend={}", self.backend.name())
     }
 }
 
@@ -205,7 +300,7 @@ impl ExecutionPlan for CountOverlapsExec {
 
         Ok(Arc::new(CountOverlapsExec {
             schema: self.schema.clone(),
-            trees: Arc::clone(&self.trees),
+            backend: self.backend.clone(),
             right: Arc::clone(&children[0]),
             columns_2: Arc::clone(&self.columns_2),
             filter_op: self.filter_op.clone(),
@@ -226,15 +321,27 @@ impl ExecutionPlan for CountOverlapsExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        get_stream(
-            Arc::clone(&self.right),
-            self.trees.clone(),
-            self.schema.clone(),
-            Arc::clone(&self.columns_2),
-            self.filter_op.clone(),
-            self.coverage,
-            partition,
-            context,
-        )
+        match &self.backend {
+            CountOverlapsBackendKind::Cpu { trees } => get_stream(
+                Arc::clone(&self.right),
+                Arc::clone(trees),
+                self.schema.clone(),
+                Arc::clone(&self.columns_2),
+                self.filter_op.clone(),
+                self.coverage,
+                partition,
+                context,
+            ),
+            #[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+            CountOverlapsBackendKind::AppleGpu { backend } => get_apple_gpu_stream(
+                Arc::clone(&self.right),
+                Arc::clone(backend),
+                self.schema.clone(),
+                Arc::clone(&self.columns_2),
+                self.filter_op.clone(),
+                partition,
+                context,
+            ),
+        }
     }
 }

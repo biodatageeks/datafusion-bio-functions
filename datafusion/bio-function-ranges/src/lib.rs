@@ -2,6 +2,9 @@ pub mod array_utils;
 pub mod cluster;
 pub mod complement;
 pub mod count_overlaps;
+#[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+mod count_overlaps_apple_gpu;
+pub mod count_overlaps_rank;
 pub mod filter_op;
 pub mod grouped_stream;
 pub mod interval_tree;
@@ -25,6 +28,8 @@ pub use overlap::OverlapProvider;
 pub use physical_planner::BioQueryPlanner;
 pub use physical_planner::IntervalJoinPhysicalOptimizationRule;
 pub use physical_planner::joins::interval_join::IntervalJoinExec;
-pub use session_context::{Algorithm, BioConfig, BioSessionExt, create_bio_session};
+pub use session_context::{
+    Algorithm, BioConfig, BioSessionExt, CountOverlapsBackendMode, create_bio_session,
+};
 pub use subtract::SubtractProvider;
 pub use table_function::register_ranges_functions;

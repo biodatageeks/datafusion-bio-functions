@@ -89,6 +89,16 @@ Counts overlapping intervals. Same interface as `coverage`, but returns the coun
 SELECT * FROM count_overlaps('reads', 'targets')
 ```
 
+When built with the `apple-gpu` Cargo feature on macOS, `count_overlaps` can use an Apple Metal endpoint-rank backend:
+
+```sql
+SET bio.count_overlaps_backend = auto;       -- default
+SET bio.count_overlaps_backend = cpu;
+SET bio.count_overlaps_backend = apple_gpu;
+```
+
+`auto` keeps the CPU COITree backend for small inputs and currently tries the Apple GPU backend for large non-coverage `count_overlaps` workloads when the collected left side has at least 5M intervals. If Metal initialization fails before output is emitted, execution falls back to CPU.
+
 ### `nearest(left_table, right_table [, k] [, overlap] [, columns...] [, filter_op])`
 
 Returns up to `k` nearest left intervals for each right interval.

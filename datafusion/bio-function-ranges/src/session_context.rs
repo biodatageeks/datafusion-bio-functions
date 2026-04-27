@@ -50,11 +50,75 @@ extensions_options! {
         pub prefer_interval_join: bool, default = true
         pub interval_join_algorithm: Algorithm, default = Algorithm::default()
         pub interval_join_low_memory: bool, default = false
+        pub count_overlaps_backend: CountOverlapsBackendMode, default = CountOverlapsBackendMode::default()
     }
 }
 
 impl ConfigExtension for BioConfig {
     const PREFIX: &'static str = "bio";
+}
+
+#[derive(Debug, Eq, PartialEq, Default, Clone, Copy)]
+pub enum CountOverlapsBackendMode {
+    #[default]
+    Auto,
+    Cpu,
+    AppleGpu,
+}
+
+#[derive(Debug)]
+pub struct ParseCountOverlapsBackendModeError(String);
+
+impl std::fmt::Display for ParseCountOverlapsBackendModeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ParseCountOverlapsBackendModeError {}
+
+impl FromStr for CountOverlapsBackendMode {
+    type Err = ParseCountOverlapsBackendModeError;
+
+    #[inline]
+    fn from_str(s: &str) -> Result<CountOverlapsBackendMode, Self::Err> {
+        match s.to_lowercase().replace(['-', '_'], "").as_str() {
+            "auto" => Ok(CountOverlapsBackendMode::Auto),
+            "cpu" => Ok(CountOverlapsBackendMode::Cpu),
+            "applegpu" => Ok(CountOverlapsBackendMode::AppleGpu),
+            _ => Err(ParseCountOverlapsBackendModeError(format!(
+                "Can't parse '{s}' as CountOverlapsBackendMode"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for CountOverlapsBackendMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let val = match self {
+            CountOverlapsBackendMode::Auto => "auto",
+            CountOverlapsBackendMode::Cpu => "cpu",
+            CountOverlapsBackendMode::AppleGpu => "apple_gpu",
+        };
+        write!(f, "{val}")
+    }
+}
+
+impl From<ParseCountOverlapsBackendModeError> for datafusion::error::DataFusionError {
+    fn from(e: ParseCountOverlapsBackendModeError) -> Self {
+        datafusion::error::DataFusionError::External(Box::new(e))
+    }
+}
+
+impl ConfigField for CountOverlapsBackendMode {
+    fn set(&mut self, _key: &str, value: &str) -> datafusion::common::Result<()> {
+        *self = value.parse::<CountOverlapsBackendMode>()?;
+        Ok(())
+    }
+
+    fn visit<V: datafusion::config::Visit>(&self, visitor: &mut V, name: &str, doc: &'static str) {
+        visitor.some(name, self, doc)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Default, Clone, Copy)]
@@ -145,4 +209,34 @@ pub fn create_bio_session() -> SessionContext {
     let ctx = SessionContext::new_with_bio(config);
     crate::table_function::register_ranges_functions(&ctx);
     ctx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_overlaps_backend_mode_parses_supported_values() {
+        assert_eq!(
+            "auto".parse::<CountOverlapsBackendMode>().unwrap(),
+            CountOverlapsBackendMode::Auto
+        );
+        assert_eq!(
+            "cpu".parse::<CountOverlapsBackendMode>().unwrap(),
+            CountOverlapsBackendMode::Cpu
+        );
+        assert_eq!(
+            "apple_gpu".parse::<CountOverlapsBackendMode>().unwrap(),
+            CountOverlapsBackendMode::AppleGpu
+        );
+        assert_eq!(
+            "apple-gpu".parse::<CountOverlapsBackendMode>().unwrap(),
+            CountOverlapsBackendMode::AppleGpu
+        );
+    }
+
+    #[test]
+    fn count_overlaps_backend_mode_rejects_unknown_values() {
+        assert!("metal".parse::<CountOverlapsBackendMode>().is_err());
+    }
 }
