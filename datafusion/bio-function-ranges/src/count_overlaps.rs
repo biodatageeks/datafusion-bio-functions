@@ -2,6 +2,8 @@ use std::any::Any;
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use ahash::AHashMap;
 use async_trait::async_trait;
@@ -34,6 +36,82 @@ use crate::session_context::{BioConfig, CountOverlapsBackendMode};
 // ex-rna (9,944,559 left intervals) vs ex-anno (1,194,285 right intervals).
 // Keep this conservative until a broader size/distribution matrix is measured.
 const AUTO_APPLE_GPU_MIN_LEFT_INTERVALS: usize = 5_000_000;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CountOverlapsTimingSnapshot {
+    pub scans: u64,
+    pub left_rows: u64,
+    pub left_collect_ns: u64,
+    pub backend_build_ns: u64,
+    pub right_plan_ns: u64,
+    pub scan_total_ns: u64,
+}
+
+struct CountOverlapsTimingCounters {
+    scans: AtomicU64,
+    left_rows: AtomicU64,
+    left_collect_ns: AtomicU64,
+    backend_build_ns: AtomicU64,
+    right_plan_ns: AtomicU64,
+    scan_total_ns: AtomicU64,
+}
+
+static COUNT_OVERLAPS_TIMINGS: CountOverlapsTimingCounters = CountOverlapsTimingCounters {
+    scans: AtomicU64::new(0),
+    left_rows: AtomicU64::new(0),
+    left_collect_ns: AtomicU64::new(0),
+    backend_build_ns: AtomicU64::new(0),
+    right_plan_ns: AtomicU64::new(0),
+    scan_total_ns: AtomicU64::new(0),
+};
+
+pub fn reset_count_overlaps_timings() {
+    COUNT_OVERLAPS_TIMINGS.reset();
+}
+
+pub fn snapshot_count_overlaps_timings() -> CountOverlapsTimingSnapshot {
+    COUNT_OVERLAPS_TIMINGS.snapshot()
+}
+
+impl CountOverlapsTimingCounters {
+    fn reset(&self) {
+        self.scans.store(0, Ordering::Relaxed);
+        self.left_rows.store(0, Ordering::Relaxed);
+        self.left_collect_ns.store(0, Ordering::Relaxed);
+        self.backend_build_ns.store(0, Ordering::Relaxed);
+        self.right_plan_ns.store(0, Ordering::Relaxed);
+        self.scan_total_ns.store(0, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> CountOverlapsTimingSnapshot {
+        CountOverlapsTimingSnapshot {
+            scans: self.scans.load(Ordering::Relaxed),
+            left_rows: self.left_rows.load(Ordering::Relaxed),
+            left_collect_ns: self.left_collect_ns.load(Ordering::Relaxed),
+            backend_build_ns: self.backend_build_ns.load(Ordering::Relaxed),
+            right_plan_ns: self.right_plan_ns.load(Ordering::Relaxed),
+            scan_total_ns: self.scan_total_ns.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record(&self, timings: CountOverlapsTimingSnapshot) {
+        self.scans.fetch_add(timings.scans, Ordering::Relaxed);
+        self.left_rows
+            .fetch_add(timings.left_rows, Ordering::Relaxed);
+        self.left_collect_ns
+            .fetch_add(timings.left_collect_ns, Ordering::Relaxed);
+        self.backend_build_ns
+            .fetch_add(timings.backend_build_ns, Ordering::Relaxed);
+        self.right_plan_ns
+            .fetch_add(timings.right_plan_ns, Ordering::Relaxed);
+        self.scan_total_ns
+            .fetch_add(timings.scan_total_ns, Ordering::Relaxed);
+    }
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
 
 pub struct CountOverlapsProvider {
     session: Arc<SessionContext>,
@@ -116,6 +194,7 @@ impl TableProvider for CountOverlapsProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let scan_start = Instant::now();
         let target_partitions = self
             .session
             .state()
@@ -124,6 +203,7 @@ impl TableProvider for CountOverlapsProvider {
             .execution
             .target_partitions;
 
+        let left_collect_start = Instant::now();
         let left_table = self
             .session
             .table(self.left_table.clone())
@@ -131,6 +211,8 @@ impl TableProvider for CountOverlapsProvider {
             .select_columns(&[&self.columns_1.0, &self.columns_1.1, &self.columns_1.2])?
             .collect()
             .await?;
+        let left_collect_ns = elapsed_ns(left_collect_start);
+        let left_interval_count = left_table.iter().map(RecordBatch::num_rows).sum::<usize>();
 
         let default = BioConfig::default();
         let state = self.session.state();
@@ -140,8 +222,11 @@ impl TableProvider for CountOverlapsProvider {
             .extensions
             .get::<BioConfig>()
             .unwrap_or(&default);
+        let backend_build_start = Instant::now();
         let backend = self.select_backend(left_table, bio_config.count_overlaps_backend)?;
+        let backend_build_ns = elapsed_ns(backend_build_start);
 
+        let right_plan_start = Instant::now();
         let full_schema = self.schema();
         let full_field_count = full_schema.fields().len();
         let count_index = full_field_count.checked_sub(1).ok_or_else(|| {
@@ -210,6 +295,15 @@ impl TableProvider for CountOverlapsProvider {
                 )?)
             };
         let output_partitions = right_plan.output_partitioning().partition_count();
+        let right_plan_ns = elapsed_ns(right_plan_start);
+        COUNT_OVERLAPS_TIMINGS.record(CountOverlapsTimingSnapshot {
+            scans: 1,
+            left_rows: u64::try_from(left_interval_count).unwrap_or(u64::MAX),
+            left_collect_ns,
+            backend_build_ns,
+            right_plan_ns,
+            scan_total_ns: elapsed_ns(scan_start),
+        });
 
         Ok(Arc::new(CountOverlapsExec {
             output_schema: output_schema.clone(),

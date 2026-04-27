@@ -2,7 +2,10 @@ use std::ffi::c_void;
 use std::mem::{size_of, size_of_val};
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
+use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -96,6 +99,8 @@ kernel void count_overlaps_rank(
 }
 "#;
 
+const GPU_COALESCED_TARGET_ROWS: usize = 65_536;
+
 type MetalDevice = ProtocolObject<dyn MTLDevice>;
 type MetalCommandQueue = ProtocolObject<dyn MTLCommandQueue>;
 type MetalComputePipelineState = ProtocolObject<dyn MTLComputePipelineState>;
@@ -108,6 +113,43 @@ pub struct AppleGpuCountOverlapsBackend {
     starts_buffer: SharedMetalBuffer,
     ends_buffer: SharedMetalBuffer,
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppleGpuTimingSnapshot {
+    pub batches: u64,
+    pub rows: u64,
+    pub encode_ns: u64,
+    pub buffer_ns: u64,
+    pub command_ns: u64,
+    pub wait_ns: u64,
+    pub readback_ns: u64,
+    pub output_ns: u64,
+    pub total_ns: u64,
+}
+
+struct AppleGpuTimingCounters {
+    batches: AtomicU64,
+    rows: AtomicU64,
+    encode_ns: AtomicU64,
+    buffer_ns: AtomicU64,
+    command_ns: AtomicU64,
+    wait_ns: AtomicU64,
+    readback_ns: AtomicU64,
+    output_ns: AtomicU64,
+    total_ns: AtomicU64,
+}
+
+static APPLE_GPU_TIMINGS: AppleGpuTimingCounters = AppleGpuTimingCounters {
+    batches: AtomicU64::new(0),
+    rows: AtomicU64::new(0),
+    encode_ns: AtomicU64::new(0),
+    buffer_ns: AtomicU64::new(0),
+    command_ns: AtomicU64::new(0),
+    wait_ns: AtomicU64::new(0),
+    readback_ns: AtomicU64::new(0),
+    output_ns: AtomicU64::new(0),
+    total_ns: AtomicU64::new(0),
+};
 
 struct MetalRuntime {
     device: Retained<MetalDevice>,
@@ -127,6 +169,63 @@ impl SharedMetalBuffer {
     fn as_buffer(&self) -> &MetalBuffer {
         &self.0
     }
+}
+
+pub fn reset_apple_gpu_timings() {
+    APPLE_GPU_TIMINGS.reset();
+}
+
+pub fn snapshot_apple_gpu_timings() -> AppleGpuTimingSnapshot {
+    APPLE_GPU_TIMINGS.snapshot()
+}
+
+impl AppleGpuTimingCounters {
+    fn reset(&self) {
+        self.batches.store(0, Ordering::Relaxed);
+        self.rows.store(0, Ordering::Relaxed);
+        self.encode_ns.store(0, Ordering::Relaxed);
+        self.buffer_ns.store(0, Ordering::Relaxed);
+        self.command_ns.store(0, Ordering::Relaxed);
+        self.wait_ns.store(0, Ordering::Relaxed);
+        self.readback_ns.store(0, Ordering::Relaxed);
+        self.output_ns.store(0, Ordering::Relaxed);
+        self.total_ns.store(0, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> AppleGpuTimingSnapshot {
+        AppleGpuTimingSnapshot {
+            batches: self.batches.load(Ordering::Relaxed),
+            rows: self.rows.load(Ordering::Relaxed),
+            encode_ns: self.encode_ns.load(Ordering::Relaxed),
+            buffer_ns: self.buffer_ns.load(Ordering::Relaxed),
+            command_ns: self.command_ns.load(Ordering::Relaxed),
+            wait_ns: self.wait_ns.load(Ordering::Relaxed),
+            readback_ns: self.readback_ns.load(Ordering::Relaxed),
+            output_ns: self.output_ns.load(Ordering::Relaxed),
+            total_ns: self.total_ns.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record(&self, timings: AppleGpuTimingSnapshot) {
+        self.batches.fetch_add(timings.batches, Ordering::Relaxed);
+        self.rows.fetch_add(timings.rows, Ordering::Relaxed);
+        self.encode_ns
+            .fetch_add(timings.encode_ns, Ordering::Relaxed);
+        self.buffer_ns
+            .fetch_add(timings.buffer_ns, Ordering::Relaxed);
+        self.command_ns
+            .fetch_add(timings.command_ns, Ordering::Relaxed);
+        self.wait_ns.fetch_add(timings.wait_ns, Ordering::Relaxed);
+        self.readback_ns
+            .fetch_add(timings.readback_ns, Ordering::Relaxed);
+        self.output_ns
+            .fetch_add(timings.output_ns, Ordering::Relaxed);
+        self.total_ns.fetch_add(timings.total_ns, Ordering::Relaxed);
+    }
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl AppleGpuCountOverlapsBackend {
@@ -159,18 +258,34 @@ impl AppleGpuCountOverlapsBackend {
         columns: (&str, &str, &str),
         filter_op: FilterOp,
     ) -> Result<datafusion::arrow::array::RecordBatch> {
+        let total_start = Instant::now();
+        let encode_start = Instant::now();
         let queries = self.index.encode_query_batch(batch, columns, filter_op)?;
+        let encode_ns = elapsed_ns(encode_start);
         if queries.query_contigs.is_empty() {
-            return build_output_batch(batch, output_schema, output_sources, Vec::new());
+            let output_start = Instant::now();
+            let output = build_output_batch(batch, output_schema, output_sources, Vec::new());
+            APPLE_GPU_TIMINGS.record(AppleGpuTimingSnapshot {
+                batches: 1,
+                rows: 0,
+                encode_ns,
+                output_ns: elapsed_ns(output_start),
+                total_ns: elapsed_ns(total_start),
+                ..Default::default()
+            });
+            return output;
         }
 
+        let buffer_start = Instant::now();
         let query_contigs = self.runtime.new_buffer_from_slice(&queries.query_contigs)?;
         let query_starts = self.runtime.new_buffer_from_slice(&queries.query_starts)?;
         let query_ends = self.runtime.new_buffer_from_slice(&queries.query_ends)?;
         let output = self
             .runtime
             .new_buffer_with_len(queries.query_contigs.len() * size_of::<i64>())?;
+        let buffer_ns = elapsed_ns(buffer_start);
 
+        let command_start = Instant::now();
         let command_buffer = self.runtime.queue.commandBuffer().ok_or_else(|| {
             DataFusionError::Execution("failed to create Metal command buffer".to_string())
         })?;
@@ -209,7 +324,11 @@ impl AppleGpuCountOverlapsBackend {
         encoder.dispatchThreads_threadsPerThreadgroup(threads_per_grid, threads_per_group);
         encoder.endEncoding();
         command_buffer.commit();
+        let command_ns = elapsed_ns(command_start);
+
+        let wait_start = Instant::now();
         command_buffer.waitUntilCompleted();
+        let wait_ns = elapsed_ns(wait_start);
 
         if let Some(error) = command_buffer.error() {
             return Err(DataFusionError::Execution(format!(
@@ -217,11 +336,28 @@ impl AppleGpuCountOverlapsBackend {
             )));
         }
 
+        let readback_start = Instant::now();
         let counts = unsafe {
             let ptr = output.contents().as_ptr().cast::<i64>();
             std::slice::from_raw_parts(ptr, queries.query_contigs.len()).to_vec()
         };
-        build_output_batch(batch, output_schema, output_sources, counts)
+        let readback_ns = elapsed_ns(readback_start);
+
+        let output_start = Instant::now();
+        let output = build_output_batch(batch, output_schema, output_sources, counts);
+        let output_ns = elapsed_ns(output_start);
+        APPLE_GPU_TIMINGS.record(AppleGpuTimingSnapshot {
+            batches: 1,
+            rows: u64::try_from(queries.query_contigs.len()).unwrap_or(u64::MAX),
+            encode_ns,
+            buffer_ns,
+            command_ns,
+            wait_ns,
+            readback_ns,
+            output_ns,
+            total_ns: elapsed_ns(total_start),
+        });
+        output
     }
 }
 
@@ -325,23 +461,69 @@ pub fn get_apple_gpu_stream(
     context: Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
     let partition_stream = right_plan.execute(partition, context)?;
+    let input_schema = right_plan.schema();
     let output_schema_for_closure = output_schema.clone();
     let output_sources_for_closure = output_sources.clone();
-    let iter = partition_stream.map(move |rb| {
-        rb.and_then(|rb| {
-            backend.execute_batch(
-                &rb,
-                output_schema_for_closure.clone(),
-                output_sources_for_closure.as_ref(),
+    let state = CoalescedGpuStreamState {
+        stream: partition_stream,
+        input_schema,
+        pending: Vec::new(),
+        pending_rows: 0,
+    };
+    let iter = futures::stream::try_unfold(state, move |mut state| {
+        let backend = Arc::clone(&backend);
+        let output_schema = output_schema_for_closure.clone();
+        let output_sources = output_sources_for_closure.clone();
+        let columns_2 = Arc::clone(&columns_2);
+        let filter_op = filter_op.clone();
+        async move {
+            while state.pending_rows < GPU_COALESCED_TARGET_ROWS {
+                let Some(batch) = state.stream.next().await else {
+                    break;
+                };
+                let batch = batch?;
+                state.pending_rows += batch.num_rows();
+                state.pending.push(batch);
+            }
+
+            if state.pending.is_empty() {
+                return Ok(None);
+            }
+
+            let batch = if state.pending.len() == 1 {
+                state.pending.pop().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "count_overlaps GPU coalescer lost pending batch".to_string(),
+                    )
+                })?
+            } else {
+                let batch = concat_batches(&state.input_schema, &state.pending)?;
+                state.pending.clear();
+                batch
+            };
+            state.pending_rows = 0;
+
+            let output = backend.execute_batch(
+                &batch,
+                output_schema,
+                output_sources.as_ref(),
                 (&columns_2.0, &columns_2.1, &columns_2.2),
-                filter_op.clone(),
-            )
-        })
+                filter_op,
+            )?;
+            Ok(Some((output, state)))
+        }
     });
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         output_schema,
         Box::pin(iter) as BoxStream<'static, Result<datafusion::arrow::array::RecordBatch>>,
     )))
+}
+
+struct CoalescedGpuStreamState {
+    stream: SendableRecordBatchStream,
+    input_schema: SchemaRef,
+    pending: Vec<datafusion::arrow::array::RecordBatch>,
+    pending_rows: usize,
 }
 
 #[allow(dead_code)]

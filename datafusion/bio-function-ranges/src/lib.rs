@@ -20,7 +20,14 @@ pub mod table_function;
 // Re-export key types
 pub use cluster::ClusterProvider;
 pub use complement::ComplementProvider;
-pub use count_overlaps::CountOverlapsProvider;
+pub use count_overlaps::{
+    CountOverlapsProvider, CountOverlapsTimingSnapshot, reset_count_overlaps_timings,
+    snapshot_count_overlaps_timings,
+};
+#[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+pub use count_overlaps_apple_gpu::{
+    AppleGpuTimingSnapshot, reset_apple_gpu_timings, snapshot_apple_gpu_timings,
+};
 pub use filter_op::FilterOp;
 pub use merge::MergeProvider;
 pub use nearest::NearestProvider;

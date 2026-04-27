@@ -35,6 +35,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
         if args.timings {
             eprintln!("{}", run.timing_line("warmup", warmup, &args));
+            if let Some(line) = run.count_overlaps_timing_line("warmup", warmup, &args) {
+                eprintln!("{line}");
+            }
+            if let Some(line) = run.gpu_timing_line("warmup", warmup, &args) {
+                eprintln!("{line}");
+            }
         }
     }
 
@@ -47,6 +53,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
         if args.timings {
             println!("{}", run.timing_line("repeat", repeat, &args));
+            if let Some(line) = run.count_overlaps_timing_line("repeat", repeat, &args) {
+                println!("{line}");
+            }
+            if let Some(line) = run.gpu_timing_line("repeat", repeat, &args) {
+                println!("{line}");
+            }
         }
         println!("{}", run.result);
     }
@@ -69,7 +81,32 @@ struct RunResult {
     sql_ms: f64,
     collect_ms: f64,
     result_ms: f64,
+    count_overlaps_timings: Option<CountOverlapsTimingResult>,
+    gpu_timings: Option<GpuTimingResult>,
     result: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CountOverlapsTimingResult {
+    scans: u64,
+    left_rows: u64,
+    left_collect_ms: f64,
+    backend_build_ms: f64,
+    right_plan_ms: f64,
+    scan_total_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GpuTimingResult {
+    batches: u64,
+    rows: u64,
+    encode_ms: f64,
+    buffer_ms: f64,
+    command_ms: f64,
+    wait_ms: f64,
+    readback_ms: f64,
+    output_ms: f64,
+    total_ms: f64,
 }
 
 async fn run_once(args: &Args) -> Result<RunResult, Box<dyn Error>> {
@@ -102,7 +139,11 @@ async fn run_once(args: &Args) -> Result<RunResult, Box<dyn Error>> {
     let sql_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let collect_start = Instant::now();
+    datafusion_bio_function_ranges::reset_count_overlaps_timings();
+    reset_gpu_timing_stats();
     let batches = dataframe.collect().await?;
+    let count_overlaps_timings = snapshot_count_overlaps_timing_stats();
+    let gpu_timings = snapshot_gpu_timing_stats();
     let collect_ms = collect_start.elapsed().as_secs_f64() * 1000.0;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -127,6 +168,8 @@ async fn run_once(args: &Args) -> Result<RunResult, Box<dyn Error>> {
         sql_ms,
         collect_ms,
         result_ms,
+        count_overlaps_timings,
+        gpu_timings,
         result,
     })
 }
@@ -225,6 +268,89 @@ impl RunResult {
             self.elapsed_ms
         )
     }
+
+    fn gpu_timing_line(&self, phase: &str, iteration: usize, args: &Args) -> Option<String> {
+        let timings = self.gpu_timings?;
+        Some(format!(
+            "gpu_timings,{phase}={iteration},backend={},threads={},batches={},rows={},encode_ms={:.3},buffer_ms={:.3},command_ms={:.3},wait_ms={:.3},readback_ms={:.3},output_ms={:.3},total_ms={:.3}",
+            args.backend,
+            args.threads,
+            timings.batches,
+            timings.rows,
+            timings.encode_ms,
+            timings.buffer_ms,
+            timings.command_ms,
+            timings.wait_ms,
+            timings.readback_ms,
+            timings.output_ms,
+            timings.total_ms
+        ))
+    }
+
+    fn count_overlaps_timing_line(
+        &self,
+        phase: &str,
+        iteration: usize,
+        args: &Args,
+    ) -> Option<String> {
+        let timings = self.count_overlaps_timings?;
+        Some(format!(
+            "count_overlaps_timings,{phase}={iteration},backend={},threads={},scans={},left_rows={},left_collect_ms={:.3},backend_build_ms={:.3},right_plan_ms={:.3},scan_total_ms={:.3}",
+            args.backend,
+            args.threads,
+            timings.scans,
+            timings.left_rows,
+            timings.left_collect_ms,
+            timings.backend_build_ms,
+            timings.right_plan_ms,
+            timings.scan_total_ms
+        ))
+    }
+}
+
+fn snapshot_count_overlaps_timing_stats() -> Option<CountOverlapsTimingResult> {
+    let snapshot = datafusion_bio_function_ranges::snapshot_count_overlaps_timings();
+    (snapshot.scans > 0).then(|| CountOverlapsTimingResult {
+        scans: snapshot.scans,
+        left_rows: snapshot.left_rows,
+        left_collect_ms: ns_to_ms(snapshot.left_collect_ns),
+        backend_build_ms: ns_to_ms(snapshot.backend_build_ns),
+        right_plan_ms: ns_to_ms(snapshot.right_plan_ns),
+        scan_total_ms: ns_to_ms(snapshot.scan_total_ns),
+    })
+}
+
+#[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+fn reset_gpu_timing_stats() {
+    datafusion_bio_function_ranges::reset_apple_gpu_timings();
+}
+
+#[cfg(not(all(feature = "apple-gpu", target_os = "macos")))]
+fn reset_gpu_timing_stats() {}
+
+#[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+fn snapshot_gpu_timing_stats() -> Option<GpuTimingResult> {
+    let snapshot = datafusion_bio_function_ranges::snapshot_apple_gpu_timings();
+    (snapshot.batches > 0).then(|| GpuTimingResult {
+        batches: snapshot.batches,
+        rows: snapshot.rows,
+        encode_ms: ns_to_ms(snapshot.encode_ns),
+        buffer_ms: ns_to_ms(snapshot.buffer_ns),
+        command_ms: ns_to_ms(snapshot.command_ns),
+        wait_ms: ns_to_ms(snapshot.wait_ns),
+        readback_ms: ns_to_ms(snapshot.readback_ns),
+        output_ms: ns_to_ms(snapshot.output_ns),
+        total_ms: ns_to_ms(snapshot.total_ns),
+    })
+}
+
+#[cfg(not(all(feature = "apple-gpu", target_os = "macos")))]
+fn snapshot_gpu_timing_stats() -> Option<GpuTimingResult> {
+    None
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
 }
 
 fn next_value(

@@ -57,11 +57,12 @@ impl CountOverlapsRankIndex {
                 let contig = contig_arr.value(i);
                 let start = i64::from(start_arr.value(i)?);
                 let end = i64::from(end_arr.value(i)?);
-                let entry = by_contig
-                    .entry(contig.to_owned())
-                    .or_insert_with(|| (Vec::new(), Vec::new()));
-                entry.0.push(start);
-                entry.1.push(end);
+                if let Some((starts, ends)) = by_contig.get_mut(contig) {
+                    starts.push(start);
+                    ends.push(end);
+                } else {
+                    by_contig.insert(contig.to_owned(), (vec![start], vec![end]));
+                }
                 interval_count += 1;
             }
         }
