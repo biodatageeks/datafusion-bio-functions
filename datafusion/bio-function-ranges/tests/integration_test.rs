@@ -1829,6 +1829,59 @@ async fn test_overlap_udtf_custom_columns() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_overlap_udtf_custom_column_names_can_match_mode_tokens() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE a (chr TEXT, start INTEGER, "join" INTEGER) AS VALUES
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE b (chr TEXT, start INTEGER, "join" INTEGER) AS VALUES
+        ('a', 150, 250)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql(r#"SELECT * FROM overlap('a', 'b', 'chr', 'start', 'join')"#)
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert_eq!(result[0].schema().field(2).name(), "left_join");
+    assert_eq!(result[0].schema().field(5).name(), "right_join");
+
+    ctx.sql(
+        r#"
+        CREATE TABLE c (chr TEXT, start INTEGER, "left" INTEGER) AS VALUES
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE d (chr TEXT, start INTEGER, "left" INTEGER) AS VALUES
+        ('a', 200, 300)
+    "#,
+    )
+    .await?;
+
+    let strict = ctx
+        .sql(r#"SELECT * FROM overlap('c', 'd', 'chr', 'start', 'left', 'strict')"#)
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(strict.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_overlap_udtf_left_output_preserves_left_rows() -> Result<()> {
     let ctx = create_bio_session();
 

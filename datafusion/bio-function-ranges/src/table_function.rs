@@ -100,14 +100,14 @@ fn parse_overlap_args(
     fn_name: &str,
 ) -> Result<(ColTriple, ColTriple, FilterOp, OverlapOutputMode)> {
     let extra = &args[2..];
-    let mut end = extra.len();
+    let mut col_args = extra;
     let mut filter_op = FilterOp::Weak;
     let mut output_mode = OverlapOutputMode::Join;
     let mut has_filter_op = false;
     let mut has_output_mode = false;
 
-    while end > 0 {
-        let Expr::Literal(ScalarValue::Utf8(Some(val)), _) = &extra[end - 1] else {
+    while !matches!(col_args.len(), 0 | 3 | 6) {
+        let Expr::Literal(ScalarValue::Utf8(Some(val)), _) = &col_args[col_args.len() - 1] else {
             break;
         };
 
@@ -115,33 +115,33 @@ fn parse_overlap_args(
             "strict" if !has_filter_op => {
                 filter_op = FilterOp::Strict;
                 has_filter_op = true;
-                end -= 1;
+                col_args = &col_args[..col_args.len() - 1];
             }
             "weak" if !has_filter_op => {
                 filter_op = FilterOp::Weak;
                 has_filter_op = true;
-                end -= 1;
+                col_args = &col_args[..col_args.len() - 1];
             }
             "left" | "left_distinct" if !has_output_mode => {
                 output_mode = OverlapOutputMode::LeftDistinct;
                 has_output_mode = true;
-                end -= 1;
+                col_args = &col_args[..col_args.len() - 1];
             }
             "left_all" | "left_multiple" if !has_output_mode => {
                 output_mode = OverlapOutputMode::Left;
                 has_output_mode = true;
-                end -= 1;
+                col_args = &col_args[..col_args.len() - 1];
             }
             "join" if !has_output_mode => {
                 output_mode = OverlapOutputMode::Join;
                 has_output_mode = true;
-                end -= 1;
+                col_args = &col_args[..col_args.len() - 1];
             }
             _ => break,
         }
     }
 
-    let (cols_left, cols_right, filter_op) = parse_col_triples(&extra[..end], filter_op, fn_name)?;
+    let (cols_left, cols_right, filter_op) = parse_col_triples(col_args, filter_op, fn_name)?;
     Ok((cols_left, cols_right, filter_op, output_mode))
 }
 
