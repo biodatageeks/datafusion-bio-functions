@@ -8,6 +8,14 @@ repository.workspace = true
 homepage.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+apple-gpu = [
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-metal",
+]
+
 [dependencies]
 datafusion = { workspace = true }
 tokio = { workspace = true }
@@ -20,6 +28,23 @@ bio = "3.0.0"
 rust-lapper = "1.1.0"
 superintervals = { path = "superintervals" }
 parking_lot = "0.12.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", optional = true }
+objc2-foundation = { version = "0.3.2", optional = true, features = ["NSError", "NSString"] }
+objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = [
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDevice",
+    "MTLLibrary",
+    "MTLResource",
+    "MTLTypes",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

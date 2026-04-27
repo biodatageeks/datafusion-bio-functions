@@ -1249,6 +1249,386 @@ async fn test_count_overlaps_udtf_strict_zero_based_boundary() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_udtf_containment_duplicates_points_and_missing_contigs() -> Result<()>
+{
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('chr1', 10, 100),
+        ('chr1', 20, 30),
+        ('chr1', 20, 30),
+        ('chr1', 50, 50),
+        ('chr1', 101, 110),
+        ('chr2', 1, 5)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (qid INTEGER, contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        (1, 'chr1', 25, 25),
+        (2, 'chr1', 50, 50),
+        (3, 'chr1', 100, 101),
+        (4, 'chr1', 31, 49),
+        (5, 'chr2', 3, 3),
+        (6, 'chr3', 1, 100),
+        (7, 'chr1', 111, 120)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql(
+            r#"SELECT qid, contig, pos_start, pos_end, "count"
+               FROM count_overlaps('reads', 'targets')
+               ORDER BY qid"#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    let expected = [
+        "+-----+--------+-----------+---------+-------+",
+        "| qid | contig | pos_start | pos_end | count |",
+        "+-----+--------+-----------+---------+-------+",
+        "| 1   | chr1   | 25        | 25      | 3     |",
+        "| 2   | chr1   | 50        | 50      | 2     |",
+        "| 3   | chr1   | 100       | 101     | 2     |",
+        "| 4   | chr1   | 31        | 49      | 1     |",
+        "| 5   | chr2   | 3         | 3       | 1     |",
+        "| 6   | chr3   | 1         | 100     | 0     |",
+        "| 7   | chr1   | 111       | 120     | 0     |",
+        "+-----+--------+-----------+---------+-------+",
+    ];
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_udtf_strict_semantics_matrix() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 10, 20),
+        ('a', 20, 30),
+        ('a', 15, 25),
+        ('a', 30, 30)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (qid INTEGER, contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        (1, 'a', 20, 20),
+        (2, 'a', 19, 21),
+        (3, 'a', 30, 30),
+        (4, 'a', 29, 31),
+        (5, 'a', 5, 9)
+    "#,
+    )
+    .await?;
+
+    let weak = ctx
+        .sql(
+            r#"SELECT *
+               FROM count_overlaps('reads', 'targets')
+               ORDER BY qid"#,
+        )
+        .await?
+        .collect()
+        .await?;
+    let strict = ctx
+        .sql(
+            r#"SELECT *
+               FROM count_overlaps('reads', 'targets', 'contig', 'pos_start', 'pos_end', 'strict')
+               ORDER BY qid"#,
+        )
+        .await?
+        .collect()
+        .await?;
+
+    let weak_expected = [
+        "+-----+--------+-----------+---------+-------+",
+        "| qid | contig | pos_start | pos_end | count |",
+        "+-----+--------+-----------+---------+-------+",
+        "| 1   | a      | 20        | 20      | 3     |",
+        "| 2   | a      | 19        | 21      | 3     |",
+        "| 3   | a      | 30        | 30      | 2     |",
+        "| 4   | a      | 29        | 31      | 2     |",
+        "| 5   | a      | 5         | 9       | 0     |",
+        "+-----+--------+-----------+---------+-------+",
+    ];
+    let strict_expected = [
+        "+-----+--------+-----------+---------+-------+",
+        "| qid | contig | pos_start | pos_end | count |",
+        "+-----+--------+-----------+---------+-------+",
+        "| 1   | a      | 20        | 20      | 0     |",
+        "| 2   | a      | 19        | 21      | 3     |",
+        "| 3   | a      | 30        | 30      | 0     |",
+        "| 4   | a      | 29        | 31      | 2     |",
+        "| 5   | a      | 5         | 9       | 0     |",
+        "+-----+--------+-----------+---------+-------+",
+    ];
+
+    assert_batches_sorted_eq!(weak_expected, &weak);
+    assert_batches_sorted_eq!(strict_expected, &strict);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_udtf_preserves_right_input_order() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 10, 20),
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (qid INTEGER, contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        (30, 'a', 150, 160),
+        (10, 'a', 1, 5),
+        (20, 'a', 15, 15),
+        (40, 'b', 1, 100)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets')")
+        .await?
+        .collect()
+        .await?;
+
+    let formatted = pretty_format_batches(&result)?.to_string();
+    let expected = [
+        "+-----+--------+-----------+---------+-------+",
+        "| qid | contig | pos_start | pos_end | count |",
+        "+-----+--------+-----------+---------+-------+",
+        "| 30  | a      | 150       | 160     | 1     |",
+        "| 10  | a      | 1         | 5       | 0     |",
+        "| 20  | a      | 15        | 15      | 1     |",
+        "| 40  | b      | 1         | 100     | 0     |",
+        "+-----+--------+-----------+---------+-------+",
+    ]
+    .join("\n");
+    assert_eq!(expected, formatted);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_backend_config_cpu_display() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql("SET bio.count_overlaps_backend TO cpu").await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 10, 20),
+        ('a', 100, 200)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 15, 15)
+    "#,
+    )
+    .await?;
+
+    let explain = explain_query(&ctx, "SELECT * FROM count_overlaps('reads', 'targets')").await?;
+    assert_contains!(&explain, "CountOverlapsExec: backend=cpu-coitree");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_supports_count_projection_and_aggregate() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 10, 20),
+        ('a', 15, 25),
+        ('b', 1, 2)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 20, 20),
+        ('a', 100, 110),
+        ('b', 2, 2)
+    "#,
+    )
+    .await?;
+
+    let aggregate = ctx
+        .sql(
+            r#"SELECT COUNT(*) AS n_rows, SUM("count") AS total_overlaps
+               FROM count_overlaps('reads', 'targets')"#,
+        )
+        .await?
+        .collect()
+        .await?;
+    let aggregate_expected = [
+        "+--------+----------------+",
+        "| n_rows | total_overlaps |",
+        "+--------+----------------+",
+        "| 3      | 3              |",
+        "+--------+----------------+",
+    ];
+    assert_batches_sorted_eq!(aggregate_expected, &aggregate);
+
+    let count_only = ctx
+        .sql(r#"SELECT "count" FROM count_overlaps('reads', 'targets') ORDER BY "count""#)
+        .await?
+        .collect()
+        .await?;
+    let count_only_expected = [
+        "+-------+",
+        "| count |",
+        "+-------+",
+        "| 0     |",
+        "| 1     |",
+        "| 2     |",
+        "+-------+",
+    ];
+    assert_batches_sorted_eq!(count_only_expected, &count_only);
+
+    let projected_right_column = ctx
+        .sql(r#"SELECT pos_end, "count" FROM count_overlaps('reads', 'targets') ORDER BY pos_end"#)
+        .await?
+        .collect()
+        .await?;
+    let projected_right_column_expected = [
+        "+---------+-------+",
+        "| pos_end | count |",
+        "+---------+-------+",
+        "| 2       | 1     |",
+        "| 20      | 2     |",
+        "| 110     | 0     |",
+        "+---------+-------+",
+    ];
+    assert_batches_sorted_eq!(projected_right_column_expected, &projected_right_column);
+
+    let row_count_only = ctx
+        .sql(r#"SELECT COUNT(*) AS n_rows FROM count_overlaps('reads', 'targets')"#)
+        .await?
+        .collect()
+        .await?;
+    let row_count_only_expected = [
+        "+--------+",
+        "| n_rows |",
+        "+--------+",
+        "| 3      |",
+        "+--------+",
+    ];
+    assert_batches_sorted_eq!(row_count_only_expected, &row_count_only);
+    Ok(())
+}
+
+#[cfg(not(all(feature = "apple-gpu", target_os = "macos")))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_overlaps_apple_gpu_config_falls_back_without_metal_build() -> Result<()> {
+    let ctx = create_bio_session();
+
+    ctx.sql("SET bio.count_overlaps_backend TO apple_gpu")
+        .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 10, 20)
+    "#,
+    )
+    .await?;
+    ctx.sql(
+        r#"
+        CREATE TABLE targets (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+        ('a', 20, 20)
+    "#,
+    )
+    .await?;
+
+    let result = ctx
+        .sql("SELECT * FROM count_overlaps('reads', 'targets')")
+        .await?
+        .collect()
+        .await?;
+    let expected = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | count |",
+        "+--------+-----------+---------+-------+",
+        "| a      | 20        | 20      | 1     |",
+        "+--------+-----------+---------+-------+",
+    ];
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a working Apple Metal device"]
+async fn test_count_overlaps_apple_gpu_matches_cpu_fixtures() -> Result<()> {
+    async fn create_fixture(ctx: &SessionContext) -> Result<()> {
+        ctx.sql(
+            r#"
+            CREATE TABLE reads (contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+            ('chr1', 10, 100),
+            ('chr1', 20, 30),
+            ('chr1', 20, 30),
+            ('chr1', 50, 50),
+            ('chr1', 101, 110),
+            ('chr2', 1, 5)
+        "#,
+        )
+        .await?;
+        ctx.sql(
+            r#"
+            CREATE TABLE targets (qid INTEGER, contig TEXT, pos_start INTEGER, pos_end INTEGER) AS VALUES
+            (1, 'chr1', 25, 25),
+            (2, 'chr1', 50, 50),
+            (3, 'chr1', 100, 101),
+            (4, 'chr1', 31, 49),
+            (5, 'chr2', 3, 3),
+            (6, 'chr3', 1, 100),
+            (7, 'chr1', 111, 120)
+        "#,
+        )
+        .await?;
+        Ok(())
+    }
+
+    let cpu = create_bio_session();
+    let gpu = create_bio_session();
+    cpu.sql("SET bio.count_overlaps_backend TO cpu").await?;
+    gpu.sql("SET bio.count_overlaps_backend TO apple_gpu")
+        .await?;
+    create_fixture(&cpu).await?;
+    create_fixture(&gpu).await?;
+
+    let query = r#"SELECT * FROM count_overlaps('reads', 'targets') ORDER BY qid"#;
+    let cpu_result = cpu.sql(query).await?.collect().await?;
+    let gpu_result = gpu.sql(query).await?.collect().await?;
+
+    assert_eq!(
+        pretty_format_batches(&cpu_result)?.to_string(),
+        pretty_format_batches(&gpu_result)?.to_string()
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_nearest_udtf_strict_zero_based_boundary_distance() -> Result<()> {
     let ctx = create_bio_session();
 
@@ -3492,6 +3872,10 @@ async fn test_range_udtfs_target_partitions_invariant() -> Result<()> {
             "subtract",
             "SELECT * FROM subtract('reads', 'targets') ORDER BY contig, pos_start, pos_end",
         ),
+        (
+            "count_overlaps",
+            r#"SELECT * FROM count_overlaps('reads', 'targets') ORDER BY contig, pos_start, pos_end, "count""#,
+        ),
     ];
 
     for (name, query) in cases {
@@ -3601,6 +3985,16 @@ async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> R
         "| chr2   | 36        | 40      |",
         "+--------+-----------+---------+",
     ];
+    let expected_count_overlaps = [
+        "+--------+-----------+---------+-------+",
+        "| contig | pos_start | pos_end | count |",
+        "+--------+-----------+---------+-------+",
+        "| chr1   | 5         | 10      | 2     |",
+        "| chr1   | 20        | 25      | 2     |",
+        "| chr2   | 12        | 15      | 1     |",
+        "| chr2   | 35        | 36      | 1     |",
+        "+--------+-----------+---------+-------+",
+    ];
 
     for target_partitions in [1, 2, 4] {
         let ctx = create_bio_session_with_target_partitions_and_batch_size(target_partitions, 1);
@@ -3655,6 +4049,15 @@ async fn test_range_udtfs_partitioned_parquet_target_partitions_invariant() -> R
             .collect()
             .await?;
         assert_batches_sorted_eq!(expected_subtract, &subtract);
+
+        let count_overlaps = ctx
+            .sql(
+                r#"SELECT * FROM count_overlaps('left_t', 'right_t') ORDER BY contig, pos_start, pos_end, "count""#,
+            )
+            .await?
+            .collect()
+            .await?;
+        assert_batches_sorted_eq!(expected_count_overlaps, &count_overlaps);
     }
 
     Ok(())

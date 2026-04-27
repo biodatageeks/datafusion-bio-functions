@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use coitrees::{COITree, Interval, IntervalTree};
-use datafusion::arrow::array::{Int64Array, RecordBatch};
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -13,6 +13,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use crate::array_utils::get_join_col_arrays;
+use crate::count_overlaps_rank::{OutputColumnSource, build_output_batch};
 use crate::filter_op::FilterOp;
 
 type IntervalHashMap = AHashMap<String, Vec<Interval<()>>>;
@@ -89,7 +90,8 @@ pub fn get_coverage(tree: &COITree<(), u32>, start: i32, end: i32) -> i32 {
 pub fn get_stream(
     right_plan: Arc<dyn ExecutionPlan>,
     trees: Arc<AHashMap<String, COITree<(), u32>>>,
-    new_schema: SchemaRef,
+    output_schema: SchemaRef,
+    output_sources: Arc<Vec<OutputColumnSource>>,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
     coverage: bool,
@@ -97,7 +99,8 @@ pub fn get_stream(
     context: Arc<TaskContext>,
 ) -> Result<SendableRecordBatchStream> {
     let partition_stream = right_plan.execute(partition, context)?;
-    let schema_for_closure = new_schema.clone();
+    let output_schema_for_closure = output_schema.clone();
+    let output_sources_for_closure = output_sources.clone();
     let strict_filter = filter_op == FilterOp::Strict;
 
     let iter = partition_stream.map(move |rb| match rb {
@@ -124,29 +127,34 @@ pub fn get_stream(
                     cached_tree = trees.get(contig);
                     cached_tree
                 };
-                let count = match tree {
-                    None => 0,
-                    Some(tree) => {
-                        if coverage {
-                            get_coverage(tree, query_start, query_end)
-                        } else {
-                            tree.query_count(query_start, query_end) as i32
+                let count = if strict_filter && query_start > query_end {
+                    0
+                } else {
+                    match tree {
+                        None => 0,
+                        Some(tree) => {
+                            if coverage {
+                                get_coverage(tree, query_start, query_end)
+                            } else {
+                                tree.query_count(query_start, query_end) as i32
+                            }
                         }
                     }
                 };
                 count_arr.push(count as i64);
             }
-            let count_arr = Arc::new(Int64Array::from(count_arr));
-            let mut columns = Vec::with_capacity(rb.num_columns() + 1);
-            columns.extend_from_slice(rb.columns());
-            columns.push(count_arr);
-            RecordBatch::try_new(schema_for_closure.clone(), columns)
-                .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))
+            build_output_batch(
+                &rb,
+                output_schema_for_closure.clone(),
+                output_sources_for_closure.as_ref(),
+                count_arr,
+            )
         }
         Err(e) => Err(e),
     });
 
-    let adapted_stream = RecordBatchStreamAdapter::new(new_schema, Box::pin(iter) as BoxStream<_>);
+    let adapted_stream =
+        RecordBatchStreamAdapter::new(output_schema, Box::pin(iter) as BoxStream<_>);
     Ok(Box::pin(adapted_stream))
 }
 

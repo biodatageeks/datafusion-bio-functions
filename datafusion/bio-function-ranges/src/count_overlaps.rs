@@ -1,10 +1,14 @@
 use std::any::Any;
+use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use ahash::AHashMap;
 use async_trait::async_trait;
 use coitrees::COITree;
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
@@ -17,9 +21,97 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, SessionContext};
+use log::warn;
 
+#[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+use crate::count_overlaps_apple_gpu::{AppleGpuCountOverlapsBackend, get_apple_gpu_stream};
+#[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+use crate::count_overlaps_rank::CountOverlapsRankIndex;
+use crate::count_overlaps_rank::OutputColumnSource;
 use crate::filter_op::FilterOp;
 use crate::interval_tree::{build_coitree_from_batches, get_stream};
+use crate::session_context::{BioConfig, CountOverlapsBackendMode};
+
+// Initial Auto threshold from the local Apple M3 Max 8-7 release benchmark:
+// ex-rna (9,944,559 left intervals) vs ex-anno (1,194,285 right intervals).
+// Keep this conservative until a broader size/distribution matrix is measured.
+const AUTO_APPLE_GPU_MIN_LEFT_INTERVALS: usize = 5_000_000;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CountOverlapsTimingSnapshot {
+    pub scans: u64,
+    pub left_rows: u64,
+    pub left_collect_ns: u64,
+    pub backend_build_ns: u64,
+    pub right_plan_ns: u64,
+    pub scan_total_ns: u64,
+}
+
+struct CountOverlapsTimingCounters {
+    scans: AtomicU64,
+    left_rows: AtomicU64,
+    left_collect_ns: AtomicU64,
+    backend_build_ns: AtomicU64,
+    right_plan_ns: AtomicU64,
+    scan_total_ns: AtomicU64,
+}
+
+static COUNT_OVERLAPS_TIMINGS: CountOverlapsTimingCounters = CountOverlapsTimingCounters {
+    scans: AtomicU64::new(0),
+    left_rows: AtomicU64::new(0),
+    left_collect_ns: AtomicU64::new(0),
+    backend_build_ns: AtomicU64::new(0),
+    right_plan_ns: AtomicU64::new(0),
+    scan_total_ns: AtomicU64::new(0),
+};
+
+pub fn reset_count_overlaps_timings() {
+    COUNT_OVERLAPS_TIMINGS.reset();
+}
+
+pub fn snapshot_count_overlaps_timings() -> CountOverlapsTimingSnapshot {
+    COUNT_OVERLAPS_TIMINGS.snapshot()
+}
+
+impl CountOverlapsTimingCounters {
+    fn reset(&self) {
+        self.scans.store(0, Ordering::Relaxed);
+        self.left_rows.store(0, Ordering::Relaxed);
+        self.left_collect_ns.store(0, Ordering::Relaxed);
+        self.backend_build_ns.store(0, Ordering::Relaxed);
+        self.right_plan_ns.store(0, Ordering::Relaxed);
+        self.scan_total_ns.store(0, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> CountOverlapsTimingSnapshot {
+        CountOverlapsTimingSnapshot {
+            scans: self.scans.load(Ordering::Relaxed),
+            left_rows: self.left_rows.load(Ordering::Relaxed),
+            left_collect_ns: self.left_collect_ns.load(Ordering::Relaxed),
+            backend_build_ns: self.backend_build_ns.load(Ordering::Relaxed),
+            right_plan_ns: self.right_plan_ns.load(Ordering::Relaxed),
+            scan_total_ns: self.scan_total_ns.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record(&self, timings: CountOverlapsTimingSnapshot) {
+        self.scans.fetch_add(timings.scans, Ordering::Relaxed);
+        self.left_rows
+            .fetch_add(timings.left_rows, Ordering::Relaxed);
+        self.left_collect_ns
+            .fetch_add(timings.left_collect_ns, Ordering::Relaxed);
+        self.backend_build_ns
+            .fetch_add(timings.backend_build_ns, Ordering::Relaxed);
+        self.right_plan_ns
+            .fetch_add(timings.right_plan_ns, Ordering::Relaxed);
+        self.scan_total_ns
+            .fetch_add(timings.scan_total_ns, Ordering::Relaxed);
+    }
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
 
 pub struct CountOverlapsProvider {
     session: Arc<SessionContext>,
@@ -98,10 +190,11 @@ impl TableProvider for CountOverlapsProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let scan_start = Instant::now();
         let target_partitions = self
             .session
             .state()
@@ -110,6 +203,7 @@ impl TableProvider for CountOverlapsProvider {
             .execution
             .target_partitions;
 
+        let left_collect_start = Instant::now();
         let left_table = self
             .session
             .table(self.left_table.clone())
@@ -117,14 +211,79 @@ impl TableProvider for CountOverlapsProvider {
             .select_columns(&[&self.columns_1.0, &self.columns_1.1, &self.columns_1.2])?
             .collect()
             .await?;
+        let left_collect_ns = elapsed_ns(left_collect_start);
+        let left_interval_count = left_table.iter().map(RecordBatch::num_rows).sum::<usize>();
 
-        let trees = Arc::new(build_coitree_from_batches(
-            left_table,
-            (&self.columns_1.0, &self.columns_1.1, &self.columns_1.2),
-            self.coverage,
-        )?);
+        let default = BioConfig::default();
+        let state = self.session.state();
+        let config = state.config();
+        let bio_config = config
+            .options()
+            .extensions
+            .get::<BioConfig>()
+            .unwrap_or(&default);
+        let backend_build_start = Instant::now();
+        let backend = self.select_backend(left_table, bio_config.count_overlaps_backend)?;
+        let backend_build_ns = elapsed_ns(backend_build_start);
 
-        let right_df = self.session.table(self.right_table.clone()).await?;
+        let right_plan_start = Instant::now();
+        let full_schema = self.schema();
+        let full_field_count = full_schema.fields().len();
+        let count_index = full_field_count.checked_sub(1).ok_or_else(|| {
+            DataFusionError::Internal("count_overlaps schema has no fields".to_string())
+        })?;
+        let requested_projection = projection
+            .cloned()
+            .unwrap_or_else(|| (0..full_field_count).collect());
+        let output_schema = Arc::new(full_schema.project(&requested_projection)?);
+
+        let interval_indices = [
+            full_schema.index_of(&self.columns_2.0)?,
+            full_schema.index_of(&self.columns_2.1)?,
+            full_schema.index_of(&self.columns_2.2)?,
+        ];
+        let mut right_projection = BTreeSet::new();
+        for &idx in &requested_projection {
+            if idx < count_index {
+                right_projection.insert(idx);
+            }
+        }
+        for idx in interval_indices {
+            right_projection.insert(idx);
+        }
+        let right_projection = right_projection.into_iter().collect::<Vec<_>>();
+        let mut full_to_right_input = vec![None; count_index];
+        for (input_idx, &full_idx) in right_projection.iter().enumerate() {
+            full_to_right_input[full_idx] = Some(input_idx);
+        }
+        let output_sources = requested_projection
+            .iter()
+            .map(|&idx| {
+                if idx == count_index {
+                    Ok(OutputColumnSource::Count)
+                } else if idx < count_index {
+                    full_to_right_input[idx].map(OutputColumnSource::Input).ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "count_overlaps missing right input column for projected field {idx}"
+                        ))
+                    })
+                } else {
+                    Err(DataFusionError::Internal(format!(
+                        "count_overlaps projection index {idx} exceeds schema field count {full_field_count}"
+                    )))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let right_projection_names = right_projection
+            .iter()
+            .map(|&idx| full_schema.field(idx).name().as_str())
+            .collect::<Vec<_>>();
+
+        let right_df = self
+            .session
+            .table(self.right_table.clone())
+            .await?
+            .select_columns(&right_projection_names)?;
         let right_plan = right_df.create_physical_plan().await?;
         let right_plan: Arc<dyn ExecutionPlan> =
             if right_plan.output_partitioning().partition_count() == target_partitions {
@@ -136,16 +295,26 @@ impl TableProvider for CountOverlapsProvider {
                 )?)
             };
         let output_partitions = right_plan.output_partitioning().partition_count();
+        let right_plan_ns = elapsed_ns(right_plan_start);
+        COUNT_OVERLAPS_TIMINGS.record(CountOverlapsTimingSnapshot {
+            scans: 1,
+            left_rows: u64::try_from(left_interval_count).unwrap_or(u64::MAX),
+            left_collect_ns,
+            backend_build_ns,
+            right_plan_ns,
+            scan_total_ns: elapsed_ns(scan_start),
+        });
 
         Ok(Arc::new(CountOverlapsExec {
-            schema: self.schema().clone(),
-            trees,
+            output_schema: output_schema.clone(),
+            output_sources: Arc::new(output_sources),
+            backend,
             right: right_plan,
             columns_2: Arc::new(self.columns_2.clone()),
             filter_op: self.filter_op.clone(),
             coverage: self.coverage,
             cache: PlanProperties::new(
-                EquivalenceProperties::new(self.schema().clone()),
+                EquivalenceProperties::new(output_schema),
                 Partitioning::UnknownPartitioning(output_partitions),
                 EmissionType::Final,
                 Boundedness::Bounded,
@@ -154,9 +323,85 @@ impl TableProvider for CountOverlapsProvider {
     }
 }
 
+#[derive(Clone)]
+enum CountOverlapsBackendKind {
+    Cpu {
+        trees: Arc<AHashMap<String, COITree<(), u32>>>,
+    },
+    #[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+    AppleGpu {
+        backend: Arc<AppleGpuCountOverlapsBackend>,
+    },
+}
+
+impl CountOverlapsBackendKind {
+    fn name(&self) -> &'static str {
+        match self {
+            CountOverlapsBackendKind::Cpu { .. } => "cpu-coitree",
+            #[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+            CountOverlapsBackendKind::AppleGpu { .. } => "apple-gpu-rank",
+        }
+    }
+}
+
+impl CountOverlapsProvider {
+    fn select_backend(
+        &self,
+        left_table: Vec<RecordBatch>,
+        backend_mode: CountOverlapsBackendMode,
+    ) -> Result<CountOverlapsBackendKind> {
+        let left_interval_count = left_table.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let try_apple_gpu = !self.coverage
+            && match backend_mode {
+                CountOverlapsBackendMode::AppleGpu => true,
+                CountOverlapsBackendMode::Auto => {
+                    left_interval_count >= AUTO_APPLE_GPU_MIN_LEFT_INTERVALS
+                }
+                CountOverlapsBackendMode::Cpu => false,
+            };
+
+        if try_apple_gpu {
+            #[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+            {
+                let rank_index = CountOverlapsRankIndex::build_from_batches(
+                    &left_table,
+                    (&self.columns_1.0, &self.columns_1.1, &self.columns_1.2),
+                )?;
+                match AppleGpuCountOverlapsBackend::try_new(rank_index) {
+                    Ok(backend) => {
+                        return Ok(CountOverlapsBackendKind::AppleGpu {
+                            backend: Arc::new(backend),
+                        });
+                    }
+                    Err(error) => {
+                        warn!(
+                            "falling back to CPU count_overlaps backend after Apple GPU initialization failed: {error}"
+                        );
+                    }
+                }
+            }
+
+            #[cfg(not(all(feature = "apple-gpu", target_os = "macos")))]
+            if backend_mode == CountOverlapsBackendMode::AppleGpu {
+                warn!(
+                    "falling back to CPU count_overlaps backend because apple-gpu feature is not active on macOS"
+                );
+            }
+        }
+
+        let trees = Arc::new(build_coitree_from_batches(
+            left_table,
+            (&self.columns_1.0, &self.columns_1.1, &self.columns_1.2),
+            self.coverage,
+        )?);
+        Ok(CountOverlapsBackendKind::Cpu { trees })
+    }
+}
+
 struct CountOverlapsExec {
-    schema: SchemaRef,
-    trees: Arc<AHashMap<String, COITree<(), u32>>>,
+    output_schema: SchemaRef,
+    output_sources: Arc<Vec<OutputColumnSource>>,
+    backend: CountOverlapsBackendKind,
     right: Arc<dyn ExecutionPlan>,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
@@ -166,13 +411,17 @@ struct CountOverlapsExec {
 
 impl Debug for CountOverlapsExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CountOverlapsExec")
+        write!(
+            f,
+            "CountOverlapsExec {{ backend: {} }}",
+            self.backend.name()
+        )
     }
 }
 
 impl DisplayAs for CountOverlapsExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "CountOverlapsExec")
+        write!(f, "CountOverlapsExec: backend={}", self.backend.name())
     }
 }
 
@@ -204,14 +453,15 @@ impl ExecutionPlan for CountOverlapsExec {
         }
 
         Ok(Arc::new(CountOverlapsExec {
-            schema: self.schema.clone(),
-            trees: Arc::clone(&self.trees),
+            output_schema: self.output_schema.clone(),
+            output_sources: self.output_sources.clone(),
+            backend: self.backend.clone(),
             right: Arc::clone(&children[0]),
             columns_2: Arc::clone(&self.columns_2),
             filter_op: self.filter_op.clone(),
             coverage: self.coverage,
             cache: PlanProperties::new(
-                EquivalenceProperties::new(self.schema.clone()),
+                EquivalenceProperties::new(self.output_schema.clone()),
                 Partitioning::UnknownPartitioning(
                     children[0].output_partitioning().partition_count(),
                 ),
@@ -226,15 +476,29 @@ impl ExecutionPlan for CountOverlapsExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        get_stream(
-            Arc::clone(&self.right),
-            self.trees.clone(),
-            self.schema.clone(),
-            Arc::clone(&self.columns_2),
-            self.filter_op.clone(),
-            self.coverage,
-            partition,
-            context,
-        )
+        match &self.backend {
+            CountOverlapsBackendKind::Cpu { trees } => get_stream(
+                Arc::clone(&self.right),
+                Arc::clone(trees),
+                self.output_schema.clone(),
+                self.output_sources.clone(),
+                Arc::clone(&self.columns_2),
+                self.filter_op.clone(),
+                self.coverage,
+                partition,
+                context,
+            ),
+            #[cfg(all(feature = "apple-gpu", target_os = "macos"))]
+            CountOverlapsBackendKind::AppleGpu { backend } => get_apple_gpu_stream(
+                Arc::clone(&self.right),
+                Arc::clone(backend),
+                self.output_schema.clone(),
+                self.output_sources.clone(),
+                Arc::clone(&self.columns_2),
+                self.filter_op.clone(),
+                partition,
+                context,
+            ),
+        }
     }
 }
