@@ -10,9 +10,14 @@ use crate::session_context::Algorithm;
 use ahash::AHashMap;
 use ahash::RandomState;
 use bio::data_structures::interval_tree as rust_bio;
-use datafusion::arrow::array::{Array, AsArray, PrimitiveArray, PrimitiveBuilder, RecordBatch};
+use datafusion::arrow::array::{
+    Array, AsArray, LargeStringArray, LargeStringBuilder, PrimitiveArray, PrimitiveBuilder,
+    RecordBatch, StringArray, StringBuilder,
+};
 use datafusion::arrow::compute;
-use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, UInt32Type};
+use datafusion::arrow::datatypes::{
+    ArrowPrimitiveType, DataType, Int32Type, Int64Type, Schema, SchemaRef, UInt32Type,
+};
 use datafusion::common::hash_utils::create_hashes;
 use datafusion::common::{
     DataFusionError, JoinSide, JoinType, Result, Statistics, internal_err, plan_err, project_schema,
@@ -20,7 +25,7 @@ use datafusion::common::{
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::equivalence::{ProjectionMapping, join_equivalence_properties};
-use datafusion::physical_expr::expressions::CastExpr;
+use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_expr::{Distribution, Partitioning, PhysicalExpr, PhysicalExprRef};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::common::can_project;
@@ -930,6 +935,149 @@ fn update_hashmap(
     Ok(())
 }
 
+fn build_right_indexes(rle_right: &[u32], len: usize) -> PrimitiveArray<UInt32Type> {
+    let mut index_right = Vec::with_capacity(len);
+    for (i, &rle) in rle_right.iter().enumerate() {
+        for _ in 0..rle {
+            index_right.push(i as u32);
+        }
+    }
+    PrimitiveArray::from(index_right)
+}
+
+fn take_primitive_rle<T>(
+    array: &PrimitiveArray<T>,
+    rle_right: &[u32],
+    len: usize,
+) -> PrimitiveArray<T>
+where
+    T: ArrowPrimitiveType,
+{
+    let mut builder =
+        PrimitiveBuilder::<T>::with_capacity(len).with_data_type(array.data_type().clone());
+    for (row_idx, &rle) in rle_right.iter().enumerate() {
+        let repeat = rle as usize;
+        if repeat == 0 {
+            continue;
+        }
+        if array.is_valid(row_idx) {
+            builder.append_value_n(array.value(row_idx), repeat);
+        } else {
+            builder.append_nulls(repeat);
+        }
+    }
+    builder.finish()
+}
+
+fn take_string_rle(array: &StringArray, rle_right: &[u32], len: usize) -> StringArray {
+    let data_capacity = rle_right
+        .iter()
+        .enumerate()
+        .filter(|(row_idx, rle)| **rle > 0 && array.is_valid(*row_idx))
+        .map(|(row_idx, rle)| array.value(row_idx).len() * (*rle as usize))
+        .sum();
+    let mut builder = StringBuilder::with_capacity(len, data_capacity);
+    for (row_idx, &rle) in rle_right.iter().enumerate() {
+        let repeat = rle as usize;
+        if repeat == 0 {
+            continue;
+        }
+        if array.is_valid(row_idx) {
+            let value = array.value(row_idx);
+            for _ in 0..repeat {
+                builder.append_value(value);
+            }
+        } else {
+            builder.append_nulls(repeat);
+        }
+    }
+    builder.finish()
+}
+
+fn take_large_string_rle(
+    array: &LargeStringArray,
+    rle_right: &[u32],
+    len: usize,
+) -> LargeStringArray {
+    let data_capacity = rle_right
+        .iter()
+        .enumerate()
+        .filter(|(row_idx, rle)| **rle > 0 && array.is_valid(*row_idx))
+        .map(|(row_idx, rle)| array.value(row_idx).len() * (*rle as usize))
+        .sum();
+    let mut builder = LargeStringBuilder::with_capacity(len, data_capacity);
+    for (row_idx, &rle) in rle_right.iter().enumerate() {
+        let repeat = rle as usize;
+        if repeat == 0 {
+            continue;
+        }
+        if array.is_valid(row_idx) {
+            let value = array.value(row_idx);
+            for _ in 0..repeat {
+                builder.append_value(value);
+            }
+        } else {
+            builder.append_nulls(repeat);
+        }
+    }
+    builder.finish()
+}
+
+fn take_right_rle(array: &dyn Array, rle_right: &[u32], len: usize) -> Option<Arc<dyn Array>> {
+    match array.data_type() {
+        DataType::Int32 => Some(Arc::new(take_primitive_rle::<Int32Type>(
+            array.as_primitive::<Int32Type>(),
+            rle_right,
+            len,
+        ))),
+        DataType::Int64 => Some(Arc::new(take_primitive_rle::<Int64Type>(
+            array.as_primitive::<Int64Type>(),
+            rle_right,
+            len,
+        ))),
+        DataType::Utf8 => Some(Arc::new(take_string_rle(
+            array.as_any().downcast_ref::<StringArray>()?,
+            rle_right,
+            len,
+        ))),
+        DataType::LargeUtf8 => Some(Arc::new(take_large_string_rle(
+            array.as_any().downcast_ref::<LargeStringArray>()?,
+            rle_right,
+            len,
+        ))),
+        _ => None,
+    }
+}
+
+fn take_right_column(
+    array: &dyn Array,
+    rle_right: &[u32],
+    len: usize,
+    right_indexes: &mut Option<PrimitiveArray<UInt32Type>>,
+) -> Result<Arc<dyn Array>> {
+    if let Some(array) = take_right_rle(array, rle_right, len) {
+        return Ok(array);
+    }
+
+    let indexes = right_indexes.get_or_insert_with(|| build_right_indexes(rle_right, len));
+    Ok(compute::take(array, indexes, None)?)
+}
+
+fn join_column_pairs(
+    on_left: &[PhysicalExprRef],
+    on_right: &[PhysicalExprRef],
+) -> Vec<(usize, usize)> {
+    on_left
+        .iter()
+        .zip(on_right)
+        .filter_map(|(left, right)| {
+            let left = left.as_any().downcast_ref::<Column>()?;
+            let right = right.as_any().downcast_ref::<Column>()?;
+            Some((left.index(), right.index()))
+        })
+        .collect()
+}
+
 #[allow(dead_code)]
 struct IntervalJoinStream {
     /// Input schema
@@ -1492,22 +1640,52 @@ impl IntervalJoinStream {
             }
 
             let left_indexes = builder_left.finish();
-            let mut index_right = Vec::with_capacity(left_indexes.len());
-            for (i, &rle) in rle_right.iter().enumerate() {
-                for _ in 0..rle {
-                    index_right.push(i as u32);
-                }
-            }
-            let right_indexes = PrimitiveArray::from(index_right);
+            let mut right_indexes = None;
 
             let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(self.schema.fields().len());
+            let join_key_pairs = if self.join_type == JoinType::Inner {
+                join_column_pairs(&self.on_left, &self.on_right)
+            } else {
+                Vec::new()
+            };
+            let mut left_join_key_outputs: Vec<(usize, Arc<dyn Array>)> =
+                Vec::with_capacity(join_key_pairs.len());
             for column_index in &self.column_indices {
                 let array: Arc<dyn Array> = if column_index.side == JoinSide::Left {
                     let array = build_side.batch.column(column_index.index);
-                    compute::take(array, &left_indexes, None)?
+                    let array = compute::take(array, &left_indexes, None)?;
+                    if join_key_pairs
+                        .iter()
+                        .any(|(left_index, _)| *left_index == column_index.index)
+                    {
+                        left_join_key_outputs.push((column_index.index, Arc::clone(&array)));
+                    }
+                    array
                 } else if column_index.side == JoinSide::Right {
                     let array = state.batch.column(column_index.index);
-                    compute::take(array, &right_indexes, None)?
+                    let matching_left_index =
+                        join_key_pairs.iter().find_map(|(left_index, right_index)| {
+                            (*right_index == column_index.index).then_some(*left_index)
+                        });
+                    matching_left_index
+                        .and_then(|left_index| {
+                            left_join_key_outputs
+                                .iter()
+                                .find(|(output_left_index, left_array)| {
+                                    *output_left_index == left_index
+                                        && left_array.data_type() == array.data_type()
+                                })
+                                .map(|(_, left_array)| Arc::clone(left_array))
+                        })
+                        .map(Ok)
+                        .unwrap_or_else(|| {
+                            take_right_column(
+                                array.as_ref(),
+                                &rle_right,
+                                left_indexes.len(),
+                                &mut right_indexes,
+                            )
+                        })?
                 } else {
                     panic!("Unsupported join_side {:?}", column_index.side);
                 };

@@ -1528,6 +1528,22 @@ async fn test_bioframe_overlap_udtf_count() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_bioframe_overlap_udtf_count_star_projection() -> Result<()> {
+    let ctx = create_bio_session();
+    init_ranges_tables(&ctx).await?;
+
+    let result = ctx
+        .sql("SELECT COUNT(*) AS n FROM overlap('reads', 'targets')")
+        .await?
+        .collect()
+        .await?;
+
+    let expected = ["+----+", "| n  |", "+----+", "| 16 |", "+----+"];
+    assert_batches_sorted_eq!(expected, &result);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_bioframe_overlap_udtf_schema_rows() -> Result<()> {
     let ctx = create_bio_session();
     init_ranges_tables(&ctx).await?;

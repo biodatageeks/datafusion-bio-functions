@@ -7,10 +7,44 @@ use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::datasource::{TableProvider, TableType};
+use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::PhysicalExpr;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::prelude::{Expr, SessionContext};
 
 use crate::filter_op::FilterOp;
+
+fn wrap_with_projection(
+    plan: Arc<dyn ExecutionPlan>,
+    projection: Option<&Vec<usize>>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let Some(indices) = projection else {
+        return Ok(plan);
+    };
+
+    let schema = plan.schema();
+    let is_identity = indices.len() == schema.fields().len()
+        && indices
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(expected, actual)| expected == actual);
+    if is_identity {
+        return Ok(plan);
+    }
+
+    let exprs = indices
+        .iter()
+        .map(|&idx| {
+            let field = schema.field(idx);
+            let expr = Arc::new(Column::new(field.name(), idx)) as Arc<dyn PhysicalExpr>;
+            (expr, field.name().clone())
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
+}
 
 pub struct OverlapProvider {
     session: Arc<SessionContext>,
@@ -105,7 +139,7 @@ impl TableProvider for OverlapProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -143,6 +177,7 @@ impl TableProvider for OverlapProvider {
         );
 
         let df = self.session.sql(&query).await?;
-        df.create_physical_plan().await
+        let plan = df.create_physical_plan().await?;
+        wrap_with_projection(plan, projection)
     }
 }
