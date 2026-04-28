@@ -13,8 +13,7 @@ use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
+use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -22,6 +21,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{Stream, ready};
 
+use crate::array_utils::get_join_col_arrays;
 use crate::filter_op::FilterOp;
 use crate::grouped_stream::{FullBatchCollector, IndexedGroups, StreamCollector};
 
@@ -33,7 +33,6 @@ pub struct SubtractProvider {
     right_columns: (String, String, String),
     filter_op: FilterOp,
     schema: SchemaRef,
-    left_schema: Schema,
     has_extra_cols: bool,
 }
 
@@ -82,7 +81,6 @@ impl SubtractProvider {
             right_columns,
             filter_op,
             schema,
-            left_schema,
             has_extra_cols,
         }
     }
@@ -133,14 +131,7 @@ impl TableProvider for SubtractProvider {
         };
         let left_plan = left_df.create_physical_plan().await?;
 
-        let contig_col_idx = if self.has_extra_cols {
-            self.left_schema.index_of(&self.left_columns.0)?
-        } else {
-            0
-        };
-
-        // Right table always selects only 3 range columns
-        let right_df = self
+        let right_batches = self
             .session
             .table(&self.right_table)
             .await?
@@ -148,18 +139,18 @@ impl TableProvider for SubtractProvider {
                 &self.right_columns.0,
                 &self.right_columns.1,
                 &self.right_columns.2,
-            ])?;
-        let right_plan = right_df.create_physical_plan().await?;
+            ])?
+            .collect()
+            .await?;
+        let right_groups = Arc::new(build_right_groups(right_batches, &self.right_columns)?);
 
         let output_partitions = left_plan.output_partitioning().partition_count();
 
         Ok(Arc::new(SubtractExec {
             schema: self.schema.clone(),
             left: left_plan,
-            right: right_plan,
             left_columns: Arc::new(self.left_columns.clone()),
-            right_columns: Arc::new(self.right_columns.clone()),
-            left_contig_col_idx: contig_col_idx,
+            right_groups,
             strict: self.filter_op == FilterOp::Strict,
             has_extra_cols: self.has_extra_cols,
             cache: PlanProperties::new(
@@ -176,10 +167,8 @@ impl TableProvider for SubtractProvider {
 struct SubtractExec {
     schema: SchemaRef,
     left: Arc<dyn ExecutionPlan>,
-    right: Arc<dyn ExecutionPlan>,
     left_columns: Arc<(String, String, String)>,
-    right_columns: Arc<(String, String, String)>,
-    left_contig_col_idx: usize,
+    right_groups: Arc<AHashMap<String, Vec<(i64, i64)>>>,
     strict: bool,
     has_extra_cols: bool,
     cache: PlanProperties,
@@ -204,40 +193,25 @@ impl ExecutionPlan for SubtractExec {
         &self.cache
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![
-            Distribution::HashPartitioned(vec![Arc::new(Column::new(
-                self.left_columns.0.as_str(),
-                self.left_contig_col_idx,
-            ))]),
-            Distribution::HashPartitioned(vec![Arc::new(Column::new(
-                self.right_columns.0.as_str(),
-                0,
-            ))]),
-        ]
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.left, &self.right]
+        vec![&self.left]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 2 {
+        if children.len() != 1 {
             return Err(DataFusionError::Internal(
-                "SubtractExec expects exactly two child plans".to_string(),
+                "SubtractExec expects exactly one child plan".to_string(),
             ));
         }
 
         Ok(Arc::new(Self {
             schema: self.schema.clone(),
             left: Arc::clone(&children[0]),
-            right: Arc::clone(&children[1]),
             left_columns: Arc::clone(&self.left_columns),
-            right_columns: Arc::clone(&self.right_columns),
-            left_contig_col_idx: self.left_contig_col_idx,
+            right_groups: Arc::clone(&self.right_groups),
             strict: self.strict,
             has_extra_cols: self.has_extra_cols,
             cache: PlanProperties::new(
@@ -257,8 +231,7 @@ impl ExecutionPlan for SubtractExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let batch_size = context.session_config().batch_size();
-        let left = self.left.execute(partition, Arc::clone(&context))?;
-        let right = self.right.execute(partition, Arc::clone(&context))?;
+        let left = self.left.execute(partition, context)?;
 
         if self.has_extra_cols {
             let left_input_schema = left.schema();
@@ -270,10 +243,9 @@ impl ExecutionPlan for SubtractExec {
                     Arc::clone(&self.left_columns),
                     left_input_schema,
                 ),
-                right_collector: Some(StreamCollector::new(right, Arc::clone(&self.right_columns))),
                 strict: self.strict,
-                phase: SubtractPhase::CollectRight,
-                right_groups: AHashMap::new(),
+                phase: SubtractPhase::CollectLeft,
+                right_groups: Arc::clone(&self.right_groups),
                 left_groups: Vec::new(),
                 concatenated: None,
                 start_col_idx: 0,
@@ -291,10 +263,9 @@ impl ExecutionPlan for SubtractExec {
             Ok(Box::pin(SubtractStream {
                 schema: self.schema.clone(),
                 left_collector: StreamCollector::new(left, Arc::clone(&self.left_columns)),
-                right_collector: Some(StreamCollector::new(right, Arc::clone(&self.right_columns))),
                 strict: self.strict,
-                phase: SubtractPhase::CollectRight,
-                right_groups: AHashMap::new(),
+                phase: SubtractPhase::CollectLeft,
+                right_groups: Arc::clone(&self.right_groups),
                 left_groups: Vec::new(),
                 group_idx: 0,
                 interval_idx: 0,
@@ -310,10 +281,63 @@ impl ExecutionPlan for SubtractExec {
 }
 
 enum SubtractPhase {
-    CollectRight,
     CollectLeft,
     Emit,
     Done,
+}
+
+fn build_right_groups(
+    batches: Vec<RecordBatch>,
+    columns: &(String, String, String),
+) -> Result<AHashMap<String, Vec<(i64, i64)>>> {
+    let mut groups = AHashMap::<String, Vec<(i64, i64)>>::new();
+
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+
+        let (contig_arr, start_arr, end_arr) =
+            get_join_col_arrays(&batch, (&columns.0, &columns.1, &columns.2))?;
+        let start_resolved = start_arr.resolve_i64()?;
+        let end_resolved = end_arr.resolve_i64()?;
+        let starts = &*start_resolved;
+        let ends = &*end_resolved;
+
+        for i in 0..batch.num_rows() {
+            groups
+                .entry(contig_arr.value(i).to_string())
+                .or_default()
+                .push((starts[i], ends[i]));
+        }
+    }
+
+    for intervals in groups.values_mut() {
+        intervals.sort_unstable();
+        merge_mask_intervals(intervals);
+    }
+
+    Ok(groups)
+}
+
+fn merge_mask_intervals(intervals: &mut Vec<(i64, i64)>) {
+    if intervals.len() <= 1 {
+        return;
+    }
+
+    let mut write_idx = 0usize;
+    for read_idx in 1..intervals.len() {
+        let (start, end) = intervals[read_idx];
+        if start <= intervals[write_idx].1 {
+            if end > intervals[write_idx].1 {
+                intervals[write_idx].1 = end;
+            }
+        } else {
+            write_idx += 1;
+            intervals[write_idx] = (start, end);
+        }
+    }
+    intervals.truncate(write_idx + 1);
 }
 
 // ─── Fast path: 3-column left input ─────────────────────────────────────────
@@ -321,10 +345,9 @@ enum SubtractPhase {
 struct SubtractStream {
     schema: SchemaRef,
     left_collector: StreamCollector,
-    right_collector: Option<StreamCollector>,
     strict: bool,
     phase: SubtractPhase,
-    right_groups: AHashMap<String, Vec<(i64, i64)>>,
+    right_groups: Arc<AHashMap<String, Vec<(i64, i64)>>>,
     left_groups: Vec<(String, Vec<(i64, i64)>)>,
     group_idx: usize,
     interval_idx: usize,
@@ -359,21 +382,6 @@ impl Stream for SubtractStream {
 
         loop {
             match this.phase {
-                SubtractPhase::CollectRight => {
-                    if let Some(ref mut rc) = this.right_collector {
-                        match ready!(rc.poll_collect(cx)) {
-                            Ok(true) => {}
-                            Ok(false) => unreachable!(),
-                            Err(e) => {
-                                this.phase = SubtractPhase::Done;
-                                return Poll::Ready(Some(Err(e)));
-                            }
-                        }
-                        this.right_groups =
-                            this.right_collector.take().unwrap().take_groups_as_map();
-                    }
-                    this.phase = SubtractPhase::CollectLeft;
-                }
                 SubtractPhase::CollectLeft => match ready!(this.left_collector.poll_collect(cx)) {
                     Ok(true) => {
                         this.left_groups = this.left_collector.take_groups();
@@ -388,11 +396,13 @@ impl Stream for SubtractStream {
                     }
                 },
                 SubtractPhase::Emit => {
-                    let empty = Vec::new();
-
                     while this.group_idx < this.left_groups.len() {
                         let (ref contig, ref left_intervals) = this.left_groups[this.group_idx];
-                        let right_intervals = this.right_groups.get(contig).unwrap_or(&empty);
+                        let right_intervals = this
+                            .right_groups
+                            .get(contig)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
 
                         while this.interval_idx < left_intervals.len() {
                             let (ls, le) = left_intervals[this.interval_idx];
@@ -480,10 +490,9 @@ struct SubtractStreamExtra {
     schema: SchemaRef,
     left_columns: Arc<(String, String, String)>,
     left_collector: FullBatchCollector,
-    right_collector: Option<StreamCollector>,
     strict: bool,
     phase: SubtractPhase,
-    right_groups: AHashMap<String, Vec<(i64, i64)>>,
+    right_groups: Arc<AHashMap<String, Vec<(i64, i64)>>>,
     left_groups: IndexedGroups,
     concatenated: Option<RecordBatch>,
     start_col_idx: usize,
@@ -534,21 +543,6 @@ impl Stream for SubtractStreamExtra {
 
         loop {
             match this.phase {
-                SubtractPhase::CollectRight => {
-                    if let Some(ref mut rc) = this.right_collector {
-                        match ready!(rc.poll_collect(cx)) {
-                            Ok(true) => {}
-                            Ok(false) => unreachable!(),
-                            Err(e) => {
-                                this.phase = SubtractPhase::Done;
-                                return Poll::Ready(Some(Err(e)));
-                            }
-                        }
-                        this.right_groups =
-                            this.right_collector.take().unwrap().take_groups_as_map();
-                    }
-                    this.phase = SubtractPhase::CollectLeft;
-                }
                 SubtractPhase::CollectLeft => match ready!(this.left_collector.poll_collect(cx)) {
                     Ok(true) => {
                         this.left_groups = this.left_collector.take_groups();
@@ -573,11 +567,13 @@ impl Stream for SubtractStreamExtra {
                     }
                 },
                 SubtractPhase::Emit => {
-                    let empty = Vec::new();
-
                     while this.group_idx < this.left_groups.len() {
                         let (ref contig, ref left_intervals) = this.left_groups[this.group_idx];
-                        let right_intervals = this.right_groups.get(contig).unwrap_or(&empty);
+                        let right_intervals = this
+                            .right_groups
+                            .get(contig)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
 
                         while this.interval_idx < left_intervals.len() {
                             let (ls, le, row_idx) = left_intervals[this.interval_idx];

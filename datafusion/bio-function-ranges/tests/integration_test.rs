@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -3951,7 +3952,7 @@ async fn test_subtract_partitioned_parquet_preserves_extra_columns_with_custom_o
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_partitioned_parquet_explain_preserves_hash_repartition() -> Result<()> {
+async fn test_partitioned_parquet_explain_distribution_contracts() -> Result<()> {
     let tmp = TempDirGuard::new("df-bio-issue-372-explain")?;
     let left_dir = tmp.path().join("left");
     let right_dir = tmp.path().join("right");
@@ -4012,8 +4013,8 @@ async fn test_partitioned_parquet_explain_preserves_hash_repartition() -> Result
         subtract_plan
             .matches("RepartitionExec: partitioning=Hash([contig@0]")
             .count()
-            >= 2,
-        "expected two hash repartitions in subtract plan, got:\n{subtract_plan}"
+            == 0,
+        "subtract should not require contig hash repartition after collecting the right mask globally, got:\n{subtract_plan}"
     );
 
     Ok(())
@@ -4205,10 +4206,54 @@ async fn bench_complement_with_partitions(
     Ok((rows, elapsed))
 }
 
+fn interval_row_checksum(batches: &[RecordBatch]) -> (usize, u128, u128, u64) {
+    let mut rows = 0usize;
+    let mut hash_sum = 0u128;
+    let mut hash_square_sum = 0u128;
+    let mut hash_xor = 0u64;
+
+    for batch in batches {
+        let contigs = batch
+            .column_by_name("contig")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let starts = batch
+            .column_by_name("pos_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ends = batch
+            .column_by_name("pos_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        for row in 0..batch.num_rows() {
+            let mut hasher = DefaultHasher::new();
+            contigs.value(row).hash(&mut hasher);
+            starts.value(row).hash(&mut hasher);
+            ends.value(row).hash(&mut hasher);
+            let hash = hasher.finish();
+            let hash_u128 = u128::from(hash);
+
+            rows += 1;
+            hash_sum = hash_sum.wrapping_add(hash_u128);
+            hash_square_sum = hash_square_sum.wrapping_add(hash_u128.wrapping_mul(hash_u128));
+            hash_xor ^= hash;
+        }
+    }
+
+    (rows, hash_sum, hash_square_sum, hash_xor)
+}
+
 async fn bench_subtract_with_partitions(
     target_partitions: usize,
     show_plan: bool,
-) -> Result<(usize, std::time::Duration)> {
+) -> Result<(usize, (u128, u128, u64), std::time::Duration)> {
     let ctx = create_bio_session_with_target_partitions(target_partitions);
     let create_left =
         format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
@@ -4236,8 +4281,8 @@ async fn bench_subtract_with_partitions(
         .collect()
         .await?;
     let elapsed = start.elapsed();
-    let rows: usize = result.iter().map(|b| b.num_rows()).sum();
-    Ok((rows, elapsed))
+    let (rows, hash_sum, hash_square_sum, hash_xor) = interval_row_checksum(&result);
+    Ok((rows, (hash_sum, hash_square_sum, hash_xor), elapsed))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4401,11 +4446,15 @@ async fn bench_scaling_subtract() -> Result<()> {
     let partition_counts = [1, 2, 4, 8];
     for (i, partitions) in partition_counts.iter().enumerate() {
         let show_plan = i == 0;
-        let (rows, elapsed) = bench_subtract_with_partitions(*partitions, show_plan).await?;
+        let (rows, checksum, elapsed) =
+            bench_subtract_with_partitions(*partitions, show_plan).await?;
         eprintln!(
-            "  partitions={:<2}  rows={:<10}  time={:.3}s",
+            "  partitions={:<2}  rows={:<10}  checksum={:032x}:{:032x}:{:016x}  time={:.3}s",
             partitions,
             rows,
+            checksum.0,
+            checksum.1,
+            checksum.2,
             elapsed.as_secs_f64()
         );
     }
