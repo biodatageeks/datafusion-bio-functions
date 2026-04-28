@@ -23,6 +23,7 @@ struct IntervalMeta {
 pub struct NearestIntervalIndex {
     tree: COITree<Position, u32>,
     by_start: Vec<Interval<Position>>,
+    prefix_max_end: Vec<i32>,
     /// Lazily initialized: only allocated when a non-overlap search is needed.
     /// For the common k=1 include_overlaps=true hot path where most queries
     /// find overlaps via the COITree, this avoids ~24MB per contig of cache
@@ -52,10 +53,17 @@ impl NearestIntervalIndex {
         });
 
         let tree = COITree::new(by_start.iter());
+        let mut prefix_max_end = Vec::with_capacity(by_start.len());
+        let mut max_end = i32::MIN;
+        for interval in &by_start {
+            max_end = max_end.max(interval.last);
+            prefix_max_end.push(max_end);
+        }
 
         Self {
             tree,
             by_start,
+            prefix_max_end,
             by_end: OnceLock::new(),
         }
     }
@@ -83,21 +91,8 @@ impl NearestIntervalIndex {
             return None;
         }
 
-        if include_overlaps {
-            let mut best_overlap: Option<IntervalMeta> = None;
-            self.tree.query(start, end, |node| {
-                let meta = extract_coitree_meta(node);
-                if best_overlap
-                    .as_ref()
-                    .map(|best| cmp_interval_meta(&meta, best).is_lt())
-                    .unwrap_or(true)
-                {
-                    best_overlap = Some(meta);
-                }
-            });
-            if let Some(best) = best_overlap {
-                return Some(best.position);
-            }
+        if include_overlaps && let Some(best) = self.first_overlap_by_start(start, end) {
+            return Some(best.position);
         }
 
         self.nearest_non_overlap_one(start, end).map(|m| m.position)
@@ -220,6 +215,20 @@ impl NearestIntervalIndex {
                 }
             }
         }
+    }
+
+    fn first_overlap_by_start(&self, start: i32, end: i32) -> Option<IntervalMeta> {
+        if end < start {
+            return None;
+        }
+
+        let prefix_len = self.by_start.partition_point(|iv| iv.first <= end);
+        if prefix_len == 0 || self.prefix_max_end[prefix_len - 1] < start {
+            return None;
+        }
+
+        let idx = self.prefix_max_end[..prefix_len].partition_point(|&max_end| max_end < start);
+        Some(interval_meta_from(&self.by_start[idx]))
     }
 }
 
@@ -363,6 +372,13 @@ mod tests {
         let nearest = idx.nearest_one(21, 21, true);
         // all overlap; deterministic tie-break is (start, end, position)
         assert_eq!(nearest, Some(20));
+    }
+
+    #[test]
+    fn nearest_one_overlap_skips_early_non_overlapping_end() {
+        let idx = mk(&[(10, 20, 0), (10, 50, 1), (30, 40, 2)]);
+        let nearest = idx.nearest_one(30, 30, true);
+        assert_eq!(nearest, Some(1));
     }
 
     #[test]
