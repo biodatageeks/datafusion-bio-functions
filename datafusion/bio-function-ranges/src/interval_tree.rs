@@ -82,12 +82,14 @@ pub fn build_coitree_from_batches(
     for batch in batches {
         let (contig_arr, start_arr, end_arr) =
             get_join_col_arrays(&batch, (columns.0, columns.1, columns.2))?;
+        let start_resolved = start_arr.resolve()?;
+        let end_resolved = end_arr.resolve()?;
+        let starts = &*start_resolved;
+        let ends = &*end_resolved;
 
         for i in 0..batch.num_rows() {
             let contig = contig_arr.value(i);
-            let pos_start = start_arr.value(i)?;
-            let pos_end = end_arr.value(i)?;
-            let interval = Interval::new(pos_start, pos_end, ());
+            let interval = Interval::new(starts[i], ends[i], ());
 
             if let Some(seqname_nodes) = nodes.get_mut(contig) {
                 seqname_nodes.push(interval);
@@ -168,14 +170,18 @@ pub fn get_stream(
         Ok(rb) => {
             let (contig, pos_start, pos_end) =
                 get_join_col_arrays(&rb, (&columns_2.0, &columns_2.1, &columns_2.2))?;
+            let start_resolved = pos_start.resolve()?;
+            let end_resolved = pos_end.resolve()?;
+            let starts = &*start_resolved;
+            let ends = &*end_resolved;
             let mut count_arr = Vec::with_capacity(rb.num_rows());
             let num_rows = rb.num_rows();
             let mut cached_contig: Option<&str> = None;
             let mut cached_tree: Option<&COITree<(), u32>> = None;
             for i in 0..num_rows {
                 let contig = contig.value(i);
-                let mut query_start = pos_start.value(i)?;
-                let mut query_end = pos_end.value(i)?;
+                let mut query_start = starts[i];
+                let mut query_end = ends[i];
                 if strict_filter {
                     query_start += 1;
                     query_end -= 1;
