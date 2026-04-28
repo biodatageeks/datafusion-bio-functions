@@ -17,6 +17,38 @@ use crate::filter_op::FilterOp;
 
 type IntervalHashMap = AHashMap<String, Vec<Interval<()>>>;
 
+pub struct CountOverlapIndex {
+    starts: Vec<i32>,
+    ends: Vec<i32>,
+}
+
+impl CountOverlapIndex {
+    fn new(intervals: Vec<Interval<()>>) -> Self {
+        let mut starts = Vec::with_capacity(intervals.len());
+        let mut ends = Vec::with_capacity(intervals.len());
+
+        for interval in intervals {
+            starts.push(interval.first);
+            ends.push(interval.last);
+        }
+
+        starts.sort_unstable();
+        ends.sort_unstable();
+
+        Self { starts, ends }
+    }
+
+    fn query_count(&self, start: i32, end: i32) -> i64 {
+        if end < start {
+            return 0;
+        }
+
+        let started = self.starts.partition_point(|&value| value <= end);
+        let ended_before = self.ends.partition_point(|&value| value < start);
+        (started - ended_before) as i64
+    }
+}
+
 pub fn merge_intervals(mut intervals: Vec<Interval<()>>) -> Vec<Interval<()>> {
     if intervals.is_empty() {
         return vec![];
@@ -74,6 +106,38 @@ pub fn build_coitree_from_batches(
         }
     }
     Ok(trees)
+}
+
+pub fn build_count_index_from_batches(
+    batches: Vec<RecordBatch>,
+    columns: (&str, &str, &str),
+) -> Result<AHashMap<String, CountOverlapIndex>> {
+    let mut nodes = IntervalHashMap::default();
+
+    for batch in batches {
+        let (contig_arr, start_arr, end_arr) =
+            get_join_col_arrays(&batch, (columns.0, columns.1, columns.2))?;
+        let start_resolved = start_arr.resolve()?;
+        let end_resolved = end_arr.resolve()?;
+        let starts = &*start_resolved;
+        let ends = &*end_resolved;
+
+        for i in 0..batch.num_rows() {
+            let contig = contig_arr.value(i);
+            let interval = Interval::new(starts[i], ends[i], ());
+
+            if let Some(seqname_nodes) = nodes.get_mut(contig) {
+                seqname_nodes.push(interval);
+            } else {
+                nodes.insert(contig.to_owned(), vec![interval]);
+            }
+        }
+    }
+
+    Ok(nodes
+        .into_iter()
+        .map(|(seqname, intervals)| (seqname, CountOverlapIndex::new(intervals)))
+        .collect())
 }
 
 pub fn get_coverage(tree: &COITree<(), u32>, start: i32, end: i32) -> i32 {
@@ -135,6 +199,65 @@ pub fn get_stream(
                     }
                 };
                 count_arr.push(count as i64);
+            }
+            let count_arr = Arc::new(Int64Array::from(count_arr));
+            let mut columns = Vec::with_capacity(rb.num_columns() + 1);
+            columns.extend_from_slice(rb.columns());
+            columns.push(count_arr);
+            RecordBatch::try_new(schema_for_closure.clone(), columns)
+                .map_err(|e| datafusion::common::DataFusionError::ArrowError(Box::new(e), None))
+        }
+        Err(e) => Err(e),
+    });
+
+    let adapted_stream = RecordBatchStreamAdapter::new(new_schema, Box::pin(iter) as BoxStream<_>);
+    Ok(Box::pin(adapted_stream))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn get_count_stream(
+    right_plan: Arc<dyn ExecutionPlan>,
+    indexes: Arc<AHashMap<String, CountOverlapIndex>>,
+    new_schema: SchemaRef,
+    columns_2: Arc<(String, String, String)>,
+    filter_op: FilterOp,
+    partition: usize,
+    context: Arc<TaskContext>,
+) -> Result<SendableRecordBatchStream> {
+    let partition_stream = right_plan.execute(partition, context)?;
+    let schema_for_closure = new_schema.clone();
+    let strict_filter = filter_op == FilterOp::Strict;
+
+    let iter = partition_stream.map(move |rb| match rb {
+        Ok(rb) => {
+            let (contig, pos_start, pos_end) =
+                get_join_col_arrays(&rb, (&columns_2.0, &columns_2.1, &columns_2.2))?;
+            let start_resolved = pos_start.resolve()?;
+            let end_resolved = pos_end.resolve()?;
+            let starts = &*start_resolved;
+            let ends = &*end_resolved;
+            let mut count_arr = Vec::with_capacity(rb.num_rows());
+            let num_rows = rb.num_rows();
+            let mut cached_contig: Option<&str> = None;
+            let mut cached_index: Option<&CountOverlapIndex> = None;
+            for i in 0..num_rows {
+                let contig = contig.value(i);
+                let mut query_start = starts[i];
+                let mut query_end = ends[i];
+                if strict_filter {
+                    query_start += 1;
+                    query_end -= 1;
+                }
+
+                let index = if cached_contig == Some(contig) {
+                    cached_index
+                } else {
+                    cached_contig = Some(contig);
+                    cached_index = indexes.get(contig);
+                    cached_index
+                };
+                let count = index.map_or(0, |index| index.query_count(query_start, query_end));
+                count_arr.push(count);
             }
             let count_arr = Arc::new(Int64Array::from(count_arr));
             let mut columns = Vec::with_capacity(rb.num_columns() + 1);
@@ -220,6 +343,22 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!((result[0].first, result[0].last), (1, 8));
         assert_eq!((result[1].first, result[1].last), (10, 15));
+    }
+
+    #[test]
+    fn test_count_overlap_index_counts_inclusive_overlaps() {
+        let index = CountOverlapIndex::new(vec![
+            Interval::new(10, 20, ()),
+            Interval::new(15, 25, ()),
+            Interval::new(30, 40, ()),
+        ]);
+
+        assert_eq!(index.query_count(5, 9), 0);
+        assert_eq!(index.query_count(5, 10), 1);
+        assert_eq!(index.query_count(20, 30), 3);
+        assert_eq!(index.query_count(26, 29), 0);
+        assert_eq!(index.query_count(31, 35), 1);
+        assert_eq!(index.query_count(10, 9), 0);
     }
 
     #[test]
