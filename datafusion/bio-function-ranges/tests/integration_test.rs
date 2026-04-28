@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::array::{
+    Array, Float64Array, GenericStringArray, Int64Array, RecordBatch, StringArray, StringViewArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::assert_batches_sorted_eq;
@@ -4083,6 +4086,68 @@ async fn test_cluster_exons_issue_373_target_partitions_preserve_boundaries() ->
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CHAIN_PATH: &str = "/tmp/polars-bio-bench/databio/chainXenTro3Link/";
+const CHAIN_MASK_PATH: &str = "/tmp/polars-bio-bench/databio/chainXenTro3Link/part-00000-d999dd06-a0e2-4b31-80e5-2acf71fcebc7-c000.snappy.parquet";
+
+enum BenchStringArray<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a GenericStringArray<i64>),
+    Utf8View(&'a StringViewArray),
+}
+
+impl BenchStringArray<'_> {
+    fn value(&self, row: usize) -> &str {
+        match self {
+            Self::Utf8(arr) => arr.value(row),
+            Self::LargeUtf8(arr) => arr.value(row),
+            Self::Utf8View(arr) => arr.value(row),
+        }
+    }
+
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Utf8(arr) => arr.is_null(row),
+            Self::LargeUtf8(arr) => arr.is_null(row),
+            Self::Utf8View(arr) => arr.is_null(row),
+        }
+    }
+}
+
+fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> BenchStringArray<'a> {
+    let column = batch.column_by_name(name).unwrap();
+    match column.data_type() {
+        DataType::Utf8 => BenchStringArray::Utf8(
+            column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap_or_else(|| panic!("failed to downcast {name} to Utf8")),
+        ),
+        DataType::LargeUtf8 => BenchStringArray::LargeUtf8(
+            column
+                .as_any()
+                .downcast_ref::<GenericStringArray<i64>>()
+                .unwrap_or_else(|| panic!("failed to downcast {name} to LargeUtf8")),
+        ),
+        DataType::Utf8View => BenchStringArray::Utf8View(
+            column
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap_or_else(|| panic!("failed to downcast {name} to Utf8View")),
+        ),
+        dt => panic!("unsupported string checksum column {name} type {dt:?}"),
+    }
+}
+
+async fn register_chain_bench_tables(ctx: &SessionContext) -> Result<()> {
+    let create_chain =
+        format!("CREATE EXTERNAL TABLE chain STORED AS PARQUET LOCATION '{CHAIN_PATH}'");
+    ctx.sql(&create_chain).await?;
+
+    let create_mask =
+        format!("CREATE EXTERNAL TABLE mask STORED AS PARQUET LOCATION '{CHAIN_MASK_PATH}'");
+    ctx.sql(&create_mask).await?;
+
+    Ok(())
+}
 
 async fn bench_merge_with_partitions(
     target_partitions: usize,
@@ -4203,6 +4268,243 @@ async fn bench_complement_with_partitions(
     let elapsed = start.elapsed();
     let rows: usize = result.iter().map(|b| b.num_rows()).sum();
     Ok((rows, elapsed))
+}
+
+fn hash_optional_string(arr: &BenchStringArray<'_>, row: usize, hasher: &mut DefaultHasher) {
+    if arr.is_null(row) {
+        None::<&str>.hash(hasher);
+    } else {
+        Some(arr.value(row)).hash(hasher);
+    }
+}
+
+fn hash_optional_i64(arr: &Int64Array, row: usize, hasher: &mut DefaultHasher) {
+    if arr.is_null(row) {
+        None::<i64>.hash(hasher);
+    } else {
+        Some(arr.value(row)).hash(hasher);
+    }
+}
+
+fn finish_row_checksum(
+    rows: &mut usize,
+    hash_sum: &mut u128,
+    hash_square_sum: &mut u128,
+    hash_xor: &mut u64,
+    hasher: DefaultHasher,
+) {
+    let hash = hasher.finish();
+    let hash_u128 = u128::from(hash);
+
+    *rows += 1;
+    *hash_sum = hash_sum.wrapping_add(hash_u128);
+    *hash_square_sum = hash_square_sum.wrapping_add(hash_u128.wrapping_mul(hash_u128));
+    *hash_xor ^= hash;
+}
+
+fn range_metric_row_checksum(batches: &[RecordBatch]) -> (usize, u128, u128, u64) {
+    let mut rows = 0usize;
+    let mut hash_sum = 0u128;
+    let mut hash_square_sum = 0u128;
+    let mut hash_xor = 0u64;
+
+    for batch in batches {
+        let contigs = string_column(batch, "contig");
+        let starts = batch
+            .column_by_name("pos_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ends = batch
+            .column_by_name("pos_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        for row in 0..batch.num_rows() {
+            let mut hasher = DefaultHasher::new();
+            hash_optional_string(&contigs, row, &mut hasher);
+            hash_optional_i64(starts, row, &mut hasher);
+            hash_optional_i64(ends, row, &mut hasher);
+            hash_optional_i64(scores, row, &mut hasher);
+            finish_row_checksum(
+                &mut rows,
+                &mut hash_sum,
+                &mut hash_square_sum,
+                &mut hash_xor,
+                hasher,
+            );
+        }
+    }
+
+    (rows, hash_sum, hash_square_sum, hash_xor)
+}
+
+fn nearest_row_checksum(batches: &[RecordBatch]) -> (usize, u128, u128, u64) {
+    let mut rows = 0usize;
+    let mut hash_sum = 0u128;
+    let mut hash_square_sum = 0u128;
+    let mut hash_xor = 0u64;
+
+    for batch in batches {
+        let left_contigs = string_column(batch, "left_contig");
+        let left_starts = batch
+            .column_by_name("left_pos_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let left_ends = batch
+            .column_by_name("left_pos_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let right_contigs = string_column(batch, "right_contig");
+        let right_starts = batch
+            .column_by_name("right_pos_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let right_ends = batch
+            .column_by_name("right_pos_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        for row in 0..batch.num_rows() {
+            let mut hasher = DefaultHasher::new();
+            hash_optional_string(&left_contigs, row, &mut hasher);
+            hash_optional_i64(left_starts, row, &mut hasher);
+            hash_optional_i64(left_ends, row, &mut hasher);
+            hash_optional_string(&right_contigs, row, &mut hasher);
+            hash_optional_i64(right_starts, row, &mut hasher);
+            hash_optional_i64(right_ends, row, &mut hasher);
+            finish_row_checksum(
+                &mut rows,
+                &mut hash_sum,
+                &mut hash_square_sum,
+                &mut hash_xor,
+                hasher,
+            );
+        }
+    }
+
+    (rows, hash_sum, hash_square_sum, hash_xor)
+}
+
+async fn bench_count_overlaps_with_partitions(
+    target_partitions: usize,
+    show_plan: bool,
+) -> Result<(usize, (u128, u128, u64), std::time::Duration)> {
+    let ctx = create_bio_session_with_target_partitions(target_partitions);
+    register_chain_bench_tables(&ctx).await?;
+
+    if show_plan {
+        let plan = ctx
+            .sql("EXPLAIN VERBOSE SELECT * FROM count_overlaps('mask', 'chain')")
+            .await?
+            .collect()
+            .await?;
+        let formatted = pretty_format_batches(&plan)?.to_string();
+        eprintln!("\n  EXPLAIN VERBOSE (partitions={target_partitions}):\n{formatted}");
+    }
+
+    let start = std::time::Instant::now();
+    let result = ctx
+        .sql(
+            r#"SELECT contig,
+                      CAST(pos_start AS BIGINT) AS pos_start,
+                      CAST(pos_end AS BIGINT) AS pos_end,
+                      "count" AS score
+               FROM count_overlaps('mask', 'chain')"#,
+        )
+        .await?
+        .collect()
+        .await?;
+    let elapsed = start.elapsed();
+    let (rows, hash_sum, hash_square_sum, hash_xor) = range_metric_row_checksum(&result);
+    Ok((rows, (hash_sum, hash_square_sum, hash_xor), elapsed))
+}
+
+async fn bench_coverage_with_partitions(
+    target_partitions: usize,
+    show_plan: bool,
+) -> Result<(usize, (u128, u128, u64), std::time::Duration)> {
+    let ctx = create_bio_session_with_target_partitions(target_partitions);
+    register_chain_bench_tables(&ctx).await?;
+
+    if show_plan {
+        let plan = ctx
+            .sql("EXPLAIN VERBOSE SELECT * FROM coverage('mask', 'chain')")
+            .await?
+            .collect()
+            .await?;
+        let formatted = pretty_format_batches(&plan)?.to_string();
+        eprintln!("\n  EXPLAIN VERBOSE (partitions={target_partitions}):\n{formatted}");
+    }
+
+    let start = std::time::Instant::now();
+    let result = ctx
+        .sql(
+            r#"SELECT contig,
+                      CAST(pos_start AS BIGINT) AS pos_start,
+                      CAST(pos_end AS BIGINT) AS pos_end,
+                      coverage AS score
+               FROM coverage('mask', 'chain')"#,
+        )
+        .await?
+        .collect()
+        .await?;
+    let elapsed = start.elapsed();
+    let (rows, hash_sum, hash_square_sum, hash_xor) = range_metric_row_checksum(&result);
+    Ok((rows, (hash_sum, hash_square_sum, hash_xor), elapsed))
+}
+
+async fn bench_nearest_with_partitions(
+    target_partitions: usize,
+    show_plan: bool,
+) -> Result<(usize, (u128, u128, u64), std::time::Duration)> {
+    let ctx = create_bio_session_with_target_partitions(target_partitions);
+    register_chain_bench_tables(&ctx).await?;
+
+    if show_plan {
+        let plan = ctx
+            .sql("EXPLAIN VERBOSE SELECT * FROM nearest('mask', 'chain', 1, true, false)")
+            .await?
+            .collect()
+            .await?;
+        let formatted = pretty_format_batches(&plan)?.to_string();
+        eprintln!("\n  EXPLAIN VERBOSE (partitions={target_partitions}):\n{formatted}");
+    }
+
+    let start = std::time::Instant::now();
+    let result = ctx
+        .sql(
+            r#"SELECT left_contig,
+                      CAST(left_pos_start AS BIGINT) AS left_pos_start,
+                      CAST(left_pos_end AS BIGINT) AS left_pos_end,
+                      right_contig,
+                      CAST(right_pos_start AS BIGINT) AS right_pos_start,
+                      CAST(right_pos_end AS BIGINT) AS right_pos_end
+               FROM nearest('mask', 'chain', 1, true, false)"#,
+        )
+        .await?
+        .collect()
+        .await?;
+    let elapsed = start.elapsed();
+    let (rows, hash_sum, hash_square_sum, hash_xor) = nearest_row_checksum(&result);
+    Ok((rows, (hash_sum, hash_square_sum, hash_xor), elapsed))
 }
 
 async fn bench_subtract_with_partitions(
@@ -4406,6 +4708,72 @@ async fn bench_scaling_subtract() -> Result<()> {
             "  partitions={:<2}  rows={:<10}  time={:.3}s",
             partitions,
             rows,
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scaling_count_overlaps() -> Result<()> {
+    eprintln!("\n=== COUNT_OVERLAPS scaling (mask -> chain, ~51M output rows) ===");
+    let partition_counts = [1, 2, 4, 8];
+    for (i, partitions) in partition_counts.iter().enumerate() {
+        let show_plan = i == 0;
+        let (rows, checksum, elapsed) =
+            bench_count_overlaps_with_partitions(*partitions, show_plan).await?;
+        eprintln!(
+            "  partitions={:<2}  rows={:<10}  checksum={:032x}:{:032x}:{:016x}  time={:.3}s",
+            partitions,
+            rows,
+            checksum.0,
+            checksum.1,
+            checksum.2,
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scaling_coverage() -> Result<()> {
+    eprintln!("\n=== COVERAGE scaling (mask -> chain, ~51M output rows) ===");
+    let partition_counts = [1, 2, 4, 8];
+    for (i, partitions) in partition_counts.iter().enumerate() {
+        let show_plan = i == 0;
+        let (rows, checksum, elapsed) =
+            bench_coverage_with_partitions(*partitions, show_plan).await?;
+        eprintln!(
+            "  partitions={:<2}  rows={:<10}  checksum={:032x}:{:032x}:{:016x}  time={:.3}s",
+            partitions,
+            rows,
+            checksum.0,
+            checksum.1,
+            checksum.2,
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scaling_nearest() -> Result<()> {
+    eprintln!("\n=== NEAREST scaling (mask -> chain, k=1, ~51M output rows) ===");
+    let partition_counts = [1, 2, 4, 8];
+    for (i, partitions) in partition_counts.iter().enumerate() {
+        let show_plan = i == 0;
+        let (rows, checksum, elapsed) =
+            bench_nearest_with_partitions(*partitions, show_plan).await?;
+        eprintln!(
+            "  partitions={:<2}  rows={:<10}  checksum={:032x}:{:032x}:{:016x}  time={:.3}s",
+            partitions,
+            rows,
+            checksum.0,
+            checksum.1,
+            checksum.2,
             elapsed.as_secs_f64()
         );
     }

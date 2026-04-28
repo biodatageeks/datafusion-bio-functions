@@ -19,7 +19,16 @@ use datafusion::physical_plan::{
 use datafusion::prelude::{Expr, SessionContext};
 
 use crate::filter_op::FilterOp;
-use crate::interval_tree::{build_coitree_from_batches, get_stream};
+use crate::interval_tree::{
+    CountOverlapIndex, build_coitree_from_batches, build_count_index_from_batches,
+    get_count_stream, get_stream,
+};
+
+#[derive(Clone)]
+enum CountOverlapsIndex {
+    Count(Arc<AHashMap<String, CountOverlapIndex>>),
+    Coverage(Arc<AHashMap<String, COITree<(), u32>>>),
+}
 
 pub struct CountOverlapsProvider {
     session: Arc<SessionContext>,
@@ -118,11 +127,18 @@ impl TableProvider for CountOverlapsProvider {
             .collect()
             .await?;
 
-        let trees = Arc::new(build_coitree_from_batches(
-            left_table,
-            (&self.columns_1.0, &self.columns_1.1, &self.columns_1.2),
-            self.coverage,
-        )?);
+        let index = if self.coverage {
+            CountOverlapsIndex::Coverage(Arc::new(build_coitree_from_batches(
+                left_table,
+                (&self.columns_1.0, &self.columns_1.1, &self.columns_1.2),
+                true,
+            )?))
+        } else {
+            CountOverlapsIndex::Count(Arc::new(build_count_index_from_batches(
+                left_table,
+                (&self.columns_1.0, &self.columns_1.1, &self.columns_1.2),
+            )?))
+        };
 
         let right_df = self.session.table(self.right_table.clone()).await?;
         let right_plan = right_df.create_physical_plan().await?;
@@ -139,7 +155,7 @@ impl TableProvider for CountOverlapsProvider {
 
         Ok(Arc::new(CountOverlapsExec {
             schema: self.schema().clone(),
-            trees,
+            index,
             right: right_plan,
             columns_2: Arc::new(self.columns_2.clone()),
             filter_op: self.filter_op.clone(),
@@ -156,7 +172,7 @@ impl TableProvider for CountOverlapsProvider {
 
 struct CountOverlapsExec {
     schema: SchemaRef,
-    trees: Arc<AHashMap<String, COITree<(), u32>>>,
+    index: CountOverlapsIndex,
     right: Arc<dyn ExecutionPlan>,
     columns_2: Arc<(String, String, String)>,
     filter_op: FilterOp,
@@ -205,7 +221,7 @@ impl ExecutionPlan for CountOverlapsExec {
 
         Ok(Arc::new(CountOverlapsExec {
             schema: self.schema.clone(),
-            trees: Arc::clone(&self.trees),
+            index: self.index.clone(),
             right: Arc::clone(&children[0]),
             columns_2: Arc::clone(&self.columns_2),
             filter_op: self.filter_op.clone(),
@@ -226,15 +242,26 @@ impl ExecutionPlan for CountOverlapsExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        get_stream(
-            Arc::clone(&self.right),
-            self.trees.clone(),
-            self.schema.clone(),
-            Arc::clone(&self.columns_2),
-            self.filter_op.clone(),
-            self.coverage,
-            partition,
-            context,
-        )
+        match &self.index {
+            CountOverlapsIndex::Count(indexes) => get_count_stream(
+                Arc::clone(&self.right),
+                Arc::clone(indexes),
+                self.schema.clone(),
+                Arc::clone(&self.columns_2),
+                self.filter_op.clone(),
+                partition,
+                context,
+            ),
+            CountOverlapsIndex::Coverage(trees) => get_stream(
+                Arc::clone(&self.right),
+                Arc::clone(trees),
+                self.schema.clone(),
+                Arc::clone(&self.columns_2),
+                self.filter_op.clone(),
+                true,
+                partition,
+                context,
+            ),
+        }
     }
 }
