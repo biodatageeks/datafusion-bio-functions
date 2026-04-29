@@ -24,6 +24,23 @@ pub type OnBatchWritten = Box<dyn Fn(usize, usize, usize) + Send + Sync>;
 pub struct AnnotateVcfConfig {
     /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
     pub everything: bool,
+    /// Emit one consequence per variant (`--pick`).
+    pub pick: bool,
+    /// Emit one consequence per allele (`--pick_allele`).
+    pub pick_allele: bool,
+    /// Emit one consequence per gene and retain non-transcript rows (`--per_gene`).
+    pub per_gene: bool,
+    /// Emit one consequence per allele and gene (`--pick_allele_gene`).
+    pub pick_allele_gene: bool,
+    /// Add standalone `PICK=1` marker for one consequence per variant.
+    pub flag_pick: bool,
+    /// Add standalone `PICK=1` marker for one consequence per allele.
+    pub flag_pick_allele: bool,
+    /// Add standalone `PICK=1` markers for VEP `--flag_pick_allele_gene`.
+    /// VEP also marks retained non-transcript regulatory/motif/intergenic rows.
+    pub flag_pick_allele_gene: bool,
+    /// Override Ensembl VEP's default pick-order ranking.
+    pub pick_order: Option<String>,
     /// Use interval-overlap fallback for shifted indels.
     pub extended_probes: bool,
     /// Path to indexed reference FASTA (required for `everything` / `hgvs`).
@@ -74,6 +91,14 @@ impl Default for AnnotateVcfConfig {
     fn default() -> Self {
         Self {
             everything: false,
+            pick: false,
+            pick_allele: false,
+            per_gene: false,
+            pick_allele_gene: false,
+            flag_pick: false,
+            flag_pick_allele: false,
+            flag_pick_allele_gene: false,
+            pick_order: None,
             extended_probes: false,
             reference_fasta_path: None,
             use_fjall: false,
@@ -116,6 +141,25 @@ impl AnnotateVcfConfig {
         opts.insert("partitioned".into(), serde_json::Value::Bool(true));
         if self.everything {
             opts.insert("everything".into(), serde_json::Value::Bool(true));
+        }
+        for (key, enabled) in [
+            ("pick", self.pick),
+            ("pick_allele", self.pick_allele),
+            ("per_gene", self.per_gene),
+            ("pick_allele_gene", self.pick_allele_gene),
+            ("flag_pick", self.flag_pick),
+            ("flag_pick_allele", self.flag_pick_allele),
+            ("flag_pick_allele_gene", self.flag_pick_allele_gene),
+        ] {
+            if enabled {
+                opts.insert(key.into(), serde_json::Value::Bool(true));
+            }
+        }
+        if let Some(ref pick_order) = self.pick_order {
+            opts.insert(
+                "pick_order".into(),
+                serde_json::Value::String(pick_order.clone()),
+            );
         }
         if self.extended_probes {
             opts.insert("extended_probes".into(), serde_json::Value::Bool(true));
@@ -179,6 +223,21 @@ impl AnnotateVcfConfig {
         }
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
+
+    fn include_pick_output(&self) -> bool {
+        self.flag_pick || self.flag_pick_allele || self.flag_pick_allele_gene
+    }
+}
+
+fn csq_header_description(config: &AnnotateVcfConfig) -> String {
+    let field_names = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
+        config.everything,
+        config.refseq,
+        config.merged,
+        config.include_pick_output(),
+    );
+    let format_list = field_names.join("|");
+    format!("Consequence annotations from annotate_vep. Format: {format_list}")
 }
 
 /// Annotate a VCF file and write results to an output VCF.
@@ -356,14 +415,7 @@ pub async fn annotate_to_vcf(
                 }
                 arrow_field.with_metadata(merged_metadata)
             } else if name == "CSQ" {
-                let field_names = crate::golden_benchmark::csq_field_names_for_mode(
-                    config.everything,
-                    config.refseq,
-                    config.merged,
-                );
-                let format_list = field_names.join("|");
-                let description =
-                    format!("Consequence annotations from annotate_vep. Format: {format_list}");
+                let description = csq_header_description(config);
                 let mut meta = std::collections::HashMap::new();
                 meta.insert("bio.vcf.field.field_type".to_string(), "INFO".to_string());
                 meta.insert("bio.vcf.field.description".to_string(), description);
@@ -420,4 +472,61 @@ pub async fn annotate_to_vcf(
     pb.finish_and_clear();
 
     Ok(total_rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_options_json_emits_pick_flags() {
+        let config = AnnotateVcfConfig {
+            everything: true,
+            pick: true,
+            pick_allele: true,
+            per_gene: true,
+            pick_allele_gene: true,
+            flag_pick: true,
+            flag_pick_allele: true,
+            flag_pick_allele_gene: true,
+            pick_order: Some("mane_select,tsl,canonical".to_string()),
+            ..Default::default()
+        };
+
+        let json = config.to_options_json();
+        assert!(json.contains("\"everything\":true"));
+        assert!(json.contains("\"pick\":true"));
+        assert!(json.contains("\"pick_allele\":true"));
+        assert!(json.contains("\"per_gene\":true"));
+        assert!(json.contains("\"pick_allele_gene\":true"));
+        assert!(json.contains("\"flag_pick\":true"));
+        assert!(json.contains("\"flag_pick_allele\":true"));
+        assert!(json.contains("\"flag_pick_allele_gene\":true"));
+        assert!(json.contains("\"pick_order\":\"mane_select,tsl,canonical\""));
+    }
+
+    #[test]
+    fn test_csq_header_description_matches_vep_pick_layout() {
+        let config = AnnotateVcfConfig {
+            everything: true,
+            flag_pick_allele_gene: true,
+            ..Default::default()
+        };
+
+        let description = csq_header_description(&config);
+        assert!(description.starts_with("Consequence annotations from annotate_vep. Format: "));
+        assert!(description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
+    }
+
+    #[test]
+    fn test_csq_header_description_omits_pick_for_filter_modes() {
+        let config = AnnotateVcfConfig {
+            everything: true,
+            pick_allele_gene: true,
+            ..Default::default()
+        };
+
+        let description = csq_header_description(&config);
+        assert!(!description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
+    }
 }

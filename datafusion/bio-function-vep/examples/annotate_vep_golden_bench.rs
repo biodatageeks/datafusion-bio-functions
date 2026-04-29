@@ -23,8 +23,8 @@ use datafusion_bio_function_vep::golden_benchmark::{
     DEFAULT_LOCAL_HG002_CHR22_VCF_GZ, DEFAULT_LOCAL_VEP_CACHE_DIR, TermComparisonReport,
     VariantAnnotation, VariantDiscrepancy, VariantKey, collect_discrepancies,
     compare_annotation_terms, compare_annotations, compare_csq_fields_with_names,
-    csq_field_names_for_mode, diagnose_csq_multiplicity, diagnose_unmatched_csq, ensure_local_copy,
-    normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
+    csq_field_names_for_mode_with_pick, diagnose_csq_multiplicity, diagnose_unmatched_csq,
+    ensure_local_copy, normalize_chrom, parse_vep_vcf_annotations, sample_gz_vcf_first_n,
 };
 use datafusion_bio_function_vep::register_vep_functions;
 
@@ -76,6 +76,23 @@ struct Args {
     reference_fasta_path: Option<PathBuf>,
     /// Use VEP --everything flag (enables all features, 80-field CSQ schema).
     everything: bool,
+    /// Select one consequence per variant using VEP --pick.
+    pick: bool,
+    /// Select one consequence per allele using VEP --pick_allele.
+    pick_allele: bool,
+    /// Select one consequence per gene using VEP --per_gene.
+    per_gene: bool,
+    /// Select one consequence per allele and gene using VEP --pick_allele_gene.
+    pick_allele_gene: bool,
+    /// Add standalone PICK field using VEP --flag_pick.
+    flag_pick: bool,
+    /// Add standalone PICK field using VEP --flag_pick_allele.
+    flag_pick_allele: bool,
+    /// Add standalone PICK field using VEP --flag_pick_allele_gene.
+    /// VEP also marks retained non-transcript regulatory/motif/intergenic rows.
+    flag_pick_allele_gene: bool,
+    /// Override VEP's pick ranking order.
+    pick_order: Option<String>,
     /// Use fjall KV store for variation lookup + SIFT (--use-fjall).
     /// Cache directory must contain a `variation.fjall/` subdirectory.
     use_fjall: bool,
@@ -106,9 +123,27 @@ fn positional_or_env_string(
         .or_else(|| default.map(str::to_string))
 }
 
+fn option_value(args: &[String], names: &[&str]) -> Option<(String, usize)> {
+    for (idx, arg) in args.iter().enumerate() {
+        for name in names {
+            let prefix = format!("{name}=");
+            if let Some(value) = arg.strip_prefix(&prefix) {
+                return Some((value.to_string(), idx));
+            }
+            if arg == name {
+                if let Some(value) = args.get(idx + 1).filter(|value| !value.starts_with("--")) {
+                    return Some((value.to_string(), idx + 1));
+                }
+            }
+        }
+    }
+    None
+}
+
 impl Args {
     fn parse() -> Result<Self> {
         let args: Vec<String> = std::env::args().collect();
+        let mut option_value_indices = Vec::new();
 
         let refseq = args.iter().any(|a| a == "--refseq");
         // Check for --merged flag anywhere in args.
@@ -126,13 +161,13 @@ impl Args {
             })
             .unwrap_or_else(|| vec!["ensembl".to_string(), "datafusion".to_string()]);
         let hgvs = args.iter().any(|a| a == "--hgvs");
-        let shift_hgvs = args
-            .iter()
-            .find_map(|a| {
-                a.strip_prefix("--shift-hgvs=")
-                    .or_else(|| a.strip_prefix("--shift_hgvs="))
-            })
-            .and_then(parse_cli_bool)
+        let shift_hgvs =
+            if let Some((raw, idx)) = option_value(&args, &["--shift-hgvs", "--shift_hgvs"]) {
+                option_value_indices.push(idx);
+                parse_cli_bool(&raw)
+            } else {
+                None
+            }
             .or_else(|| {
                 args.iter()
                     .any(|a| a == "--shift-hgvs" || a == "--shift_hgvs")
@@ -143,12 +178,42 @@ impl Args {
                     .any(|a| a == "--no-shift-hgvs" || a == "--no-shift_hgvs")
                     .then_some(false)
             });
-        let reference_fasta_path = args
+        let reference_fasta_path =
+            option_value(&args, &["--reference-fasta-path", "--reference_fasta_path"]).map(
+                |(value, idx)| {
+                    option_value_indices.push(idx);
+                    PathBuf::from(value)
+                },
+            );
+        let pick = args.iter().any(|a| a == "--pick");
+        let pick_allele = args
             .iter()
-            .find_map(|a| a.strip_prefix("--reference-fasta-path="))
-            .map(PathBuf::from);
+            .any(|a| a == "--pick-allele" || a == "--pick_allele");
+        let per_gene = args.iter().any(|a| a == "--per-gene" || a == "--per_gene");
+        let pick_allele_gene = args
+            .iter()
+            .any(|a| a == "--pick-allele-gene" || a == "--pick_allele_gene");
+        let flag_pick = args
+            .iter()
+            .any(|a| a == "--flag-pick" || a == "--flag_pick");
+        let flag_pick_allele = args
+            .iter()
+            .any(|a| a == "--flag-pick-allele" || a == "--flag_pick_allele");
+        let flag_pick_allele_gene = args
+            .iter()
+            .any(|a| a == "--flag-pick-allele-gene" || a == "--flag_pick_allele_gene");
+        let pick_order =
+            option_value(&args, &["--pick-order", "--pick_order"]).map(|(value, idx)| {
+                option_value_indices.push(idx);
+                value
+            });
         // Filter out flags for positional parsing.
-        let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+        let positional: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(idx, a)| !a.starts_with("--") && !option_value_indices.contains(idx))
+            .map(|(_, a)| a)
+            .collect();
         let cache_source = positional_or_env_string(&positional, 2, ENV_CACHE_SOURCE, None)
             .ok_or_else(|| {
                 DataFusionError::Execution(format!(
@@ -220,6 +285,14 @@ impl Args {
             shift_hgvs,
             reference_fasta_path,
             everything: args.iter().any(|a| a == "--everything"),
+            pick,
+            pick_allele,
+            per_gene,
+            pick_allele_gene,
+            flag_pick,
+            flag_pick_allele,
+            flag_pick_allele_gene,
+            pick_order,
             use_fjall: args.iter().any(|a| a == "--use-fjall"),
         })
     }
@@ -230,6 +303,22 @@ impl Args {
 
     fn run_datafusion(&self) -> bool {
         self.steps.iter().any(|s| s == "datafusion")
+    }
+
+    fn pick_options(&self) -> [(&'static str, bool); 7] {
+        [
+            ("pick", self.pick),
+            ("pick_allele", self.pick_allele),
+            ("per_gene", self.per_gene),
+            ("pick_allele_gene", self.pick_allele_gene),
+            ("flag_pick", self.flag_pick),
+            ("flag_pick_allele", self.flag_pick_allele),
+            ("flag_pick_allele_gene", self.flag_pick_allele_gene),
+        ]
+    }
+
+    fn include_pick_output(&self) -> bool {
+        self.flag_pick || self.flag_pick_allele || self.flag_pick_allele_gene
     }
 }
 
@@ -279,6 +368,13 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "(none)".to_string())
     );
     println!("  everything: {}", args.everything);
+    for (name, enabled) in args.pick_options() {
+        println!("  {name}: {enabled}");
+    }
+    println!(
+        "  pick_order: {}",
+        args.pick_order.as_deref().unwrap_or("(default)")
+    );
     println!("  use_fjall: {}", args.use_fjall);
 
     fs::create_dir_all(&args.work_dir).map_err(io_err)?;
@@ -381,6 +477,8 @@ async fn main() -> Result<()> {
                 args.shift_hgvs,
                 args.reference_fasta_path.as_deref(),
                 args.everything,
+                args.pick_options(),
+                args.pick_order.as_deref(),
             )?;
             let elapsed = docker_start.elapsed().as_secs_f64();
             println!(
@@ -433,7 +531,12 @@ async fn main() -> Result<()> {
     if let (Some(golden), Some(ours)) = (&golden_annotations, &ours_annotations) {
         let report = compare_annotations(golden, ours);
         let term_report = compare_annotation_terms(golden, ours);
-        let csq_field_names = csq_field_names_for_mode(args.everything, args.refseq, args.merged);
+        let csq_field_names = csq_field_names_for_mode_with_pick(
+            args.everything,
+            args.refseq,
+            args.merged,
+            args.include_pick_output(),
+        );
         let csq_field_report = compare_csq_fields_with_names(golden, ours, &csq_field_names);
         let discrepancies = collect_discrepancies(golden, ours);
         let unmatched_report = diagnose_unmatched_csq(golden, ours);
@@ -548,6 +651,14 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
         }
         if args.use_fjall {
             entries.push("\"use_fjall\":true".to_string());
+        }
+        for (name, enabled) in args.pick_options() {
+            if enabled {
+                entries.push(format!("\"{name}\":true"));
+            }
+        }
+        if let Some(pick_order) = &args.pick_order {
+            entries.push(format!("\"pick_order\":\"{}\"", sql_literal(pick_order)));
         }
         return Ok(Some(format!("{{{}}}", entries.join(","))));
     }
@@ -747,6 +858,16 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
         entries.push("\"exclude_predicted\":true".to_string());
     }
 
+    for (name, enabled) in args.pick_options() {
+        if enabled {
+            entries.push(format!("\"{name}\":true"));
+        }
+    }
+
+    if let Some(pick_order) = &args.pick_order {
+        entries.push(format!("\"pick_order\":\"{}\"", sql_literal(pick_order)));
+    }
+
     if entries.is_empty() {
         return Ok(None);
     }
@@ -842,6 +963,8 @@ fn run_vep_docker(
     shift_hgvs: Option<bool>,
     reference_fasta_path: Option<&Path>,
     everything: bool,
+    pick_options: [(&'static str, bool); 7],
+    pick_order: Option<&str>,
 ) -> Result<()> {
     let sampled_name = sampled_vcf
         .file_name()
@@ -951,7 +1074,11 @@ fn run_vep_docker(
         cmd.arg("--max_af");
         cmd.arg("--pubmed");
 
-        let fields = csq_field_names_for_mode(false, refseq, merged).join(",");
+        let include_pick_output = pick_options
+            .iter()
+            .any(|(name, enabled)| *enabled && name.starts_with("flag_"));
+        let fields = csq_field_names_for_mode_with_pick(false, refseq, merged, include_pick_output)
+            .join(",");
         cmd.arg("--fields").arg(fields);
     }
 
@@ -976,6 +1103,14 @@ fn run_vep_docker(
     }
     if exclude_predicted {
         cmd.arg("--exclude_predicted");
+    }
+    for (name, enabled) in pick_options {
+        if enabled {
+            cmd.arg(format!("--{name}"));
+        }
+    }
+    if let Some(pick_order) = pick_order {
+        cmd.arg("--pick_order").arg(pick_order);
     }
 
     let output = cmd.output().map_err(io_err)?;
