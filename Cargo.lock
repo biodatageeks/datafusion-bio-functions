@@ -1310,7 +1310,7 @@ dependencies = [
  "log",
  "lz4_flex 0.12.1",
  "noodles-core 0.16.0",
- "noodles-fasta",
+ "noodles-fasta 0.60.0",
  "noodles-vcf 0.80.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
  "parquet",
  "serde_json",
@@ -3252,7 +3252,7 @@ dependencies = [
  "noodles-bgzf 0.36.0",
  "noodles-cram",
  "noodles-csi 0.44.0",
- "noodles-fasta",
+ "noodles-fasta 0.49.0",
  "noodles-fastq",
  "noodles-gff",
  "noodles-sam 0.72.0",
@@ -3381,6 +3381,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "noodles-bgzf"
+version = "0.46.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37290f565045fd2775b549e62dffca7e1afadc70d8d5a3a2ef19609eb3d8193b"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "flate2",
+]
+
+[[package]]
 name = "noodles-core"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3414,6 +3425,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "noodles-core"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53e1e8a419dbba0e4000b0e60830b124138c7f2277ad556463506f1a81d32d17"
+dependencies = [
+ "bstr",
+]
+
+[[package]]
 name = "noodles-cram"
 version = "0.79.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3430,7 +3450,7 @@ dependencies = [
  "md-5",
  "noodles-bam 0.76.0",
  "noodles-core 0.16.0",
- "noodles-fasta",
+ "noodles-fasta 0.49.0",
  "noodles-sam 0.72.0",
  "pin-project-lite",
  "tokio",
@@ -3500,6 +3520,18 @@ dependencies = [
  "noodles-bgzf 0.36.0",
  "noodles-core 0.16.0",
  "tokio",
+]
+
+[[package]]
+name = "noodles-fasta"
+version = "0.60.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5c8ccd951d43ba0a1c4dcc1f86fdc2ee86c1742de2988956bcdf1bc58905769"
+dependencies = [
+ "bstr",
+ "memchr",
+ "noodles-bgzf 0.46.0",
+ "noodles-core 0.19.0",
 ]
 
 [[package]]
