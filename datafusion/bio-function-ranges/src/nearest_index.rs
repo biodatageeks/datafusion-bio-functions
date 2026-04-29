@@ -23,6 +23,8 @@ struct IntervalMeta {
 pub struct NearestIntervalIndex {
     tree: COITree<Position, u32>,
     by_start: Vec<Interval<Position>>,
+    /// Eagerly allocated because the k=1 include-overlaps hot path probes it on
+    /// every query to find the first deterministic overlap in O(log n).
     prefix_max_end: Vec<i32>,
     /// Lazily initialized: only allocated when a non-overlap search is needed.
     /// For the common k=1 include_overlaps=true hot path where most queries
