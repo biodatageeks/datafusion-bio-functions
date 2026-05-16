@@ -36,6 +36,7 @@ use crate::kv_cache::LoadStats;
 use crate::kv_cache::key_encoding::{chrom_to_code, encode_position_key};
 use crate::kv_cache::kv_store::VepKvStore;
 use crate::kv_cache::position_entry::serialize_position_entry;
+use crate::kv_cache::redb_store::VepRedbStore;
 use crate::kv_cache::sift_store::SiftKvStore;
 use crate::transcript_consequence::CachedPredictions;
 
@@ -47,6 +48,31 @@ use crate::transcript_consequence::CachedPredictions;
 /// - `total_rows`: cumulative rows processed so far for this (entity, format)
 /// - `total_expected`: total rows expected (0 if unknown)
 pub type OnProgress = Box<dyn Fn(&str, &str, usize, usize, usize) + Send + Sync>;
+
+trait VariationMetadataStore {
+    fn store_dict(&self, dict_bytes: &[u8]) -> Result<()>;
+    fn store_zstd_level(&self, level: i32) -> Result<()>;
+}
+
+impl VariationMetadataStore for VepKvStore {
+    fn store_dict(&self, dict_bytes: &[u8]) -> Result<()> {
+        VepKvStore::store_dict(self, dict_bytes)
+    }
+
+    fn store_zstd_level(&self, level: i32) -> Result<()> {
+        VepKvStore::store_zstd_level(self, level)
+    }
+}
+
+impl VariationMetadataStore for VepRedbStore {
+    fn store_dict(&self, dict_bytes: &[u8]) -> Result<()> {
+        VepRedbStore::store_dict(self, dict_bytes)
+    }
+
+    fn store_zstd_level(&self, level: i32) -> Result<()> {
+        VepRedbStore::store_zstd_level(self, level)
+    }
+}
 
 /// Main chromosomes that get their own parquet file.
 const MAIN_CHROMS: &[&str] = &[
@@ -957,10 +983,314 @@ impl CacheBuilder {
         }])
     }
 
+    /// Build variation redb from existing parquet files.
+    ///
+    /// Reads chr*.parquet and other.parquet in chrom_code order, reusing the
+    /// same sorted accumulator as the fjall fast path, then commits each
+    /// serialized position batch to redb in a single write transaction.
+    pub async fn build_variation_redb_from_parquet(&self) -> Result<Vec<EntityStats>> {
+        let parquet_dir = format!("{}/variation", self.output_dir);
+        let redb_path = format!("{}/variation.redb", self.output_dir);
+
+        let mut parquet_files: Vec<(u16, String)> = Vec::new();
+        for entry in std::fs::read_dir(&parquet_dir).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to read dir {parquet_dir}: {e}"))
+        })? {
+            let entry = entry.map_err(|e| {
+                DataFusionError::Execution(format!("Failed to read dir entry: {e}"))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let chrom = stem.strip_prefix("chr").unwrap_or(stem);
+            let code = if chrom == "other" {
+                u16::MAX
+            } else {
+                chrom_to_code(chrom)
+            };
+            parquet_files.push((code, path.to_string_lossy().to_string()));
+        }
+        parquet_files.sort_by_key(|(code, _)| *code);
+
+        if parquet_files.is_empty() {
+            return Err(DataFusionError::Execution(
+                "No parquet files found for variation redb rebuild".to_string(),
+            ));
+        }
+
+        info!(
+            "variation: rebuilding redb from {} parquet files",
+            parquet_files.len()
+        );
+
+        if Path::new(&redb_path).exists() {
+            let path = Path::new(&redb_path);
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to remove existing {redb_path}: {e}"
+                    ))
+                })?;
+            } else {
+                std::fs::remove_file(path).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to remove existing {redb_path}: {e}"
+                    ))
+                })?;
+            }
+            info!("variation.redb: removed existing DB for clean rebuild");
+        }
+
+        let read_ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        read_ctx
+            .register_parquet("_probe", &parquet_files[0].1, Default::default())
+            .await?;
+        let probe_df = read_ctx.sql("SELECT * FROM _probe LIMIT 0").await?;
+        let schema: SchemaRef = Arc::new(probe_df.schema().as_arrow().clone());
+        read_ctx.deregister_table("_probe")?;
+
+        let store = VepRedbStore::create(Path::new(&redb_path), schema.clone())?;
+
+        {
+            let mut all_contigs: HashSet<String> = HashSet::new();
+            for (_, path) in &parquet_files {
+                let stem = Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                let chrom = stem.strip_prefix("chr").unwrap_or(stem);
+                if chrom != "other" && !CHROM_TO_CODE_SET.contains(&chrom) {
+                    all_contigs.insert(chrom.to_string());
+                }
+            }
+            let other_path = parquet_files
+                .iter()
+                .find(|(code, _)| *code == u16::MAX)
+                .map(|(_, p)| p.clone());
+            if let Some(ref other_path) = other_path {
+                read_ctx
+                    .register_parquet("_other_scan", other_path, Default::default())
+                    .await?;
+                let distinct_df = read_ctx
+                    .sql("SELECT DISTINCT chrom FROM _other_scan")
+                    .await?;
+                let batches = distinct_df.collect().await?;
+                read_ctx.deregister_table("_other_scan")?;
+                for batch in &batches {
+                    let chrom_col = batch.column(0);
+                    for row in 0..batch.num_rows() {
+                        let chrom = string_value(chrom_col.as_ref(), row);
+                        if !CHROM_TO_CODE_SET.contains(&chrom) {
+                            all_contigs.insert(chrom.to_string());
+                        }
+                    }
+                }
+            }
+
+            if !all_contigs.is_empty() {
+                let refs: Vec<&str> = all_contigs.iter().map(|s| s.as_str()).collect();
+                let mapping = crate::kv_cache::key_encoding::register_non_canonical_contigs(&refs);
+                store.store_contig_codes(&mapping)?;
+                info!(
+                    "variation: registered {} non-canonical contigs for redb rebuild",
+                    mapping.len()
+                );
+            }
+        }
+
+        let dict = {
+            read_ctx
+                .register_parquet("_sample", &parquet_files[0].1, Default::default())
+                .await?;
+            let sample_df = read_ctx.sql("SELECT * FROM _sample LIMIT 10000").await?;
+            let batches = sample_df.collect().await?;
+            read_ctx.deregister_table("_sample")?;
+            self.train_dict_from_batches(&store, &schema, &batches)
+                .await?
+        };
+
+        let chrom_col_idx = schema.index_of("chrom")?;
+        let start_col_idx = schema.index_of("start")?;
+        let allele_col_idx = schema.index_of("allele_string")?;
+        let col_indices: Vec<usize> = (0..schema.fields().len())
+            .filter(|&i| i != chrom_col_idx && i != start_col_idx)
+            .collect();
+
+        let mut total_positions = 0u64;
+        let mut total_variants = 0u64;
+        let mut total_bytes = 0u64;
+        let start_time = Instant::now();
+
+        for (file_idx, (_, parquet_path)) in parquet_files.iter().enumerate() {
+            let file_start = Instant::now();
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<PositionAccumulator>, u64)>(2);
+
+            let parquet_path_clone = parquet_path.clone();
+            let chrom_col_idx_c = chrom_col_idx;
+            let start_col_idx_c = start_col_idx;
+
+            let producer = std::thread::spawn(move || -> Result<()> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| DataFusionError::Execution(format!("tokio runtime: {e}")))?;
+
+                rt.block_on(async {
+                    let read_config = SessionConfig::new().with_target_partitions(1);
+                    let read_ctx = SessionContext::new_with_config(read_config);
+
+                    let mut accum: Option<PositionAccumulator> = None;
+                    let mut pending: Vec<PositionAccumulator> =
+                        Vec::with_capacity(PARALLEL_FLUSH_BATCH);
+                    let mut variants_in_batch = 0u64;
+
+                    read_ctx
+                        .register_parquet("_part", &parquet_path_clone, Default::default())
+                        .await?;
+                    let df = read_ctx.sql("SELECT * FROM _part").await?;
+                    let mut stream = df.execute_stream().await?;
+                    read_ctx.deregister_table("_part")?;
+
+                    while let Some(batch_result) = stream.next().await {
+                        let batch = batch_result?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        let starts = batch.column(start_col_idx_c).as_primitive::<Int64Type>();
+                        let chrom_col = batch.column(chrom_col_idx_c);
+
+                        for row in 0..batch.num_rows() {
+                            let start = starts.value(row);
+                            let row_chrom = string_value(chrom_col.as_ref(), row);
+                            let chrom_code = chrom_to_code(row_chrom);
+
+                            let should_flush = accum
+                                .as_ref()
+                                .is_some_and(|a| a.chrom_code != chrom_code || a.start != start);
+
+                            if should_flush {
+                                pending.push(accum.take().unwrap());
+                                if pending.len() >= PARALLEL_FLUSH_BATCH {
+                                    let batch_to_send = std::mem::replace(
+                                        &mut pending,
+                                        Vec::with_capacity(PARALLEL_FLUSH_BATCH),
+                                    );
+                                    if tx.send((batch_to_send, variants_in_batch)).is_err() {
+                                        return Ok(());
+                                    }
+                                    variants_in_batch = 0;
+                                }
+                            }
+
+                            variants_in_batch += 1;
+
+                            match &mut accum {
+                                Some(a) => a.add_row(row, &batch),
+                                None => {
+                                    accum = Some(PositionAccumulator::new(
+                                        chrom_code,
+                                        row_chrom.to_string(),
+                                        start,
+                                        row,
+                                        &batch,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(a) = accum.take() {
+                        pending.push(a);
+                    }
+                    if !pending.is_empty() {
+                        let _ = tx.send((pending, variants_in_batch));
+                    }
+
+                    Ok(())
+                })
+            });
+
+            let max_threads = self.partitions;
+            while let Ok((mut batch, batch_variants)) = rx.recv() {
+                total_variants += batch_variants;
+                let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch.len());
+                flush_positions_parallel(
+                    &mut batch,
+                    &col_indices,
+                    allele_col_idx,
+                    &dict,
+                    self.zstd_level,
+                    max_threads,
+                    &mut |k, v| {
+                        entries.push((k.to_vec(), v.to_vec()));
+                        Ok(())
+                    },
+                    &mut total_positions,
+                    &mut total_bytes,
+                )?;
+                store.batch_insert_raw(&entries)?;
+            }
+
+            producer
+                .join()
+                .expect("producer thread panicked")
+                .map_err(|e| DataFusionError::Execution(format!("producer error: {e}")))?;
+
+            let stem = Path::new(parquet_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?");
+            info!(
+                "variation.redb: {stem} ingested in {:.1}s ({}/{} files, {} positions)",
+                file_start.elapsed().as_secs_f64(),
+                file_idx + 1,
+                parquet_files.len(),
+                total_positions,
+            );
+        }
+
+        info!("Running redb compaction on variation.redb...");
+        let compact_start = Instant::now();
+        store.optimize_after_load()?;
+        info!(
+            "redb compaction completed in {:.1}s",
+            compact_start.elapsed().as_secs_f64()
+        );
+
+        store.persist()?;
+        drop(store);
+
+        let elapsed = start_time.elapsed().as_secs_f64();
+        info!(
+            "variation.redb rebuilt: {} positions, {} variants, {:.1} MB in {:.1}s",
+            total_positions,
+            total_variants,
+            total_bytes as f64 / 1_048_576.0,
+            elapsed
+        );
+
+        Ok(vec![EntityStats {
+            entity: "variation".to_string(),
+            parquet_files: vec![],
+            fjall_stats: Some(LoadStats {
+                total_variants,
+                total_positions,
+                total_bytes,
+                elapsed_secs: elapsed,
+            }),
+        }])
+    }
+
     /// Train zstd dictionary from pre-collected batches.
     async fn train_dict_from_batches(
         &self,
-        store: &VepKvStore,
+        store: &impl VariationMetadataStore,
         schema: &SchemaRef,
         batches: &[RecordBatch],
     ) -> Result<Option<Arc<Vec<u8>>>> {
@@ -3423,6 +3753,88 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    fn make_synthetic_variation_batch(start: i64, rows: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            variation_schema(),
+            vec![
+                Arc::new(StringArray::from_iter_values((0..rows).map(|_| "1"))),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows).map(|i| start + i as i64),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows).map(|i| start + i as i64 + 1),
+                )),
+                Arc::new(StringArray::from_iter_values((0..rows).map(|_| "A/G"))),
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|i| format!("rs{}", start + i as i64)),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn write_synthetic_variation_parquet(path: &str, rows: usize) {
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, variation_schema(), None).unwrap();
+        let chunk_size = 20_000;
+        let mut written = 0usize;
+        while written < rows {
+            let chunk_rows = (rows - written).min(chunk_size);
+            let batch = make_synthetic_variation_batch(written as i64 + 1, chunk_rows);
+            writer.write(&batch).unwrap();
+            written += chunk_rows;
+        }
+        writer.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // release-only synthetic benchmark
+    async fn test_variation_redb_bulk_vs_fjall_bulk_timing_synthetic() {
+        use std::time::Instant;
+
+        let rows = std::env::var("VEP_BULK_BENCH_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100_000);
+        let partitions = std::env::var("VEP_BULK_BENCH_PARTITIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+
+        let output = tempfile::tempdir().unwrap();
+        let output_dir = output.path().to_str().unwrap();
+        let var_dir = format!("{output_dir}/variation");
+        std::fs::create_dir_all(&var_dir).unwrap();
+        let parquet_path = format!("{var_dir}/chr1.parquet");
+        write_synthetic_variation_parquet(&parquet_path, rows);
+
+        let builder = CacheBuilder::new("/nonexistent_cache", output_dir)
+            .with_partitions(partitions)
+            .with_build_fjall(true);
+
+        let fjall_start = Instant::now();
+        let fjall = builder.build_variation_fjall_from_parquet().await.unwrap();
+        let fjall_elapsed = fjall_start.elapsed().as_secs_f64();
+        let fjall_stats = fjall[0].fjall_stats.as_ref().unwrap();
+
+        let redb_start = Instant::now();
+        let redb = builder.build_variation_redb_from_parquet().await.unwrap();
+        let redb_elapsed = redb_start.elapsed().as_secs_f64();
+        let redb_stats = redb[0].fjall_stats.as_ref().unwrap();
+
+        eprintln!(
+            "synthetic variation bulk benchmark rows={rows} partitions={partitions}: fjall={fjall_elapsed:.3}s redb={redb_elapsed:.3}s ratio={:.2}x",
+            redb_elapsed / fjall_elapsed
+        );
+        eprintln!("fjall stats: {fjall_stats:?}");
+        eprintln!("redb stats: {redb_stats:?}");
+
+        assert_eq!(fjall_stats.total_variants, rows as u64);
+        assert_eq!(redb_stats.total_variants, rows as u64);
+        assert_eq!(fjall_stats.total_positions, rows as u64);
+        assert_eq!(redb_stats.total_positions, rows as u64);
+    }
+
     // -----------------------------------------------------------------------
     // dir_has_parquet_files
     // -----------------------------------------------------------------------
@@ -3552,6 +3964,46 @@ mod tests {
             result.is_err(),
             "should attempt fjall rebuild and fail on fake parquet"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_variation_rebuilds_redb_from_parquet() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().to_str().unwrap();
+
+        let var_dir = dir.path().join("variation");
+        std::fs::create_dir_all(&var_dir).unwrap();
+        let parquet_path = var_dir.join("chr1.parquet");
+        write_parquet(
+            parquet_path.to_str().unwrap(),
+            &[make_batch(
+                vec!["1", "1", "1"],
+                vec![100, 100, 200],
+                vec![100, 101, 200],
+                vec!["A/G", "A/T", "C/T"],
+                vec!["rs1", "rs2", "rs3"],
+            )],
+        );
+
+        let builder = CacheBuilder::new("/nonexistent_cache", output).with_partitions(2);
+        let stats = builder.build_variation_redb_from_parquet().await.unwrap();
+
+        assert_eq!(stats.len(), 1);
+        let redb_stats = stats[0].fjall_stats.as_ref().unwrap();
+        assert_eq!(redb_stats.total_variants, 3);
+        assert_eq!(redb_stats.total_positions, 2);
+
+        let redb_path = dir.path().join("variation.redb");
+        assert!(redb_path.is_file());
+
+        let store = crate::kv_cache::VepRedbStore::open(&redb_path).unwrap();
+        let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
+        let raw = store
+            .get_position_entry_decompressed(chrom_code, 100)
+            .unwrap()
+            .unwrap();
+        let reader = crate::kv_cache::position_entry::PositionEntryReader::new(&raw).unwrap();
+        assert_eq!(reader.num_alleles(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]

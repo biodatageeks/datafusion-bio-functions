@@ -150,6 +150,35 @@ impl VepRedbStore {
         Ok(())
     }
 
+    pub(crate) fn batch_insert_raw(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|e| DataFusionError::Execution(format!("redb write mutex poisoned: {e}")))?;
+        let RedbHandle::Writable(db) = &self.db else {
+            return Err(DataFusionError::Execution(
+                "redb cache was opened read-only; writes are not allowed".to_string(),
+            ));
+        };
+        let db = db.lock().map_err(|e| {
+            DataFusionError::Execution(format!("redb database mutex poisoned: {e}"))
+        })?;
+        let write_txn = db.begin_write().map_err(redb_err)?;
+        {
+            let mut table = write_txn.open_table(DATA_TABLE).map_err(redb_err)?;
+            for (key, value) in entries {
+                table
+                    .insert(key.as_slice(), value.as_slice())
+                    .map_err(redb_err)?;
+            }
+        }
+        write_txn.commit().map_err(redb_err)?;
+        Ok(())
+    }
+
     pub fn get_position_entry(&self, chrom_code: u16, start: i64) -> Result<Option<Vec<u8>>> {
         let mut key_buf = Vec::with_capacity(10);
         super::key_encoding::encode_position_key_buf(chrom_code, start, &mut key_buf);
@@ -468,5 +497,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(value, b"entry");
+    }
+
+    #[test]
+    fn redb_store_batch_insert_raw_writes_multiple_entries() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = VepRedbStore::create(file.path(), test_schema()).unwrap();
+        let key_100 = crate::kv_cache::key_encoding::encode_position_key("1", 100);
+        let key_200 = crate::kv_cache::key_encoding::encode_position_key("1", 200);
+
+        store
+            .batch_insert_raw(&[
+                (key_100.clone(), b"entry-100".to_vec()),
+                (key_200.clone(), b"entry-200".to_vec()),
+            ])
+            .unwrap();
+        drop(store);
+
+        let reopened = VepRedbStore::open(file.path()).unwrap();
+        assert_eq!(
+            reopened.get_position_entry_raw(&key_100).unwrap().unwrap(),
+            b"entry-100"
+        );
+        assert_eq!(
+            reopened.get_position_entry_raw(&key_200).unwrap().unwrap(),
+            b"entry-200"
+        );
     }
 }
