@@ -128,6 +128,7 @@ pub struct CacheBuilder {
     partitions: usize,
     build_fjall: bool,
     overwrite: bool,
+    compact_redb_after_load: bool,
     zstd_level: i32,
     dict_size_kb: u32,
     on_progress: Option<Arc<OnProgress>>,
@@ -141,6 +142,7 @@ impl CacheBuilder {
             partitions: 8,
             build_fjall: true,
             overwrite: false,
+            compact_redb_after_load: false,
             zstd_level: 3,
             dict_size_kb: 112,
             on_progress: None,
@@ -159,6 +161,11 @@ impl CacheBuilder {
 
     pub fn with_overwrite(mut self, overwrite: bool) -> Self {
         self.overwrite = overwrite;
+        self
+    }
+
+    pub fn with_compact_redb_after_load(mut self, enabled: bool) -> Self {
+        self.compact_redb_after_load = enabled;
         self
     }
 
@@ -992,6 +999,15 @@ impl CacheBuilder {
         let parquet_dir = format!("{}/variation", self.output_dir);
         let redb_path = format!("{}/variation.redb", self.output_dir);
 
+        if Path::new(&redb_path).exists() && !self.overwrite {
+            info!("variation.redb already exists, skipping (use overwrite to rebuild)");
+            return Ok(vec![EntityStats {
+                entity: "variation".to_string(),
+                parquet_files: vec![],
+                fjall_stats: None,
+            }]);
+        }
+
         let mut parquet_files: Vec<(u16, String)> = Vec::new();
         for entry in std::fs::read_dir(&parquet_dir).map_err(|e| {
             DataFusionError::Execution(format!("Failed to read dir {parquet_dir}: {e}"))
@@ -1255,13 +1271,17 @@ impl CacheBuilder {
             );
         }
 
-        info!("Running redb compaction on variation.redb...");
-        let compact_start = Instant::now();
-        store.optimize_after_load()?;
-        info!(
-            "redb compaction completed in {:.1}s",
-            compact_start.elapsed().as_secs_f64()
-        );
+        if self.compact_redb_after_load {
+            info!("Running redb compaction on variation.redb...");
+            let compact_start = Instant::now();
+            store.optimize_after_load()?;
+            info!(
+                "redb compaction completed in {:.1}s",
+                compact_start.elapsed().as_secs_f64()
+            );
+        } else {
+            info!("Skipping redb compaction on variation.redb");
+        }
 
         store.persist()?;
         drop(store);
@@ -3880,6 +3900,18 @@ mod tests {
         assert!(builder.overwrite);
     }
 
+    #[test]
+    fn test_builder_redb_compaction_default_false() {
+        let builder = CacheBuilder::new("/cache", "/output");
+        assert!(!builder.compact_redb_after_load);
+    }
+
+    #[test]
+    fn test_builder_with_redb_compaction() {
+        let builder = CacheBuilder::new("/cache", "/output").with_compact_redb_after_load(true);
+        assert!(builder.compact_redb_after_load);
+    }
+
     // -----------------------------------------------------------------------
     // skip logic integration
     // -----------------------------------------------------------------------
@@ -3995,6 +4027,67 @@ mod tests {
 
         let redb_path = dir.path().join("variation.redb");
         assert!(redb_path.is_file());
+
+        let store = crate::kv_cache::VepRedbStore::open(&redb_path).unwrap();
+        let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
+        let raw = store
+            .get_position_entry_decompressed(chrom_code, 100)
+            .unwrap()
+            .unwrap();
+        let reader = crate::kv_cache::position_entry::PositionEntryReader::new(&raw).unwrap();
+        assert_eq!(reader.num_alleles(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_variation_redb_skips_existing_without_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().to_str().unwrap();
+        let redb_path = dir.path().join("variation.redb");
+        std::fs::write(&redb_path, b"existing redb placeholder").unwrap();
+
+        let builder = CacheBuilder::new("/nonexistent_cache", output);
+        let stats = builder.build_variation_redb_from_parquet().await.unwrap();
+
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].entity, "variation");
+        assert!(stats[0].parquet_files.is_empty());
+        assert!(stats[0].fjall_stats.is_none());
+        assert_eq!(
+            std::fs::read(&redb_path).unwrap(),
+            b"existing redb placeholder"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_variation_redb_overwrite_rebuilds_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().to_str().unwrap();
+
+        let var_dir = dir.path().join("variation");
+        std::fs::create_dir_all(&var_dir).unwrap();
+        let parquet_path = var_dir.join("chr1.parquet");
+        write_parquet(
+            parquet_path.to_str().unwrap(),
+            &[make_batch(
+                vec!["1", "1", "1"],
+                vec![100, 100, 200],
+                vec![100, 101, 200],
+                vec!["A/G", "A/T", "C/T"],
+                vec!["rs1", "rs2", "rs3"],
+            )],
+        );
+
+        let redb_path = dir.path().join("variation.redb");
+        std::fs::write(&redb_path, b"existing redb placeholder").unwrap();
+
+        let builder = CacheBuilder::new("/nonexistent_cache", output)
+            .with_partitions(2)
+            .with_overwrite(true);
+        let stats = builder.build_variation_redb_from_parquet().await.unwrap();
+
+        let redb_stats = stats[0].fjall_stats.as_ref().unwrap();
+        assert_eq!(redb_stats.total_variants, 3);
+        assert_eq!(redb_stats.total_positions, 2);
 
         let store = crate::kv_cache::VepRedbStore::open(&redb_path).unwrap();
         let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
