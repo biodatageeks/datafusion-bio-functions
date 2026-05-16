@@ -8,7 +8,7 @@
 //!     --input <vcf_path> \
 //!     --cache <cache_dir> \
 //!     --output <output.vcf> \
-//!     [--backend parquet|fjall] \
+//!     [--backend parquet|fjall|redb] \
 //!     [--everything] \
 //!     [--extended-probes] \
 //!     [--reference-fasta <path>] \
@@ -153,6 +153,7 @@ async fn main() -> Result<()> {
         extended_probes: args.extended_probes,
         reference_fasta_path: args.reference_fasta.clone(),
         use_fjall: args.backend == "fjall",
+        use_redb: args.backend == "redb",
         compression: args.compression,
         show_progress: true,
         ..Default::default()
@@ -162,7 +163,7 @@ async fn main() -> Result<()> {
     let rows = vcf_sink::annotate_to_vcf(
         &args.input,
         &args.cache,
-        "parquet",
+        &args.backend,
         &args.output,
         &annotate_config,
     )

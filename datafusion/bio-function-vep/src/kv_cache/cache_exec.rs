@@ -4,6 +4,7 @@
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -44,13 +45,54 @@ pub enum KvMatchMode {
     Exact,
 }
 
+/// Position-keyed variation cache used by the shared KV lookup executor.
+///
+/// Fjall and redb store the same serialized position entries. Keeping this
+/// trait narrow lets both backends share all allele matching and output logic.
+pub trait PositionEntryStore: Send + Sync {
+    fn schema(&self) -> SchemaRef;
+    fn root_path(&self) -> &Path;
+    fn create_decompressor(&self) -> Result<Option<zstd::bulk::Decompressor<'static>>>;
+    fn get_position_entry_fast(
+        &self,
+        chrom_code: u16,
+        start: i64,
+        decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool>;
+}
+
+impl PositionEntryStore for VepKvStore {
+    fn schema(&self) -> SchemaRef {
+        VepKvStore::schema(self).clone()
+    }
+
+    fn root_path(&self) -> &Path {
+        VepKvStore::root_path(self)
+    }
+
+    fn create_decompressor(&self) -> Result<Option<zstd::bulk::Decompressor<'static>>> {
+        VepKvStore::create_decompressor(self)
+    }
+
+    fn get_position_entry_fast(
+        &self,
+        chrom_code: u16,
+        start: i64,
+        decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        VepKvStore::get_position_entry_fast(self, chrom_code, start, decompressor, buf)
+    }
+}
+
 /// Physical execution plan for KV-backed variant lookup.
 ///
 /// Takes a VCF input plan, probes a fjall KV store per-position,
 /// and emits LEFT JOIN output (unmatched VCF rows get NULL cache columns).
 pub struct KvLookupExec {
     input: Arc<dyn ExecutionPlan>,
-    store: Arc<VepKvStore>,
+    store: Arc<dyn PositionEntryStore>,
     cache_columns: Vec<String>,
     match_mode: KvMatchMode,
     exact_matcher: AlleleMatcher,
@@ -78,7 +120,7 @@ impl KvLookupExec {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        store: Arc<VepKvStore>,
+        store: Arc<dyn PositionEntryStore>,
         cache_columns: Vec<String>,
         match_mode: KvMatchMode,
         exact_matcher: AlleleMatcher,
@@ -245,7 +287,7 @@ impl ExecutionPlan for KvLookupExec {
 /// the colocated map — matching the buffering behavior of `VariantLookupExec`.
 struct KvLookupStream {
     input: SendableRecordBatchStream,
-    store: Arc<VepKvStore>,
+    store: Arc<dyn PositionEntryStore>,
     schema: SchemaRef,
     cache_columns: Vec<String>,
     _match_mode: KvMatchMode,
@@ -396,7 +438,7 @@ impl KvLookupStream {
     #[allow(clippy::too_many_arguments)]
     fn new(
         input: SendableRecordBatchStream,
-        store: Arc<VepKvStore>,
+        store: Arc<dyn PositionEntryStore>,
         schema: SchemaRef,
         cache_columns: Vec<String>,
         match_mode: KvMatchMode,
@@ -413,7 +455,7 @@ impl KvLookupStream {
         // Resolve colocated column indices within the KV entry if we have a sink.
         let coloc_col_indices = colocated_sink
             .as_ref()
-            .and_then(|_| resolve_kv_coloc_indices(&store));
+            .and_then(|_| resolve_kv_coloc_indices(store.as_ref()));
 
         // Open the reference FASTA reader if a path is provided and we have a
         // colocated sink (shift state is only needed for colocated matching).
@@ -1162,7 +1204,7 @@ fn canonical_event_lengths(ref_allele: &str, alt_allele: &str) -> (usize, usize)
 ///
 /// The entry stores all cache schema columns except chrom/start, in schema order
 /// minus those two. `end` is stored as a regular column inside the entry.
-fn resolve_kv_coloc_indices(store: &VepKvStore) -> Option<KvColocIndices> {
+fn resolve_kv_coloc_indices(store: &dyn PositionEntryStore) -> Option<KvColocIndices> {
     let cache_schema = store.schema();
 
     let cache_chrom_idx = cache_schema.index_of("chrom").unwrap_or(usize::MAX);

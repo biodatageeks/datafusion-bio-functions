@@ -167,10 +167,14 @@ async fn main() -> Result<()> {
 
     let mut options = Vec::new();
 
-    // Detect fjall stores inside a partitioned cache directory.
+    // Detect KV stores inside a partitioned cache directory.
     let has_fjall = cache_dir.join("variation.fjall").is_dir();
+    let has_redb = cache_dir.join("variation.redb").is_file();
     if has_fjall {
         eprintln!("[PREP] Detected variation.fjall — enabling use_fjall=true");
+    }
+    if has_redb {
+        eprintln!("[PREP] Detected variation.redb — enabling use_redb=true");
     }
 
     if is_partitioned {
@@ -179,6 +183,9 @@ async fn main() -> Result<()> {
         options.push("\"partitioned\":true".to_string());
         if has_fjall {
             options.push("\"use_fjall\":true".to_string());
+        }
+        if has_redb {
+            options.push("\"use_redb\":true".to_string());
         }
         eprintln!("[PREP] Partitioned mode — context tables loaded per contig internally");
     } else {

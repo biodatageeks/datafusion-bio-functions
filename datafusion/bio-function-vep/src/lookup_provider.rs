@@ -228,18 +228,39 @@ impl TableProvider for LookupProvider {
         #[cfg(feature = "kv-cache")]
         {
             use crate::allele::allele_matches;
-            use crate::kv_cache::KvCacheTableProvider;
             use crate::kv_cache::cache_exec::{KvLookupExec, KvMatchMode};
+            use crate::kv_cache::{
+                KvCacheTableProvider, PositionCacheTableProvider, RedbCacheTableProvider,
+            };
 
             let table_ref = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(self.session.table_provider(&self.cache_table))
             });
             if let Ok(provider) = table_ref {
-                if let Some(kv_provider) = provider.as_any().downcast_ref::<KvCacheTableProvider>()
-                {
-                    let store = kv_provider.store().clone();
+                let store: Option<Arc<dyn crate::kv_cache::cache_exec::PositionEntryStore>> =
+                    if let Some(kv_provider) =
+                        provider.as_any().downcast_ref::<KvCacheTableProvider>()
+                    {
+                        Some(kv_provider.store().clone())
+                    } else {
+                        if let Some(position_provider) = provider
+                            .as_any()
+                            .downcast_ref::<PositionCacheTableProvider>()
+                        {
+                            Some(position_provider.store().clone())
+                        } else {
+                            provider
+                                .as_any()
+                                .downcast_ref::<RedbCacheTableProvider>()
+                                .map(|redb_provider| {
+                                    redb_provider.store().clone()
+                                        as Arc<dyn crate::kv_cache::cache_exec::PositionEntryStore>
+                                })
+                        }
+                    };
 
+                if let Some(store) = store {
                     let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
 
                     let vcf_df = self.session.table(&self.vcf_table).await?;
@@ -330,7 +351,8 @@ mod tests {
     use crate::create_vep_session;
     #[cfg(feature = "kv-cache")]
     use crate::kv_cache::{
-        KvCacheTableProvider, VepKvStore, position_entry::serialize_position_entry,
+        KvCacheTableProvider, RedbCacheTableProvider, VepKvStore, VepRedbStore,
+        position_entry::serialize_position_entry,
     };
     use datafusion::arrow::array::{
         Array, ArrayRef, Int64Array, RecordBatch, StringArray, StringViewArray,
@@ -557,6 +579,85 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_dispatches_to_kv_exec_for_redb_cache_provider() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("clin_sig", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![101])),
+                Arc::new(StringArray::from(vec!["rs_redb"])),
+                Arc::new(StringArray::from(vec!["A/G"])),
+                Arc::new(StringArray::from(vec!["benign"])),
+                Arc::new(Int64Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+
+        let entry = serialize_position_entry(&[0], &cache_batch, &[2, 3, 4, 5, 6], 4).unwrap();
+        let cache_path = unique_temp_dir("vep-redb-dispatch").with_extension("redb");
+
+        let store = VepRedbStore::create(&cache_path, cache_schema).unwrap();
+        store.put_position_entry("1", 100, &entry).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let redb_provider = RedbCacheTableProvider::open(&cache_path).unwrap();
+        ctx.register_table("var_cache", Arc::new(redb_provider))
+            .unwrap();
+
+        let df = ctx
+            .sql(
+                "SELECT * FROM lookup_variants('vcf_data', 'var_cache', 'variation_name,clin_sig')",
+            )
+            .await
+            .unwrap();
+
+        let plan = df.clone().create_physical_plan().await.unwrap();
+        let plan_str = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            plan_str.contains("KvLookupExec"),
+            "Expected KvLookupExec in plan for redb provider, got:\n{plan_str}"
+        );
+        assert!(
+            !plan_str.contains("IntervalJoinExec"),
+            "Did not expect IntervalJoinExec for redb provider, got:\n{plan_str}"
+        );
+
+        let batches = df.collect().await.unwrap();
+        let mut annotations = Vec::new();
+        for batch in &batches {
+            let col = batch.column_by_name("cache_variation_name").unwrap();
+            for value in string_values(col) {
+                if let Some(v) = value {
+                    annotations.push(v);
+                }
+            }
+        }
+        assert!(
+            annotations.contains(&"rs_redb".to_string()),
+            "Expected annotation from redb cache, got: {annotations:?}"
+        );
+
+        let _ = std::fs::remove_file(&cache_path);
     }
 
     #[cfg(feature = "kv-cache")]

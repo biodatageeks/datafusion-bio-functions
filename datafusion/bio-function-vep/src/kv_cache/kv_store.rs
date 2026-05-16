@@ -42,11 +42,11 @@ pub struct VepKvStore {
     zstd_dict: Option<Arc<Vec<u8>>>,
 }
 
-fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
+pub(crate) fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
     DataFusionError::ArrowError(Box::new(e), None)
 }
 
-fn fjall_err(e: fjall::Error) -> DataFusionError {
+pub(crate) fn fjall_err(e: fjall::Error) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
 
@@ -479,7 +479,7 @@ impl VepKvStore {
 }
 
 /// Serialize schema to IPC bytes by writing an empty batch.
-fn schema_to_ipc_bytes(schema: &SchemaRef) -> Result<Vec<u8>> {
+pub(crate) fn schema_to_ipc_bytes(schema: &SchemaRef) -> Result<Vec<u8>> {
     let empty_batch = RecordBatch::new_empty(schema.clone());
     let mut buf = Vec::new();
     {
@@ -492,7 +492,7 @@ fn schema_to_ipc_bytes(schema: &SchemaRef) -> Result<Vec<u8>> {
 }
 
 /// Deserialize schema from IPC bytes (empty batch carrying schema).
-fn schema_from_ipc_bytes(data: &[u8]) -> Result<SchemaRef> {
+pub(crate) fn schema_from_ipc_bytes(data: &[u8]) -> Result<SchemaRef> {
     let cursor = Cursor::new(data);
     let reader = arrow_ipc::reader::StreamReader::try_new(cursor, None).map_err(arrow_err)?;
     Ok(reader.schema())

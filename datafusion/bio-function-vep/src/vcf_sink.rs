@@ -47,6 +47,8 @@ pub struct AnnotateVcfConfig {
     pub reference_fasta_path: Option<String>,
     /// Use fjall KV store for variation lookup + SIFT.
     pub use_fjall: bool,
+    /// Use redb KV store for variation lookup.
+    pub use_redb: bool,
     /// Enable HGVS notation.
     pub hgvs: bool,
     /// Enable transcript HGVS notation explicitly.
@@ -102,6 +104,7 @@ impl Default for AnnotateVcfConfig {
             extended_probes: false,
             reference_fasta_path: None,
             use_fjall: false,
+            use_redb: false,
             hgvs: false,
             hgvsc: false,
             hgvsp: false,
@@ -172,6 +175,9 @@ impl AnnotateVcfConfig {
         }
         if self.use_fjall {
             opts.insert("use_fjall".into(), serde_json::Value::Bool(true));
+        }
+        if self.use_redb {
+            opts.insert("use_redb".into(), serde_json::Value::Bool(true));
         }
         if self.hgvs {
             opts.insert("hgvs".into(), serde_json::Value::Bool(true));

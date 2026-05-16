@@ -38,7 +38,7 @@ Full VEP-style annotation: consequence prediction, population frequencies, clini
 SELECT * FROM annotate_vep(
   'my_vcf_table',
   '/path/to/cache',
-  'parquet',                                          -- backend: parquet | fjall
+  'parquet',                                          -- backend: parquet | fjall | redb
   '{"everything":true,"extended_probes":true,
     "reference_fasta_path":"/path/to/reference.fa"}'  -- options (optional)
 )
@@ -232,6 +232,10 @@ Ensembl variation cache converted to Parquet format. Supports per-chromosome par
 
 LSM-tree backend using [fjall](https://crates.io/crates/fjall) with zstd compression. Requires the `kv-cache` feature (enabled by default).
 
+### redb (KV store)
+
+Single-file backend using [redb](https://crates.io/crates/redb) with the same position-entry and zstd metadata format as fjall. Annotation opens `variation.redb` via redb's `ReadOnlyDatabase`, allowing multiple annotator processes to read the same cache in parallel.
+
 Configuration via `AnnotationConfig` (session-level):
 
 | Option | Default | Description |
@@ -286,8 +290,8 @@ cargo run --release --example annotate_vep_golden_bench -- \
 | # | Argument | Description |
 |---|----------|-------------|
 | 1 | `source_vcf_gz` | Input VCF (bgzipped) |
-| 2 | `cache_source` | Variation cache path (parquet file or fjall directory) |
-| 3 | `backend` | `parquet` or `fjall` |
+| 2 | `cache_source` | Variation cache path (parquet file, fjall directory, or cache dir containing `variation.redb`) |
+| 3 | `backend` | `parquet`, `fjall`, or `redb` |
 | 4 | `sample_limit` | Number of variants to sample (0 = all) |
 | 5 | `vep_cache_dir` | Directory with golden VEP output / Docker VEP cache |
 | 6 | `local_copy_vcf_gz` | Local copy path for the input VCF |
@@ -328,7 +332,7 @@ cargo run --release --features kv-cache --example bench_annotate_vcf -- \
   --compression gzip
 ```
 
-**Options:** `--input`, `--cache`, `--output`, `--backend parquet|fjall`, `--everything`, `--extended-probes`, `--reference-fasta`, `--compression none|gzip|bgzf`, `--limit`
+**Options:** `--input`, `--cache`, `--output`, `--backend parquet|fjall|redb`, `--everything`, `--extended-probes`, `--reference-fasta`, `--compression none|gzip|bgzf`, `--limit`
 
 ### Other benchmarks
 
@@ -336,7 +340,7 @@ cargo run --release --features kv-cache --example bench_annotate_vcf -- \
 |---------|---------|-------------|
 | `bench_annotate` | `kv-cache` | Arrow-level annotation performance (fjall) |
 | `lookup_parquet_bench` | — | `lookup_variants()` with parquet backend |
-| `lookup_kv_bench` | `kv-cache` | `lookup_variants()` with fjall backend |
+| `lookup_kv_bench` | `kv-cache` | `lookup_variants()` with KV backend |
 | `bench_fjall_gets` | `kv-cache` | Raw fjall KV store read throughput |
 | `bench_sift_queries` | `kv-cache` | SIFT prediction query performance |
 
@@ -350,7 +354,7 @@ cargo run --release [--features kv-cache] --example <name> -- <args>
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `kv-cache` | yes | Fjall LSM-tree backend with zstd compression |
+| `kv-cache` | yes | fjall and redb KV backends with zstd compression |
 
 ## License
 

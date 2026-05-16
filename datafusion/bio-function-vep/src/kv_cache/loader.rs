@@ -30,9 +30,11 @@ use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use log::{debug, info};
 
+use super::cache_exec::PositionEntryStore;
 use super::key_encoding::{chrom_to_code, encode_position_key};
 use super::kv_store::{VepKvStore, decompress_into_buffer_with_retry};
 use super::position_entry::{PositionEntryReader, make_builder, serialize_position_entry};
+use super::redb_store::VepRedbStore;
 
 /// Statistics returned after loading.
 #[derive(Debug, Clone)]
@@ -41,6 +43,32 @@ pub struct LoadStats {
     pub total_positions: u64,
     pub total_bytes: u64,
     pub elapsed_secs: f64,
+}
+
+/// Storage backend to use when building a position-keyed variation cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheBackend {
+    Fjall,
+    Redb,
+}
+
+impl CacheBackend {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "fjall" => Ok(Self::Fjall),
+            "redb" => Ok(Self::Redb),
+            other => Err(DataFusionError::Execution(format!(
+                "cache backend must be one of: fjall, redb; got: {other}"
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fjall => "fjall",
+            Self::Redb => "redb",
+        }
+    }
 }
 
 /// Per-partition stats accumulated during streaming.
@@ -80,9 +108,108 @@ impl ShardedPositionLock {
     }
 }
 
+trait CacheLoadStore: PositionEntryStore + 'static {
+    fn put_position_entry(&self, chrom: &str, start: i64, value: &[u8]) -> Result<()>;
+    fn get_position_entry_raw(&self, chrom_code: u16, start: i64) -> Result<Option<Vec<u8>>>;
+    fn get_position_entry_decompressed(
+        &self,
+        chrom_code: u16,
+        start: i64,
+    ) -> Result<Option<Vec<u8>>>;
+    fn store_dict(&self, dict_bytes: &[u8]) -> Result<()>;
+    fn store_zstd_level(&self, level: i32) -> Result<()>;
+    fn persist(&self) -> Result<()>;
+    fn optimize_after_load(&self) -> Result<()>;
+}
+
+impl CacheLoadStore for VepKvStore {
+    fn put_position_entry(&self, chrom: &str, start: i64, value: &[u8]) -> Result<()> {
+        VepKvStore::put_position_entry(self, chrom, start, value)
+    }
+
+    fn get_position_entry_raw(&self, chrom_code: u16, start: i64) -> Result<Option<Vec<u8>>> {
+        VepKvStore::get_position_entry(self, chrom_code, start)
+            .map(|value| value.map(|raw| raw.to_vec()))
+    }
+
+    fn get_position_entry_decompressed(
+        &self,
+        chrom_code: u16,
+        start: i64,
+    ) -> Result<Option<Vec<u8>>> {
+        VepKvStore::get_position_entry_decompressed(self, chrom_code, start)
+    }
+
+    fn store_dict(&self, dict_bytes: &[u8]) -> Result<()> {
+        VepKvStore::store_dict(self, dict_bytes)
+    }
+
+    fn store_zstd_level(&self, level: i32) -> Result<()> {
+        VepKvStore::store_zstd_level(self, level)
+    }
+
+    fn persist(&self) -> Result<()> {
+        VepKvStore::persist(self)
+    }
+
+    fn optimize_after_load(&self) -> Result<()> {
+        info!("Running major compaction on fjall data keyspace...");
+        let compact_start = Instant::now();
+        self.data_partition()
+            .major_compact()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        info!(
+            "Fjall major compaction completed in {:.1}s",
+            compact_start.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+}
+
+impl CacheLoadStore for VepRedbStore {
+    fn put_position_entry(&self, chrom: &str, start: i64, value: &[u8]) -> Result<()> {
+        VepRedbStore::put_position_entry(self, chrom, start, value)
+    }
+
+    fn get_position_entry_raw(&self, chrom_code: u16, start: i64) -> Result<Option<Vec<u8>>> {
+        VepRedbStore::get_position_entry(self, chrom_code, start)
+    }
+
+    fn get_position_entry_decompressed(
+        &self,
+        chrom_code: u16,
+        start: i64,
+    ) -> Result<Option<Vec<u8>>> {
+        VepRedbStore::get_position_entry_decompressed(self, chrom_code, start)
+    }
+
+    fn store_dict(&self, dict_bytes: &[u8]) -> Result<()> {
+        VepRedbStore::store_dict(self, dict_bytes)
+    }
+
+    fn store_zstd_level(&self, level: i32) -> Result<()> {
+        VepRedbStore::store_zstd_level(self, level)
+    }
+
+    fn persist(&self) -> Result<()> {
+        VepRedbStore::persist(self)
+    }
+
+    fn optimize_after_load(&self) -> Result<()> {
+        info!("Running redb compaction...");
+        let compact_start = Instant::now();
+        VepRedbStore::optimize_after_load(self)?;
+        info!(
+            "redb compaction completed in {:.1}s",
+            compact_start.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+}
+
 /// Shared context passed to each partition's streaming task.
 struct StreamContext {
-    store: Arc<VepKvStore>,
+    store: Arc<dyn CacheLoadStore>,
     schema: SchemaRef,
     /// Pre-trained dictionary bytes shared by all partitions. `None` if training
     /// was skipped (too few samples) — partitions store entries uncompressed.
@@ -97,6 +224,7 @@ struct StreamContext {
 pub struct CacheLoader {
     source_table: String,
     target_path: String,
+    backend: CacheBackend,
     parallelism: Option<usize>,
     zstd_level: i32,
     dict_size_kb: u32,
@@ -111,6 +239,7 @@ impl CacheLoader {
         Self {
             source_table: source_table.into(),
             target_path: target_path.into(),
+            backend: CacheBackend::Fjall,
             parallelism: None,
             zstd_level: 3,
             dict_size_kb: 112,
@@ -121,6 +250,12 @@ impl CacheLoader {
     /// Default is `None` — all partitions run concurrently.
     pub fn with_parallelism(mut self, n: usize) -> Self {
         self.parallelism = Some(n);
+        self
+    }
+
+    /// Set the storage backend (default: fjall).
+    pub fn with_backend(mut self, backend: CacheBackend) -> Self {
+        self.backend = backend;
         self
     }
 
@@ -151,15 +286,23 @@ impl CacheLoader {
         let source_df = session.table(&self.source_table).await?;
         let schema: SchemaRef = Arc::new(source_df.schema().as_arrow().clone());
 
-        let store = Arc::new(VepKvStore::create(
-            Path::new(&self.target_path),
-            schema.clone(),
-        )?);
+        let store: Arc<dyn CacheLoadStore> = match self.backend {
+            CacheBackend::Fjall => Arc::new(VepKvStore::create(
+                Path::new(&self.target_path),
+                schema.clone(),
+            )?),
+            CacheBackend::Redb => Arc::new(VepRedbStore::create(
+                Path::new(&self.target_path),
+                schema.clone(),
+            )?),
+        };
 
         // Phase 1: Train zstd dictionary from a sample of the source data.
         // This happens once before any parallel work, ensuring all partitions
         // share the same dictionary.
-        let dict = self.train_dictionary(session, &store, &schema).await?;
+        let dict = self
+            .train_dictionary(session, store.as_ref(), &schema)
+            .await?;
 
         // Phase 2: Stream all partitions in parallel with the shared dictionary.
         let source_df = session.table(&self.source_table).await?;
@@ -225,18 +368,8 @@ impl CacheLoader {
 
         store.persist()?;
 
-        // Major-compact the data keyspace so the LSM tree is fully optimized
-        // for reads (bloom filters built, levels merged) before first use.
-        info!("Running major compaction on data keyspace...");
-        let compact_start = Instant::now();
-        store
-            .data_partition()
-            .major_compact()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        info!(
-            "Major compaction completed in {:.1}s",
-            compact_start.elapsed().as_secs_f64()
-        );
+        // Optimize the backend for read-mostly annotation before first use.
+        store.optimize_after_load()?;
 
         let elapsed = start_time.elapsed().as_secs_f64();
         info!(
@@ -266,7 +399,7 @@ impl CacheLoader {
     async fn train_dictionary(
         &self,
         session: &SessionContext,
-        store: &VepKvStore,
+        store: &dyn CacheLoadStore,
         schema: &SchemaRef,
     ) -> Result<Option<Arc<Vec<u8>>>> {
         let sample_df = session
@@ -406,7 +539,7 @@ async fn stream_partition(
             let locks = Arc::clone(&ctx.position_locks);
             let (comp_back, dec_back, positions, bytes) = tokio::task::spawn_blocking(move || {
                 let result = flush_positions_compressed(
-                    &store,
+                    store.as_ref(),
                     &schema,
                     &batch_clone,
                     &mut comp,
@@ -424,7 +557,7 @@ async fn stream_partition(
         } else {
             let locks = Arc::clone(&ctx.position_locks);
             let (positions, bytes) = tokio::task::spawn_blocking(move || {
-                flush_positions_uncompressed(&store, &schema, &batch_clone, &locks)
+                flush_positions_uncompressed(store.as_ref(), &schema, &batch_clone, &locks)
             })
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))??;
@@ -445,7 +578,7 @@ async fn stream_partition(
 
 /// Flush position entries without compression (fallback when dictionary training was skipped).
 fn flush_positions_uncompressed(
-    store: &VepKvStore,
+    store: &dyn CacheLoadStore,
     schema: &SchemaRef,
     batch: &RecordBatch,
     position_locks: &ShardedPositionLock,
@@ -494,7 +627,7 @@ fn flush_positions_uncompressed(
 
 /// Compress and flush position entries using a pre-trained zstd dictionary compressor.
 fn flush_positions_compressed(
-    store: &VepKvStore,
+    store: &dyn CacheLoadStore,
     schema: &SchemaRef,
     batch: &RecordBatch,
     compressor: &mut zstd::bulk::Compressor<'_>,
@@ -531,7 +664,7 @@ fn flush_positions_compressed(
         let mut raw_value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
         // Per-position lock: only serializes merges at the same (chrom, start).
         let _guard = position_locks.lock_for(chrom_code, *start);
-        if let Some(existing_compressed) = store.get_position_entry(chrom_code, *start)? {
+        if let Some(existing_compressed) = store.get_position_entry_raw(chrom_code, *start)? {
             let mut existing_raw = Vec::new();
             decompress_into_buffer_with_retry(
                 decompressor,
@@ -890,6 +1023,36 @@ mod tests {
         assert!(entry.is_none());
 
         // Verify a position entry can be deserialized after decompression.
+        let raw = store
+            .get_position_entry_decompressed(chrom_code_1, 100)
+            .unwrap()
+            .unwrap();
+        let reader = crate::kv_cache::position_entry::PositionEntryReader::new(&raw).unwrap();
+        assert!(reader.num_alleles() >= 1);
+        assert!(reader.num_cols() > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_loader_basic_redb_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let redb_path = dir.path().join("variation.redb");
+        let ctx = SessionContext::new();
+
+        let (schema, table) = make_test_table();
+        ctx.register_table("source_redb", Arc::new(table)).unwrap();
+
+        let loader = CacheLoader::new("source_redb", redb_path.to_str().unwrap())
+            .with_backend(CacheBackend::Redb);
+        let stats = loader.load(&ctx).await.unwrap();
+
+        assert_eq!(stats.total_variants, 4);
+        assert!(stats.total_positions > 0);
+
+        let store = VepRedbStore::open(&redb_path).unwrap();
+        assert_eq!(store.format_version(), FORMAT_V0);
+        assert_eq!(store.schema().as_ref(), schema.as_ref());
+
+        let chrom_code_1 = crate::kv_cache::key_encoding::chrom_to_code("1");
         let raw = store
             .get_position_entry_decompressed(chrom_code_1, 100)
             .unwrap()

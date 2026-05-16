@@ -13,6 +13,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 
+use super::cache_exec::PositionEntryStore;
 use super::kv_store::VepKvStore;
 
 /// TableProvider backed by a fjall KV store containing VEP cache data.
@@ -78,6 +79,62 @@ impl TableProvider for KvCacheTableProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Err(datafusion::common::DataFusionError::NotImplemented(
             "Direct scan of KvCacheTableProvider is not yet supported. \
+             Use lookup_variants() table function instead."
+                .to_string(),
+        ))
+    }
+}
+
+/// Backend-neutral TableProvider for an already-opened position cache store.
+pub(crate) struct PositionCacheTableProvider {
+    store: Arc<dyn PositionEntryStore>,
+    schema: SchemaRef,
+}
+
+impl PositionCacheTableProvider {
+    pub(crate) fn from_store(store: Arc<dyn PositionEntryStore>) -> Self {
+        let schema = store.schema();
+        Self { store, schema }
+    }
+
+    pub(crate) fn store(&self) -> &Arc<dyn PositionEntryStore> {
+        &self.store
+    }
+}
+
+impl Debug for PositionCacheTableProvider {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PositionCacheTableProvider {{ schema: {:?} }}",
+            self.schema
+        )
+    }
+}
+
+#[async_trait]
+impl TableProvider for PositionCacheTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Err(datafusion::common::DataFusionError::NotImplemented(
+            "Direct scan of PositionCacheTableProvider is not yet supported. \
              Use lookup_variants() table function instead."
                 .to_string(),
         ))

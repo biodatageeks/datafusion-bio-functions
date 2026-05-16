@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_bio_function_vep::kv_cache::{CacheLoader, VepKvStore};
+use datafusion_bio_function_vep::kv_cache::{CacheBackend, CacheLoader, VepKvStore, VepRedbStore};
 
 #[tokio::main]
 async fn main() -> datafusion::common::Result<()> {
@@ -11,7 +11,7 @@ async fn main() -> datafusion::common::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Usage: {} <parquet_path> <fjall_output_path> [chrom_filter] [partitions] [zstd_level] [dict_size_kb]",
+            "Usage: {} <parquet_path> <cache_output_path> [chrom_filter] [partitions] [zstd_level] [dict_size_kb] [fjall|redb]",
             args[0]
         );
         eprintln!(
@@ -27,6 +27,11 @@ async fn main() -> datafusion::common::Result<()> {
     let target_partitions: Option<usize> = args.get(4).and_then(|s| s.parse().ok());
     let zstd_level: i32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(3);
     let dict_size_kb: u32 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(112);
+    let backend = args
+        .get(7)
+        .map(|value| CacheBackend::parse(value))
+        .transpose()?
+        .unwrap_or(CacheBackend::Fjall);
 
     let ctx = if let Some(partitions) = target_partitions {
         let config = SessionConfig::new().with_target_partitions(partitions);
@@ -62,22 +67,22 @@ async fn main() -> datafusion::common::Result<()> {
         .unwrap()
         .value(0);
 
-    // Clean output dir if exists
+    // Clean output if exists.
     if Path::new(output_path).exists() {
-        std::fs::remove_dir_all(output_path).ok();
+        remove_existing(output_path);
     }
 
-    // Load into fjall
+    // Load into the selected KV backend.
     let load_start = Instant::now();
     let loader = CacheLoader::new(source_table, output_path)
         .with_zstd_level(zstd_level)
-        .with_dict_size_kb(dict_size_kb);
+        .with_dict_size_kb(dict_size_kb)
+        .with_backend(backend);
     let stats = loader.load(&ctx).await?;
     let load_elapsed = load_start.elapsed().as_secs_f64();
 
     // Verify + measure disk
-    let store = VepKvStore::open(output_path)?;
-    let dir_size = walkdir(output_path);
+    let dir_size = path_size(output_path);
     let avg_variants_per_pos = if stats.total_positions > 0 {
         row_count as f64 / stats.total_positions as f64
     } else {
@@ -96,10 +101,7 @@ async fn main() -> datafusion::common::Result<()> {
     let read_start = Instant::now();
     let mut read_iters = 0u32;
     for pos in 0..20u64 {
-        if store
-            .get_position_entry_decompressed(chrom_code, pos as i64)?
-            .is_some()
-        {
+        if read_decompressed_exists(backend, output_path, chrom_code, pos as i64)? {
             read_iters += 1;
         }
     }
@@ -112,13 +114,12 @@ async fn main() -> datafusion::common::Result<()> {
     // Single lookup from mid-range
     let mid_pos = stats.total_positions / 2;
     let single_start = Instant::now();
-    let _ = store.get_position_entry_decompressed(chrom_code, mid_pos as i64)?;
+    let _ = read_decompressed_exists(backend, output_path, chrom_code, mid_pos as i64)?;
     let single_read_ms = single_start.elapsed().as_secs_f64() * 1000.0;
 
-    drop(store);
-
     println!(
-        "zstd_level={} dict_kb={} | variants={:>10} | positions={:>6} | avg/pos={:>8.0} | load={:>5.1}s | disk={:>7.1}MB | avg_pos_disk={:>6.0}KB | read={:>6.1}ms avg | single={:>6.1}ms",
+        "backend={} zstd_level={} dict_kb={} | variants={:>10} | positions={:>6} | avg/pos={:>8.0} | load={:>5.1}s | disk={:>7.1}MB | avg_pos_disk={:>6.0}KB | read={:>6.1}ms avg | single={:>6.1}ms",
+        backend.as_str(),
         zstd_level,
         dict_size_kb,
         row_count,
@@ -134,7 +135,48 @@ async fn main() -> datafusion::common::Result<()> {
     Ok(())
 }
 
-fn walkdir(path: &str) -> u64 {
+fn read_decompressed_exists(
+    backend: CacheBackend,
+    output_path: &str,
+    chrom_code: u16,
+    pos: i64,
+) -> datafusion::common::Result<bool> {
+    match backend {
+        CacheBackend::Fjall => {
+            let store = VepKvStore::open(output_path)?;
+            Ok(store
+                .get_position_entry_decompressed(chrom_code, pos)?
+                .is_some())
+        }
+        CacheBackend::Redb => {
+            let store = VepRedbStore::open(output_path)?;
+            Ok(store
+                .get_position_entry_decompressed(chrom_code, pos)?
+                .is_some())
+        }
+    }
+}
+
+fn remove_existing(path: &str) {
+    let path = Path::new(path);
+    if path.is_dir() {
+        std::fs::remove_dir_all(path).ok();
+    } else {
+        std::fs::remove_file(path).ok();
+    }
+}
+
+fn path_size(path: &str) -> u64 {
+    let path = Path::new(path);
+    if let Ok(meta) = path.metadata()
+        && meta.is_file()
+    {
+        return meta.len();
+    }
+    walkdir(path)
+}
+
+fn walkdir(path: &Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
@@ -143,7 +185,7 @@ fn walkdir(path: &str) -> u64 {
                 if m.is_file() {
                     total += m.len();
                 } else if m.is_dir() {
-                    total += walkdir(&entry.path().to_string_lossy());
+                    total += walkdir(&entry.path());
                 }
             }
         }

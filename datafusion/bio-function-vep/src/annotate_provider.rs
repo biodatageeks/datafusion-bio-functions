@@ -85,7 +85,9 @@ use crate::allele::{
 use crate::annotation_store::{AnnotationBackend, build_store};
 use crate::config;
 #[cfg(feature = "kv-cache")]
-use crate::kv_cache::KvCacheTableProvider;
+use crate::kv_cache::PositionCacheTableProvider;
+#[cfg(feature = "kv-cache")]
+use crate::kv_cache::cache_exec::PositionEntryStore;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::partitioned_cache::PartitionedParquetCache;
@@ -4245,7 +4247,8 @@ impl AnnotateProvider {
         extended_probes: bool,
         cache: &PartitionedParquetCache,
         translations_sift_table: Option<&str>,
-        #[cfg(feature = "kv-cache")] kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
+        #[cfg(feature = "kv-cache")] kv_store: Option<Arc<dyn PositionEntryStore>>,
+        #[cfg(feature = "kv-cache")] use_fjall_sift: bool,
         fetch_limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if profiling_enabled() {
@@ -4331,15 +4334,21 @@ impl AnnotateProvider {
             annotation_column_count: self.annotation_column_count(),
             fetch_limit,
             #[cfg(feature = "kv-cache")]
-            use_fjall: kv_store.is_some(),
+            use_kv_cache: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
-            sift_kv_store: kv_store.as_ref().and_then(|store| {
-                let parent = store.root_path().parent()?;
-                let sift_path = parent.join("translation_sift.fjall");
-                crate::kv_cache::SiftKvStore::open_path(&sift_path)
-                    .ok()
-                    .flatten()
-            }),
+            use_fjall_sift,
+            #[cfg(feature = "kv-cache")]
+            sift_kv_store: if use_fjall_sift {
+                kv_store.as_ref().and_then(|store| {
+                    let parent = store.root_path().parent()?;
+                    let sift_path = parent.join("translation_sift.fjall");
+                    crate::kv_cache::SiftKvStore::open_path(&sift_path)
+                        .ok()
+                        .flatten()
+                })
+            } else {
+                None
+            },
             #[cfg(feature = "kv-cache")]
             kv_store,
         };
@@ -7440,13 +7449,16 @@ struct ContigAnnotationConfig {
     /// Maximum number of output rows (LIMIT pushdown).
     fetch_limit: Option<usize>,
     pick_flags: PickFlags,
-    /// When true, use fjall KV store for variation lookup + SIFT instead of parquet.
+    /// When true, use a KV store for variation lookup instead of parquet.
     #[cfg(feature = "kv-cache")]
-    use_fjall: bool,
-    /// Shared fjall KV store handle (opened once, reused across contigs).
+    use_kv_cache: bool,
+    /// When true, use the fjall SIFT store in addition to KV variation lookup.
     #[cfg(feature = "kv-cache")]
-    kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
-    /// Shared fjall SIFT store (opened once, reused across contigs).
+    use_fjall_sift: bool,
+    /// Shared KV variation store handle (opened once, reused across contigs).
+    #[cfg(feature = "kv-cache")]
+    kv_store: Option<Arc<dyn PositionEntryStore>>,
+    /// Shared SIFT store (opened once, reused across contigs).
     #[cfg(feature = "kv-cache")]
     sift_kv_store: Option<crate::kv_cache::SiftKvStore>,
 }
@@ -7716,7 +7728,7 @@ impl ContigAnnotationStream {
         match &mut self.state {
             StreamState::AnnotatingContig(ann) => {
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
-                if ann.config.use_fjall {
+                if ann.config.use_kv_cache {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
                 }
                 ann.ephemeral_tables.clear();
@@ -7726,13 +7738,13 @@ impl ContigAnnotationStream {
                 ..
             } => {
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
-                if ann.config.use_fjall {
+                if ann.config.use_kv_cache {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
                 }
                 ann.ephemeral_tables.clear();
             }
             StreamState::CleaningUp(_) | StreamState::ErrorCleaningUp(_, _) => {
-                if self.config.use_fjall {
+                if self.config.use_kv_cache {
                     let _ = self.session.deregister_table("__vep_kv_variation");
                 }
             }
@@ -7740,7 +7752,7 @@ impl ContigAnnotationStream {
             | StreamState::PreparingContig(_)
             | StreamState::FinalCleanup(_)
             | StreamState::Done => {
-                if self.config.use_fjall {
+                if self.config.use_kv_cache {
                     let _ = self.session.deregister_table("__vep_kv_variation");
                 }
             }
@@ -8396,10 +8408,10 @@ impl Stream for ContigAnnotationStream {
                     }
                     let Some(chrom) = self.contigs.pop_front() else {
                         // All contigs processed. Deregister the global KV
-                        // variation table if fjall was used, via async cleanup
+                        // variation table if a KV backend was used, via async cleanup
                         // future (safe on any Tokio runtime flavor).
                         #[cfg(feature = "kv-cache")]
-                        if self.config.use_fjall {
+                        if self.config.use_kv_cache {
                             let session = Arc::clone(&self.session);
                             let fut: CleanupFuture = Box::pin(async move {
                                 crate::partitioned_cache::deregister_table(
@@ -8478,11 +8490,11 @@ impl Stream for ContigAnnotationStream {
                                 .build_from_path(path)
                                 .ok()
                         });
-                        // SIFT source: when use_fjall, use SiftKvStore from fjall
+                        // SIFT source: when enabled, use SiftKvStore from fjall
                         // for lazy per-transcript lookups; otherwise use parquet
                         // SiftDirectReader.
                         #[cfg(feature = "kv-cache")]
-                        let use_fjall_sift = config.use_fjall;
+                        let use_fjall_sift = config.use_fjall_sift;
                         #[cfg(not(feature = "kv-cache"))]
                         let use_fjall_sift = false;
 
@@ -8815,11 +8827,11 @@ async fn prepare_contig_context(
 
     // Variation table: either per-chrom parquet or global fjall KV store.
     #[cfg(feature = "kv-cache")]
-    let use_fjall = config.use_fjall;
+    let use_kv_cache = config.use_kv_cache;
     #[cfg(not(feature = "kv-cache"))]
-    let use_fjall = false;
+    let use_kv_cache = false;
 
-    let var_table = if use_fjall {
+    let var_table = if use_kv_cache {
         #[cfg(feature = "kv-cache")]
         {
             // Register the shared fjall KV store as a table (idempotent).
@@ -8828,8 +8840,8 @@ async fn prepare_contig_context(
                 let store = config
                     .kv_store
                     .as_ref()
-                    .expect("kv_store must be set when use_fjall=true");
-                let kv_provider = KvCacheTableProvider::from_store(Arc::clone(store));
+                    .expect("kv_store must be set when a KV backend is enabled");
+                let kv_provider = PositionCacheTableProvider::from_store(Arc::clone(store));
                 session.register_table(&kv_table_name, Arc::new(kv_provider))?;
             }
             // Don't add to ephemeral_tables — the global KV table persists
@@ -8838,7 +8850,7 @@ async fn prepare_contig_context(
         }
         #[cfg(not(feature = "kv-cache"))]
         {
-            unreachable!("use_fjall requires kv-cache feature")
+            unreachable!("KV backend requires kv-cache feature")
         }
     } else {
         let var_table =
@@ -9015,20 +9027,41 @@ impl TableProvider for AnnotateProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let _store = build_store(self.backend, self.cache_source.clone());
 
-        // Parse use_fjall option — when true, use fjall KV store for variation
-        // lookup + SIFT while keeping context from partitioned parquet.
+        // Select optional KV variation backend while keeping context from
+        // partitioned parquet. The backend argument is authoritative; legacy
+        // `use_fjall`/`use_redb` options remain accepted for parquet calls.
         #[cfg(feature = "kv-cache")]
-        let use_fjall = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_bool_option(opts, "use_fjall"))
-            .unwrap_or(false);
+        let kv_backend = match self.backend {
+            AnnotationBackend::Fjall => Some(AnnotationBackend::Fjall),
+            AnnotationBackend::Redb => Some(AnnotationBackend::Redb),
+            AnnotationBackend::Parquet => {
+                let use_fjall = self
+                    .options_json
+                    .as_deref()
+                    .and_then(|opts| Self::parse_json_bool_option(opts, "use_fjall"))
+                    .unwrap_or(false);
+                let use_redb = self
+                    .options_json
+                    .as_deref()
+                    .and_then(|opts| Self::parse_json_bool_option(opts, "use_redb"))
+                    .unwrap_or(false);
+                if use_redb {
+                    Some(AnnotationBackend::Redb)
+                } else if use_fjall {
+                    Some(AnnotationBackend::Fjall)
+                } else {
+                    None
+                }
+            }
+        };
+        #[cfg(feature = "kv-cache")]
+        let use_kv_cache = kv_backend.is_some();
         #[cfg(not(feature = "kv-cache"))]
-        let use_fjall = false;
+        let use_kv_cache = false;
 
         // Check for partitioned per-chromosome cache layout.
         // Opt-in/out via "partitioned": true/false in options_json.
-        // Both parquet-only and fjall paths require partitioned context parquet.
+        // All paths require partitioned context parquet.
         let partitioned_opt = self
             .options_json
             .as_deref()
@@ -9045,8 +9078,19 @@ impl TableProvider for AnnotateProvider {
                     "[VEP_PROFILE] detected partitioned cache: {} chroms in {}{}",
                     cache.available_chroms().len(),
                     self.cache_source,
-                    if use_fjall {
-                        " [fjall variation+sift]"
+                    if use_kv_cache {
+                        #[cfg(feature = "kv-cache")]
+                        {
+                            match kv_backend {
+                                Some(AnnotationBackend::Fjall) => " [fjall variation+sift]",
+                                Some(AnnotationBackend::Redb) => " [redb variation]",
+                                _ => "",
+                            }
+                        }
+                        #[cfg(not(feature = "kv-cache"))]
+                        {
+                            ""
+                        }
                     } else {
                         ""
                     },
@@ -9054,37 +9098,48 @@ impl TableProvider for AnnotateProvider {
             }
 
             // Determine requested cache columns.
-            // When using fjall, get schema from the KV store; otherwise from
-            // a sample variation parquet file.
+            // When using a KV backend, get schema from the KV store; otherwise
+            // from a sample variation parquet file.
             #[cfg(feature = "kv-cache")]
-            let kv_store_arc: Option<Arc<crate::kv_cache::VepKvStore>> = if use_fjall {
-                let fjall_path = std::path::Path::new(&self.cache_source).join("variation.fjall");
-                if !fjall_path.exists() {
-                    return Err(DataFusionError::Execution(format!(
-                        "annotate_vep(): use_fjall=true but no fjall store found at '{}'",
-                        fjall_path.display()
-                    )));
+            let kv_store_arc: Option<Arc<dyn PositionEntryStore>> = match kv_backend {
+                Some(AnnotationBackend::Fjall) => {
+                    let fjall_path =
+                        std::path::Path::new(&self.cache_source).join("variation.fjall");
+                    if !fjall_path.exists() {
+                        return Err(DataFusionError::Execution(format!(
+                            "annotate_vep(): backend=fjall but no fjall store found at '{}'",
+                            fjall_path.display()
+                        )));
+                    }
+                    Some(Arc::new(crate::kv_cache::VepKvStore::open(&fjall_path)?))
                 }
-                Some(Arc::new(crate::kv_cache::VepKvStore::open(&fjall_path)?))
-            } else {
-                None
+                Some(AnnotationBackend::Redb) => {
+                    let redb_path = std::path::Path::new(&self.cache_source).join("variation.redb");
+                    if !redb_path.exists() {
+                        return Err(DataFusionError::Execution(format!(
+                            "annotate_vep(): backend=redb but no redb store found at '{}'",
+                            redb_path.display()
+                        )));
+                    }
+                    Some(Arc::new(crate::kv_cache::VepRedbStore::open(&redb_path)?))
+                }
+                _ => None,
             };
+            #[cfg(feature = "kv-cache")]
+            let use_fjall_sift = matches!(kv_backend, Some(AnnotationBackend::Fjall));
 
-            let (available_cache_columns, sample_table_to_deregister) = if use_fjall {
+            let (available_cache_columns, sample_table_to_deregister) = if use_kv_cache {
                 #[cfg(feature = "kv-cache")]
                 {
                     let store = kv_store_arc.as_ref().unwrap();
-                    let cols: HashSet<String> = store
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().clone())
-                        .collect();
+                    let schema = store.schema();
+                    let cols: HashSet<String> =
+                        schema.fields().iter().map(|f| f.name().clone()).collect();
                     (cols, None)
                 }
                 #[cfg(not(feature = "kv-cache"))]
                 {
-                    unreachable!("use_fjall requires kv-cache feature")
+                    unreachable!("KV backend requires kv-cache feature")
                 }
             } else {
                 let sample_chrom = &cache.available_chroms()[0];
@@ -9153,6 +9208,8 @@ impl TableProvider for AnnotateProvider {
                     translations_sift_table.as_deref(),
                     #[cfg(feature = "kv-cache")]
                     kv_store_arc,
+                    #[cfg(feature = "kv-cache")]
+                    use_fjall_sift,
                     limit,
                 )
                 .await;

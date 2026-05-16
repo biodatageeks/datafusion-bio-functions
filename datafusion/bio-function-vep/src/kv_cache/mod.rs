@@ -11,10 +11,13 @@ pub mod key_encoding;
 pub mod kv_store;
 pub mod loader;
 pub mod position_entry;
+pub mod redb_store;
 pub mod sift_store;
 
 pub use cache_provider::KvCacheTableProvider;
+pub(crate) use cache_provider::PositionCacheTableProvider;
 pub use context_store::{ExonKvStore, TranslationKvStore};
 pub use kv_store::VepKvStore;
-pub use loader::{CacheLoader, LoadStats};
+pub use loader::{CacheBackend, CacheLoader, LoadStats};
+pub use redb_store::{RedbCacheTableProvider, VepRedbStore};
 pub use sift_store::SiftKvStore;

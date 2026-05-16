@@ -10,6 +10,7 @@ use datafusion::common::{DataFusionError, Result};
 pub enum AnnotationBackend {
     Parquet,
     Fjall,
+    Redb,
 }
 
 impl AnnotationBackend {
@@ -18,8 +19,9 @@ impl AnnotationBackend {
         match value {
             "parquet" => Ok(Self::Parquet),
             "fjall" => Ok(Self::Fjall),
+            "redb" => Ok(Self::Redb),
             other => Err(DataFusionError::Plan(format!(
-                "annotate_vep() backend must be one of: parquet, fjall; got: {other}"
+                "annotate_vep() backend must be one of: parquet, fjall, redb; got: {other}"
             ))),
         }
     }
@@ -29,6 +31,7 @@ impl AnnotationBackend {
         match self {
             Self::Parquet => "parquet",
             Self::Fjall => "fjall",
+            Self::Redb => "redb",
         }
     }
 }
@@ -87,11 +90,34 @@ impl AnnotationStore for FjallAnnotationStore {
     }
 }
 
+/// redb-backed annotation store descriptor.
+#[derive(Debug, Clone)]
+pub struct RedbAnnotationStore {
+    source: String,
+}
+
+impl RedbAnnotationStore {
+    pub fn new(source: String) -> Self {
+        Self { source }
+    }
+}
+
+impl AnnotationStore for RedbAnnotationStore {
+    fn backend(&self) -> AnnotationBackend {
+        AnnotationBackend::Redb
+    }
+
+    fn source(&self) -> &str {
+        &self.source
+    }
+}
+
 /// Build a store descriptor for the selected backend.
 pub fn build_store(backend: AnnotationBackend, source: String) -> Box<dyn AnnotationStore> {
     match backend {
         AnnotationBackend::Parquet => Box::new(ParquetAnnotationStore::new(source)),
         AnnotationBackend::Fjall => Box::new(FjallAnnotationStore::new(source)),
+        AnnotationBackend::Redb => Box::new(RedbAnnotationStore::new(source)),
     }
 }
 
@@ -108,6 +134,10 @@ mod tests {
         assert_eq!(
             AnnotationBackend::parse("fjall").unwrap(),
             AnnotationBackend::Fjall
+        );
+        assert_eq!(
+            AnnotationBackend::parse("redb").unwrap(),
+            AnnotationBackend::Redb
         );
     }
 

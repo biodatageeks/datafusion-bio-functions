@@ -15,7 +15,7 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 |-------|-------------|--------|
 | **[datafusion-bio-function-pileup](datafusion/bio-function-pileup)** | Depth-of-coverage (pileup) computation from BAM alignments | ✅ |
 | **[datafusion-bio-function-ranges](datafusion/bio-function-ranges)** | Interval join, coverage, count-overlaps, nearest-neighbor, overlap, merge, cluster, complement, and subtract operations | ✅ |
-| **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via `lookup_variants()` table function with parquet + Fjall KV cache backends | ✅ |
+| **[datafusion-bio-function-vep](datafusion/bio-function-vep)** | VEP variant annotation via `lookup_variants()` table function with parquet, fjall, and redb cache backends | ✅ |
 
 ## Features
 
@@ -46,9 +46,9 @@ This workspace provides a collection of Rust crates that implement DataFusion UD
 ### VEP Annotation (lookup + consequence scaffolding)
 
 - **`lookup_variants()` Table Function**: SQL-based variant annotation against a pre-built VEP cache
-- **KV Cache Backend**: fjall LSM-tree store with zstd dictionary compression for compact on-disk storage
+- **KV Cache Backends**: fjall LSM-tree or redb single-file store with zstd dictionary compression for compact on-disk storage
 - **Match Modes**: `exact`, `exact_or_colocated_ids`, `exact_or_vep_existing` (indel-aware relaxed matching)
-- **`annotate_vep()` Table Function**: backend-unified consequence annotation entrypoint (`parquet` or `fjall`) with phased CSQ rollout
+- **`annotate_vep()` Table Function**: backend-unified consequence annotation entrypoint (`parquet`, `fjall`, or `redb`) with phased CSQ rollout
 - **Session Configuration**: Tunable parameters via SQL `SET` statements under the `bio.annotation` namespace
 
 #### `annotate_vep` API (Phase 1)
@@ -64,7 +64,7 @@ annotate_vep(
 
 - `vcf_table`: registered input VCF table.
 - `cache_source`: backend-specific source path/identifier.
-- `backend`: `parquet` or `fjall`.
+- `backend`: `parquet`, `fjall`, or `redb`.
 - `options_json` (optional): backend/runtime options. Current keys:
   - `transcripts_table`: registered table name with transcript intervals/coding context.
   - `exons_table`: registered table name with exon intervals/order.
@@ -92,9 +92,9 @@ Feature comparison snapshot:
 | Transcript consequence engine | ✅ (full SO consequence model) | 🚧 transcript/exon phase-2 baseline merged (not full VEP parity) |
 | Supported consequence terms | 41/41 | 🚧 41/41 term handlers wired; codon-accurate parity still in progress |
 | Most severe consequence output | ✅ | 🚧 ranked SO output when transcript/exon context is available; fallback placeholder otherwise |
-| Backend abstraction | Cache/files in VEP ecosystem | ✅ unified API for `parquet` + `fjall` entrypoint |
+| Backend abstraction | Cache/files in VEP ecosystem | ✅ unified API for `parquet`, `fjall`, and `redb` entrypoints |
 | Native SQL execution in DataFusion | ❌ | ✅ |
-| Fjall KV backend | ❌ | ✅ |
+| KV backends | ❌ | ✅ fjall + redb |
 
 #### Golden Benchmark (`annotate_vep` vs Ensembl VEP 115)
 
@@ -123,7 +123,7 @@ Output report:
 `lookup_variants(vcf_table, cache_table, ...)` supports both backends through the same API:
 
 - **Parquet or other scan-capable table providers**: uses interval-join execution.
-- **Fjall `KvCacheTableProvider`**: dispatches to direct KV lookup execution.
+- **KV cache table providers**: dispatch to direct position-key lookup execution.
 
 Both cache backends must expose the same required cache column names:
 `chrom`, `start`, `end`, `variation_name`, `allele_string`.
@@ -141,7 +141,7 @@ lookup_variants(
 ```
 
 - `vcf_table`: registered VCF input table name.
-- `cache_table`: registered annotation cache table/provider name (Parquet or Fjall).
+- `cache_table`: registered annotation cache table/provider name (Parquet, fjall, or redb).
 - `columns` (optional): comma-separated cache columns to project. Default: all cache columns except `chrom,start,end` and `source_*`.
 - `match_mode` (optional, default `exact`):
   - `exact`: interval overlap + exact allele matching only.
@@ -189,19 +189,22 @@ let df = ctx
     .await?;
 ```
 
-#### Create Fjall Cache
+#### Create KV Cache
 
-Create a full Fjall cache from a Parquet variation cache:
+Create a full fjall or redb cache from a Parquet variation cache:
 
 ```bash
 cargo run -p datafusion-bio-function-vep --example load_cache_full --features kv-cache --release -- \
   /path/to/115_GRCh38_variants.parquet \
   /path/to/variation_fjall \
-  8
+  8 \
+  fjall
 ```
 
 - Third argument is thread count (`target_partitions` + loader parallelism).
+- Optional fourth argument is backend: `fjall` (default) or `redb`.
 - Output path is recreated if it already exists.
+- For annotation with `backend='redb'`, place the redb file at `<cache_dir>/variation.redb` alongside partitioned context parquet directories.
 
 Create a filtered cache (single chromosome) and optionally tune compression:
 
@@ -212,10 +215,11 @@ cargo run -p datafusion-bio-function-vep --example load_cache --features kv-cach
   22 \
   8 \
   9 \
-  256
+  256 \
+  fjall
 ```
 
-- Args: `<parquet_path> <fjall_output_path> [chrom_filter] [partitions] [zstd_level] [dict_size_kb]`
+- Args: `<parquet_path> <cache_output_path> [chrom_filter] [partitions] [zstd_level] [dict_size_kb] [fjall|redb]`
 - Defaults for `load_cache`: `zstd_level=3`, `dict_size_kb=112`.
 
 #### Annotation Configuration
