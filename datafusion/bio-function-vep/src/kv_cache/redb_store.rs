@@ -331,7 +331,7 @@ impl VepRedbStore {
         let mut db = db.lock().map_err(|e| {
             DataFusionError::Execution(format!("redb database mutex poisoned: {e}"))
         })?;
-        while db.compact().map_err(redb_err)? {}
+        db.compact().map_err(redb_err)?;
         Ok(())
     }
 
