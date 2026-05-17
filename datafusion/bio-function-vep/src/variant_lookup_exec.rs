@@ -17,8 +17,9 @@ use std::task::{Context, Poll};
 
 use coitrees::{COITree, GenericInterval, Interval, IntervalTree};
 use datafusion::arrow::array::{
-    Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch,
-    StringArray, StringViewArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray,
+    MutableArrayData, RecordBatch, StringArray, StringViewArray, UInt32Array, UInt64Array,
+    make_array,
 };
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
@@ -745,6 +746,11 @@ struct BuildSide {
     matched: Vec<bool>,
 }
 
+struct MatchedBatch {
+    batch: RecordBatch,
+    vcf_indices: Vec<u32>,
+}
+
 /// Cached column indices for the cache (probe) schema, resolved once on first batch.
 struct CacheIndices {
     chrom: usize,
@@ -765,13 +771,13 @@ enum StreamState {
     /// emitted, so that the colocated sink is fully populated before any
     /// downstream consumer sees the first batch.
     ProcessProbe,
-    /// Emitting buffered matched rows (probe complete, sink is final).
-    EmitMatched,
-    /// Emitting unmatched build rows.
-    EmitUnmatched,
+    /// Emitting ordered lookup output (probe complete, sink is final).
+    EmitOrdered,
     /// Done.
     Done,
 }
+
+const LOOKUP_OUTPUT_BATCH_SIZE: usize = 8192;
 
 /// Cached column indices for co-located metadata in the cache schema.
 struct ColocIndices {
@@ -813,12 +819,14 @@ struct VariantLookupStream {
     colocated_sink: Option<ColocatedSink>,
     /// Cached column indices for co-located collection.
     coloc_indices: Option<ColocIndices>,
-    /// Matched batches buffered during probe (emitted after probe completes
-    /// so that the colocated sink is fully populated).
+    /// Matched batches buffered during probe so that the colocated sink is
+    /// fully populated before downstream annotation uses it.
     /// Note: peaks at the full chromosome result set size (~300K rows for
     /// chr1 WGS). This is inherent — the colocated sink must be complete
     /// before downstream annotation can use it.
-    matched_batches: VecDeque<RecordBatch>,
+    matched_batches: VecDeque<MatchedBatch>,
+    /// Final lookup output in original VCF row order, including unmatched rows.
+    ordered_batches: VecDeque<RecordBatch>,
 }
 
 impl VariantLookupStream {
@@ -853,6 +861,7 @@ impl VariantLookupStream {
             colocated_sink,
             coloc_indices: None,
             matched_batches: VecDeque::new(),
+            ordered_batches: VecDeque::new(),
         }
     }
 
@@ -1166,7 +1175,7 @@ impl VariantLookupStream {
     /// unusable cache rows, match by exact hash or overlap window, and collect
     /// colocated entries during the same scan with identical compare-existing
     /// semantics.
-    fn process_probe_batch(&mut self, cache_batch: &RecordBatch) -> Result<Option<RecordBatch>> {
+    fn process_probe_batch(&mut self, cache_batch: &RecordBatch) -> Result<Option<MatchedBatch>> {
         let cache_schema = cache_batch.schema();
         self.resolve_cache_indices(&cache_schema)?;
         self.resolve_coloc_indices(&cache_schema);
@@ -1452,6 +1461,7 @@ impl VariantLookupStream {
         }
 
         // Build output batch: VCF columns via take + cache columns via take.
+        let matched_vcf_indices = vcf_indices.clone();
         let vcf_take = UInt32Array::from(vcf_indices);
         let cache_take = UInt32Array::from(cache_indices_buf);
 
@@ -1485,53 +1495,91 @@ impl VariantLookupStream {
         }
 
         RecordBatch::try_new(self.schema.clone(), output_columns)
-            .map(Some)
+            .map(|batch| {
+                Some(MatchedBatch {
+                    batch,
+                    vcf_indices: matched_vcf_indices,
+                })
+            })
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
-    /// Emit unmatched VCF rows with NULL cache columns.
-    fn emit_unmatched(&mut self) -> Result<Option<RecordBatch>> {
-        let build = match self.build.as_ref() {
-            Some(b) => b,
-            None => return Ok(None),
+    fn prepare_ordered_output_batches(&mut self) -> Result<()> {
+        let Some(build) = self.build.as_ref() else {
+            return Ok(());
         };
+        let total_rows = build.vcf_batch.num_rows();
+        let matched_batches: Vec<MatchedBatch> = self.matched_batches.drain(..).collect();
+        let mut matched_by_vcf: Vec<Option<(usize, usize)>> = vec![None; total_rows];
 
-        let unmatched_indices: Vec<u32> = build
-            .matched
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| !**m)
-            .map(|(i, _)| i as u32)
+        for (batch_idx, matched) in matched_batches.iter().enumerate() {
+            for (row_idx, &vcf_idx) in matched.vcf_indices.iter().enumerate() {
+                let vcf_idx = vcf_idx as usize;
+                if vcf_idx < total_rows {
+                    matched_by_vcf[vcf_idx] = Some((batch_idx, row_idx));
+                }
+            }
+        }
+
+        let matched_data_by_cache_col: Vec<Vec<_>> = (0..self.cache_columns.len())
+            .map(|cache_col_offset| {
+                matched_batches
+                    .iter()
+                    .map(|matched| {
+                        matched
+                            .batch
+                            .column(self.num_vcf_cols + cache_col_offset)
+                            .to_data()
+                    })
+                    .collect()
+            })
             .collect();
 
-        if unmatched_indices.is_empty() {
-            return Ok(None);
+        for chunk_start in (0..total_rows).step_by(LOOKUP_OUTPUT_BATCH_SIZE) {
+            let chunk_end = (chunk_start + LOOKUP_OUTPUT_BATCH_SIZE).min(total_rows);
+            let chunk_len = chunk_end - chunk_start;
+            let take_indices =
+                UInt32Array::from_iter_values((chunk_start..chunk_end).map(|idx| idx as u32));
+            let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
+
+            for col_idx in 0..self.num_vcf_cols {
+                let taken = datafusion::arrow::compute::take(
+                    build.vcf_batch.column(col_idx),
+                    &take_indices,
+                    None,
+                )
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                output_columns.push(taken);
+            }
+
+            for (cache_col_offset, source_data) in matched_data_by_cache_col.iter().enumerate() {
+                if source_data.is_empty() {
+                    let field = self.schema.field(self.num_vcf_cols + cache_col_offset);
+                    output_columns.push(datafusion::arrow::array::new_null_array(
+                        field.data_type(),
+                        chunk_len,
+                    ));
+                } else {
+                    let source_refs: Vec<_> = source_data.iter().collect();
+                    let mut mutable = MutableArrayData::new(source_refs, true, chunk_len);
+                    for row_idx in chunk_start..chunk_end {
+                        if let Some((matched_batch_idx, matched_row_idx)) = matched_by_vcf[row_idx]
+                        {
+                            mutable.extend(matched_batch_idx, matched_row_idx, matched_row_idx + 1);
+                        } else {
+                            mutable.extend_nulls(1);
+                        }
+                    }
+                    output_columns.push(make_array(mutable.freeze()));
+                }
+            }
+
+            let batch = RecordBatch::try_new(self.schema.clone(), output_columns)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            self.ordered_batches.push_back(batch);
         }
 
-        let take_indices = UInt32Array::from(unmatched_indices);
-        let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
-
-        for col_idx in 0..self.num_vcf_cols {
-            let taken = datafusion::arrow::compute::take(
-                build.vcf_batch.column(col_idx),
-                &take_indices,
-                None,
-            )
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            output_columns.push(taken);
-        }
-
-        let num_unmatched = take_indices.len();
-        for i in 0..self.cache_columns.len() {
-            let field = self.schema.field(self.num_vcf_cols + i);
-            let null_array =
-                datafusion::arrow::array::new_null_array(field.data_type(), num_unmatched);
-            output_columns.push(null_array);
-        }
-
-        RecordBatch::try_new(self.schema.clone(), output_columns)
-            .map(Some)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        Ok(())
     }
 }
 
@@ -1588,27 +1636,21 @@ impl Stream for VariantLookupStream {
                         Poll::Ready(None) => {
                             self.cache_stream = None;
                             // Probe complete — colocated sink is final.
-                            self.state = StreamState::EmitMatched;
+                            if let Err(e) = self.prepare_ordered_output_batches() {
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                            self.state = StreamState::EmitOrdered;
                             continue;
                         }
                         Poll::Pending => return Poll::Pending,
                     }
                 }
-                StreamState::EmitMatched => {
-                    if let Some(batch) = self.matched_batches.pop_front() {
+                StreamState::EmitOrdered => {
+                    if let Some(batch) = self.ordered_batches.pop_front() {
                         return Poll::Ready(Some(Ok(batch)));
                     }
-                    // All matched emitted — continue to unmatched.
-                    self.state = StreamState::EmitUnmatched;
-                    continue;
-                }
-                StreamState::EmitUnmatched => {
                     self.state = StreamState::Done;
-                    match self.emit_unmatched() {
-                        Ok(Some(batch)) => return Poll::Ready(Some(Ok(batch))),
-                        Ok(None) => return Poll::Ready(None),
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                    }
+                    return Poll::Ready(None);
                 }
                 StreamState::Done => return Poll::Ready(None),
             }
