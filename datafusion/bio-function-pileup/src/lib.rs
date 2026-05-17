@@ -12,4 +12,6 @@ pub use filter::ReadFilter;
 pub use physical_exec::{DenseMode, PileupExec};
 
 #[cfg(feature = "bam")]
-pub use table_function::{DepthFunction, DepthTableProvider, register_pileup_functions};
+pub use table_function::{
+    DepthFunction, DepthTableProvider, open_bam_provider_for_pileup, register_pileup_functions,
+};

@@ -17,11 +17,11 @@ datafusion.workspace = true
 tokio.workspace = true
 futures.workspace = true
 log.workspace = true
-datafusion-bio-format-bam = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "1848d26f7b870f4a549383b9d3cd49abc4e591d9", optional = true }
+datafusion-bio-format-bam = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "b9b76948dfc9b18a663cb2bf546a99514756056d", optional = true }
 async-trait = "0.1.88"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-datafusion-bio-format-bam = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "1848d26f7b870f4a549383b9d3cd49abc4e591d9" }
+datafusion-bio-format-bam = { git = "https://github.com/biodatageeks/datafusion-bio-formats.git", rev = "b9b76948dfc9b18a663cb2bf546a99514756056d" }
