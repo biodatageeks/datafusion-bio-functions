@@ -53,13 +53,33 @@ pub trait PositionEntryStore: Send + Sync {
     fn schema(&self) -> SchemaRef;
     fn root_path(&self) -> &Path;
     fn create_decompressor(&self) -> Result<Option<zstd::bulk::Decompressor<'static>>>;
+    fn begin_lookup_session(&self) -> Result<Box<dyn PositionEntryLookupSession + '_>>;
+}
+
+pub trait PositionEntryLookupSession {
     fn get_position_entry_fast(
-        &self,
+        &mut self,
         chrom_code: u16,
         start: i64,
         decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
         buf: &mut Vec<u8>,
     ) -> Result<bool>;
+}
+
+struct FjallPositionEntryLookupSession<'a> {
+    store: &'a VepKvStore,
+}
+
+impl PositionEntryLookupSession for FjallPositionEntryLookupSession<'_> {
+    fn get_position_entry_fast(
+        &mut self,
+        chrom_code: u16,
+        start: i64,
+        decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        VepKvStore::get_position_entry_fast(self.store, chrom_code, start, decompressor, buf)
+    }
 }
 
 impl PositionEntryStore for VepKvStore {
@@ -75,14 +95,8 @@ impl PositionEntryStore for VepKvStore {
         VepKvStore::create_decompressor(self)
     }
 
-    fn get_position_entry_fast(
-        &self,
-        chrom_code: u16,
-        start: i64,
-        decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
-        buf: &mut Vec<u8>,
-    ) -> Result<bool> {
-        VepKvStore::get_position_entry_fast(self, chrom_code, start, decompressor, buf)
+    fn begin_lookup_session(&self) -> Result<Box<dyn PositionEntryLookupSession + '_>> {
+        Ok(Box::new(FjallPositionEntryLookupSession { store: self }))
     }
 }
 
@@ -503,6 +517,7 @@ impl KvLookupStream {
     /// For each VCF row, fetch the per-position entry from fjall, match alleles,
     /// and append matched column values directly into ArrayBuilders.
     fn process_batch(&mut self, vcf_batch: &RecordBatch) -> Result<RecordBatch> {
+        let store = Arc::clone(&self.store);
         let vcf_schema = vcf_batch.schema();
         let chrom_idx = vcf_schema.index_of("chrom")?;
         let start_idx = vcf_schema.index_of("start")?;
@@ -547,7 +562,7 @@ impl KvLookupStream {
         let mut vcf_indices: Vec<u32> = Vec::with_capacity(num_rows);
 
         // Reusable zstd decompressor — created once, amortized across all lookups.
-        let mut decompressor = self.store.create_decompressor()?;
+        let mut decompressor = store.create_decompressor()?;
 
         // Reusable decompression / raw-value buffer — avoids alloc per lookup.
         let mut decompress_buf: Vec<u8> = Vec::with_capacity(4096);
@@ -558,7 +573,7 @@ impl KvLookupStream {
         // Determine which column indices in the entry correspond to our output columns.
         // Entry stores all columns except chrom/start, in schema order minus those 2.
         // (`end` is stored as a regular column inside the entry.)
-        let cache_schema = self.store.schema();
+        let cache_schema = store.schema();
         let cache_chrom_idx = cache_schema.index_of("chrom").unwrap_or(usize::MAX);
         let cache_start_idx = cache_schema.index_of("start").unwrap_or(usize::MAX);
 
@@ -593,6 +608,7 @@ impl KvLookupStream {
         } else {
             None
         };
+        let mut lookup_session = store.begin_lookup_session()?;
 
         // Local buffer for colocated data (flushed to the shared sink after the loop).
         let mut coloc_buf: Option<HashMap<ColocatedKey, ColocatedSinkValue>> =
@@ -639,7 +655,7 @@ impl KvLookupStream {
 
             let mut emitted_match = false;
             for probe_start in &probe_starts {
-                let found = self.store.get_position_entry_fast(
+                let found = lookup_session.get_position_entry_fast(
                     chrom_code,
                     *probe_start,
                     decompressor.as_mut(),

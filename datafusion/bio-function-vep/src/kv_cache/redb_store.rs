@@ -19,10 +19,11 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 use redb::{
-    Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
+    Database, ReadOnlyDatabase, ReadOnlyTable, ReadTransaction, ReadableDatabase, ReadableTable,
+    TableDefinition,
 };
 
-use super::cache_exec::PositionEntryStore;
+use super::cache_exec::{PositionEntryLookupSession, PositionEntryStore};
 use super::kv_store::{
     FORMAT_V0, decompress_into_buffer_with_retry, schema_from_ipc_bytes, schema_to_ipc_bytes,
 };
@@ -63,8 +64,16 @@ fn redb_err(e: impl std::fmt::Display) -> DataFusionError {
 impl VepRedbStore {
     /// Open an existing redb cache for annotation using `ReadOnlyDatabase`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_cache_size(path, 1024 * 1024 * 1024)
+    }
+
+    /// Open an existing redb cache with a custom page cache size.
+    pub fn open_with_cache_size(path: impl AsRef<Path>, cache_size_bytes: usize) -> Result<Self> {
         let root_path = path.as_ref().to_path_buf();
-        let db = ReadOnlyDatabase::open(&root_path).map_err(redb_err)?;
+        let db = redb::Builder::new()
+            .set_cache_size(cache_size_bytes)
+            .open_read_only(&root_path)
+            .map_err(redb_err)?;
         let (schema, format_version, zstd_dict) = Self::read_metadata(&db)?;
         Ok(Self {
             root_path,
@@ -247,29 +256,16 @@ impl VepRedbStore {
         decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
         buf: &mut Vec<u8>,
     ) -> Result<bool> {
-        let mut key_buf = Vec::with_capacity(10);
-        super::key_encoding::encode_position_key_buf(chrom_code, start, &mut key_buf);
         let read_txn = self.begin_read()?;
         let table = read_txn.open_table(DATA_TABLE).map_err(redb_err)?;
-        let Some(raw) = table.get(key_buf.as_slice()).map_err(redb_err)? else {
-            return Ok(false);
-        };
-        let compressed = raw.value();
-        match decompressor {
-            Some(dec) => {
-                decompress_into_buffer_with_retry(
-                    dec,
-                    compressed,
-                    buf,
-                    "zstd decompression failed",
-                )?;
-            }
-            None => {
-                buf.clear();
-                buf.extend_from_slice(compressed);
-            }
-        }
-        Ok(true)
+        let mut session = RedbPositionEntryLookupSession::new(read_txn, table);
+        session.get_position_entry_fast(chrom_code, start, decompressor, buf)
+    }
+
+    pub(crate) fn begin_position_lookup_session(&self) -> Result<RedbPositionEntryLookupSession> {
+        let read_txn = self.begin_read()?;
+        let table = read_txn.open_table(DATA_TABLE).map_err(redb_err)?;
+        Ok(RedbPositionEntryLookupSession::new(read_txn, table))
     }
 
     pub fn store_dict(&self, dict_bytes: &[u8]) -> Result<()> {
@@ -384,6 +380,53 @@ impl VepRedbStore {
     }
 }
 
+pub(crate) struct RedbPositionEntryLookupSession {
+    _read_txn: ReadTransaction,
+    table: ReadOnlyTable<&'static [u8], &'static [u8]>,
+    key_buf: Vec<u8>,
+}
+
+impl RedbPositionEntryLookupSession {
+    fn new(read_txn: ReadTransaction, table: ReadOnlyTable<&'static [u8], &'static [u8]>) -> Self {
+        Self {
+            _read_txn: read_txn,
+            table,
+            key_buf: Vec::with_capacity(10),
+        }
+    }
+}
+
+impl PositionEntryLookupSession for RedbPositionEntryLookupSession {
+    fn get_position_entry_fast(
+        &mut self,
+        chrom_code: u16,
+        start: i64,
+        decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        super::key_encoding::encode_position_key_buf(chrom_code, start, &mut self.key_buf);
+        let Some(raw) = self.table.get(self.key_buf.as_slice()).map_err(redb_err)? else {
+            return Ok(false);
+        };
+        let compressed = raw.value();
+        match decompressor {
+            Some(dec) => {
+                decompress_into_buffer_with_retry(
+                    dec,
+                    compressed,
+                    buf,
+                    "zstd decompression failed",
+                )?;
+            }
+            None => {
+                buf.clear();
+                buf.extend_from_slice(compressed);
+            }
+        }
+        Ok(true)
+    }
+}
+
 impl PositionEntryStore for VepRedbStore {
     fn schema(&self) -> SchemaRef {
         VepRedbStore::schema(self).clone()
@@ -397,14 +440,8 @@ impl PositionEntryStore for VepRedbStore {
         VepRedbStore::create_decompressor(self)
     }
 
-    fn get_position_entry_fast(
-        &self,
-        chrom_code: u16,
-        start: i64,
-        decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
-        buf: &mut Vec<u8>,
-    ) -> Result<bool> {
-        VepRedbStore::get_position_entry_fast(self, chrom_code, start, decompressor, buf)
+    fn begin_lookup_session(&self) -> Result<Box<dyn PositionEntryLookupSession + '_>> {
+        Ok(Box::new(self.begin_position_lookup_session()?))
     }
 }
 
@@ -523,5 +560,42 @@ mod tests {
             reopened.get_position_entry_raw(&key_200).unwrap().unwrap(),
             b"entry-200"
         );
+    }
+
+    #[test]
+    fn redb_lookup_session_reads_multiple_entries() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = VepRedbStore::create(file.path(), test_schema()).unwrap();
+        store
+            .batch_insert_raw(&[
+                (
+                    crate::kv_cache::key_encoding::encode_position_key("1", 100),
+                    b"entry-100".to_vec(),
+                ),
+                (
+                    crate::kv_cache::key_encoding::encode_position_key("1", 200),
+                    b"entry-200".to_vec(),
+                ),
+            ])
+            .unwrap();
+        drop(store);
+
+        let reopened = VepRedbStore::open(file.path()).unwrap();
+        let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
+        let mut session = reopened.begin_position_lookup_session().unwrap();
+        let mut buf = Vec::new();
+
+        assert!(
+            session
+                .get_position_entry_fast(chrom_code, 100, None, &mut buf)
+                .unwrap()
+        );
+        assert_eq!(buf, b"entry-100");
+        assert!(
+            session
+                .get_position_entry_fast(chrom_code, 200, None, &mut buf)
+                .unwrap()
+        );
+        assert_eq!(buf, b"entry-200");
     }
 }

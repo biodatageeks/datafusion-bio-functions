@@ -9122,6 +9122,14 @@ impl TableProvider for AnnotateProvider {
             // When using a KV backend, get schema from the KV store; otherwise
             // from a sample variation parquet file.
             #[cfg(feature = "kv-cache")]
+            let kv_cache_size_bytes = self
+                .options_json
+                .as_deref()
+                .and_then(|opts| Self::parse_json_i64_option(opts, "cache_size_mb"))
+                .filter(|mb| *mb > 0)
+                .map(|mb| mb as u64 * 1024 * 1024)
+                .unwrap_or(1024 * 1024 * 1024);
+            #[cfg(feature = "kv-cache")]
             let kv_store_arc: Option<Arc<dyn PositionEntryStore>> = match kv_backend {
                 Some(AnnotationBackend::Fjall) => {
                     let fjall_path =
@@ -9132,7 +9140,10 @@ impl TableProvider for AnnotateProvider {
                             fjall_path.display()
                         )));
                     }
-                    Some(Arc::new(crate::kv_cache::VepKvStore::open(&fjall_path)?))
+                    Some(Arc::new(crate::kv_cache::VepKvStore::open_with_cache_size(
+                        &fjall_path,
+                        kv_cache_size_bytes,
+                    )?))
                 }
                 Some(AnnotationBackend::Redb) => {
                     let redb_path = std::path::Path::new(&self.cache_source).join("variation.redb");
@@ -9142,7 +9153,12 @@ impl TableProvider for AnnotateProvider {
                             redb_path.display()
                         )));
                     }
-                    Some(Arc::new(crate::kv_cache::VepRedbStore::open(&redb_path)?))
+                    Some(Arc::new(
+                        crate::kv_cache::VepRedbStore::open_with_cache_size(
+                            &redb_path,
+                            kv_cache_size_bytes as usize,
+                        )?,
+                    ))
                 }
                 _ => None,
             };
