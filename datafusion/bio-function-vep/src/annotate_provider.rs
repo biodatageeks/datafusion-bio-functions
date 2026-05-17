@@ -2744,7 +2744,7 @@ fn lookup_sift_polyphen(
     protein_position: Option<&str>,
     amino_acids: Option<&str>,
     cache: &mut SiftPolyphenCache,
-    #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
+    #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftPredictionStore>,
     #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
 ) -> (String, String) {
     let empty = || (String::new(), String::new());
@@ -2771,7 +2771,7 @@ fn lookup_sift_polyphen(
         return empty();
     };
 
-    // Lazy load from fjall sift keyspace on cache miss.
+    // Lazy load from a SIFT KV store on cache miss.
     if cache.get(tx_id).is_none() {
         #[cfg(feature = "kv-cache")]
         if let Some(kv) = sift_kv {
@@ -4248,7 +4248,7 @@ impl AnnotateProvider {
         cache: &PartitionedParquetCache,
         translations_sift_table: Option<&str>,
         #[cfg(feature = "kv-cache")] kv_store: Option<Arc<dyn PositionEntryStore>>,
-        #[cfg(feature = "kv-cache")] use_fjall_sift: bool,
+        #[cfg(feature = "kv-cache")] sift_kv_store: Option<crate::kv_cache::SiftPredictionStore>,
         fetch_limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if profiling_enabled() {
@@ -4336,19 +4336,9 @@ impl AnnotateProvider {
             #[cfg(feature = "kv-cache")]
             use_kv_cache: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
-            use_fjall_sift,
+            use_kv_sift: sift_kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
-            sift_kv_store: if use_fjall_sift {
-                kv_store.as_ref().and_then(|store| {
-                    let parent = store.root_path().parent()?;
-                    let sift_path = parent.join("translation_sift.fjall");
-                    crate::kv_cache::SiftKvStore::open_path(&sift_path)
-                        .ok()
-                        .flatten()
-                })
-            } else {
-                None
-            },
+            sift_kv_store,
             #[cfg(feature = "kv-cache")]
             kv_store,
         };
@@ -4379,7 +4369,7 @@ impl AnnotateProvider {
         ctx: &PreparedContext<'_>,
         colocated_map: &HashMap<ColocatedKey, ColocatedData>,
         sift_cache: &mut SiftPolyphenCache,
-        #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
+        #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftPredictionStore>,
         #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
         skip_csq: bool,
         skip_typed_cols: bool,
@@ -7452,15 +7442,15 @@ struct ContigAnnotationConfig {
     /// When true, use a KV store for variation lookup instead of parquet.
     #[cfg(feature = "kv-cache")]
     use_kv_cache: bool,
-    /// When true, use the fjall SIFT store in addition to KV variation lookup.
+    /// When true, use a SIFT KV store in addition to KV variation lookup.
     #[cfg(feature = "kv-cache")]
-    use_fjall_sift: bool,
+    use_kv_sift: bool,
     /// Shared KV variation store handle (opened once, reused across contigs).
     #[cfg(feature = "kv-cache")]
     kv_store: Option<Arc<dyn PositionEntryStore>>,
     /// Shared SIFT store (opened once, reused across contigs).
     #[cfg(feature = "kv-cache")]
-    sift_kv_store: Option<crate::kv_cache::SiftKvStore>,
+    sift_kv_store: Option<crate::kv_cache::SiftPredictionStore>,
 }
 
 /// Leaf `ExecutionPlan` that processes contigs one at a time via a state-machine
@@ -7632,9 +7622,9 @@ struct ContigAnnotationState {
     sift_cache: SiftPolyphenCache,
     sift_direct: Option<SiftDirectReader>,
     loaded_sift_windows: HashSet<(String, i64)>,
-    /// Fjall-backed SIFT store for lazy per-transcript lookups (used when use_fjall=true).
+    /// SIFT KV store for lazy per-transcript lookups.
     #[cfg(feature = "kv-cache")]
-    sift_kv: Option<crate::kv_cache::SiftKvStore>,
+    sift_kv: Option<crate::kv_cache::SiftPredictionStore>,
     // Annotation engine + provider.
     tmp_provider: AnnotateProvider,
     engine: TranscriptConsequenceEngine,
@@ -8490,16 +8480,15 @@ impl Stream for ContigAnnotationStream {
                                 .build_from_path(path)
                                 .ok()
                         });
-                        // SIFT source: when enabled, use SiftKvStore from fjall
-                        // for lazy per-transcript lookups; otherwise use parquet
-                        // SiftDirectReader.
+                        // SIFT source: when enabled, use a KV store for lazy
+                        // per-transcript lookups; otherwise use parquet SiftDirectReader.
                         #[cfg(feature = "kv-cache")]
-                        let use_fjall_sift = config.use_fjall_sift;
+                        let use_kv_sift = config.use_kv_sift;
                         #[cfg(not(feature = "kv-cache"))]
-                        let use_fjall_sift = false;
+                        let use_kv_sift = false;
 
                         let sift_direct: Option<SiftDirectReader> = if config.flags.everything
-                            && !use_fjall_sift
+                            && !use_kv_sift
                         {
                             config
                                 .translations_sift_table
@@ -8523,11 +8512,10 @@ impl Stream for ContigAnnotationStream {
                             None
                         };
 
-                        // Reuse the pre-opened SiftKvStore from config (opened
-                        // once, shared across contigs) rather than re-opening
-                        // the fjall DB every contig.
+                        // Reuse the pre-opened SIFT KV store from config rather
+                        // than re-opening it every contig.
                         #[cfg(feature = "kv-cache")]
-                        let sift_kv = if use_fjall_sift && config.flags.everything {
+                        let sift_kv = if use_kv_sift && config.flags.everything {
                             config.sift_kv_store.clone()
                         } else {
                             None
@@ -9126,7 +9114,25 @@ impl TableProvider for AnnotateProvider {
                 _ => None,
             };
             #[cfg(feature = "kv-cache")]
-            let use_fjall_sift = matches!(kv_backend, Some(AnnotationBackend::Fjall));
+            let sift_kv_store: Option<crate::kv_cache::SiftPredictionStore> = match kv_backend {
+                Some(AnnotationBackend::Fjall) => {
+                    let sift_path =
+                        std::path::Path::new(&self.cache_source).join("translation_sift.fjall");
+                    crate::kv_cache::SiftKvStore::open_path(&sift_path)
+                        .ok()
+                        .flatten()
+                        .map(crate::kv_cache::SiftPredictionStore::Fjall)
+                }
+                Some(AnnotationBackend::Redb) => {
+                    let sift_path =
+                        std::path::Path::new(&self.cache_source).join("translation_sift.redb");
+                    crate::kv_cache::SiftRedbStore::open_path(&sift_path)
+                        .ok()
+                        .flatten()
+                        .map(crate::kv_cache::SiftPredictionStore::Redb)
+                }
+                _ => None,
+            };
 
             let (available_cache_columns, sample_table_to_deregister) = if use_kv_cache {
                 #[cfg(feature = "kv-cache")]
@@ -9209,7 +9215,7 @@ impl TableProvider for AnnotateProvider {
                     #[cfg(feature = "kv-cache")]
                     kv_store_arc,
                     #[cfg(feature = "kv-cache")]
-                    use_fjall_sift,
+                    sift_kv_store,
                     limit,
                 )
                 .await;
@@ -9909,6 +9915,43 @@ mod tests {
         );
         assert!(sift.is_empty());
         assert!(polyphen.is_empty());
+    }
+
+    #[test]
+    fn test_lookup_sift_polyphen_loads_from_redb_sift_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let redb_path = dir.path().join("translation_sift.redb");
+        let entries = make_sift_cache(vec![(
+            "ENST00000001",
+            42,
+            "I",
+            "deleterious",
+            0.01,
+            "probably damaging",
+            0.999,
+        )]);
+        let preds = entries.get("ENST00000001").unwrap().clone();
+        crate::kv_cache::SiftRedbStore::ingest_sorted(
+            &redb_path,
+            vec![("ENST00000001".to_string(), preds)].into_iter(),
+        )
+        .unwrap();
+        let redb = crate::kv_cache::SiftRedbStore::open_path(&redb_path)
+            .unwrap()
+            .unwrap();
+        let sift_store = crate::kv_cache::SiftPredictionStore::Redb(redb);
+
+        let mut cache = SiftPolyphenCache::new();
+        let (sift, polyphen) = lookup_sift_polyphen(
+            Some("ENST00000001"),
+            Some("42"),
+            Some("V/I"),
+            &mut cache,
+            &Some(sift_store),
+        );
+
+        assert_eq!(sift, "deleterious(0.01)");
+        assert_eq!(polyphen, "probably_damaging(0.999)");
     }
 
     // ── lookup_domains ─────────────────────────────────────────────────

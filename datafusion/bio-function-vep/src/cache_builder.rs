@@ -37,7 +37,7 @@ use crate::kv_cache::key_encoding::{chrom_to_code, encode_position_key};
 use crate::kv_cache::kv_store::VepKvStore;
 use crate::kv_cache::position_entry::serialize_position_entry;
 use crate::kv_cache::redb_store::VepRedbStore;
-use crate::kv_cache::sift_store::SiftKvStore;
+use crate::kv_cache::sift_store::{SiftKvStore, SiftRedbStore};
 use crate::transcript_consequence::CachedPredictions;
 
 /// Progress callback: `(entity, format, batch_rows, total_rows, total_expected)`.
@@ -1874,6 +1874,166 @@ impl CacheBuilder {
         }))
     }
 
+    /// Build translation_sift redb from existing parquet files.
+    pub async fn build_sift_redb_from_parquet(&self) -> Result<Vec<EntityStats>> {
+        let sift_dir = format!("{}/translation_sift", self.output_dir);
+        let redb_path = format!("{}/translation_sift.redb", self.output_dir);
+
+        if Path::new(&redb_path).exists() && !self.overwrite {
+            info!("translation_sift.redb already exists, skipping (use overwrite to rebuild)");
+            return Ok(vec![EntityStats {
+                entity: "translation_sift".to_string(),
+                parquet_files: vec![],
+                fjall_stats: None,
+            }]);
+        }
+
+        let mut parquet_files = Vec::new();
+        for entry in std::fs::read_dir(&sift_dir).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to read dir {sift_dir}: {e}"))
+        })? {
+            let entry = entry.map_err(|e| {
+                DataFusionError::Execution(format!("Failed to read dir entry: {e}"))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
+                parquet_files.push(path.to_string_lossy().to_string());
+            }
+        }
+        parquet_files.sort();
+
+        if parquet_files.is_empty() {
+            return Err(DataFusionError::Execution(
+                "No parquet files found for translation_sift redb rebuild".to_string(),
+            ));
+        }
+
+        if Path::new(&redb_path).exists() {
+            let path = Path::new(&redb_path);
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to remove existing {redb_path}: {e}"
+                    ))
+                })?;
+            } else {
+                std::fs::remove_file(path).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to remove existing {redb_path}: {e}"
+                    ))
+                })?;
+            }
+            info!("translation_sift.redb: removed existing DB for clean rebuild");
+        }
+
+        let start_time = Instant::now();
+        let read_ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+
+        let mut total_rows = 0usize;
+        let mut duplicate_rows = 0usize;
+        let mut replacement_rows = 0usize;
+        let mut sorted_preds: BTreeMap<String, SiftBuildEntry> = BTreeMap::new();
+
+        for parquet_path in &parquet_files {
+            read_ctx
+                .register_parquet("_sift_redb", parquet_path, Default::default())
+                .await?;
+            let df = read_ctx.sql("SELECT * FROM _sift_redb").await?;
+            let mut stream = df.execute_stream().await?;
+            read_ctx.deregister_table("_sift_redb")?;
+
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+
+                let schema = batch.schema();
+                let chrom_idx = schema.index_of("chrom")?;
+                let tid_idx = schema.index_of("transcript_id")?;
+                let sift_idx = schema.index_of("sift_predictions").ok();
+                let poly_idx = schema.index_of("polyphen_predictions").ok();
+
+                for row in 0..batch.num_rows() {
+                    let chrom = string_value(batch.column(chrom_idx).as_ref(), row).to_string();
+                    let transcript_id =
+                        string_value(batch.column(tid_idx).as_ref(), row).to_string();
+
+                    let mut preds = CachedPredictions::default();
+                    if let Some(idx) = sift_idx {
+                        preds.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
+                    }
+                    if let Some(idx) = poly_idx {
+                        preds.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
+                    }
+                    preds.sort();
+
+                    let new_entry = SiftBuildEntry {
+                        chrom,
+                        predictions: preds,
+                    };
+                    match sorted_preds.entry(transcript_id) {
+                        std::collections::btree_map::Entry::Vacant(slot) => {
+                            slot.insert(new_entry);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut slot) => {
+                            duplicate_rows += 1;
+                            if should_replace_sift_build_entry(
+                                slot.get(),
+                                &new_entry.chrom,
+                                &new_entry.predictions,
+                            ) {
+                                slot.insert(new_entry);
+                                replacement_rows += 1;
+                            }
+                        }
+                    }
+                    total_rows += 1;
+                }
+
+                if let Some(ref cb) = self.on_progress {
+                    cb("translation_sift", "redb", batch.num_rows(), total_rows, 0);
+                }
+            }
+        }
+
+        let transcript_count = sorted_preds.len();
+        if duplicate_rows > 0 {
+            info!(
+                "translation_sift.redb: resolved {duplicate_rows} duplicate transcript rows, replaced {replacement_rows} with preferred sources"
+            );
+        }
+        info!(
+            "translation_sift.redb: ingesting {} transcripts from {} rows...",
+            transcript_count, total_rows
+        );
+        let store = SiftRedbStore::ingest_sorted(
+            &redb_path,
+            sorted_preds
+                .into_iter()
+                .map(|(transcript_id, entry)| (transcript_id, entry.predictions)),
+        )?;
+        drop(store);
+
+        let elapsed = start_time.elapsed().as_secs_f64();
+        info!(
+            "translation_sift.redb: {} transcripts from {} rows in {:.1}s",
+            transcript_count, total_rows, elapsed
+        );
+
+        Ok(vec![EntityStats {
+            entity: "translation_sift".to_string(),
+            parquet_files: vec![],
+            fjall_stats: Some(LoadStats {
+                total_variants: total_rows as u64,
+                total_positions: transcript_count as u64,
+                total_bytes: 0,
+                elapsed_secs: elapsed,
+            }),
+        }])
+    }
+
     /// Build a parquet-only entity (transcript, exon, regulatory, motif).
     async fn build_parquet_entity(&self, kind: EnsemblEntityKind) -> Result<Vec<(String, usize)>> {
         let table_name = entity_table_name(kind);
@@ -2510,7 +2670,10 @@ fn string_value(col: &dyn Array, row: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::array::{
+        ArrayRef, Float32Builder, Int32Builder, Int64Array, ListBuilder, StringArray,
+        StringBuilder, StructBuilder,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2543,6 +2706,76 @@ mod tests {
                 Arc::new(Int64Array::from(ends)),
                 Arc::new(StringArray::from(alleles)),
                 Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn prediction_list_array(rows: Vec<Vec<(i32, &str, &str, f32)>>) -> ArrayRef {
+        let fields = vec![
+            Field::new("position", DataType::Int32, false),
+            Field::new("amino_acid", DataType::Utf8, false),
+            Field::new("prediction", DataType::Utf8, false),
+            Field::new("score", DataType::Float32, false),
+        ];
+        let struct_builder = StructBuilder::new(
+            fields,
+            vec![
+                Box::new(Int32Builder::new()),
+                Box::new(StringBuilder::new()),
+                Box::new(StringBuilder::new()),
+                Box::new(Float32Builder::new()),
+            ],
+        );
+        let mut list_builder = ListBuilder::new(struct_builder);
+
+        for row in rows {
+            for (position, amino_acid, prediction, score) in row {
+                let values = list_builder.values();
+                values
+                    .field_builder::<Int32Builder>(0)
+                    .unwrap()
+                    .append_value(position);
+                values
+                    .field_builder::<StringBuilder>(1)
+                    .unwrap()
+                    .append_value(amino_acid);
+                values
+                    .field_builder::<StringBuilder>(2)
+                    .unwrap()
+                    .append_value(prediction);
+                values
+                    .field_builder::<Float32Builder>(3)
+                    .unwrap()
+                    .append_value(score);
+                values.append(true);
+            }
+            list_builder.append(true);
+        }
+
+        Arc::new(list_builder.finish())
+    }
+
+    fn make_translation_sift_batch() -> RecordBatch {
+        let schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(false);
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "ENST00000111111",
+                    "ENST00000222222",
+                ])),
+                Arc::new(StringArray::from(vec!["1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Int64Array::from(vec![150, 250])),
+                prediction_list_array(vec![
+                    vec![(42, "I", "deleterious", 0.01)],
+                    vec![(20, "V", "tolerated", 0.88)],
+                ]),
+                prediction_list_array(vec![
+                    vec![(42, "I", "probably damaging", 0.99)],
+                    vec![(20, "V", "benign", 0.10)],
+                ]),
             ],
         )
         .unwrap()
@@ -4097,6 +4330,59 @@ mod tests {
             .unwrap();
         let reader = crate::kv_cache::position_entry::PositionEntryReader::new(&raw).unwrap();
         assert_eq!(reader.num_alleles(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_translation_sift_redb_rebuilds_from_parquet() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().to_str().unwrap();
+
+        let sift_dir = dir.path().join("translation_sift");
+        std::fs::create_dir_all(&sift_dir).unwrap();
+        let parquet_path = sift_dir.join("chr1.parquet");
+        write_parquet(
+            parquet_path.to_str().unwrap(),
+            &[make_translation_sift_batch()],
+        );
+
+        let builder = CacheBuilder::new("/nonexistent_cache", output);
+        let stats = builder.build_sift_redb_from_parquet().await.unwrap();
+
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].entity, "translation_sift");
+        let redb_stats = stats[0].fjall_stats.as_ref().unwrap();
+        assert_eq!(redb_stats.total_variants, 2);
+        assert_eq!(redb_stats.total_positions, 2);
+
+        let redb_path = dir.path().join("translation_sift.redb");
+        assert!(redb_path.is_file());
+        let store = crate::kv_cache::SiftRedbStore::open_path(&redb_path)
+            .unwrap()
+            .unwrap();
+        let preds = store.get("ENST00000111111").unwrap().unwrap();
+        assert_eq!(preds.sift.len(), 1);
+        assert_eq!(preds.polyphen.len(), 1);
+        assert_eq!(preds.sift[0].position, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_translation_sift_redb_skips_existing_without_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().to_str().unwrap();
+        let redb_path = dir.path().join("translation_sift.redb");
+        std::fs::write(&redb_path, b"existing redb placeholder").unwrap();
+
+        let builder = CacheBuilder::new("/nonexistent_cache", output);
+        let stats = builder.build_sift_redb_from_parquet().await.unwrap();
+
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].entity, "translation_sift");
+        assert!(stats[0].parquet_files.is_empty());
+        assert!(stats[0].fjall_stats.is_none());
+        assert_eq!(
+            std::fs::read(&redb_path).unwrap(),
+            b"existing redb placeholder"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

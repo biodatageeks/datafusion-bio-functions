@@ -20,4 +20,4 @@ pub use context_store::{ExonKvStore, TranslationKvStore};
 pub use kv_store::VepKvStore;
 pub use loader::{CacheBackend, CacheLoader, LoadStats};
 pub use redb_store::{RedbCacheTableProvider, VepRedbStore};
-pub use sift_store::SiftKvStore;
+pub use sift_store::{SiftKvStore, SiftPredictionStore, SiftRedbStore};

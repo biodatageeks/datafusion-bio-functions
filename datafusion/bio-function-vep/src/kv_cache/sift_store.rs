@@ -9,17 +9,26 @@
 //!   [polyphen_count × 10B CompactPrediction]
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use datafusion::common::{DataFusionError, Result};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
+use redb::{
+    Database as RedbDatabase, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable,
+    TableDefinition,
+};
 
 use crate::transcript_consequence::{CachedPredictions, CompactPrediction};
 
 const SIFT_KEYSPACE: &str = "sift";
+const REDB_SIFT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sift");
 
 fn fjall_err(e: fjall::Error) -> DataFusionError {
     DataFusionError::External(Box::new(e))
+}
+
+fn redb_err(e: impl std::fmt::Display) -> DataFusionError {
+    DataFusionError::Execution(format!("redb error: {e}"))
 }
 
 /// Store for SIFT/PolyPhen predictions keyed by transcript_id.
@@ -121,6 +130,121 @@ impl SiftKvStore {
             return Ok(None);
         };
         deserialize_predictions(&raw).map(Some)
+    }
+}
+
+#[derive(Clone)]
+enum SiftRedbHandle {
+    Writable(Arc<Mutex<RedbDatabase>>),
+    ReadOnly(Arc<ReadOnlyDatabase>),
+}
+
+/// redb-backed SIFT/PolyPhen prediction store keyed by transcript_id.
+#[derive(Clone)]
+pub struct SiftRedbStore {
+    db: SiftRedbHandle,
+}
+
+impl SiftRedbStore {
+    /// Open a standalone redb SIFT database at the given path.
+    pub fn open_path(path: impl AsRef<Path>) -> Result<Option<Self>> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let db = ReadOnlyDatabase::open(path).map_err(redb_err)?;
+        Ok(Some(Self {
+            db: SiftRedbHandle::ReadOnly(Arc::new(db)),
+        }))
+    }
+
+    /// Create a writable standalone redb SIFT database.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let db = RedbDatabase::create(path).map_err(redb_err)?;
+        {
+            let write_txn = db.begin_write().map_err(redb_err)?;
+            {
+                let _table = write_txn.open_table(REDB_SIFT_TABLE).map_err(redb_err)?;
+            }
+            write_txn.commit().map_err(redb_err)?;
+        }
+        Ok(Self {
+            db: SiftRedbHandle::Writable(Arc::new(Mutex::new(db))),
+        })
+    }
+
+    /// Bulk-load sorted transcript predictions into a new redb database.
+    pub fn ingest_sorted(
+        path: impl AsRef<Path>,
+        sorted_iter: impl Iterator<Item = (String, CachedPredictions)>,
+    ) -> Result<Self> {
+        let store = Self::create(path)?;
+        store.batch_insert(sorted_iter)?;
+        Ok(store)
+    }
+
+    /// Retrieve predictions for a transcript. Returns None on miss.
+    pub fn get(&self, transcript_id: &str) -> Result<Option<CachedPredictions>> {
+        let read_txn = self.begin_read()?;
+        let table = read_txn.open_table(REDB_SIFT_TABLE).map_err(redb_err)?;
+        let Some(raw) = table.get(transcript_id).map_err(redb_err)? else {
+            return Ok(None);
+        };
+        deserialize_predictions(raw.value()).map(Some)
+    }
+
+    fn batch_insert(
+        &self,
+        sorted_iter: impl Iterator<Item = (String, CachedPredictions)>,
+    ) -> Result<()> {
+        let SiftRedbHandle::Writable(db) = &self.db else {
+            return Err(DataFusionError::Execution(
+                "redb sift store was opened read-only; writes are not allowed".to_string(),
+            ));
+        };
+        let db = db.lock().map_err(|e| {
+            DataFusionError::Execution(format!("redb sift database mutex poisoned: {e}"))
+        })?;
+        let write_txn = db.begin_write().map_err(redb_err)?;
+        {
+            let mut table = write_txn.open_table(REDB_SIFT_TABLE).map_err(redb_err)?;
+            for (transcript_id, preds) in sorted_iter {
+                let value = serialize_predictions(&preds);
+                table
+                    .insert(transcript_id.as_str(), value.as_slice())
+                    .map_err(redb_err)?;
+            }
+        }
+        write_txn.commit().map_err(redb_err)?;
+        Ok(())
+    }
+
+    fn begin_read(&self) -> Result<ReadTransaction> {
+        match &self.db {
+            SiftRedbHandle::Writable(db) => {
+                let db = db.lock().map_err(|e| {
+                    DataFusionError::Execution(format!("redb sift database mutex poisoned: {e}"))
+                })?;
+                db.begin_read().map_err(redb_err)
+            }
+            SiftRedbHandle::ReadOnly(db) => db.begin_read().map_err(redb_err),
+        }
+    }
+}
+
+/// SIFT/PolyPhen prediction store used by annotation, regardless of backend.
+#[derive(Clone)]
+pub enum SiftPredictionStore {
+    Fjall(SiftKvStore),
+    Redb(SiftRedbStore),
+}
+
+impl SiftPredictionStore {
+    pub fn get(&self, transcript_id: &str) -> Result<Option<CachedPredictions>> {
+        match self {
+            Self::Fjall(store) => store.get(transcript_id),
+            Self::Redb(store) => store.get(transcript_id),
+        }
     }
 }
 
@@ -309,6 +433,26 @@ mod tests {
         let store = SiftKvStore::open_path(dir.path())
             .unwrap()
             .expect("open_path should return Some for a valid sift DB");
+        let preds = store
+            .get("ENST00000111111")
+            .unwrap()
+            .expect("predictions should be present");
+        assert_eq!(preds.sift.len(), 2);
+        assert_eq!(preds.polyphen.len(), 1);
+        assert_eq!(preds.sift[0].position, 10);
+    }
+
+    #[test]
+    fn test_redb_open_path_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let redb_path = dir.path().join("translation_sift.redb");
+
+        let entries = vec![("ENST00000111111".to_string(), make_predictions())];
+        SiftRedbStore::ingest_sorted(&redb_path, entries.into_iter()).unwrap();
+
+        let store = SiftRedbStore::open_path(&redb_path)
+            .unwrap()
+            .expect("open_path should return Some for a valid redb sift DB");
         let preds = store
             .get("ENST00000111111")
             .unwrap()
