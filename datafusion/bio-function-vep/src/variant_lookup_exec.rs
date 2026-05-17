@@ -546,7 +546,7 @@ pub struct VariantLookupExec {
     allowed_failed: i64,
     reference_fasta_path: Option<String>,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// Optional sink for co-located data collected during probe phase.
     colocated_sink: Option<ColocatedSink>,
 }
@@ -564,12 +564,12 @@ impl VariantLookupExec {
         reference_fasta_path: Option<String>,
         output_schema: SchemaRef,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             vcf_input.output_partitioning().clone(),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             vcf_input,
@@ -626,7 +626,7 @@ impl ExecutionPlan for VariantLookupExec {
         self.output_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

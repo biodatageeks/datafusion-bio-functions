@@ -85,7 +85,7 @@ pub struct PileupExec {
     /// Pileup configuration.
     config: PileupConfig,
     /// Cached plan properties.
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl PileupExec {
@@ -95,12 +95,12 @@ impl PileupExec {
         } else {
             coverage_output_schema(config.zero_based)
         };
-        let cache = PlanProperties::new(
+        let cache = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1), // always 1 output partition
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             input,
             config,
@@ -137,7 +137,7 @@ impl ExecutionPlan for PileupExec {
         self.cache.eq_properties.schema().clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 

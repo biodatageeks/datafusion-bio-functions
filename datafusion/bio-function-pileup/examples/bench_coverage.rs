@@ -25,9 +25,18 @@ async fn main() {
 
     let start = Instant::now();
 
-    let table = BamTableProvider::new(bam_path.clone(), None, zero_based, None, binary_cigar)
-        .await
-        .expect("Failed to open BAM file");
+    let table = BamTableProvider::new(
+        bam_path.clone(),
+        None,
+        zero_based,
+        None,
+        binary_cigar,
+        true,
+        100,
+        None,
+    )
+    .await
+    .expect("Failed to open BAM file");
     let open_time = start.elapsed();
     println!("BAM open time: {:.3}s", open_time.as_secs_f64());
 

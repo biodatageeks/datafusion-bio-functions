@@ -98,7 +98,7 @@ pub struct IntervalJoinExec {
     /// matched and thus will not appear in the output.
     pub null_equals_null: bool,
 
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 
     algorithm: Algorithm,
     low_memory: bool,
@@ -135,9 +135,9 @@ impl IntervalJoinExec {
         let join_schema = Arc::new(join_schema);
 
         //  check if the projection is valid
-        can_project(&join_schema, projection.as_ref())?;
+        can_project(&join_schema, projection.as_deref())?;
 
-        let cache = Self::compute_properties(
+        let cache = Arc::new(Self::compute_properties(
             &left,
             &right,
             join_schema.clone(),
@@ -145,7 +145,7 @@ impl IntervalJoinExec {
             &on,
             partition_mode,
             projection.as_ref(),
-        )?;
+        )?);
 
         Ok(IntervalJoinExec {
             left,
@@ -228,7 +228,7 @@ impl IntervalJoinExec {
     /// Return new instance of [IntervalJoinExec] with the given projection.
     pub fn with_projection(&self, projection: Option<Vec<usize>>) -> Result<Self> {
         //  check if the projection is valid
-        can_project(&self.schema(), projection.as_ref())?;
+        can_project(&self.schema(), projection.as_deref())?;
         let projection = match projection {
             Some(projection) => match &self.projection {
                 Some(p) => Some(projection.iter().map(|i| p[*i]).collect()),
@@ -387,7 +387,7 @@ impl ExecutionPlan for IntervalJoinExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -569,13 +569,16 @@ impl ExecutionPlan for IntervalJoinExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        let stats = estimate_join_statistics(
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+        let mut stats = estimate_join_statistics(
             Arc::clone(&self.left),
             Arc::clone(&self.right),
             self.on.clone(),
             &self.join_type,
         )?;
+        if stats.column_statistics.len() != self.join_schema.fields().len() {
+            stats.column_statistics = Statistics::unknown_column(self.join_schema.as_ref());
+        }
         Ok(stats.project(self.projection.as_ref()))
     }
 }
@@ -609,7 +612,7 @@ async fn collect_left_input(
     // 1. creates a [JoinHashMap] of all batches from the stream
     // 2. stores the batches in a vector.
     let initial = (Vec::new(), 0, metrics, reservation);
-    let (batches, num_rows, metrics, mut reservation) = stream
+    let (batches, num_rows, metrics, reservation) = stream
         .try_fold(initial, |mut acc, batch| async {
             let batch_size = batch.get_array_memory_size();
             // Reserve memory for incoming batch
@@ -907,7 +910,7 @@ fn update_hashmap(
     hash_map: &mut AHashMap<u64, Vec<BioInterval>>,
     offset: usize,
     random_state: &RandomState,
-    hashes_buffer: &mut Vec<u64>,
+    hashes_buffer: &mut [u64],
 ) -> Result<()> {
     let keys_values = on
         .iter()

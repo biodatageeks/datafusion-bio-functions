@@ -117,7 +117,7 @@ async fn collect_coverage_sql(ctx: &SessionContext, sql: &str) -> Vec<(String, i
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ovl_fast_mode() {
     let bam_path = format!("{}/tests/data/ovl.bam", env!("CARGO_MANIFEST_DIR"));
-    let table = BamTableProvider::new(bam_path, None, true, None, true)
+    let table = BamTableProvider::new(bam_path, None, true, None, true, true, 100, None)
         .await
         .unwrap();
 
@@ -156,7 +156,7 @@ async fn test_overlapping_pairs() {
         "{}/tests/data/overlapping-pairs.bam",
         env!("CARGO_MANIFEST_DIR")
     );
-    let table = BamTableProvider::new(bam_path, None, true, None, true)
+    let table = BamTableProvider::new(bam_path, None, true, None, true, true, 100, None)
         .await
         .unwrap();
 

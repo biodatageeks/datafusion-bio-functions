@@ -119,12 +119,12 @@ impl TableProvider for ComplementProvider {
             columns: Arc::new(self.columns.clone()),
             view_columns: Arc::new(self.view_columns.clone()),
             strict: self.filter_op == FilterOp::Strict,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(output_partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -137,7 +137,7 @@ struct ComplementExec {
     columns: Arc<(String, String, String)>,
     view_columns: Arc<(String, String, String)>,
     strict: bool,
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl DisplayAs for ComplementExec {
@@ -155,7 +155,7 @@ impl ExecutionPlan for ComplementExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 
@@ -205,14 +205,14 @@ impl ExecutionPlan for ComplementExec {
             columns: Arc::clone(&self.columns),
             view_columns: Arc::clone(&self.view_columns),
             strict: self.strict,
-            cache: PlanProperties::new(
+            cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
                 Partitioning::UnknownPartitioning(
                     children[0].output_partitioning().partition_count(),
                 ),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 

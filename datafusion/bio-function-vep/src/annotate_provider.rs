@@ -6789,7 +6789,7 @@ struct ContigAnnotationExec {
     session: Arc<SessionContext>,
     cache: Arc<PartitionedParquetCache>,
     config: ContigAnnotationConfig,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ContigAnnotationExec {
@@ -6801,12 +6801,12 @@ impl ContigAnnotationExec {
         cache: Arc<PartitionedParquetCache>,
         config: ContigAnnotationConfig,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
             datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             projected_schema,
             full_schema,
@@ -6849,7 +6849,7 @@ impl ExecutionPlan for ContigAnnotationExec {
         self.projected_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

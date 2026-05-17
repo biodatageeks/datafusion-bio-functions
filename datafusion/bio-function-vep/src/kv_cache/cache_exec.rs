@@ -64,7 +64,7 @@ pub struct KvLookupExec {
     extended_probes: bool,
     /// Maximum allowed `failed` flag value from the cache.
     allowed_failed: i64,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// Cache schema column positions for requested cache output columns.
     output_col_positions: Vec<usize>,
     /// Optional sink for co-located data collected during probe phase.
@@ -107,12 +107,12 @@ impl KvLookupExec {
         }
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             input.output_partitioning().clone(),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Self {
             input,
@@ -179,7 +179,7 @@ impl ExecutionPlan for KvLookupExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -22,9 +22,18 @@ async fn main() {
     let zero_based = args.iter().any(|a| a == "--zero-based");
     let per_base = args.iter().any(|a| a == "--per-base");
 
-    let table = BamTableProvider::new(bam_path.clone(), None, zero_based, None, true)
-        .await
-        .expect("Failed to open BAM file");
+    let table = BamTableProvider::new(
+        bam_path.clone(),
+        None,
+        zero_based,
+        None,
+        true,
+        true,
+        100,
+        None,
+    )
+    .await
+    .expect("Failed to open BAM file");
 
     let ctx = SessionContext::new();
     ctx.register_table("reads", Arc::new(table)).unwrap();

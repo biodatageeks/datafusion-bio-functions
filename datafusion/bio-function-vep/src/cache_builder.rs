@@ -18,8 +18,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef
 use datafusion::common::{DataFusionError, Result};
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::basic::Compression;
+use datafusion::parquet::file::metadata::SortingColumn;
 use datafusion::parquet::file::properties::WriterProperties;
-use datafusion::parquet::format::SortingColumn;
 use datafusion::parquet::schema::types::ColumnPath;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -463,7 +463,6 @@ impl CacheBuilder {
                         })?;
 
                 use parquet::column::writer::ColumnCloseResult;
-                use parquet::format::{ColumnIndex, OffsetIndex};
 
                 for (_, part_file, part_rows) in &part_files {
                     let src_file = File::open(part_file)
@@ -1882,9 +1881,11 @@ fn sorting_columns_for(schema: &SchemaRef, sort_columns: &[&str]) -> Option<Vec<
     let cols: Vec<SortingColumn> = sort_columns
         .iter()
         .filter_map(|name| {
-            schema
-                .column_with_name(name)
-                .map(|(idx, _)| SortingColumn::new(idx as i32, false, false))
+            schema.column_with_name(name).map(|(idx, _)| SortingColumn {
+                column_idx: idx as i32,
+                descending: false,
+                nulls_first: false,
+            })
         })
         .collect();
     if cols.len() == sort_columns.len() {
@@ -1905,7 +1906,7 @@ fn writer_properties(
 
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(rg_size)
+        .set_max_row_group_row_count(Some(rg_size))
         .set_sorting_columns(sorting);
 
     if matches!(
@@ -2820,7 +2821,7 @@ mod tests {
             &["chrom", "start"],
             None,
         );
-        assert_eq!(props.max_row_group_size(), 100_000);
+        assert_eq!(props.max_row_group_row_count(), Some(100_000));
     }
 
     #[test]
@@ -2832,7 +2833,7 @@ mod tests {
             &["chrom", "start"],
             Some(256),
         );
-        assert_eq!(props.max_row_group_size(), 256);
+        assert_eq!(props.max_row_group_row_count(), Some(256));
     }
 
     fn test_cached_predictions(sift_len: usize, polyphen_len: usize) -> CachedPredictions {
@@ -3927,7 +3928,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
 
-        // Write a parquet file with small max_row_group_size to force multiple row groups
+        // Write a parquet file with small row groups to force multiple row groups
         let batch = make_batch(
             vec!["1", "1", "1", "1", "1"],
             vec![10, 20, 30, 40, 50],
@@ -3939,7 +3940,7 @@ mod tests {
         let src_path = format!("{}/src.parquet", dir.path().display());
         let file = File::create(&src_path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(2) // 2 rows per row group
+            .set_max_row_group_row_count(Some(2)) // 2 rows per row group
             .build();
         let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
         w.write(&batch).unwrap();

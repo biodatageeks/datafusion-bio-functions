@@ -127,14 +127,14 @@ impl TableFunctionImpl for DepthFunction {
         let bam_provider = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
                 handle.block_on(BamTableProvider::new(
-                    file_path, None, zero_based, None, true,
+                    file_path, None, zero_based, None, true, true, 100, None,
                 ))
             })?,
             Err(_) => {
                 let rt = tokio::runtime::Runtime::new()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 rt.block_on(BamTableProvider::new(
-                    file_path, None, zero_based, None, true,
+                    file_path, None, zero_based, None, true, true, 100, None,
                 ))?
             }
         };
