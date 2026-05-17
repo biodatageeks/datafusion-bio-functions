@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use datafusion::common::{DataFusionError, Result};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use redb::{
-    Database as RedbDatabase, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableTable,
-    TableDefinition,
+    Database as RedbDatabase, ReadOnlyDatabase, ReadOnlyTable, ReadTransaction, ReadableDatabase,
+    ReadableTable, TableDefinition,
 };
 
 use crate::transcript_consequence::{CachedPredictions, CompactPrediction};
@@ -185,12 +185,13 @@ impl SiftRedbStore {
 
     /// Retrieve predictions for a transcript. Returns None on miss.
     pub fn get(&self, transcript_id: &str) -> Result<Option<CachedPredictions>> {
+        self.begin_lookup_session()?.get(transcript_id)
+    }
+
+    fn begin_lookup_session(&self) -> Result<SiftRedbLookupSession> {
         let read_txn = self.begin_read()?;
         let table = read_txn.open_table(REDB_SIFT_TABLE).map_err(redb_err)?;
-        let Some(raw) = table.get(transcript_id).map_err(redb_err)? else {
-            return Ok(None);
-        };
-        deserialize_predictions(raw.value()).map(Some)
+        Ok(SiftRedbLookupSession::new(read_txn, table))
     }
 
     fn batch_insert(
@@ -232,6 +233,27 @@ impl SiftRedbStore {
     }
 }
 
+pub(crate) struct SiftRedbLookupSession {
+    _read_txn: ReadTransaction,
+    table: ReadOnlyTable<&'static str, &'static [u8]>,
+}
+
+impl SiftRedbLookupSession {
+    fn new(read_txn: ReadTransaction, table: ReadOnlyTable<&'static str, &'static [u8]>) -> Self {
+        Self {
+            _read_txn: read_txn,
+            table,
+        }
+    }
+
+    pub(crate) fn get(&self, transcript_id: &str) -> Result<Option<CachedPredictions>> {
+        let Some(raw) = self.table.get(transcript_id).map_err(redb_err)? else {
+            return Ok(None);
+        };
+        deserialize_predictions(raw.value()).map(Some)
+    }
+}
+
 /// SIFT/PolyPhen prediction store used by annotation, regardless of backend.
 #[derive(Clone)]
 pub enum SiftPredictionStore {
@@ -239,11 +261,34 @@ pub enum SiftPredictionStore {
     Redb(SiftRedbStore),
 }
 
+pub(crate) enum SiftPredictionLookupSession<'a> {
+    Fjall(&'a SiftKvStore),
+    Redb(Box<SiftRedbLookupSession>),
+}
+
 impl SiftPredictionStore {
     pub fn get(&self, transcript_id: &str) -> Result<Option<CachedPredictions>> {
         match self {
             Self::Fjall(store) => store.get(transcript_id),
             Self::Redb(store) => store.get(transcript_id),
+        }
+    }
+
+    pub(crate) fn begin_lookup_session(&self) -> Result<SiftPredictionLookupSession<'_>> {
+        match self {
+            Self::Fjall(store) => Ok(SiftPredictionLookupSession::Fjall(store)),
+            Self::Redb(store) => store
+                .begin_lookup_session()
+                .map(|session| SiftPredictionLookupSession::Redb(Box::new(session))),
+        }
+    }
+}
+
+impl SiftPredictionLookupSession<'_> {
+    pub(crate) fn get(&self, transcript_id: &str) -> Result<Option<CachedPredictions>> {
+        match self {
+            Self::Fjall(store) => store.get(transcript_id),
+            Self::Redb(session) => session.get(transcript_id),
         }
     }
 }
@@ -460,6 +505,27 @@ mod tests {
         assert_eq!(preds.sift.len(), 2);
         assert_eq!(preds.polyphen.len(), 1);
         assert_eq!(preds.sift[0].position, 10);
+    }
+
+    #[test]
+    fn test_redb_lookup_session_reuses_table_for_multiple_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let redb_path = dir.path().join("translation_sift.redb");
+        let entries = vec![
+            ("ENST00000111111".to_string(), make_predictions()),
+            ("ENST00000222222".to_string(), make_predictions()),
+        ];
+        SiftRedbStore::ingest_sorted(&redb_path, entries.into_iter()).unwrap();
+
+        let store = SiftRedbStore::open_path(&redb_path)
+            .unwrap()
+            .expect("open_path should return Some for a valid redb sift DB");
+        let prediction_store = SiftPredictionStore::Redb(store);
+        let session = prediction_store.begin_lookup_session().unwrap();
+
+        assert!(session.get("ENST00000111111").unwrap().is_some());
+        assert!(session.get("ENST00000222222").unwrap().is_some());
+        assert!(session.get("MISSING").unwrap().is_none());
     }
 
     #[test]

@@ -20,4 +20,5 @@ pub use context_store::{ExonKvStore, TranslationKvStore};
 pub use kv_store::VepKvStore;
 pub use loader::{CacheBackend, CacheLoader, LoadStats};
 pub use redb_store::{RedbCacheTableProvider, VepRedbStore};
+pub(crate) use sift_store::SiftPredictionLookupSession;
 pub use sift_store::{SiftKvStore, SiftPredictionStore, SiftRedbStore};

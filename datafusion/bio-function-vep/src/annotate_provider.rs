@@ -2746,7 +2746,7 @@ fn lookup_sift_polyphen(
     protein_position: Option<&str>,
     amino_acids: Option<&str>,
     cache: &mut SiftPolyphenCache,
-    #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftPredictionStore>,
+    #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftPredictionLookupSession<'_>>,
     #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
 ) -> (String, String) {
     let empty = || (String::new(), String::new());
@@ -4629,6 +4629,11 @@ impl AnnotateProvider {
             transcript_selection,
             include_pick_output,
         );
+        #[cfg(feature = "kv-cache")]
+        let sift_kv_session = match sift_kv {
+            Some(store) => Some(store.begin_lookup_session()?),
+            None => None,
+        };
 
         for row in 0..batch.num_rows() {
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
@@ -5063,7 +5068,7 @@ impl AnnotateProvider {
                                 tc.amino_acids.as_deref(),
                                 sift_cache,
                                 #[cfg(feature = "kv-cache")]
-                                sift_kv,
+                                &sift_kv_session,
                                 #[cfg(not(feature = "kv-cache"))]
                                 _sift_kv,
                             );
@@ -5483,7 +5488,7 @@ impl AnnotateProvider {
                                 tc.amino_acids.as_deref(),
                                 sift_cache,
                                 #[cfg(feature = "kv-cache")]
-                                sift_kv,
+                                &sift_kv_session,
                                 #[cfg(not(feature = "kv-cache"))]
                                 _sift_kv,
                             );
@@ -9976,6 +9981,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let sift_store = crate::kv_cache::SiftPredictionStore::Redb(redb);
+        let sift_session = sift_store.begin_lookup_session().unwrap();
 
         let mut cache = SiftPolyphenCache::new();
         let (sift, polyphen) = lookup_sift_polyphen(
@@ -9983,7 +9989,7 @@ mod tests {
             Some("42"),
             Some("V/I"),
             &mut cache,
-            &Some(sift_store),
+            &Some(sift_session),
         );
 
         assert_eq!(sift, "deleterious(0.01)");
