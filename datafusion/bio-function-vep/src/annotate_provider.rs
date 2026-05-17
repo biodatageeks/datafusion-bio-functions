@@ -7933,6 +7933,13 @@ fn transcript_cache_regions(transcript: &TranscriptFeature) -> Vec<TranscriptCac
     cache_regions_for_coords(&transcript.chrom, transcript.start, transcript.end, 0, 0)
 }
 
+fn transcript_start_cache_region(transcript: &TranscriptFeature) -> TranscriptCacheRegion {
+    TranscriptCacheRegion {
+        chrom: normalized_chrom_name(&transcript.chrom).to_string(),
+        region_index: cache_region_index(transcript.start),
+    }
+}
+
 fn collect_buffer_cache_regions(
     batches: &[RecordBatch],
     upstream_distance: i64,
@@ -8005,6 +8012,7 @@ fn select_buffer_local_transcripts(
     max_end: i64,
     upstream_distance: i64,
     downstream_distance: i64,
+    active_regions: &HashSet<TranscriptCacheRegion>,
 ) -> Vec<TranscriptFeature> {
     let chrom_norm = chrom.strip_prefix("chr").unwrap_or(chrom);
     // VEP's up_down_size = max(upstream, downstream), applied symmetrically.
@@ -8017,7 +8025,11 @@ fn select_buffer_local_transcripts(
         .iter()
         .filter(|tx| {
             let tx_chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
-            tx_chrom == chrom_norm && tx.end >= query_start && tx.start <= query_end
+            tx_chrom == chrom_norm
+                // VEP populates transcript objects per 1 Mb cache region; same-region
+                // donor objects are needed for merge_features() HGNC propagation.
+                && ((tx.end >= query_start && tx.start <= query_end)
+                    || active_regions.contains(&transcript_start_cache_region(tx)))
         })
         .cloned()
         .collect()
@@ -8031,6 +8043,15 @@ fn build_buffer_local_transcripts(
     upstream_distance: i64,
     downstream_distance: i64,
 ) -> Vec<TranscriptFeature> {
+    let active_regions: HashSet<TranscriptCacheRegion> = cache_regions_for_coords(
+        chrom,
+        min_start,
+        max_end,
+        upstream_distance,
+        downstream_distance,
+    )
+    .into_iter()
+    .collect();
     let mut buffer_transcripts = select_buffer_local_transcripts(
         transcripts,
         chrom,
@@ -8038,6 +8059,7 @@ fn build_buffer_local_transcripts(
         max_end,
         upstream_distance,
         downstream_distance,
+        &active_regions,
     );
     reset_buffer_local_hgnc_effective_values(&mut buffer_transcripts);
     apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
@@ -8066,6 +8088,7 @@ fn build_stateful_buffer_local_transcripts(
         max_end,
         upstream_distance,
         downstream_distance,
+        &active_regions,
     );
 
     // Reuse the same transcript objects across adjacent input buffers while
@@ -10743,7 +10766,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_buffer_local_transcripts_scopes_to_expanded_range() {
+    fn test_build_buffer_local_transcripts_includes_active_cache_region_starts() {
         let mut tx_before = make_tx(
             "ENST00000000001",
             Some("ENSG_BEFORE"),
@@ -10760,8 +10783,17 @@ mod tests {
             Some("HGNC"),
             Some("HGNC:2"),
         );
-        tx_inside.start = 120;
-        tx_inside.end = 180;
+        tx_inside.start = 1_000_120;
+        tx_inside.end = 1_000_180;
+        let mut tx_same_region_donor = make_tx(
+            "ENST00000000004",
+            Some("ENSG_DONOR"),
+            Some("GENE4"),
+            Some("HGNC"),
+            Some("HGNC:4"),
+        );
+        tx_same_region_donor.start = 1_900_000;
+        tx_same_region_donor.end = 1_900_050;
         let mut tx_after = make_tx(
             "ENST00000000003",
             Some("ENSG_AFTER"),
@@ -10769,20 +10801,79 @@ mod tests {
             Some("HGNC"),
             Some("HGNC:3"),
         );
-        tx_after.start = 400;
-        tx_after.end = 450;
+        tx_after.start = 2_000_400;
+        tx_after.end = 2_000_450;
 
         let scoped = build_buffer_local_transcripts(
-            &[tx_before, tx_inside.clone(), tx_after],
+            &[
+                tx_before,
+                tx_inside.clone(),
+                tx_same_region_donor.clone(),
+                tx_after,
+            ],
             "chr2",
-            140,
-            160,
+            1_000_140,
+            1_000_160,
             50,
             50,
         );
 
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].transcript_id, tx_inside.transcript_id);
+        let scoped_ids: HashSet<&str> = scoped.iter().map(|tx| tx.transcript_id.as_str()).collect();
+        assert_eq!(scoped_ids.len(), 2);
+        assert!(scoped_ids.contains(tx_inside.transcript_id.as_str()));
+        assert!(scoped_ids.contains(tx_same_region_donor.transcript_id.as_str()));
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_include_same_cache_region_hgnc_donor() {
+        let mut tx_recipient = make_tx(
+            "NR_160941.1",
+            Some("106479023"),
+            Some("H3P4"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr1".to_string();
+        tx_recipient.start = 121_059_763;
+        tx_recipient.end = 121_118_626;
+
+        let mut tx_donor = make_tx(
+            "ENST00000401004",
+            Some("ENSG00000213244"),
+            Some("H3P4"),
+            Some("HGNC"),
+            Some("HGNC:43797"),
+        );
+        tx_donor.chrom = "chr1".to_string();
+        tx_donor.start = 121_118_195;
+        tx_donor.end = 121_118_610;
+
+        let transcripts = vec![tx_recipient, tx_donor];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        let buffer = vec![make_buffer_batch("chr1", 121_096_952, 121_096_952)];
+        let scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &buffer,
+            "chr1",
+            121_096_952,
+            121_096_952,
+            5_000,
+            5_000,
+        )
+        .unwrap();
+
+        let recipient = scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "NR_160941.1")
+            .unwrap();
+        assert_eq!(recipient.gene_hgnc_id.as_deref(), Some("HGNC:43797"));
     }
 
     #[test]
@@ -10846,9 +10937,11 @@ mod tests {
             50,
         )
         .unwrap();
-        assert_eq!(second_scoped.len(), 1);
-        assert_eq!(second_scoped[0].transcript_id, "XR_RECIPIENT");
-        assert_eq!(second_scoped[0].gene_hgnc_id.as_deref(), Some("HGNC:54298"));
+        let second_recipient = second_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "XR_RECIPIENT")
+            .unwrap();
+        assert_eq!(second_recipient.gene_hgnc_id.as_deref(), Some("HGNC:54298"));
     }
 
     #[test]
@@ -10914,9 +11007,11 @@ mod tests {
             50,
         )
         .unwrap();
-        assert_eq!(second_scoped.len(), 1);
-        assert_eq!(second_scoped[0].transcript_id, "XR_007060157.1");
-        assert_eq!(second_scoped[0].gene_hgnc_id.as_deref(), Some("HGNC:16001"));
+        let second_recipient = second_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "XR_007060157.1")
+            .unwrap();
+        assert_eq!(second_recipient.gene_hgnc_id.as_deref(), Some("HGNC:16001"));
     }
 
     #[test]
