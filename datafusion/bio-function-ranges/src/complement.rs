@@ -12,12 +12,9 @@ use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::prelude::{Expr, SessionContext};
 use futures::{Stream, ready};
 
@@ -110,8 +107,6 @@ impl TableProvider for ComplementProvider {
             None
         };
 
-        let output_partitions = input_plan.output_partitioning().partition_count();
-
         Ok(Arc::new(ComplementExec {
             schema: self.schema.clone(),
             input: input_plan,
@@ -121,7 +116,7 @@ impl TableProvider for ComplementProvider {
             strict: self.filter_op == FilterOp::Strict,
             cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
-                Partitioning::UnknownPartitioning(output_partitions),
+                Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             )),
@@ -160,15 +155,9 @@ impl ExecutionPlan for ComplementExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        let mut distributions = vec![Distribution::HashPartitioned(vec![Arc::new(Column::new(
-            self.columns.0.as_str(),
-            0,
-        ))])];
+        let mut distributions = vec![Distribution::SinglePartition];
         if self.view.is_some() {
-            distributions.push(Distribution::HashPartitioned(vec![Arc::new(Column::new(
-                self.view_columns.0.as_str(),
-                0,
-            ))]));
+            distributions.push(Distribution::SinglePartition);
         }
         distributions
     }
@@ -207,9 +196,7 @@ impl ExecutionPlan for ComplementExec {
             strict: self.strict,
             cache: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(self.schema.clone()),
-                Partitioning::UnknownPartitioning(
-                    children[0].output_partitioning().partition_count(),
-                ),
+                Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             )),
