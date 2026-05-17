@@ -4007,6 +4007,14 @@ async fn test_partitioned_parquet_explain_preserves_hash_repartition() -> Result
         "complement must coalesce globally instead of independently hash-partitioning input and view plans:\n{complement_plan}"
     );
 
+    let complement_without_view_plan =
+        explain_query(&ctx, "SELECT * FROM complement('left_t')").await?;
+    assert_contains!(complement_without_view_plan.as_str(), "ComplementExec");
+    assert_contains!(
+        complement_without_view_plan.as_str(),
+        "RepartitionExec: partitioning=Hash([contig@0]"
+    );
+
     let subtract_plan = explain_query(&ctx, "SELECT * FROM subtract('left_t', 'right_t')").await?;
     assert_contains!(subtract_plan.as_str(), "SubtractExec");
     assert!(
