@@ -15,6 +15,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Seek};
+#[cfg(feature = "kv-cache")]
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskCtx, Poll};
@@ -2795,6 +2797,37 @@ fn lookup_sift_polyphen(
         .unwrap_or_default();
 
     (sift, polyphen)
+}
+
+#[cfg(feature = "kv-cache")]
+fn open_sift_prediction_store_for_backend(
+    cache_source: &Path,
+    backend: AnnotationBackend,
+) -> Result<Option<crate::kv_cache::SiftPredictionStore>> {
+    match backend {
+        AnnotationBackend::Fjall => {
+            let sift_path = cache_source.join("translation_sift.fjall");
+            let store = crate::kv_cache::SiftKvStore::open_path(&sift_path)?.ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): backend=fjall but no fjall SIFT store found at '{}'",
+                    sift_path.display()
+                ))
+            })?;
+            Ok(Some(crate::kv_cache::SiftPredictionStore::Fjall(store)))
+        }
+        AnnotationBackend::Redb => {
+            let sift_path = cache_source.join("translation_sift.redb");
+            let store =
+                crate::kv_cache::SiftRedbStore::open_path(&sift_path)?.ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "annotate_vep(): backend=redb but no redb SIFT store found at '{}'",
+                        sift_path.display()
+                    ))
+                })?;
+            Ok(Some(crate::kv_cache::SiftPredictionStore::Redb(store)))
+        }
+        AnnotationBackend::Parquet => Ok(None),
+    }
 }
 
 /// Format a SIFT/PolyPhen prediction as `prediction(score)` with spaces→underscores.
@@ -9071,7 +9104,7 @@ impl TableProvider for AnnotateProvider {
                         {
                             match kv_backend {
                                 Some(AnnotationBackend::Fjall) => " [fjall variation+sift]",
-                                Some(AnnotationBackend::Redb) => " [redb variation]",
+                                Some(AnnotationBackend::Redb) => " [redb variation+sift]",
                                 _ => "",
                             }
                         }
@@ -9115,23 +9148,10 @@ impl TableProvider for AnnotateProvider {
             };
             #[cfg(feature = "kv-cache")]
             let sift_kv_store: Option<crate::kv_cache::SiftPredictionStore> = match kv_backend {
-                Some(AnnotationBackend::Fjall) => {
-                    let sift_path =
-                        std::path::Path::new(&self.cache_source).join("translation_sift.fjall");
-                    crate::kv_cache::SiftKvStore::open_path(&sift_path)
-                        .ok()
-                        .flatten()
-                        .map(crate::kv_cache::SiftPredictionStore::Fjall)
+                Some(backend) => {
+                    open_sift_prediction_store_for_backend(Path::new(&self.cache_source), backend)?
                 }
-                Some(AnnotationBackend::Redb) => {
-                    let sift_path =
-                        std::path::Path::new(&self.cache_source).join("translation_sift.redb");
-                    crate::kv_cache::SiftRedbStore::open_path(&sift_path)
-                        .ok()
-                        .flatten()
-                        .map(crate::kv_cache::SiftPredictionStore::Redb)
-                }
-                _ => None,
+                None => None,
             };
 
             let (available_cache_columns, sample_table_to_deregister) = if use_kv_cache {
@@ -9952,6 +9972,32 @@ mod tests {
 
         assert_eq!(sift, "deleterious(0.01)");
         assert_eq!(polyphen, "probably_damaging(0.999)");
+    }
+
+    #[test]
+    fn test_fjall_backend_requires_sift_kv_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = match open_sift_prediction_store_for_backend(dir.path(), AnnotationBackend::Fjall)
+        {
+            Ok(_) => panic!("expected missing fjall SIFT store to error"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("backend=fjall"), "{msg}");
+        assert!(msg.contains("translation_sift.fjall"), "{msg}");
+    }
+
+    #[test]
+    fn test_redb_backend_requires_sift_kv_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = match open_sift_prediction_store_for_backend(dir.path(), AnnotationBackend::Redb)
+        {
+            Ok(_) => panic!("expected missing redb SIFT store to error"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("backend=redb"), "{msg}");
+        assert!(msg.contains("translation_sift.redb"), "{msg}");
     }
 
     // ── lookup_domains ─────────────────────────────────────────────────

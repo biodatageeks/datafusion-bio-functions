@@ -175,8 +175,10 @@ fn resolve_table_sync(
 mod tests {
     use crate::create_vep_session;
     #[cfg(feature = "kv-cache")]
-    use crate::kv_cache::{VepKvStore, position_entry::serialize_position_entry};
+    use crate::kv_cache::{SiftKvStore, VepKvStore, position_entry::serialize_position_entry};
     use crate::so_terms::SoTerm;
+    #[cfg(feature = "kv-cache")]
+    use crate::transcript_consequence::{CachedPredictions, CompactPrediction};
     use datafusion::arrow::array::{
         Array, Float64Array, Int64Array, ListArray, RecordBatch, StringArray,
     };
@@ -304,6 +306,31 @@ mod tests {
         }
 
         store.persist().expect("persist fjall cache");
+    }
+
+    #[cfg(feature = "kv-cache")]
+    fn write_dummy_sift_fjall(tmpdir: &TempDir) {
+        let fjall_dir = tmpdir.path().join("translation_sift.fjall");
+        let db = fjall::Database::builder(&fjall_dir)
+            .cache_size(64 * 1024 * 1024)
+            .worker_threads(1)
+            .open()
+            .expect("open sift fjall database");
+        let store = SiftKvStore::create(&db).expect("create sift fjall cache");
+        let preds = CachedPredictions {
+            sift: vec![CompactPrediction {
+                position: 1,
+                amino_acid: CompactPrediction::encode_amino_acid("A").unwrap(),
+                prediction: CompactPrediction::encode_prediction("tolerated"),
+                score: 0.05,
+            }],
+            polyphen: Vec::new(),
+        };
+        store
+            .put("ENST00000000000", &preds)
+            .expect("write sift fjall prediction");
+        db.persist(fjall::PersistMode::SyncAll)
+            .expect("persist sift fjall cache");
     }
 
     fn vcf_table() -> MemTable {
@@ -3912,6 +3939,7 @@ mod tests {
         let cache_batch = multi_row_cache_batch();
         write_batch_to_cache(&tmpdir, "variation", &cache_batch);
         write_batch_to_fjall(&tmpdir, &cache_batch);
+        write_dummy_sift_fjall(&tmpdir);
 
         let ctx = create_vep_session();
         ctx.register_table("vcf_data", Arc::new(multi_row_vcf_table()))
