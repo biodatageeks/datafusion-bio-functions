@@ -3040,25 +3040,6 @@ fn is_non_coding_biotype(biotype: &str) -> bool {
     )
 }
 
-/// Returns true for transcript IDs that VEP annotates against.
-/// When `merged` is true (VEP `--merged` mode), both Ensembl and RefSeq
-/// transcripts are accepted.  Default (non-merged) accepts only ENST.
-///
-/// Traceability:
-/// - Ensembl VEP `AnnotationSourceAdaptor::get_all_TranscriptVariations()`
-///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSourceAdaptor.pm#L173-L220>
-pub fn is_vep_transcript(id: &str, merged: bool) -> bool {
-    if merged {
-        id.starts_with("ENST")
-            || id.starts_with("NM_")
-            || id.starts_with("NR_")
-            || id.starts_with("XM_")
-            || id.starts_with("XR_")
-    } else {
-        id.starts_with("ENST")
-    }
-}
-
 /// Strip only `protein_altering_variant` when specific children are present.
 /// Used at the cross-transcript collapse level.
 ///

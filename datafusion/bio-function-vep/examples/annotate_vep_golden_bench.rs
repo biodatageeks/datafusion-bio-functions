@@ -631,12 +631,6 @@ fn build_options_json(args: &Args) -> Result<Option<String>> {
             entries.push("\"max_af\":true".to_string());
             entries.push("\"pubmed\":true".to_string());
         }
-        if args.refseq {
-            entries.push("\"refseq\":true".to_string());
-        }
-        if args.merged {
-            entries.push("\"merged\":true".to_string());
-        }
         if args.gencode_basic {
             entries.push("\"gencode_basic\":true".to_string());
         }

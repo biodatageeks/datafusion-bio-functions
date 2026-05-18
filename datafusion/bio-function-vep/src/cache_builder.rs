@@ -27,8 +27,9 @@ use futures::StreamExt;
 use log::info;
 
 use datafusion_bio_format_ensembl_cache::{
-    EnsemblCacheOptions, EnsemblCacheTableProvider, EnsemblEntityKind, VEP_CACHE_REGION_SIZE_BP,
-    build_export_query, build_export_query_multi_chrom,
+    CacheSourceType as BioFormatsCacheSourceType, EnsemblCacheOptions, EnsemblCacheTableProvider,
+    EnsemblEntityKind, VEP_CACHE_REGION_SIZE_BP, build_export_query,
+    build_export_query_multi_chrom,
 };
 
 use crate::annotate_provider::read_compact_predictions;
@@ -79,7 +80,7 @@ fn build_translation_dedup_query_with_where_clause(table_name: &str, where_claus
     format!(
         "SELECT * FROM (\
             SELECT *, ROW_NUMBER() OVER (\
-                PARTITION BY transcript_id \
+                PARTITION BY chrom, transcript_id \
                 ORDER BY {source_pref}, cdna_coding_start NULLS LAST, source_file\
             ) AS _rn \
             FROM {table_name}{where_clause}\
@@ -104,6 +105,7 @@ pub struct CacheBuilder {
     overwrite: bool,
     zstd_level: i32,
     dict_size_kb: u32,
+    cache_source_type: BioFormatsCacheSourceType,
     on_progress: Option<Arc<OnProgress>>,
 }
 
@@ -117,6 +119,7 @@ impl CacheBuilder {
             overwrite: false,
             zstd_level: 3,
             dict_size_kb: 112,
+            cache_source_type: BioFormatsCacheSourceType::Ensembl,
             on_progress: None,
         }
     }
@@ -143,6 +146,11 @@ impl CacheBuilder {
 
     pub fn with_dict_size_kb(mut self, size: u32) -> Self {
         self.dict_size_kb = size;
+        self
+    }
+
+    pub fn with_cache_source_type(mut self, cache_source_type: BioFormatsCacheSourceType) -> Self {
+        self.cache_source_type = cache_source_type;
         self
     }
 
@@ -273,7 +281,13 @@ impl CacheBuilder {
         }
 
         // Discover chromosomes from schema metadata
-        let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let init_ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            table_name,
+            self.partitions,
+            self.cache_source_type,
+        )?;
         let provider_schema = {
             let table = init_ctx.table(table_name).await?;
             table.schema().inner().clone()
@@ -324,7 +338,13 @@ impl CacheBuilder {
         let mut other_total_rows = 0usize;
 
         for (chrom, output_file, is_other) in &chrom_batches {
-            let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+            let ctx = make_ctx_and_register(
+                &self.cache_root,
+                kind,
+                table_name,
+                self.partitions,
+                self.cache_source_type,
+            )?;
             let query = build_export_query(kind, table_name, Some(chrom), None);
 
             let df = ctx.sql(&query).await?;
@@ -1059,7 +1079,13 @@ impl CacheBuilder {
         }
 
         // Discover chroms
-        let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let init_ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            table_name,
+            self.partitions,
+            self.cache_source_type,
+        )?;
         let provider_schema = {
             let table = init_ctx.table(table_name).await?;
             table.schema().inner().clone()
@@ -1126,7 +1152,13 @@ impl CacheBuilder {
         kind: EnsemblEntityKind,
         table_name: &str,
     ) -> Result<(Option<(String, usize)>, Option<(String, usize)>)> {
-        let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            table_name,
+            self.partitions,
+            self.cache_source_type,
+        )?;
 
         let dedup_query = build_translation_dedup_query_with_where_clause(
             table_name,
@@ -1154,7 +1186,10 @@ impl CacheBuilder {
         split_ctx.register_table("_tl_deduped", Arc::new(mem_table))?;
 
         // translation_core
-        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(false);
+        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(
+            false,
+            self.cache_source_type,
+        );
         let core_select = core_schema
             .fields()
             .iter()
@@ -1192,7 +1227,10 @@ impl CacheBuilder {
         })?;
 
         // translation_sift
-        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(false);
+        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
+            false,
+            self.cache_source_type,
+        );
         let sift_select = sift_schema
             .fields()
             .iter()
@@ -1260,7 +1298,13 @@ impl CacheBuilder {
         kind: EnsemblEntityKind,
         table_name: &str,
     ) -> Result<(Option<(String, usize)>, Option<(String, usize)>)> {
-        let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            table_name,
+            self.partitions,
+            self.cache_source_type,
+        )?;
         let in_list = other_chroms
             .iter()
             .map(|c| format!("'{c}'"))
@@ -1291,7 +1335,10 @@ impl CacheBuilder {
         );
         split_ctx.register_table("_tl_deduped", Arc::new(mem_table))?;
 
-        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(false);
+        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(
+            false,
+            self.cache_source_type,
+        );
         let core_select = core_schema
             .fields()
             .iter()
@@ -1313,7 +1360,10 @@ impl CacheBuilder {
             DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
         })?;
 
-        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(false);
+        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
+            false,
+            self.cache_source_type,
+        );
         let sift_select = sift_schema
             .fields()
             .iter()
@@ -1533,7 +1583,13 @@ impl CacheBuilder {
         let needs_rn_drop = matches!(kind, EnsemblEntityKind::Exon);
 
         // Discover chroms + get schema (needed for transcript HGNC propagation).
-        let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let init_ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            table_name,
+            self.partitions,
+            self.cache_source_type,
+        )?;
         let provider_schema: SchemaRef = {
             let table = init_ctx.table(table_name).await?;
             Arc::new(table.schema().as_arrow().clone())
@@ -1561,7 +1617,13 @@ impl CacheBuilder {
         };
 
         for chrom in &main_chroms {
-            let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+            let ctx = make_ctx_and_register(
+                &self.cache_root,
+                kind,
+                table_name,
+                self.partitions,
+                self.cache_source_type,
+            )?;
             let query = build_export_query(kind, table_name, Some(chrom), tx_schema);
             let output_file = format!("{}/{subdir}/chr{chrom}.parquet", self.output_dir);
 
@@ -1607,7 +1669,13 @@ impl CacheBuilder {
 
         // Process remaining contigs as "other.parquet"
         if !other_chroms.is_empty() {
-            let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+            let ctx = make_ctx_and_register(
+                &self.cache_root,
+                kind,
+                table_name,
+                self.partitions,
+                self.cache_source_type,
+            )?;
             let other_refs: Vec<&str> = other_chroms.iter().map(|s| s.as_str()).collect();
             let query = build_export_query_multi_chrom(kind, table_name, &other_refs, tx_schema);
             let output_file = format!("{}/{subdir}/other.parquet", self.output_dir);
@@ -2016,10 +2084,12 @@ fn make_ctx_and_register(
     kind: EnsemblEntityKind,
     table_name: &str,
     partitions: usize,
+    cache_source_type: BioFormatsCacheSourceType,
 ) -> Result<SessionContext> {
     let config = SessionConfig::new().with_target_partitions(partitions);
     let ctx = SessionContext::new_with_config(config);
-    let mut options = EnsemblCacheOptions::new(cache_root);
+    let mut options =
+        EnsemblCacheOptions::new(cache_root).with_cache_source_type(cache_source_type);
     options.target_partitions = Some(partitions);
     let provider = EnsemblCacheTableProvider::for_entity(kind, options)?;
     ctx.register_table(table_name, provider)?;
@@ -2427,7 +2497,7 @@ mod tests {
             Some(&schema),
         );
         assert!(q.contains("ROW_NUMBER()"));
-        assert!(q.contains("PARTITION BY stable_id"));
+        assert!(q.contains("PARTITION BY chrom, stable_id"));
         assert!(q.contains("WHERE _rn = 1"));
         assert!(q.contains("ORDER BY chrom, start"));
         assert!(q.contains("WHERE chrom = 'X'"));
@@ -2469,7 +2539,7 @@ mod tests {
     #[test]
     fn test_build_query_exon_dedup() {
         let q = build_export_query(EnsemblEntityKind::Exon, "exon", None, None);
-        assert!(q.contains("PARTITION BY transcript_id, exon_number"));
+        assert!(q.contains("PARTITION BY chrom, transcript_id, exon_number"));
         assert!(q.contains("ORDER BY transcript_id, start"));
     }
 
@@ -2500,7 +2570,7 @@ mod tests {
         assert!(q.contains("WHERE chrom IN ('1', '2')"));
         assert!(q.contains("ROW_NUMBER()"));
         assert!(q.contains("WHERE _rn = 1"));
-        assert!(q.contains("PARTITION BY stable_id"));
+        assert!(q.contains("PARTITION BY chrom, stable_id"));
         // HGNC propagation is a runtime concern (see
         // apply_buffer_local_hgnc_propagation) — must not be embedded in the
         // cache-level export query.
@@ -2513,7 +2583,7 @@ mod tests {
     #[test]
     fn test_build_translation_dedup_query_prefers_transcript_start_region() {
         let q = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom = '2'");
-        assert!(q.contains("PARTITION BY transcript_id"));
+        assert!(q.contains("PARTITION BY chrom, transcript_id"));
         assert!(q.contains("source_file LIKE CONCAT('%/'"));
         assert!(q.contains("cdna_coding_start NULLS LAST"));
         assert!(q.contains("WHERE chrom = '2'"));
@@ -2522,7 +2592,7 @@ mod tests {
     #[test]
     fn test_build_translation_dedup_query_multi_chrom_prefers_transcript_start_region() {
         let q = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom IN ('2', 'X')");
-        assert!(q.contains("PARTITION BY transcript_id"));
+        assert!(q.contains("PARTITION BY chrom, transcript_id"));
         assert!(q.contains("source_file LIKE CONCAT('%/'"));
         assert!(q.contains("WHERE chrom IN ('2', 'X')"));
     }
@@ -3017,9 +3087,14 @@ mod tests {
         }
 
         let partitions = 8;
-        let ctx =
-            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", partitions)
-                .unwrap();
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            partitions,
+            BioFormatsCacheSourceType::Ensembl,
+        )
+        .unwrap();
 
         let query = "SELECT * FROM var WHERE chrom = '1' ORDER BY chrom, start";
         let df = ctx.sql(query).await.unwrap();
@@ -3242,8 +3317,14 @@ mod tests {
         if !std::path::Path::new(cache_root).exists() {
             return;
         }
-        let ctx =
-            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", 1).unwrap();
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            1,
+            BioFormatsCacheSourceType::Ensembl,
+        )
+        .unwrap();
         let table = ctx.table("var").await.unwrap();
         let schema = table.schema().inner().clone();
         let chroms = chroms_from_schema(&schema);
@@ -3308,9 +3389,14 @@ mod tests {
         // Run with 1 partition (sequential) and 8 partitions (parallel)
         // on a small chromosome to compare row counts.
         for partitions in [1, 8] {
-            let ctx =
-                make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", partitions)
-                    .unwrap();
+            let ctx = make_ctx_and_register(
+                cache_root,
+                EnsemblEntityKind::Variation,
+                "var",
+                partitions,
+                BioFormatsCacheSourceType::Ensembl,
+            )
+            .unwrap();
 
             let query = "SELECT COUNT(*) as cnt FROM var WHERE chrom = '22'";
             let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
@@ -3335,8 +3421,14 @@ mod tests {
             return;
         }
 
-        let ctx =
-            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", 8).unwrap();
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            8,
+            BioFormatsCacheSourceType::Ensembl,
+        )
+        .unwrap();
 
         let query = "SELECT * FROM var WHERE chrom = '22' ORDER BY chrom, start";
         let df = ctx.sql(query).await.unwrap();
@@ -3376,8 +3468,14 @@ mod tests {
         std::fs::create_dir_all(&var_dir).unwrap();
 
         // Step 1: Write chr22 parquet
-        let ctx =
-            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", 1).unwrap();
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            1,
+            BioFormatsCacheSourceType::Ensembl,
+        )
+        .unwrap();
         let query = "SELECT * FROM var WHERE chrom = '22' ORDER BY chrom, start";
         let df = ctx.sql(query).await.unwrap();
         let mut stream = df.execute_stream().await.unwrap();

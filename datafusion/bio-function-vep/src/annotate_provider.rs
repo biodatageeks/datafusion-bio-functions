@@ -82,6 +82,7 @@ use crate::allele::{
     MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::annotation_store::{AnnotationBackend, build_store};
+use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 use crate::config;
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
@@ -1380,16 +1381,8 @@ impl HgvsFlags {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum TranscriptSourceMode {
-    #[default]
-    Ensembl,
-    RefSeq,
-    Merged,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct TranscriptSelectionFlags {
-    source_mode: TranscriptSourceMode,
+    cache_source_type: CacheSourceType,
     gencode_basic: bool,
     gencode_primary: bool,
     all_refseq: bool,
@@ -1397,35 +1390,21 @@ struct TranscriptSelectionFlags {
 }
 
 impl TranscriptSelectionFlags {
-    fn from_options_json(options_json: Option<&str>) -> Result<Self> {
+    fn from_options_json(
+        cache_source_type: CacheSourceType,
+        options_json: Option<&str>,
+    ) -> Result<Self> {
         let parse = |key| {
             options_json
                 .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
                 .unwrap_or(false)
         };
 
-        let refseq = parse("refseq");
-        let merged = parse("merged");
         let gencode_basic = parse("gencode_basic");
         let gencode_primary = parse("gencode_primary");
         let all_refseq = parse("all_refseq");
         let exclude_predicted = parse("exclude_predicted");
 
-        if refseq && merged {
-            return Err(DataFusionError::Execution(
-                "annotate_vep(): --refseq and --merged are mutually exclusive".to_string(),
-            ));
-        }
-        if refseq && gencode_basic {
-            return Err(DataFusionError::Execution(
-                "annotate_vep(): --refseq and --gencode_basic are mutually exclusive".to_string(),
-            ));
-        }
-        if refseq && gencode_primary {
-            return Err(DataFusionError::Execution(
-                "annotate_vep(): --refseq and --gencode_primary are mutually exclusive".to_string(),
-            ));
-        }
         if gencode_basic && gencode_primary {
             return Err(DataFusionError::Execution(
                 "annotate_vep(): --gencode_basic and --gencode_primary are mutually exclusive"
@@ -1433,27 +1412,19 @@ impl TranscriptSelectionFlags {
             ));
         }
 
-        let source_mode = if merged {
-            TranscriptSourceMode::Merged
-        } else if refseq {
-            TranscriptSourceMode::RefSeq
-        } else {
-            TranscriptSourceMode::Ensembl
-        };
-
-        if source_mode == TranscriptSourceMode::Ensembl && all_refseq {
+        if cache_source_type == CacheSourceType::Ensembl && all_refseq {
             return Err(DataFusionError::Execution(
-                "annotate_vep(): --all_refseq requires --refseq or --merged".to_string(),
+                "annotate_vep(): --all_refseq requires cache schema metadata bio.vep.cache_source_type='refseq' or 'merged'".to_string(),
             ));
         }
-        if source_mode == TranscriptSourceMode::Ensembl && exclude_predicted {
+        if cache_source_type == CacheSourceType::Ensembl && exclude_predicted {
             return Err(DataFusionError::Execution(
-                "annotate_vep(): --exclude_predicted requires --refseq or --merged".to_string(),
+                "annotate_vep(): --exclude_predicted requires cache schema metadata bio.vep.cache_source_type='refseq' or 'merged'".to_string(),
             ));
         }
 
         Ok(Self {
-            source_mode,
+            cache_source_type,
             gencode_basic,
             gencode_primary,
             all_refseq,
@@ -1462,18 +1433,18 @@ impl TranscriptSelectionFlags {
     }
 
     fn merged(self) -> bool {
-        self.source_mode == TranscriptSourceMode::Merged
+        self.cache_source_type == CacheSourceType::Merged
     }
 
     fn refseq_fields(self) -> bool {
         matches!(
-            self.source_mode,
-            TranscriptSourceMode::RefSeq | TranscriptSourceMode::Merged
+            self.cache_source_type,
+            CacheSourceType::RefSeq | CacheSourceType::Merged
         )
     }
 
     fn source_field(self) -> bool {
-        self.source_mode == TranscriptSourceMode::Merged
+        self.cache_source_type == CacheSourceType::Merged
     }
 }
 
@@ -1576,8 +1547,8 @@ impl CsqPlaceholderLayout {
     ) -> Self {
         let fields = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
             everything,
-            transcript_selection.source_mode == TranscriptSourceMode::RefSeq,
-            transcript_selection.source_mode == TranscriptSourceMode::Merged,
+            transcript_selection.cache_source_type == CacheSourceType::RefSeq,
+            transcript_selection.cache_source_type == CacheSourceType::Merged,
             include_pick,
         )
         .into_iter()
@@ -2900,6 +2871,7 @@ pub struct AnnotateProvider {
     vcf_table: String,
     cache_source: String,
     backend: AnnotationBackend,
+    cache_source_type: CacheSourceType,
     options_json: Option<String>,
     transcript_selection: TranscriptSelectionFlags,
     pick_flags: PickFlags,
@@ -2909,16 +2881,19 @@ pub struct AnnotateProvider {
 }
 
 impl AnnotateProvider {
-    pub fn new(
+    pub(crate) fn new(
         session: Arc<SessionContext>,
         vcf_table: String,
         cache_source: String,
         backend: AnnotationBackend,
+        cache_source_type: CacheSourceType,
         options_json: Option<String>,
         vcf_schema: Schema,
     ) -> Result<Self> {
-        let transcript_selection =
-            TranscriptSelectionFlags::from_options_json(options_json.as_deref())?;
+        let transcript_selection = TranscriptSelectionFlags::from_options_json(
+            cache_source_type,
+            options_json.as_deref(),
+        )?;
         let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
         let include_pick_output = pick_flags.include_pick_output();
         let annotation_column_defs =
@@ -2955,6 +2930,7 @@ impl AnnotateProvider {
             vcf_table,
             cache_source,
             backend,
+            cache_source_type,
             options_json,
             transcript_selection,
             pick_flags,
@@ -4343,6 +4319,7 @@ impl AnnotateProvider {
             translations_sift_table: translations_sift_table.map(|s| s.to_string()),
             flags,
             hgvs_flags,
+            cache_source_type: self.cache_source_type,
             transcript_selection,
             pick_flags,
             allowed_failed,
@@ -6336,12 +6313,30 @@ fn is_ensembl_transcript(tx: &TranscriptFeature) -> bool {
     tx.source.as_deref() == Some("Ensembl") || tx.transcript_id.starts_with("ENST")
 }
 
+fn is_ensembl_transcript_id(id: &str) -> bool {
+    id.starts_with("ENST")
+}
+
+fn row_source_is_refseq(tx: &TranscriptFeature) -> bool {
+    tx.source_cache
+        .as_deref()
+        .or(tx.source.as_deref())
+        .and_then(normalize_source_label)
+        .as_deref()
+        == Some("RefSeq")
+}
+
+fn is_standard_refseq_accession(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() >= 4
+        && bytes[0].is_ascii_uppercase()
+        && bytes[1].is_ascii_uppercase()
+        && bytes[2] == b'_'
+        && bytes[3].is_ascii_digit()
+}
+
 fn is_refseq_transcript(tx: &TranscriptFeature) -> bool {
-    tx.source.as_deref() == Some("RefSeq")
-        || matches!(
-            tx.transcript_id.as_bytes().get(..2),
-            Some(b"NM") | Some(b"NR") | Some(b"XM") | Some(b"XR")
-        )
+    row_source_is_refseq(tx) || is_standard_refseq_accession(&tx.transcript_id)
 }
 
 fn is_refseq_offset_transcript(tx: &TranscriptFeature) -> bool {
@@ -6407,12 +6402,7 @@ fn is_mitochondrial_chrom(chrom: &str) -> bool {
 
 fn is_default_refseq_transcript_id(tx: &TranscriptFeature) -> bool {
     let id = tx.transcript_id.as_str();
-    let starts_with_refseq_accession = id.len() >= 4
-        && id.as_bytes()[0].is_ascii_uppercase()
-        && id.as_bytes()[1].is_ascii_uppercase()
-        && id.as_bytes()[2] == b'_'
-        && id.as_bytes()[3].is_ascii_digit();
-    if starts_with_refseq_accession {
+    if is_standard_refseq_accession(id) {
         return true;
     }
 
@@ -6430,14 +6420,9 @@ fn is_default_refseq_transcript_id(tx: &TranscriptFeature) -> bool {
     }
 
     tx.display_xref_id.as_deref().is_some_and(|display_id| {
-        let is_refseq_accession = display_id.len() >= 4
-            && display_id.as_bytes()[0].is_ascii_uppercase()
-            && display_id.as_bytes()[1].is_ascii_uppercase()
-            && display_id.as_bytes()[2] == b'_'
-            && display_id.as_bytes()[3].is_ascii_digit();
         let is_mt_display_id =
             display_id.len() == 4 && display_id.chars().all(|ch| ch.is_ascii_digit());
-        is_refseq_accession || is_mt_display_id
+        is_standard_refseq_accession(display_id) || is_mt_display_id
     })
 }
 
@@ -6459,17 +6444,16 @@ fn passes_transcript_selection(
         return false;
     }
 
-    match selection.source_mode {
-        TranscriptSourceMode::Ensembl => is_ensembl_transcript(tx),
-        TranscriptSourceMode::RefSeq => {
-            is_refseq_transcript(tx)
-                && (selection.all_refseq || is_default_refseq_transcript_id(tx))
-        }
-        TranscriptSourceMode::Merged => {
-            if is_refseq_transcript(tx) {
+    match selection.cache_source_type {
+        CacheSourceType::Ensembl => is_ensembl_transcript_id(&tx.transcript_id),
+        CacheSourceType::RefSeq => selection.all_refseq || is_default_refseq_transcript_id(tx),
+        CacheSourceType::Merged => {
+            if is_ensembl_transcript_id(&tx.transcript_id) {
+                true
+            } else if row_source_is_refseq(tx) {
                 selection.all_refseq || is_default_refseq_transcript_id(tx)
             } else {
-                is_ensembl_transcript(tx)
+                false
             }
         }
     }
@@ -6781,6 +6765,7 @@ fn hydrate_refseq_translation_cds_from_reference<R>(
     translations: &mut [TranslationFeature],
     translateable_seq_by_tx: &HashMap<String, String>,
     input_variant_intervals: &HashMap<String, Vec<(i64, i64)>>,
+    cache_source_type: CacheSourceType,
 ) -> Result<HashSet<String>>
 where
     R: BufRead + Seek,
@@ -6805,7 +6790,7 @@ where
         if !translation_ids.contains(tx.transcript_id.as_str()) {
             continue;
         }
-        if !is_refseq_transcript_for_hydration(tx) {
+        if !is_refseq_transcript_for_hydration(tx, cache_source_type) {
             continue;
         }
         // VEP keeps transcript-local sequence state on the Transcript object.
@@ -6896,6 +6881,7 @@ fn hydrate_transcript_cdna_from_reference<R>(
     exons: &[ExonFeature],
     indel_intervals: &HashMap<String, Vec<(i64, i64)>>,
     all_intervals: &HashMap<String, Vec<(i64, i64)>>,
+    cache_source_type: CacheSourceType,
 ) -> Result<()>
 where
     R: BufRead + Seek,
@@ -6917,7 +6903,7 @@ where
         };
 
         let should_infer_implicit_refseq_deletions = tx.spliced_seq.is_some()
-            && is_refseq_transcript_for_hydration(tx)
+            && is_refseq_transcript_for_hydration(tx, cache_source_type)
             && tx.bam_edit_status.as_deref() == Some("ok")
             && tx.refseq_edits.is_empty()
             && tx.cdna_mapper_segments.is_empty();
@@ -7071,8 +7057,40 @@ fn apply_translateable_seq_overrides(
     }
 }
 
-fn is_refseq_transcript_for_hydration(tx: &TranscriptFeature) -> bool {
-    is_refseq_transcript(tx)
+fn validate_partitioned_cache_source(
+    cache: &PartitionedParquetCache,
+    context_type: &str,
+    chrom: &str,
+    role: &str,
+    expected: CacheSourceType,
+) -> Result<()> {
+    let Some(path) = cache.context_path(context_type, chrom) else {
+        return Ok(());
+    };
+    let actual = CacheSourceType::from_parquet_file(&path).map_err(|err| {
+        DataFusionError::Plan(format!(
+            "annotate_vep(): {role} table '{}' has invalid cache source metadata: {err}",
+            path.display()
+        ))
+    })?;
+    if actual != expected {
+        return Err(DataFusionError::Plan(format!(
+            "annotate_vep(): {role} table '{}' has {CACHE_SOURCE_METADATA_KEY}='{}' but variation cache has {CACHE_SOURCE_METADATA_KEY}='{}'",
+            path.display(),
+            actual.as_str(),
+            expected.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn is_refseq_transcript_for_hydration(
+    tx: &TranscriptFeature,
+    cache_source_type: CacheSourceType,
+) -> bool {
+    row_source_is_refseq(tx)
+        || is_standard_refseq_accession(&tx.transcript_id)
+        || cache_source_type == CacheSourceType::RefSeq && is_default_refseq_transcript_id(tx)
 }
 
 fn read_reference_sequence<R>(
@@ -7430,10 +7448,11 @@ impl Debug for AnnotateProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "AnnotateProvider {{ vcf: {}, cache_source: {}, backend: {} }}",
+            "AnnotateProvider {{ vcf: {}, cache_source: {}, backend: {}, cache_source_type: {} }}",
             self.vcf_table,
             self.cache_source,
-            self.backend.as_str()
+            self.backend.as_str(),
+            self.cache_source_type.as_str()
         )
     }
 }
@@ -7452,6 +7471,7 @@ struct ContigAnnotationConfig {
     translations_sift_table: Option<String>,
     flags: VepFlags,
     hgvs_flags: HgvsFlags,
+    cache_source_type: CacheSourceType,
     transcript_selection: TranscriptSelectionFlags,
     allowed_failed: i64,
     reference_fasta_path: Option<String>,
@@ -7864,6 +7884,7 @@ fn hydrate_window(
     hgvs_reader: &mut Option<FastaReader>,
     hydrated_cds_tx_ids: &mut HashSet<String>,
     window_batches: &[RecordBatch],
+    cache_source_type: CacheSourceType,
 ) -> Result<()> {
     let Some(reader) = hgvs_reader.as_mut() else {
         return Ok(());
@@ -7880,6 +7901,7 @@ fn hydrate_window(
         translations,
         translateable_seq_by_tx,
         &input_intervals,
+        cache_source_type,
     )?;
     // Merge newly hydrated IDs into cumulative set.
     let first_window = hydrated_cds_tx_ids.is_empty();
@@ -7895,6 +7917,7 @@ fn hydrate_window(
         exons,
         &indel_intervals,
         &input_intervals,
+        cache_source_type,
     )?;
 
     if first_window && profiling_enabled() {
@@ -8532,6 +8555,7 @@ impl Stream for ContigAnnotationStream {
                             config.vcf_table.clone(),
                             String::new(),
                             AnnotationBackend::Parquet,
+                            config.cache_source_type,
                             config.options_json.clone(),
                             vcf_only_schema,
                         ) {
@@ -8758,6 +8782,7 @@ impl Stream for ContigAnnotationStream {
                             &mut ann.hgvs_reader,
                             &mut ann.hydrated_cds_tx_ids,
                             &window_batches,
+                            ann.config.cache_source_type,
                         ) {
                             let fut = make_cleanup_future(
                                 Arc::clone(&ann.session),
@@ -8931,16 +8956,37 @@ async fn prepare_contig_context(
         ephemeral_tables.push(var_table.clone());
         var_table
     };
+    validate_partitioned_cache_source(
+        &cache,
+        "variation",
+        &chrom,
+        "variation",
+        config.cache_source_type,
+    )?;
 
     let tx_table =
         crate::partitioned_cache::register_chrom_parquet(&session, &cache, "transcript", &chrom)
             .await?;
     if let Some(ref t) = tx_table {
+        validate_partitioned_cache_source(
+            &cache,
+            "transcript",
+            &chrom,
+            "transcript",
+            config.cache_source_type,
+        )?;
         ephemeral_tables.push(t.clone());
     }
     let ex_table =
         crate::partitioned_cache::register_chrom_parquet(&session, &cache, "exon", &chrom).await?;
     if let Some(ref t) = ex_table {
+        validate_partitioned_cache_source(
+            &cache,
+            "exon",
+            &chrom,
+            "exon",
+            config.cache_source_type,
+        )?;
         ephemeral_tables.push(t.clone());
     }
     let tl_table = crate::partitioned_cache::register_chrom_parquet(
@@ -8951,17 +8997,38 @@ async fn prepare_contig_context(
     )
     .await?;
     if let Some(ref t) = tl_table {
+        validate_partitioned_cache_source(
+            &cache,
+            "translation_core",
+            &chrom,
+            "translation_core",
+            config.cache_source_type,
+        )?;
         ephemeral_tables.push(t.clone());
     }
     let rg_table =
         crate::partitioned_cache::register_chrom_parquet(&session, &cache, "regulatory", &chrom)
             .await?;
     if let Some(ref t) = rg_table {
+        validate_partitioned_cache_source(
+            &cache,
+            "regulatory",
+            &chrom,
+            "regulatory",
+            config.cache_source_type,
+        )?;
         ephemeral_tables.push(t.clone());
     }
     let mt_table =
         crate::partitioned_cache::register_chrom_parquet(&session, &cache, "motif", &chrom).await?;
     if let Some(ref t) = mt_table {
+        validate_partitioned_cache_source(
+            &cache,
+            "motif",
+            &chrom,
+            "motif",
+            config.cache_source_type,
+        )?;
         ephemeral_tables.push(t.clone());
     }
 
@@ -9004,6 +9071,7 @@ async fn prepare_contig_context(
         config.vcf_table.clone(),
         String::new(),
         AnnotationBackend::Parquet,
+        config.cache_source_type,
         config.options_json.clone(),
         vcf_only_schema,
     )?;
@@ -9178,6 +9246,13 @@ impl TableProvider for AnnotateProvider {
                         "partitioned cache: no variation parquet for sample chrom".to_string(),
                     )
                 })?;
+                validate_partitioned_cache_source(
+                    cache,
+                    "variation",
+                    sample_chrom,
+                    "variation",
+                    self.cache_source_type,
+                )?;
                 let cache_schema = self
                     .session
                     .table(&sample_table)
@@ -10257,35 +10332,29 @@ mod tests {
 
     #[test]
     fn test_transcript_selection_flags_reject_invalid_combinations() {
-        let err =
-            TranscriptSelectionFlags::from_options_json(Some("{\"refseq\":true,\"merged\":true}"))
-                .expect_err("refseq+merged should be rejected")
-                .to_string();
-        assert!(err.contains("--refseq and --merged"));
-
-        let err = TranscriptSelectionFlags::from_options_json(Some(
-            "{\"refseq\":true,\"gencode_basic\":true}",
-        ))
-        .expect_err("refseq+gencode_basic should be rejected")
-        .to_string();
-        assert!(err.contains("--refseq and --gencode_basic"));
-
-        let err = TranscriptSelectionFlags::from_options_json(Some(
-            "{\"gencode_basic\":true,\"gencode_primary\":true}",
-        ))
+        let err = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Ensembl,
+            Some("{\"gencode_basic\":true,\"gencode_primary\":true}"),
+        )
         .expect_err("gencode_basic+gencode_primary should be rejected")
         .to_string();
         assert!(err.contains("--gencode_basic and --gencode_primary"));
 
-        let err = TranscriptSelectionFlags::from_options_json(Some("{\"all_refseq\":true}"))
-            .expect_err("all_refseq without refseq/merged should be rejected")
-            .to_string();
-        assert!(err.contains("--all_refseq requires --refseq or --merged"));
+        let err = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Ensembl,
+            Some("{\"all_refseq\":true}"),
+        )
+        .expect_err("all_refseq without RefSeq-capable metadata should be rejected")
+        .to_string();
+        assert!(err.contains("--all_refseq requires cache schema metadata"));
 
-        let err = TranscriptSelectionFlags::from_options_json(Some("{\"exclude_predicted\":true}"))
-            .expect_err("exclude_predicted without refseq/merged should be rejected")
-            .to_string();
-        assert!(err.contains("--exclude_predicted requires --refseq or --merged"));
+        let err = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Ensembl,
+            Some("{\"exclude_predicted\":true}"),
+        )
+        .expect_err("exclude_predicted without RefSeq-capable metadata should be rejected")
+        .to_string();
+        assert!(err.contains("--exclude_predicted requires cache schema metadata"));
     }
 
     #[test]
@@ -10295,7 +10364,7 @@ mod tests {
             (
                 false,
                 TranscriptSelectionFlags {
-                    source_mode: TranscriptSourceMode::RefSeq,
+                    cache_source_type: CacheSourceType::RefSeq,
                     ..Default::default()
                 },
                 78,
@@ -10303,7 +10372,7 @@ mod tests {
             (
                 false,
                 TranscriptSelectionFlags {
-                    source_mode: TranscriptSourceMode::Merged,
+                    cache_source_type: CacheSourceType::Merged,
                     ..Default::default()
                 },
                 79,
@@ -10312,7 +10381,7 @@ mod tests {
             (
                 true,
                 TranscriptSelectionFlags {
-                    source_mode: TranscriptSourceMode::RefSeq,
+                    cache_source_type: CacheSourceType::RefSeq,
                     ..Default::default()
                 },
                 85,
@@ -10320,7 +10389,7 @@ mod tests {
             (
                 true,
                 TranscriptSelectionFlags {
-                    source_mode: TranscriptSourceMode::Merged,
+                    cache_source_type: CacheSourceType::Merged,
                     ..Default::default()
                 },
                 86,
@@ -10359,7 +10428,7 @@ mod tests {
         };
 
         let refseq_selection = TranscriptSelectionFlags {
-            source_mode: TranscriptSourceMode::RefSeq,
+            cache_source_type: CacheSourceType::RefSeq,
             ..Default::default()
         };
         let refseq_layout = CsqPlaceholderLayout::for_mode(false, refseq_selection, false);
@@ -10384,7 +10453,7 @@ mod tests {
         assert_eq!(refseq_values[refseq_index("MAX_AF_POPS")], "gnomADg_AFR");
 
         let merged_selection = TranscriptSelectionFlags {
-            source_mode: TranscriptSourceMode::Merged,
+            cache_source_type: CacheSourceType::Merged,
             ..Default::default()
         };
         let merged_layout = CsqPlaceholderLayout::for_mode(true, merged_selection, false);
@@ -10775,29 +10844,50 @@ mod tests {
     fn test_passes_transcript_selection_matches_vep_refseq_filters() {
         let ensembl_tx = make_selection_tx("ENST00000311111", Some("Ensembl"));
         let nm_tx = make_selection_tx("NM_000001", Some("RefSeq"));
+        let nr_tx = make_selection_tx("NR_123456.1", Some("RefSeq"));
+        let xm_tx = make_selection_tx("XM_011520402.2", Some("RefSeq"));
+        let xr_tx = make_selection_tx("XR_001734695.1", Some("RefSeq"));
         let mut ccds_tx = make_selection_tx("CCDS1234.1", Some("RefSeq"));
         ccds_tx.display_xref_id = Some("CCDS1234".to_string());
-        let xm_tx = make_selection_tx("XM_123456", Some("RefSeq"));
+        let mut mt_numeric_tx = make_selection_tx("4540", Some("RefSeq"));
+        mt_numeric_tx.chrom = "MT".to_string();
+        let mut mt_gene_tx = make_selection_tx("COX3", Some("RefSeq"));
+        mt_gene_tx.chrom = "MT".to_string();
+        let mut mt_rna_tx = make_selection_tx("rna-TRNK", Some("RefSeq"));
+        mt_rna_tx.chrom = "MT".to_string();
+        let mut non_refseq_mt_gene_tx = make_selection_tx("COX3", Some("Ensembl"));
+        non_refseq_mt_gene_tx.chrom = "MT".to_string();
         let mut gencode_tx = make_selection_tx("ENST00000322222", Some("Ensembl"));
         gencode_tx.is_gencode_basic = true;
         gencode_tx.is_gencode_primary = true;
 
-        let default_selection = TranscriptSelectionFlags::from_options_json(None).unwrap();
+        let default_selection =
+            TranscriptSelectionFlags::from_options_json(CacheSourceType::Ensembl, None).unwrap();
         assert!(passes_transcript_selection(&ensembl_tx, default_selection));
         assert!(!passes_transcript_selection(&nm_tx, default_selection));
 
         let refseq_selection =
-            TranscriptSelectionFlags::from_options_json(Some("{\"refseq\":true}")).unwrap();
+            TranscriptSelectionFlags::from_options_json(CacheSourceType::RefSeq, None).unwrap();
         assert!(!passes_transcript_selection(&ensembl_tx, refseq_selection));
         assert!(passes_transcript_selection(&nm_tx, refseq_selection));
+        assert!(passes_transcript_selection(&nr_tx, refseq_selection));
+        assert!(passes_transcript_selection(&xm_tx, refseq_selection));
+        assert!(passes_transcript_selection(&xr_tx, refseq_selection));
+        assert!(passes_transcript_selection(
+            &mt_numeric_tx,
+            refseq_selection
+        ));
+        assert!(passes_transcript_selection(&mt_gene_tx, refseq_selection));
+        assert!(passes_transcript_selection(&mt_rna_tx, refseq_selection));
         assert!(
             !passes_transcript_selection(&ccds_tx, refseq_selection),
             "CCDS rows should be excluded unless all_refseq is enabled"
         );
 
-        let all_refseq_selection = TranscriptSelectionFlags::from_options_json(Some(
-            "{\"merged\":true,\"all_refseq\":true}",
-        ))
+        let all_refseq_selection = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Merged,
+            Some("{\"all_refseq\":true}"),
+        )
         .unwrap();
         assert!(passes_transcript_selection(
             &ensembl_tx,
@@ -10805,18 +10895,30 @@ mod tests {
         ));
         assert!(passes_transcript_selection(&nm_tx, all_refseq_selection));
         assert!(passes_transcript_selection(&ccds_tx, all_refseq_selection));
+        assert!(passes_transcript_selection(
+            &mt_gene_tx,
+            all_refseq_selection
+        ));
+        assert!(
+            !passes_transcript_selection(&non_refseq_mt_gene_tx, all_refseq_selection),
+            "merged mode should not accept mitochondrial gene-like IDs without RefSeq row source"
+        );
 
-        let exclude_predicted_selection = TranscriptSelectionFlags::from_options_json(Some(
-            "{\"merged\":true,\"all_refseq\":true,\"exclude_predicted\":true}",
-        ))
+        let exclude_predicted_selection = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Merged,
+            Some("{\"all_refseq\":true,\"exclude_predicted\":true}"),
+        )
         .unwrap();
         assert!(
             !passes_transcript_selection(&xm_tx, exclude_predicted_selection),
             "XM_/XR_ transcripts should be filtered by exclude_predicted"
         );
 
-        let gencode_basic_selection =
-            TranscriptSelectionFlags::from_options_json(Some("{\"gencode_basic\":true}")).unwrap();
+        let gencode_basic_selection = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Ensembl,
+            Some("{\"gencode_basic\":true}"),
+        )
+        .unwrap();
         assert!(passes_transcript_selection(
             &gencode_tx,
             gencode_basic_selection
@@ -10826,9 +10928,10 @@ mod tests {
             gencode_basic_selection
         ));
 
-        let gencode_primary_selection = TranscriptSelectionFlags::from_options_json(Some(
-            "{\"merged\":true,\"gencode_primary\":true}",
-        ))
+        let gencode_primary_selection = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Merged,
+            Some("{\"gencode_primary\":true}"),
+        )
         .unwrap();
         assert!(passes_transcript_selection(
             &gencode_tx,
@@ -10837,6 +10940,38 @@ mod tests {
         assert!(!passes_transcript_selection(
             &nm_tx,
             gencode_primary_selection
+        ));
+    }
+
+    #[test]
+    fn test_refseq_hydration_accepts_standard_and_mitochondrial_ids() {
+        let nm_tx = make_selection_tx("NM_000546.6", None);
+        let mut mt_numeric_tx = make_selection_tx("4540", None);
+        mt_numeric_tx.chrom = "MT".to_string();
+        let mut mt_gene_tx = make_selection_tx("COX3", Some("RefSeq"));
+        mt_gene_tx.chrom = "MT".to_string();
+        let mut mt_rna_tx = make_selection_tx("rna-TRNK", None);
+        mt_rna_tx.chrom = "MT".to_string();
+
+        assert!(is_refseq_transcript_for_hydration(
+            &nm_tx,
+            CacheSourceType::Ensembl
+        ));
+        assert!(is_refseq_transcript_for_hydration(
+            &mt_numeric_tx,
+            CacheSourceType::RefSeq
+        ));
+        assert!(is_refseq_transcript_for_hydration(
+            &mt_gene_tx,
+            CacheSourceType::Merged
+        ));
+        assert!(is_refseq_transcript_for_hydration(
+            &mt_rna_tx,
+            CacheSourceType::RefSeq
+        ));
+        assert!(!is_refseq_transcript_for_hydration(
+            &mt_rna_tx,
+            CacheSourceType::Ensembl
         ));
     }
 

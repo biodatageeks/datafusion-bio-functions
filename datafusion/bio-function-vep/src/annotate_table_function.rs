@@ -10,9 +10,11 @@ use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::SessionContext;
+use serde_json::Value;
 
 use crate::annotate_provider::AnnotateProvider;
 use crate::annotation_store::AnnotationBackend;
+use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 
 /// Table function implementing
 /// `annotate_vep(vcf_table, cache_source, backend [, options_json])`.
@@ -74,6 +76,8 @@ impl TableFunctionImpl for AnnotateFunction {
         } else {
             None
         };
+        reject_options_json_source_selectors(options_json.as_deref())?;
+        let cache_source_type = CacheSourceType::from_partitioned_cache_source(&cache_source)?;
 
         let vcf_schema = resolve_schema_from_catalog(
             &*self.catalog_list,
@@ -87,6 +91,7 @@ impl TableFunctionImpl for AnnotateFunction {
             vcf_table,
             cache_source,
             backend,
+            cache_source_type,
             options_json,
             vcf_schema,
         )?))
@@ -171,8 +176,32 @@ fn resolve_table_sync(
         .ok_or_else(|| DataFusionError::Plan(format!("Table '{table_name}' not found")))
 }
 
+fn options_json_has_key(options_json: Option<&str>, key: &str) -> Result<bool> {
+    let Some(raw) = options_json else {
+        return Ok(false);
+    };
+    let value: Value = serde_json::from_str(raw).map_err(|err| {
+        DataFusionError::Plan(format!(
+            "annotate_vep() options_json must be valid JSON: {err}"
+        ))
+    })?;
+    Ok(value.as_object().is_some_and(|obj| obj.contains_key(key)))
+}
+
+fn reject_options_json_source_selectors(options_json: Option<&str>) -> Result<()> {
+    for key in ["merged", "refseq"] {
+        if options_json_has_key(options_json, key)? {
+            return Err(DataFusionError::Plan(format!(
+                "annotate_vep(): options_json key '{key}' is unsupported; register/export cache tables with schema metadata {CACHE_SOURCE_METADATA_KEY}='{key}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
     use crate::create_vep_session;
     #[cfg(feature = "kv-cache")]
     use crate::kv_cache::{VepKvStore, position_entry::serialize_position_entry};
@@ -184,6 +213,7 @@ mod tests {
     use datafusion::datasource::MemTable;
     use parquet::arrow::ArrowWriter;
     use std::collections::BTreeSet;
+    use std::collections::HashMap;
     use std::fs::File;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -191,7 +221,22 @@ mod tests {
     /// Write record batches into the partitioned cache layout under
     /// `{tmpdir}/{table_type}/{chrom}.parquet`, grouping rows by the "chrom"
     /// column in each batch.
-    fn write_partitioned_cache(tmpdir: &TempDir, table_type: &str, batches: &[RecordBatch]) {
+    fn batch_with_cache_source(batch: &RecordBatch, source: CacheSourceType) -> RecordBatch {
+        let mut metadata = batch.schema().metadata().clone();
+        metadata.insert(
+            CACHE_SOURCE_METADATA_KEY.to_string(),
+            source.as_str().to_string(),
+        );
+        let schema = Arc::new(batch.schema().as_ref().clone().with_metadata(metadata));
+        RecordBatch::try_new(schema, batch.columns().to_vec()).expect("metadata-only batch schema")
+    }
+
+    fn write_partitioned_cache_with_source(
+        tmpdir: &TempDir,
+        table_type: &str,
+        batches: &[RecordBatch],
+        source: CacheSourceType,
+    ) {
         let type_dir = tmpdir.path().join(table_type);
         std::fs::create_dir_all(&type_dir).expect("create type dir");
 
@@ -200,6 +245,7 @@ mod tests {
             std::collections::HashMap::new();
 
         for batch in batches {
+            let batch = batch_with_cache_source(batch, source);
             let schema = batch.schema();
             let chrom_idx = schema
                 .index_of("chrom")
@@ -251,21 +297,103 @@ mod tests {
         }
     }
 
+    fn write_partitioned_cache_without_source_metadata(
+        tmpdir: &TempDir,
+        table_type: &str,
+        batches: &[RecordBatch],
+    ) {
+        let type_dir = tmpdir.path().join(table_type);
+        std::fs::create_dir_all(&type_dir).expect("create type dir");
+
+        let mut chrom_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let chrom_idx = schema
+                .index_of("chrom")
+                .expect("batch must have a 'chrom' column");
+            let chrom_arr = batch
+                .column(chrom_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("chrom column must be StringArray");
+            let unique_chroms: BTreeSet<String> = (0..chrom_arr.len())
+                .map(|i| chrom_arr.value(i).to_string())
+                .collect();
+            for chrom in unique_chroms {
+                let indices: Vec<u32> = (0..chrom_arr.len())
+                    .filter(|&i| chrom_arr.value(i) == chrom)
+                    .map(|i| i as u32)
+                    .collect();
+                let indices_arr = datafusion::arrow::array::UInt32Array::from(indices);
+                let filtered_columns: Vec<Arc<dyn Array>> = (0..batch.num_columns())
+                    .map(|c| {
+                        datafusion::arrow::compute::take(
+                            batch.column(c).as_ref(),
+                            &indices_arr,
+                            None,
+                        )
+                        .expect("take should succeed")
+                    })
+                    .collect();
+                let filtered_batch =
+                    RecordBatch::try_new(schema.clone(), filtered_columns).expect("filtered batch");
+                chrom_batches.entry(chrom).or_default().push(filtered_batch);
+            }
+        }
+
+        for (chrom, batches) in &chrom_batches {
+            let path = type_dir.join(format!("{chrom}.parquet"));
+            let file = File::create(&path).expect("create parquet file");
+            let mut writer = ArrowWriter::try_new(file, batches[0].schema(), None)
+                .expect("create parquet writer");
+            for b in batches {
+                writer.write(b).expect("write parquet batch");
+            }
+            writer.close().expect("close parquet writer");
+        }
+    }
+
     /// Convenience: write a single RecordBatch to the partitioned cache.
     fn write_batch_to_cache(tmpdir: &TempDir, table_type: &str, batch: &RecordBatch) {
-        write_partitioned_cache(tmpdir, table_type, &[batch.clone()]);
+        write_batch_to_cache_with_source(tmpdir, table_type, batch, CacheSourceType::Ensembl);
+    }
+
+    fn write_batch_to_cache_with_source(
+        tmpdir: &TempDir,
+        table_type: &str,
+        batch: &RecordBatch,
+        source: CacheSourceType,
+    ) {
+        write_partitioned_cache_with_source(tmpdir, table_type, &[batch.clone()], source);
     }
 
     /// Write a RecordBatch directly into a specific chrom parquet file,
     /// for tables that do not have a "chrom" column (e.g. exons, translations).
     fn write_batch_to_chrom(tmpdir: &TempDir, table_type: &str, chrom: &str, batch: &RecordBatch) {
+        write_batch_to_chrom_with_source(
+            tmpdir,
+            table_type,
+            chrom,
+            batch,
+            CacheSourceType::Ensembl,
+        );
+    }
+
+    fn write_batch_to_chrom_with_source(
+        tmpdir: &TempDir,
+        table_type: &str,
+        chrom: &str,
+        batch: &RecordBatch,
+        source: CacheSourceType,
+    ) {
         let type_dir = tmpdir.path().join(table_type);
         std::fs::create_dir_all(&type_dir).expect("create type dir");
         let path = type_dir.join(format!("{chrom}.parquet"));
         let file = File::create(&path).expect("create parquet file");
+        let batch = batch_with_cache_source(batch, source);
         let mut writer =
             ArrowWriter::try_new(file, batch.schema(), None).expect("create parquet writer");
-        writer.write(batch).expect("write parquet batch");
+        writer.write(&batch).expect("write parquet batch");
         writer.close().expect("close parquet writer");
     }
 
@@ -3462,14 +3590,14 @@ mod tests {
         let ctx = create_vep_session();
         ctx.register_table("vcf_refseq", Arc::new(refseq_vcf_table()))
             .expect("register refseq vcf table");
-        let tmpdir = TempDir::new().expect("create tmpdir");
-        write_batch_to_cache(&tmpdir, "variation", &refseq_cache_batch());
-        write_batch_to_cache(&tmpdir, "transcript", &refseq_transcripts_batch());
-        write_batch_to_chrom(&tmpdir, "exon", "1", &refseq_exons_batch());
-        let cache_path = tmpdir.path().display().to_string();
+        let ensembl_tmpdir = TempDir::new().expect("create ensembl tmpdir");
+        write_batch_to_cache(&ensembl_tmpdir, "variation", &refseq_cache_batch());
+        write_batch_to_cache(&ensembl_tmpdir, "transcript", &refseq_transcripts_batch());
+        write_batch_to_chrom(&ensembl_tmpdir, "exon", "1", &refseq_exons_batch());
+        let ensembl_cache_path = ensembl_tmpdir.path().display().to_string();
 
         let default_sql = format!(
-            "SELECT \"CSQ\" FROM annotate_vep('vcf_refseq', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
+            "SELECT \"CSQ\" FROM annotate_vep('vcf_refseq', '{ensembl_cache_path}', 'parquet', '{{\"partitioned\":true}}')"
         );
         let default_batches = ctx
             .sql(&default_sql)
@@ -3490,8 +3618,29 @@ mod tests {
         assert_eq!(default_entry.len(), 74);
         assert_eq!(default_entry[1], "intergenic_variant");
 
+        let refseq_tmpdir = TempDir::new().expect("create refseq tmpdir");
+        write_batch_to_cache_with_source(
+            &refseq_tmpdir,
+            "variation",
+            &refseq_cache_batch(),
+            CacheSourceType::RefSeq,
+        );
+        write_batch_to_cache_with_source(
+            &refseq_tmpdir,
+            "transcript",
+            &refseq_transcripts_batch(),
+            CacheSourceType::RefSeq,
+        );
+        write_batch_to_chrom_with_source(
+            &refseq_tmpdir,
+            "exon",
+            "1",
+            &refseq_exons_batch(),
+            CacheSourceType::RefSeq,
+        );
+        let refseq_cache_path = refseq_tmpdir.path().display().to_string();
         let refseq_sql = format!(
-            "SELECT \"CSQ\" FROM annotate_vep('vcf_refseq', '{cache_path}', 'parquet', '{{\"partitioned\":true,\"refseq\":true}}')"
+            "SELECT \"CSQ\" FROM annotate_vep('vcf_refseq', '{refseq_cache_path}', 'parquet', '{{\"partitioned\":true}}')"
         );
         let refseq_batches = ctx
             .sql(&refseq_sql)
@@ -3516,8 +3665,29 @@ mod tests {
         assert_eq!(refseq_entry[31], "A");
         assert_eq!(refseq_entry[32], "OK");
 
+        let merged_tmpdir = TempDir::new().expect("create merged tmpdir");
+        write_batch_to_cache_with_source(
+            &merged_tmpdir,
+            "variation",
+            &refseq_cache_batch(),
+            CacheSourceType::Merged,
+        );
+        write_batch_to_cache_with_source(
+            &merged_tmpdir,
+            "transcript",
+            &refseq_transcripts_batch(),
+            CacheSourceType::Merged,
+        );
+        write_batch_to_chrom_with_source(
+            &merged_tmpdir,
+            "exon",
+            "1",
+            &refseq_exons_batch(),
+            CacheSourceType::Merged,
+        );
+        let merged_cache_path = merged_tmpdir.path().display().to_string();
         let merged_sql = format!(
-            "SELECT \"CSQ\" FROM annotate_vep('vcf_refseq', '{cache_path}', 'parquet', '{{\"partitioned\":true,\"merged\":true}}')"
+            "SELECT \"CSQ\" FROM annotate_vep('vcf_refseq', '{merged_cache_path}', 'parquet', '{{\"partitioned\":true}}')"
         );
         let merged_batches = ctx
             .sql(&merged_sql)
@@ -3549,14 +3719,14 @@ mod tests {
         let ctx = create_vep_session();
         ctx.register_table("vcf_refseq_schema", Arc::new(refseq_vcf_table()))
             .expect("register refseq vcf table");
-        let tmpdir = TempDir::new().expect("create tmpdir");
-        write_batch_to_cache(&tmpdir, "variation", &refseq_cache_batch());
-        write_batch_to_cache(&tmpdir, "transcript", &refseq_transcripts_batch());
-        write_batch_to_chrom(&tmpdir, "exon", "1", &refseq_exons_batch());
-        let cache_path = tmpdir.path().display().to_string();
+        let ensembl_tmpdir = TempDir::new().expect("create ensembl tmpdir");
+        write_batch_to_cache(&ensembl_tmpdir, "variation", &refseq_cache_batch());
+        write_batch_to_cache(&ensembl_tmpdir, "transcript", &refseq_transcripts_batch());
+        write_batch_to_chrom(&ensembl_tmpdir, "exon", "1", &refseq_exons_batch());
+        let ensembl_cache_path = ensembl_tmpdir.path().display().to_string();
 
         let default_sql = format!(
-            "SELECT * FROM annotate_vep('vcf_refseq_schema', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
+            "SELECT * FROM annotate_vep('vcf_refseq_schema', '{ensembl_cache_path}', 'parquet', '{{\"partitioned\":true}}')"
         );
         let default_batches = ctx
             .sql(&default_sql)
@@ -3580,8 +3750,29 @@ mod tests {
             );
         }
 
+        let refseq_tmpdir = TempDir::new().expect("create refseq tmpdir");
+        write_batch_to_cache_with_source(
+            &refseq_tmpdir,
+            "variation",
+            &refseq_cache_batch(),
+            CacheSourceType::RefSeq,
+        );
+        write_batch_to_cache_with_source(
+            &refseq_tmpdir,
+            "transcript",
+            &refseq_transcripts_batch(),
+            CacheSourceType::RefSeq,
+        );
+        write_batch_to_chrom_with_source(
+            &refseq_tmpdir,
+            "exon",
+            "1",
+            &refseq_exons_batch(),
+            CacheSourceType::RefSeq,
+        );
+        let refseq_cache_path = refseq_tmpdir.path().display().to_string();
         let refseq_sql = format!(
-            "SELECT * FROM annotate_vep('vcf_refseq_schema', '{cache_path}', 'parquet', '{{\"partitioned\":true,\"refseq\":true}}')"
+            "SELECT * FROM annotate_vep('vcf_refseq_schema', '{refseq_cache_path}', 'parquet', '{{\"partitioned\":true}}')"
         );
         let refseq_batches = ctx
             .sql(&refseq_sql)
@@ -3612,8 +3803,29 @@ mod tests {
             "refseq-only schema should not expose SOURCE"
         );
 
+        let merged_tmpdir = TempDir::new().expect("create merged tmpdir");
+        write_batch_to_cache_with_source(
+            &merged_tmpdir,
+            "variation",
+            &refseq_cache_batch(),
+            CacheSourceType::Merged,
+        );
+        write_batch_to_cache_with_source(
+            &merged_tmpdir,
+            "transcript",
+            &refseq_transcripts_batch(),
+            CacheSourceType::Merged,
+        );
+        write_batch_to_chrom_with_source(
+            &merged_tmpdir,
+            "exon",
+            "1",
+            &refseq_exons_batch(),
+            CacheSourceType::Merged,
+        );
+        let merged_cache_path = merged_tmpdir.path().display().to_string();
         let merged_sql = format!(
-            "SELECT * FROM annotate_vep('vcf_refseq_schema', '{cache_path}', 'parquet', '{{\"partitioned\":true,\"merged\":true}}')"
+            "SELECT * FROM annotate_vep('vcf_refseq_schema', '{merged_cache_path}', 'parquet', '{{\"partitioned\":true}}')"
         );
         let merged_batches = ctx
             .sql(&merged_sql)
@@ -3679,7 +3891,12 @@ mod tests {
     async fn test_annotate_vep_merged_typed_columns_handle_rows_without_transcript_assignments() {
         let backend = "parquet";
         let tmpdir = TempDir::new().expect("create temp dir");
-        write_batch_to_cache(&tmpdir, "variation", &cache_batch());
+        write_batch_to_cache_with_source(
+            &tmpdir,
+            "variation",
+            &cache_batch(),
+            CacheSourceType::Merged,
+        );
 
         let ctx = create_vep_session();
         ctx.register_table("vcf_data", Arc::new(vcf_table()))
@@ -3687,7 +3904,7 @@ mod tests {
 
         let cache_path = tmpdir.path().to_str().expect("utf8 path");
         let sql = format!(
-            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', '{backend}', '{{\"partitioned\":true,\"merged\":true}}')"
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', '{backend}', '{{\"partitioned\":true}}')"
         );
         let batches = ctx
             .sql(&sql)
@@ -3737,6 +3954,105 @@ mod tests {
             .to_string();
 
         assert!(err.contains("annotate_vep() backend must be one of"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_rejects_options_json_source_selectors() {
+        for (key, expected_source) in [("merged", "merged"), ("refseq", "refseq")] {
+            for value in ["true", "false"] {
+                let ctx = create_vep_session();
+                ctx.register_table("vcf_data", Arc::new(vcf_table()))
+                    .expect("register vcf table");
+
+                let tmpdir = TempDir::new().expect("create temp dir");
+                write_batch_to_cache(&tmpdir, "variation", &cache_batch());
+                let cache_path = tmpdir.path().to_string_lossy();
+
+                let sql = format!(
+                    "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', '{{\"partitioned\":true,\"{key}\":{value}}}')"
+                );
+                let err = ctx
+                    .sql(&sql)
+                    .await
+                    .expect_err("legacy source selector should fail during planning")
+                    .to_string();
+
+                assert!(
+                    err.contains(&format!(
+                        "annotate_vep(): options_json key '{key}' is unsupported"
+                    )),
+                    "unexpected error for {key}={value}: {err}"
+                );
+                assert!(
+                    err.contains(&format!("bio.vep.cache_source_type='{expected_source}'")),
+                    "error should point to schema metadata for {key}={value}: {err}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_ignores_options_json_cache_source_type_and_requires_metadata() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_data", Arc::new(vcf_table()))
+            .expect("register vcf table");
+
+        let tmpdir = TempDir::new().expect("create temp dir");
+        write_partitioned_cache_without_source_metadata(&tmpdir, "variation", &[cache_batch()]);
+        let cache_path = tmpdir.path().to_string_lossy();
+
+        let sql = format!(
+            "SELECT * FROM annotate_vep('vcf_data', '{cache_path}', 'parquet', '{{\"partitioned\":true,\"cache_source_type\":\"refseq\"}}')"
+        );
+        let err = ctx
+            .sql(&sql)
+            .await
+            .expect_err("options_json cache_source_type must not replace schema metadata")
+            .to_string();
+
+        assert!(err.contains("missing bio.vep.cache_source_type"), "{err}");
+        assert!(
+            err.contains("expected one of ensembl, merged, refseq"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_annotate_vep_rejects_mismatched_cache_source_metadata() {
+        let ctx = create_vep_session();
+        ctx.register_table("vcf_refseq", Arc::new(refseq_vcf_table()))
+            .expect("register refseq vcf table");
+
+        let tmpdir = TempDir::new().expect("create tmpdir");
+        write_batch_to_cache_with_source(
+            &tmpdir,
+            "variation",
+            &refseq_cache_batch(),
+            CacheSourceType::RefSeq,
+        );
+        write_batch_to_cache_with_source(
+            &tmpdir,
+            "transcript",
+            &refseq_transcripts_batch(),
+            CacheSourceType::Ensembl,
+        );
+        let cache_path = tmpdir.path().display().to_string();
+
+        let sql = format!(
+            "SELECT \"CSQ\" FROM annotate_vep('vcf_refseq', '{cache_path}', 'parquet', '{{\"partitioned\":true}}')"
+        );
+        let err = ctx
+            .sql(&sql)
+            .await
+            .expect("query should parse")
+            .collect()
+            .await
+            .expect_err("mismatched cache source metadata should fail")
+            .to_string();
+
+        assert!(err.contains("transcript table"), "{err}");
+        assert!(err.contains("bio.vep.cache_source_type='ensembl'"), "{err}");
+        assert!(err.contains("bio.vep.cache_source_type='refseq'"), "{err}");
     }
 
     /// VCF table with 10 rows on the same contig for LIMIT tests.
