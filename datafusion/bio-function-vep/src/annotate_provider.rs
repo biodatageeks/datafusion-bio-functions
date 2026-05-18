@@ -2319,9 +2319,17 @@ fn pick_assignment_feature_id<'a>(
 ) -> &'a str {
     assignments
         .get(assignment_idx)
-        .and_then(|tc| tc.transcript_idx)
-        .and_then(|idx| ctx.transcripts.get(idx))
-        .map(|tx| tx.transcript_id.as_str())
+        .map(|tc| {
+            if tc.feature_type == FeatureType::Transcript {
+                tc.transcript_idx
+                    .and_then(|idx| ctx.transcripts.get(idx))
+                    .map(|tx| tx.transcript_id.as_str())
+                    .or(tc.transcript_id.as_deref())
+                    .unwrap_or("")
+            } else {
+                tc.transcript_id.as_deref().unwrap_or("")
+            }
+        })
         .unwrap_or("")
 }
 
@@ -2449,17 +2457,30 @@ fn pick_assignment_allele_key<'a>(_tc: &'a TranscriptConsequence, row_allele: &'
     row_allele
 }
 
-fn sort_pick_candidates_by_feature_id(
+fn sort_pick_candidates_by_vep_order(
     candidate_indices: &mut [usize],
     assignments: &[TranscriptConsequence],
     ctx: &PreparedContext<'_>,
 ) {
+    // VEP's pick logic applies the configured biological/clinical criteria
+    // first, then returns the first candidate still tied after all criteria.
+    // That last fallback is only a deterministic representative choice; it
+    // carries no additional biological or interpretation meaning. Use the same
+    // feature concat order we use for CSQ output so COITree/query callback order
+    // cannot change which tied transcript/regulatory/motif feature wins.
     candidate_indices.sort_by(|&a, &b| {
-        pick_assignment_feature_id(a, assignments, ctx).cmp(pick_assignment_feature_id(
-            b,
-            assignments,
-            ctx,
-        ))
+        assignments[a]
+            .feature_type
+            .rank()
+            .cmp(&assignments[b].feature_type.rank())
+            .then_with(|| {
+                pick_assignment_feature_id(a, assignments, ctx).cmp(pick_assignment_feature_id(
+                    b,
+                    assignments,
+                    ctx,
+                ))
+            })
+            .then_with(|| a.cmp(&b))
     });
 }
 
@@ -2490,6 +2511,7 @@ fn select_pick_indices(
         PickMode::None => {}
         PickMode::Pick | PickMode::FlagPick => {
             let mut candidates: Vec<usize> = (0..assignments.len()).collect();
+            sort_pick_candidates_by_vep_order(&mut candidates, assignments, ctx);
             insert_pick_winner(&mut selected, &mut candidates, assignments, ctx, pick_flags);
         }
         PickMode::PickAllele | PickMode::FlagPickAllele => {
@@ -2499,6 +2521,7 @@ fn select_pick_indices(
                 grouped.entry(allele).or_default().push(idx);
             }
             for candidate_indices in grouped.values_mut() {
+                sort_pick_candidates_by_vep_order(candidate_indices, assignments, ctx);
                 insert_pick_winner(
                     &mut selected,
                     candidate_indices,
@@ -2520,7 +2543,7 @@ fn select_pick_indices(
                 grouped.entry(gene_key).or_default().push(idx);
             }
             for candidate_indices in grouped.values_mut() {
-                sort_pick_candidates_by_feature_id(candidate_indices, assignments, ctx);
+                sort_pick_candidates_by_vep_order(candidate_indices, assignments, ctx);
                 insert_pick_winner(
                     &mut selected,
                     candidate_indices,
@@ -2543,7 +2566,7 @@ fn select_pick_indices(
                 grouped.entry((allele, gene_key)).or_default().push(idx);
             }
             for candidate_indices in grouped.values_mut() {
-                sort_pick_candidates_by_feature_id(candidate_indices, assignments, ctx);
+                sort_pick_candidates_by_vep_order(candidate_indices, assignments, ctx);
                 insert_pick_winner(
                     &mut selected,
                     candidate_indices,
@@ -9418,6 +9441,45 @@ mod tests {
             assert_eq!(picked[0].transcript_idx, Some(1));
             assert!(!picked[0].picked);
         }
+    }
+
+    #[test]
+    fn test_apply_pick_allele_tie_breaks_by_vep_feature_order() {
+        let mut tx_a = make_tx("ENST00000051", None, Some("GENE1"), Some("HGNC"), None);
+        tx_a.biotype = "protein_coding".to_string();
+
+        let mut tx_b = make_tx("ENST00000052", None, Some("GENE1"), Some("HGNC"), None);
+        tx_b.biotype = "protein_coding".to_string();
+
+        let transcripts = vec![tx_a, tx_b];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::FivePrimeUtrVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::FivePrimeUtrVariant],
+                ..Default::default()
+            },
+        ];
+
+        let picked = apply_pick_mode(
+            assignments,
+            &ctx,
+            &PickFlags {
+                mode: PickMode::PickAllele,
+                pick_order: vec![PickCriterion::Rank],
+            },
+            "A",
+        );
+
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].transcript_idx, Some(0));
     }
 
     #[test]
