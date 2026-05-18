@@ -7,7 +7,6 @@
 //! - otherwise falls back to phase-1.5 known-variant CSQ placeholders.
 
 use std::any::Any;
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
