@@ -2281,18 +2281,19 @@ fn pick_transcript_length(tx: &TranscriptFeature, ctx: &PreparedContext<'_>) -> 
             .unwrap_or(0);
     }
 
-    tx.spliced_seq
-        .as_ref()
-        .map(|sequence| sequence.len())
-        .or_else(|| tx.cdna_seq.as_ref().map(|sequence| sequence.len()))
-        .or_else(|| {
-            ctx.exons_by_tx.get(tx.transcript_id.as_str()).map(|exons| {
-                exons
-                    .iter()
-                    .map(|exon| exon.end.saturating_sub(exon.start).saturating_add(1))
-                    .filter_map(|len| usize::try_from(len).ok())
-                    .sum()
-            })
+    // Traceability:
+    // - Ensembl VEP release 115 uses `$tr->length()` for transcripts without
+    //   translation in `OutputFactory::pick_worst_VariationFeatureOverlapAllele()`.
+    // - Ensembl core `Bio::EnsEMBL::Transcript::length()` sums exon lengths;
+    //   it does not rank non-coding transcripts by cached `spliced_seq`.
+    ctx.exons_by_tx
+        .get(tx.transcript_id.as_str())
+        .map(|exons| {
+            exons
+                .iter()
+                .map(|exon| exon.end.saturating_sub(exon.start).saturating_add(1))
+                .filter_map(|len| usize::try_from(len).ok())
+                .sum()
         })
         .unwrap_or_else(|| {
             usize::try_from(tx.end.saturating_sub(tx.start).saturating_add(1)).unwrap_or(0)
@@ -9728,23 +9729,22 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_flag_pick_allele_gene_uses_spliced_length_for_noncoding_transcripts() {
-        let mut tx_shorter_spliced =
-            make_tx("ENST00000041", Some("GENE1"), Some("HGNC"), None, None);
-        tx_shorter_spliced.gene_stable_id = Some("ENSG00000041".to_string());
-        tx_shorter_spliced.biotype = "lncRNA".to_string();
-        // Genomic span is intentionally larger; exon length drives the pick.
-        tx_shorter_spliced.start = 1;
-        tx_shorter_spliced.end = 1000;
+    fn test_mark_flag_pick_allele_gene_uses_exon_length_for_noncoding_transcripts() {
+        let mut tx_shorter_exons = make_tx("ENST00000041", Some("GENE1"), Some("HGNC"), None, None);
+        tx_shorter_exons.gene_stable_id = Some("ENSG00000041".to_string());
+        tx_shorter_exons.biotype = "lncRNA".to_string();
+        tx_shorter_exons.start = 1;
+        tx_shorter_exons.end = 1000;
+        tx_shorter_exons.spliced_seq = Some("A".repeat(300));
+        tx_shorter_exons.cdna_seq = Some("A".repeat(300));
 
-        let mut tx_longer_spliced =
-            make_tx("ENST00000042", Some("GENE1"), Some("HGNC"), None, None);
-        tx_longer_spliced.gene_stable_id = Some("ENSG00000041".to_string());
-        tx_longer_spliced.biotype = "lncRNA".to_string();
-        tx_longer_spliced.start = 1;
-        tx_longer_spliced.end = 500;
+        let mut tx_longer_exons = make_tx("ENST00000042", Some("GENE1"), Some("HGNC"), None, None);
+        tx_longer_exons.gene_stable_id = Some("ENSG00000041".to_string());
+        tx_longer_exons.biotype = "lncRNA".to_string();
+        tx_longer_exons.start = 1;
+        tx_longer_exons.end = 500;
 
-        let transcripts = vec![tx_shorter_spliced, tx_longer_spliced];
+        let transcripts = vec![tx_shorter_exons, tx_longer_exons];
         let exons = vec![
             ExonFeature {
                 transcript_id: "ENST00000041".to_string(),
