@@ -7575,6 +7575,71 @@ type PersistedBufferTranscripts =
 
 type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
 
+#[derive(Default)]
+struct InputBufferAccumulator {
+    pending_batches: VecDeque<RecordBatch>,
+    pending_rows: usize,
+}
+
+impl InputBufferAccumulator {
+    fn pending_rows(&self) -> usize {
+        self.pending_rows
+    }
+
+    fn push_window_and_drain_ready(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        row_limit: usize,
+        flush_partial: bool,
+    ) -> Vec<Vec<RecordBatch>> {
+        for batch in batches {
+            let rows = batch.num_rows();
+            if rows == 0 {
+                continue;
+            }
+            self.pending_rows += rows;
+            self.pending_batches.push_back(batch);
+        }
+
+        let row_limit = row_limit.max(1);
+        let mut ready = Vec::new();
+        while self.pending_rows >= row_limit {
+            ready.push(self.drain_rows(row_limit));
+        }
+        if flush_partial && self.pending_rows > 0 {
+            ready.push(self.drain_rows(self.pending_rows));
+        }
+        ready
+    }
+
+    fn drain_rows(&mut self, rows: usize) -> Vec<RecordBatch> {
+        debug_assert!(rows > 0);
+        debug_assert!(rows <= self.pending_rows);
+
+        let mut remaining = rows;
+        let mut drained = Vec::new();
+        while remaining > 0 {
+            let batch = self
+                .pending_batches
+                .pop_front()
+                .expect("pending row count must match pending batches");
+            let batch_rows = batch.num_rows();
+            if batch_rows <= remaining {
+                remaining -= batch_rows;
+                drained.push(batch);
+            } else {
+                drained.push(batch.slice(0, remaining));
+                self.pending_batches
+                    .push_front(batch.slice(remaining, batch_rows - remaining));
+                remaining = 0;
+            }
+        }
+
+        self.pending_rows -= rows;
+        drained
+    }
+}
+
 /// Everything needed to start streaming annotation for a contig.
 /// Produced by `prepare_contig_context()`.
 struct ContigReadyState {
@@ -7628,6 +7693,7 @@ struct ContigAnnotationState {
     engine: TranscriptConsequenceEngine,
     // Window buffer.
     window_buffer: Vec<RecordBatch>,
+    input_buffer_accumulator: InputBufferAccumulator,
     lookup_done: bool,
     // Cleanup + profiling.
     ephemeral_tables: Vec<String>,
@@ -7817,34 +7883,6 @@ fn hydrate_window(
     Ok(())
 }
 
-fn split_batches_by_row_limit(batches: &[RecordBatch], row_limit: usize) -> Vec<Vec<RecordBatch>> {
-    let mut out = Vec::new();
-    let mut current = Vec::new();
-    let mut current_rows = 0usize;
-
-    for batch in batches {
-        let mut offset = 0usize;
-        while offset < batch.num_rows() {
-            let remaining = row_limit.saturating_sub(current_rows);
-            let take = remaining.min(batch.num_rows() - offset);
-            current.push(batch.slice(offset, take));
-            current_rows += take;
-            offset += take;
-
-            if current_rows == row_limit {
-                out.push(std::mem::take(&mut current));
-                current_rows = 0;
-            }
-        }
-    }
-
-    if !current.is_empty() {
-        out.push(current);
-    }
-
-    out
-}
-
 fn buffer_variant_bounds(batches: &[RecordBatch]) -> Result<Option<(String, i64, i64)>> {
     let mut chrom: Option<String> = None;
     let mut min_start = i64::MAX;
@@ -7933,13 +7971,6 @@ fn transcript_cache_regions(transcript: &TranscriptFeature) -> Vec<TranscriptCac
     cache_regions_for_coords(&transcript.chrom, transcript.start, transcript.end, 0, 0)
 }
 
-fn transcript_start_cache_region(transcript: &TranscriptFeature) -> TranscriptCacheRegion {
-    TranscriptCacheRegion {
-        chrom: normalized_chrom_name(&transcript.chrom).to_string(),
-        region_index: cache_region_index(transcript.start),
-    }
-}
-
 fn collect_buffer_cache_regions(
     batches: &[RecordBatch],
     upstream_distance: i64,
@@ -8012,7 +8043,6 @@ fn select_buffer_local_transcripts(
     max_end: i64,
     upstream_distance: i64,
     downstream_distance: i64,
-    active_regions: &HashSet<TranscriptCacheRegion>,
 ) -> Vec<TranscriptFeature> {
     let chrom_norm = chrom.strip_prefix("chr").unwrap_or(chrom);
     // VEP's up_down_size = max(upstream, downstream), applied symmetrically.
@@ -8026,10 +8056,11 @@ fn select_buffer_local_transcripts(
         .filter(|tx| {
             let tx_chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
             tx_chrom == chrom_norm
-                // VEP populates transcript objects per 1 Mb cache region; same-region
-                // donor objects are needed for merge_features() HGNC propagation.
-                && ((tx.end >= query_start && tx.start <= query_end)
-                    || active_regions.contains(&transcript_start_cache_region(tx)))
+                // VEP fetches broad 1 Mb cache regions, but it filters those
+                // cached features against the input-buffer min/max window
+                // before merge_features() can propagate HGNC values.
+                && tx.end >= query_start
+                && tx.start <= query_end
         })
         .cloned()
         .collect()
@@ -8043,15 +8074,6 @@ fn build_buffer_local_transcripts(
     upstream_distance: i64,
     downstream_distance: i64,
 ) -> Vec<TranscriptFeature> {
-    let active_regions: HashSet<TranscriptCacheRegion> = cache_regions_for_coords(
-        chrom,
-        min_start,
-        max_end,
-        upstream_distance,
-        downstream_distance,
-    )
-    .into_iter()
-    .collect();
     let mut buffer_transcripts = select_buffer_local_transcripts(
         transcripts,
         chrom,
@@ -8059,7 +8081,6 @@ fn build_buffer_local_transcripts(
         max_end,
         upstream_distance,
         downstream_distance,
-        &active_regions,
     );
     reset_buffer_local_hgnc_effective_values(&mut buffer_transcripts);
     apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
@@ -8088,7 +8109,6 @@ fn build_stateful_buffer_local_transcripts(
         max_end,
         upstream_distance,
         downstream_distance,
-        &active_regions,
     );
 
     // Reuse the same transcript objects across adjacent input buffers while
@@ -8265,7 +8285,14 @@ fn annotate_window(
     let sift_enabled = ann.config.flags.everything;
     let mut out = VecDeque::with_capacity(window_batches.len());
 
-    for buffer_batches in split_batches_by_row_limit(window_batches, ann.config.input_buffer_size) {
+    let flush_partial = ann.lookup_done && ann.window_buffer.is_empty();
+    let ready_input_buffers = ann.input_buffer_accumulator.push_window_and_drain_ready(
+        window_batches.to_vec(),
+        ann.config.input_buffer_size,
+        flush_partial,
+    );
+
+    for buffer_batches in ready_input_buffers {
         let Some((chrom, min_start, max_end)) = buffer_variant_bounds(&buffer_batches)? else {
             continue;
         };
@@ -8573,6 +8600,7 @@ impl Stream for ContigAnnotationStream {
                             tmp_provider,
                             engine,
                             window_buffer: Vec::with_capacity(HYDRATION_WINDOW_SIZE),
+                            input_buffer_accumulator: InputBufferAccumulator::default(),
                             lookup_done: false,
                             ephemeral_tables: ready.ephemeral_tables,
                             chrom: ready.chrom,
@@ -8651,8 +8679,10 @@ impl Stream for ContigAnnotationStream {
 
                     // LIMIT pushdown: skip remaining windows if limit reached.
                     let limit_reached = fetch_limit.is_some_and(|limit| rows_emitted >= limit);
+                    let has_pending_input_buffer = ann.input_buffer_accumulator.pending_rows() > 0;
 
-                    if ann.window_buffer.is_empty() || limit_reached {
+                    if limit_reached || (ann.window_buffer.is_empty() && !has_pending_input_buffer)
+                    {
                         // No more data (or limit reached) — clean up.
                         // Drop heavy state eagerly before the async cleanup future runs.
                         profile_end!(
@@ -8696,21 +8726,23 @@ impl Stream for ContigAnnotationStream {
                         ann.window_buffer.drain(..window_end).collect();
 
                     // Window-based HGVS hydration (like SIFT sliding window).
-                    if let Err(e) = hydrate_window(
-                        &mut ann.transcripts,
-                        &ann.exons,
-                        &mut ann.translations,
-                        &ann.translateable_seq_by_tx,
-                        &mut ann.hgvs_reader,
-                        &mut ann.hydrated_cds_tx_ids,
-                        &window_batches,
-                    ) {
-                        let fut = make_cleanup_future(
-                            Arc::clone(&ann.session),
-                            std::mem::take(&mut ann.ephemeral_tables),
-                        );
-                        self.state = StreamState::ErrorCleaningUp(fut, e);
-                        continue;
+                    if !window_batches.is_empty() {
+                        if let Err(e) = hydrate_window(
+                            &mut ann.transcripts,
+                            &ann.exons,
+                            &mut ann.translations,
+                            &ann.translateable_seq_by_tx,
+                            &mut ann.hgvs_reader,
+                            &mut ann.hydrated_cds_tx_ids,
+                            &window_batches,
+                        ) {
+                            let fut = make_cleanup_future(
+                                Arc::clone(&ann.session),
+                                std::mem::take(&mut ann.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(fut, e);
+                            continue;
+                        }
                     }
 
                     // Annotate window.
@@ -10112,6 +10144,56 @@ mod tests {
         .unwrap()
     }
 
+    fn make_buffer_batch_many(chrom: &str, starts: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![chrom; starts.len()])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(starts.to_vec())) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(starts.to_vec())) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_input_buffer_accumulator_carries_partial_rows_across_windows() {
+        let mut accumulator = InputBufferAccumulator::default();
+
+        let first_ready = accumulator.push_window_and_drain_ready(
+            vec![make_buffer_batch_many("chr2", &[1, 2, 3])],
+            5,
+            false,
+        );
+        assert!(first_ready.is_empty());
+        assert_eq!(accumulator.pending_rows(), 3);
+
+        let second_ready = accumulator.push_window_and_drain_ready(
+            vec![make_buffer_batch_many("chr2", &[4, 5, 6, 7])],
+            5,
+            false,
+        );
+        assert_eq!(second_ready.len(), 1);
+        assert_eq!(
+            buffer_variant_bounds(&second_ready[0]).unwrap(),
+            Some(("chr2".to_string(), 1, 5))
+        );
+        assert_eq!(accumulator.pending_rows(), 2);
+
+        let final_ready = accumulator.push_window_and_drain_ready(Vec::new(), 5, true);
+        assert_eq!(final_ready.len(), 1);
+        assert_eq!(
+            buffer_variant_bounds(&final_ready[0]).unwrap(),
+            Some(("chr2".to_string(), 6, 7))
+        );
+        assert_eq!(accumulator.pending_rows(), 0);
+    }
+
     #[test]
     fn test_transcript_selection_flags_reject_invalid_combinations() {
         let err =
@@ -10766,7 +10848,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_buffer_local_transcripts_includes_active_cache_region_starts() {
+    fn test_build_buffer_local_transcripts_filters_same_region_non_overlaps() {
         let mut tx_before = make_tx(
             "ENST00000000001",
             Some("ENSG_BEFORE"),
@@ -10819,13 +10901,13 @@ mod tests {
         );
 
         let scoped_ids: HashSet<&str> = scoped.iter().map(|tx| tx.transcript_id.as_str()).collect();
-        assert_eq!(scoped_ids.len(), 2);
+        assert_eq!(scoped_ids.len(), 1);
         assert!(scoped_ids.contains(tx_inside.transcript_id.as_str()));
-        assert!(scoped_ids.contains(tx_same_region_donor.transcript_id.as_str()));
+        assert!(!scoped_ids.contains(tx_same_region_donor.transcript_id.as_str()));
     }
 
     #[test]
-    fn test_stateful_buffer_local_transcripts_include_same_cache_region_hgnc_donor() {
+    fn test_stateful_buffer_local_transcripts_filters_same_region_hgnc_donor() {
         let mut tx_recipient = make_tx(
             "NR_160941.1",
             Some("106479023"),
@@ -10873,7 +10955,83 @@ mod tests {
             .iter()
             .find(|tx| tx.transcript_id == "NR_160941.1")
             .unwrap();
-        assert_eq!(recipient.gene_hgnc_id.as_deref(), Some("HGNC:43797"));
+        assert_eq!(recipient.gene_hgnc_id, None);
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_filters_anapc1p1_donor_before_boundary() {
+        let mut tx_recipient = make_tx(
+            "NR_037931.2",
+            Some("100286979"),
+            Some("ANAPC1P1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr2".to_string();
+        tx_recipient.start = 86_861_787;
+        tx_recipient.end = 86_912_978;
+
+        let mut tx_donor = make_tx(
+            "ENST00000426186",
+            Some("ENSG00000233673"),
+            Some("ANAPC1P1"),
+            Some("HGNC"),
+            Some("HGNC:44150"),
+        );
+        tx_donor.chrom = "chr2".to_string();
+        tx_donor.start = 86_871_301;
+        tx_donor.end = 86_912_978;
+
+        let transcripts = vec![tx_recipient, tx_donor];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        let first_buffer = vec![make_buffer_batch_many(
+            "chr2",
+            &[
+                86_856_985, 86_857_793, 86_858_475, 86_858_518, 86_858_619, 86_859_060, 86_859_741,
+                86_860_097, 86_860_689, 86_861_077, 86_861_757, 86_861_841, 86_862_499,
+            ],
+        )];
+        let first_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &first_buffer,
+            "chr2",
+            86_856_985,
+            86_862_499,
+            5_000,
+            5_000,
+        )
+        .unwrap();
+        let first_recipient = first_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "NR_037931.2")
+            .unwrap();
+        assert_eq!(first_recipient.gene_hgnc_id, None);
+
+        let second_buffer = vec![make_buffer_batch_many("chr2", &[86_862_550, 86_871_302])];
+        let second_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &second_buffer,
+            "chr2",
+            86_862_550,
+            86_871_302,
+            5_000,
+            5_000,
+        )
+        .unwrap();
+        let second_recipient = second_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "NR_037931.2")
+            .unwrap();
+        assert_eq!(second_recipient.gene_hgnc_id.as_deref(), Some("HGNC:44150"));
     }
 
     #[test]

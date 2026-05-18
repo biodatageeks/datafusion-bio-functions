@@ -20,6 +20,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 /// Used by Python wrappers (vepyr) to drive tqdm progress bars in Jupyter.
 pub type OnBatchWritten = Box<dyn Fn(usize, usize, usize) + Send + Sync>;
 
+/// Ensembl VEP release/115 default `--buffer_size`.
+pub const VEP_DEFAULT_BUFFER_SIZE: usize = 5000;
+
 /// Configuration for VCF annotation output.
 pub struct AnnotateVcfConfig {
     /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
@@ -77,6 +80,8 @@ pub struct AnnotateVcfConfig {
     pub failed: Option<i64>,
     /// Upstream/downstream distance for transcript overlap.
     pub distance: Option<String>,
+    /// Number of input variants per VEP-style annotation buffer.
+    pub buffer_size: usize,
     /// Output compression type.
     pub compression: VcfCompressionType,
     /// Show an indicatif progress bar on stderr (for Rust CLI).
@@ -117,6 +122,7 @@ impl Default for AnnotateVcfConfig {
             exclude_predicted: false,
             failed: None,
             distance: None,
+            buffer_size: VEP_DEFAULT_BUFFER_SIZE,
             compression: VcfCompressionType::Plain,
             show_progress: false,
             on_batch_written: None,
@@ -128,6 +134,7 @@ impl std::fmt::Debug for AnnotateVcfConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnnotateVcfConfig")
             .field("everything", &self.everything)
+            .field("buffer_size", &self.buffer_size)
             .field("compression", &self.compression)
             .field("show_progress", &self.show_progress)
             .field("on_batch_written", &self.on_batch_written.is_some())
@@ -221,6 +228,10 @@ impl AnnotateVcfConfig {
         if let Some(ref dist) = self.distance {
             opts.insert("distance".into(), serde_json::Value::String(dist.clone()));
         }
+        opts.insert(
+            "buffer_size".into(),
+            serde_json::Value::Number(serde_json::Number::from(self.buffer_size)),
+        );
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
 
@@ -503,6 +514,17 @@ mod tests {
         assert!(json.contains("\"flag_pick_allele\":true"));
         assert!(json.contains("\"flag_pick_allele_gene\":true"));
         assert!(json.contains("\"pick_order\":\"mane_select,tsl,canonical\""));
+    }
+
+    #[test]
+    fn test_to_options_json_emits_buffer_size() {
+        let config = AnnotateVcfConfig {
+            buffer_size: 1234,
+            ..Default::default()
+        };
+
+        let json = config.to_options_json();
+        assert!(json.contains("\"buffer_size\":1234"));
     }
 
     #[test]
