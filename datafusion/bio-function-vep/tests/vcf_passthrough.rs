@@ -12,6 +12,8 @@ use datafusion::prelude::*;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::register_vep_functions;
 
+mod common;
+
 /// Resolve a path relative to the workspace root (two levels up from CARGO_MANIFEST_DIR).
 /// Check if a file is a Git LFS pointer (not actual content).
 fn is_lfs_pointer(path: &std::path::Path) -> bool {
@@ -38,7 +40,11 @@ fn count_non_null_strings(array: &dyn Array) -> usize {
 
 async fn build_test_query(
     sql_select: &str,
-) -> Option<(datafusion::prelude::DataFrame, Vec<String>)> {
+) -> Option<(
+    datafusion::prelude::DataFrame,
+    Vec<String>,
+    tempfile::TempDir,
+)> {
     let input_vcf = workspace_path("vep-benchmark/data/golden/input_1000.vcf");
     if !input_vcf.exists() || is_lfs_pointer(&input_vcf) {
         eprintln!(
@@ -49,7 +55,8 @@ async fn build_test_query(
     }
     let input_vcf = input_vcf.to_str().unwrap();
     let cache_path = workspace_path("vep-benchmark/data/golden/cache");
-    let cache_path = cache_path.to_str().unwrap();
+    let cache_with_metadata = common::cache_with_source_metadata(&cache_path, "ensembl");
+    let cache_path = cache_with_metadata.path().to_str().unwrap();
 
     let input_str = input_vcf.to_string();
     let vcf_provider = tokio::task::spawn_blocking(move || {
@@ -76,12 +83,13 @@ async fn build_test_query(
          \"reference_fasta_path\":\"{ref_fasta}\"}}')"
     );
     let df = ctx.sql(&sql).await.unwrap();
-    Some((df, input_field_names))
+    Some((df, input_field_names, cache_with_metadata))
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_vcf_columns_pass_through_annotation() {
-    let Some((df, input_field_names)) = build_test_query("SELECT *").await else {
+    let Some((df, input_field_names, _cache_with_metadata)) = build_test_query("SELECT *").await
+    else {
         return;
     };
     let output_schema = df.schema().clone();
@@ -134,7 +142,9 @@ async fn test_vcf_columns_pass_through_annotation() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_projection_including_csq_preserves_values() {
-    let Some((df, _)) = build_test_query("SELECT chrom, start, \"CSQ\"").await else {
+    let Some((df, _, _cache_with_metadata)) =
+        build_test_query("SELECT chrom, start, \"CSQ\"").await
+    else {
         return;
     };
 
@@ -157,7 +167,7 @@ async fn test_projection_including_csq_preserves_values() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_projection_omitting_csq_skips_column() {
-    let Some((df, _)) = build_test_query("SELECT chrom, start").await else {
+    let Some((df, _, _cache_with_metadata)) = build_test_query("SELECT chrom, start").await else {
         return;
     };
 

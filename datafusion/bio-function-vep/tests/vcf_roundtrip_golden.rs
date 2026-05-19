@@ -14,6 +14,8 @@ use datafusion::prelude::*;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::vcf_sink;
 
+mod common;
+
 /// Check if a file is a Git LFS pointer (not actual content).
 fn is_lfs_pointer(path: &std::path::Path) -> bool {
     std::fs::read_to_string(path)
@@ -44,7 +46,8 @@ async fn test_roundtrip_golden_all_column_values() {
     }
     let input_vcf = input_vcf.to_str().unwrap();
     let golden_vcf = golden_vcf.to_str().unwrap();
-    let cache_path = cache_path.to_str().unwrap();
+    let cache_with_metadata = common::cache_with_source_metadata(&cache_path, "ensembl");
+    let cache_path = cache_with_metadata.path().to_str().unwrap();
     let ref_fasta = ref_fasta.to_str().unwrap();
 
     // ── Step 1: Annotate and write to VCF ──────────────────────────
