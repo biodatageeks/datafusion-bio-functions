@@ -54,10 +54,10 @@ selector.
 The system SHALL filter transcripts according to the explicit cache source mode,
 matching Ensembl VEP cache behavior for Ensembl, merged, and RefSeq caches.
 
-#### Scenario: Ensembl mode accepts only Ensembl transcripts
+#### Scenario: Ensembl mode accepts stable transcripts
 - **WHEN** cache source mode is `ensembl`
-- **THEN** transcripts with stable IDs beginning `ENST` are included
-- **AND** RefSeq-only stable IDs such as `NM_000000.1`, `NR_000000.1`, `XM_000000.1`, and `XR_000000.1` are excluded
+- **THEN** transcripts with non-empty stable IDs are included after common gencode filters
+- **AND** transcript IDs are not required to begin `ENST`
 
 #### Scenario: RefSeq mode accepts canonical RefSeq transcripts
 - **WHEN** cache source mode is `refseq`
@@ -74,6 +74,7 @@ matching Ensembl VEP cache behavior for Ensembl, merged, and RefSeq caches.
 - **THEN** Ensembl transcript rows beginning `ENST` are included
 - **AND** RefSeq rows beginning `NM_`, `NR_`, `XM_`, or `XR_` are included
 - **AND** mitochondrial RefSeq rows accepted by Ensembl VEP are included when the row source is RefSeq
+- **AND** non-RefSeq-source rows with non-empty stable IDs are included even when their IDs do not begin `ENST`
 
 ### Requirement: Source-Specific CSQ SOURCE Output
 The system SHALL populate the CSQ `SOURCE` field only for merged cache mode.

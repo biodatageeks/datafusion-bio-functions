@@ -6309,14 +6309,6 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
     }
 }
 
-fn is_ensembl_transcript(tx: &TranscriptFeature) -> bool {
-    tx.source.as_deref() == Some("Ensembl") || tx.transcript_id.starts_with("ENST")
-}
-
-fn is_ensembl_transcript_id(id: &str) -> bool {
-    id.starts_with("ENST")
-}
-
 fn row_source_is_refseq(tx: &TranscriptFeature) -> bool {
     tx.source_cache
         .as_deref()
@@ -6333,10 +6325,6 @@ fn is_standard_refseq_accession(id: &str) -> bool {
         && bytes[1].is_ascii_uppercase()
         && bytes[2] == b'_'
         && bytes[3].is_ascii_digit()
-}
-
-fn is_refseq_transcript(tx: &TranscriptFeature) -> bool {
-    row_source_is_refseq(tx) || is_standard_refseq_accession(&tx.transcript_id)
 }
 
 fn is_refseq_offset_transcript(tx: &TranscriptFeature) -> bool {
@@ -6444,21 +6432,18 @@ fn passes_transcript_selection(
         return false;
     }
 
+    // Ensembl VEP release/115 only applies the RefSeq stable-id whitelist when
+    // source_type is RefSeq, or when source_type is merged and the row came
+    // from the RefSeq cache. Other source rows pass once the common filters
+    // above have accepted their stable ID.
     match selection.cache_source_type {
-        CacheSourceType::Ensembl => {
-            // Match VEP source-mode behavior: Ensembl mode keeps Ensembl stable
-            // transcript IDs and intentionally excludes source-labeled non-ENST
-            // rows such as LRG transcripts.
-            is_ensembl_transcript_id(&tx.transcript_id)
-        }
+        CacheSourceType::Ensembl => true,
         CacheSourceType::RefSeq => selection.all_refseq || is_default_refseq_transcript_id(tx),
         CacheSourceType::Merged => {
-            if is_ensembl_transcript_id(&tx.transcript_id) {
-                true
-            } else if row_source_is_refseq(tx) {
+            if row_source_is_refseq(tx) {
                 selection.all_refseq || is_default_refseq_transcript_id(tx)
             } else {
-                false
+                true
             }
         }
     }
@@ -10850,6 +10835,7 @@ mod tests {
     #[test]
     fn test_passes_transcript_selection_matches_vep_refseq_filters() {
         let ensembl_tx = make_selection_tx("ENST00000311111", Some("Ensembl"));
+        let lrg_tx = make_selection_tx("LRG_485", Some("Ensembl"));
         let nm_tx = make_selection_tx("NM_000001", Some("RefSeq"));
         let nr_tx = make_selection_tx("NR_123456.1", Some("RefSeq"));
         let xm_tx = make_selection_tx("XM_011520402.2", Some("RefSeq"));
@@ -10871,7 +10857,10 @@ mod tests {
         let default_selection =
             TranscriptSelectionFlags::from_options_json(CacheSourceType::Ensembl, None).unwrap();
         assert!(passes_transcript_selection(&ensembl_tx, default_selection));
-        assert!(!passes_transcript_selection(&nm_tx, default_selection));
+        assert!(
+            passes_transcript_selection(&lrg_tx, default_selection),
+            "VEP Ensembl mode does not require ENST-prefixed stable IDs"
+        );
 
         let refseq_selection =
             TranscriptSelectionFlags::from_options_json(CacheSourceType::RefSeq, None).unwrap();
@@ -10891,6 +10880,21 @@ mod tests {
             "CCDS rows should be excluded unless all_refseq is enabled"
         );
 
+        let merged_selection =
+            TranscriptSelectionFlags::from_options_json(CacheSourceType::Merged, None).unwrap();
+        assert!(passes_transcript_selection(&ensembl_tx, merged_selection));
+        assert!(passes_transcript_selection(&lrg_tx, merged_selection));
+        assert!(passes_transcript_selection(&nm_tx, merged_selection));
+        assert!(passes_transcript_selection(&mt_gene_tx, merged_selection));
+        assert!(
+            passes_transcript_selection(&non_refseq_mt_gene_tx, merged_selection),
+            "VEP merged mode applies RefSeq filtering only to RefSeq-sourced rows"
+        );
+        assert!(
+            !passes_transcript_selection(&ccds_tx, merged_selection),
+            "merged RefSeq rows should still use the default RefSeq whitelist"
+        );
+
         let all_refseq_selection = TranscriptSelectionFlags::from_options_json(
             CacheSourceType::Merged,
             Some("{\"all_refseq\":true}"),
@@ -10900,6 +10904,7 @@ mod tests {
             &ensembl_tx,
             all_refseq_selection
         ));
+        assert!(passes_transcript_selection(&lrg_tx, all_refseq_selection));
         assert!(passes_transcript_selection(&nm_tx, all_refseq_selection));
         assert!(passes_transcript_selection(&ccds_tx, all_refseq_selection));
         assert!(passes_transcript_selection(
@@ -10907,8 +10912,8 @@ mod tests {
             all_refseq_selection
         ));
         assert!(
-            !passes_transcript_selection(&non_refseq_mt_gene_tx, all_refseq_selection),
-            "merged mode should not accept mitochondrial gene-like IDs without RefSeq row source"
+            passes_transcript_selection(&non_refseq_mt_gene_tx, all_refseq_selection),
+            "VEP merged mode applies RefSeq filtering only to RefSeq-sourced rows"
         );
 
         let exclude_predicted_selection = TranscriptSelectionFlags::from_options_json(

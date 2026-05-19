@@ -277,10 +277,6 @@ async fn validate_registered_cache_source(&self, table: &str, role: &str) -> Res
 - [ ] 7.3 Add source helpers near the existing transcript filtering helpers:
 
 ```rust
-fn is_ensembl_transcript_id(id: &str) -> bool {
-    id.starts_with("ENST")
-}
-
 fn is_standard_refseq_accession(id: &str) -> bool {
     let bytes = id.as_bytes();
     bytes.len() >= 4 && bytes[0].is_ascii_uppercase() && bytes[1].is_ascii_uppercase() && bytes[2] == b'_' && bytes[3].is_ascii_digit()
@@ -318,25 +314,23 @@ fn row_source_is_refseq(tx: &TranscriptFeature) -> bool {
 
 ```rust
 match selection.cache_source_type {
-    CacheSourceType::Ensembl => is_ensembl_transcript_id(&tx.transcript_id),
+    CacheSourceType::Ensembl => true,
     CacheSourceType::RefSeq => {
         selection.all_refseq || is_default_refseq_transcript_id(tx)
     }
     CacheSourceType::Merged => {
-        if is_ensembl_transcript_id(&tx.transcript_id) {
-            true
-        } else if row_source_is_refseq(tx) {
+        if row_source_is_refseq(tx) {
             selection.all_refseq || is_default_refseq_transcript_id(tx)
         } else {
-            false
+            true
         }
     }
 }
 ```
 
-- [ ] 7.6 Keep `exclude_predicted` as an earlier RefSeq-only filter for `XM_`/`XR_`.
+- [ ] 7.6 Keep `exclude_predicted` as an earlier filter for `XM_`/`XR_` in RefSeq-capable modes.
 - [ ] 7.7 Retire `transcript_consequence::is_vep_transcript(id, merged)` if it remains unused. If tests or future call sites need it, replace it with a `TranscriptFeature` plus `CacheSourceType` signature.
-- [ ] 7.8 Add unit tests for Ensembl, RefSeq, merged, numeric MT IDs, `COX3`, `rna-TRNK`, and a non-RefSeq merged row whose ID would otherwise match the MT exception pattern.
+- [ ] 7.8 Add unit tests for Ensembl, RefSeq, merged, non-`ENST` Ensembl-side IDs, numeric MT IDs, `COX3`, `rna-TRNK`, and a non-RefSeq merged row whose ID would otherwise match the MT exception pattern.
 
 ### 8. Drive CSQ Fields from Source Mode
 

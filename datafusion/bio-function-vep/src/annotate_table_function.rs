@@ -3620,7 +3620,9 @@ mod tests {
             .next()
             .expect("default CSQ entry");
         assert_eq!(default_entry.len(), 74);
-        assert_eq!(default_entry[1], "intergenic_variant");
+        assert_eq!(default_entry[1], "non_coding_transcript_exon_variant");
+        assert_eq!(default_entry[5], "Transcript");
+        assert_eq!(default_entry[6], "NM_000001");
 
         let refseq_tmpdir = TempDir::new().expect("create refseq tmpdir");
         write_batch_to_cache_with_source(

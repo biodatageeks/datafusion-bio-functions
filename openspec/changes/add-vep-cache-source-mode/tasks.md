@@ -61,10 +61,10 @@
 ### 4.1 Replace `is_vep_transcript`
 - [x] 4.1.1 Change `is_vep_transcript(id: &str, merged: bool)` to source-mode-aware filtering
 - [x] 4.1.2 Prefer signature `is_vep_transcript(tx: &TranscriptFeature, source_type: CacheSourceType) -> bool`
-- [x] 4.1.3 Implement Ensembl mode: accept only IDs starting `ENST`
+- [x] 4.1.3 Implement Ensembl mode: accept non-empty stable IDs after common filters
 - [x] 4.1.4 Implement RefSeq mode: accept standard RefSeq IDs matching `^[A-Z]{2}_\d+`
 - [x] 4.1.5 Implement RefSeq mitochondrial exceptions: accept `^\d{4}$` and `^(rna-)?[A-Z0-9]{3,}$`
-- [x] 4.1.6 Implement merged mode: accept `ENST` rows plus RefSeq rows matching RefSeq rules when row source normalizes to `RefSeq`
+- [x] 4.1.6 Implement merged mode: accept non-RefSeq-source rows after common filters and apply RefSeq rules only when row source normalizes to `RefSeq`
 
 ### 4.2 Update transcript filtering call sites
 - [x] 4.2.1 Update partitioned context loading filter to call source-mode-aware `is_vep_transcript`
@@ -72,12 +72,12 @@
 - [x] 4.2.3 Keep HGNC backfill behavior for merged caches; do not apply merged-only HGNC fill to RefSeq-only mode unless existing data requires it
 
 ### 4.3 Add transcript filter tests
-- [x] 4.3.1 Test Ensembl mode includes `ENST00000367770` and excludes `NM_000546.6`
+- [x] 4.3.1 Test Ensembl mode includes `ENST00000367770` and a non-`ENST` stable ID
 - [x] 4.3.2 Test RefSeq mode includes `NM_000546.6`, `NR_123456.1`, `XM_011520402.2`, and `XR_001734695.1`
 - [x] 4.3.3 Test RefSeq mode includes mitochondrial names `4540`, `COX3`, and `rna-TRNK`
 - [x] 4.3.4 Test RefSeq mode excludes `ENST00000367770`
 - [x] 4.3.5 Test merged mode includes Ensembl rows and source-normalized RefSeq rows
-- [x] 4.3.6 Test merged mode does not include gene-like non-RefSeq rows solely because their ID matches the mitochondrial exception regex
+- [x] 4.3.6 Test merged mode includes non-RefSeq rows after common filters, including gene-like IDs that would match the mitochondrial exception regex only for RefSeq rows
 
 ## 5. CSQ SOURCE Output
 

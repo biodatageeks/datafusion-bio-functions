@@ -126,20 +126,21 @@ Rules:
 
 | Source mode | Accepted rows |
 |---|---|
-| `Ensembl` | `stable_id` starts with `ENST` |
+| `Ensembl` | any non-empty `stable_id` after common filters |
 | `RefSeq` | RefSeq stable IDs and RefSeq mitochondrial cache names |
-| `Merged` | `ENST` rows plus rows whose normalized row source is `RefSeq` and match RefSeq rules |
+| `Merged` | non-RefSeq-source rows after common filters, plus rows whose normalized row source is `RefSeq` and match RefSeq rules |
 
 RefSeq stable ID rules should match Ensembl VEP:
 - standard RefSeq IDs: `^[A-Z]{2}_\d+`
 - mitochondrial exceptions: `^\d{4}$|^(rna-)?[A-Z0-9]{3,}$`
 
-For merged mode, RefSeq ID and mitochondrial exceptions should be accepted only
-for rows whose source normalizes to `RefSeq`, so a non-RefSeq row with a
-gene-like ID is not accidentally included. This matches Ensembl VEP
+For merged mode, RefSeq ID and mitochondrial exceptions should be applied only
+for rows whose source normalizes to `RefSeq`. Other merged rows pass after the
+common stable-id and gencode filters. This matches Ensembl VEP
 `AnnotationType::Transcript::filter_transcript()`, which applies the RefSeq
 whitelist for `source_type eq 'refseq'` or for `source_type eq 'merged'` rows
-whose `_source_cache` is `RefSeq`.
+whose `_source_cache` is `RefSeq`; it does not impose an `ENST`-only rule on
+Ensembl-mode or merged Ensembl-source rows.
 
 ## CSQ SOURCE Output
 
@@ -216,8 +217,8 @@ source type instead of guessing from cache paths.
 Unit tests:
 - parse `ensembl`, `merged`, `refseq`; reject missing/invalid metadata
 - reject `{"merged": true}` and `{"merged": false}`
-- source-specific transcript inclusion for `ENST`, `NM_`, `NR_`, `XM_`, `XR_`,
-  `4540`, `COX3`, and `rna-TRNK`
+- source-specific transcript inclusion for non-`ENST` Ensembl-side stable IDs,
+  `NM_`, `NR_`, `XM_`, `XR_`, `4540`, `COX3`, and `rna-TRNK`
 - SOURCE output is populated only in merged mode
 - hydration eligibility includes RefSeq mitochondrial IDs
 
