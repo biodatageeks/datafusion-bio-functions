@@ -455,85 +455,19 @@ impl CacheBuilder {
                     })?;
                 }
 
-                use parquet::file::properties::WriterProperties;
-                use parquet::file::reader::FileReader;
-                use parquet::file::serialized_reader::SerializedFileReader;
-                use parquet::file::writer::SerializedFileWriter;
-
-                let first_reader = SerializedFileReader::try_from(
-                    File::open(&part_files[0].1)
-                        .map_err(|e| DataFusionError::Execution(format!("open part file: {e}")))?,
-                )
-                .map_err(|e| DataFusionError::Execution(format!("read part parquet: {e}")))?;
-                let parquet_schema = first_reader.metadata().file_metadata().schema().clone();
-                let props = WriterProperties::builder()
-                    .set_compression(parquet::basic::Compression::ZSTD(
-                        parquet::basic::ZstdLevel::try_new(self.zstd_level).unwrap_or_default(),
-                    ))
-                    .build();
-                drop(first_reader);
-
-                let out_file = File::create(output_file).map_err(|e| {
-                    DataFusionError::Execution(format!("create merged parquet: {e}"))
-                })?;
-                let mut merged_writer =
-                    SerializedFileWriter::new(out_file, Arc::new(parquet_schema), Arc::new(props))
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!("create parquet writer: {e}"))
-                        })?;
-
-                use parquet::column::writer::ColumnCloseResult;
-                use parquet::format::{ColumnIndex, OffsetIndex};
-
-                for (_, part_file, part_rows) in &part_files {
-                    let src_file = File::open(part_file)
-                        .map_err(|e| DataFusionError::Execution(format!("open part file: {e}")))?;
-                    let reader = SerializedFileReader::try_from(src_file).map_err(|e| {
-                        DataFusionError::Execution(format!("read part parquet: {e}"))
-                    })?;
-
-                    let meta = reader.metadata();
-                    for rg_idx in 0..meta.num_row_groups() {
-                        let rg_meta = meta.row_group(rg_idx);
-                        let mut rg_writer = merged_writer.next_row_group().map_err(|e| {
-                            DataFusionError::Execution(format!("create row group: {e}"))
-                        })?;
-
-                        // Re-open the file for each row group so append_column
-                        // can read column data via ChunkReader.
-                        let chunk_reader = File::open(part_file)
-                            .map_err(|e| DataFusionError::Execution(format!("open part: {e}")))?;
-
-                        for col_idx in 0..rg_meta.num_columns() {
-                            let col_meta = rg_meta.column(col_idx).clone();
-                            let close_result = ColumnCloseResult {
-                                bytes_written: col_meta.compressed_size() as u64,
-                                rows_written: rg_meta.num_rows() as u64,
-                                metadata: col_meta,
-                                bloom_filter: None,
-                                column_index: None,
-                                offset_index: None,
-                            };
-
-                            rg_writer
-                                .append_column(&chunk_reader, close_result)
-                                .map_err(|e| {
-                                    DataFusionError::Execution(format!("append column chunk: {e}"))
-                                })?;
-                        }
-
-                        rg_writer.close().map_err(|e| {
-                            DataFusionError::Execution(format!("close row group: {e}"))
-                        })?;
-                    }
-
-                    chrom_rows += part_rows;
-                    total_parquet_rows += part_rows;
+                let part_paths: Vec<String> = part_files
+                    .iter()
+                    .map(|(_, part_file, _)| part_file.clone())
+                    .collect();
+                let merged_rows =
+                    merge_parquet_row_groups(&part_paths, output_file, Some(self.zstd_level))?;
+                if merged_rows != parallel_rows {
+                    return Err(DataFusionError::Execution(format!(
+                        "merged parquet row count mismatch for {output_file}: copied {merged_rows}, expected {parallel_rows}"
+                    )));
                 }
-
-                merged_writer.close().map_err(|e| {
-                    DataFusionError::Execution(format!("close merged parquet: {e}"))
-                })?;
+                chrom_rows += merged_rows;
+                total_parquet_rows += merged_rows;
 
                 if let Some(ref cb) = self.on_progress {
                     cb("variation", "parquet", chrom_rows, total_parquet_rows, 0);
@@ -1986,6 +1920,93 @@ fn writer_properties(
     builder.build()
 }
 
+fn merge_parquet_row_groups(
+    part_files: &[String],
+    output_file: &str,
+    zstd_level: Option<i32>,
+) -> Result<usize> {
+    use parquet::column::writer::ColumnCloseResult;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+    use parquet::file::writer::SerializedFileWriter;
+
+    let first_part = part_files.first().ok_or_else(|| {
+        DataFusionError::Execution("merge parquet row groups: no part files provided".to_string())
+    })?;
+    let first_reader = SerializedFileReader::try_from(
+        File::open(first_part)
+            .map_err(|e| DataFusionError::Execution(format!("open part file: {e}")))?,
+    )
+    .map_err(|e| DataFusionError::Execution(format!("read part parquet: {e}")))?;
+    let first_file_metadata = first_reader.metadata().file_metadata();
+    let parquet_schema = first_file_metadata.schema().clone();
+    let key_value_metadata = first_file_metadata.key_value_metadata().cloned();
+    drop(first_reader);
+
+    let mut props = WriterProperties::builder();
+    if let Some(level) = zstd_level {
+        props = props.set_compression(parquet::basic::Compression::ZSTD(
+            parquet::basic::ZstdLevel::try_new(level).unwrap_or_default(),
+        ));
+    }
+    let props = props.set_key_value_metadata(key_value_metadata).build();
+
+    let out_file = File::create(output_file)
+        .map_err(|e| DataFusionError::Execution(format!("create merged parquet: {e}")))?;
+    let mut merged_writer =
+        SerializedFileWriter::new(out_file, Arc::new(parquet_schema), Arc::new(props))
+            .map_err(|e| DataFusionError::Execution(format!("create parquet writer: {e}")))?;
+
+    let mut total_rows = 0usize;
+    for part_file in part_files {
+        let src_file = File::open(part_file)
+            .map_err(|e| DataFusionError::Execution(format!("open part file: {e}")))?;
+        let reader = SerializedFileReader::try_from(src_file)
+            .map_err(|e| DataFusionError::Execution(format!("read part parquet: {e}")))?;
+
+        let meta = reader.metadata();
+        for rg_idx in 0..meta.num_row_groups() {
+            let rg_meta = meta.row_group(rg_idx);
+            let mut rg_writer = merged_writer
+                .next_row_group()
+                .map_err(|e| DataFusionError::Execution(format!("create row group: {e}")))?;
+
+            // Re-open the file for each row group so append_column can read
+            // column data via ChunkReader.
+            let chunk_reader = File::open(part_file)
+                .map_err(|e| DataFusionError::Execution(format!("open part: {e}")))?;
+
+            for col_idx in 0..rg_meta.num_columns() {
+                let col_meta = rg_meta.column(col_idx).clone();
+                let close_result = ColumnCloseResult {
+                    bytes_written: col_meta.compressed_size() as u64,
+                    rows_written: rg_meta.num_rows() as u64,
+                    metadata: col_meta,
+                    bloom_filter: None,
+                    column_index: None,
+                    offset_index: None,
+                };
+
+                rg_writer
+                    .append_column(&chunk_reader, close_result)
+                    .map_err(|e| DataFusionError::Execution(format!("append column chunk: {e}")))?;
+            }
+
+            rg_writer
+                .close()
+                .map_err(|e| DataFusionError::Execution(format!("close row group: {e}")))?;
+            total_rows += rg_meta.num_rows() as usize;
+        }
+    }
+
+    merged_writer
+        .close()
+        .map_err(|e| DataFusionError::Execution(format!("close merged parquet: {e}")))?;
+
+    Ok(total_rows)
+}
+
 fn project_batch(batch: &RecordBatch, target_schema: &SchemaRef) -> Result<RecordBatch> {
     let source_schema = batch.schema();
     let mut columns = Vec::with_capacity(target_schema.fields().len());
@@ -2230,6 +2251,7 @@ fn string_value(col: &dyn Array, row: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashMap;
@@ -2255,8 +2277,19 @@ mod tests {
         alleles: Vec<&str>,
         names: Vec<&str>,
     ) -> RecordBatch {
+        make_batch_with_schema(variation_schema(), chroms, starts, ends, alleles, names)
+    }
+
+    fn make_batch_with_schema(
+        schema: SchemaRef,
+        chroms: Vec<&str>,
+        starts: Vec<i64>,
+        ends: Vec<i64>,
+        alleles: Vec<&str>,
+        names: Vec<&str>,
+    ) -> RecordBatch {
         RecordBatch::try_new(
-            variation_schema(),
+            schema,
             vec![
                 Arc::new(StringArray::from(chroms)),
                 Arc::new(Int64Array::from(starts)),
@@ -4011,6 +4044,51 @@ mod tests {
             all_starts,
             vec![100, 200, 300, 400, 500, 600, 700, 800, 900],
             "merged data should preserve order and values"
+        );
+    }
+
+    #[test]
+    fn test_zero_copy_merge_preserves_arrow_schema_metadata() {
+        use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert(
+            CACHE_SOURCE_METADATA_KEY.to_string(),
+            CacheSourceType::RefSeq.as_str().to_string(),
+        );
+        let schema = Arc::new(
+            variation_schema()
+                .as_ref()
+                .clone()
+                .with_metadata(schema_metadata),
+        );
+        let batch = make_batch_with_schema(
+            schema,
+            vec!["1", "1"],
+            vec![100, 200],
+            vec![100, 200],
+            vec!["A/G", "C/T"],
+            vec!["rs1", "rs2"],
+        );
+        let part_path = format!("{}/part_0.parquet", dir_path.display());
+        write_parquet(&part_path, &[batch]);
+
+        let merged_path = format!("{}/merged.parquet", dir_path.display());
+        merge_parquet_row_groups(&[part_path], &merged_path, None).unwrap();
+
+        let merged_file = File::open(&merged_path).unwrap();
+        let arrow_metadata =
+            ArrowReaderMetadata::load(&merged_file, ArrowReaderOptions::default()).unwrap();
+        assert_eq!(
+            arrow_metadata
+                .schema()
+                .metadata()
+                .get(CACHE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(CacheSourceType::RefSeq.as_str())
         );
     }
 

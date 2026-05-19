@@ -6445,7 +6445,12 @@ fn passes_transcript_selection(
     }
 
     match selection.cache_source_type {
-        CacheSourceType::Ensembl => is_ensembl_transcript_id(&tx.transcript_id),
+        CacheSourceType::Ensembl => {
+            // Match VEP source-mode behavior: Ensembl mode keeps Ensembl stable
+            // transcript IDs and intentionally excludes source-labeled non-ENST
+            // rows such as LRG transcripts.
+            is_ensembl_transcript_id(&tx.transcript_id)
+        }
         CacheSourceType::RefSeq => selection.all_refseq || is_default_refseq_transcript_id(tx),
         CacheSourceType::Merged => {
             if is_ensembl_transcript_id(&tx.transcript_id) {
@@ -7067,6 +7072,8 @@ fn validate_partitioned_cache_source(
     let Some(path) = cache.context_path(context_type, chrom) else {
         return Ok(());
     };
+    // This validates the co-located shard used for the current chromosome.
+    // Mixed metadata across other shards is caught when those shards are read.
     let actual = CacheSourceType::from_parquet_file(&path).map_err(|err| {
         DataFusionError::Plan(format!(
             "annotate_vep(): {role} table '{}' has invalid cache source metadata: {err}",

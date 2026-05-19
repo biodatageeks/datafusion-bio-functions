@@ -106,7 +106,6 @@ fn first_variation_parquet(cache_source: &str) -> Result<PathBuf> {
                 parquet_files.push(path);
             }
         }
-        dirs.sort();
     }
     parquet_files.sort();
     parquet_files.into_iter().next().ok_or_else(|| {

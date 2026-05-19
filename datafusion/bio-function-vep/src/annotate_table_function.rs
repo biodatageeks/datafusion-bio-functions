@@ -18,6 +18,10 @@ use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 
 /// Table function implementing
 /// `annotate_vep(vcf_table, cache_source, backend [, options_json])`.
+///
+/// Cache source mode is read from Arrow schema metadata on a parquet file under
+/// `{cache_source}/variation`. That directory must be readable even when the
+/// annotation backend itself is `fjall`.
 pub struct AnnotateFunction {
     session: Arc<SessionContext>,
     /// Catalog list captured at registration time to avoid acquiring

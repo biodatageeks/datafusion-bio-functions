@@ -261,6 +261,10 @@ fn csq_header_description(
 /// are NOT written to the VCF — only core VCF columns, original INFO/FORMAT
 /// fields, and the `csq` annotation are included.
 ///
+/// Cache source mode is read from Arrow schema metadata on a parquet file under
+/// `{cache_source}/variation`. That directory must be readable even when
+/// `backend` selects a non-parquet annotation store such as `fjall`.
+///
 /// # Returns
 ///
 /// The number of rows written.
