@@ -88,6 +88,8 @@ pub struct LookupProvider {
     schema: SchemaRef,
     /// Optional sink for co-located data collection during probe phase.
     colocated_sink: Option<ColocatedSink>,
+    /// Optional partition-local sinks for fjall co-located data collection.
+    partition_colocated_sinks: Option<Vec<ColocatedSink>>,
     /// Optional filter to apply to the VCF input (e.g., `chrom = 'chr1'`
     /// for per-contig partitioned annotation).
     vcf_filter: Option<Expr>,
@@ -154,6 +156,7 @@ impl LookupProvider {
             reference_fasta_path,
             schema,
             colocated_sink: None,
+            partition_colocated_sinks: None,
             vcf_filter: None,
         })
     }
@@ -161,6 +164,11 @@ impl LookupProvider {
     /// Set the co-located data sink for piggybacked collection during probe.
     pub fn set_colocated_sink(&mut self, sink: ColocatedSink) {
         self.colocated_sink = Some(sink);
+    }
+
+    /// Set partition-local co-located data sinks for fjall lookup execution.
+    pub fn set_partition_colocated_sinks(&mut self, sinks: Vec<ColocatedSink>) {
+        self.partition_colocated_sinks = Some(sinks);
     }
 
     /// Set an optional filter to apply to VCF input before lookup.
@@ -265,6 +273,9 @@ impl TableProvider for LookupProvider {
                     exec = exec.with_reference_fasta_path(self.reference_fasta_path.clone());
                     if let Some(ref sink) = self.colocated_sink {
                         exec = exec.with_colocated_sink(Arc::clone(sink));
+                    }
+                    if let Some(ref sinks) = self.partition_colocated_sinks {
+                        exec = exec.with_colocated_partition_sinks(sinks.clone());
                     }
                     let plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
                     return wrap_with_projection(plan, projection);
