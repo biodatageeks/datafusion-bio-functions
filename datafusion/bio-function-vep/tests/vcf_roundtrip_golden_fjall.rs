@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::Array;
+use datafusion::arrow::array::{
+    Array, Int32Array, Int64Array, StringArray, StringViewArray, UInt32Array, UInt64Array,
+};
 use datafusion::prelude::*;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::vcf_sink;
@@ -207,6 +209,127 @@ fn ensure_context_symlinks(fjall_dir: &std::path::Path, parquet_dir: &std::path:
             }
         }
     }
+}
+
+fn string_value(column: &dyn Array, row: usize) -> String {
+    if column.is_null(row) {
+        return String::new();
+    }
+    if let Some(values) = column.as_any().downcast_ref::<StringArray>() {
+        return values.value(row).to_string();
+    }
+    if let Some(values) = column.as_any().downcast_ref::<StringViewArray>() {
+        return values.value(row).to_string();
+    }
+    String::new()
+}
+
+fn integer_value(column: &dyn Array, row: usize) -> i64 {
+    if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+        return values.value(row);
+    }
+    if let Some(values) = column.as_any().downcast_ref::<Int32Array>() {
+        return i64::from(values.value(row));
+    }
+    if let Some(values) = column.as_any().downcast_ref::<UInt32Array>() {
+        return i64::from(values.value(row));
+    }
+    if let Some(values) = column.as_any().downcast_ref::<UInt64Array>() {
+        return i64::try_from(values.value(row)).unwrap();
+    }
+    panic!("unsupported integer column type: {:?}", column.data_type());
+}
+
+async fn prepare_metadata_fjall_cache() -> Option<tempfile::TempDir> {
+    let input_vcf = workspace_path("vep-benchmark/data/golden/input_1000.vcf");
+    let cache_dir = workspace_path("vep-benchmark/data/golden/cache");
+    let ref_fasta = workspace_path("vep-benchmark/data/golden/reference_chr1.fa");
+    if !input_vcf.exists()
+        || !cache_dir.exists()
+        || !ref_fasta.exists()
+        || is_lfs_pointer(&input_vcf)
+        || is_lfs_pointer(&cache_dir.join("variation/chr1.parquet"))
+    {
+        return None;
+    }
+
+    let cache_with_metadata = common::cache_with_source_metadata(&cache_dir, "ensembl");
+    let fjall_path = cache_with_metadata.path().join("variation.fjall");
+    ensure_fjall_variation(
+        cache_with_metadata
+            .path()
+            .join("variation")
+            .to_string_lossy()
+            .as_ref(),
+        fjall_path.to_string_lossy().as_ref(),
+    )
+    .await;
+
+    Some(cache_with_metadata)
+}
+
+async fn collect_fjall_annotation_starts_and_csq(
+    cache_path: &std::path::Path,
+    target_partitions: usize,
+) -> Vec<(String, i64, String)> {
+    let input_vcf = workspace_path("vep-benchmark/data/golden/input_1000.vcf");
+    let config = SessionConfig::new().with_target_partitions(target_partitions);
+    let ctx = SessionContext::new_with_config(config);
+    datafusion_bio_function_vep::register_vep_functions(&ctx);
+
+    let vcf_provider = VcfTableProvider::new(
+        input_vcf.to_string_lossy().to_string(),
+        None,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    ctx.register_table("vcf", Arc::new(vcf_provider)).unwrap();
+
+    let cache_path_sql = cache_path.to_string_lossy().replace('\'', "''");
+    let ref_fasta = workspace_path("vep-benchmark/data/golden/reference_chr1.fa");
+    let options = serde_json::json!({
+        "partitioned": true,
+        "use_fjall": true,
+        "everything": true,
+        "reference_fasta_path": ref_fasta.to_string_lossy(),
+    })
+    .to_string()
+    .replace('\'', "''");
+    let sql = format!(
+        "SELECT chrom, start, `CSQ` FROM annotate_vep('vcf', '{cache_path_sql}', 'fjall', '{options}')"
+    );
+
+    let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let chroms = batch.column(0);
+        let starts = batch.column(1);
+        let csqs = batch.column(2);
+        for row in 0..batch.num_rows() {
+            rows.push((
+                string_value(chroms.as_ref(), row),
+                integer_value(starts.as_ref(), row),
+                string_value(csqs.as_ref(), row),
+            ));
+        }
+    }
+    rows
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_fjall_annotation_output_is_invariant_across_target_partitions() {
+    let Some(cache_with_metadata) = prepare_metadata_fjall_cache().await else {
+        eprintln!("Skipping: test fixtures not available");
+        return;
+    };
+
+    let serial = collect_fjall_annotation_starts_and_csq(cache_with_metadata.path(), 1).await;
+    let parallel = collect_fjall_annotation_starts_and_csq(cache_with_metadata.path(), 4).await;
+
+    assert_eq!(serial.len(), 1000);
+    assert_eq!(parallel, serial);
 }
 
 #[tokio::test(flavor = "multi_thread")]
