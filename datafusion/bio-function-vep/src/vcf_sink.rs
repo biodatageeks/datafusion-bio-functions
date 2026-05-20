@@ -15,6 +15,7 @@ use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cache_source::CacheSourceType;
+use crate::plugin::ActivePlugins;
 
 /// Callback invoked after each batch is written to VCF.
 /// Arguments: (rows_in_batch, total_rows_written_so_far, total_input_rows).
@@ -82,6 +83,10 @@ pub struct AnnotateVcfConfig {
     pub failed: Option<i64>,
     /// Upstream/downstream distance for transcript overlap.
     pub distance: Option<String>,
+    /// Base plugin cache directory.
+    pub plugins_dir: Option<String>,
+    /// Explicit plugin names to enable. Empty means discover all plugins under `plugins_dir`.
+    pub plugins: Vec<String>,
     /// Number of input variants per VEP-style annotation buffer.
     pub buffer_size: usize,
     /// Output compression type.
@@ -124,6 +129,8 @@ impl Default for AnnotateVcfConfig {
             exclude_predicted: false,
             failed: None,
             distance: None,
+            plugins_dir: None,
+            plugins: Vec::new(),
             buffer_size: VEP_DEFAULT_BUFFER_SIZE,
             compression: VcfCompressionType::Plain,
             show_progress: false,
@@ -139,12 +146,25 @@ impl std::fmt::Debug for AnnotateVcfConfig {
             .field("buffer_size", &self.buffer_size)
             .field("compression", &self.compression)
             .field("show_progress", &self.show_progress)
+            .field("plugins", &self.plugins)
             .field("on_batch_written", &self.on_batch_written.is_some())
             .finish()
     }
 }
 
 impl AnnotateVcfConfig {
+    fn active_plugins(&self) -> ActivePlugins {
+        let Some(plugins_dir) = self.plugins_dir.as_deref() else {
+            return ActivePlugins::default();
+        };
+        let plugins_dir = Path::new(plugins_dir);
+        if self.plugins.is_empty() {
+            ActivePlugins::discover(plugins_dir)
+        } else {
+            ActivePlugins::from_names(&self.plugins, plugins_dir)
+        }
+    }
+
     fn to_options_json(&self) -> String {
         let mut opts = serde_json::Map::new();
         opts.insert("partitioned".into(), serde_json::Value::Bool(true));
@@ -224,6 +244,24 @@ impl AnnotateVcfConfig {
         if let Some(ref dist) = self.distance {
             opts.insert("distance".into(), serde_json::Value::String(dist.clone()));
         }
+        if let Some(ref plugins_dir) = self.plugins_dir {
+            opts.insert(
+                "plugins_dir".into(),
+                serde_json::Value::String(plugins_dir.clone()),
+            );
+        }
+        if !self.plugins.is_empty() {
+            opts.insert(
+                "plugins".into(),
+                serde_json::Value::Array(
+                    self.plugins
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
         opts.insert(
             "buffer_size".into(),
             serde_json::Value::Number(serde_json::Number::from(self.buffer_size)),
@@ -240,11 +278,21 @@ fn csq_header_description(
     config: &AnnotateVcfConfig,
     cache_source_type: CacheSourceType,
 ) -> String {
-    let field_names = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
+    let mut field_names: Vec<String> = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
         config.everything,
         cache_source_type == CacheSourceType::RefSeq,
         cache_source_type == CacheSourceType::Merged,
         config.include_pick_output(),
+    )
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    field_names.extend(
+        config
+            .active_plugins()
+            .csq_field_names()
+            .into_iter()
+            .map(str::to_string),
     );
     let format_list = field_names.join("|");
     format!("Consequence annotations from annotate_vep. Format: {format_list}")

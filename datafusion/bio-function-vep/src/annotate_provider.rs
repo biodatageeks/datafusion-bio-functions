@@ -89,6 +89,10 @@ use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::partitioned_cache::PartitionedParquetCache;
+use crate::plugin::ActivePlugins;
+use crate::plugin_lookup::{
+    ContigPlugins, PluginIndex, PluginTargetKey, single_base_substitution_key,
+};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, FeatureType, MirnaFeature, MotifFeature,
@@ -2877,6 +2881,7 @@ pub struct AnnotateProvider {
     pick_flags: PickFlags,
     include_pick_output: bool,
     annotation_column_defs: Vec<AnnotationColumnDef>,
+    active_plugins: ActivePlugins,
     schema: SchemaRef,
 }
 
@@ -2898,6 +2903,7 @@ impl AnnotateProvider {
         let include_pick_output = pick_flags.include_pick_output();
         let annotation_column_defs =
             annotation_column_defs_for_selection(transcript_selection, include_pick_output);
+        let active_plugins = Self::resolve_active_plugins(options_json.as_deref());
         // Output schema starts with all VCF columns and appends annotation fields.
         let mut fields: Vec<Arc<Field>> = vcf_schema
             .fields()
@@ -2924,6 +2930,9 @@ impl AnnotateProvider {
                 true,
             )));
         }
+        for field in active_plugins.output_fields() {
+            fields.push(Arc::new(field));
+        }
 
         Ok(Self {
             session,
@@ -2936,6 +2945,7 @@ impl AnnotateProvider {
             pick_flags,
             include_pick_output,
             annotation_column_defs,
+            active_plugins,
             schema: Arc::new(Schema::new(fields)),
         })
     }
@@ -2952,7 +2962,7 @@ impl AnnotateProvider {
     }
 
     fn annotation_column_count(&self) -> usize {
-        self.annotation_column_defs.len() + 2
+        self.annotation_column_defs.len() + 2 + self.active_plugins.output_fields().len()
     }
 
     fn vcf_field_names(&self) -> Vec<String> {
@@ -3007,6 +3017,32 @@ impl AnnotateProvider {
         }
 
         after_colon[..digits_len].parse().ok()
+    }
+
+    fn parse_json_string_array_option(json: &str, key: &str) -> Option<Vec<String>> {
+        let value: Value = serde_json::from_str(json).ok()?;
+        let items = value.get(key)?.as_array()?;
+        Some(
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect(),
+        )
+    }
+
+    fn resolve_active_plugins(options_json: Option<&str>) -> ActivePlugins {
+        let Some(options_json) = options_json else {
+            return ActivePlugins::default();
+        };
+        let Some(plugins_dir) = Self::parse_json_string_option(options_json, "plugins_dir") else {
+            return ActivePlugins::default();
+        };
+        let plugins_dir = std::path::Path::new(&plugins_dir);
+        let plugin_names = Self::parse_json_string_array_option(options_json, "plugins");
+        match plugin_names {
+            Some(names) if !names.is_empty() => ActivePlugins::from_names(&names, plugins_dir),
+            _ => ActivePlugins::discover(plugins_dir),
+        }
     }
 
     /// Traceability:
@@ -4321,6 +4357,7 @@ impl AnnotateProvider {
             hgvs_flags,
             cache_source_type: self.cache_source_type,
             transcript_selection,
+            active_plugins: self.active_plugins.clone(),
             pick_flags,
             allowed_failed,
             reference_fasta_path,
@@ -4369,6 +4406,7 @@ impl AnnotateProvider {
         engine: &TranscriptConsequenceEngine,
         ctx: &PreparedContext<'_>,
         colocated_map: &HashMap<ColocatedKey, ColocatedData>,
+        contig_plugins: Option<&ContigPlugins>,
         sift_cache: &mut SiftPolyphenCache,
         #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
         #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
@@ -4647,6 +4685,9 @@ impl AnnotateProvider {
             // coordinate space, not the fully minimized VEP-normalized allele space.
             let start_val = int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0);
             let end_val = int64_at(batch.column(end_idx).as_ref(), row).unwrap_or(0);
+            let variant_plugin_suffix = contig_plugins
+                .filter(|plugins| !plugins.active_plugins.is_empty())
+                .map(|plugins| plugins.csq_suffix_for_variant(start_val, &ref_al, &alt_allele));
             let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
             let (input_ref, input_alt, input_start) =
                 vcf_to_vep_input_allele(start_val, &ref_al, &alt_allele);
@@ -4734,6 +4775,10 @@ impl AnnotateProvider {
                         variant_fields: &variant_fields,
                     };
                     placeholder_layout.append_entry(&mut csq_buf, &entry);
+                    if let Some(plugin_suffix) = variant_plugin_suffix.as_deref() {
+                        csq_buf.push('|');
+                        csq_buf.push_str(plugin_suffix);
+                    }
                 }
                 most_str = most_val.to_string();
             } else {
@@ -4770,7 +4815,7 @@ impl AnnotateProvider {
                     chrom.clone(),
                     start,
                     end,
-                    ref_allele,
+                    ref_allele.clone(),
                     alt_allele.clone(),
                 );
                 // Only compute genomic shift for indels (ref != alt length).
@@ -4971,6 +5016,39 @@ impl AnnotateProvider {
                         let uniprot_isoform = tx_opt
                             .and_then(|tx| tx.uniprot_isoform.as_deref())
                             .unwrap_or("");
+                        let include_alphamissense = tc.terms.contains(&SoTerm::MissenseVariant)
+                            && contig_plugins.is_some_and(|plugins| {
+                                plugins.alphamissense_matches_transcript_consequence(
+                                    start,
+                                    &ref_allele,
+                                    &alt_allele,
+                                    tc.protein_position.as_deref(),
+                                    tc.amino_acids.as_deref(),
+                                )
+                            });
+                        let include_dbnsfp = tc.terms.iter().any(|term| {
+                            matches!(
+                                term,
+                                SoTerm::MissenseVariant
+                                    | SoTerm::StopLost
+                                    | SoTerm::StopGained
+                                    | SoTerm::StartLost
+                            )
+                        });
+                        let consequence_plugin_suffix = contig_plugins
+                            .filter(|plugins| !plugins.active_plugins.is_empty())
+                            .map(|plugins| {
+                                plugins.csq_suffix_for_consequence(
+                                    start,
+                                    &ref_allele,
+                                    &alt_allele,
+                                    include_alphamissense,
+                                    include_dbnsfp,
+                                    (!symbol.is_empty()).then_some(symbol),
+                                    tc.protein_position.as_deref(),
+                                    tc.amino_acids.as_deref(),
+                                )
+                            });
 
                         if flags.everything {
                             // HGVS_OFFSET mirrors the transcript-level HGVSc shift
@@ -5111,7 +5189,11 @@ impl AnnotateProvider {
                              {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}{refseq_block}|{gene_pheno}|\
                              {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
-                             {batch3_suffix}|||||"
+                             {batch3_suffix}|||||{}",
+                                consequence_plugin_suffix
+                                    .as_ref()
+                                    .map(|suffix| format!("|{suffix}"))
+                                    .unwrap_or_default()
                             );
                         } else {
                             // 74-field CSQ base layout, with optional PICK and RefSeq fields.
@@ -5140,7 +5222,11 @@ impl AnnotateProvider {
                              {source_block}|\
                              {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                              {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
-                             {batch3_suffix}"
+                             {batch3_suffix}{}",
+                                consequence_plugin_suffix
+                                    .as_ref()
+                                    .map(|suffix| format!("|{suffix}"))
+                                    .unwrap_or_default()
                             );
                         }
                     }
@@ -5156,6 +5242,10 @@ impl AnnotateProvider {
                             variant_fields: &variant_fields,
                         };
                         placeholder_layout.append_entry(&mut csq_buf, &entry);
+                        if let Some(plugin_suffix) = variant_plugin_suffix.as_deref() {
+                            csq_buf.push('|');
+                            csq_buf.push_str(plugin_suffix);
+                        }
                     }
                 } // end if !skip_csq (cache-miss CSQ formatting)
             };
@@ -7465,6 +7555,7 @@ struct ContigAnnotationConfig {
     hgvs_flags: HgvsFlags,
     cache_source_type: CacheSourceType,
     transcript_selection: TranscriptSelectionFlags,
+    active_plugins: ActivePlugins,
     allowed_failed: i64,
     reference_fasta_path: Option<String>,
     upstream_distance: i64,
@@ -7688,6 +7779,7 @@ struct ContigReadyState {
     motifs: Vec<MotifFeature>,
     mirnas: Vec<MirnaFeature>,
     structural: Vec<StructuralFeature>,
+    contig_plugins: Option<ContigPlugins>,
     ephemeral_tables: Vec<String>,
     chrom: String,
     t_contig: Instant,
@@ -7707,6 +7799,7 @@ struct ContigAnnotationState {
     motifs: Vec<MotifFeature>,
     mirnas: Vec<MirnaFeature>,
     structural: Vec<StructuralFeature>,
+    contig_plugins: Option<ContigPlugins>,
     transcript_cache_regions: HashMap<String, Vec<TranscriptCacheRegion>>,
     persisted_buffer_transcripts: PersistedBufferTranscripts,
     // Colocated (built lazily from sink on first window).
@@ -8442,6 +8535,7 @@ fn annotate_window(
                 engine,
                 &ctx,
                 &ann.colocated_map,
+                ann.contig_plugins.as_ref(),
                 &mut ann.sift_cache,
                 #[cfg(feature = "kv-cache")]
                 sift_kv,
@@ -8455,6 +8549,12 @@ fn annotate_window(
                 &ann.config.pick_flags,
                 &mut ann.hgvs_reader,
             )?;
+
+            let annotated = if let Some(plugins) = ann.contig_plugins.as_ref() {
+                plugins.annotate_batch(annotated)?
+            } else {
+                annotated
+            };
 
             if let Some(indices) = projection {
                 out.push_back(annotated.project(indices)?);
@@ -8626,6 +8726,7 @@ impl Stream for ContigAnnotationStream {
                             motifs: ready.motifs,
                             mirnas: ready.mirnas,
                             structural: ready.structural,
+                            contig_plugins: ready.contig_plugins,
                             colocated_map: HashMap::new(),
                             colocated_map_built: false,
                             coloc_sink: ready.coloc_sink,
@@ -8880,6 +8981,46 @@ impl Stream for ContigAnnotationStream {
 // Per-contig setup: parallel context loading + lookup stream creation
 // ---------------------------------------------------------------------------
 
+async fn collect_plugin_target_keys(
+    session: &SessionContext,
+    vcf_table: &str,
+    chrom: &str,
+) -> Result<HashSet<PluginTargetKey>> {
+    let df = session
+        .table(vcf_table)
+        .await?
+        .filter(col("chrom").eq(lit(chrom.to_string())))?;
+    let batches = df.collect().await?;
+    let mut keys = HashSet::new();
+
+    for batch in batches {
+        let schema = batch.schema();
+        let start_idx = schema.index_of("start")?;
+        let ref_idx = schema.index_of("ref")?;
+        let alt_idx = schema.index_of("alt")?;
+
+        for row in 0..batch.num_rows() {
+            let Some(pos) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(ref_allele) = string_at(batch.column(ref_idx).as_ref(), row) else {
+                continue;
+            };
+            let Some(raw_alt) = string_at(batch.column(alt_idx).as_ref(), row) else {
+                continue;
+            };
+            for alt_allele in raw_alt.split([',', '|']).filter(|value| !value.is_empty()) {
+                keys.insert((pos, ref_allele.clone(), alt_allele.to_string()));
+                if let Some(snv_key) = single_base_substitution_key(pos, &ref_allele, alt_allele) {
+                    keys.insert(snv_key);
+                }
+            }
+        }
+    }
+
+    Ok(keys)
+}
+
 /// Register ephemeral tables, load context data, and create the variation
 /// lookup stream — all in preparation for window-based streaming annotation.
 ///
@@ -9056,6 +9197,33 @@ async fn prepare_contig_context(
     let plan = provider.scan(&session_state, None, &[], None).await?;
     let lookup_stream = plan.execute(0, session.task_ctx())?;
 
+    let contig_plugins = if config.active_plugins.is_empty() {
+        None
+    } else {
+        let chrom_key = chrom.strip_prefix("chr").unwrap_or(&chrom);
+        let target_keys = collect_plugin_target_keys(&session, &config.vcf_table, &chrom).await?;
+        let mut indexes = Vec::new();
+        for plugin in &config.active_plugins.configs {
+            for source in &plugin.source_dirs {
+                if let Some(index) = PluginIndex::load(
+                    &session,
+                    source.kind,
+                    &source.source_dir.to_string_lossy(),
+                    chrom_key,
+                    Some(&target_keys),
+                )
+                .await?
+                {
+                    indexes.push(index);
+                }
+            }
+        }
+        Some(ContigPlugins {
+            active_plugins: config.active_plugins.clone(),
+            indexes,
+        })
+    };
+
     // Context arm: load transcripts, exons, translations, etc.
     let t_ctx = profile_start!();
     let tmp_provider = AnnotateProvider::new(
@@ -9124,6 +9292,7 @@ async fn prepare_contig_context(
         // these are rare and handled by the monolithic path only.
         mirnas: Vec::new(),
         structural: Vec::new(),
+        contig_plugins,
         ephemeral_tables,
         chrom,
         t_contig,
