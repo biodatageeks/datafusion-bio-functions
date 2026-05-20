@@ -69,6 +69,8 @@ pub struct KvLookupExec {
     output_col_positions: Vec<usize>,
     /// Optional sink for co-located data collected during probe phase.
     colocated_sink: Option<ColocatedSink>,
+    /// Optional partition-local sinks for co-located data collected during probe phase.
+    colocated_partition_sinks: Option<Vec<ColocatedSink>>,
     /// Optional indexed reference FASTA for genomic shift state in colocated
     /// matching (parity with parquet path's two-pass allele matching).
     reference_fasta_path: Option<String>,
@@ -129,6 +131,7 @@ impl KvLookupExec {
             properties,
             output_col_positions,
             colocated_sink: None,
+            colocated_partition_sinks: None,
             reference_fasta_path: None,
         })
     }
@@ -136,6 +139,12 @@ impl KvLookupExec {
     /// Set the co-located data sink for piggybacked collection during probe.
     pub fn with_colocated_sink(mut self, sink: ColocatedSink) -> Self {
         self.colocated_sink = Some(sink);
+        self
+    }
+
+    /// Set one co-located data sink per input partition.
+    pub fn with_colocated_partition_sinks(mut self, sinks: Vec<ColocatedSink>) -> Self {
+        self.colocated_partition_sinks = Some(sinks);
         self
     }
 
@@ -207,6 +216,9 @@ impl ExecutionPlan for KvLookupExec {
         if let Some(sink) = &self.colocated_sink {
             exec = exec.with_colocated_sink(Arc::clone(sink));
         }
+        if let Some(sinks) = &self.colocated_partition_sinks {
+            exec = exec.with_colocated_partition_sinks(sinks.clone());
+        }
         exec = exec.with_reference_fasta_path(self.reference_fasta_path.clone());
         Ok(Arc::new(exec))
     }
@@ -217,6 +229,11 @@ impl ExecutionPlan for KvLookupExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
+        let colocated_sink = self
+            .colocated_partition_sinks
+            .as_ref()
+            .and_then(|sinks| sinks.get(partition).cloned())
+            .or_else(|| self.colocated_sink.clone());
 
         Ok(Box::pin(KvLookupStream::new(
             input_stream,
@@ -231,7 +248,7 @@ impl ExecutionPlan for KvLookupExec {
             self.extended_probes,
             self.allowed_failed,
             self.output_col_positions.clone(),
-            self.colocated_sink.clone(),
+            colocated_sink,
             self.reference_fasta_path.clone(),
         )))
     }
