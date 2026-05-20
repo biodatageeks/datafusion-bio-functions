@@ -165,6 +165,7 @@ pub fn build_plugin_fjall_from_parquet(
     ))
 }
 
+#[allow(clippy::type_complexity)]
 async fn convert_plugin_to_parquet_async(
     plugin_name: &str,
     source_path: &str,
@@ -256,6 +257,7 @@ async fn convert_plugin_to_parquet_async(
     Ok(all_results)
 }
 
+#[allow(clippy::type_complexity)]
 async fn convert_cadd_sources_to_parquet_async(
     snv_source_path: &str,
     indel_source_path: &str,

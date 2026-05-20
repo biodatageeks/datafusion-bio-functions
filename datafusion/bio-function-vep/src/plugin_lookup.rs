@@ -54,6 +54,7 @@ pub(crate) fn single_base_substitution_key(
     ))
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PluginBackend {
     Parquet(ParquetPluginIndex),
     #[cfg(feature = "kv-cache")]
@@ -129,7 +130,7 @@ impl PluginIndex {
                 .filter_map(|(pos, _, _)| u32::try_from(*pos).ok())
                 .collect::<HashSet<_>>()
                 .into_iter()
-                .map(|pos| lit(pos))
+                .map(lit)
                 .collect::<Vec<Expr>>();
             if pos_exprs.is_empty() {
                 return Ok(None);
