@@ -21,6 +21,8 @@ use datafusion::arrow::compute::concat_batches;
 use datafusion::prelude::*;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 
+mod common;
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn is_lfs_pointer(path: &std::path::Path) -> bool {
@@ -251,7 +253,8 @@ async fn test_arrow_typed_columns_vs_golden_vep115() {
         return;
     }
 
-    let cache_str = cache_path.to_str().unwrap();
+    let cache_with_metadata = common::cache_with_source_metadata(&cache_path, "ensembl");
+    let cache_str = cache_with_metadata.path().to_str().unwrap();
     let ref_fasta_str = ref_fasta.to_str().unwrap();
 
     // ── 1. Annotate via annotate_vep() → typed Arrow columns ─────────

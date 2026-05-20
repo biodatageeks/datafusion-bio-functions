@@ -6,13 +6,15 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use datafusion::common::Result;
+use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_bio_format_vcf::serializer::batch_to_vcf_lines;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
+
+use crate::cache_source::CacheSourceType;
 
 /// Callback invoked after each batch is written to VCF.
 /// Arguments: (rows_in_batch, total_rows_written_so_far, total_input_rows).
@@ -201,12 +203,6 @@ impl AnnotateVcfConfig {
         if self.hgvsp_use_prediction {
             opts.insert("hgvsp_use_prediction".into(), serde_json::Value::Bool(true));
         }
-        if self.refseq {
-            opts.insert("refseq".into(), serde_json::Value::Bool(true));
-        }
-        if self.merged {
-            opts.insert("merged".into(), serde_json::Value::Bool(true));
-        }
         if self.gencode_basic {
             opts.insert("gencode_basic".into(), serde_json::Value::Bool(true));
         }
@@ -240,11 +236,14 @@ impl AnnotateVcfConfig {
     }
 }
 
-fn csq_header_description(config: &AnnotateVcfConfig) -> String {
+fn csq_header_description(
+    config: &AnnotateVcfConfig,
+    cache_source_type: CacheSourceType,
+) -> String {
     let field_names = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
         config.everything,
-        config.refseq,
-        config.merged,
+        cache_source_type == CacheSourceType::RefSeq,
+        cache_source_type == CacheSourceType::Merged,
         config.include_pick_output(),
     );
     let format_list = field_names.join("|");
@@ -262,6 +261,10 @@ fn csq_header_description(config: &AnnotateVcfConfig) -> String {
 /// are NOT written to the VCF — only core VCF columns, original INFO/FORMAT
 /// fields, and the `csq` annotation are included.
 ///
+/// Cache source mode is read from Arrow schema metadata on a parquet file under
+/// `{cache_source}/variation`. That directory must be readable even when
+/// `backend` selects a non-parquet annotation store such as `fjall`.
+///
 /// # Returns
 ///
 /// The number of rows written.
@@ -272,6 +275,13 @@ pub async fn annotate_to_vcf(
     output_vcf: &str,
     config: &AnnotateVcfConfig,
 ) -> Result<usize> {
+    if config.refseq || config.merged {
+        return Err(DataFusionError::Plan(
+            "annotate_to_vcf(): refseq and merged config fields are unsupported; cache source mode must come from cache schema metadata bio.vep.cache_source_type".to_string(),
+        ));
+    }
+    let cache_source_type = CacheSourceType::from_partitioned_cache_source(cache_source)?;
+
     // 1. Create session and register VCF table.
     let session_config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(session_config);
@@ -426,7 +436,7 @@ pub async fn annotate_to_vcf(
                 }
                 arrow_field.with_metadata(merged_metadata)
             } else if name == "CSQ" {
-                let description = csq_header_description(config);
+                let description = csq_header_description(config, cache_source_type);
                 let mut meta = std::collections::HashMap::new();
                 meta.insert("bio.vcf.field.field_type".to_string(), "INFO".to_string());
                 meta.insert("bio.vcf.field.description".to_string(), description);
@@ -528,6 +538,19 @@ mod tests {
     }
 
     #[test]
+    fn test_to_options_json_does_not_emit_source_selectors() {
+        let config = AnnotateVcfConfig {
+            refseq: true,
+            merged: true,
+            ..Default::default()
+        };
+
+        let json = config.to_options_json();
+        assert!(!json.contains("\"refseq\""));
+        assert!(!json.contains("\"merged\""));
+    }
+
+    #[test]
     fn test_csq_header_description_matches_vep_pick_layout() {
         let config = AnnotateVcfConfig {
             everything: true,
@@ -535,7 +558,7 @@ mod tests {
             ..Default::default()
         };
 
-        let description = csq_header_description(&config);
+        let description = csq_header_description(&config, CacheSourceType::Ensembl);
         assert!(description.starts_with("Consequence annotations from annotate_vep. Format: "));
         assert!(description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
     }
@@ -548,7 +571,7 @@ mod tests {
             ..Default::default()
         };
 
-        let description = csq_header_description(&config);
+        let description = csq_header_description(&config, CacheSourceType::Ensembl);
         assert!(!description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
     }
 }

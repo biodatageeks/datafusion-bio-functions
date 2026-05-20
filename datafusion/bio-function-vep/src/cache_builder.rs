@@ -27,8 +27,9 @@ use futures::StreamExt;
 use log::info;
 
 use datafusion_bio_format_ensembl_cache::{
-    EnsemblCacheOptions, EnsemblCacheTableProvider, EnsemblEntityKind, VEP_CACHE_REGION_SIZE_BP,
-    build_export_query, build_export_query_multi_chrom,
+    CacheSourceType as BioFormatsCacheSourceType, EnsemblCacheOptions, EnsemblCacheTableProvider,
+    EnsemblEntityKind, VEP_CACHE_REGION_SIZE_BP, build_export_query,
+    build_export_query_multi_chrom,
 };
 
 use crate::annotate_provider::read_compact_predictions;
@@ -79,7 +80,7 @@ fn build_translation_dedup_query_with_where_clause(table_name: &str, where_claus
     format!(
         "SELECT * FROM (\
             SELECT *, ROW_NUMBER() OVER (\
-                PARTITION BY transcript_id \
+                PARTITION BY chrom, transcript_id \
                 ORDER BY {source_pref}, cdna_coding_start NULLS LAST, source_file\
             ) AS _rn \
             FROM {table_name}{where_clause}\
@@ -104,6 +105,7 @@ pub struct CacheBuilder {
     overwrite: bool,
     zstd_level: i32,
     dict_size_kb: u32,
+    cache_source_type: BioFormatsCacheSourceType,
     on_progress: Option<Arc<OnProgress>>,
 }
 
@@ -117,6 +119,7 @@ impl CacheBuilder {
             overwrite: false,
             zstd_level: 3,
             dict_size_kb: 112,
+            cache_source_type: BioFormatsCacheSourceType::Ensembl,
             on_progress: None,
         }
     }
@@ -143,6 +146,11 @@ impl CacheBuilder {
 
     pub fn with_dict_size_kb(mut self, size: u32) -> Self {
         self.dict_size_kb = size;
+        self
+    }
+
+    pub fn with_cache_source_type(mut self, cache_source_type: BioFormatsCacheSourceType) -> Self {
+        self.cache_source_type = cache_source_type;
         self
     }
 
@@ -273,7 +281,13 @@ impl CacheBuilder {
         }
 
         // Discover chromosomes from schema metadata
-        let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let init_ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            table_name,
+            self.partitions,
+            self.cache_source_type,
+        )?;
         let provider_schema = {
             let table = init_ctx.table(table_name).await?;
             table.schema().inner().clone()
@@ -324,7 +338,13 @@ impl CacheBuilder {
         let mut other_total_rows = 0usize;
 
         for (chrom, output_file, is_other) in &chrom_batches {
-            let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+            let ctx = make_ctx_and_register(
+                &self.cache_root,
+                kind,
+                table_name,
+                self.partitions,
+                self.cache_source_type,
+            )?;
             let query = build_export_query(kind, table_name, Some(chrom), None);
 
             let df = ctx.sql(&query).await?;
@@ -435,85 +455,19 @@ impl CacheBuilder {
                     })?;
                 }
 
-                use parquet::file::properties::WriterProperties;
-                use parquet::file::reader::FileReader;
-                use parquet::file::serialized_reader::SerializedFileReader;
-                use parquet::file::writer::SerializedFileWriter;
-
-                let first_reader = SerializedFileReader::try_from(
-                    File::open(&part_files[0].1)
-                        .map_err(|e| DataFusionError::Execution(format!("open part file: {e}")))?,
-                )
-                .map_err(|e| DataFusionError::Execution(format!("read part parquet: {e}")))?;
-                let parquet_schema = first_reader.metadata().file_metadata().schema().clone();
-                let props = WriterProperties::builder()
-                    .set_compression(parquet::basic::Compression::ZSTD(
-                        parquet::basic::ZstdLevel::try_new(self.zstd_level).unwrap_or_default(),
-                    ))
-                    .build();
-                drop(first_reader);
-
-                let out_file = File::create(output_file).map_err(|e| {
-                    DataFusionError::Execution(format!("create merged parquet: {e}"))
-                })?;
-                let mut merged_writer =
-                    SerializedFileWriter::new(out_file, Arc::new(parquet_schema), Arc::new(props))
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!("create parquet writer: {e}"))
-                        })?;
-
-                use parquet::column::writer::ColumnCloseResult;
-                use parquet::format::{ColumnIndex, OffsetIndex};
-
-                for (_, part_file, part_rows) in &part_files {
-                    let src_file = File::open(part_file)
-                        .map_err(|e| DataFusionError::Execution(format!("open part file: {e}")))?;
-                    let reader = SerializedFileReader::try_from(src_file).map_err(|e| {
-                        DataFusionError::Execution(format!("read part parquet: {e}"))
-                    })?;
-
-                    let meta = reader.metadata();
-                    for rg_idx in 0..meta.num_row_groups() {
-                        let rg_meta = meta.row_group(rg_idx);
-                        let mut rg_writer = merged_writer.next_row_group().map_err(|e| {
-                            DataFusionError::Execution(format!("create row group: {e}"))
-                        })?;
-
-                        // Re-open the file for each row group so append_column
-                        // can read column data via ChunkReader.
-                        let chunk_reader = File::open(part_file)
-                            .map_err(|e| DataFusionError::Execution(format!("open part: {e}")))?;
-
-                        for col_idx in 0..rg_meta.num_columns() {
-                            let col_meta = rg_meta.column(col_idx).clone();
-                            let close_result = ColumnCloseResult {
-                                bytes_written: col_meta.compressed_size() as u64,
-                                rows_written: rg_meta.num_rows() as u64,
-                                metadata: col_meta,
-                                bloom_filter: None,
-                                column_index: None,
-                                offset_index: None,
-                            };
-
-                            rg_writer
-                                .append_column(&chunk_reader, close_result)
-                                .map_err(|e| {
-                                    DataFusionError::Execution(format!("append column chunk: {e}"))
-                                })?;
-                        }
-
-                        rg_writer.close().map_err(|e| {
-                            DataFusionError::Execution(format!("close row group: {e}"))
-                        })?;
-                    }
-
-                    chrom_rows += part_rows;
-                    total_parquet_rows += part_rows;
+                let part_paths: Vec<String> = part_files
+                    .iter()
+                    .map(|(_, part_file, _)| part_file.clone())
+                    .collect();
+                let merged_rows =
+                    merge_parquet_row_groups(&part_paths, output_file, Some(self.zstd_level))?;
+                if merged_rows != parallel_rows {
+                    return Err(DataFusionError::Execution(format!(
+                        "merged parquet row count mismatch for {output_file}: copied {merged_rows}, expected {parallel_rows}"
+                    )));
                 }
-
-                merged_writer.close().map_err(|e| {
-                    DataFusionError::Execution(format!("close merged parquet: {e}"))
-                })?;
+                chrom_rows += merged_rows;
+                total_parquet_rows += merged_rows;
 
                 if let Some(ref cb) = self.on_progress {
                     cb("variation", "parquet", chrom_rows, total_parquet_rows, 0);
@@ -1059,7 +1013,13 @@ impl CacheBuilder {
         }
 
         // Discover chroms
-        let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let init_ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            table_name,
+            self.partitions,
+            self.cache_source_type,
+        )?;
         let provider_schema = {
             let table = init_ctx.table(table_name).await?;
             table.schema().inner().clone()
@@ -1126,7 +1086,13 @@ impl CacheBuilder {
         kind: EnsemblEntityKind,
         table_name: &str,
     ) -> Result<(Option<(String, usize)>, Option<(String, usize)>)> {
-        let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            table_name,
+            self.partitions,
+            self.cache_source_type,
+        )?;
 
         let dedup_query = build_translation_dedup_query_with_where_clause(
             table_name,
@@ -1154,7 +1120,10 @@ impl CacheBuilder {
         split_ctx.register_table("_tl_deduped", Arc::new(mem_table))?;
 
         // translation_core
-        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(false);
+        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(
+            false,
+            self.cache_source_type,
+        );
         let core_select = core_schema
             .fields()
             .iter()
@@ -1192,7 +1161,10 @@ impl CacheBuilder {
         })?;
 
         // translation_sift
-        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(false);
+        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
+            false,
+            self.cache_source_type,
+        );
         let sift_select = sift_schema
             .fields()
             .iter()
@@ -1260,7 +1232,13 @@ impl CacheBuilder {
         kind: EnsemblEntityKind,
         table_name: &str,
     ) -> Result<(Option<(String, usize)>, Option<(String, usize)>)> {
-        let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            table_name,
+            self.partitions,
+            self.cache_source_type,
+        )?;
         let in_list = other_chroms
             .iter()
             .map(|c| format!("'{c}'"))
@@ -1291,7 +1269,10 @@ impl CacheBuilder {
         );
         split_ctx.register_table("_tl_deduped", Arc::new(mem_table))?;
 
-        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(false);
+        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(
+            false,
+            self.cache_source_type,
+        );
         let core_select = core_schema
             .fields()
             .iter()
@@ -1313,7 +1294,10 @@ impl CacheBuilder {
             DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
         })?;
 
-        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(false);
+        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
+            false,
+            self.cache_source_type,
+        );
         let sift_select = sift_schema
             .fields()
             .iter()
@@ -1533,7 +1517,13 @@ impl CacheBuilder {
         let needs_rn_drop = matches!(kind, EnsemblEntityKind::Exon);
 
         // Discover chroms + get schema (needed for transcript HGNC propagation).
-        let init_ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+        let init_ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            table_name,
+            self.partitions,
+            self.cache_source_type,
+        )?;
         let provider_schema: SchemaRef = {
             let table = init_ctx.table(table_name).await?;
             Arc::new(table.schema().as_arrow().clone())
@@ -1561,7 +1551,13 @@ impl CacheBuilder {
         };
 
         for chrom in &main_chroms {
-            let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+            let ctx = make_ctx_and_register(
+                &self.cache_root,
+                kind,
+                table_name,
+                self.partitions,
+                self.cache_source_type,
+            )?;
             let query = build_export_query(kind, table_name, Some(chrom), tx_schema);
             let output_file = format!("{}/{subdir}/chr{chrom}.parquet", self.output_dir);
 
@@ -1607,7 +1603,13 @@ impl CacheBuilder {
 
         // Process remaining contigs as "other.parquet"
         if !other_chroms.is_empty() {
-            let ctx = make_ctx_and_register(&self.cache_root, kind, table_name, self.partitions)?;
+            let ctx = make_ctx_and_register(
+                &self.cache_root,
+                kind,
+                table_name,
+                self.partitions,
+                self.cache_source_type,
+            )?;
             let other_refs: Vec<&str> = other_chroms.iter().map(|s| s.as_str()).collect();
             let query = build_export_query_multi_chrom(kind, table_name, &other_refs, tx_schema);
             let output_file = format!("{}/{subdir}/other.parquet", self.output_dir);
@@ -1918,6 +1920,93 @@ fn writer_properties(
     builder.build()
 }
 
+fn merge_parquet_row_groups(
+    part_files: &[String],
+    output_file: &str,
+    zstd_level: Option<i32>,
+) -> Result<usize> {
+    use parquet::column::writer::ColumnCloseResult;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+    use parquet::file::writer::SerializedFileWriter;
+
+    let first_part = part_files.first().ok_or_else(|| {
+        DataFusionError::Execution("merge parquet row groups: no part files provided".to_string())
+    })?;
+    let first_reader = SerializedFileReader::try_from(
+        File::open(first_part)
+            .map_err(|e| DataFusionError::Execution(format!("open part file: {e}")))?,
+    )
+    .map_err(|e| DataFusionError::Execution(format!("read part parquet: {e}")))?;
+    let first_file_metadata = first_reader.metadata().file_metadata();
+    let parquet_schema = first_file_metadata.schema().clone();
+    let key_value_metadata = first_file_metadata.key_value_metadata().cloned();
+    drop(first_reader);
+
+    let mut props = WriterProperties::builder();
+    if let Some(level) = zstd_level {
+        props = props.set_compression(parquet::basic::Compression::ZSTD(
+            parquet::basic::ZstdLevel::try_new(level).unwrap_or_default(),
+        ));
+    }
+    let props = props.set_key_value_metadata(key_value_metadata).build();
+
+    let out_file = File::create(output_file)
+        .map_err(|e| DataFusionError::Execution(format!("create merged parquet: {e}")))?;
+    let mut merged_writer =
+        SerializedFileWriter::new(out_file, Arc::new(parquet_schema), Arc::new(props))
+            .map_err(|e| DataFusionError::Execution(format!("create parquet writer: {e}")))?;
+
+    let mut total_rows = 0usize;
+    for part_file in part_files {
+        let src_file = File::open(part_file)
+            .map_err(|e| DataFusionError::Execution(format!("open part file: {e}")))?;
+        let reader = SerializedFileReader::try_from(src_file)
+            .map_err(|e| DataFusionError::Execution(format!("read part parquet: {e}")))?;
+
+        let meta = reader.metadata();
+        for rg_idx in 0..meta.num_row_groups() {
+            let rg_meta = meta.row_group(rg_idx);
+            let mut rg_writer = merged_writer
+                .next_row_group()
+                .map_err(|e| DataFusionError::Execution(format!("create row group: {e}")))?;
+
+            // Re-open the file for each row group so append_column can read
+            // column data via ChunkReader.
+            let chunk_reader = File::open(part_file)
+                .map_err(|e| DataFusionError::Execution(format!("open part: {e}")))?;
+
+            for col_idx in 0..rg_meta.num_columns() {
+                let col_meta = rg_meta.column(col_idx).clone();
+                let close_result = ColumnCloseResult {
+                    bytes_written: col_meta.compressed_size() as u64,
+                    rows_written: rg_meta.num_rows() as u64,
+                    metadata: col_meta,
+                    bloom_filter: None,
+                    column_index: None,
+                    offset_index: None,
+                };
+
+                rg_writer
+                    .append_column(&chunk_reader, close_result)
+                    .map_err(|e| DataFusionError::Execution(format!("append column chunk: {e}")))?;
+            }
+
+            rg_writer
+                .close()
+                .map_err(|e| DataFusionError::Execution(format!("close row group: {e}")))?;
+            total_rows += rg_meta.num_rows() as usize;
+        }
+    }
+
+    merged_writer
+        .close()
+        .map_err(|e| DataFusionError::Execution(format!("close merged parquet: {e}")))?;
+
+    Ok(total_rows)
+}
+
 fn project_batch(batch: &RecordBatch, target_schema: &SchemaRef) -> Result<RecordBatch> {
     let source_schema = batch.schema();
     let mut columns = Vec::with_capacity(target_schema.fields().len());
@@ -2016,10 +2105,12 @@ fn make_ctx_and_register(
     kind: EnsemblEntityKind,
     table_name: &str,
     partitions: usize,
+    cache_source_type: BioFormatsCacheSourceType,
 ) -> Result<SessionContext> {
     let config = SessionConfig::new().with_target_partitions(partitions);
     let ctx = SessionContext::new_with_config(config);
-    let mut options = EnsemblCacheOptions::new(cache_root);
+    let mut options =
+        EnsemblCacheOptions::new(cache_root).with_cache_source_type(cache_source_type);
     options.target_partitions = Some(partitions);
     let provider = EnsemblCacheTableProvider::for_entity(kind, options)?;
     ctx.register_table(table_name, provider)?;
@@ -2160,6 +2251,7 @@ fn string_value(col: &dyn Array, row: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashMap;
@@ -2185,8 +2277,19 @@ mod tests {
         alleles: Vec<&str>,
         names: Vec<&str>,
     ) -> RecordBatch {
+        make_batch_with_schema(variation_schema(), chroms, starts, ends, alleles, names)
+    }
+
+    fn make_batch_with_schema(
+        schema: SchemaRef,
+        chroms: Vec<&str>,
+        starts: Vec<i64>,
+        ends: Vec<i64>,
+        alleles: Vec<&str>,
+        names: Vec<&str>,
+    ) -> RecordBatch {
         RecordBatch::try_new(
-            variation_schema(),
+            schema,
             vec![
                 Arc::new(StringArray::from(chroms)),
                 Arc::new(Int64Array::from(starts)),
@@ -2427,7 +2530,7 @@ mod tests {
             Some(&schema),
         );
         assert!(q.contains("ROW_NUMBER()"));
-        assert!(q.contains("PARTITION BY stable_id"));
+        assert!(q.contains("PARTITION BY chrom, stable_id"));
         assert!(q.contains("WHERE _rn = 1"));
         assert!(q.contains("ORDER BY chrom, start"));
         assert!(q.contains("WHERE chrom = 'X'"));
@@ -2469,7 +2572,7 @@ mod tests {
     #[test]
     fn test_build_query_exon_dedup() {
         let q = build_export_query(EnsemblEntityKind::Exon, "exon", None, None);
-        assert!(q.contains("PARTITION BY transcript_id, exon_number"));
+        assert!(q.contains("PARTITION BY chrom, transcript_id, exon_number"));
         assert!(q.contains("ORDER BY transcript_id, start"));
     }
 
@@ -2500,7 +2603,7 @@ mod tests {
         assert!(q.contains("WHERE chrom IN ('1', '2')"));
         assert!(q.contains("ROW_NUMBER()"));
         assert!(q.contains("WHERE _rn = 1"));
-        assert!(q.contains("PARTITION BY stable_id"));
+        assert!(q.contains("PARTITION BY chrom, stable_id"));
         // HGNC propagation is a runtime concern (see
         // apply_buffer_local_hgnc_propagation) — must not be embedded in the
         // cache-level export query.
@@ -2513,7 +2616,7 @@ mod tests {
     #[test]
     fn test_build_translation_dedup_query_prefers_transcript_start_region() {
         let q = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom = '2'");
-        assert!(q.contains("PARTITION BY transcript_id"));
+        assert!(q.contains("PARTITION BY chrom, transcript_id"));
         assert!(q.contains("source_file LIKE CONCAT('%/'"));
         assert!(q.contains("cdna_coding_start NULLS LAST"));
         assert!(q.contains("WHERE chrom = '2'"));
@@ -2522,7 +2625,7 @@ mod tests {
     #[test]
     fn test_build_translation_dedup_query_multi_chrom_prefers_transcript_start_region() {
         let q = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom IN ('2', 'X')");
-        assert!(q.contains("PARTITION BY transcript_id"));
+        assert!(q.contains("PARTITION BY chrom, transcript_id"));
         assert!(q.contains("source_file LIKE CONCAT('%/'"));
         assert!(q.contains("WHERE chrom IN ('2', 'X')"));
     }
@@ -3017,9 +3120,14 @@ mod tests {
         }
 
         let partitions = 8;
-        let ctx =
-            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", partitions)
-                .unwrap();
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            partitions,
+            BioFormatsCacheSourceType::Ensembl,
+        )
+        .unwrap();
 
         let query = "SELECT * FROM var WHERE chrom = '1' ORDER BY chrom, start";
         let df = ctx.sql(query).await.unwrap();
@@ -3242,8 +3350,14 @@ mod tests {
         if !std::path::Path::new(cache_root).exists() {
             return;
         }
-        let ctx =
-            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", 1).unwrap();
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            1,
+            BioFormatsCacheSourceType::Ensembl,
+        )
+        .unwrap();
         let table = ctx.table("var").await.unwrap();
         let schema = table.schema().inner().clone();
         let chroms = chroms_from_schema(&schema);
@@ -3308,9 +3422,14 @@ mod tests {
         // Run with 1 partition (sequential) and 8 partitions (parallel)
         // on a small chromosome to compare row counts.
         for partitions in [1, 8] {
-            let ctx =
-                make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", partitions)
-                    .unwrap();
+            let ctx = make_ctx_and_register(
+                cache_root,
+                EnsemblEntityKind::Variation,
+                "var",
+                partitions,
+                BioFormatsCacheSourceType::Ensembl,
+            )
+            .unwrap();
 
             let query = "SELECT COUNT(*) as cnt FROM var WHERE chrom = '22'";
             let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
@@ -3335,8 +3454,14 @@ mod tests {
             return;
         }
 
-        let ctx =
-            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", 8).unwrap();
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            8,
+            BioFormatsCacheSourceType::Ensembl,
+        )
+        .unwrap();
 
         let query = "SELECT * FROM var WHERE chrom = '22' ORDER BY chrom, start";
         let df = ctx.sql(query).await.unwrap();
@@ -3376,8 +3501,14 @@ mod tests {
         std::fs::create_dir_all(&var_dir).unwrap();
 
         // Step 1: Write chr22 parquet
-        let ctx =
-            make_ctx_and_register(cache_root, EnsemblEntityKind::Variation, "var", 1).unwrap();
+        let ctx = make_ctx_and_register(
+            cache_root,
+            EnsemblEntityKind::Variation,
+            "var",
+            1,
+            BioFormatsCacheSourceType::Ensembl,
+        )
+        .unwrap();
         let query = "SELECT * FROM var WHERE chrom = '22' ORDER BY chrom, start";
         let df = ctx.sql(query).await.unwrap();
         let mut stream = df.execute_stream().await.unwrap();
@@ -3913,6 +4044,51 @@ mod tests {
             all_starts,
             vec![100, 200, 300, 400, 500, 600, 700, 800, 900],
             "merged data should preserve order and values"
+        );
+    }
+
+    #[test]
+    fn test_zero_copy_merge_preserves_arrow_schema_metadata() {
+        use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert(
+            CACHE_SOURCE_METADATA_KEY.to_string(),
+            CacheSourceType::RefSeq.as_str().to_string(),
+        );
+        let schema = Arc::new(
+            variation_schema()
+                .as_ref()
+                .clone()
+                .with_metadata(schema_metadata),
+        );
+        let batch = make_batch_with_schema(
+            schema,
+            vec!["1", "1"],
+            vec![100, 200],
+            vec![100, 200],
+            vec!["A/G", "C/T"],
+            vec!["rs1", "rs2"],
+        );
+        let part_path = format!("{}/part_0.parquet", dir_path.display());
+        write_parquet(&part_path, &[batch]);
+
+        let merged_path = format!("{}/merged.parquet", dir_path.display());
+        merge_parquet_row_groups(&[part_path], &merged_path, None).unwrap();
+
+        let merged_file = File::open(&merged_path).unwrap();
+        let arrow_metadata =
+            ArrowReaderMetadata::load(&merged_file, ArrowReaderOptions::default()).unwrap();
+        assert_eq!(
+            arrow_metadata
+                .schema()
+                .metadata()
+                .get(CACHE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(CacheSourceType::RefSeq.as_str())
         );
     }
 
