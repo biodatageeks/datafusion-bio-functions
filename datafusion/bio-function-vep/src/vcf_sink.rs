@@ -84,6 +84,8 @@ pub struct AnnotateVcfConfig {
     pub distance: Option<String>,
     /// Number of input variants per VEP-style annotation buffer.
     pub buffer_size: usize,
+    /// DataFusion target partitions for the annotation session.
+    pub target_partitions: usize,
     /// Output compression type.
     pub compression: VcfCompressionType,
     /// Show an indicatif progress bar on stderr (for Rust CLI).
@@ -125,6 +127,7 @@ impl Default for AnnotateVcfConfig {
             failed: None,
             distance: None,
             buffer_size: VEP_DEFAULT_BUFFER_SIZE,
+            target_partitions: 1,
             compression: VcfCompressionType::Plain,
             show_progress: false,
             on_batch_written: None,
@@ -137,6 +140,7 @@ impl std::fmt::Debug for AnnotateVcfConfig {
         f.debug_struct("AnnotateVcfConfig")
             .field("everything", &self.everything)
             .field("buffer_size", &self.buffer_size)
+            .field("target_partitions", &self.target_partitions)
             .field("compression", &self.compression)
             .field("show_progress", &self.show_progress)
             .field("on_batch_written", &self.on_batch_written.is_some())
@@ -283,7 +287,8 @@ pub async fn annotate_to_vcf(
     let cache_source_type = CacheSourceType::from_partitioned_cache_source(cache_source)?;
 
     // 1. Create session and register VCF table.
-    let session_config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+    let session_config = datafusion::prelude::SessionConfig::new()
+        .with_target_partitions(config.target_partitions.max(1));
     let ctx = SessionContext::new_with_config(session_config);
     crate::register_vep_functions(&ctx);
 
@@ -535,6 +540,11 @@ mod tests {
 
         let json = config.to_options_json();
         assert!(json.contains("\"buffer_size\":1234"));
+    }
+
+    #[test]
+    fn test_default_target_partitions_is_one() {
+        assert_eq!(AnnotateVcfConfig::default().target_partitions, 1);
     }
 
     #[test]

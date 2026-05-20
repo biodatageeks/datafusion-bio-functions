@@ -12,6 +12,7 @@
 //!     [--everything] \
 //!     [--extended-probes] \
 //!     [--reference-fasta <path>] \
+//!     [--target-partitions <n>] \
 //!     [--compression none|gzip|bgzf] \
 //!     [--limit <n>]
 
@@ -29,6 +30,7 @@ struct Args {
     everything: bool,
     extended_probes: bool,
     reference_fasta: Option<String>,
+    target_partitions: usize,
     compression: VcfCompressionType,
     limit: Option<usize>,
 }
@@ -42,6 +44,7 @@ fn parse_args() -> Args {
     let mut everything = false;
     let mut extended_probes = false;
     let mut reference_fasta = None;
+    let mut target_partitions = 1;
     let mut compression = VcfCompressionType::Plain;
     let mut limit = None;
 
@@ -69,6 +72,10 @@ fn parse_args() -> Args {
             "--reference-fasta" => {
                 i += 1;
                 reference_fasta = Some(args[i].clone());
+            }
+            "--target-partitions" => {
+                i += 1;
+                target_partitions = args[i].parse().unwrap_or(1);
             }
             "--compression" => {
                 i += 1;
@@ -114,6 +121,7 @@ fn parse_args() -> Args {
         everything,
         extended_probes,
         reference_fasta,
+        target_partitions,
         compression,
         limit,
     }
@@ -134,6 +142,7 @@ async fn main() -> Result<()> {
         "  ref_fasta:  {}",
         args.reference_fasta.as_deref().unwrap_or("(none)")
     );
+    eprintln!("  target_partitions: {}", args.target_partitions);
     eprintln!(
         "  compress:   {}",
         match args.compression {
@@ -153,6 +162,7 @@ async fn main() -> Result<()> {
         extended_probes: args.extended_probes,
         reference_fasta_path: args.reference_fasta.clone(),
         use_fjall: args.backend == "fjall",
+        target_partitions: args.target_partitions,
         compression: args.compression,
         show_progress: true,
         ..Default::default()
