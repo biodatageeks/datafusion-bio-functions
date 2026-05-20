@@ -73,7 +73,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext, col, lit};
-use futures::{Future, Stream};
+use futures::{Future, Stream, StreamExt};
 use noodles_core::{Position, Region};
 use noodles_fasta as fasta;
 use serde_json::Value;
@@ -2062,6 +2062,41 @@ fn build_colocated_map_from_sink(
         );
     }
     map
+}
+
+fn drain_colocated_sink(sink: &ColocatedSink) -> Result<HashMap<ColocatedKey, ColocatedData>> {
+    let raw = {
+        let mut guard = sink.lock().map_err(|e| {
+            DataFusionError::Execution(format!("colocated sink mutex poisoned: {e}"))
+        })?;
+        std::mem::take(&mut *guard)
+    };
+
+    if raw.is_empty() {
+        Ok(HashMap::new())
+    } else {
+        Ok(build_colocated_map_from_sink(&raw))
+    }
+}
+
+fn merge_colocated_delta(
+    target: &mut HashMap<ColocatedKey, ColocatedData>,
+    mut delta: HashMap<ColocatedKey, ColocatedData>,
+) {
+    for (key, mut value) in delta.drain() {
+        target
+            .entry(key)
+            .and_modify(|existing| {
+                if existing.compare_output_allele.is_none() {
+                    existing.compare_output_allele = value.compare_output_allele.clone();
+                }
+                if existing.unshifted_output_allele.is_none() {
+                    existing.unshifted_output_allele = value.unshifted_output_allele.clone();
+                }
+                existing.entries.append(&mut value.entries);
+            })
+            .or_insert(value);
+    }
 }
 
 /// Traceability:
@@ -4238,7 +4273,7 @@ impl AnnotateProvider {
     #[allow(clippy::too_many_arguments)]
     async fn scan_with_transcript_engine_partitioned(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         requested_columns: &[&str],
         extended_probes: bool,
@@ -4271,6 +4306,7 @@ impl AnnotateProvider {
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0)
             .unwrap_or(VEP_INPUT_BUFFER_SIZE);
+        let target_partitions = state.config().target_partitions().max(1);
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
 
@@ -4330,6 +4366,7 @@ impl AnnotateProvider {
             projection: projection.cloned(),
             annotation_column_count: self.annotation_column_count(),
             fetch_limit,
+            target_partitions,
             #[cfg(feature = "kv-cache")]
             use_fjall: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
@@ -7474,6 +7511,8 @@ struct ContigAnnotationConfig {
     annotation_column_count: usize,
     /// Maximum number of output rows (LIMIT pushdown).
     fetch_limit: Option<usize>,
+    /// Maximum number of ordered fjall lookup partitions to execute per chromosome.
+    target_partitions: usize,
     pick_flags: PickFlags,
     /// When true, use fjall KV store for variation lookup + SIFT instead of parquet.
     #[cfg(feature = "kv-cache")]
@@ -7594,6 +7633,8 @@ impl ExecutionPlan for ContigAnnotationExec {
 /// Each window triggers a PreparedContext rebuild (~22ms).
 /// With ~30 rows/batch: 1000 batches ≈ 30K variants per window.
 const HYDRATION_WINDOW_SIZE: usize = 1000;
+/// Number of looked-up batches each background lookup partition may buffer.
+const LOOKUP_PARTITION_QUEUE_BATCHES: usize = 2;
 /// Ensembl VEP release/115 default `buffer_size`.
 const VEP_INPUT_BUFFER_SIZE: usize = 5000;
 /// Ensembl VEP transcript cache region size (`cache_region_size`).
@@ -7607,8 +7648,27 @@ struct TranscriptCacheRegion {
 
 type PersistedBufferTranscripts =
     HashMap<TranscriptCacheRegion, HashMap<String, TranscriptFeature>>;
+type LoadedContigContext = (
+    Vec<TranscriptFeature>,
+    HashMap<String, String>,
+    Vec<ExonFeature>,
+    Vec<TranslationFeature>,
+    Vec<RegulatoryFeature>,
+    Vec<MotifFeature>,
+);
 
 type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
+
+struct LookupBatchMessage {
+    batch: RecordBatch,
+    colocated_delta: HashMap<ColocatedKey, ColocatedData>,
+}
+
+struct LookupPartitionHandle {
+    partition_id: usize,
+    receiver: tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>,
+    join_handle: tokio::task::JoinHandle<Result<()>>,
+}
 
 #[derive(Default)]
 struct InputBufferAccumulator {
@@ -7678,8 +7738,7 @@ impl InputBufferAccumulator {
 /// Everything needed to start streaming annotation for a contig.
 /// Produced by `prepare_contig_context()`.
 struct ContigReadyState {
-    lookup_stream: SendableRecordBatchStream,
-    coloc_sink: ColocatedSink,
+    lookup_partitions: VecDeque<LookupPartitionHandle>,
     transcripts: Vec<TranscriptFeature>,
     translateable_seq_by_tx: HashMap<String, String>,
     exons: Vec<ExonFeature>,
@@ -7695,9 +7754,8 @@ struct ContigReadyState {
 
 /// Mutable annotation state for window-based streaming within a single contig.
 struct ContigAnnotationState {
-    /// Dropped after exhaustion to reclaim BuildSide memory (COITrees, hash
-    /// indices, concatenated VCF batch).
-    lookup_stream: Option<SendableRecordBatchStream>,
+    lookup_partitions: VecDeque<LookupPartitionHandle>,
+    active_lookup_partition: Option<LookupPartitionHandle>,
     // Context data (transcripts/translations mutated by HGVS hydration).
     transcripts: Vec<TranscriptFeature>,
     translateable_seq_by_tx: HashMap<String, String>,
@@ -7709,10 +7767,8 @@ struct ContigAnnotationState {
     structural: Vec<StructuralFeature>,
     transcript_cache_regions: HashMap<String, Vec<TranscriptCacheRegion>>,
     persisted_buffer_transcripts: PersistedBufferTranscripts,
-    // Colocated (built lazily from sink on first window).
+    // Colocated data merged incrementally from ordered lookup partition messages.
     colocated_map: HashMap<ColocatedKey, ColocatedData>,
-    colocated_map_built: bool,
-    coloc_sink: ColocatedSink,
     // HGVS hydration tracking — already-hydrated transcripts are skipped.
     hydrated_cds_tx_ids: HashSet<String>,
     hgvs_reader: Option<FastaReader>,
@@ -7780,6 +7836,105 @@ fn deregister_tables_sync(session: &SessionContext, tables: &[String]) {
     }
 }
 
+fn spawn_lookup_partition_worker(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+    partition_id: usize,
+    sink: ColocatedSink,
+    queue_batches: usize,
+) -> LookupPartitionHandle {
+    let (sender, receiver) = tokio::sync::mpsc::channel(queue_batches.max(1));
+    let join_handle = tokio::spawn(async move {
+        let mut stream = plan.execute(partition_id, task_ctx)?;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            let colocated_delta = drain_colocated_sink(&sink)?;
+            if sender
+                .send(Ok(LookupBatchMessage {
+                    batch,
+                    colocated_delta,
+                }))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+
+        let colocated_delta = drain_colocated_sink(&sink)?;
+        if !colocated_delta.is_empty() {
+            let _ = sender
+                .send(Ok(LookupBatchMessage {
+                    batch: RecordBatch::new_empty(plan.schema()),
+                    colocated_delta,
+                }))
+                .await;
+        }
+        Ok(())
+    });
+
+    LookupPartitionHandle {
+        partition_id,
+        receiver,
+        join_handle,
+    }
+}
+
+fn spawn_lookup_stream_worker(
+    mut stream: SendableRecordBatchStream,
+    schema: SchemaRef,
+    sink: ColocatedSink,
+    queue_batches: usize,
+) -> LookupPartitionHandle {
+    let (sender, receiver) = tokio::sync::mpsc::channel(queue_batches.max(1));
+    let join_handle = tokio::spawn(async move {
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            let colocated_delta = drain_colocated_sink(&sink)?;
+            if sender
+                .send(Ok(LookupBatchMessage {
+                    batch,
+                    colocated_delta,
+                }))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+
+        let colocated_delta = drain_colocated_sink(&sink)?;
+        if !colocated_delta.is_empty() {
+            let _ = sender
+                .send(Ok(LookupBatchMessage {
+                    batch: RecordBatch::new_empty(schema),
+                    colocated_delta,
+                }))
+                .await;
+        }
+        Ok(())
+    });
+
+    LookupPartitionHandle {
+        partition_id: 0,
+        receiver,
+        join_handle,
+    }
+}
+
+fn abort_lookup_partitions(partitions: &mut VecDeque<LookupPartitionHandle>) {
+    for handle in partitions.drain(..) {
+        handle.join_handle.abort();
+    }
+}
+
+fn abort_annotation_lookup_workers(ann: &mut ContigAnnotationState) {
+    if let Some(active) = ann.active_lookup_partition.take() {
+        active.join_handle.abort();
+    }
+    abort_lookup_partitions(&mut ann.lookup_partitions);
+}
+
 struct ContigAnnotationStream {
     projected_schema: SchemaRef,
     full_schema: SchemaRef,
@@ -7816,6 +7971,7 @@ impl ContigAnnotationStream {
     fn cleanup_registered_tables_on_drop(&mut self) {
         match &mut self.state {
             StreamState::AnnotatingContig(ann) => {
+                abort_annotation_lookup_workers(ann);
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
                 if ann.config.use_fjall {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
@@ -7826,6 +7982,7 @@ impl ContigAnnotationStream {
                 annotation_state: ann,
                 ..
             } => {
+                abort_annotation_lookup_workers(ann);
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
                 if ann.config.use_fjall {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
@@ -8466,6 +8623,64 @@ fn annotate_window(
     Ok(out)
 }
 
+fn poll_lookup_partitions(
+    ann: &mut ContigAnnotationState,
+    cx: &mut TaskCtx<'_>,
+) -> Poll<Result<()>> {
+    while !ann.lookup_done && ann.window_buffer.len() < HYDRATION_WINDOW_SIZE {
+        if ann.active_lookup_partition.is_none() {
+            ann.active_lookup_partition = ann.lookup_partitions.pop_front();
+            if ann.active_lookup_partition.is_none() {
+                ann.lookup_done = true;
+                profile_end!(
+                    &format!("{}: 1. variation_lookup", ann.chrom),
+                    ann.t_contig,
+                    format!("{} rows", ann.contig_rows)
+                );
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        let active = ann
+            .active_lookup_partition
+            .as_mut()
+            .expect("active lookup partition must be present");
+        match active.receiver.poll_recv(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Some(Ok(message))) => {
+                merge_colocated_delta(&mut ann.colocated_map, message.colocated_delta);
+                if message.batch.num_rows() > 0 {
+                    ann.contig_rows += message.batch.num_rows();
+                    ann.window_buffer.push(message.batch);
+                }
+            }
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+            Poll::Ready(None) => {
+                let mut done = ann
+                    .active_lookup_partition
+                    .take()
+                    .expect("active lookup partition must be present");
+                match Pin::new(&mut done.join_handle).poll(cx) {
+                    Poll::Ready(Ok(Ok(()))) => {}
+                    Poll::Ready(Ok(Err(e))) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready(Err(DataFusionError::Execution(format!(
+                            "lookup partition {} task failed: {e}",
+                            done.partition_id
+                        ))));
+                    }
+                    Poll::Pending => {
+                        ann.active_lookup_partition = Some(done);
+                        return Poll::Pending;
+                    }
+                }
+            }
+        }
+    }
+
+    Poll::Ready(Ok(()))
+}
+
 impl Stream for ContigAnnotationStream {
     type Item = Result<RecordBatch>;
 
@@ -8611,7 +8826,8 @@ impl Stream for ContigAnnotationStream {
                         };
 
                         self.state = StreamState::AnnotatingContig(ContigAnnotationState {
-                            lookup_stream: Some(ready.lookup_stream),
+                            lookup_partitions: ready.lookup_partitions,
+                            active_lookup_partition: None,
                             transcript_cache_regions: ready
                                 .transcripts
                                 .iter()
@@ -8627,8 +8843,6 @@ impl Stream for ContigAnnotationStream {
                             mirnas: ready.mirnas,
                             structural: ready.structural,
                             colocated_map: HashMap::new(),
-                            colocated_map_built: false,
-                            coloc_sink: ready.coloc_sink,
                             hydrated_cds_tx_ids: HashSet::new(),
                             hgvs_reader,
                             sift_cache: SiftPolyphenCache::new(),
@@ -8653,12 +8867,9 @@ impl Stream for ContigAnnotationStream {
                 },
 
                 StreamState::AnnotatingContig(ann) => {
-                    // Pull batches from lookup stream into window buffer.
-                    //
-                    // Both VariantLookupExec (parquet) and KvLookupExec (fjall)
-                    // buffer matched rows internally and only emit after the
-                    // input is exhausted, ensuring the colocated sink is fully
-                    // populated when the first batch arrives here.
+                    // Pull looked-up batches into the window buffer. For fjall,
+                    // partition workers run concurrently, but this state machine
+                    // drains their bounded receivers strictly by partition id.
                     //
                     // LIMIT pushdown: once we have enough buffered rows to
                     // satisfy the limit, stop pulling from the lookup stream
@@ -8667,20 +8878,11 @@ impl Stream for ContigAnnotationStream {
                     let limit_buffered =
                         fetch_limit.is_some_and(|limit| rows_emitted + buffered_rows >= limit);
                     if !ann.lookup_done && !limit_buffered {
-                        let stream = ann
-                            .lookup_stream
-                            .as_mut()
-                            .expect("stream alive during lookup");
-                        match stream.as_mut().poll_next(cx) {
+                        match poll_lookup_partitions(ann, cx) {
                             Poll::Pending => return Poll::Pending,
-                            Poll::Ready(Some(Ok(batch))) => {
-                                ann.contig_rows += batch.num_rows();
-                                ann.window_buffer.push(batch);
-                                if ann.window_buffer.len() < HYDRATION_WINDOW_SIZE {
-                                    continue; // Keep filling window.
-                                }
-                            }
-                            Poll::Ready(Some(Err(e))) => {
+                            Poll::Ready(Ok(())) => {}
+                            Poll::Ready(Err(e)) => {
+                                abort_annotation_lookup_workers(ann);
                                 let session = Arc::clone(&ann.session);
                                 let tables = ann.ephemeral_tables.clone();
                                 self.state = StreamState::ErrorCleaningUp(
@@ -8688,22 +8890,6 @@ impl Stream for ContigAnnotationStream {
                                     e,
                                 );
                                 continue;
-                            }
-                            Poll::Ready(None) => {
-                                ann.lookup_done = true;
-                                // Drop the lookup stream to reclaim BuildSide
-                                // memory (COITrees, hash indices, concatenated
-                                // VCF batch) — no longer needed.
-                                ann.lookup_stream = None;
-                                // NOTE: colocated sink is cleared AFTER the
-                                // colocated map is built (below), not here.
-                                // Clearing here would lose data for backends
-                                // like fjall that emit batches immediately.
-                                profile_end!(
-                                    &format!("{}: 1. variation_lookup", ann.chrom),
-                                    ann.t_contig,
-                                    format!("{} rows", ann.contig_rows)
-                                );
                             }
                         }
                     }
@@ -8723,6 +8909,7 @@ impl Stream for ContigAnnotationStream {
                     if limit_reached || (ann.window_buffer.is_empty() && !has_pending_input_buffer)
                     {
                         // No more data (or limit reached) — clean up.
+                        abort_annotation_lookup_workers(&mut ann);
                         // Drop heavy state eagerly before the async cleanup future runs.
                         profile_end!(
                             &format!("{}: TOTAL", ann.chrom),
@@ -8747,18 +8934,6 @@ impl Stream for ContigAnnotationStream {
                         continue;
                     }
 
-                    // Build colocated map once (sink is fully populated now
-                    // that the entire lookup stream has been drained).
-                    if !ann.colocated_map_built {
-                        if ann.config.flags.check_existing {
-                            let mut guard = ann.coloc_sink.lock().unwrap();
-                            ann.colocated_map = build_colocated_map_from_sink(&guard);
-                            // Clear sink now that data has been copied to the map.
-                            guard.clear();
-                        }
-                        ann.colocated_map_built = true;
-                    }
-
                     // Take one window's worth of batches from the buffer.
                     let window_end = ann.window_buffer.len().min(HYDRATION_WINDOW_SIZE);
                     let window_batches: Vec<RecordBatch> =
@@ -8776,6 +8951,7 @@ impl Stream for ContigAnnotationStream {
                             &window_batches,
                             ann.config.cache_source_type,
                         ) {
+                            abort_annotation_lookup_workers(&mut ann);
                             let fut = make_cleanup_future(
                                 Arc::clone(&ann.session),
                                 std::mem::take(&mut ann.ephemeral_tables),
@@ -8789,6 +8965,7 @@ impl Stream for ContigAnnotationStream {
                     let projection = ann.config.projection.clone();
                     match annotate_window(&mut ann, &window_batches, projection.as_deref()) {
                         Err(e) => {
+                            abort_annotation_lookup_workers(&mut ann);
                             let fut = make_cleanup_future(
                                 Arc::clone(&ann.session),
                                 std::mem::take(&mut ann.ephemeral_tables),
@@ -9029,7 +9206,7 @@ async fn prepare_contig_context(
 
     // Lookup arm: build LookupProvider, create stream (cheap — build+probe
     // happens on first poll, NOT here).
-    let coloc_sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+    let fallback_coloc_sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
     let vcf_schema = session
         .table(&config.vcf_table)
         .await?
@@ -9049,71 +9226,125 @@ async fn prepare_contig_context(
         None, // reference_fasta_path is for HGVS hydration, not lookup
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
+    let partition_coloc_sinks: Vec<ColocatedSink> = if config.flags.check_existing && use_fjall {
+        (0..config.target_partitions)
+            .map(|_| Arc::new(Mutex::new(HashMap::new())))
+            .collect()
+    } else {
+        Vec::new()
+    };
     if config.flags.check_existing {
-        provider.set_colocated_sink(Arc::clone(&coloc_sink));
+        if use_fjall {
+            provider.set_partition_colocated_sinks(partition_coloc_sinks.clone());
+        } else {
+            provider.set_colocated_sink(Arc::clone(&fallback_coloc_sink));
+        }
     }
     let session_state = session.state();
     let plan = provider.scan(&session_state, None, &[], None).await?;
-    let lookup_stream = plan.execute(0, session.task_ctx())?;
+    let mut lookup_partitions = if use_fjall {
+        let partition_count = plan.output_partitioning().partition_count().max(1);
+        if config.flags.check_existing && partition_count > partition_coloc_sinks.len() {
+            return Err(DataFusionError::Execution(format!(
+                "lookup plan produced {partition_count} partitions but only {} colocated sinks were configured",
+                partition_coloc_sinks.len()
+            )));
+        }
+
+        let task_ctx = session.task_ctx();
+        let mut handles = VecDeque::with_capacity(partition_count);
+        for partition_id in 0..partition_count {
+            let sink = partition_coloc_sinks
+                .get(partition_id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+            handles.push_back(spawn_lookup_partition_worker(
+                Arc::clone(&plan),
+                Arc::clone(&task_ctx),
+                partition_id,
+                sink,
+                LOOKUP_PARTITION_QUEUE_BATCHES,
+            ));
+        }
+        handles
+    } else {
+        let lookup_stream = plan.execute(0, session.task_ctx())?;
+        VecDeque::from([spawn_lookup_stream_worker(
+            lookup_stream,
+            plan.schema(),
+            fallback_coloc_sink,
+            LOOKUP_PARTITION_QUEUE_BATCHES,
+        )])
+    };
 
     // Context arm: load transcripts, exons, translations, etc.
-    let t_ctx = profile_start!();
-    let tmp_provider = AnnotateProvider::new(
-        Arc::clone(&session),
-        config.vcf_table.clone(),
-        String::new(),
-        AnnotationBackend::Parquet,
-        config.cache_source_type,
-        config.options_json.clone(),
-        vcf_only_schema,
-    )?;
+    let context_result: Result<LoadedContigContext> = async {
+        let t_ctx = profile_start!();
+        let tmp_provider = AnnotateProvider::new(
+            Arc::clone(&session),
+            config.vcf_table.clone(),
+            String::new(),
+            AnnotationBackend::Parquet,
+            config.cache_source_type,
+            config.options_json.clone(),
+            vcf_only_schema,
+        )?;
 
-    let tx = if let Some(ref table) = tx_table {
-        let (tx, seq) = tmp_provider.load_transcripts(table, &worklist).await?;
-        let filtered: Vec<_> = tx
-            .into_iter()
-            .filter(|t| passes_transcript_selection(t, config.transcript_selection))
-            .collect();
-        (filtered, seq)
-    } else {
-        (Vec::new(), HashMap::new())
-    };
-    let (tx_vec, translateable_seq) = tx;
-    let tx_ids: HashSet<String> = tx_vec.iter().map(|t| t.transcript_id.clone()).collect();
+        let tx = if let Some(ref table) = tx_table {
+            let (tx, seq) = tmp_provider.load_transcripts(table, &worklist).await?;
+            let filtered: Vec<_> = tx
+                .into_iter()
+                .filter(|t| passes_transcript_selection(t, config.transcript_selection))
+                .collect();
+            (filtered, seq)
+        } else {
+            (Vec::new(), HashMap::new())
+        };
+        let (tx_vec, translateable_seq) = tx;
+        let tx_ids: HashSet<String> = tx_vec.iter().map(|t| t.transcript_id.clone()).collect();
 
-    let ex = if let Some(ref table) = ex_table {
-        let raw = tmp_provider.load_exons(table, &worklist).await?;
-        raw.into_iter()
-            .filter(|e| tx_ids.contains(&e.transcript_id))
-            .collect()
-    } else {
-        Vec::new()
+        let ex = if let Some(ref table) = ex_table {
+            let raw = tmp_provider.load_exons(table, &worklist).await?;
+            raw.into_iter()
+                .filter(|e| tx_ids.contains(&e.transcript_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let tl = if let Some(ref table) = tl_table {
+            let raw = tmp_provider.load_translations(table, &worklist).await?;
+            raw.into_iter()
+                .filter(|t| tx_ids.contains(&t.transcript_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let rg = if let Some(ref table) = rg_table {
+            tmp_provider
+                .load_regulatory_features(table, &worklist)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let mt = if let Some(ref table) = mt_table {
+            tmp_provider.load_motif_features(table, &worklist).await?
+        } else {
+            Vec::new()
+        };
+        profile_end!(&format!("{chrom}: context_load"), t_ctx);
+        Ok((tx_vec, translateable_seq, ex, tl, rg, mt))
+    }
+    .await;
+    let (tx_vec, translateable_seq, ex, tl, rg, mt) = match context_result {
+        Ok(context) => context,
+        Err(e) => {
+            abort_lookup_partitions(&mut lookup_partitions);
+            return Err(e);
+        }
     };
-    let tl = if let Some(ref table) = tl_table {
-        let raw = tmp_provider.load_translations(table, &worklist).await?;
-        raw.into_iter()
-            .filter(|t| tx_ids.contains(&t.transcript_id))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let rg = if let Some(ref table) = rg_table {
-        tmp_provider
-            .load_regulatory_features(table, &worklist)
-            .await?
-    } else {
-        Vec::new()
-    };
-    let mt = if let Some(ref table) = mt_table {
-        tmp_provider.load_motif_features(table, &worklist).await?
-    } else {
-        Vec::new()
-    };
-    profile_end!(&format!("{chrom}: context_load"), t_ctx);
 
     Ok(Some(ContigReadyState {
-        lookup_stream,
-        coloc_sink,
+        lookup_partitions,
         transcripts: tx_vec,
         translateable_seq_by_tx: translateable_seq,
         exons: ex,
@@ -9317,6 +9548,26 @@ mod tests {
     use crate::transcript_consequence::{
         CachedPredictions, FeatureType, ProteinDomainFeature, SiftPolyphenCache, TranslationFeature,
     };
+
+    #[test]
+    fn draining_colocated_sink_leaves_sink_empty() {
+        let sink: ColocatedSink = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut guard = sink.lock().unwrap();
+            guard.insert(
+                ("1".to_string(), 100, 100, "A/G".to_string()),
+                ColocatedSinkValue {
+                    entries: Vec::new(),
+                    compare_output_allele: Some("G".to_string()),
+                    unshifted_output_allele: None,
+                },
+            );
+        }
+
+        let drained = drain_colocated_sink(&sink).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert!(sink.lock().unwrap().is_empty());
+    }
 
     // ── format_appris ──────────────────────────────────────────────────
 
