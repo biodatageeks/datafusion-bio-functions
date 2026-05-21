@@ -7635,6 +7635,8 @@ impl ExecutionPlan for ContigAnnotationExec {
 const HYDRATION_WINDOW_SIZE: usize = 1000;
 /// Number of looked-up batches each background lookup partition may buffer.
 const LOOKUP_PARTITION_QUEUE_BATCHES: usize = 2;
+/// Number of annotated batches each background annotation partition may buffer.
+const ANNOTATION_PARTITION_QUEUE_BATCHES: usize = 2;
 /// Ensembl VEP release/115 default `buffer_size`.
 const VEP_INPUT_BUFFER_SIZE: usize = 5000;
 /// Ensembl VEP transcript cache region size (`cache_region_size`).
@@ -7659,6 +7661,40 @@ type LoadedContigContext = (
 
 type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
 
+struct SharedContigAnnotationContext {
+    config: ContigAnnotationConfig,
+    base_transcripts: Arc<Vec<TranscriptFeature>>,
+    base_translations: Arc<Vec<TranslationFeature>>,
+    exons: Arc<Vec<ExonFeature>>,
+    regulatory: Arc<Vec<RegulatoryFeature>>,
+    motifs: Arc<Vec<MotifFeature>>,
+    mirnas: Arc<Vec<MirnaFeature>>,
+    structural: Arc<Vec<StructuralFeature>>,
+    translateable_seq_by_tx: Arc<HashMap<String, String>>,
+    transcript_cache_regions: Arc<HashMap<String, Vec<TranscriptCacheRegion>>>,
+    tmp_provider: Arc<AnnotateProvider>,
+    engine: Arc<TranscriptConsequenceEngine>,
+    sift_direct_path: Option<String>,
+    #[cfg(feature = "kv-cache")]
+    sift_kv: Option<crate::kv_cache::SiftKvStore>,
+}
+
+struct AnnotationWorkerState {
+    shared: Arc<SharedContigAnnotationContext>,
+    transcripts: Vec<TranscriptFeature>,
+    translations: Vec<TranslationFeature>,
+    persisted_buffer_transcripts: PersistedBufferTranscripts,
+    colocated_map: HashMap<ColocatedKey, ColocatedData>,
+    hydrated_cds_tx_ids: HashSet<String>,
+    hgvs_reader: Option<FastaReader>,
+    sift_cache: SiftPolyphenCache,
+    sift_direct: Option<SiftDirectReader>,
+    loaded_sift_windows: HashSet<(String, i64)>,
+    input_buffer_accumulator: InputBufferAccumulator,
+    window_buffer: Vec<RecordBatch>,
+    lookup_done: bool,
+}
+
 struct LookupBatchMessage {
     batch: RecordBatch,
     colocated_delta: HashMap<ColocatedKey, ColocatedData>,
@@ -7668,6 +7704,24 @@ struct LookupPartitionHandle {
     partition_id: usize,
     receiver: tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>,
     join_handle: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl Drop for LookupPartitionHandle {
+    fn drop(&mut self) {
+        self.join_handle.abort();
+    }
+}
+
+struct AnnotationPartitionHandle {
+    partition_id: usize,
+    receiver: tokio::sync::mpsc::Receiver<Result<RecordBatch>>,
+    join_handle: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl Drop for AnnotationPartitionHandle {
+    fn drop(&mut self) {
+        self.join_handle.abort();
+    }
 }
 
 #[derive(Default)]
@@ -7739,14 +7793,7 @@ impl InputBufferAccumulator {
 /// Produced by `prepare_contig_context()`.
 struct ContigReadyState {
     lookup_partitions: VecDeque<LookupPartitionHandle>,
-    transcripts: Vec<TranscriptFeature>,
-    translateable_seq_by_tx: HashMap<String, String>,
-    exons: Vec<ExonFeature>,
-    translations: Vec<TranslationFeature>,
-    regulatory: Vec<RegulatoryFeature>,
-    motifs: Vec<MotifFeature>,
-    mirnas: Vec<MirnaFeature>,
-    structural: Vec<StructuralFeature>,
+    shared_context: Arc<SharedContigAnnotationContext>,
     ephemeral_tables: Vec<String>,
     chrom: String,
     t_contig: Instant,
@@ -7756,42 +7803,23 @@ struct ContigReadyState {
 struct ContigAnnotationState {
     lookup_partitions: VecDeque<LookupPartitionHandle>,
     active_lookup_partition: Option<LookupPartitionHandle>,
-    // Context data (transcripts/translations mutated by HGVS hydration).
-    transcripts: Vec<TranscriptFeature>,
-    translateable_seq_by_tx: HashMap<String, String>,
-    exons: Vec<ExonFeature>,
-    translations: Vec<TranslationFeature>,
-    regulatory: Vec<RegulatoryFeature>,
-    motifs: Vec<MotifFeature>,
-    mirnas: Vec<MirnaFeature>,
-    structural: Vec<StructuralFeature>,
-    transcript_cache_regions: HashMap<String, Vec<TranscriptCacheRegion>>,
-    persisted_buffer_transcripts: PersistedBufferTranscripts,
-    // Colocated data merged incrementally from ordered lookup partition messages.
-    colocated_map: HashMap<ColocatedKey, ColocatedData>,
-    // HGVS hydration tracking — already-hydrated transcripts are skipped.
-    hydrated_cds_tx_ids: HashSet<String>,
-    hgvs_reader: Option<FastaReader>,
-    // SIFT state (same sliding-window pattern as before).
-    sift_cache: SiftPolyphenCache,
-    sift_direct: Option<SiftDirectReader>,
-    loaded_sift_windows: HashSet<(String, i64)>,
-    /// Fjall-backed SIFT store for lazy per-transcript lookups (used when use_fjall=true).
-    #[cfg(feature = "kv-cache")]
-    sift_kv: Option<crate::kv_cache::SiftKvStore>,
-    // Annotation engine + provider.
-    tmp_provider: AnnotateProvider,
-    engine: TranscriptConsequenceEngine,
-    // Window buffer.
-    window_buffer: Vec<RecordBatch>,
-    input_buffer_accumulator: InputBufferAccumulator,
-    lookup_done: bool,
+    worker: AnnotationWorkerState,
     // Cleanup + profiling.
     ephemeral_tables: Vec<String>,
     chrom: String,
     config: ContigAnnotationConfig,
     session: Arc<SessionContext>,
-    cache: Arc<PartitionedParquetCache>,
+    t_contig: Instant,
+    contig_rows: usize,
+}
+
+struct ParallelAnnotationDrainState {
+    annotation_partitions: VecDeque<AnnotationPartitionHandle>,
+    active_annotation_partition: Option<AnnotationPartitionHandle>,
+    ephemeral_tables: Vec<String>,
+    chrom: String,
+    config: ContigAnnotationConfig,
+    session: Arc<SessionContext>,
     t_contig: Instant,
     contig_rows: usize,
 }
@@ -7810,6 +7838,8 @@ enum StreamState {
         batches: VecDeque<RecordBatch>,
         annotation_state: ContigAnnotationState,
     },
+    /// Drain already-annotated fjall partition workers strictly by partition id.
+    DrainingAnnotationPartitions(ParallelAnnotationDrainState),
     /// Deregister ephemeral tables after contig completes.
     CleaningUp(CleanupFuture),
     /// Deregister ephemeral tables after an error, then propagate the error.
@@ -7935,6 +7965,55 @@ fn abort_annotation_lookup_workers(ann: &mut ContigAnnotationState) {
     abort_lookup_partitions(&mut ann.lookup_partitions);
 }
 
+impl AnnotationWorkerState {
+    fn new(shared: Arc<SharedContigAnnotationContext>) -> Result<Self> {
+        let transcripts = shared.base_transcripts.as_ref().clone();
+        let translations = shared.base_translations.as_ref().clone();
+        let hgvs_reader = shared
+            .config
+            .reference_fasta_path
+            .as_deref()
+            .and_then(|path| {
+                fasta::io::indexed_reader::Builder::default()
+                    .build_from_path(path)
+                    .ok()
+            });
+        let sift_direct = shared
+            .sift_direct_path
+            .as_deref()
+            .and_then(AnnotateProvider::build_sift_direct_reader);
+
+        Ok(Self {
+            shared,
+            transcripts,
+            translations,
+            persisted_buffer_transcripts: HashMap::new(),
+            colocated_map: HashMap::new(),
+            hydrated_cds_tx_ids: HashSet::new(),
+            hgvs_reader,
+            sift_cache: SiftPolyphenCache::new(),
+            sift_direct,
+            loaded_sift_windows: HashSet::new(),
+            input_buffer_accumulator: InputBufferAccumulator::default(),
+            window_buffer: Vec::with_capacity(HYDRATION_WINDOW_SIZE),
+            lookup_done: false,
+        })
+    }
+}
+
+fn abort_annotation_partitions(partitions: &mut VecDeque<AnnotationPartitionHandle>) {
+    for handle in partitions.drain(..) {
+        handle.join_handle.abort();
+    }
+}
+
+fn abort_parallel_annotation_workers(state: &mut ParallelAnnotationDrainState) {
+    if let Some(active) = state.active_annotation_partition.take() {
+        active.join_handle.abort();
+    }
+    abort_annotation_partitions(&mut state.annotation_partitions);
+}
+
 struct ContigAnnotationStream {
     projected_schema: SchemaRef,
     full_schema: SchemaRef,
@@ -7988,6 +8067,14 @@ impl ContigAnnotationStream {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
                 }
                 ann.ephemeral_tables.clear();
+            }
+            StreamState::DrainingAnnotationPartitions(state) => {
+                abort_parallel_annotation_workers(state);
+                deregister_tables_sync(&state.session, &state.ephemeral_tables);
+                if state.config.use_fjall {
+                    let _ = state.session.deregister_table("__vep_kv_variation");
+                }
+                state.ephemeral_tables.clear();
             }
             StreamState::CleaningUp(_) | StreamState::ErrorCleaningUp(_, _) => {
                 if self.config.use_fjall {
@@ -8456,34 +8543,36 @@ fn apply_buffer_local_hgnc_propagation(transcripts: &mut [TranscriptFeature]) {
     }
 }
 
-/// Annotate a window of batches: build PreparedContext, run SIFT loading,
-/// annotate each batch, apply projection.
-fn annotate_window(
-    ann: &mut ContigAnnotationState,
+/// Annotate a window of batches inside one partition worker: build
+/// PreparedContext, run SIFT loading, annotate each batch, apply projection.
+fn annotate_worker_window(
+    worker: &mut AnnotationWorkerState,
     window_batches: &[RecordBatch],
     projection: Option<&[usize]>,
 ) -> Result<VecDeque<RecordBatch>> {
-    let engine = &ann.engine;
-    let csq_col_idx = ann.tmp_provider.vcf_field_count();
+    let shared = Arc::clone(&worker.shared);
+    let config = &shared.config;
+    let tmp_provider = shared.tmp_provider.as_ref();
+    let engine = shared.engine.as_ref();
+    let csq_col_idx = tmp_provider.vcf_field_count();
     let skip_csq = projection.is_some_and(|indices| !indices.contains(&csq_col_idx));
     let typed_cols_start = csq_col_idx + 2;
-    let typed_cols_end = typed_cols_start + ann.tmp_provider.annotation_column_defs.len();
+    let typed_cols_end = typed_cols_start + tmp_provider.annotation_column_defs.len();
     let skip_typed_cols = projection.map_or(false, |indices| {
         !indices
             .iter()
             .any(|&i| i >= typed_cols_start && i < typed_cols_end)
     });
-    let pick_requires_full_annotations = ann
-        .config
+    let pick_requires_full_annotations = config
         .pick_flags
         .requires_transcript_annotations(skip_csq, skip_typed_cols);
-    let sift_enabled = ann.config.flags.everything;
+    let sift_enabled = config.flags.everything;
     let mut out = VecDeque::with_capacity(window_batches.len());
 
-    let flush_partial = ann.lookup_done && ann.window_buffer.is_empty();
-    let ready_input_buffers = ann.input_buffer_accumulator.push_window_and_drain_ready(
+    let flush_partial = worker.lookup_done && worker.window_buffer.is_empty();
+    let ready_input_buffers = worker.input_buffer_accumulator.push_window_and_drain_ready(
         window_batches.to_vec(),
-        ann.config.input_buffer_size,
+        config.input_buffer_size,
         flush_partial,
     );
 
@@ -8492,27 +8581,27 @@ fn annotate_window(
             continue;
         };
         let buffer_transcripts = build_stateful_buffer_local_transcripts(
-            &ann.transcripts,
-            &ann.transcript_cache_regions,
-            &mut ann.persisted_buffer_transcripts,
+            &worker.transcripts,
+            &shared.transcript_cache_regions,
+            &mut worker.persisted_buffer_transcripts,
             &buffer_batches,
             &chrom,
             min_start,
             max_end,
-            ann.config.upstream_distance,
-            ann.config.downstream_distance,
+            config.upstream_distance,
+            config.downstream_distance,
         )?;
         let buffer_tx_ids: HashSet<&str> = buffer_transcripts
             .iter()
             .map(|tx| tx.transcript_id.as_str())
             .collect();
-        let buffer_exons: Vec<ExonFeature> = ann
+        let buffer_exons: Vec<ExonFeature> = shared
             .exons
             .iter()
             .filter(|exon| buffer_tx_ids.contains(exon.transcript_id.as_str()))
             .cloned()
             .collect();
-        let buffer_translations: Vec<TranslationFeature> = ann
+        let buffer_translations: Vec<TranslationFeature> = worker
             .translations
             .iter()
             .filter(|translation| buffer_tx_ids.contains(translation.transcript_id.as_str()))
@@ -8522,15 +8611,15 @@ fn annotate_window(
             &buffer_transcripts,
             &buffer_exons,
             &buffer_translations,
-            &ann.regulatory,
-            &ann.motifs,
-            &ann.mirnas,
-            &ann.structural,
+            &shared.regulatory,
+            &shared.motifs,
+            &shared.mirnas,
+            &shared.structural,
         );
 
         for batch in &buffer_batches {
             // Lazy SIFT window loading (same pattern as before).
-            if sift_enabled && ann.sift_direct.is_some() {
+            if sift_enabled && worker.sift_direct.is_some() {
                 let batch_needs_engine = if pick_requires_full_annotations {
                     true
                 } else {
@@ -8570,20 +8659,20 @@ fn annotate_window(
                             let mut ws = min_window_start;
                             while ws <= window_start + AnnotateProvider::SIFT_WINDOW_SIZE {
                                 let key = (ch.clone(), ws);
-                                if !ann.loaded_sift_windows.contains(&key) {
-                                    if let Some(ref direct) = ann.sift_direct {
+                                if !worker.loaded_sift_windows.contains(&key) {
+                                    if let Some(ref direct) = worker.sift_direct {
                                         direct.load_window(
                                             ch,
                                             ws,
                                             ws + AnnotateProvider::SIFT_WINDOW_SIZE,
-                                            &mut ann.sift_cache,
+                                            &mut worker.sift_cache,
                                         )?;
                                     }
-                                    ann.loaded_sift_windows.insert(key);
+                                    worker.loaded_sift_windows.insert(key);
                                 }
                                 ws += AnnotateProvider::SIFT_WINDOW_SIZE;
                             }
-                            ann.sift_cache.evict_before(*batch_min);
+                            worker.sift_cache.evict_before(*batch_min);
                         }
                     }
                 }
@@ -8592,25 +8681,25 @@ fn annotate_window(
             #[cfg(not(feature = "kv-cache"))]
             let sift_kv: Option<()> = None;
             #[cfg(feature = "kv-cache")]
-            let sift_kv = &ann.sift_kv;
+            let sift_kv = &shared.sift_kv;
 
-            let annotated = ann.tmp_provider.annotate_batch_with_transcript_engine(
+            let annotated = tmp_provider.annotate_batch_with_transcript_engine(
                 batch,
                 engine,
                 &ctx,
-                &ann.colocated_map,
-                &mut ann.sift_cache,
+                &worker.colocated_map,
+                &mut worker.sift_cache,
                 #[cfg(feature = "kv-cache")]
                 sift_kv,
                 #[cfg(not(feature = "kv-cache"))]
                 &sift_kv,
                 skip_csq,
                 skip_typed_cols,
-                &ann.config.flags,
-                &ann.config.hgvs_flags,
-                ann.config.transcript_selection,
-                &ann.config.pick_flags,
-                &mut ann.hgvs_reader,
+                &config.flags,
+                &config.hgvs_flags,
+                config.transcript_selection,
+                &config.pick_flags,
+                &mut worker.hgvs_reader,
             )?;
 
             if let Some(indices) = projection {
@@ -8623,15 +8712,23 @@ fn annotate_window(
     Ok(out)
 }
 
+fn annotate_window(
+    ann: &mut ContigAnnotationState,
+    window_batches: &[RecordBatch],
+    projection: Option<&[usize]>,
+) -> Result<VecDeque<RecordBatch>> {
+    annotate_worker_window(&mut ann.worker, window_batches, projection)
+}
+
 fn poll_lookup_partitions(
     ann: &mut ContigAnnotationState,
     cx: &mut TaskCtx<'_>,
 ) -> Poll<Result<()>> {
-    while !ann.lookup_done && ann.window_buffer.len() < HYDRATION_WINDOW_SIZE {
+    while !ann.worker.lookup_done && ann.worker.window_buffer.len() < HYDRATION_WINDOW_SIZE {
         if ann.active_lookup_partition.is_none() {
             ann.active_lookup_partition = ann.lookup_partitions.pop_front();
             if ann.active_lookup_partition.is_none() {
-                ann.lookup_done = true;
+                ann.worker.lookup_done = true;
                 profile_end!(
                     &format!("{}: 1. variation_lookup", ann.chrom),
                     ann.t_contig,
@@ -8648,10 +8745,10 @@ fn poll_lookup_partitions(
         match active.receiver.poll_recv(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Some(Ok(message))) => {
-                merge_colocated_delta(&mut ann.colocated_map, message.colocated_delta);
+                merge_colocated_delta(&mut ann.worker.colocated_map, message.colocated_delta);
                 if message.batch.num_rows() > 0 {
                     ann.contig_rows += message.batch.num_rows();
-                    ann.window_buffer.push(message.batch);
+                    ann.worker.window_buffer.push(message.batch);
                 }
             }
             Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
@@ -8679,6 +8776,159 @@ fn poll_lookup_partitions(
     }
 
     Poll::Ready(Ok(()))
+}
+
+async fn send_annotated_batches(
+    sender: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+    mut batches: VecDeque<RecordBatch>,
+) -> bool {
+    while let Some(batch) = batches.pop_front() {
+        if sender.send(Ok(batch)).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+async fn run_annotation_partition_worker(
+    mut lookup_partition: LookupPartitionHandle,
+    shared_context: Arc<SharedContigAnnotationContext>,
+    projection: Option<Vec<usize>>,
+    sender: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
+) -> Result<()> {
+    let mut worker = AnnotationWorkerState::new(shared_context)?;
+
+    loop {
+        while !worker.lookup_done && worker.window_buffer.len() < HYDRATION_WINDOW_SIZE {
+            match lookup_partition.receiver.recv().await {
+                Some(Ok(message)) => {
+                    merge_colocated_delta(&mut worker.colocated_map, message.colocated_delta);
+                    if message.batch.num_rows() > 0 {
+                        worker.window_buffer.push(message.batch);
+                    }
+                }
+                Some(Err(e)) => return Err(e),
+                None => {
+                    worker.lookup_done = true;
+                    match (&mut lookup_partition.join_handle).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => {
+                            return Err(DataFusionError::Execution(format!(
+                                "lookup partition {} task failed: {e}",
+                                lookup_partition.partition_id
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        let has_pending_input_buffer = worker.input_buffer_accumulator.pending_rows() > 0;
+        if worker.window_buffer.is_empty() && !has_pending_input_buffer {
+            break;
+        }
+
+        let window_end = worker.window_buffer.len().min(HYDRATION_WINDOW_SIZE);
+        let window_batches: Vec<RecordBatch> = worker.window_buffer.drain(..window_end).collect();
+
+        if !window_batches.is_empty() {
+            let shared = Arc::clone(&worker.shared);
+            hydrate_window(
+                &mut worker.transcripts,
+                &shared.exons,
+                &mut worker.translations,
+                &shared.translateable_seq_by_tx,
+                &mut worker.hgvs_reader,
+                &mut worker.hydrated_cds_tx_ids,
+                &window_batches,
+                shared.config.cache_source_type,
+            )?;
+        }
+
+        let batches = annotate_worker_window(&mut worker, &window_batches, projection.as_deref())?;
+        if !send_annotated_batches(&sender, batches).await {
+            return Ok(());
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_annotation_partition_worker(
+    lookup_partition: LookupPartitionHandle,
+    shared_context: Arc<SharedContigAnnotationContext>,
+    projection: Option<Vec<usize>>,
+) -> AnnotationPartitionHandle {
+    let partition_id = lookup_partition.partition_id;
+    let (sender, receiver) = tokio::sync::mpsc::channel(ANNOTATION_PARTITION_QUEUE_BATCHES.max(1));
+    let join_handle = tokio::spawn(run_annotation_partition_worker(
+        lookup_partition,
+        shared_context,
+        projection,
+        sender,
+    ));
+
+    AnnotationPartitionHandle {
+        partition_id,
+        receiver,
+        join_handle,
+    }
+}
+
+fn poll_next_annotated_partition_batch(
+    state: &mut ParallelAnnotationDrainState,
+    cx: &mut TaskCtx<'_>,
+) -> Poll<Result<Option<RecordBatch>>> {
+    loop {
+        if state.active_annotation_partition.is_none() {
+            state.active_annotation_partition = state.annotation_partitions.pop_front();
+            if state.active_annotation_partition.is_none() {
+                profile_end!(
+                    &format!("{}: TOTAL", state.chrom),
+                    state.t_contig,
+                    format!("{} rows", state.contig_rows)
+                );
+                if profiling_enabled() {
+                    eprintln!("[VEP_PROFILE] ------ contig {} END ------", state.chrom);
+                }
+                return Poll::Ready(Ok(None));
+            }
+        }
+
+        let active = state
+            .active_annotation_partition
+            .as_mut()
+            .expect("active annotation partition must be present");
+        match active.receiver.poll_recv(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Some(Ok(batch))) => {
+                state.contig_rows += batch.num_rows();
+                return Poll::Ready(Ok(Some(batch)));
+            }
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+            Poll::Ready(None) => {
+                let mut done = state
+                    .active_annotation_partition
+                    .take()
+                    .expect("active annotation partition must be present");
+                match Pin::new(&mut done.join_handle).poll(cx) {
+                    Poll::Ready(Ok(Ok(()))) => {}
+                    Poll::Ready(Ok(Err(e))) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready(Err(DataFusionError::Execution(format!(
+                            "annotation partition {} task failed: {e}",
+                            done.partition_id
+                        ))));
+                    }
+                    Poll::Pending => {
+                        state.active_annotation_partition = Some(done);
+                        return Poll::Pending;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Stream for ContigAnnotationStream {
@@ -8742,127 +8992,67 @@ impl Stream for ContigAnnotationStream {
                         // Contig skipped (no variation table).
                         self.state = StreamState::StartContig;
                     }
-                    Poll::Ready(Ok(Some(ready))) => {
-                        let projected_schema = self.projected_schema.clone();
-                        let full_schema = self.full_schema.clone();
+                    Poll::Ready(Ok(Some(mut ready))) => {
                         let session = Arc::clone(&self.session);
-                        let cache = Arc::clone(&self.cache);
                         let config = self.config.clone();
-
-                        // Derive VCF-only schema for AnnotateProvider.
-                        let vcf_field_count = full_schema
-                            .fields()
-                            .len()
-                            .saturating_sub(config.annotation_column_count);
-                        let vcf_only_schema =
-                            Schema::new(full_schema.fields()[..vcf_field_count].to_vec());
-
-                        let tmp_provider = match AnnotateProvider::new(
-                            Arc::clone(&session),
-                            config.vcf_table.clone(),
-                            String::new(),
-                            AnnotationBackend::Parquet,
-                            config.cache_source_type,
-                            config.options_json.clone(),
-                            vcf_only_schema,
-                        ) {
-                            Ok(provider) => provider,
-                            Err(e) => {
-                                self.state = StreamState::Done;
-                                return Poll::Ready(Some(Err(e)));
-                            }
-                        };
-                        let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
-                            config.upstream_distance,
-                            config.downstream_distance,
-                            config.hgvs_flags.shift_hgvs,
-                        );
-                        let hgvs_reader = config.reference_fasta_path.as_deref().and_then(|path| {
-                            fasta::io::indexed_reader::Builder::default()
-                                .build_from_path(path)
-                                .ok()
-                        });
-                        // SIFT source: when use_fjall, use SiftKvStore from fjall
-                        // for lazy per-transcript lookups; otherwise use parquet
-                        // SiftDirectReader.
                         #[cfg(feature = "kv-cache")]
-                        let use_fjall_sift = config.use_fjall;
+                        let use_parallel_annotation = config.use_fjall;
                         #[cfg(not(feature = "kv-cache"))]
-                        let use_fjall_sift = false;
+                        let use_parallel_annotation = false;
 
-                        let sift_direct: Option<SiftDirectReader> = if config.flags.everything
-                            && !use_fjall_sift
-                        {
-                            config
-                                .translations_sift_table
-                                .as_deref()
-                                .and_then(|table| {
-                                    let path = std::path::Path::new(table);
-                                    if path.exists() {
-                                        AnnotateProvider::build_sift_direct_reader(table)
-                                    } else {
-                                        None
+                        if use_parallel_annotation {
+                            let mut annotation_partitions =
+                                VecDeque::with_capacity(ready.lookup_partitions.len());
+                            let projection = config.projection.clone();
+                            for lookup_partition in ready.lookup_partitions {
+                                annotation_partitions.push_back(spawn_annotation_partition_worker(
+                                    lookup_partition,
+                                    Arc::clone(&ready.shared_context),
+                                    projection.clone(),
+                                ));
+                            }
+                            if profiling_enabled() {
+                                eprintln!(
+                                    "[VEP_PROFILE] {}: parallel_fjall_annotation partitions={}",
+                                    ready.chrom,
+                                    annotation_partitions.len()
+                                );
+                            }
+                            self.state = StreamState::DrainingAnnotationPartitions(
+                                ParallelAnnotationDrainState {
+                                    annotation_partitions,
+                                    active_annotation_partition: None,
+                                    ephemeral_tables: ready.ephemeral_tables,
+                                    chrom: ready.chrom,
+                                    config,
+                                    session,
+                                    t_contig: ready.t_contig,
+                                    contig_rows: 0,
+                                },
+                            );
+                        } else {
+                            let worker =
+                                match AnnotationWorkerState::new(Arc::clone(&ready.shared_context))
+                                {
+                                    Ok(worker) => worker,
+                                    Err(e) => {
+                                        abort_lookup_partitions(&mut ready.lookup_partitions);
+                                        self.state = StreamState::Done;
+                                        return Poll::Ready(Some(Err(e)));
                                     }
-                                })
-                                .or_else(|| {
-                                    cache
-                                        .context_path("translation_sift", &ready.chrom)
-                                        .and_then(|p| {
-                                            AnnotateProvider::build_sift_direct_reader(p.to_str()?)
-                                        })
-                                })
-                        } else {
-                            None
-                        };
-
-                        // Reuse the pre-opened SiftKvStore from config (opened
-                        // once, shared across contigs) rather than re-opening
-                        // the fjall DB every contig.
-                        #[cfg(feature = "kv-cache")]
-                        let sift_kv = if use_fjall_sift && config.flags.everything {
-                            config.sift_kv_store.clone()
-                        } else {
-                            None
-                        };
-
-                        self.state = StreamState::AnnotatingContig(ContigAnnotationState {
-                            lookup_partitions: ready.lookup_partitions,
-                            active_lookup_partition: None,
-                            transcript_cache_regions: ready
-                                .transcripts
-                                .iter()
-                                .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
-                                .collect(),
-                            persisted_buffer_transcripts: HashMap::new(),
-                            transcripts: ready.transcripts,
-                            translateable_seq_by_tx: ready.translateable_seq_by_tx,
-                            exons: ready.exons,
-                            translations: ready.translations,
-                            regulatory: ready.regulatory,
-                            motifs: ready.motifs,
-                            mirnas: ready.mirnas,
-                            structural: ready.structural,
-                            colocated_map: HashMap::new(),
-                            hydrated_cds_tx_ids: HashSet::new(),
-                            hgvs_reader,
-                            sift_cache: SiftPolyphenCache::new(),
-                            sift_direct,
-                            loaded_sift_windows: HashSet::new(),
-                            #[cfg(feature = "kv-cache")]
-                            sift_kv,
-                            tmp_provider,
-                            engine,
-                            window_buffer: Vec::with_capacity(HYDRATION_WINDOW_SIZE),
-                            input_buffer_accumulator: InputBufferAccumulator::default(),
-                            lookup_done: false,
-                            ephemeral_tables: ready.ephemeral_tables,
-                            chrom: ready.chrom,
-                            config,
-                            session,
-                            cache,
-                            t_contig: ready.t_contig,
-                            contig_rows: 0,
-                        });
+                                };
+                            self.state = StreamState::AnnotatingContig(ContigAnnotationState {
+                                lookup_partitions: ready.lookup_partitions,
+                                active_lookup_partition: None,
+                                worker,
+                                ephemeral_tables: ready.ephemeral_tables,
+                                chrom: ready.chrom,
+                                config,
+                                session,
+                                t_contig: ready.t_contig,
+                                contig_rows: 0,
+                            });
+                        }
                     }
                 },
 
@@ -8874,10 +9064,11 @@ impl Stream for ContigAnnotationStream {
                     // LIMIT pushdown: once we have enough buffered rows to
                     // satisfy the limit, stop pulling from the lookup stream
                     // to avoid unnecessary annotation work.
-                    let buffered_rows: usize = ann.window_buffer.iter().map(|b| b.num_rows()).sum();
+                    let buffered_rows: usize =
+                        ann.worker.window_buffer.iter().map(|b| b.num_rows()).sum();
                     let limit_buffered =
                         fetch_limit.is_some_and(|limit| rows_emitted + buffered_rows >= limit);
-                    if !ann.lookup_done && !limit_buffered {
+                    if !ann.worker.lookup_done && !limit_buffered {
                         match poll_lookup_partitions(ann, cx) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Ok(())) => {}
@@ -8904,9 +9095,11 @@ impl Stream for ContigAnnotationStream {
 
                     // LIMIT pushdown: skip remaining windows if limit reached.
                     let limit_reached = fetch_limit.is_some_and(|limit| rows_emitted >= limit);
-                    let has_pending_input_buffer = ann.input_buffer_accumulator.pending_rows() > 0;
+                    let has_pending_input_buffer =
+                        ann.worker.input_buffer_accumulator.pending_rows() > 0;
 
-                    if limit_reached || (ann.window_buffer.is_empty() && !has_pending_input_buffer)
+                    if limit_reached
+                        || (ann.worker.window_buffer.is_empty() && !has_pending_input_buffer)
                     {
                         // No more data (or limit reached) — clean up.
                         abort_annotation_lookup_workers(&mut ann);
@@ -8920,12 +9113,9 @@ impl Stream for ContigAnnotationStream {
                             eprintln!("[VEP_PROFILE] ------ contig {} END ------", ann.chrom);
                         }
                         // Eagerly reclaim per-contig memory.
-                        ann.colocated_map = HashMap::new();
-                        ann.transcripts = Vec::new();
-                        ann.exons = Vec::new();
-                        ann.translations = Vec::new();
-                        ann.regulatory = Vec::new();
-                        ann.motifs = Vec::new();
+                        ann.worker.colocated_map = HashMap::new();
+                        ann.worker.transcripts = Vec::new();
+                        ann.worker.translations = Vec::new();
                         let fut = make_cleanup_future(
                             Arc::clone(&ann.session),
                             std::mem::take(&mut ann.ephemeral_tables),
@@ -8935,19 +9125,20 @@ impl Stream for ContigAnnotationStream {
                     }
 
                     // Take one window's worth of batches from the buffer.
-                    let window_end = ann.window_buffer.len().min(HYDRATION_WINDOW_SIZE);
+                    let window_end = ann.worker.window_buffer.len().min(HYDRATION_WINDOW_SIZE);
                     let window_batches: Vec<RecordBatch> =
-                        ann.window_buffer.drain(..window_end).collect();
+                        ann.worker.window_buffer.drain(..window_end).collect();
 
                     // Window-based HGVS hydration (like SIFT sliding window).
                     if !window_batches.is_empty() {
+                        let shared = Arc::clone(&ann.worker.shared);
                         if let Err(e) = hydrate_window(
-                            &mut ann.transcripts,
-                            &ann.exons,
-                            &mut ann.translations,
-                            &ann.translateable_seq_by_tx,
-                            &mut ann.hgvs_reader,
-                            &mut ann.hydrated_cds_tx_ids,
+                            &mut ann.worker.transcripts,
+                            &shared.exons,
+                            &mut ann.worker.translations,
+                            &shared.translateable_seq_by_tx,
+                            &mut ann.worker.hgvs_reader,
+                            &mut ann.worker.hydrated_cds_tx_ids,
                             &window_batches,
                             ann.config.cache_source_type,
                         ) {
@@ -9015,6 +9206,58 @@ impl Stream for ContigAnnotationStream {
                         unreachable!()
                     };
                     self.state = StreamState::AnnotatingContig(ann);
+                }
+
+                StreamState::DrainingAnnotationPartitions(state) => {
+                    if fetch_limit.is_some_and(|limit| rows_emitted >= limit) {
+                        abort_parallel_annotation_workers(state);
+                        let fut = make_cleanup_future(
+                            Arc::clone(&state.session),
+                            std::mem::take(&mut state.ephemeral_tables),
+                        );
+                        self.state = StreamState::CleaningUp(fut);
+                        continue;
+                    }
+
+                    match poll_next_annotated_partition_batch(state, cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(e)) => {
+                            abort_parallel_annotation_workers(state);
+                            let fut = make_cleanup_future(
+                                Arc::clone(&state.session),
+                                std::mem::take(&mut state.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(fut, e);
+                            continue;
+                        }
+                        Poll::Ready(Ok(None)) => {
+                            let StreamState::DrainingAnnotationPartitions(mut state) =
+                                std::mem::replace(&mut self.state, StreamState::Done)
+                            else {
+                                unreachable!()
+                            };
+                            let fut = make_cleanup_future(
+                                Arc::clone(&state.session),
+                                std::mem::take(&mut state.ephemeral_tables),
+                            );
+                            self.state = StreamState::CleaningUp(fut);
+                            continue;
+                        }
+                        Poll::Ready(Ok(Some(batch))) => {
+                            if let Some(limit) = fetch_limit {
+                                let remaining = limit.saturating_sub(rows_emitted);
+                                if remaining == 0 {
+                                    continue;
+                                }
+                                if batch.num_rows() > remaining {
+                                    self.rows_emitted += remaining;
+                                    return Poll::Ready(Some(Ok(batch.slice(0, remaining))));
+                                }
+                            }
+                            self.rows_emitted += batch.num_rows();
+                            return Poll::Ready(Some(Ok(batch)));
+                        }
+                    }
                 }
 
                 StreamState::CleaningUp(fut) => match fut.as_mut().poll(cx) {
@@ -9287,7 +9530,7 @@ async fn prepare_contig_context(
             AnnotationBackend::Parquet,
             config.cache_source_type,
             config.options_json.clone(),
-            vcf_only_schema,
+            vcf_only_schema.clone(),
         )?;
 
         let tx = if let Some(ref table) = tx_table {
@@ -9343,18 +9586,88 @@ async fn prepare_contig_context(
         }
     };
 
-    Ok(Some(ContigReadyState {
-        lookup_partitions,
-        transcripts: tx_vec,
-        translateable_seq_by_tx: translateable_seq,
-        exons: ex,
-        translations: tl,
-        regulatory: rg,
-        motifs: mt,
+    let tmp_provider = AnnotateProvider::new(
+        Arc::clone(&session),
+        config.vcf_table.clone(),
+        String::new(),
+        AnnotationBackend::Parquet,
+        config.cache_source_type,
+        config.options_json.clone(),
+        vcf_only_schema,
+    )?;
+    let engine = TranscriptConsequenceEngine::new_with_hgvs_shift(
+        config.upstream_distance,
+        config.downstream_distance,
+        config.hgvs_flags.shift_hgvs,
+    );
+
+    // SIFT source: when use_fjall, use SiftKvStore from fjall for lazy
+    // per-transcript lookups; otherwise each annotation worker opens its own
+    // parquet direct reader from this immutable path.
+    #[cfg(feature = "kv-cache")]
+    let use_fjall_sift = config.use_fjall;
+    #[cfg(not(feature = "kv-cache"))]
+    let use_fjall_sift = false;
+
+    let sift_direct_path = if config.flags.everything && !use_fjall_sift {
+        config
+            .translations_sift_table
+            .as_deref()
+            .and_then(|table| {
+                if std::path::Path::new(table).exists() {
+                    Some(table.to_string())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                cache
+                    .context_path("translation_sift", &chrom)
+                    .and_then(|p| p.to_str().map(ToString::to_string))
+            })
+    } else {
+        None
+    };
+
+    // Reuse the pre-opened SiftKvStore from config (opened once, shared across
+    // contigs) rather than re-opening the fjall DB every contig.
+    #[cfg(feature = "kv-cache")]
+    let sift_kv = if use_fjall_sift && config.flags.everything {
+        config.sift_kv_store.clone()
+    } else {
+        None
+    };
+
+    let base_transcripts = Arc::new(tx_vec);
+    let transcript_cache_regions = Arc::new(
+        base_transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect(),
+    );
+    let shared_context = Arc::new(SharedContigAnnotationContext {
+        config: config.clone(),
+        base_transcripts,
+        base_translations: Arc::new(tl),
+        exons: Arc::new(ex),
+        regulatory: Arc::new(rg),
+        motifs: Arc::new(mt),
         // TODO: miRNA and structural features are not yet partitioned —
         // these are rare and handled by the monolithic path only.
-        mirnas: Vec::new(),
-        structural: Vec::new(),
+        mirnas: Arc::new(Vec::new()),
+        structural: Arc::new(Vec::new()),
+        translateable_seq_by_tx: Arc::new(translateable_seq),
+        transcript_cache_regions,
+        tmp_provider: Arc::new(tmp_provider),
+        engine: Arc::new(engine),
+        sift_direct_path,
+        #[cfg(feature = "kv-cache")]
+        sift_kv,
+    });
+
+    Ok(Some(ContigReadyState {
+        lookup_partitions,
+        shared_context,
         ephemeral_tables,
         chrom,
         t_contig,
@@ -9567,6 +9880,105 @@ mod tests {
         let drained = drain_colocated_sink(&sink).unwrap();
         assert_eq!(drained.len(), 1);
         assert!(sink.lock().unwrap().is_empty());
+    }
+
+    fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
+        ContigAnnotationConfig {
+            vcf_table: "vcf".to_string(),
+            options_json: None,
+            cache_columns: Vec::new(),
+            extended_probes: true,
+            translations_sift_table: None,
+            flags: VepFlags::from_options_json(None),
+            hgvs_flags: HgvsFlags::default(),
+            cache_source_type: CacheSourceType::Ensembl,
+            transcript_selection: TranscriptSelectionFlags::default(),
+            allowed_failed: 0,
+            reference_fasta_path: None,
+            upstream_distance: 5000,
+            downstream_distance: 5000,
+            input_buffer_size: VEP_INPUT_BUFFER_SIZE,
+            projection: None,
+            annotation_column_count: 0,
+            fetch_limit: None,
+            target_partitions: 1,
+            pick_flags: PickFlags::default(),
+            #[cfg(feature = "kv-cache")]
+            use_fjall: true,
+            #[cfg(feature = "kv-cache")]
+            kv_store: None,
+            #[cfg(feature = "kv-cache")]
+            sift_kv_store: None,
+        }
+    }
+
+    fn minimal_shared_contig_annotation_context() -> Arc<SharedContigAnnotationContext> {
+        let session = Arc::new(SessionContext::new());
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let tmp_provider = AnnotateProvider::new(
+            session,
+            "vcf".to_string(),
+            String::new(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Ensembl,
+            None,
+            vcf_schema,
+        )
+        .unwrap();
+
+        Arc::new(SharedContigAnnotationContext {
+            config: minimal_contig_annotation_config(),
+            base_transcripts: Arc::new(Vec::new()),
+            base_translations: Arc::new(Vec::new()),
+            exons: Arc::new(Vec::new()),
+            regulatory: Arc::new(Vec::new()),
+            motifs: Arc::new(Vec::new()),
+            mirnas: Arc::new(Vec::new()),
+            structural: Arc::new(Vec::new()),
+            translateable_seq_by_tx: Arc::new(HashMap::new()),
+            transcript_cache_regions: Arc::new(HashMap::new()),
+            tmp_provider: Arc::new(tmp_provider),
+            engine: Arc::new(TranscriptConsequenceEngine::new_with_hgvs_shift(
+                5000, 5000, false,
+            )),
+            sift_direct_path: None,
+            #[cfg(feature = "kv-cache")]
+            sift_kv: None,
+        })
+    }
+
+    #[test]
+    fn annotation_worker_state_starts_with_partition_local_mutable_state() {
+        let shared = minimal_shared_contig_annotation_context();
+        let mut left = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+        let right = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+
+        left.hydrated_cds_tx_ids.insert("left_tx".to_string());
+        left.loaded_sift_windows.insert(("1".to_string(), 0));
+        left.persisted_buffer_transcripts.insert(
+            TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 0,
+            },
+            HashMap::new(),
+        );
+
+        assert!(right.hydrated_cds_tx_ids.is_empty());
+        assert!(right.loaded_sift_windows.is_empty());
+        assert!(right.persisted_buffer_transcripts.is_empty());
+
+        assert!(Arc::ptr_eq(&left.shared.exons, &right.shared.exons));
+        assert!(Arc::ptr_eq(
+            &left.shared.regulatory,
+            &right.shared.regulatory
+        ));
+        assert!(Arc::ptr_eq(&left.shared.motifs, &right.shared.motifs));
     }
 
     // ── format_appris ──────────────────────────────────────────────────
