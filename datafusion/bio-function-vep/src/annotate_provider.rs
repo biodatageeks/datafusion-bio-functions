@@ -7767,7 +7767,7 @@ struct SharedContigAnnotationContext {
     transcript_cache_regions: Arc<HashMap<String, Vec<TranscriptCacheRegion>>>,
     tmp_provider: Arc<AnnotateProvider>,
     engine: Arc<TranscriptConsequenceEngine>,
-    sift_direct_path: Option<String>,
+    sift_direct: Option<Arc<SiftDirectReader>>,
     #[cfg(feature = "kv-cache")]
     sift_kv: Option<crate::kv_cache::SiftKvStore>,
 }
@@ -7781,9 +7781,10 @@ struct AnnotationWorkerState {
     hydrated_cds_tx_ids: HashSet<String>,
     hgvs_reader: Option<FastaReader>,
     sift_cache: SiftPolyphenCache,
-    sift_direct: Option<SiftDirectReader>,
+    sift_direct: Option<Arc<SiftDirectReader>>,
     loaded_sift_windows: HashSet<(String, i64)>,
     input_buffer_accumulator: InputBufferAccumulator,
+    next_input_buffer_id: usize,
     window_buffer: Vec<RecordBatch>,
     lookup_done: bool,
 }
@@ -8016,6 +8017,20 @@ struct ParallelAnnotationDrainState {
     contig_rows: usize,
 }
 
+struct InputBufferAnnotationJob {
+    buffer_id: usize,
+    batches: Vec<RecordBatch>,
+    transcripts: Vec<TranscriptFeature>,
+    exons: Vec<ExonFeature>,
+    translations: Vec<TranslationFeature>,
+    colocated_map: Arc<HashMap<ColocatedKey, ColocatedData>>,
+}
+
+struct AnnotatedInputBuffer {
+    buffer_id: usize,
+    batches: VecDeque<RecordBatch>,
+}
+
 fn should_parallelize_annotation(config: &ContigAnnotationConfig) -> bool {
     // VEP input-buffer state is global and order-dependent: buffer size counts
     // parsed ALT alleles, and HGNC promotion can carry across adjacent buffers.
@@ -8025,8 +8040,22 @@ fn should_parallelize_annotation(config: &ContigAnnotationConfig) -> bool {
     false
 }
 
+fn should_parallelize_input_buffers(config: &ContigAnnotationConfig) -> bool {
+    #[cfg(feature = "kv-cache")]
+    {
+        config.use_fjall && config.target_partitions > 1
+    }
+    #[cfg(not(feature = "kv-cache"))]
+    {
+        let _ = config;
+        false
+    }
+}
+
 type PrepareFuture = Pin<Box<dyn Future<Output = Result<Option<ContigReadyState>>> + Send>>;
 type CleanupFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+type AnnotateWindowFuture =
+    Pin<Box<dyn Future<Output = (ContigAnnotationState, Result<VecDeque<RecordBatch>>)> + Send>>;
 
 enum StreamState {
     StartContig,
@@ -8034,6 +8063,13 @@ enum StreamState {
     PreparingContig(PrepareFuture),
     /// Pull from lookup stream, accumulate windows, hydrate + annotate.
     AnnotatingContig(ContigAnnotationState),
+    /// Run annotation for one ordered window, potentially across input-buffer workers.
+    AnnotatingWindow {
+        fut: AnnotateWindowFuture,
+        session: Arc<SessionContext>,
+        config: ContigAnnotationConfig,
+        ephemeral_tables: Vec<String>,
+    },
     /// Yield annotated batches from the current window, then resume annotation.
     DrainingWindow {
         batches: VecDeque<RecordBatch>,
@@ -8179,10 +8215,7 @@ impl AnnotationWorkerState {
                     .build_from_path(path)
                     .ok()
             });
-        let sift_direct = shared
-            .sift_direct_path
-            .as_deref()
-            .and_then(AnnotateProvider::build_sift_direct_reader);
+        let sift_direct = shared.sift_direct.clone();
 
         let state = Self {
             shared,
@@ -8196,6 +8229,7 @@ impl AnnotationWorkerState {
             sift_direct,
             loaded_sift_windows: HashSet::new(),
             input_buffer_accumulator: InputBufferAccumulator::default(),
+            next_input_buffer_id: 0,
             window_buffer: Vec::with_capacity(HYDRATION_WINDOW_SIZE),
             lookup_done: false,
         };
@@ -8262,6 +8296,17 @@ impl ContigAnnotationStream {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
                 }
                 ann.ephemeral_tables.clear();
+            }
+            StreamState::AnnotatingWindow {
+                session,
+                config,
+                ephemeral_tables,
+                ..
+            } => {
+                deregister_tables_sync(session, ephemeral_tables);
+                if config.use_fjall {
+                    let _ = session.deregister_table("__vep_kv_variation");
+                }
             }
             StreamState::DrainingWindow {
                 annotation_state: ann,
@@ -8993,6 +9038,75 @@ fn apply_buffer_local_hgnc_propagation_with_extra_donors(
     }
 }
 
+fn load_sift_for_batch(
+    batch: &RecordBatch,
+    pick_requires_full_annotations: bool,
+    sift_direct: Option<&SiftDirectReader>,
+    loaded_sift_windows: &mut HashSet<(String, i64)>,
+    sift_cache: &mut SiftPolyphenCache,
+) -> Result<()> {
+    let Some(direct) = sift_direct else {
+        return Ok(());
+    };
+
+    let batch_needs_engine = if pick_requires_full_annotations {
+        true
+    } else {
+        batch
+            .schema()
+            .index_of("cache_most_severe_consequence")
+            .ok()
+            .map_or(true, |idx| batch.column(idx).null_count() > 0)
+    };
+    if !batch_needs_engine {
+        return Ok(());
+    }
+
+    let schema = batch.schema();
+    let (Ok(ci), Ok(si), Ok(ei)) = (
+        schema.index_of("chrom"),
+        schema.index_of("start"),
+        schema.index_of("end"),
+    ) else {
+        return Ok(());
+    };
+
+    let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
+    for row in 0..batch.num_rows() {
+        if let (Some(c), Some(s), Some(e)) = (
+            string_at(batch.column(ci).as_ref(), row),
+            int64_at(batch.column(si).as_ref(), row),
+            int64_at(batch.column(ei).as_ref(), row),
+        ) {
+            let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
+            let entry = batch_chrom_bounds
+                .entry(c_norm)
+                .or_insert((i64::MAX, i64::MIN));
+            entry.0 = entry.0.min(s);
+            entry.1 = entry.1.max(e);
+        }
+    }
+
+    for (ch, (batch_min, batch_max)) in &batch_chrom_bounds {
+        let window_start =
+            (batch_max / AnnotateProvider::SIFT_WINDOW_SIZE) * AnnotateProvider::SIFT_WINDOW_SIZE;
+        let min_window_start =
+            (batch_min / AnnotateProvider::SIFT_WINDOW_SIZE) * AnnotateProvider::SIFT_WINDOW_SIZE;
+        let mut ws = min_window_start;
+        while ws <= window_start + AnnotateProvider::SIFT_WINDOW_SIZE {
+            let key = (ch.clone(), ws);
+            if !loaded_sift_windows.contains(&key) {
+                direct.load_window(ch, ws, ws + AnnotateProvider::SIFT_WINDOW_SIZE, sift_cache)?;
+                loaded_sift_windows.insert(key);
+            }
+            ws += AnnotateProvider::SIFT_WINDOW_SIZE;
+        }
+        sift_cache.evict_before(*batch_min);
+    }
+
+    Ok(())
+}
+
 /// Annotate a window of batches inside one partition worker: build
 /// PreparedContext, run SIFT loading, annotate each batch, apply projection.
 fn annotate_worker_window(
@@ -9099,62 +9213,13 @@ fn annotate_worker_window(
             // Lazy SIFT window loading (same pattern as before).
             if sift_enabled && worker.sift_direct.is_some() {
                 let sift_started = Instant::now();
-                let batch_needs_engine = if pick_requires_full_annotations {
-                    true
-                } else {
-                    batch
-                        .schema()
-                        .index_of("cache_most_severe_consequence")
-                        .ok()
-                        .map_or(true, |idx| batch.column(idx).null_count() > 0)
-                };
-                if batch_needs_engine {
-                    let schema = batch.schema();
-                    if let (Ok(ci), Ok(si), Ok(ei)) = (
-                        schema.index_of("chrom"),
-                        schema.index_of("start"),
-                        schema.index_of("end"),
-                    ) {
-                        let mut batch_chrom_bounds: HashMap<String, (i64, i64)> = HashMap::new();
-                        for row in 0..batch.num_rows() {
-                            if let (Some(c), Some(s), Some(e)) = (
-                                string_at(batch.column(ci).as_ref(), row),
-                                int64_at(batch.column(si).as_ref(), row),
-                                int64_at(batch.column(ei).as_ref(), row),
-                            ) {
-                                let c_norm = c.strip_prefix("chr").unwrap_or(&c).to_string();
-                                let entry = batch_chrom_bounds
-                                    .entry(c_norm)
-                                    .or_insert((i64::MAX, i64::MIN));
-                                entry.0 = entry.0.min(s);
-                                entry.1 = entry.1.max(e);
-                            }
-                        }
-                        for (ch, (batch_min, batch_max)) in &batch_chrom_bounds {
-                            let window_start = (batch_max / AnnotateProvider::SIFT_WINDOW_SIZE)
-                                * AnnotateProvider::SIFT_WINDOW_SIZE;
-                            let min_window_start = (batch_min / AnnotateProvider::SIFT_WINDOW_SIZE)
-                                * AnnotateProvider::SIFT_WINDOW_SIZE;
-                            let mut ws = min_window_start;
-                            while ws <= window_start + AnnotateProvider::SIFT_WINDOW_SIZE {
-                                let key = (ch.clone(), ws);
-                                if !worker.loaded_sift_windows.contains(&key) {
-                                    if let Some(ref direct) = worker.sift_direct {
-                                        direct.load_window(
-                                            ch,
-                                            ws,
-                                            ws + AnnotateProvider::SIFT_WINDOW_SIZE,
-                                            &mut worker.sift_cache,
-                                        )?;
-                                    }
-                                    worker.loaded_sift_windows.insert(key);
-                                }
-                                ws += AnnotateProvider::SIFT_WINDOW_SIZE;
-                            }
-                            worker.sift_cache.evict_before(*batch_min);
-                        }
-                    }
-                }
+                load_sift_for_batch(
+                    batch,
+                    pick_requires_full_annotations,
+                    worker.sift_direct.as_deref(),
+                    &mut worker.loaded_sift_windows,
+                    &mut worker.sift_cache,
+                )?;
                 record_contig_profile(&profile, |profile| {
                     profile.sift_load += sift_started.elapsed();
                 });
@@ -9212,6 +9277,256 @@ fn annotate_window(
     projection: Option<&[usize]>,
 ) -> Result<VecDeque<RecordBatch>> {
     annotate_worker_window(&mut ann.worker, window_batches, projection)
+}
+
+fn prepare_input_buffer_annotation_jobs(
+    worker: &mut AnnotationWorkerState,
+    window_batches: Vec<RecordBatch>,
+) -> Result<Vec<InputBufferAnnotationJob>> {
+    let shared = Arc::clone(&worker.shared);
+    let profile = shared.profile.clone();
+    let config = &shared.config;
+
+    let flush_partial = worker.lookup_done && worker.window_buffer.is_empty();
+    let input_buffer_started = Instant::now();
+    let ready_input_buffers = worker.input_buffer_accumulator.push_window_and_drain_ready(
+        window_batches,
+        config.input_buffer_size,
+        flush_partial,
+    );
+    let ready_input_buffer_count = ready_input_buffers.len();
+    record_contig_profile(&profile, |profile| {
+        profile.input_buffer += input_buffer_started.elapsed();
+        profile.input_buffers += ready_input_buffer_count;
+    });
+
+    let mut jobs = Vec::with_capacity(ready_input_buffer_count);
+    for buffer_batches in ready_input_buffers {
+        let bounds_started = Instant::now();
+        let Some((chrom, min_start, max_end)) = buffer_variant_bounds(&buffer_batches)? else {
+            continue;
+        };
+        record_contig_profile(&profile, |profile| {
+            profile.variant_bounds += bounds_started.elapsed();
+        });
+
+        let tx_window_started = Instant::now();
+        let mut buffer_transcripts = build_stateful_buffer_local_transcripts(
+            &shared.base_transcripts,
+            &shared.transcript_cache_regions,
+            &mut worker.persisted_buffer_transcripts,
+            &buffer_batches,
+            &chrom,
+            min_start,
+            max_end,
+            config.upstream_distance,
+            config.downstream_distance,
+        )?;
+        apply_partition_transcript_overrides(&mut buffer_transcripts, &worker.transcript_overrides);
+        let buffer_tx_ids: HashSet<&str> = buffer_transcripts
+            .iter()
+            .map(|tx| tx.transcript_id.as_str())
+            .collect();
+        record_contig_profile(&profile, |profile| {
+            profile.transcript_window += tx_window_started.elapsed();
+        });
+
+        let exon_filter_started = Instant::now();
+        let buffer_exons: Vec<ExonFeature> = shared
+            .exons
+            .iter()
+            .filter(|exon| buffer_tx_ids.contains(exon.transcript_id.as_str()))
+            .cloned()
+            .collect();
+        record_contig_profile(&profile, |profile| {
+            profile.exon_filter += exon_filter_started.elapsed();
+        });
+
+        let translation_filter_started = Instant::now();
+        let buffer_translations = materialize_buffer_translations(
+            &shared.base_translations,
+            &worker.translation_overrides,
+            &buffer_tx_ids,
+        );
+        record_contig_profile(&profile, |profile| {
+            profile.translation_filter += translation_filter_started.elapsed();
+        });
+
+        let colocated_map = if config.flags.check_existing {
+            Arc::new(worker.colocated_map.clone())
+        } else {
+            Arc::new(HashMap::new())
+        };
+        jobs.push(InputBufferAnnotationJob {
+            buffer_id: worker.next_input_buffer_id,
+            batches: buffer_batches,
+            transcripts: buffer_transcripts,
+            exons: buffer_exons,
+            translations: buffer_translations,
+            colocated_map,
+        });
+        worker.next_input_buffer_id += 1;
+    }
+
+    Ok(jobs)
+}
+
+fn annotate_input_buffer_job(
+    shared: Arc<SharedContigAnnotationContext>,
+    job: InputBufferAnnotationJob,
+    projection: Option<Vec<usize>>,
+) -> Result<AnnotatedInputBuffer> {
+    let tmp_provider = shared.tmp_provider.as_ref();
+    let engine = shared.engine.as_ref();
+    let config = &shared.config;
+    let profile = shared.profile.clone();
+    let csq_col_idx = tmp_provider.vcf_field_count();
+    let skip_csq = projection
+        .as_deref()
+        .is_some_and(|indices| !indices.contains(&csq_col_idx));
+    let typed_cols_start = csq_col_idx + 2;
+    let typed_cols_end = typed_cols_start + tmp_provider.annotation_column_defs.len();
+    let skip_typed_cols = projection.as_deref().map_or(false, |indices| {
+        !indices
+            .iter()
+            .any(|&i| i >= typed_cols_start && i < typed_cols_end)
+    });
+    let pick_requires_full_annotations = config
+        .pick_flags
+        .requires_transcript_annotations(skip_csq, skip_typed_cols);
+    let sift_enabled = config.flags.everything;
+    let mut sift_cache = SiftPolyphenCache::new();
+    let mut loaded_sift_windows = HashSet::new();
+    let mut hgvs_reader = config.reference_fasta_path.as_deref().and_then(|path| {
+        fasta::io::indexed_reader::Builder::default()
+            .build_from_path(path)
+            .ok()
+    });
+    let mut out = VecDeque::with_capacity(job.batches.len());
+
+    let prepared_context_started = Instant::now();
+    let ctx = PreparedContext::new(
+        &job.transcripts,
+        &job.exons,
+        &job.translations,
+        &shared.regulatory,
+        &shared.motifs,
+        &shared.mirnas,
+        &shared.structural,
+    );
+    record_contig_profile(&profile, |profile| {
+        profile.prepared_context += prepared_context_started.elapsed();
+    });
+
+    for batch in &job.batches {
+        if sift_enabled && shared.sift_direct.is_some() {
+            let sift_started = Instant::now();
+            load_sift_for_batch(
+                batch,
+                pick_requires_full_annotations,
+                shared.sift_direct.as_deref(),
+                &mut loaded_sift_windows,
+                &mut sift_cache,
+            )?;
+            record_contig_profile(&profile, |profile| {
+                profile.sift_load += sift_started.elapsed();
+            });
+        }
+
+        #[cfg(not(feature = "kv-cache"))]
+        let sift_kv: Option<()> = None;
+        #[cfg(feature = "kv-cache")]
+        let sift_kv = &shared.sift_kv;
+
+        let engine_started = Instant::now();
+        let annotated = tmp_provider.annotate_batch_with_transcript_engine(
+            batch,
+            engine,
+            &ctx,
+            &job.colocated_map,
+            &mut sift_cache,
+            #[cfg(feature = "kv-cache")]
+            sift_kv,
+            #[cfg(not(feature = "kv-cache"))]
+            &sift_kv,
+            skip_csq,
+            skip_typed_cols,
+            &config.flags,
+            &config.hgvs_flags,
+            config.transcript_selection,
+            &config.pick_flags,
+            &mut hgvs_reader,
+        )?;
+        record_contig_profile(&profile, |profile| {
+            profile.engine += engine_started.elapsed();
+        });
+
+        if let Some(indices) = projection.as_deref() {
+            let projection_started = Instant::now();
+            let projected = annotated.project(indices)?;
+            record_contig_profile(&profile, |profile| {
+                profile.projection += projection_started.elapsed();
+            });
+            out.push_back(projected);
+        } else {
+            out.push_back(annotated);
+        }
+    }
+
+    Ok(AnnotatedInputBuffer {
+        buffer_id: job.buffer_id,
+        batches: out,
+    })
+}
+
+async fn annotate_window_parallel_input_buffers(
+    ann: &mut ContigAnnotationState,
+    window_batches: Vec<RecordBatch>,
+    projection: Option<Vec<usize>>,
+) -> Result<VecDeque<RecordBatch>> {
+    let annotation_started = Instant::now();
+    let shared = Arc::clone(&ann.worker.shared);
+    let profile = shared.profile.clone();
+    let jobs = prepare_input_buffer_annotation_jobs(&mut ann.worker, window_batches)?;
+    if jobs.is_empty() {
+        record_contig_profile(&profile, |profile| {
+            profile.annotation_compute += annotation_started.elapsed();
+        });
+        return Ok(VecDeque::new());
+    }
+
+    let max_parallel = ann.config.target_partitions.max(1);
+    let mut pending_jobs = VecDeque::from(jobs);
+    let mut out = VecDeque::new();
+    let mut next_output_buffer_id = ann.worker.next_input_buffer_id - pending_jobs.len();
+    while !pending_jobs.is_empty() {
+        let wave_size = pending_jobs.len().min(max_parallel);
+        let mut handles = Vec::with_capacity(wave_size);
+        for _ in 0..wave_size {
+            let job = pending_jobs
+                .pop_front()
+                .expect("wave size must not exceed pending jobs");
+            let shared = Arc::clone(&shared);
+            let projection = projection.clone();
+            handles.push(tokio::spawn(async move {
+                annotate_input_buffer_job(shared, job, projection)
+            }));
+        }
+
+        for handle in handles {
+            let annotated = handle.await.map_err(|e| {
+                DataFusionError::Execution(format!("input-buffer annotation task failed: {e}"))
+            })??;
+            debug_assert_eq!(annotated.buffer_id, next_output_buffer_id);
+            next_output_buffer_id += 1;
+            out.extend(annotated.batches);
+        }
+    }
+
+    record_contig_profile(&profile, |profile| {
+        profile.annotation_compute += annotation_started.elapsed();
+    });
+    Ok(out)
 }
 
 fn poll_lookup_partitions(
@@ -9693,24 +10008,65 @@ impl Stream for ContigAnnotationStream {
 
                     // Annotate window.
                     let projection = ann.config.projection.clone();
-                    match annotate_window(&mut ann, &window_batches, projection.as_deref()) {
-                        Err(e) => {
-                            abort_annotation_lookup_workers(&mut ann);
-                            let fut = make_cleanup_future(
-                                Arc::clone(&ann.session),
-                                std::mem::take(&mut ann.ephemeral_tables),
-                            );
-                            self.state = StreamState::ErrorCleaningUp(fut, e);
-                            continue;
-                        }
-                        Ok(batches) => {
-                            self.state = StreamState::DrainingWindow {
-                                batches,
-                                annotation_state: ann,
-                            };
+                    if should_parallelize_input_buffers(&ann.config) {
+                        let cleanup_session = Arc::clone(&ann.session);
+                        let cleanup_config = ann.config.clone();
+                        let cleanup_tables = ann.ephemeral_tables.clone();
+                        let fut: AnnotateWindowFuture = Box::pin(async move {
+                            let result = annotate_window_parallel_input_buffers(
+                                &mut ann,
+                                window_batches,
+                                projection,
+                            )
+                            .await;
+                            (ann, result)
+                        });
+                        self.state = StreamState::AnnotatingWindow {
+                            fut,
+                            session: cleanup_session,
+                            config: cleanup_config,
+                            ephemeral_tables: cleanup_tables,
+                        };
+                        continue;
+                    } else {
+                        match annotate_window(&mut ann, &window_batches, projection.as_deref()) {
+                            Err(e) => {
+                                abort_annotation_lookup_workers(&mut ann);
+                                let fut = make_cleanup_future(
+                                    Arc::clone(&ann.session),
+                                    std::mem::take(&mut ann.ephemeral_tables),
+                                );
+                                self.state = StreamState::ErrorCleaningUp(fut, e);
+                                continue;
+                            }
+                            Ok(batches) => {
+                                self.state = StreamState::DrainingWindow {
+                                    batches,
+                                    annotation_state: ann,
+                                };
+                            }
                         }
                     }
                 }
+
+                StreamState::AnnotatingWindow { fut, .. } => match fut.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready((mut ann, Err(e))) => {
+                        abort_annotation_lookup_workers(&mut ann);
+                        let fut = make_cleanup_future(
+                            Arc::clone(&ann.session),
+                            std::mem::take(&mut ann.ephemeral_tables),
+                        );
+                        self.state = StreamState::ErrorCleaningUp(fut, e);
+                        continue;
+                    }
+                    Poll::Ready((ann, Ok(batches))) => {
+                        self.state = StreamState::DrainingWindow {
+                            batches,
+                            annotation_state: ann,
+                        };
+                    }
+                },
 
                 StreamState::DrainingWindow {
                     batches,
@@ -10214,6 +10570,10 @@ async fn prepare_contig_context(
     } else {
         None
     };
+    let sift_direct = sift_direct_path
+        .as_deref()
+        .and_then(AnnotateProvider::build_sift_direct_reader)
+        .map(Arc::new);
 
     // Reuse the pre-opened SiftKvStore from config (opened once, shared across
     // contigs) rather than re-opening the fjall DB every contig.
@@ -10247,7 +10607,7 @@ async fn prepare_contig_context(
         transcript_cache_regions,
         tmp_provider: Arc::new(tmp_provider),
         engine: Arc::new(engine),
-        sift_direct_path,
+        sift_direct,
         #[cfg(feature = "kv-cache")]
         sift_kv,
     });
@@ -10538,7 +10898,7 @@ mod tests {
             engine: Arc::new(TranscriptConsequenceEngine::new_with_hgvs_shift(
                 5000, 5000, false,
             )),
-            sift_direct_path: None,
+            sift_direct: None,
             #[cfg(feature = "kv-cache")]
             sift_kv: None,
         })
@@ -11691,6 +12051,47 @@ mod tests {
         config.use_fjall = true;
 
         assert!(!should_parallelize_annotation(&config));
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[test]
+    fn test_fjall_annotation_parallelizes_global_input_buffers() {
+        let mut config = minimal_contig_annotation_config();
+        config.target_partitions = 8;
+        config.use_fjall = true;
+
+        assert!(should_parallelize_input_buffers(&config));
+    }
+
+    #[test]
+    fn test_input_buffer_annotation_jobs_have_global_ordered_ids() {
+        let shared = minimal_shared_contig_annotation_context();
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        let starts: Vec<i64> = (1..=5001).collect();
+
+        let first_jobs = prepare_input_buffer_annotation_jobs(
+            &mut worker,
+            vec![make_buffer_batch_many("chr1", &starts)],
+        )
+        .unwrap();
+
+        assert_eq!(first_jobs.len(), 1);
+        assert_eq!(first_jobs[0].buffer_id, 0);
+        assert_eq!(
+            buffer_variant_bounds(&first_jobs[0].batches).unwrap(),
+            Some(("chr1".to_string(), 1, 5000))
+        );
+        assert_eq!(worker.input_buffer_accumulator.pending_rows(), 1);
+
+        worker.lookup_done = true;
+        let final_jobs = prepare_input_buffer_annotation_jobs(&mut worker, Vec::new()).unwrap();
+
+        assert_eq!(final_jobs.len(), 1);
+        assert_eq!(final_jobs[0].buffer_id, 1);
+        assert_eq!(
+            buffer_variant_bounds(&final_jobs[0].batches).unwrap(),
+            Some(("chr1".to_string(), 5001, 5001))
+        );
     }
 
     #[test]
