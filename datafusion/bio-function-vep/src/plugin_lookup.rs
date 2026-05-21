@@ -307,13 +307,25 @@ impl PluginIndex {
         }
 
         let store = VepKvStore::open(&path)?;
+        let allele_string_idx = store
+            .schema()
+            .fields()
+            .iter()
+            .position(|field| field.name() == "allele_string");
         let stored_entry_indices = store
             .schema()
             .fields()
             .iter()
             .enumerate()
-            .filter(|(_, field)| !["chrom", "start"].contains(&field.name().as_str()))
-            .map(|(idx, field)| (field.name().to_string(), idx - 2))
+            .filter(|(_, field)| {
+                !["chrom", "start", "end", "allele_string"].contains(&field.name().as_str())
+            })
+            .filter_map(|(idx, field)| {
+                let entry_idx = allele_string_idx
+                    .and_then(|allele_idx| idx.checked_sub(allele_idx + 1))
+                    .or_else(|| idx.checked_sub(2))?;
+                Some((field.name().to_string(), entry_idx))
+            })
             .collect::<HashMap<_, _>>();
         let value_fields: Vec<Arc<Field>> = kind
             .plugin_kind()
