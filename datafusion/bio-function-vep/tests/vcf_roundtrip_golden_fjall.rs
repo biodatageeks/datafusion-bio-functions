@@ -319,7 +319,7 @@ async fn collect_fjall_annotation_starts_and_csq(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_fjall_annotation_output_is_invariant_across_target_partitions() {
+async fn test_fjall_parallel_lookup_and_annotation_output_is_invariant_across_target_partitions() {
     let Some(cache_with_metadata) = prepare_metadata_fjall_cache().await else {
         eprintln!("Skipping: test fixtures not available");
         return;
@@ -330,6 +330,14 @@ async fn test_fjall_annotation_output_is_invariant_across_target_partitions() {
 
     assert_eq!(serial.len(), 1000);
     assert_eq!(parallel, serial);
+    for pair in parallel.windows(2) {
+        let previous = &pair[0];
+        let next = &pair[1];
+        assert!(
+            previous.0 < next.0 || (previous.0 == next.0 && previous.1 <= next.1),
+            "parallel fjall annotation output is not sorted: {previous:?} before {next:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -36,6 +36,16 @@ async fn main() -> Result<()> {
     println!();
 
     for target_partitions in [1, 4, 8] {
+        let use_fjall = options.contains("\"use_fjall\":true")
+            || options.contains("\"use_fjall\": true")
+            || backend == "fjall";
+        let annotation_mode = if use_fjall && target_partitions > 1 {
+            "parallel-fjall-annotation"
+        } else if use_fjall {
+            "single-fjall-annotation"
+        } else {
+            "serial-parquet-annotation"
+        };
         let config = SessionConfig::new().with_target_partitions(target_partitions);
         let ctx = SessionContext::new_with_config(config);
         datafusion_bio_function_vep::register_vep_functions(&ctx);
@@ -57,7 +67,7 @@ async fn main() -> Result<()> {
         let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
 
         println!(
-            "target_partitions={target_partitions} output_partitions={output_partitions} rows={rows} elapsed_s={:.3} rows_per_s={:.1}",
+            "mode={annotation_mode} target_partitions={target_partitions} output_partitions={output_partitions} rows={rows} elapsed_s={:.3} rows_per_s={:.1}",
             elapsed.as_secs_f64(),
             rows as f64 / elapsed.as_secs_f64()
         );
