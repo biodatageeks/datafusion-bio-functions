@@ -8617,13 +8617,58 @@ fn select_buffer_local_transcripts(
         .filter(|tx| {
             let tx_chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
             tx_chrom == chrom_norm
-                // VEP fetches broad 1 Mb cache regions, but it filters those
-                // cached features against the input-buffer min/max window
-                // before merge_features() can propagate HGNC values.
+                // Only transcripts close enough to produce CSQ rows are
+                // emitted. HGNC-only merge donors from the broader active
+                // cache region are handled separately below.
                 && tx.end >= query_start
                 && tx.start <= query_end
         })
         .cloned()
+        .collect()
+}
+
+fn transcript_start_region_is_active(
+    transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
+    active_regions: &HashSet<TranscriptCacheRegion>,
+    transcript_id: &str,
+) -> bool {
+    transcript_cache_regions
+        .get(transcript_id)
+        .and_then(|regions| regions.first())
+        .is_some_and(|start_region| active_regions.contains(start_region))
+}
+
+fn select_active_region_hgnc_propagation_donors<'a>(
+    transcripts: &'a [TranscriptFeature],
+    transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
+    active_regions: &HashSet<TranscriptCacheRegion>,
+    buffer_transcripts: &[TranscriptFeature],
+) -> Vec<&'a TranscriptFeature> {
+    let needed_symbols: HashSet<&str> = buffer_transcripts
+        .iter()
+        .filter(|tx| tx.biotype == "protein_coding")
+        .filter(|tx| tx.gene_hgnc_id.is_none() && tx.gene_hgnc_id_native.is_none())
+        .filter_map(|tx| tx.gene_symbol.as_deref())
+        .collect();
+    if needed_symbols.is_empty() {
+        return Vec::new();
+    }
+
+    transcripts
+        .iter()
+        .filter(|tx| {
+            tx.biotype == "protein_coding"
+                && tx.gene_hgnc_id_native.is_some()
+                && tx
+                    .gene_symbol
+                    .as_deref()
+                    .is_some_and(|symbol| needed_symbols.contains(symbol))
+                && transcript_start_region_is_active(
+                    transcript_cache_regions,
+                    active_regions,
+                    &tx.transcript_id,
+                )
+        })
         .collect()
 }
 
@@ -8699,7 +8744,16 @@ fn build_stateful_buffer_local_transcripts(
         transcript_cache_regions,
         &active_regions,
     );
-    apply_buffer_local_hgnc_propagation(&mut buffer_transcripts);
+    let hgnc_propagation_donors = select_active_region_hgnc_propagation_donors(
+        transcripts,
+        transcript_cache_regions,
+        &active_regions,
+        &buffer_transcripts,
+    );
+    apply_buffer_local_hgnc_propagation_with_extra_donors(
+        &mut buffer_transcripts,
+        &hgnc_propagation_donors,
+    );
 
     for tx in &buffer_transcripts {
         if let Some(regions) = transcript_cache_regions.get(&tx.transcript_id) {
@@ -8750,6 +8804,13 @@ fn reset_persisted_hgnc_effective_values_outside_start_region(
 /// - Ensembl VEP `AnnotationType::Transcript::merge_features()`
 ///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L246-L310>
 fn apply_buffer_local_hgnc_propagation(transcripts: &mut [TranscriptFeature]) {
+    apply_buffer_local_hgnc_propagation_with_extra_donors(transcripts, &[]);
+}
+
+fn apply_buffer_local_hgnc_propagation_with_extra_donors(
+    transcripts: &mut [TranscriptFeature],
+    extra_donors: &[&TranscriptFeature],
+) {
     #[derive(Default)]
     struct GeneFill {
         gene_symbol: Option<String>,
@@ -8760,7 +8821,7 @@ fn apply_buffer_local_hgnc_propagation(transcripts: &mut [TranscriptFeature]) {
     let mut hgnc_by_symbol: HashMap<String, String> = HashMap::new();
     let mut gene_fill_by_stable_id: HashMap<String, GeneFill> = HashMap::new();
 
-    for tx in transcripts.iter() {
+    for tx in transcripts.iter().chain(extra_donors.iter().copied()) {
         if let (Some(symbol), Some(hgnc_id)) =
             (tx.gene_symbol.as_deref(), tx.gene_hgnc_id_native.as_deref())
         {
@@ -12315,6 +12376,66 @@ mod tests {
             .find(|tx| tx.transcript_id == "NR_160941.1")
             .unwrap();
         assert_eq!(recipient.gene_hgnc_id, None);
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_uses_protein_coding_cache_region_hgnc_donor() {
+        let mut tx_recipient = make_tx(
+            "XM_017001769.3",
+            Some("55791"),
+            Some("LRIF1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr1".to_string();
+        tx_recipient.start = 110_874_957;
+        tx_recipient.end = 110_963_922;
+        tx_recipient.biotype = "protein_coding".to_string();
+
+        let mut tx_donor = make_tx(
+            "ENST00000369763",
+            Some("ENSG00000121931"),
+            Some("LRIF1"),
+            Some("HGNC"),
+            Some("HGNC:30299"),
+        );
+        tx_donor.chrom = "chr1".to_string();
+        tx_donor.start = 110_947_190;
+        tx_donor.end = 110_963_922;
+        tx_donor.biotype = "protein_coding".to_string();
+
+        let transcripts = vec![tx_recipient, tx_donor];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        let buffer = vec![make_buffer_batch("chr1", 110_870_290, 110_870_290)];
+        let scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &buffer,
+            "chr1",
+            110_870_290,
+            110_870_290,
+            5_000,
+            5_000,
+        )
+        .unwrap();
+
+        let recipient = scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "XM_017001769.3")
+            .unwrap();
+        assert_eq!(recipient.gene_hgnc_id.as_deref(), Some("HGNC:30299"));
+        assert!(
+            scoped
+                .iter()
+                .all(|tx| tx.transcript_id != "ENST00000369763"),
+            "cache-region donors should not be emitted as annotated transcripts"
+        );
     }
 
     #[test]
