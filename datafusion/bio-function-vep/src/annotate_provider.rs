@@ -8638,6 +8638,10 @@ fn transcript_start_region_is_active(
         .is_some_and(|start_region| active_regions.contains(start_region))
 }
 
+fn is_active_region_hgnc_propagation_biotype(biotype: &str) -> bool {
+    matches!(biotype, "protein_coding" | "lncRNA")
+}
+
 fn select_active_region_hgnc_propagation_donors<'a>(
     transcripts: &'a [TranscriptFeature],
     transcript_cache_regions: &HashMap<String, Vec<TranscriptCacheRegion>>,
@@ -8646,7 +8650,7 @@ fn select_active_region_hgnc_propagation_donors<'a>(
 ) -> Vec<&'a TranscriptFeature> {
     let needed_symbols: HashSet<&str> = buffer_transcripts
         .iter()
-        .filter(|tx| tx.biotype == "protein_coding")
+        .filter(|tx| is_active_region_hgnc_propagation_biotype(&tx.biotype))
         .filter(|tx| tx.gene_hgnc_id.is_none() && tx.gene_hgnc_id_native.is_none())
         .filter_map(|tx| tx.gene_symbol.as_deref())
         .collect();
@@ -8657,7 +8661,7 @@ fn select_active_region_hgnc_propagation_donors<'a>(
     transcripts
         .iter()
         .filter(|tx| {
-            tx.biotype == "protein_coding"
+            is_active_region_hgnc_propagation_biotype(&tx.biotype)
                 && tx.gene_hgnc_id_native.is_some()
                 && tx
                     .gene_symbol
@@ -12434,6 +12438,66 @@ mod tests {
             scoped
                 .iter()
                 .all(|tx| tx.transcript_id != "ENST00000369763"),
+            "cache-region donors should not be emitted as annotated transcripts"
+        );
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_uses_lnc_rna_cache_region_hgnc_donor() {
+        let mut tx_recipient = make_tx(
+            "NR_040773.1",
+            Some("100505666"),
+            Some("DCST1-AS1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr1".to_string();
+        tx_recipient.start = 155_045_191;
+        tx_recipient.end = 155_063_991;
+        tx_recipient.biotype = "lncRNA".to_string();
+
+        let mut tx_donor = make_tx(
+            "ENST00000452962",
+            Some("ENSG00000232093"),
+            Some("DCST1-AS1"),
+            Some("HGNC"),
+            Some("HGNC:41147"),
+        );
+        tx_donor.chrom = "chr1".to_string();
+        tx_donor.start = 155_045_191;
+        tx_donor.end = 155_051_172;
+        tx_donor.biotype = "lncRNA".to_string();
+
+        let transcripts = vec![tx_recipient, tx_donor];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        let buffer = vec![make_buffer_batch("chr1", 155_059_192, 155_059_192)];
+        let scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &buffer,
+            "chr1",
+            155_059_192,
+            155_059_192,
+            5_000,
+            5_000,
+        )
+        .unwrap();
+
+        let recipient = scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "NR_040773.1")
+            .unwrap();
+        assert_eq!(recipient.gene_hgnc_id.as_deref(), Some("HGNC:41147"));
+        assert!(
+            scoped
+                .iter()
+                .all(|tx| tx.transcript_id != "ENST00000452962"),
             "cache-region donors should not be emitted as annotated transcripts"
         );
     }
