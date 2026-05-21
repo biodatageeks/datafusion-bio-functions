@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableProvider;
@@ -24,6 +25,36 @@ pub type OnBatchWritten = Box<dyn Fn(usize, usize, usize) + Send + Sync>;
 
 /// Ensembl VEP release/115 default `--buffer_size`.
 pub const VEP_DEFAULT_BUFFER_SIZE: usize = 5000;
+
+fn sink_profile_enabled() -> bool {
+    std::env::var("VEP_PROFILE").is_ok() || std::env::var("VEP_VCF_PROFILE").is_ok()
+}
+
+#[derive(Debug, Default)]
+struct VcfSinkProfile {
+    stream_next: Duration,
+    batch_to_lines: Duration,
+    write_records: Duration,
+    writer_finish: Duration,
+    batches: usize,
+    rows: usize,
+    lines: usize,
+}
+
+impl VcfSinkProfile {
+    fn summary_line(&self) -> String {
+        format!(
+            "[VEP_PROFILE] vcf_sink_profile batches={} rows={} lines={} stream_next={:.3}s batch_to_lines={:.3}s write_records={:.3}s writer_finish={:.3}s",
+            self.batches,
+            self.rows,
+            self.lines,
+            self.stream_next.as_secs_f64(),
+            self.batch_to_lines.as_secs_f64(),
+            self.write_records.as_secs_f64(),
+            self.writer_finish.as_secs_f64(),
+        )
+    }
+}
 
 /// Configuration for VCF annotation output.
 pub struct AnnotateVcfConfig {
@@ -477,8 +508,19 @@ pub async fn annotate_to_vcf(
     use futures::StreamExt;
     let mut stream = df.execute_stream().await?;
     let mut total_rows = 0;
-    while let Some(batch_result) = stream.next().await {
+    let mut sink_profile = sink_profile_enabled().then(VcfSinkProfile::default);
+    loop {
+        let stream_started = Instant::now();
+        let next_batch = stream.next().await;
+        if let Some(profile) = sink_profile.as_mut() {
+            profile.stream_next += stream_started.elapsed();
+        }
+        let Some(batch_result) = next_batch else {
+            break;
+        };
         let batch = batch_result?;
+        let input_rows = batch.num_rows();
+        let lines_started = Instant::now();
         let lines = batch_to_vcf_lines(
             &batch,
             &vcf_info_fields,
@@ -486,16 +528,33 @@ pub async fn annotate_to_vcf(
             &sample_names,
             coordinate_zero_based,
         )?;
+        if let Some(profile) = sink_profile.as_mut() {
+            profile.batch_to_lines += lines_started.elapsed();
+            profile.batches += 1;
+            profile.rows += input_rows;
+            profile.lines += lines.len();
+        }
         total_rows += lines.len();
+        let write_started = Instant::now();
         writer.write_records(&lines)?;
+        if let Some(profile) = sink_profile.as_mut() {
+            profile.write_records += write_started.elapsed();
+        }
         pb.inc(lines.len() as u64);
         if let Some(ref cb) = config.on_batch_written {
             cb(lines.len(), total_rows, total_input);
         }
     }
 
+    let finish_started = Instant::now();
     writer.finish()?;
+    if let Some(profile) = sink_profile.as_mut() {
+        profile.writer_finish += finish_started.elapsed();
+    }
     pb.finish_and_clear();
+    if let Some(profile) = sink_profile {
+        eprintln!("{}", profile.summary_line());
+    }
 
     Ok(total_rows)
 }
@@ -583,5 +642,28 @@ mod tests {
 
         let description = csq_header_description(&config, CacheSourceType::Ensembl);
         assert!(!description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
+    }
+
+    #[test]
+    fn test_vcf_sink_profile_summary_formats_stage_timings() {
+        let mut profile = VcfSinkProfile::default();
+        profile.stream_next += std::time::Duration::from_millis(10);
+        profile.batch_to_lines += std::time::Duration::from_millis(20);
+        profile.write_records += std::time::Duration::from_millis(30);
+        profile.writer_finish += std::time::Duration::from_millis(40);
+        profile.batches = 2;
+        profile.rows = 3;
+        profile.lines = 4;
+
+        let line = profile.summary_line();
+
+        assert!(line.contains("[VEP_PROFILE] vcf_sink_profile"));
+        assert!(line.contains("batches=2"));
+        assert!(line.contains("rows=3"));
+        assert!(line.contains("lines=4"));
+        assert!(line.contains("stream_next=0.010s"));
+        assert!(line.contains("batch_to_lines=0.020s"));
+        assert!(line.contains("write_records=0.030s"));
+        assert!(line.contains("writer_finish=0.040s"));
     }
 }

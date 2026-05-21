@@ -17,7 +17,7 @@ use std::io::{BufRead, Seek};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskCtx, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Returns true when VEP_PROFILE env var is set (any value).
 fn profiling_enabled() -> bool {
@@ -7660,9 +7660,102 @@ type LoadedContigContext = (
 );
 
 type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
+type SharedContigPipelineProfile = Arc<Mutex<ContigPipelineProfile>>;
+
+#[derive(Debug, Default)]
+struct ContigPipelineProfile {
+    context_load: Duration,
+    context_transcripts: Duration,
+    context_exons: Duration,
+    context_translations: Duration,
+    context_regulatory: Duration,
+    context_motifs: Duration,
+    worker_init: Duration,
+    lookup_wait: Duration,
+    hydration: Duration,
+    annotation_compute: Duration,
+    input_buffer: Duration,
+    variant_bounds: Duration,
+    transcript_window: Duration,
+    exon_filter: Duration,
+    translation_filter: Duration,
+    prepared_context: Duration,
+    sift_load: Duration,
+    engine: Duration,
+    projection: Duration,
+    send_wait: Duration,
+    ordered_drain_wait: Duration,
+    workers: usize,
+    lookup_batches: usize,
+    input_buffers: usize,
+    output_batches: usize,
+    output_rows: usize,
+}
+
+impl ContigPipelineProfile {
+    fn summary_line(&self, chrom: &str) -> String {
+        format!(
+            "[VEP_PROFILE] {chrom}: pipeline_profile workers={} lookup_batches={} input_buffers={} output_batches={} output_rows={} context_load={:.3}s context_tx={:.3}s context_exons={:.3}s context_tl={:.3}s context_reg={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s",
+            self.workers,
+            self.lookup_batches,
+            self.input_buffers,
+            self.output_batches,
+            self.output_rows,
+            self.context_load.as_secs_f64(),
+            self.context_transcripts.as_secs_f64(),
+            self.context_exons.as_secs_f64(),
+            self.context_translations.as_secs_f64(),
+            self.context_regulatory.as_secs_f64(),
+            self.context_motifs.as_secs_f64(),
+            self.worker_init.as_secs_f64(),
+            self.lookup_wait.as_secs_f64(),
+            self.hydration.as_secs_f64(),
+            self.annotation_compute.as_secs_f64(),
+            self.input_buffer.as_secs_f64(),
+            self.variant_bounds.as_secs_f64(),
+            self.transcript_window.as_secs_f64(),
+            self.exon_filter.as_secs_f64(),
+            self.translation_filter.as_secs_f64(),
+            self.prepared_context.as_secs_f64(),
+            self.sift_load.as_secs_f64(),
+            self.engine.as_secs_f64(),
+            self.projection.as_secs_f64(),
+            self.send_wait.as_secs_f64(),
+            self.ordered_drain_wait.as_secs_f64(),
+        )
+    }
+}
+
+fn record_contig_profile(
+    profile: &Option<SharedContigPipelineProfile>,
+    update: impl FnOnce(&mut ContigPipelineProfile),
+) {
+    if !profiling_enabled() {
+        return;
+    }
+    let Some(profile) = profile else {
+        return;
+    };
+    if let Ok(mut guard) = profile.lock() {
+        update(&mut guard);
+    }
+}
+
+fn emit_contig_pipeline_profile(profile: &Option<SharedContigPipelineProfile>, chrom: &str) {
+    if !profiling_enabled() {
+        return;
+    }
+    let Some(profile) = profile else {
+        return;
+    };
+    if let Ok(guard) = profile.lock() {
+        eprintln!("{}", guard.summary_line(chrom));
+    }
+}
 
 struct SharedContigAnnotationContext {
     config: ContigAnnotationConfig,
+    profile: Option<SharedContigPipelineProfile>,
     base_transcripts: Arc<Vec<TranscriptFeature>>,
     base_translations: Arc<Vec<TranslationFeature>>,
     exons: Arc<Vec<ExonFeature>>,
@@ -7681,8 +7774,8 @@ struct SharedContigAnnotationContext {
 
 struct AnnotationWorkerState {
     shared: Arc<SharedContigAnnotationContext>,
-    transcripts: Vec<TranscriptFeature>,
-    translations: Vec<TranslationFeature>,
+    transcript_overrides: HashMap<String, TranscriptPartitionState>,
+    translation_overrides: HashMap<String, TranslationPartitionState>,
     persisted_buffer_transcripts: PersistedBufferTranscripts,
     colocated_map: HashMap<ColocatedKey, ColocatedData>,
     hydrated_cds_tx_ids: HashSet<String>,
@@ -7816,6 +7909,8 @@ struct ContigAnnotationState {
 struct ParallelAnnotationDrainState {
     annotation_partitions: VecDeque<AnnotationPartitionHandle>,
     active_annotation_partition: Option<AnnotationPartitionHandle>,
+    active_drain_wait_started: Option<Instant>,
+    profile: Option<SharedContigPipelineProfile>,
     ephemeral_tables: Vec<String>,
     chrom: String,
     config: ContigAnnotationConfig,
@@ -7967,8 +8062,8 @@ fn abort_annotation_lookup_workers(ann: &mut ContigAnnotationState) {
 
 impl AnnotationWorkerState {
     fn new(shared: Arc<SharedContigAnnotationContext>) -> Result<Self> {
-        let transcripts = shared.base_transcripts.as_ref().clone();
-        let translations = shared.base_translations.as_ref().clone();
+        let init_started = Instant::now();
+        let profile = shared.profile.clone();
         let hgvs_reader = shared
             .config
             .reference_fasta_path
@@ -7983,10 +8078,10 @@ impl AnnotationWorkerState {
             .as_deref()
             .and_then(AnnotateProvider::build_sift_direct_reader);
 
-        Ok(Self {
+        let state = Self {
             shared,
-            transcripts,
-            translations,
+            transcript_overrides: HashMap::new(),
+            translation_overrides: HashMap::new(),
             persisted_buffer_transcripts: HashMap::new(),
             colocated_map: HashMap::new(),
             hydrated_cds_tx_ids: HashSet::new(),
@@ -7997,7 +8092,12 @@ impl AnnotationWorkerState {
             input_buffer_accumulator: InputBufferAccumulator::default(),
             window_buffer: Vec::with_capacity(HYDRATION_WINDOW_SIZE),
             lookup_done: false,
-        })
+        };
+        record_contig_profile(&profile, |profile| {
+            profile.worker_init += init_started.elapsed();
+            profile.workers += 1;
+        });
+        Ok(state)
     }
 }
 
@@ -8162,6 +8262,185 @@ fn hydrate_window(
             hydrated_cds_tx_ids.len()
         );
     }
+    Ok(())
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TranscriptPartitionState {
+    refseq_edits: Vec<RefSeqEdit>,
+    spliced_seq: Option<String>,
+    five_prime_utr_seq: Option<String>,
+    three_prime_utr_seq: Option<String>,
+    translateable_seq: Option<String>,
+    cdna_seq: Option<String>,
+}
+
+impl TranscriptPartitionState {
+    fn from_transcript(tx: &TranscriptFeature) -> Self {
+        Self {
+            refseq_edits: tx.refseq_edits.clone(),
+            spliced_seq: tx.spliced_seq.clone(),
+            five_prime_utr_seq: tx.five_prime_utr_seq.clone(),
+            three_prime_utr_seq: tx.three_prime_utr_seq.clone(),
+            translateable_seq: tx.translateable_seq.clone(),
+            cdna_seq: tx.cdna_seq.clone(),
+        }
+    }
+
+    fn apply_to(&self, tx: &mut TranscriptFeature) {
+        tx.refseq_edits = self.refseq_edits.clone();
+        tx.spliced_seq = self.spliced_seq.clone();
+        tx.five_prime_utr_seq = self.five_prime_utr_seq.clone();
+        tx.three_prime_utr_seq = self.three_prime_utr_seq.clone();
+        tx.translateable_seq = self.translateable_seq.clone();
+        tx.cdna_seq = self.cdna_seq.clone();
+    }
+}
+
+fn apply_partition_transcript_overrides(
+    transcripts: &mut [TranscriptFeature],
+    overrides: &HashMap<String, TranscriptPartitionState>,
+) {
+    for tx in transcripts {
+        let Some(override_state) = overrides.get(&tx.transcript_id) else {
+            continue;
+        };
+        override_state.apply_to(tx);
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TranslationPartitionState {
+    cds_sequence: Option<String>,
+}
+
+impl TranslationPartitionState {
+    fn from_translation(translation: &TranslationFeature) -> Self {
+        Self {
+            cds_sequence: translation.cds_sequence.clone(),
+        }
+    }
+
+    fn apply_to(&self, translation: &mut TranslationFeature) {
+        translation.cds_sequence = self.cds_sequence.clone();
+    }
+}
+
+fn apply_partition_translation_override(
+    translation: &mut TranslationFeature,
+    override_state: &TranslationPartitionState,
+) {
+    override_state.apply_to(translation);
+}
+
+fn materialize_buffer_translations(
+    base_translations: &[TranslationFeature],
+    overrides: &HashMap<String, TranslationPartitionState>,
+    buffer_tx_ids: &HashSet<&str>,
+) -> Vec<TranslationFeature> {
+    base_translations
+        .iter()
+        .filter(|translation| buffer_tx_ids.contains(translation.transcript_id.as_str()))
+        .map(|translation| {
+            let mut translation = translation.clone();
+            if let Some(override_state) = overrides.get(&translation.transcript_id) {
+                apply_partition_translation_override(&mut translation, override_state);
+            }
+            translation
+        })
+        .collect()
+}
+
+fn hydrate_worker_window(
+    worker: &mut AnnotationWorkerState,
+    window_batches: &[RecordBatch],
+    cache_source_type: CacheSourceType,
+) -> Result<()> {
+    if worker.hgvs_reader.is_none() {
+        return Ok(());
+    }
+    let shared = Arc::clone(&worker.shared);
+    let Some((chrom, min_start, max_end)) = buffer_variant_bounds(window_batches)? else {
+        return Ok(());
+    };
+
+    let mut window_transcripts = select_buffer_local_transcripts(
+        &shared.base_transcripts,
+        &chrom,
+        min_start,
+        max_end,
+        shared.config.upstream_distance,
+        shared.config.downstream_distance,
+    );
+    apply_partition_transcript_overrides(&mut window_transcripts, &worker.transcript_overrides);
+    let before_transcript_states: HashMap<String, TranscriptPartitionState> = window_transcripts
+        .iter()
+        .map(|tx| {
+            (
+                tx.transcript_id.clone(),
+                TranscriptPartitionState::from_transcript(tx),
+            )
+        })
+        .collect();
+
+    let window_tx_ids: HashSet<&str> = window_transcripts
+        .iter()
+        .map(|tx| tx.transcript_id.as_str())
+        .collect();
+    let mut window_translations = materialize_buffer_translations(
+        &shared.base_translations,
+        &worker.translation_overrides,
+        &window_tx_ids,
+    );
+    let before_translation_cds: HashMap<String, Option<String>> = window_translations
+        .iter()
+        .map(|translation| {
+            (
+                translation.transcript_id.clone(),
+                translation.cds_sequence.clone(),
+            )
+        })
+        .collect();
+
+    hydrate_window(
+        &mut window_transcripts,
+        &shared.exons,
+        &mut window_translations,
+        &shared.translateable_seq_by_tx,
+        &mut worker.hgvs_reader,
+        &mut worker.hydrated_cds_tx_ids,
+        window_batches,
+        cache_source_type,
+    )?;
+
+    for tx in window_transcripts {
+        let after = TranscriptPartitionState::from_transcript(&tx);
+        let changed = before_transcript_states
+            .get(&tx.transcript_id)
+            .is_some_and(|before| before != &after);
+        if changed || worker.transcript_overrides.contains_key(&tx.transcript_id) {
+            worker
+                .transcript_overrides
+                .insert(tx.transcript_id.clone(), after);
+        }
+    }
+
+    for translation in window_translations {
+        let changed = before_translation_cds
+            .get(&translation.transcript_id)
+            .is_some_and(|before| before != &translation.cds_sequence);
+        if changed
+            || worker
+                .translation_overrides
+                .contains_key(&translation.transcript_id)
+        {
+            let after = TranslationPartitionState::from_translation(&translation);
+            worker
+                .translation_overrides
+                .insert(translation.transcript_id.clone(), after);
+        }
+    }
+
     Ok(())
 }
 
@@ -8550,7 +8829,9 @@ fn annotate_worker_window(
     window_batches: &[RecordBatch],
     projection: Option<&[usize]>,
 ) -> Result<VecDeque<RecordBatch>> {
+    let annotation_started = Instant::now();
     let shared = Arc::clone(&worker.shared);
+    let profile = shared.profile.clone();
     let config = &shared.config;
     let tmp_provider = shared.tmp_provider.as_ref();
     let engine = shared.engine.as_ref();
@@ -8570,18 +8851,29 @@ fn annotate_worker_window(
     let mut out = VecDeque::with_capacity(window_batches.len());
 
     let flush_partial = worker.lookup_done && worker.window_buffer.is_empty();
+    let input_buffer_started = Instant::now();
     let ready_input_buffers = worker.input_buffer_accumulator.push_window_and_drain_ready(
         window_batches.to_vec(),
         config.input_buffer_size,
         flush_partial,
     );
+    let ready_input_buffer_count = ready_input_buffers.len();
+    record_contig_profile(&profile, |profile| {
+        profile.input_buffer += input_buffer_started.elapsed();
+        profile.input_buffers += ready_input_buffer_count;
+    });
 
     for buffer_batches in ready_input_buffers {
+        let bounds_started = Instant::now();
         let Some((chrom, min_start, max_end)) = buffer_variant_bounds(&buffer_batches)? else {
             continue;
         };
-        let buffer_transcripts = build_stateful_buffer_local_transcripts(
-            &worker.transcripts,
+        record_contig_profile(&profile, |profile| {
+            profile.variant_bounds += bounds_started.elapsed();
+        });
+        let tx_window_started = Instant::now();
+        let mut buffer_transcripts = build_stateful_buffer_local_transcripts(
+            &shared.base_transcripts,
             &shared.transcript_cache_regions,
             &mut worker.persisted_buffer_transcripts,
             &buffer_batches,
@@ -8591,22 +8883,34 @@ fn annotate_worker_window(
             config.upstream_distance,
             config.downstream_distance,
         )?;
+        apply_partition_transcript_overrides(&mut buffer_transcripts, &worker.transcript_overrides);
         let buffer_tx_ids: HashSet<&str> = buffer_transcripts
             .iter()
             .map(|tx| tx.transcript_id.as_str())
             .collect();
+        record_contig_profile(&profile, |profile| {
+            profile.transcript_window += tx_window_started.elapsed();
+        });
+        let exon_filter_started = Instant::now();
         let buffer_exons: Vec<ExonFeature> = shared
             .exons
             .iter()
             .filter(|exon| buffer_tx_ids.contains(exon.transcript_id.as_str()))
             .cloned()
             .collect();
-        let buffer_translations: Vec<TranslationFeature> = worker
-            .translations
-            .iter()
-            .filter(|translation| buffer_tx_ids.contains(translation.transcript_id.as_str()))
-            .cloned()
-            .collect();
+        record_contig_profile(&profile, |profile| {
+            profile.exon_filter += exon_filter_started.elapsed();
+        });
+        let translation_filter_started = Instant::now();
+        let buffer_translations = materialize_buffer_translations(
+            &shared.base_translations,
+            &worker.translation_overrides,
+            &buffer_tx_ids,
+        );
+        record_contig_profile(&profile, |profile| {
+            profile.translation_filter += translation_filter_started.elapsed();
+        });
+        let prepared_context_started = Instant::now();
         let ctx = PreparedContext::new(
             &buffer_transcripts,
             &buffer_exons,
@@ -8616,10 +8920,14 @@ fn annotate_worker_window(
             &shared.mirnas,
             &shared.structural,
         );
+        record_contig_profile(&profile, |profile| {
+            profile.prepared_context += prepared_context_started.elapsed();
+        });
 
         for batch in &buffer_batches {
             // Lazy SIFT window loading (same pattern as before).
             if sift_enabled && worker.sift_direct.is_some() {
+                let sift_started = Instant::now();
                 let batch_needs_engine = if pick_requires_full_annotations {
                     true
                 } else {
@@ -8676,6 +8984,9 @@ fn annotate_worker_window(
                         }
                     }
                 }
+                record_contig_profile(&profile, |profile| {
+                    profile.sift_load += sift_started.elapsed();
+                });
             }
 
             #[cfg(not(feature = "kv-cache"))]
@@ -8683,6 +8994,7 @@ fn annotate_worker_window(
             #[cfg(feature = "kv-cache")]
             let sift_kv = &shared.sift_kv;
 
+            let engine_started = Instant::now();
             let annotated = tmp_provider.annotate_batch_with_transcript_engine(
                 batch,
                 engine,
@@ -8701,14 +9013,25 @@ fn annotate_worker_window(
                 &config.pick_flags,
                 &mut worker.hgvs_reader,
             )?;
+            record_contig_profile(&profile, |profile| {
+                profile.engine += engine_started.elapsed();
+            });
 
             if let Some(indices) = projection {
-                out.push_back(annotated.project(indices)?);
+                let projection_started = Instant::now();
+                let projected = annotated.project(indices)?;
+                record_contig_profile(&profile, |profile| {
+                    profile.projection += projection_started.elapsed();
+                });
+                out.push_back(projected);
             } else {
                 out.push_back(annotated);
             }
         }
     }
+    record_contig_profile(&profile, |profile| {
+        profile.annotation_compute += annotation_started.elapsed();
+    });
     Ok(out)
 }
 
@@ -8745,6 +9068,9 @@ fn poll_lookup_partitions(
         match active.receiver.poll_recv(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Some(Ok(message))) => {
+                record_contig_profile(&ann.worker.shared.profile, |profile| {
+                    profile.lookup_batches += 1;
+                });
                 merge_colocated_delta(&mut ann.worker.colocated_map, message.colocated_delta);
                 if message.batch.num_rows() > 0 {
                     ann.contig_rows += message.batch.num_rows();
@@ -8781,11 +9107,23 @@ fn poll_lookup_partitions(
 async fn send_annotated_batches(
     sender: &tokio::sync::mpsc::Sender<Result<RecordBatch>>,
     mut batches: VecDeque<RecordBatch>,
+    profile: &Option<SharedContigPipelineProfile>,
 ) -> bool {
     while let Some(batch) = batches.pop_front() {
-        if sender.send(Ok(batch)).await.is_err() {
+        let rows = batch.num_rows();
+        let send_started = Instant::now();
+        let send_result = sender.send(Ok(batch)).await;
+        let send_elapsed = send_started.elapsed();
+        record_contig_profile(profile, |profile| {
+            profile.send_wait += send_elapsed;
+        });
+        if send_result.is_err() {
             return false;
         }
+        record_contig_profile(profile, |profile| {
+            profile.output_batches += 1;
+            profile.output_rows += rows;
+        });
     }
     true
 }
@@ -8797,11 +9135,20 @@ async fn run_annotation_partition_worker(
     sender: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
 ) -> Result<()> {
     let mut worker = AnnotationWorkerState::new(shared_context)?;
+    let profile = worker.shared.profile.clone();
 
     loop {
         while !worker.lookup_done && worker.window_buffer.len() < HYDRATION_WINDOW_SIZE {
-            match lookup_partition.receiver.recv().await {
+            let lookup_wait_started = Instant::now();
+            let lookup_message = lookup_partition.receiver.recv().await;
+            record_contig_profile(&profile, |profile| {
+                profile.lookup_wait += lookup_wait_started.elapsed();
+            });
+            match lookup_message {
                 Some(Ok(message)) => {
+                    record_contig_profile(&profile, |profile| {
+                        profile.lookup_batches += 1;
+                    });
                     merge_colocated_delta(&mut worker.colocated_map, message.colocated_delta);
                     if message.batch.num_rows() > 0 {
                         worker.window_buffer.push(message.batch);
@@ -8834,20 +9181,19 @@ async fn run_annotation_partition_worker(
 
         if !window_batches.is_empty() {
             let shared = Arc::clone(&worker.shared);
-            hydrate_window(
-                &mut worker.transcripts,
-                &shared.exons,
-                &mut worker.translations,
-                &shared.translateable_seq_by_tx,
-                &mut worker.hgvs_reader,
-                &mut worker.hydrated_cds_tx_ids,
+            let hydration_started = Instant::now();
+            hydrate_worker_window(
+                &mut worker,
                 &window_batches,
                 shared.config.cache_source_type,
             )?;
+            record_contig_profile(&profile, |profile| {
+                profile.hydration += hydration_started.elapsed();
+            });
         }
 
         let batches = annotate_worker_window(&mut worker, &window_batches, projection.as_deref())?;
-        if !send_annotated_batches(&sender, batches).await {
+        if !send_annotated_batches(&sender, batches, &profile).await {
             return Ok(());
         }
     }
@@ -8889,6 +9235,7 @@ fn poll_next_annotated_partition_batch(
                     state.t_contig,
                     format!("{} rows", state.contig_rows)
                 );
+                emit_contig_pipeline_profile(&state.profile, &state.chrom);
                 if profiling_enabled() {
                     eprintln!("[VEP_PROFILE] ------ contig {} END ------", state.chrom);
                 }
@@ -8901,13 +9248,35 @@ fn poll_next_annotated_partition_batch(
             .as_mut()
             .expect("active annotation partition must be present");
         match active.receiver.poll_recv(cx) {
-            Poll::Pending => return Poll::Pending,
+            Poll::Pending => {
+                if profiling_enabled() && state.active_drain_wait_started.is_none() {
+                    state.active_drain_wait_started = Some(Instant::now());
+                }
+                return Poll::Pending;
+            }
             Poll::Ready(Some(Ok(batch))) => {
+                if let Some(started) = state.active_drain_wait_started.take() {
+                    record_contig_profile(&state.profile, |profile| {
+                        profile.ordered_drain_wait += started.elapsed();
+                    });
+                }
                 state.contig_rows += batch.num_rows();
                 return Poll::Ready(Ok(Some(batch)));
             }
-            Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+            Poll::Ready(Some(Err(e))) => {
+                if let Some(started) = state.active_drain_wait_started.take() {
+                    record_contig_profile(&state.profile, |profile| {
+                        profile.ordered_drain_wait += started.elapsed();
+                    });
+                }
+                return Poll::Ready(Err(e));
+            }
             Poll::Ready(None) => {
+                if let Some(started) = state.active_drain_wait_started.take() {
+                    record_contig_profile(&state.profile, |profile| {
+                        profile.ordered_drain_wait += started.elapsed();
+                    });
+                }
                 let mut done = state
                     .active_annotation_partition
                     .take()
@@ -9022,6 +9391,8 @@ impl Stream for ContigAnnotationStream {
                                 ParallelAnnotationDrainState {
                                     annotation_partitions,
                                     active_annotation_partition: None,
+                                    active_drain_wait_started: None,
+                                    profile: ready.shared_context.profile.clone(),
                                     ephemeral_tables: ready.ephemeral_tables,
                                     chrom: ready.chrom,
                                     config,
@@ -9109,13 +9480,14 @@ impl Stream for ContigAnnotationStream {
                             ann.t_contig,
                             format!("{} rows", ann.contig_rows)
                         );
+                        emit_contig_pipeline_profile(&ann.worker.shared.profile, &ann.chrom);
                         if profiling_enabled() {
                             eprintln!("[VEP_PROFILE] ------ contig {} END ------", ann.chrom);
                         }
                         // Eagerly reclaim per-contig memory.
                         ann.worker.colocated_map = HashMap::new();
-                        ann.worker.transcripts = Vec::new();
-                        ann.worker.translations = Vec::new();
+                        ann.worker.transcript_overrides = HashMap::new();
+                        ann.worker.translation_overrides = HashMap::new();
                         let fut = make_cleanup_future(
                             Arc::clone(&ann.session),
                             std::mem::take(&mut ann.ephemeral_tables),
@@ -9132,13 +9504,9 @@ impl Stream for ContigAnnotationStream {
                     // Window-based HGVS hydration (like SIFT sliding window).
                     if !window_batches.is_empty() {
                         let shared = Arc::clone(&ann.worker.shared);
-                        if let Err(e) = hydrate_window(
-                            &mut ann.worker.transcripts,
-                            &shared.exons,
-                            &mut ann.worker.translations,
-                            &shared.translateable_seq_by_tx,
-                            &mut ann.worker.hgvs_reader,
-                            &mut ann.worker.hydrated_cds_tx_ids,
+                        let hydration_started = Instant::now();
+                        if let Err(e) = hydrate_worker_window(
+                            &mut ann.worker,
                             &window_batches,
                             ann.config.cache_source_type,
                         ) {
@@ -9150,6 +9518,9 @@ impl Stream for ContigAnnotationStream {
                             self.state = StreamState::ErrorCleaningUp(fut, e);
                             continue;
                         }
+                        record_contig_profile(&shared.profile, |profile| {
+                            profile.hydration += hydration_started.elapsed();
+                        });
                     }
 
                     // Annotate window.
@@ -9175,9 +9546,10 @@ impl Stream for ContigAnnotationStream {
 
                 StreamState::DrainingWindow {
                     batches,
-                    annotation_state: _,
+                    annotation_state,
                 } => {
                     if let Some(batch) = batches.pop_front() {
+                        let profile = annotation_state.worker.shared.profile.clone();
                         // LIMIT pushdown: truncate or stop if we've reached the limit.
                         if let Some(limit) = fetch_limit {
                             let remaining = limit.saturating_sub(rows_emitted);
@@ -9190,10 +9562,18 @@ impl Stream for ContigAnnotationStream {
                             }
                             if batch.num_rows() > remaining {
                                 self.rows_emitted += remaining;
+                                record_contig_profile(&profile, |profile| {
+                                    profile.output_batches += 1;
+                                    profile.output_rows += remaining;
+                                });
                                 return Poll::Ready(Some(Ok(batch.slice(0, remaining))));
                             }
                         }
                         self.rows_emitted += batch.num_rows();
+                        record_contig_profile(&profile, |profile| {
+                            profile.output_batches += 1;
+                            profile.output_rows += batch.num_rows();
+                        });
                         return Poll::Ready(Some(Ok(batch)));
                     }
                     // Window drained — back to AnnotatingContig for next window
@@ -9314,6 +9694,8 @@ async fn prepare_contig_context(
     full_schema: SchemaRef,
 ) -> Result<Option<ContigReadyState>> {
     let t_contig = profile_start!();
+    let pipeline_profile =
+        profiling_enabled().then(|| Arc::new(Mutex::new(ContigPipelineProfile::default())));
     if profiling_enabled() {
         eprintln!("[VEP_PROFILE] ------ contig {chrom} START ------");
     }
@@ -9534,11 +9916,15 @@ async fn prepare_contig_context(
         )?;
 
         let tx = if let Some(ref table) = tx_table {
+            let started = Instant::now();
             let (tx, seq) = tmp_provider.load_transcripts(table, &worklist).await?;
             let filtered: Vec<_> = tx
                 .into_iter()
                 .filter(|t| passes_transcript_selection(t, config.transcript_selection))
                 .collect();
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_transcripts += started.elapsed();
+            });
             (filtered, seq)
         } else {
             (Vec::new(), HashMap::new())
@@ -9547,34 +9933,66 @@ async fn prepare_contig_context(
         let tx_ids: HashSet<String> = tx_vec.iter().map(|t| t.transcript_id.clone()).collect();
 
         let ex = if let Some(ref table) = ex_table {
+            let started = Instant::now();
             let raw = tmp_provider.load_exons(table, &worklist).await?;
-            raw.into_iter()
+            let ex: Vec<_> = raw
+                .into_iter()
                 .filter(|e| tx_ids.contains(&e.transcript_id))
-                .collect()
+                .collect();
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_exons += started.elapsed();
+            });
+            ex
         } else {
             Vec::new()
         };
         let tl = if let Some(ref table) = tl_table {
+            let started = Instant::now();
             let raw = tmp_provider.load_translations(table, &worklist).await?;
-            raw.into_iter()
+            let tl: Vec<_> = raw
+                .into_iter()
                 .filter(|t| tx_ids.contains(&t.transcript_id))
-                .collect()
+                .collect();
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_translations += started.elapsed();
+            });
+            tl
         } else {
             Vec::new()
         };
         let rg = if let Some(ref table) = rg_table {
-            tmp_provider
+            let started = Instant::now();
+            let rg = tmp_provider
                 .load_regulatory_features(table, &worklist)
-                .await?
+                .await?;
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_regulatory += started.elapsed();
+            });
+            rg
         } else {
             Vec::new()
         };
         let mt = if let Some(ref table) = mt_table {
-            tmp_provider.load_motif_features(table, &worklist).await?
+            let started = Instant::now();
+            let mt = tmp_provider.load_motif_features(table, &worklist).await?;
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_motifs += started.elapsed();
+            });
+            mt
         } else {
             Vec::new()
         };
-        profile_end!(&format!("{chrom}: context_load"), t_ctx);
+        let context_elapsed = t_ctx.elapsed();
+        record_contig_profile(&pipeline_profile, |profile| {
+            profile.context_load += context_elapsed;
+        });
+        if profiling_enabled() {
+            eprintln!(
+                "[VEP_PROFILE] {:.<50} {:>8.1}ms",
+                format!("{chrom}: context_load"),
+                context_elapsed.as_secs_f64() * 1000.0
+            );
+        }
         Ok((tx_vec, translateable_seq, ex, tl, rg, mt))
     }
     .await;
@@ -9647,6 +10065,7 @@ async fn prepare_contig_context(
     );
     let shared_context = Arc::new(SharedContigAnnotationContext {
         config: config.clone(),
+        profile: pipeline_profile,
         base_transcripts,
         base_translations: Arc::new(tl),
         exons: Arc::new(ex),
@@ -9912,7 +10331,10 @@ mod tests {
         }
     }
 
-    fn minimal_shared_contig_annotation_context() -> Arc<SharedContigAnnotationContext> {
+    fn minimal_shared_contig_annotation_context_with_features(
+        transcripts: Vec<TranscriptFeature>,
+        translations: Vec<TranslationFeature>,
+    ) -> Arc<SharedContigAnnotationContext> {
         let session = Arc::new(SessionContext::new());
         let vcf_schema = Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -9934,8 +10356,9 @@ mod tests {
 
         Arc::new(SharedContigAnnotationContext {
             config: minimal_contig_annotation_config(),
-            base_transcripts: Arc::new(Vec::new()),
-            base_translations: Arc::new(Vec::new()),
+            profile: None,
+            base_transcripts: Arc::new(transcripts),
+            base_translations: Arc::new(translations),
             exons: Arc::new(Vec::new()),
             regulatory: Arc::new(Vec::new()),
             motifs: Arc::new(Vec::new()),
@@ -9951,6 +10374,10 @@ mod tests {
             #[cfg(feature = "kv-cache")]
             sift_kv: None,
         })
+    }
+
+    fn minimal_shared_contig_annotation_context() -> Arc<SharedContigAnnotationContext> {
+        minimal_shared_contig_annotation_context_with_features(Vec::new(), Vec::new())
     }
 
     #[test]
@@ -9979,6 +10406,67 @@ mod tests {
             &right.shared.regulatory
         ));
         assert!(Arc::ptr_eq(&left.shared.motifs, &right.shared.motifs));
+    }
+
+    #[test]
+    fn annotation_worker_state_shares_base_features_with_empty_partition_overlays() {
+        let shared = minimal_shared_contig_annotation_context_with_features(
+            vec![make_tx(
+                "tx1",
+                Some("gene1"),
+                Some("GENE1"),
+                Some("HGNC"),
+                Some("1"),
+            )],
+            vec![make_translation("tx1", Vec::new())],
+        );
+
+        let worker = AnnotationWorkerState::new(Arc::clone(&shared)).unwrap();
+
+        assert_eq!(worker.shared.base_transcripts.len(), 1);
+        assert_eq!(worker.shared.base_translations.len(), 1);
+        assert!(worker.transcript_overrides.is_empty());
+        assert!(worker.translation_overrides.is_empty());
+    }
+
+    #[test]
+    fn partition_overrides_replace_only_selected_buffer_features() {
+        let base_tx = make_tx("tx1", Some("gene1"), Some("GENE1"), Some("HGNC"), Some("1"));
+        let other_tx = make_tx("tx2", Some("gene2"), Some("GENE2"), Some("HGNC"), Some("2"));
+        let mut hydrated_tx = base_tx.clone();
+        hydrated_tx.spliced_seq = Some("ACGT".to_string());
+        let mut transcript_overrides = HashMap::new();
+        transcript_overrides.insert(
+            hydrated_tx.transcript_id.clone(),
+            TranscriptPartitionState::from_transcript(&hydrated_tx),
+        );
+        let mut buffer_transcripts = vec![base_tx, other_tx];
+
+        apply_partition_transcript_overrides(&mut buffer_transcripts, &transcript_overrides);
+
+        assert_eq!(buffer_transcripts[0].spliced_seq.as_deref(), Some("ACGT"));
+        assert!(buffer_transcripts[1].spliced_seq.is_none());
+
+        let base_translation = make_translation("tx1", Vec::new());
+        let other_translation = make_translation("tx2", Vec::new());
+        let mut hydrated_translation = base_translation.clone();
+        hydrated_translation.cds_sequence = Some("ATG".to_string());
+        let mut translation_overrides = HashMap::new();
+        translation_overrides.insert(
+            hydrated_translation.transcript_id.clone(),
+            TranslationPartitionState::from_translation(&hydrated_translation),
+        );
+        let buffer_tx_ids = HashSet::from(["tx1"]);
+
+        let buffer_translations = materialize_buffer_translations(
+            &[base_translation, other_translation],
+            &translation_overrides,
+            &buffer_tx_ids,
+        );
+
+        assert_eq!(buffer_translations.len(), 1);
+        assert_eq!(buffer_translations[0].transcript_id, "tx1");
+        assert_eq!(buffer_translations[0].cds_sequence.as_deref(), Some("ATG"));
     }
 
     // ── format_appris ──────────────────────────────────────────────────
@@ -12286,5 +12774,74 @@ mod tests {
         assert_eq!(escaped, val);
         // Should be a borrowed Cow (no allocation)
         assert!(matches!(escaped, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_contig_pipeline_profile_summary_formats_stage_timings() {
+        let mut profile = ContigPipelineProfile::default();
+        profile.context_load += std::time::Duration::from_millis(10);
+        profile.worker_init += std::time::Duration::from_millis(20);
+        profile.lookup_wait += std::time::Duration::from_millis(30);
+        profile.hydration += std::time::Duration::from_millis(40);
+        profile.annotation_compute += std::time::Duration::from_millis(50);
+        profile.send_wait += std::time::Duration::from_millis(60);
+        profile.ordered_drain_wait += std::time::Duration::from_millis(70);
+        profile.workers = 2;
+        profile.lookup_batches = 3;
+        profile.output_batches = 4;
+        profile.output_rows = 5;
+
+        let line = profile.summary_line("chr1");
+
+        assert!(line.contains("[VEP_PROFILE] chr1: pipeline_profile"));
+        assert!(line.contains("workers=2"));
+        assert!(line.contains("lookup_batches=3"));
+        assert!(line.contains("output_batches=4"));
+        assert!(line.contains("output_rows=5"));
+        assert!(line.contains("context_load=0.010s"));
+        assert!(line.contains("worker_init=0.020s"));
+        assert!(line.contains("lookup_wait=0.030s"));
+        assert!(line.contains("hydrate=0.040s"));
+        assert!(line.contains("annotate=0.050s"));
+        assert!(line.contains("send_wait=0.060s"));
+        assert!(line.contains("ordered_drain_wait=0.070s"));
+    }
+
+    #[test]
+    fn test_contig_pipeline_profile_summary_formats_nested_hotspots() {
+        let mut profile = ContigPipelineProfile::default();
+        profile.context_transcripts += std::time::Duration::from_millis(1);
+        profile.context_exons += std::time::Duration::from_millis(2);
+        profile.context_translations += std::time::Duration::from_millis(3);
+        profile.context_regulatory += std::time::Duration::from_millis(4);
+        profile.context_motifs += std::time::Duration::from_millis(5);
+        profile.input_buffer += std::time::Duration::from_millis(6);
+        profile.variant_bounds += std::time::Duration::from_millis(7);
+        profile.transcript_window += std::time::Duration::from_millis(8);
+        profile.exon_filter += std::time::Duration::from_millis(9);
+        profile.translation_filter += std::time::Duration::from_millis(10);
+        profile.prepared_context += std::time::Duration::from_millis(11);
+        profile.sift_load += std::time::Duration::from_millis(12);
+        profile.engine += std::time::Duration::from_millis(13);
+        profile.projection += std::time::Duration::from_millis(14);
+        profile.input_buffers = 15;
+
+        let line = profile.summary_line("chr2");
+
+        assert!(line.contains("context_tx=0.001s"));
+        assert!(line.contains("context_exons=0.002s"));
+        assert!(line.contains("context_tl=0.003s"));
+        assert!(line.contains("context_reg=0.004s"));
+        assert!(line.contains("context_motif=0.005s"));
+        assert!(line.contains("input_buffer=0.006s"));
+        assert!(line.contains("variant_bounds=0.007s"));
+        assert!(line.contains("tx_window=0.008s"));
+        assert!(line.contains("exon_filter=0.009s"));
+        assert!(line.contains("tl_filter=0.010s"));
+        assert!(line.contains("prepared_ctx=0.011s"));
+        assert!(line.contains("sift_load=0.012s"));
+        assert!(line.contains("engine=0.013s"));
+        assert!(line.contains("projection=0.014s"));
+        assert!(line.contains("input_buffers=15"));
     }
 }
