@@ -13,13 +13,16 @@
 //!     [--extended-probes] \
 //!     [--reference-fasta <path>] \
 //!     [--target-partitions <n>] \
+//!     [--buffer-size <n>] \
 //!     [--compression none|gzip|bgzf] \
-//!     [--limit <n>]
+//!     [--limit <n>] \
+//!     [--no-progress]
 
 use std::time::Instant;
 
 use datafusion::common::Result;
 use datafusion_bio_format_vcf::VcfCompressionType;
+use datafusion_bio_function_vep::golden_benchmark::sample_gz_vcf_first_n;
 use datafusion_bio_function_vep::vcf_sink;
 
 struct Args {
@@ -31,8 +34,10 @@ struct Args {
     extended_probes: bool,
     reference_fasta: Option<String>,
     target_partitions: usize,
+    buffer_size: usize,
     compression: VcfCompressionType,
     limit: Option<usize>,
+    show_progress: bool,
 }
 
 fn parse_args() -> Args {
@@ -45,8 +50,10 @@ fn parse_args() -> Args {
     let mut extended_probes = false;
     let mut reference_fasta = None;
     let mut target_partitions = 1;
+    let mut buffer_size = vcf_sink::VEP_DEFAULT_BUFFER_SIZE;
     let mut compression = VcfCompressionType::Plain;
     let mut limit = None;
+    let mut show_progress = true;
 
     let mut i = 1;
     while i < args.len() {
@@ -77,6 +84,10 @@ fn parse_args() -> Args {
                 i += 1;
                 target_partitions = args[i].parse().unwrap_or(1);
             }
+            "--buffer-size" => {
+                i += 1;
+                buffer_size = args[i].parse().unwrap_or(vcf_sink::VEP_DEFAULT_BUFFER_SIZE);
+            }
             "--compression" => {
                 i += 1;
                 compression = match args[i].as_str() {
@@ -89,6 +100,8 @@ fn parse_args() -> Args {
                 i += 1;
                 limit = args[i].parse().ok();
             }
+            "--no-progress" => show_progress = false,
+            "--progress" => show_progress = true,
             other => {
                 eprintln!("Unknown argument: {other}");
                 std::process::exit(1);
@@ -122,8 +135,10 @@ fn parse_args() -> Args {
         extended_probes,
         reference_fasta,
         target_partitions,
+        buffer_size,
         compression,
         limit,
+        show_progress,
     }
 }
 
@@ -143,6 +158,7 @@ async fn main() -> Result<()> {
         args.reference_fasta.as_deref().unwrap_or("(none)")
     );
     eprintln!("  target_partitions: {}", args.target_partitions);
+    eprintln!("  buffer_size: {}", args.buffer_size);
     eprintln!(
         "  compress:   {}",
         match args.compression {
@@ -154,8 +170,29 @@ async fn main() -> Result<()> {
     if let Some(n) = args.limit {
         eprintln!("  limit:      {n}");
     }
+    eprintln!("  progress:   {}", args.show_progress);
 
-    // ── Annotate + stream to VCF (with built-in progress bar) ──
+    let mut input_for_run = args.input.clone();
+    let _sample_dir = if let Some(limit) = args.limit {
+        let sample_dir = tempfile::tempdir().map_err(|e| {
+            datafusion::common::DataFusionError::Execution(format!(
+                "failed to create sample tempdir: {e}"
+            ))
+        })?;
+        let sampled_vcf = sample_dir.path().join("sampled.vcf");
+        let sampled =
+            sample_gz_vcf_first_n(std::path::Path::new(&args.input), &sampled_vcf, limit)?;
+        eprintln!(
+            "  sampled:    {sampled} variants -> {}",
+            sampled_vcf.display()
+        );
+        input_for_run = sampled_vcf.display().to_string();
+        Some(sample_dir)
+    } else {
+        None
+    };
+
+    // ── Annotate + stream to VCF ──
     let t0 = Instant::now();
     let annotate_config = vcf_sink::AnnotateVcfConfig {
         everything: args.everything,
@@ -163,14 +200,15 @@ async fn main() -> Result<()> {
         reference_fasta_path: args.reference_fasta.clone(),
         use_fjall: args.backend == "fjall",
         target_partitions: args.target_partitions,
+        buffer_size: args.buffer_size,
         compression: args.compression,
-        show_progress: true,
+        show_progress: args.show_progress,
         ..Default::default()
     };
 
     let t_annotate = Instant::now();
     let rows = vcf_sink::annotate_to_vcf(
-        &args.input,
+        &input_for_run,
         &args.cache,
         "parquet",
         &args.output,
