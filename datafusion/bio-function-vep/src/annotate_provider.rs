@@ -7821,6 +7821,7 @@ impl Drop for AnnotationPartitionHandle {
 struct InputBufferAccumulator {
     pending_batches: VecDeque<RecordBatch>,
     pending_rows: usize,
+    pending_input_units: usize,
 }
 
 impl InputBufferAccumulator {
@@ -7831,7 +7832,7 @@ impl InputBufferAccumulator {
     fn push_window_and_drain_ready(
         &mut self,
         batches: Vec<RecordBatch>,
-        row_limit: usize,
+        input_unit_limit: usize,
         flush_partial: bool,
     ) -> Vec<Vec<RecordBatch>> {
         for batch in batches {
@@ -7839,47 +7840,143 @@ impl InputBufferAccumulator {
             if rows == 0 {
                 continue;
             }
+            let input_units = batch_input_units(&batch);
             self.pending_rows += rows;
+            self.pending_input_units += input_units;
             self.pending_batches.push_back(batch);
         }
 
-        let row_limit = row_limit.max(1);
+        let input_unit_limit = input_unit_limit.max(1);
         let mut ready = Vec::new();
-        while self.pending_rows >= row_limit {
-            ready.push(self.drain_rows(row_limit));
+        while self.pending_input_units >= input_unit_limit {
+            ready.push(self.drain_input_units(input_unit_limit));
         }
         if flush_partial && self.pending_rows > 0 {
-            ready.push(self.drain_rows(self.pending_rows));
+            ready.push(self.drain_input_units(self.pending_input_units));
         }
         ready
     }
 
-    fn drain_rows(&mut self, rows: usize) -> Vec<RecordBatch> {
-        debug_assert!(rows > 0);
-        debug_assert!(rows <= self.pending_rows);
+    fn drain_input_units(&mut self, input_units: usize) -> Vec<RecordBatch> {
+        debug_assert!(input_units > 0);
+        debug_assert!(input_units <= self.pending_input_units);
 
-        let mut remaining = rows;
+        let mut remaining_units = input_units;
+        let mut drained_rows = 0usize;
+        let mut drained_units = 0usize;
         let mut drained = Vec::new();
-        while remaining > 0 {
+        while remaining_units > 0 {
             let batch = self
                 .pending_batches
                 .pop_front()
                 .expect("pending row count must match pending batches");
             let batch_rows = batch.num_rows();
-            if batch_rows <= remaining {
-                remaining -= batch_rows;
+            let batch_units = batch_input_units(&batch);
+            if batch_units <= remaining_units {
+                remaining_units -= batch_units;
+                drained_rows += batch_rows;
+                drained_units += batch_units;
                 drained.push(batch);
             } else {
-                drained.push(batch.slice(0, remaining));
+                let (take_rows, take_units) = rows_covering_input_units(&batch, remaining_units);
+                debug_assert!(take_rows > 0);
+                debug_assert!(take_rows <= batch_rows);
+                drained.push(batch.slice(0, take_rows));
                 self.pending_batches
-                    .push_front(batch.slice(remaining, batch_rows - remaining));
-                remaining = 0;
+                    .push_front(batch.slice(take_rows, batch_rows - take_rows));
+                drained_rows += take_rows;
+                drained_units += take_units;
+                remaining_units = remaining_units.saturating_sub(take_units);
             }
         }
 
-        self.pending_rows -= rows;
+        self.pending_rows -= drained_rows;
+        self.pending_input_units -= drained_units;
         drained
     }
+}
+
+enum AltColumnView<'a> {
+    Utf8(&'a StringArray),
+    Utf8View(&'a StringViewArray),
+    LargeUtf8(&'a LargeStringArray),
+}
+
+impl<'a> AltColumnView<'a> {
+    fn from_batch(batch: &'a RecordBatch) -> Option<Self> {
+        let idx = batch.schema().index_of("alt").ok()?;
+        let col = batch.column(idx);
+        if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+            Some(Self::Utf8(arr))
+        } else if let Some(arr) = col.as_any().downcast_ref::<StringViewArray>() {
+            Some(Self::Utf8View(arr))
+        } else {
+            col.as_any()
+                .downcast_ref::<LargeStringArray>()
+                .map(Self::LargeUtf8)
+        }
+    }
+
+    fn input_units_at(&self, row: usize) -> usize {
+        let value = match self {
+            Self::Utf8(arr) => {
+                if arr.is_null(row) {
+                    return 1;
+                }
+                arr.value(row)
+            }
+            Self::Utf8View(arr) => {
+                if arr.is_null(row) {
+                    return 1;
+                }
+                arr.value(row)
+            }
+            Self::LargeUtf8(arr) => {
+                if arr.is_null(row) {
+                    return 1;
+                }
+                arr.value(row)
+            }
+        };
+        alt_input_units(value)
+    }
+}
+
+fn alt_input_units(alt: &str) -> usize {
+    let alt = alt.trim();
+    if alt.is_empty() || alt == "." {
+        return 1;
+    }
+    alt.split([',', '|'])
+        .filter(|allele| !allele.is_empty() && *allele != ".")
+        .count()
+        .max(1)
+}
+
+fn batch_input_units(batch: &RecordBatch) -> usize {
+    // VEP's buffer_size is applied to parsed VariationFeatures, so a
+    // multi-allelic VCF row contributes one input unit per ALT allele.
+    let Some(alts) = AltColumnView::from_batch(batch) else {
+        return batch.num_rows();
+    };
+    (0..batch.num_rows())
+        .map(|row| alts.input_units_at(row))
+        .sum()
+}
+
+fn rows_covering_input_units(batch: &RecordBatch, input_units: usize) -> (usize, usize) {
+    let Some(alts) = AltColumnView::from_batch(batch) else {
+        let rows = input_units.min(batch.num_rows());
+        return (rows, rows);
+    };
+
+    let mut rows = 0usize;
+    let mut units = 0usize;
+    while rows < batch.num_rows() && units < input_units {
+        units += alts.input_units_at(rows);
+        rows += 1;
+    }
+    (rows, units)
 }
 
 /// Everything needed to start streaming annotation for a contig.
@@ -7917,6 +8014,15 @@ struct ParallelAnnotationDrainState {
     session: Arc<SessionContext>,
     t_contig: Instant,
     contig_rows: usize,
+}
+
+fn should_parallelize_annotation(config: &ContigAnnotationConfig) -> bool {
+    // VEP input-buffer state is global and order-dependent: buffer size counts
+    // parsed ALT alleles, and HGNC promotion can carry across adjacent buffers.
+    // Keep annotation on the ordered drain until parallel workers have stable
+    // global buffer ids/prefixes instead of partition-local accumulators.
+    let _ = config;
+    false
 }
 
 type PrepareFuture = Pin<Box<dyn Future<Output = Result<Option<ContigReadyState>>> + Send>>;
@@ -9429,10 +9535,7 @@ impl Stream for ContigAnnotationStream {
                     Poll::Ready(Ok(Some(mut ready))) => {
                         let session = Arc::clone(&self.session);
                         let config = self.config.clone();
-                        #[cfg(feature = "kv-cache")]
-                        let use_parallel_annotation = config.use_fjall;
-                        #[cfg(not(feature = "kv-cache"))]
-                        let use_parallel_annotation = false;
+                        let use_parallel_annotation = should_parallelize_annotation(&config);
 
                         if use_parallel_annotation {
                             let mut annotation_partitions =
@@ -11505,6 +11608,26 @@ mod tests {
         .unwrap()
     }
 
+    fn make_buffer_batch_many_with_alts(chrom: &str, starts: &[i64], alts: &[&str]) -> RecordBatch {
+        assert_eq!(starts.len(), alts.len());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![chrom; starts.len()])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(starts.to_vec())) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(starts.to_vec())) as Arc<dyn Array>,
+                Arc::new(StringArray::from(alts.to_vec())) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_input_buffer_accumulator_carries_partial_rows_across_windows() {
         let mut accumulator = InputBufferAccumulator::default();
@@ -11536,6 +11659,38 @@ mod tests {
             Some(("chr2".to_string(), 6, 7))
         );
         assert_eq!(accumulator.pending_rows(), 0);
+    }
+
+    #[test]
+    fn test_input_buffer_accumulator_counts_alt_alleles_like_vep_buffers() {
+        let mut accumulator = InputBufferAccumulator::default();
+
+        let ready = accumulator.push_window_and_drain_ready(
+            vec![make_buffer_batch_many_with_alts(
+                "chr2",
+                &[10, 20, 30],
+                &["C", "G,A", "T"],
+            )],
+            3,
+            false,
+        );
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            buffer_variant_bounds(&ready[0]).unwrap(),
+            Some(("chr2".to_string(), 10, 20))
+        );
+        assert_eq!(accumulator.pending_rows(), 1);
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[test]
+    fn test_fjall_annotation_uses_ordered_serial_drain_for_stateful_buffers() {
+        let mut config = minimal_contig_annotation_config();
+        config.target_partitions = 8;
+        config.use_fjall = true;
+
+        assert!(!should_parallelize_annotation(&config));
     }
 
     #[test]
