@@ -1281,7 +1281,7 @@ dependencies = [
 [[package]]
 name = "datafusion-bio-format-core"
 version = "1.7.0"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=bcec0dd825d1abbb094c94f09e7de8b5b8e70f17#bcec0dd825d1abbb094c94f09e7de8b5b8e70f17"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=41f13835e8fd26c5588653d248e2a1941a790414#41f13835e8fd26c5588653d248e2a1941a790414"
 dependencies = [
  "async-compression",
  "bytes",
@@ -1352,14 +1352,14 @@ dependencies = [
 [[package]]
 name = "datafusion-bio-format-vcf"
 version = "1.7.0"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=bcec0dd825d1abbb094c94f09e7de8b5b8e70f17#bcec0dd825d1abbb094c94f09e7de8b5b8e70f17"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=41f13835e8fd26c5588653d248e2a1941a790414#41f13835e8fd26c5588653d248e2a1941a790414"
 dependencies = [
  "async-compression",
  "async-stream",
  "async-trait",
  "bytes",
  "datafusion",
- "datafusion-bio-format-core 1.7.0 (git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=bcec0dd825d1abbb094c94f09e7de8b5b8e70f17)",
+ "datafusion-bio-format-core 1.7.0 (git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=41f13835e8fd26c5588653d248e2a1941a790414)",
  "datafusion-execution",
  "env_logger",
  "flate2",
@@ -1382,10 +1382,10 @@ dependencies = [
 [[package]]
 name = "datafusion-bio-format-vep-plugin"
 version = "1.2.0"
-source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=bcec0dd825d1abbb094c94f09e7de8b5b8e70f17#bcec0dd825d1abbb094c94f09e7de8b5b8e70f17"
+source = "git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=41f13835e8fd26c5588653d248e2a1941a790414#41f13835e8fd26c5588653d248e2a1941a790414"
 dependencies = [
  "datafusion",
- "datafusion-bio-format-vcf 1.7.0 (git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=bcec0dd825d1abbb094c94f09e7de8b5b8e70f17)",
+ "datafusion-bio-format-vcf 1.7.0 (git+https://github.com/biodatageeks/datafusion-bio-formats.git?rev=41f13835e8fd26c5588653d248e2a1941a790414)",
  "flate2",
  "futures",
  "once_cell",
