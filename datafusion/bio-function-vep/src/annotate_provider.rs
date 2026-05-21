@@ -2080,9 +2080,10 @@ fn drain_colocated_sink(sink: &ColocatedSink) -> Result<HashMap<ColocatedKey, Co
 }
 
 fn merge_colocated_delta(
-    target: &mut HashMap<ColocatedKey, ColocatedData>,
+    target: &mut Arc<HashMap<ColocatedKey, ColocatedData>>,
     mut delta: HashMap<ColocatedKey, ColocatedData>,
 ) {
+    let target = Arc::make_mut(target);
     for (key, mut value) in delta.drain() {
         target
             .entry(key)
@@ -7777,7 +7778,7 @@ struct AnnotationWorkerState {
     transcript_overrides: HashMap<String, TranscriptPartitionState>,
     translation_overrides: HashMap<String, TranslationPartitionState>,
     persisted_buffer_transcripts: PersistedBufferTranscripts,
-    colocated_map: HashMap<ColocatedKey, ColocatedData>,
+    colocated_map: Arc<HashMap<ColocatedKey, ColocatedData>>,
     hydrated_cds_tx_ids: HashSet<String>,
     hgvs_reader: Option<FastaReader>,
     sift_cache: SiftPolyphenCache,
@@ -7830,11 +7831,30 @@ impl InputBufferAccumulator {
         self.pending_rows
     }
 
+    fn has_ready_input_buffer(&self, input_unit_limit: usize) -> bool {
+        self.pending_input_units >= input_unit_limit.max(1)
+    }
+
     fn push_window_and_drain_ready(
         &mut self,
         batches: Vec<RecordBatch>,
         input_unit_limit: usize,
         flush_partial: bool,
+    ) -> Vec<Vec<RecordBatch>> {
+        self.push_window_and_drain_ready_limited(
+            batches,
+            input_unit_limit,
+            flush_partial,
+            usize::MAX,
+        )
+    }
+
+    fn push_window_and_drain_ready_limited(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        input_unit_limit: usize,
+        flush_partial: bool,
+        max_ready_buffers: usize,
     ) -> Vec<Vec<RecordBatch>> {
         for batch in batches {
             let rows = batch.num_rows();
@@ -7848,11 +7868,12 @@ impl InputBufferAccumulator {
         }
 
         let input_unit_limit = input_unit_limit.max(1);
+        let max_ready_buffers = max_ready_buffers.max(1);
         let mut ready = Vec::new();
-        while self.pending_input_units >= input_unit_limit {
+        while self.pending_input_units >= input_unit_limit && ready.len() < max_ready_buffers {
             ready.push(self.drain_input_units(input_unit_limit));
         }
-        if flush_partial && self.pending_rows > 0 {
+        if flush_partial && self.pending_rows > 0 && ready.len() < max_ready_buffers {
             ready.push(self.drain_input_units(self.pending_input_units));
         }
         ready
@@ -8222,7 +8243,7 @@ impl AnnotationWorkerState {
             transcript_overrides: HashMap::new(),
             translation_overrides: HashMap::new(),
             persisted_buffer_transcripts: HashMap::new(),
-            colocated_map: HashMap::new(),
+            colocated_map: Arc::new(HashMap::new()),
             hydrated_cds_tx_ids: HashSet::new(),
             hgvs_reader,
             sift_cache: SiftPolyphenCache::new(),
@@ -9282,6 +9303,7 @@ fn annotate_window(
 fn prepare_input_buffer_annotation_jobs(
     worker: &mut AnnotationWorkerState,
     window_batches: Vec<RecordBatch>,
+    max_ready_buffers: usize,
 ) -> Result<Vec<InputBufferAnnotationJob>> {
     let shared = Arc::clone(&worker.shared);
     let profile = shared.profile.clone();
@@ -9289,17 +9311,25 @@ fn prepare_input_buffer_annotation_jobs(
 
     let flush_partial = worker.lookup_done && worker.window_buffer.is_empty();
     let input_buffer_started = Instant::now();
-    let ready_input_buffers = worker.input_buffer_accumulator.push_window_and_drain_ready(
-        window_batches,
-        config.input_buffer_size,
-        flush_partial,
-    );
+    let ready_input_buffers = worker
+        .input_buffer_accumulator
+        .push_window_and_drain_ready_limited(
+            window_batches,
+            config.input_buffer_size,
+            flush_partial,
+            max_ready_buffers,
+        );
     let ready_input_buffer_count = ready_input_buffers.len();
     record_contig_profile(&profile, |profile| {
         profile.input_buffer += input_buffer_started.elapsed();
         profile.input_buffers += ready_input_buffer_count;
     });
 
+    let colocated_map = if config.flags.check_existing {
+        Arc::clone(&worker.colocated_map)
+    } else {
+        Arc::new(HashMap::new())
+    };
     let mut jobs = Vec::with_capacity(ready_input_buffer_count);
     for buffer_batches in ready_input_buffers {
         let bounds_started = Instant::now();
@@ -9352,18 +9382,13 @@ fn prepare_input_buffer_annotation_jobs(
             profile.translation_filter += translation_filter_started.elapsed();
         });
 
-        let colocated_map = if config.flags.check_existing {
-            Arc::new(worker.colocated_map.clone())
-        } else {
-            Arc::new(HashMap::new())
-        };
         jobs.push(InputBufferAnnotationJob {
             buffer_id: worker.next_input_buffer_id,
             batches: buffer_batches,
             transcripts: buffer_transcripts,
             exons: buffer_exons,
             translations: buffer_translations,
-            colocated_map,
+            colocated_map: Arc::clone(&colocated_map),
         });
         worker.next_input_buffer_id += 1;
     }
@@ -9487,7 +9512,8 @@ async fn annotate_window_parallel_input_buffers(
     let annotation_started = Instant::now();
     let shared = Arc::clone(&ann.worker.shared);
     let profile = shared.profile.clone();
-    let jobs = prepare_input_buffer_annotation_jobs(&mut ann.worker, window_batches)?;
+    let max_parallel = ann.config.target_partitions.max(1);
+    let jobs = prepare_input_buffer_annotation_jobs(&mut ann.worker, window_batches, max_parallel)?;
     if jobs.is_empty() {
         record_contig_profile(&profile, |profile| {
             profile.annotation_compute += annotation_started.elapsed();
@@ -9495,7 +9521,6 @@ async fn annotate_window_parallel_input_buffers(
         return Ok(VecDeque::new());
     }
 
-    let max_parallel = ann.config.target_partitions.max(1);
     let mut pending_jobs = VecDeque::from(jobs);
     let mut out = VecDeque::new();
     let mut next_output_buffer_id = ann.worker.next_input_buffer_id - pending_jobs.len();
@@ -9922,7 +9947,11 @@ impl Stream for ContigAnnotationStream {
                         ann.worker.window_buffer.iter().map(|b| b.num_rows()).sum();
                     let limit_buffered =
                         fetch_limit.is_some_and(|limit| rows_emitted + buffered_rows >= limit);
-                    if !ann.worker.lookup_done && !limit_buffered {
+                    let has_ready_input_buffer = ann
+                        .worker
+                        .input_buffer_accumulator
+                        .has_ready_input_buffer(ann.config.input_buffer_size);
+                    if !ann.worker.lookup_done && !limit_buffered && !has_ready_input_buffer {
                         match poll_lookup_partitions(ann, cx) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Ok(())) => {}
@@ -9968,7 +9997,7 @@ impl Stream for ContigAnnotationStream {
                             eprintln!("[VEP_PROFILE] ------ contig {} END ------", ann.chrom);
                         }
                         // Eagerly reclaim per-contig memory.
-                        ann.worker.colocated_map = HashMap::new();
+                        ann.worker.colocated_map = Arc::new(HashMap::new());
                         ann.worker.transcript_overrides = HashMap::new();
                         ann.worker.translation_overrides = HashMap::new();
                         let fut = make_cleanup_future(
@@ -12043,6 +12072,40 @@ mod tests {
         assert_eq!(accumulator.pending_rows(), 1);
     }
 
+    #[test]
+    fn test_input_buffer_accumulator_limits_ready_buffers() {
+        let mut accumulator = InputBufferAccumulator::default();
+        let starts: Vec<i64> = (1..=15).collect();
+
+        let ready = accumulator.push_window_and_drain_ready_limited(
+            vec![make_buffer_batch_many("chr1", &starts)],
+            5,
+            false,
+            2,
+        );
+
+        assert_eq!(ready.len(), 2);
+        assert_eq!(
+            buffer_variant_bounds(&ready[0]).unwrap(),
+            Some(("chr1".to_string(), 1, 5))
+        );
+        assert_eq!(
+            buffer_variant_bounds(&ready[1]).unwrap(),
+            Some(("chr1".to_string(), 6, 10))
+        );
+        assert_eq!(accumulator.pending_rows(), 5);
+        assert!(accumulator.has_ready_input_buffer(5));
+
+        let next = accumulator.push_window_and_drain_ready_limited(Vec::new(), 5, false, 2);
+        assert_eq!(next.len(), 1);
+        assert_eq!(
+            buffer_variant_bounds(&next[0]).unwrap(),
+            Some(("chr1".to_string(), 11, 15))
+        );
+        assert_eq!(accumulator.pending_rows(), 0);
+        assert!(!accumulator.has_ready_input_buffer(5));
+    }
+
     #[cfg(feature = "kv-cache")]
     #[test]
     fn test_fjall_annotation_uses_ordered_serial_drain_for_stateful_buffers() {
@@ -12065,18 +12128,28 @@ mod tests {
 
     #[test]
     fn test_input_buffer_annotation_jobs_have_global_ordered_ids() {
-        let shared = minimal_shared_contig_annotation_context();
+        let mut shared = minimal_shared_contig_annotation_context();
+        Arc::get_mut(&mut shared)
+            .unwrap()
+            .config
+            .flags
+            .check_existing = true;
         let mut worker = AnnotationWorkerState::new(shared).unwrap();
         let starts: Vec<i64> = (1..=5001).collect();
 
         let first_jobs = prepare_input_buffer_annotation_jobs(
             &mut worker,
             vec![make_buffer_batch_many("chr1", &starts)],
+            usize::MAX,
         )
         .unwrap();
 
         assert_eq!(first_jobs.len(), 1);
         assert_eq!(first_jobs[0].buffer_id, 0);
+        assert!(Arc::ptr_eq(
+            &first_jobs[0].colocated_map,
+            &worker.colocated_map
+        ));
         assert_eq!(
             buffer_variant_bounds(&first_jobs[0].batches).unwrap(),
             Some(("chr1".to_string(), 1, 5000))
@@ -12084,7 +12157,8 @@ mod tests {
         assert_eq!(worker.input_buffer_accumulator.pending_rows(), 1);
 
         worker.lookup_done = true;
-        let final_jobs = prepare_input_buffer_annotation_jobs(&mut worker, Vec::new()).unwrap();
+        let final_jobs =
+            prepare_input_buffer_annotation_jobs(&mut worker, Vec::new(), usize::MAX).unwrap();
 
         assert_eq!(final_jobs.len(), 1);
         assert_eq!(final_jobs[0].buffer_id, 1);
