@@ -7431,6 +7431,56 @@ type LoadedContigContext = (
     Vec<MotifFeature>,
 );
 
+#[derive(Debug, Default)]
+struct SharedContextIndexes {
+    exons_by_transcript: HashMap<String, Vec<usize>>,
+    translation_by_transcript: HashMap<String, usize>,
+}
+
+impl SharedContextIndexes {
+    fn new(exons: &[ExonFeature], translations: &[TranslationFeature]) -> Self {
+        let mut exons_by_transcript: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, exon) in exons.iter().enumerate() {
+            exons_by_transcript
+                .entry(exon.transcript_id.clone())
+                .or_default()
+                .push(idx);
+        }
+
+        let mut translation_by_transcript = HashMap::new();
+        for (idx, translation) in translations.iter().enumerate() {
+            translation_by_transcript.insert(translation.transcript_id.clone(), idx);
+        }
+
+        Self {
+            exons_by_transcript,
+            translation_by_transcript,
+        }
+    }
+
+    fn exon_indices_for_transcripts(&self, tx_ids: &HashSet<&str>) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for tx_id in tx_ids {
+            if let Some(exon_indices) = self.exons_by_transcript.get(*tx_id) {
+                indices.extend(exon_indices.iter().copied());
+            }
+        }
+        indices.sort_unstable();
+        indices
+    }
+
+    fn translation_indices_for_transcripts(&self, tx_ids: &HashSet<&str>) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for tx_id in tx_ids {
+            if let Some(idx) = self.translation_by_transcript.get(*tx_id) {
+                indices.push(*idx);
+            }
+        }
+        indices.sort_unstable();
+        indices
+    }
+}
+
 type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
 type SharedContigPipelineProfile = Arc<Mutex<ContigPipelineProfile>>;
 
@@ -7531,6 +7581,7 @@ struct SharedContigAnnotationContext {
     base_transcripts: Arc<Vec<TranscriptFeature>>,
     base_translations: Arc<Vec<TranslationFeature>>,
     exons: Arc<Vec<ExonFeature>>,
+    indexes: Arc<SharedContextIndexes>,
     regulatory: Arc<Vec<RegulatoryFeature>>,
     motifs: Arc<Vec<MotifFeature>>,
     mirnas: Arc<Vec<MirnaFeature>>,
@@ -7822,10 +7873,15 @@ struct ContigAnnotationState {
 struct InputBufferAnnotationJob {
     buffer_id: usize,
     batches: Vec<RecordBatch>,
-    transcripts: Vec<TranscriptFeature>,
-    exons: Vec<ExonFeature>,
-    translations: Vec<TranslationFeature>,
+    context: BufferAnnotationContext,
     colocated_map: Arc<HashMap<ColocatedKey, ColocatedData>>,
+}
+
+struct BufferAnnotationContext {
+    transcripts: Vec<TranscriptFeature>,
+    exon_indices: Vec<usize>,
+    translation_indices: Vec<usize>,
+    translation_overrides: HashMap<String, TranslationPartitionState>,
 }
 
 struct AnnotatedInputBuffer {
@@ -8339,6 +8395,134 @@ fn materialize_buffer_translations(
             translation
         })
         .collect()
+}
+
+fn prepare_buffer_annotation_context(
+    worker: &mut AnnotationWorkerState,
+    buffer_batches: &[RecordBatch],
+    chrom: &str,
+    min_start: i64,
+    max_end: i64,
+) -> Result<BufferAnnotationContext> {
+    let shared = Arc::clone(&worker.shared);
+    let profile = shared.profile.clone();
+    let config = &shared.config;
+
+    let tx_window_started = Instant::now();
+    let mut transcripts = build_stateful_buffer_local_transcripts(
+        &shared.base_transcripts,
+        &shared.transcript_cache_regions,
+        &mut worker.persisted_buffer_transcripts,
+        buffer_batches,
+        chrom,
+        min_start,
+        max_end,
+        config.upstream_distance,
+        config.downstream_distance,
+    )?;
+    apply_partition_transcript_overrides(&mut transcripts, &worker.transcript_overrides);
+    let buffer_tx_ids: HashSet<&str> = transcripts
+        .iter()
+        .map(|tx| tx.transcript_id.as_str())
+        .collect();
+    record_contig_profile(&profile, |profile| {
+        profile.transcript_window += tx_window_started.elapsed();
+    });
+
+    let exon_filter_started = Instant::now();
+    let exon_indices = shared.indexes.exon_indices_for_transcripts(&buffer_tx_ids);
+    record_contig_profile(&profile, |profile| {
+        profile.exon_filter += exon_filter_started.elapsed();
+    });
+
+    let translation_filter_started = Instant::now();
+    let translation_indices = shared
+        .indexes
+        .translation_indices_for_transcripts(&buffer_tx_ids);
+    let translation_overrides =
+        selected_translation_overrides(&worker.translation_overrides, &buffer_tx_ids);
+    record_contig_profile(&profile, |profile| {
+        profile.translation_filter += translation_filter_started.elapsed();
+    });
+
+    Ok(BufferAnnotationContext {
+        transcripts,
+        exon_indices,
+        translation_indices,
+        translation_overrides,
+    })
+}
+
+fn selected_translation_overrides(
+    overrides: &HashMap<String, TranslationPartitionState>,
+    buffer_tx_ids: &HashSet<&str>,
+) -> HashMap<String, TranslationPartitionState> {
+    overrides
+        .iter()
+        .filter(|(tx_id, _)| buffer_tx_ids.contains(tx_id.as_str()))
+        .map(|(tx_id, override_state)| (tx_id.clone(), override_state.clone()))
+        .collect()
+}
+
+fn materialize_buffer_context_translations(
+    shared: &SharedContigAnnotationContext,
+    buffer_context: &BufferAnnotationContext,
+) -> Vec<TranslationFeature> {
+    if buffer_context.translation_overrides.is_empty() {
+        return Vec::new();
+    }
+
+    buffer_context
+        .translation_indices
+        .iter()
+        .filter_map(|&idx| {
+            let base_translation = &shared.base_translations[idx];
+            let override_state = buffer_context
+                .translation_overrides
+                .get(&base_translation.transcript_id)?;
+            let mut translation = base_translation.clone();
+            apply_partition_translation_override(&mut translation, override_state);
+            Some(translation)
+        })
+        .collect()
+}
+
+fn prepared_context_from_buffer<'a>(
+    buffer_context: &'a BufferAnnotationContext,
+    shared: &'a SharedContigAnnotationContext,
+    materialized_translations: &'a [TranslationFeature],
+) -> PreparedContext<'a> {
+    let transcript_refs = buffer_context.transcripts.iter().collect();
+    let exon_refs = buffer_context
+        .exon_indices
+        .iter()
+        .map(|&idx| &shared.exons[idx])
+        .collect();
+    let materialized_by_tx: HashMap<&str, &TranslationFeature> = materialized_translations
+        .iter()
+        .map(|translation| (translation.transcript_id.as_str(), translation))
+        .collect();
+    let translation_refs = buffer_context
+        .translation_indices
+        .iter()
+        .map(|&idx| {
+            let base_translation = &shared.base_translations[idx];
+            materialized_by_tx
+                .get(base_translation.transcript_id.as_str())
+                .copied()
+                .unwrap_or(base_translation)
+        })
+        .collect();
+
+    PreparedContext::new_from_refs(
+        transcript_refs,
+        exon_refs,
+        translation_refs,
+        &shared.regulatory,
+        &shared.motifs,
+        &shared.mirnas,
+        &shared.structural,
+    )
 }
 
 fn hydrate_worker_window(
@@ -8995,55 +9179,13 @@ fn annotate_worker_window(
         record_contig_profile(&profile, |profile| {
             profile.variant_bounds += bounds_started.elapsed();
         });
-        let tx_window_started = Instant::now();
-        let mut buffer_transcripts = build_stateful_buffer_local_transcripts(
-            &shared.base_transcripts,
-            &shared.transcript_cache_regions,
-            &mut worker.persisted_buffer_transcripts,
-            &buffer_batches,
-            &chrom,
-            min_start,
-            max_end,
-            config.upstream_distance,
-            config.downstream_distance,
-        )?;
-        apply_partition_transcript_overrides(&mut buffer_transcripts, &worker.transcript_overrides);
-        let buffer_tx_ids: HashSet<&str> = buffer_transcripts
-            .iter()
-            .map(|tx| tx.transcript_id.as_str())
-            .collect();
-        record_contig_profile(&profile, |profile| {
-            profile.transcript_window += tx_window_started.elapsed();
-        });
-        let exon_filter_started = Instant::now();
-        let buffer_exons: Vec<ExonFeature> = shared
-            .exons
-            .iter()
-            .filter(|exon| buffer_tx_ids.contains(exon.transcript_id.as_str()))
-            .cloned()
-            .collect();
-        record_contig_profile(&profile, |profile| {
-            profile.exon_filter += exon_filter_started.elapsed();
-        });
-        let translation_filter_started = Instant::now();
-        let buffer_translations = materialize_buffer_translations(
-            &shared.base_translations,
-            &worker.translation_overrides,
-            &buffer_tx_ids,
-        );
-        record_contig_profile(&profile, |profile| {
-            profile.translation_filter += translation_filter_started.elapsed();
-        });
+        let buffer_context =
+            prepare_buffer_annotation_context(worker, &buffer_batches, &chrom, min_start, max_end)?;
         let prepared_context_started = Instant::now();
-        let ctx = PreparedContext::new(
-            &buffer_transcripts,
-            &buffer_exons,
-            &buffer_translations,
-            &shared.regulatory,
-            &shared.motifs,
-            &shared.mirnas,
-            &shared.structural,
-        );
+        let materialized_translations =
+            materialize_buffer_context_translations(&shared, &buffer_context);
+        let ctx =
+            prepared_context_from_buffer(&buffer_context, &shared, &materialized_translations);
         record_contig_profile(&profile, |profile| {
             profile.prepared_context += prepared_context_started.elapsed();
         });
@@ -9167,54 +9309,13 @@ fn prepare_input_buffer_annotation_jobs(
             profile.variant_bounds += bounds_started.elapsed();
         });
 
-        let tx_window_started = Instant::now();
-        let mut buffer_transcripts = build_stateful_buffer_local_transcripts(
-            &shared.base_transcripts,
-            &shared.transcript_cache_regions,
-            &mut worker.persisted_buffer_transcripts,
-            &buffer_batches,
-            &chrom,
-            min_start,
-            max_end,
-            config.upstream_distance,
-            config.downstream_distance,
-        )?;
-        apply_partition_transcript_overrides(&mut buffer_transcripts, &worker.transcript_overrides);
-        let buffer_tx_ids: HashSet<&str> = buffer_transcripts
-            .iter()
-            .map(|tx| tx.transcript_id.as_str())
-            .collect();
-        record_contig_profile(&profile, |profile| {
-            profile.transcript_window += tx_window_started.elapsed();
-        });
-
-        let exon_filter_started = Instant::now();
-        let buffer_exons: Vec<ExonFeature> = shared
-            .exons
-            .iter()
-            .filter(|exon| buffer_tx_ids.contains(exon.transcript_id.as_str()))
-            .cloned()
-            .collect();
-        record_contig_profile(&profile, |profile| {
-            profile.exon_filter += exon_filter_started.elapsed();
-        });
-
-        let translation_filter_started = Instant::now();
-        let buffer_translations = materialize_buffer_translations(
-            &shared.base_translations,
-            &worker.translation_overrides,
-            &buffer_tx_ids,
-        );
-        record_contig_profile(&profile, |profile| {
-            profile.translation_filter += translation_filter_started.elapsed();
-        });
+        let buffer_context =
+            prepare_buffer_annotation_context(worker, &buffer_batches, &chrom, min_start, max_end)?;
 
         jobs.push(InputBufferAnnotationJob {
             buffer_id: worker.next_input_buffer_id,
             batches: buffer_batches,
-            transcripts: buffer_transcripts,
-            exons: buffer_exons,
-            translations: buffer_translations,
+            context: buffer_context,
             colocated_map: Arc::clone(&colocated_map),
         });
         worker.next_input_buffer_id += 1;
@@ -9257,15 +9358,8 @@ fn annotate_input_buffer_job(
     let mut out = VecDeque::with_capacity(job.batches.len());
 
     let prepared_context_started = Instant::now();
-    let ctx = PreparedContext::new(
-        &job.transcripts,
-        &job.exons,
-        &job.translations,
-        &shared.regulatory,
-        &shared.motifs,
-        &shared.mirnas,
-        &shared.structural,
-    );
+    let materialized_translations = materialize_buffer_context_translations(&shared, &job.context);
+    let ctx = prepared_context_from_buffer(&job.context, &shared, &materialized_translations);
     record_contig_profile(&profile, |profile| {
         profile.prepared_context += prepared_context_started.elapsed();
     });
@@ -10399,12 +10493,14 @@ async fn prepare_contig_context(
             .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
             .collect(),
     );
+    let indexes = Arc::new(SharedContextIndexes::new(&ex, &tl));
     let shared_context = Arc::new(SharedContigAnnotationContext {
         config: config.clone(),
         profile: pipeline_profile,
         base_transcripts,
         base_translations: Arc::new(tl),
         exons: Arc::new(ex),
+        indexes,
         regulatory: Arc::new(rg),
         motifs: Arc::new(mt),
         // TODO: miRNA and structural features are not yet partitioned —
@@ -10671,6 +10767,14 @@ mod tests {
         transcripts: Vec<TranscriptFeature>,
         translations: Vec<TranslationFeature>,
     ) -> Arc<SharedContigAnnotationContext> {
+        minimal_shared_contig_annotation_context_with_context(transcripts, translations, Vec::new())
+    }
+
+    fn minimal_shared_contig_annotation_context_with_context(
+        transcripts: Vec<TranscriptFeature>,
+        translations: Vec<TranslationFeature>,
+        exons: Vec<ExonFeature>,
+    ) -> Arc<SharedContigAnnotationContext> {
         let session = Arc::new(SessionContext::new());
         let vcf_schema = Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -10694,8 +10798,9 @@ mod tests {
             config: minimal_contig_annotation_config(),
             profile: None,
             base_transcripts: Arc::new(transcripts),
+            indexes: Arc::new(SharedContextIndexes::new(&exons, &translations)),
             base_translations: Arc::new(translations),
-            exons: Arc::new(Vec::new()),
+            exons: Arc::new(exons),
             regulatory: Arc::new(Vec::new()),
             motifs: Arc::new(Vec::new()),
             mirnas: Arc::new(Vec::new()),
@@ -12139,6 +12244,151 @@ mod tests {
         );
         assert!(ready.is_empty());
         assert_eq!(next_buffer_id, 3);
+    }
+
+    #[test]
+    fn test_prepare_buffer_annotation_context_selects_buffer_features() {
+        let included_tx = make_tx("tx1", None, None, None, None);
+        let mut skipped_tx = make_tx("tx2", None, None, None, None);
+        skipped_tx.start = 1_000_000;
+        skipped_tx.end = 1_000_100;
+        let translations = vec![
+            make_translation("tx1", Vec::new()),
+            make_translation("tx2", Vec::new()),
+        ];
+        let exons = vec![
+            ExonFeature {
+                transcript_id: "tx1".to_string(),
+                exon_number: 1,
+                start: 1,
+                end: 50,
+            },
+            ExonFeature {
+                transcript_id: "tx2".to_string(),
+                exon_number: 1,
+                start: 1_000_000,
+                end: 1_000_050,
+            },
+        ];
+        let shared = minimal_shared_contig_annotation_context_with_context(
+            vec![included_tx, skipped_tx],
+            translations,
+            exons,
+        );
+        let mut worker = AnnotationWorkerState::new(shared).unwrap();
+        let batches = vec![make_buffer_batch("chr2", 10, 10)];
+
+        let prepared =
+            prepare_buffer_annotation_context(&mut worker, &batches, "chr2", 10, 10).unwrap();
+
+        assert_eq!(
+            prepared
+                .transcripts
+                .iter()
+                .map(|tx| tx.transcript_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tx1"]
+        );
+        assert_eq!(
+            prepared
+                .exon_indices
+                .iter()
+                .map(|&idx| worker.shared.exons[idx].transcript_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tx1"]
+        );
+        assert_eq!(
+            prepared
+                .translation_indices
+                .iter()
+                .map(|&idx| worker.shared.base_translations[idx].transcript_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tx1"]
+        );
+        assert!(prepared.translation_overrides.is_empty());
+    }
+
+    #[test]
+    fn test_prepared_context_from_buffer_materializes_only_overridden_translations() {
+        let tx1 = make_tx("tx1", None, None, None, None);
+        let tx2 = make_tx("tx2", None, None, None, None);
+        let base_translation = make_translation("tx1", Vec::new());
+        let other_translation = make_translation("tx2", Vec::new());
+        let mut overridden_translation = base_translation.clone();
+        overridden_translation.cds_sequence = Some("ATG".to_string());
+        let shared = minimal_shared_contig_annotation_context_with_features(
+            vec![tx1.clone(), tx2.clone()],
+            vec![base_translation, other_translation],
+        );
+        let buffer_context = BufferAnnotationContext {
+            transcripts: vec![tx1, tx2],
+            exon_indices: Vec::new(),
+            translation_indices: vec![0, 1],
+            translation_overrides: HashMap::from([(
+                "tx1".to_string(),
+                TranslationPartitionState::from_translation(&overridden_translation),
+            )]),
+        };
+
+        let materialized = materialize_buffer_context_translations(&shared, &buffer_context);
+        let prepared = prepared_context_from_buffer(&buffer_context, &shared, &materialized);
+
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].transcript_id, "tx1");
+        assert_eq!(
+            prepared
+                .translation_by_tx
+                .get("tx1")
+                .and_then(|translation| translation.cds_sequence.as_deref()),
+            Some("ATG")
+        );
+        assert_eq!(
+            prepared
+                .translation_by_tx
+                .get("tx2")
+                .and_then(|translation| translation.cds_sequence.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_shared_context_indexes_select_feature_indices_in_source_order() {
+        let exons = vec![
+            ExonFeature {
+                transcript_id: "tx1".to_string(),
+                exon_number: 1,
+                start: 10,
+                end: 20,
+            },
+            ExonFeature {
+                transcript_id: "tx2".to_string(),
+                exon_number: 1,
+                start: 30,
+                end: 40,
+            },
+            ExonFeature {
+                transcript_id: "tx1".to_string(),
+                exon_number: 2,
+                start: 50,
+                end: 60,
+            },
+        ];
+        let translations = vec![
+            make_translation("tx1", Vec::new()),
+            make_translation("tx3", Vec::new()),
+            make_translation("tx2", Vec::new()),
+        ];
+        let indexes = SharedContextIndexes::new(&exons, &translations);
+        let buffer_tx_ids = HashSet::from(["tx1", "tx3"]);
+
+        assert_eq!(
+            indexes.exon_indices_for_transcripts(&buffer_tx_ids),
+            vec![0, 2]
+        );
+        assert_eq!(
+            indexes.translation_indices_for_transcripts(&buffer_tx_ids),
+            vec![0, 1]
+        );
     }
 
     #[cfg(feature = "kv-cache")]

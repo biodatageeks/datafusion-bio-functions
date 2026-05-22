@@ -722,6 +722,26 @@ impl<'a> PreparedContext<'a> {
         mirnas: &'a [MirnaFeature],
         structural: &'a [StructuralFeature],
     ) -> Self {
+        Self::new_from_refs(
+            transcripts.iter().collect(),
+            exons.iter().collect(),
+            translations.iter().collect(),
+            regulatory,
+            motifs,
+            mirnas,
+            structural,
+        )
+    }
+
+    pub fn new_from_refs(
+        transcripts: Vec<&'a TranscriptFeature>,
+        exons: Vec<&'a ExonFeature>,
+        translations: Vec<&'a TranslationFeature>,
+        regulatory: &'a [RegulatoryFeature],
+        motifs: &'a [MotifFeature],
+        mirnas: &'a [MirnaFeature],
+        structural: &'a [StructuralFeature],
+    ) -> Self {
         let mut exons_by_tx: HashMap<&str, Vec<&ExonFeature>> = HashMap::new();
         for exon in exons {
             exons_by_tx
@@ -733,14 +753,14 @@ impl<'a> PreparedContext<'a> {
             tx_exons.sort_by_key(|e| e.exon_number);
         }
         let translation_by_tx: HashMap<&str, &TranslationFeature> = translations
-            .iter()
+            .into_iter()
             .map(|t| (t.transcript_id.as_str(), t))
             .collect();
         // Sort transcripts by transcript_id so that source-array index order
         // equals lexicographic feature-ID order.  The downstream CSQ sort can
         // then compare lightweight `transcript_idx` integers instead of heap-
         // allocated transcript_id strings.
-        let mut tx_refs: Vec<&TranscriptFeature> = transcripts.iter().collect();
+        let mut tx_refs = transcripts;
         tx_refs.sort_unstable_by(|a, b| a.transcript_id.cmp(&b.transcript_id));
 
         // Build per-chromosome COITree for fast interval overlap queries.
