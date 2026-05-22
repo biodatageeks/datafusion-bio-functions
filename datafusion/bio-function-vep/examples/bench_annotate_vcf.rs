@@ -13,6 +13,7 @@
 //!     [--extended-probes] \
 //!     [--reference-fasta <path>] \
 //!     [--target-partitions <n>] \
+//!     [--forks <n>] \
 //!     [--buffer-size <n>] \
 //!     [--compression none|gzip|bgzf] \
 //!     [--limit <n>] \
@@ -34,6 +35,7 @@ struct Args {
     extended_probes: bool,
     reference_fasta: Option<String>,
     target_partitions: usize,
+    forks: Option<usize>,
     buffer_size: usize,
     compression: VcfCompressionType,
     limit: Option<usize>,
@@ -50,6 +52,7 @@ fn parse_args() -> Args {
     let mut extended_probes = false;
     let mut reference_fasta = None;
     let mut target_partitions = 1;
+    let mut forks = None;
     let mut buffer_size = vcf_sink::VEP_DEFAULT_BUFFER_SIZE;
     let mut compression = VcfCompressionType::Plain;
     let mut limit = None;
@@ -83,6 +86,10 @@ fn parse_args() -> Args {
             "--target-partitions" => {
                 i += 1;
                 target_partitions = args[i].parse().unwrap_or(1);
+            }
+            "--forks" => {
+                i += 1;
+                forks = args[i].parse().ok();
             }
             "--buffer-size" => {
                 i += 1;
@@ -135,6 +142,7 @@ fn parse_args() -> Args {
         extended_probes,
         reference_fasta,
         target_partitions,
+        forks,
         buffer_size,
         compression,
         limit,
@@ -158,6 +166,12 @@ async fn main() -> Result<()> {
         args.reference_fasta.as_deref().unwrap_or("(none)")
     );
     eprintln!("  target_partitions: {}", args.target_partitions);
+    eprintln!(
+        "  forks:      {}",
+        args.forks
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "(legacy target_partitions)".to_string())
+    );
     eprintln!("  buffer_size: {}", args.buffer_size);
     eprintln!(
         "  compress:   {}",
@@ -200,6 +214,7 @@ async fn main() -> Result<()> {
         reference_fasta_path: args.reference_fasta.clone(),
         use_fjall: args.backend == "fjall",
         target_partitions: args.target_partitions,
+        forks: args.forks,
         buffer_size: args.buffer_size,
         compression: args.compression,
         show_progress: args.show_progress,

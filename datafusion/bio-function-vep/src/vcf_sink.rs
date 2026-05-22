@@ -76,18 +76,71 @@ struct FormattedVcfBatch {
     format_duration: Duration,
 }
 
-fn parallel_vcf_format_enabled(config: &AnnotateVcfConfig) -> bool {
-    config.target_partitions > 1
-        && std::env::var("VEP_VCF_PARALLEL_FORMAT")
-            .map(|value| value != "0")
-            .unwrap_or(true)
+fn parallel_vcf_format_env_enabled() -> bool {
+    std::env::var("VEP_VCF_PARALLEL_FORMAT")
+        .map(|value| value != "0")
+        .unwrap_or(true)
         && std::env::var("VEP_VCF_BYTE_CHUNKS")
             .map(|value| value != "0")
             .unwrap_or(true)
 }
 
-fn parallel_vcf_format_jobs(config: &AnnotateVcfConfig) -> usize {
-    config.target_partitions.max(1)
+fn parallel_vcf_format_enabled(plan: VepConcurrencyPlan) -> bool {
+    plan.formatter_workers > 0 && parallel_vcf_format_env_enabled()
+}
+
+fn parallel_vcf_format_jobs(plan: VepConcurrencyPlan) -> usize {
+    plan.formatter_workers.max(1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VepConcurrencyPlan {
+    lookup_partitions: usize,
+    annotation_workers: usize,
+    formatter_workers: usize,
+    inline_lookup: bool,
+    spawn_vcf_provider_open: bool,
+}
+
+impl VepConcurrencyPlan {
+    fn from_config(config: &AnnotateVcfConfig) -> Self {
+        if let Some(forks) = config.forks {
+            return Self::from_forks(forks);
+        }
+
+        let target_partitions = config.target_partitions.max(1);
+        Self {
+            lookup_partitions: target_partitions,
+            annotation_workers: target_partitions,
+            formatter_workers: if target_partitions > 1 {
+                target_partitions
+            } else {
+                0
+            },
+            inline_lookup: false,
+            spawn_vcf_provider_open: true,
+        }
+    }
+
+    fn from_forks(forks: usize) -> Self {
+        if forks == 0 {
+            return Self {
+                lookup_partitions: 1,
+                annotation_workers: 1,
+                formatter_workers: 0,
+                inline_lookup: true,
+                spawn_vcf_provider_open: false,
+            };
+        }
+
+        Self {
+            lookup_partitions: forks,
+            annotation_workers: forks,
+            formatter_workers: forks,
+            inline_lookup: false,
+            spawn_vcf_provider_open: true,
+        }
+    }
 }
 
 fn vcf_lines_to_body_chunk(lines: Vec<VcfRecordLine>) -> (Vec<u8>, usize) {
@@ -235,6 +288,11 @@ pub struct AnnotateVcfConfig {
     pub buffer_size: usize,
     /// DataFusion target partitions for the annotation session.
     pub target_partitions: usize,
+    /// User-facing fork count. `None` preserves legacy `target_partitions`
+    /// behavior; `Some(0)` is a strict single-lane path with no helper lookup
+    /// or formatting tasks; `Some(n)` uses `n` lookup, annotation, and
+    /// formatter workers.
+    pub forks: Option<usize>,
     /// Output compression type.
     pub compression: VcfCompressionType,
     /// Show an indicatif progress bar on stderr (for Rust CLI).
@@ -277,6 +335,7 @@ impl Default for AnnotateVcfConfig {
             distance: None,
             buffer_size: VEP_DEFAULT_BUFFER_SIZE,
             target_partitions: 1,
+            forks: None,
             compression: VcfCompressionType::Plain,
             show_progress: false,
             on_batch_written: None,
@@ -290,6 +349,7 @@ impl std::fmt::Debug for AnnotateVcfConfig {
             .field("everything", &self.everything)
             .field("buffer_size", &self.buffer_size)
             .field("target_partitions", &self.target_partitions)
+            .field("forks", &self.forks)
             .field("compression", &self.compression)
             .field("show_progress", &self.show_progress)
             .field("on_batch_written", &self.on_batch_written.is_some())
@@ -381,6 +441,21 @@ impl AnnotateVcfConfig {
             "buffer_size".into(),
             serde_json::Value::Number(serde_json::Number::from(self.buffer_size)),
         );
+        if let Some(forks) = self.forks {
+            let plan = VepConcurrencyPlan::from_config(self);
+            opts.insert(
+                "forks".into(),
+                serde_json::Value::Number(serde_json::Number::from(forks)),
+            );
+            opts.insert(
+                "annotation_workers".into(),
+                serde_json::Value::Number(serde_json::Number::from(plan.annotation_workers)),
+            );
+            opts.insert(
+                "inline_lookup".into(),
+                serde_json::Value::Bool(plan.inline_lookup),
+            );
+        }
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
 
@@ -434,19 +509,34 @@ pub async fn annotate_to_vcf(
         ));
     }
     let cache_source_type = CacheSourceType::from_partitioned_cache_source(cache_source)?;
+    let concurrency_plan = VepConcurrencyPlan::from_config(config);
+    if sink_profile_enabled() {
+        eprintln!(
+            "[VEP_PROFILE] concurrency_plan lookup_partitions={} annotation_workers={} formatter_workers={} inline_lookup={} spawn_vcf_provider_open={}",
+            concurrency_plan.lookup_partitions,
+            concurrency_plan.annotation_workers,
+            concurrency_plan.formatter_workers,
+            concurrency_plan.inline_lookup,
+            concurrency_plan.spawn_vcf_provider_open
+        );
+    }
 
     // 1. Create session and register VCF table.
     let session_config = datafusion::prelude::SessionConfig::new()
-        .with_target_partitions(config.target_partitions.max(1));
+        .with_target_partitions(concurrency_plan.lookup_partitions);
     let ctx = SessionContext::new_with_config(session_config);
     crate::register_vep_functions(&ctx);
 
     let vcf_path = input_vcf.to_string();
-    let vcf_provider = tokio::task::spawn_blocking(move || {
-        VcfTableProvider::new(vcf_path, None, None, None, false)
-    })
-    .await
-    .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??;
+    let vcf_provider = if concurrency_plan.spawn_vcf_provider_open {
+        tokio::task::spawn_blocking(move || {
+            VcfTableProvider::new(vcf_path, None, None, None, false)
+        })
+        .await
+        .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))??
+    } else {
+        VcfTableProvider::new(vcf_path, None, None, None, false)?
+    };
 
     let vcf_schema = vcf_provider.schema();
     ctx.register_table("__vep_vcf", Arc::new(vcf_provider))?;
@@ -628,11 +718,11 @@ pub async fn annotate_to_vcf(
     let mut total_rows = 0;
     let mut sink_profile = sink_profile_enabled().then(VcfSinkProfile::default);
 
-    if parallel_vcf_format_enabled(config) {
+    if parallel_vcf_format_enabled(concurrency_plan) {
         let vcf_info_fields = Arc::new(vcf_info_fields);
         let unique_format_tags = Arc::new(unique_format_tags);
         let sample_names = Arc::new(sample_names);
-        let max_format_jobs = parallel_vcf_format_jobs(config);
+        let max_format_jobs = parallel_vcf_format_jobs(concurrency_plan);
         let mut format_jobs = tokio::task::JoinSet::new();
         let mut ready_chunks = BTreeMap::new();
         let mut next_input_batch_id = 0;
@@ -815,6 +905,73 @@ mod tests {
     #[test]
     fn test_default_target_partitions_is_one() {
         assert_eq!(AnnotateVcfConfig::default().target_partitions, 1);
+    }
+
+    #[test]
+    fn test_forks_zero_derives_strict_inline_concurrency_plan() {
+        let config = AnnotateVcfConfig {
+            forks: Some(0),
+            target_partitions: 8,
+            ..Default::default()
+        };
+
+        let plan = VepConcurrencyPlan::from_config(&config);
+
+        assert_eq!(plan.lookup_partitions, 1);
+        assert_eq!(plan.annotation_workers, 1);
+        assert_eq!(plan.formatter_workers, 0);
+        assert!(plan.inline_lookup);
+        assert!(!plan.spawn_vcf_provider_open);
+    }
+
+    #[test]
+    fn test_forks_nonzero_uses_fork_count_for_parallel_stages() {
+        let config = AnnotateVcfConfig {
+            forks: Some(4),
+            target_partitions: 1,
+            ..Default::default()
+        };
+
+        let plan = VepConcurrencyPlan::from_config(&config);
+
+        assert_eq!(plan.lookup_partitions, 4);
+        assert_eq!(plan.annotation_workers, 4);
+        assert_eq!(plan.formatter_workers, 4);
+        assert!(!plan.inline_lookup);
+        assert!(plan.spawn_vcf_provider_open);
+    }
+
+    #[test]
+    fn test_missing_forks_preserves_target_partitions_behavior() {
+        let config = AnnotateVcfConfig {
+            forks: None,
+            target_partitions: 4,
+            ..Default::default()
+        };
+
+        let plan = VepConcurrencyPlan::from_config(&config);
+
+        assert_eq!(plan.lookup_partitions, 4);
+        assert_eq!(plan.annotation_workers, 4);
+        assert_eq!(plan.formatter_workers, 4);
+        assert!(!plan.inline_lookup);
+        assert!(plan.spawn_vcf_provider_open);
+    }
+
+    #[test]
+    fn test_to_options_json_emits_forks_plan_when_set() {
+        let config = AnnotateVcfConfig {
+            forks: Some(0),
+            target_partitions: 8,
+            ..Default::default()
+        };
+
+        let json = config.to_options_json();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["forks"], 0);
+        assert_eq!(value["annotation_workers"], 1);
+        assert_eq!(value["inline_lookup"], true);
     }
 
     #[test]
