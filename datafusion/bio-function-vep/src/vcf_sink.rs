@@ -132,6 +132,15 @@ impl VepConcurrencyPlan {
                 spawn_vcf_provider_open: false,
             };
         }
+        if forks == 1 {
+            return Self {
+                lookup_partitions: 1,
+                annotation_workers: 1,
+                formatter_workers: 0,
+                inline_lookup: false,
+                spawn_vcf_provider_open: true,
+            };
+        }
 
         Self {
             lookup_partitions: forks,
@@ -922,6 +931,23 @@ mod tests {
         assert_eq!(plan.formatter_workers, 0);
         assert!(plan.inline_lookup);
         assert!(!plan.spawn_vcf_provider_open);
+    }
+
+    #[test]
+    fn test_forks_one_preserves_legacy_single_partition_plan() {
+        let config = AnnotateVcfConfig {
+            forks: Some(1),
+            target_partitions: 8,
+            ..Default::default()
+        };
+
+        let plan = VepConcurrencyPlan::from_config(&config);
+
+        assert_eq!(plan.lookup_partitions, 1);
+        assert_eq!(plan.annotation_workers, 1);
+        assert_eq!(plan.formatter_workers, 0);
+        assert!(!plan.inline_lookup);
+        assert!(plan.spawn_vcf_provider_open);
     }
 
     #[test]
