@@ -7639,6 +7639,8 @@ const HYDRATION_WINDOW_SIZE: usize = 1000;
 const LOOKUP_PARTITION_QUEUE_BATCHES: usize = 2;
 /// Ensembl VEP release/115 default `buffer_size`.
 const VEP_INPUT_BUFFER_SIZE: usize = 5000;
+/// Keep one queue of whole VEP buffers ahead of the active workers.
+const PARALLEL_INPUT_BUFFER_BACKLOG_FACTOR: usize = 2;
 /// Ensembl VEP transcript cache region size (`cache_region_size`).
 const VEP_TRANSCRIPT_CACHE_REGION_SIZE_BP: i64 = 1_000_000;
 
@@ -8056,20 +8058,88 @@ struct InputBufferAnnotationJob {
     colocated_map: Arc<HashMap<ColocatedKey, ColocatedData>>,
 }
 
-struct AnnotationSubchunkJob {
+struct AnnotatedInputBuffer {
     buffer_id: usize,
-    chunk_id: usize,
-    batches: Vec<RecordBatch>,
-    transcripts: Arc<Vec<TranscriptFeature>>,
-    exons: Arc<Vec<ExonFeature>>,
-    translations: Arc<Vec<TranslationFeature>>,
-    colocated_map: Arc<HashMap<ColocatedKey, ColocatedData>>,
+    batches: VecDeque<RecordBatch>,
 }
 
-struct AnnotatedSubchunk {
-    buffer_id: usize,
-    chunk_id: usize,
-    batches: VecDeque<RecordBatch>,
+struct ParallelAnnotationState {
+    ann: ContigAnnotationState,
+    pending_jobs: VecDeque<InputBufferAnnotationJob>,
+    in_flight: tokio::task::JoinSet<Result<(AnnotatedInputBuffer, Duration)>>,
+    ready_buffers: BTreeMap<usize, AnnotatedInputBuffer>,
+    output_queue: VecDeque<RecordBatch>,
+    queued_input_rows: usize,
+    next_output_buffer_id: usize,
+    projection: Option<Vec<usize>>,
+    max_parallel: usize,
+    max_queued_buffers: usize,
+}
+
+enum ParallelAnnotationPoll {
+    Batch(RecordBatch, usize),
+    Complete,
+    Failed(DataFusionError),
+}
+
+impl ParallelAnnotationState {
+    fn new(ann: ContigAnnotationState) -> Self {
+        let max_parallel = ann.config.target_partitions.max(1);
+        let max_queued_buffers = parallel_annotation_buffer_queue_target(max_parallel);
+        let projection = ann.config.projection.clone();
+        Self {
+            ann,
+            pending_jobs: VecDeque::new(),
+            in_flight: tokio::task::JoinSet::new(),
+            ready_buffers: BTreeMap::new(),
+            output_queue: VecDeque::new(),
+            queued_input_rows: 0,
+            next_output_buffer_id: 0,
+            projection,
+            max_parallel,
+            max_queued_buffers,
+        }
+    }
+
+    fn queued_buffer_count(&self) -> usize {
+        self.pending_jobs.len() + self.in_flight.len() + self.ready_buffers.len()
+    }
+
+    fn remaining_buffer_capacity(&self) -> usize {
+        self.max_queued_buffers
+            .saturating_sub(self.queued_buffer_count())
+    }
+
+    fn spawn_pending_jobs(&mut self) {
+        while self.in_flight.len() < self.max_parallel && !self.pending_jobs.is_empty() {
+            let job = self
+                .pending_jobs
+                .pop_front()
+                .expect("pending job queue must be non-empty");
+            let shared = Arc::clone(&self.ann.worker.shared);
+            let projection = self.projection.clone();
+            self.in_flight.spawn(async move {
+                let started = Instant::now();
+                annotate_input_buffer_job(shared, job, projection)
+                    .map(|annotated| (annotated, started.elapsed()))
+            });
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.ann.worker.lookup_done
+            && self.ann.worker.window_buffer.is_empty()
+            && self.ann.worker.input_buffer_accumulator.pending_rows() == 0
+            && self.pending_jobs.is_empty()
+            && self.in_flight.is_empty()
+            && self.ready_buffers.is_empty()
+            && self.output_queue.is_empty()
+    }
+
+    fn abort_background_work(&mut self) {
+        self.in_flight.abort_all();
+        abort_annotation_lookup_workers(&mut self.ann);
+    }
 }
 
 fn should_parallelize_input_buffers(config: &ContigAnnotationConfig) -> bool {
@@ -8086,8 +8156,6 @@ fn should_parallelize_input_buffers(config: &ContigAnnotationConfig) -> bool {
 
 type PrepareFuture = Pin<Box<dyn Future<Output = Result<Option<ContigReadyState>>> + Send>>;
 type CleanupFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-type AnnotateWindowFuture =
-    Pin<Box<dyn Future<Output = (ContigAnnotationState, Result<VecDeque<RecordBatch>>)> + Send>>;
 
 enum StreamState {
     StartContig,
@@ -8095,13 +8163,8 @@ enum StreamState {
     PreparingContig(PrepareFuture),
     /// Pull from lookup stream, accumulate windows, hydrate + annotate.
     AnnotatingContig(ContigAnnotationState),
-    /// Run annotation for one ordered window, potentially across input-buffer workers.
-    AnnotatingWindow {
-        fut: AnnotateWindowFuture,
-        session: Arc<SessionContext>,
-        config: ContigAnnotationConfig,
-        ephemeral_tables: Vec<String>,
-    },
+    /// Pull, hydrate, annotate, and drain whole VEP input buffers concurrently.
+    ParallelAnnotatingContig(ParallelAnnotationState),
     /// Yield annotated batches from the current window, then resume annotation.
     DrainingWindow {
         batches: VecDeque<RecordBatch>,
@@ -8314,16 +8377,13 @@ impl ContigAnnotationStream {
                 }
                 ann.ephemeral_tables.clear();
             }
-            StreamState::AnnotatingWindow {
-                session,
-                config,
-                ephemeral_tables,
-                ..
-            } => {
-                deregister_tables_sync(session, ephemeral_tables);
-                if config.use_fjall {
-                    let _ = session.deregister_table("__vep_kv_variation");
+            StreamState::ParallelAnnotatingContig(par) => {
+                par.abort_background_work();
+                deregister_tables_sync(&par.ann.session, &par.ann.ephemeral_tables);
+                if par.ann.config.use_fjall {
+                    let _ = par.ann.session.deregister_table("__vep_kv_variation");
                 }
+                par.ann.ephemeral_tables.clear();
             }
             StreamState::DrainingWindow {
                 annotation_state: ann,
@@ -9288,73 +9348,13 @@ fn annotate_window(
     annotate_worker_window(&mut ann.worker, window_batches, projection)
 }
 
-fn split_batches_by_input_units(
-    batches: Vec<RecordBatch>,
-    target_chunks: usize,
-) -> Vec<Vec<RecordBatch>> {
-    let target_chunks = target_chunks.max(1);
-    if batches.is_empty() || target_chunks == 1 {
-        return if batches.is_empty() {
-            Vec::new()
-        } else {
-            vec![batches]
-        };
+fn parallel_annotation_buffer_queue_target(target_partitions: usize) -> usize {
+    let target_partitions = target_partitions.max(1);
+    if target_partitions == 1 {
+        1
+    } else {
+        target_partitions * PARALLEL_INPUT_BUFFER_BACKLOG_FACTOR
     }
-
-    let total_units: usize = batches.iter().map(batch_input_units).sum();
-    if total_units == 0 {
-        return vec![batches];
-    }
-    let input_unit_limit = total_units.div_ceil(target_chunks).max(1);
-
-    let mut chunks: Vec<Vec<RecordBatch>> = Vec::new();
-    let mut current_chunk: Vec<RecordBatch> = Vec::new();
-    let mut current_chunk_units = 0usize;
-
-    for batch in batches {
-        let batch_rows = batch.num_rows();
-        if batch_rows == 0 {
-            continue;
-        }
-        let alts = AltColumnView::from_batch(&batch);
-        let mut slice_offset = 0usize;
-        let mut slice_rows = 0usize;
-        let mut slice_units = 0usize;
-
-        for row in 0..batch_rows {
-            let row_units = alts.as_ref().map_or(1, |alts| alts.input_units_at(row));
-            if slice_rows > 0
-                && current_chunk_units + slice_units + row_units > input_unit_limit
-                && chunks.len() + 1 < target_chunks
-            {
-                current_chunk.push(batch.slice(slice_offset, slice_rows));
-                chunks.push(current_chunk);
-                current_chunk = Vec::new();
-                current_chunk_units = 0;
-                slice_offset += slice_rows;
-                slice_rows = 0;
-                slice_units = 0;
-            }
-
-            slice_rows += 1;
-            slice_units += row_units;
-        }
-
-        if slice_rows > 0 {
-            current_chunk.push(batch.slice(slice_offset, slice_rows));
-            current_chunk_units += slice_units;
-        }
-        if current_chunk_units >= input_unit_limit && chunks.len() + 1 < target_chunks {
-            chunks.push(current_chunk);
-            current_chunk = Vec::new();
-            current_chunk_units = 0;
-        }
-    }
-
-    if !current_chunk.is_empty() {
-        chunks.push(current_chunk);
-    }
-    chunks
 }
 
 fn prepare_input_buffer_annotation_jobs(
@@ -9453,35 +9453,11 @@ fn prepare_input_buffer_annotation_jobs(
     Ok(jobs)
 }
 
-fn split_input_buffer_annotation_job(
-    job: InputBufferAnnotationJob,
-    target_chunks: usize,
-) -> Vec<AnnotationSubchunkJob> {
-    let buffer_id = job.buffer_id;
-    let colocated_map = job.colocated_map;
-    let transcripts = Arc::new(job.transcripts);
-    let exons = Arc::new(job.exons);
-    let translations = Arc::new(job.translations);
-    split_batches_by_input_units(job.batches, target_chunks)
-        .into_iter()
-        .enumerate()
-        .map(|(chunk_id, batches)| AnnotationSubchunkJob {
-            buffer_id,
-            chunk_id,
-            batches,
-            transcripts: Arc::clone(&transcripts),
-            exons: Arc::clone(&exons),
-            translations: Arc::clone(&translations),
-            colocated_map: Arc::clone(&colocated_map),
-        })
-        .collect()
-}
-
-fn annotate_subchunk_job(
+fn annotate_input_buffer_job(
     shared: Arc<SharedContigAnnotationContext>,
-    job: AnnotationSubchunkJob,
+    job: InputBufferAnnotationJob,
     projection: Option<Vec<usize>>,
-) -> Result<AnnotatedSubchunk> {
+) -> Result<AnnotatedInputBuffer> {
     let tmp_provider = shared.tmp_provider.as_ref();
     let engine = shared.engine.as_ref();
     let config = &shared.config;
@@ -9512,9 +9488,9 @@ fn annotate_subchunk_job(
 
     let prepared_context_started = Instant::now();
     let ctx = PreparedContext::new(
-        job.transcripts.as_slice(),
-        job.exons.as_slice(),
-        job.translations.as_slice(),
+        &job.transcripts,
+        &job.exons,
+        &job.translations,
         &shared.regulatory,
         &shared.motifs,
         &shared.mirnas,
@@ -9579,153 +9555,22 @@ fn annotate_subchunk_job(
         }
     }
 
-    Ok(AnnotatedSubchunk {
+    Ok(AnnotatedInputBuffer {
         buffer_id: job.buffer_id,
-        chunk_id: job.chunk_id,
         batches: out,
     })
 }
 
-fn drain_ready_ordered_subchunks(
-    ready: &mut BTreeMap<(usize, usize), AnnotatedSubchunk>,
-    chunks_by_buffer: &BTreeMap<usize, usize>,
+fn drain_ready_ordered_input_buffers(
+    ready: &mut BTreeMap<usize, AnnotatedInputBuffer>,
     next_buffer_id: &mut usize,
-    next_chunk_id: &mut usize,
     out: &mut VecDeque<RecordBatch>,
 ) {
-    loop {
-        let Some(chunk_count) = chunks_by_buffer.get(next_buffer_id).copied() else {
-            break;
-        };
-        if *next_chunk_id >= chunk_count {
-            *next_buffer_id += 1;
-            *next_chunk_id = 0;
-            continue;
-        }
-
-        let key = (*next_buffer_id, *next_chunk_id);
-        let Some(mut annotated) = ready.remove(&key) else {
-            break;
-        };
-        debug_assert_eq!(annotated.buffer_id, key.0);
-        debug_assert_eq!(annotated.chunk_id, key.1);
+    while let Some(mut annotated) = ready.remove(next_buffer_id) {
+        debug_assert_eq!(annotated.buffer_id, *next_buffer_id);
         out.extend(annotated.batches.drain(..));
-        *next_chunk_id += 1;
+        *next_buffer_id += 1;
     }
-}
-
-async fn annotate_window_parallel_input_buffers(
-    ann: &mut ContigAnnotationState,
-    window_batches: Vec<RecordBatch>,
-    projection: Option<Vec<usize>>,
-) -> Result<VecDeque<RecordBatch>> {
-    let annotation_started = Instant::now();
-    let shared = Arc::clone(&ann.worker.shared);
-    let profile = shared.profile.clone();
-    let max_parallel = ann.config.target_partitions.max(1);
-    let jobs = prepare_input_buffer_annotation_jobs(&mut ann.worker, window_batches, max_parallel)?;
-    if jobs.is_empty() {
-        record_contig_profile(&profile, |profile| {
-            profile.annotation_compute += annotation_started.elapsed();
-        });
-        return Ok(VecDeque::new());
-    }
-
-    let buffer_count = jobs.len();
-    let mut chunks_by_buffer = BTreeMap::new();
-    let mut pending_jobs = VecDeque::new();
-    for (idx, job) in jobs.into_iter().enumerate() {
-        let chunks_for_buffer =
-            (max_parallel / buffer_count) + usize::from(idx < max_parallel % buffer_count);
-        let chunks_for_buffer = chunks_for_buffer.max(1);
-        let buffer_id = job.buffer_id;
-        let subchunks = split_input_buffer_annotation_job(job, chunks_for_buffer);
-        if subchunks.is_empty() {
-            continue;
-        }
-        chunks_by_buffer.insert(buffer_id, subchunks.len());
-        pending_jobs.extend(subchunks);
-    }
-    if pending_jobs.is_empty() {
-        record_contig_profile(&profile, |profile| {
-            profile.annotation_compute += annotation_started.elapsed();
-        });
-        return Ok(VecDeque::new());
-    }
-
-    let mut out = VecDeque::new();
-    let mut next_output_buffer_id = *chunks_by_buffer
-        .keys()
-        .next()
-        .expect("non-empty subchunk jobs must have buffer metadata");
-    let mut next_output_chunk_id = 0usize;
-    let mut ready = BTreeMap::new();
-    let mut tasks = tokio::task::JoinSet::new();
-    while !pending_jobs.is_empty() || !tasks.is_empty() {
-        while tasks.len() < max_parallel && !pending_jobs.is_empty() {
-            let job = pending_jobs
-                .pop_front()
-                .expect("pending job queue must be non-empty");
-            let shared = Arc::clone(&shared);
-            let projection = projection.clone();
-            tasks.spawn(async move { annotate_subchunk_job(shared, job, projection) });
-        }
-
-        let Some(joined) = tasks.join_next().await else {
-            break;
-        };
-        let annotated = match joined {
-            Ok(Ok(annotated)) => annotated,
-            Ok(Err(e)) => {
-                tasks.abort_all();
-                return Err(e);
-            }
-            Err(e) => {
-                tasks.abort_all();
-                return Err(DataFusionError::Execution(format!(
-                    "input-buffer annotation task failed: {e}"
-                )));
-            }
-        };
-        ready.insert((annotated.buffer_id, annotated.chunk_id), annotated);
-        drain_ready_ordered_subchunks(
-            &mut ready,
-            &chunks_by_buffer,
-            &mut next_output_buffer_id,
-            &mut next_output_chunk_id,
-            &mut out,
-        );
-    }
-
-    if !ready.is_empty() {
-        return Err(DataFusionError::Execution(
-            "input-buffer annotation finished with undrained subchunks".to_string(),
-        ));
-    }
-
-    if next_output_buffer_id
-        < *chunks_by_buffer
-            .keys()
-            .last()
-            .expect("non-empty subchunk jobs must have buffer metadata")
-    {
-        return Err(DataFusionError::Execution(
-            "input-buffer annotation finished before all subchunks were emitted".to_string(),
-        ));
-    }
-
-    if let Some((&last_buffer_id, &last_chunk_count)) = chunks_by_buffer.iter().last() {
-        if next_output_buffer_id == last_buffer_id && next_output_chunk_id < last_chunk_count {
-            return Err(DataFusionError::Execution(
-                "input-buffer annotation finished before final buffer was emitted".to_string(),
-            ));
-        }
-    }
-
-    record_contig_profile(&profile, |profile| {
-        profile.annotation_compute += annotation_started.elapsed();
-    });
-    Ok(out)
 }
 
 fn poll_lookup_partitions(
@@ -9787,6 +9632,211 @@ fn poll_lookup_partitions(
     }
 
     Poll::Ready(Ok(()))
+}
+
+fn pop_parallel_output_batch(
+    par: &mut ParallelAnnotationState,
+    rows_emitted: usize,
+    fetch_limit: Option<usize>,
+) -> Option<(RecordBatch, usize)> {
+    if fetch_limit.is_some_and(|limit| rows_emitted >= limit) {
+        return None;
+    }
+    let batch = par.output_queue.pop_front()?;
+    par.queued_input_rows = par.queued_input_rows.saturating_sub(batch.num_rows());
+    let profile = par.ann.worker.shared.profile.clone();
+    if let Some(limit) = fetch_limit {
+        let remaining = limit.saturating_sub(rows_emitted);
+        if batch.num_rows() > remaining {
+            record_contig_profile(&profile, |profile| {
+                profile.output_batches += 1;
+                profile.output_rows += remaining;
+            });
+            return Some((batch.slice(0, remaining), remaining));
+        }
+    }
+
+    let rows = batch.num_rows();
+    record_contig_profile(&profile, |profile| {
+        profile.output_batches += 1;
+        profile.output_rows += rows;
+    });
+    Some((batch, rows))
+}
+
+fn poll_completed_parallel_annotation_jobs(
+    par: &mut ParallelAnnotationState,
+    cx: &mut TaskCtx<'_>,
+) -> Poll<Result<bool>> {
+    let mut made_progress = false;
+    loop {
+        match par.in_flight.poll_join_next(cx) {
+            Poll::Ready(Some(Ok(Ok((annotated, elapsed))))) => {
+                record_contig_profile(&par.ann.worker.shared.profile, |profile| {
+                    profile.annotation_compute += elapsed;
+                });
+                par.ready_buffers.insert(annotated.buffer_id, annotated);
+                drain_ready_ordered_input_buffers(
+                    &mut par.ready_buffers,
+                    &mut par.next_output_buffer_id,
+                    &mut par.output_queue,
+                );
+                made_progress = true;
+            }
+            Poll::Ready(Some(Ok(Err(e)))) => {
+                par.in_flight.abort_all();
+                return Poll::Ready(Err(e));
+            }
+            Poll::Ready(Some(Err(e))) => {
+                par.in_flight.abort_all();
+                return Poll::Ready(Err(DataFusionError::Execution(format!(
+                    "input-buffer annotation task failed: {e}"
+                ))));
+            }
+            Poll::Ready(None) => return Poll::Ready(Ok(made_progress)),
+            Poll::Pending if made_progress => return Poll::Ready(Ok(true)),
+            Poll::Pending => return Poll::Pending,
+        }
+    }
+}
+
+fn hydrate_and_prepare_parallel_window(
+    par: &mut ParallelAnnotationState,
+    window_batches: Vec<RecordBatch>,
+    max_ready_buffers: usize,
+) -> Result<Vec<InputBufferAnnotationJob>> {
+    if !window_batches.is_empty() {
+        let shared = Arc::clone(&par.ann.worker.shared);
+        let hydration_started = Instant::now();
+        hydrate_worker_window(
+            &mut par.ann.worker,
+            &window_batches,
+            par.ann.config.cache_source_type,
+        )?;
+        record_contig_profile(&shared.profile, |profile| {
+            profile.hydration += hydration_started.elapsed();
+        });
+    }
+
+    prepare_input_buffer_annotation_jobs(&mut par.ann.worker, window_batches, max_ready_buffers)
+}
+
+fn poll_parallel_annotation_state(
+    par: &mut ParallelAnnotationState,
+    cx: &mut TaskCtx<'_>,
+    rows_emitted: usize,
+    fetch_limit: Option<usize>,
+) -> Poll<ParallelAnnotationPoll> {
+    loop {
+        if let Some((batch, rows)) = pop_parallel_output_batch(par, rows_emitted, fetch_limit) {
+            return Poll::Ready(ParallelAnnotationPoll::Batch(batch, rows));
+        }
+
+        let mut made_progress = match poll_completed_parallel_annotation_jobs(par, cx) {
+            Poll::Ready(Ok(progress)) => progress,
+            Poll::Ready(Err(e)) => return Poll::Ready(ParallelAnnotationPoll::Failed(e)),
+            Poll::Pending => false,
+        };
+        if let Some((batch, rows)) = pop_parallel_output_batch(par, rows_emitted, fetch_limit) {
+            return Poll::Ready(ParallelAnnotationPoll::Batch(batch, rows));
+        }
+
+        par.spawn_pending_jobs();
+        if par.is_complete() {
+            return Poll::Ready(ParallelAnnotationPoll::Complete);
+        }
+
+        let remaining_capacity = par.remaining_buffer_capacity();
+        let limit_scheduled =
+            fetch_limit.is_some_and(|limit| rows_emitted + par.queued_input_rows >= limit);
+        if limit_scheduled && !par.ann.worker.lookup_done {
+            abort_annotation_lookup_workers(&mut par.ann);
+            par.ann.worker.lookup_done = true;
+        }
+        let ready_input_buffer_count = par
+            .ann
+            .worker
+            .input_buffer_accumulator
+            .ready_input_buffer_count_with_batches(
+                par.ann.config.input_buffer_size,
+                &par.ann.worker.window_buffer,
+            );
+        let target_ready_input_buffers = remaining_capacity.min(par.max_parallel).max(1);
+        let window_full = par.ann.worker.window_buffer.len() >= HYDRATION_WINDOW_SIZE;
+
+        if remaining_capacity > 0
+            && !par.ann.worker.lookup_done
+            && !limit_scheduled
+            && ready_input_buffer_count < target_ready_input_buffers
+            && !window_full
+        {
+            match poll_lookup_partitions(&mut par.ann, cx) {
+                Poll::Pending => {}
+                Poll::Ready(Ok(())) => made_progress = true,
+                Poll::Ready(Err(e)) => return Poll::Ready(ParallelAnnotationPoll::Failed(e)),
+            }
+        }
+
+        let remaining_capacity = par.remaining_buffer_capacity();
+        let ready_input_buffer_count = par
+            .ann
+            .worker
+            .input_buffer_accumulator
+            .ready_input_buffer_count_with_batches(
+                par.ann.config.input_buffer_size,
+                &par.ann.worker.window_buffer,
+            );
+        let window_full = par.ann.worker.window_buffer.len() >= HYDRATION_WINDOW_SIZE;
+        let has_final_partial = par.ann.worker.lookup_done
+            && (!par.ann.worker.window_buffer.is_empty()
+                || par.ann.worker.input_buffer_accumulator.pending_rows() > 0);
+        let should_prepare = remaining_capacity > 0
+            && !limit_scheduled
+            && (ready_input_buffer_count > 0 || window_full || has_final_partial);
+
+        if should_prepare {
+            let window_end = par
+                .ann
+                .worker
+                .window_buffer
+                .len()
+                .min(HYDRATION_WINDOW_SIZE);
+            let window_batches: Vec<RecordBatch> =
+                par.ann.worker.window_buffer.drain(..window_end).collect();
+            match hydrate_and_prepare_parallel_window(par, window_batches, remaining_capacity) {
+                Ok(jobs) => {
+                    let mut prepared = 0usize;
+                    for job in jobs {
+                        if fetch_limit
+                            .is_some_and(|limit| rows_emitted + par.queued_input_rows >= limit)
+                        {
+                            break;
+                        }
+                        par.queued_input_rows += job
+                            .batches
+                            .iter()
+                            .map(|batch| batch.num_rows())
+                            .sum::<usize>();
+                        par.pending_jobs.push_back(job);
+                        prepared += 1;
+                    }
+                    if prepared > 0 {
+                        par.spawn_pending_jobs();
+                    }
+                    continue;
+                }
+                Err(e) => return Poll::Ready(ParallelAnnotationPoll::Failed(e)),
+            }
+        }
+
+        if par.is_complete() {
+            return Poll::Ready(ParallelAnnotationPoll::Complete);
+        }
+        if made_progress {
+            continue;
+        }
+        return Poll::Pending;
+    }
 }
 
 impl Stream for ContigAnnotationStream {
@@ -9862,7 +9912,7 @@ impl Stream for ContigAnnotationStream {
                                     return Poll::Ready(Some(Err(e)));
                                 }
                             };
-                        self.state = StreamState::AnnotatingContig(ContigAnnotationState {
+                        let ann = ContigAnnotationState {
                             lookup_partitions: ready.lookup_partitions,
                             active_lookup_partition: None,
                             worker,
@@ -9872,9 +9922,98 @@ impl Stream for ContigAnnotationStream {
                             session,
                             t_contig: ready.t_contig,
                             contig_rows: 0,
-                        });
+                        };
+                        if should_parallelize_input_buffers(&ann.config) {
+                            self.state = StreamState::ParallelAnnotatingContig(
+                                ParallelAnnotationState::new(ann),
+                            );
+                        } else {
+                            self.state = StreamState::AnnotatingContig(ann);
+                        }
                     }
                 },
+
+                StreamState::ParallelAnnotatingContig(par) => {
+                    if fetch_limit.is_some_and(|limit| rows_emitted >= limit) {
+                        let StreamState::ParallelAnnotatingContig(mut par) =
+                            std::mem::replace(&mut self.state, StreamState::Done)
+                        else {
+                            unreachable!()
+                        };
+                        par.abort_background_work();
+                        profile_end!(
+                            &format!("{}: TOTAL", par.ann.chrom),
+                            par.ann.t_contig,
+                            format!("{} rows", par.ann.contig_rows)
+                        );
+                        emit_contig_pipeline_profile(
+                            &par.ann.worker.shared.profile,
+                            &par.ann.chrom,
+                        );
+                        if profiling_enabled() {
+                            eprintln!("[VEP_PROFILE] ------ contig {} END ------", par.ann.chrom);
+                        }
+                        let fut = make_cleanup_future(
+                            Arc::clone(&par.ann.session),
+                            std::mem::take(&mut par.ann.ephemeral_tables),
+                        );
+                        self.state = StreamState::CleaningUp(fut);
+                        continue;
+                    }
+
+                    match poll_parallel_annotation_state(par, cx, rows_emitted, fetch_limit) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(ParallelAnnotationPoll::Batch(batch, rows)) => {
+                            self.rows_emitted += rows;
+                            return Poll::Ready(Some(Ok(batch)));
+                        }
+                        Poll::Ready(ParallelAnnotationPoll::Failed(e)) => {
+                            let StreamState::ParallelAnnotatingContig(mut par) =
+                                std::mem::replace(&mut self.state, StreamState::Done)
+                            else {
+                                unreachable!()
+                            };
+                            par.abort_background_work();
+                            let fut = make_cleanup_future(
+                                Arc::clone(&par.ann.session),
+                                std::mem::take(&mut par.ann.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(fut, e);
+                            continue;
+                        }
+                        Poll::Ready(ParallelAnnotationPoll::Complete) => {
+                            let StreamState::ParallelAnnotatingContig(mut par) =
+                                std::mem::replace(&mut self.state, StreamState::Done)
+                            else {
+                                unreachable!()
+                            };
+                            profile_end!(
+                                &format!("{}: TOTAL", par.ann.chrom),
+                                par.ann.t_contig,
+                                format!("{} rows", par.ann.contig_rows)
+                            );
+                            emit_contig_pipeline_profile(
+                                &par.ann.worker.shared.profile,
+                                &par.ann.chrom,
+                            );
+                            if profiling_enabled() {
+                                eprintln!(
+                                    "[VEP_PROFILE] ------ contig {} END ------",
+                                    par.ann.chrom
+                                );
+                            }
+                            par.ann.worker.colocated_map = Arc::new(HashMap::new());
+                            par.ann.worker.transcript_overrides = HashMap::new();
+                            par.ann.worker.translation_overrides = HashMap::new();
+                            let fut = make_cleanup_future(
+                                Arc::clone(&par.ann.session),
+                                std::mem::take(&mut par.ann.ephemeral_tables),
+                            );
+                            self.state = StreamState::CleaningUp(fut);
+                            continue;
+                        }
+                    }
+                }
 
                 StreamState::AnnotatingContig(ann) => {
                     // Pull looked-up batches into the window buffer. For fjall,
@@ -10000,65 +10139,24 @@ impl Stream for ContigAnnotationStream {
 
                     // Annotate window.
                     let projection = ann.config.projection.clone();
-                    if should_parallelize_input_buffers(&ann.config) {
-                        let cleanup_session = Arc::clone(&ann.session);
-                        let cleanup_config = ann.config.clone();
-                        let cleanup_tables = ann.ephemeral_tables.clone();
-                        let fut: AnnotateWindowFuture = Box::pin(async move {
-                            let result = annotate_window_parallel_input_buffers(
-                                &mut ann,
-                                window_batches,
-                                projection,
-                            )
-                            .await;
-                            (ann, result)
-                        });
-                        self.state = StreamState::AnnotatingWindow {
-                            fut,
-                            session: cleanup_session,
-                            config: cleanup_config,
-                            ephemeral_tables: cleanup_tables,
-                        };
-                        continue;
-                    } else {
-                        match annotate_window(&mut ann, &window_batches, projection.as_deref()) {
-                            Err(e) => {
-                                abort_annotation_lookup_workers(&mut ann);
-                                let fut = make_cleanup_future(
-                                    Arc::clone(&ann.session),
-                                    std::mem::take(&mut ann.ephemeral_tables),
-                                );
-                                self.state = StreamState::ErrorCleaningUp(fut, e);
-                                continue;
-                            }
-                            Ok(batches) => {
-                                self.state = StreamState::DrainingWindow {
-                                    batches,
-                                    annotation_state: ann,
-                                };
-                            }
+                    match annotate_window(&mut ann, &window_batches, projection.as_deref()) {
+                        Err(e) => {
+                            abort_annotation_lookup_workers(&mut ann);
+                            let fut = make_cleanup_future(
+                                Arc::clone(&ann.session),
+                                std::mem::take(&mut ann.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(fut, e);
+                            continue;
+                        }
+                        Ok(batches) => {
+                            self.state = StreamState::DrainingWindow {
+                                batches,
+                                annotation_state: ann,
+                            };
                         }
                     }
                 }
-
-                StreamState::AnnotatingWindow { fut, .. } => match fut.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready((mut ann, Err(e))) => {
-                        abort_annotation_lookup_workers(&mut ann);
-                        let fut = make_cleanup_future(
-                            Arc::clone(&ann.session),
-                            std::mem::take(&mut ann.ephemeral_tables),
-                        );
-                        self.state = StreamState::ErrorCleaningUp(fut, e);
-                        continue;
-                    }
-                    Poll::Ready((ann, Ok(batches))) => {
-                        self.state = StreamState::DrainingWindow {
-                            batches,
-                            annotation_state: ann,
-                        };
-                    }
-                },
 
                 StreamState::DrainingWindow {
                     batches,
@@ -12038,97 +12136,46 @@ mod tests {
     }
 
     #[test]
-    fn test_split_batches_by_input_units_preserves_rows_and_order() {
-        let chunks = split_batches_by_input_units(
-            vec![make_buffer_batch_many_with_alts(
-                "chr1",
-                &[1, 2, 3, 4, 5],
-                &["A", "C,G", "T", "A,C,G,T", "G"],
-            )],
-            3,
-        );
-
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(
-            buffer_variant_bounds(&chunks[0]).unwrap(),
-            Some(("chr1".to_string(), 1, 2))
-        );
-        assert_eq!(
-            buffer_variant_bounds(&chunks[1]).unwrap(),
-            Some(("chr1".to_string(), 3, 3))
-        );
-        assert_eq!(
-            buffer_variant_bounds(&chunks[2]).unwrap(),
-            Some(("chr1".to_string(), 4, 5))
-        );
-
-        let unsplit = split_batches_by_input_units(
-            vec![make_buffer_batch_many_with_alts(
-                "chr1",
-                &[1, 2, 3, 4, 5],
-                &["A", "C,G", "T", "A,C,G,T", "G"],
-            )],
-            1,
-        );
-        assert_eq!(unsplit.len(), 1);
-        assert_eq!(
-            buffer_variant_bounds(&unsplit[0]).unwrap(),
-            Some(("chr1".to_string(), 1, 5))
-        );
+    fn test_parallel_annotation_buffers_more_whole_vep_buffers_than_inflight_workers() {
+        assert_eq!(parallel_annotation_buffer_queue_target(0), 1);
+        assert_eq!(parallel_annotation_buffer_queue_target(1), 1);
+        assert_eq!(parallel_annotation_buffer_queue_target(2), 4);
+        assert_eq!(parallel_annotation_buffer_queue_target(12), 24);
     }
 
     #[test]
-    fn test_ordered_subchunk_drain_waits_for_missing_prefix() {
+    fn test_ordered_input_buffer_drain_waits_for_missing_prefix() {
         let mut ready = BTreeMap::new();
-        let mut chunks_by_buffer = BTreeMap::new();
-        chunks_by_buffer.insert(0, 2);
-        chunks_by_buffer.insert(1, 1);
         let mut next_buffer_id = 0;
-        let mut next_chunk_id = 0;
         let mut out = VecDeque::new();
 
         ready.insert(
-            (0, 1),
-            AnnotatedSubchunk {
-                buffer_id: 0,
-                chunk_id: 1,
+            1,
+            AnnotatedInputBuffer {
+                buffer_id: 1,
                 batches: VecDeque::from(vec![make_buffer_batch("chr1", 2, 2)]),
             },
         );
         ready.insert(
-            (1, 0),
-            AnnotatedSubchunk {
-                buffer_id: 1,
-                chunk_id: 0,
+            2,
+            AnnotatedInputBuffer {
+                buffer_id: 2,
                 batches: VecDeque::from(vec![make_buffer_batch("chr1", 3, 3)]),
             },
         );
 
-        drain_ready_ordered_subchunks(
-            &mut ready,
-            &chunks_by_buffer,
-            &mut next_buffer_id,
-            &mut next_chunk_id,
-            &mut out,
-        );
+        drain_ready_ordered_input_buffers(&mut ready, &mut next_buffer_id, &mut out);
         assert!(out.is_empty());
 
         ready.insert(
-            (0, 0),
-            AnnotatedSubchunk {
+            0,
+            AnnotatedInputBuffer {
                 buffer_id: 0,
-                chunk_id: 0,
                 batches: VecDeque::from(vec![make_buffer_batch("chr1", 1, 1)]),
             },
         );
 
-        drain_ready_ordered_subchunks(
-            &mut ready,
-            &chunks_by_buffer,
-            &mut next_buffer_id,
-            &mut next_chunk_id,
-            &mut out,
-        );
+        drain_ready_ordered_input_buffers(&mut ready, &mut next_buffer_id, &mut out);
 
         assert_eq!(out.len(), 3);
         assert_eq!(
@@ -12144,8 +12191,7 @@ mod tests {
             Some(("chr1".to_string(), 3, 3))
         );
         assert!(ready.is_empty());
-        assert_eq!(next_buffer_id, 2);
-        assert_eq!(next_chunk_id, 0);
+        assert_eq!(next_buffer_id, 3);
     }
 
     #[cfg(feature = "kv-cache")]
