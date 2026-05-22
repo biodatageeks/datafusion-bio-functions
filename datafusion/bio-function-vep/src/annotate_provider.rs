@@ -4292,6 +4292,24 @@ impl AnnotateProvider {
             .filter(|value| *value > 0)
             .unwrap_or(VEP_INPUT_BUFFER_SIZE);
         let target_partitions = state.config().target_partitions().max(1);
+        let forks = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "forks"))
+            .and_then(|value| usize::try_from(value).ok());
+        let annotation_workers = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "annotation_workers"))
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .or_else(|| forks.map(|value| value.max(1)))
+            .unwrap_or(target_partitions);
+        let inline_lookup = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_bool_option(opts, "inline_lookup"))
+            .unwrap_or(forks == Some(0));
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
 
@@ -4352,6 +4370,8 @@ impl AnnotateProvider {
             annotation_column_count: self.annotation_column_count(),
             fetch_limit,
             target_partitions,
+            annotation_workers,
+            inline_lookup,
             #[cfg(feature = "kv-cache")]
             use_fjall: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
@@ -7287,6 +7307,10 @@ struct ContigAnnotationConfig {
     fetch_limit: Option<usize>,
     /// Maximum number of ordered fjall lookup partitions to execute per chromosome.
     target_partitions: usize,
+    /// Maximum number of VEP input-buffer annotation jobs to execute concurrently.
+    annotation_workers: usize,
+    /// Poll lookup streams inline instead of spawning lookup tasks.
+    inline_lookup: bool,
     pick_flags: PickFlags,
     /// When true, use fjall KV store for variation lookup + SIFT instead of parquet.
     #[cfg(feature = "kv-cache")]
@@ -7619,15 +7643,34 @@ struct LookupBatchMessage {
     colocated_delta: HashMap<ColocatedKey, ColocatedData>,
 }
 
-struct LookupPartitionHandle {
+struct SpawnedLookupPartitionHandle {
     partition_id: usize,
     receiver: tokio::sync::mpsc::Receiver<Result<LookupBatchMessage>>,
     join_handle: tokio::task::JoinHandle<Result<()>>,
 }
 
+struct InlineLookupPartitionHandle {
+    partition_id: usize,
+    stream: SendableRecordBatchStream,
+    sink: ColocatedSink,
+}
+
+enum LookupPartitionHandle {
+    Spawned(SpawnedLookupPartitionHandle),
+    Inline(InlineLookupPartitionHandle),
+}
+
+impl LookupPartitionHandle {
+    fn abort(&mut self) {
+        if let LookupPartitionHandle::Spawned(handle) = self {
+            handle.join_handle.abort();
+        }
+    }
+}
+
 impl Drop for LookupPartitionHandle {
     fn drop(&mut self) {
-        self.join_handle.abort();
+        self.abort();
     }
 }
 
@@ -7912,7 +7955,7 @@ enum ParallelAnnotationPoll {
 
 impl ParallelAnnotationState {
     fn new(ann: ContigAnnotationState) -> Self {
-        let max_parallel = ann.config.target_partitions.max(1);
+        let max_parallel = ann.config.annotation_workers.max(1);
         let max_queued_buffers = parallel_annotation_buffer_queue_target(max_parallel);
         let projection = ann.config.projection.clone();
         Self {
@@ -7973,7 +8016,7 @@ impl ParallelAnnotationState {
 fn should_parallelize_input_buffers(config: &ContigAnnotationConfig) -> bool {
     #[cfg(feature = "kv-cache")]
     {
-        config.use_fjall && config.target_partitions > 1
+        config.use_fjall && !config.inline_lookup && config.annotation_workers > 1
     }
     #[cfg(not(feature = "kv-cache"))]
     {
@@ -8061,11 +8104,11 @@ fn spawn_lookup_partition_worker(
         Ok(())
     });
 
-    LookupPartitionHandle {
+    LookupPartitionHandle::Spawned(SpawnedLookupPartitionHandle {
         partition_id,
         receiver,
         join_handle,
-    }
+    })
 }
 
 fn spawn_lookup_stream_worker(
@@ -8103,22 +8146,36 @@ fn spawn_lookup_stream_worker(
         Ok(())
     });
 
-    LookupPartitionHandle {
+    LookupPartitionHandle::Spawned(SpawnedLookupPartitionHandle {
         partition_id: 0,
         receiver,
         join_handle,
-    }
+    })
+}
+
+fn inline_lookup_partition(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+    partition_id: usize,
+    sink: ColocatedSink,
+) -> Result<LookupPartitionHandle> {
+    let stream = plan.execute(partition_id, task_ctx)?;
+    Ok(LookupPartitionHandle::Inline(InlineLookupPartitionHandle {
+        partition_id,
+        stream,
+        sink,
+    }))
 }
 
 fn abort_lookup_partitions(partitions: &mut VecDeque<LookupPartitionHandle>) {
-    for handle in partitions.drain(..) {
-        handle.join_handle.abort();
+    for mut handle in partitions.drain(..) {
+        handle.abort();
     }
 }
 
 fn abort_annotation_lookup_workers(ann: &mut ContigAnnotationState) {
-    if let Some(active) = ann.active_lookup_partition.take() {
-        active.join_handle.abort();
+    if let Some(mut active) = ann.active_lookup_partition.take() {
+        active.abort();
     }
     abort_lookup_partitions(&mut ann.lookup_partitions);
 }
@@ -9439,6 +9496,65 @@ fn drain_ready_ordered_input_buffers(
     }
 }
 
+enum LookupPartitionPoll {
+    Batch(LookupBatchMessage),
+    Done(HashMap<ColocatedKey, ColocatedData>),
+}
+
+fn poll_lookup_partition(
+    active: &mut LookupPartitionHandle,
+    cx: &mut TaskCtx<'_>,
+) -> Poll<Result<LookupPartitionPoll>> {
+    match active {
+        LookupPartitionHandle::Spawned(active) => match active.receiver.poll_recv(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(message))) => Poll::Ready(Ok(LookupPartitionPoll::Batch(message))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+            Poll::Ready(None) => match Pin::new(&mut active.join_handle).poll(cx) {
+                Poll::Ready(Ok(Ok(()))) => {
+                    Poll::Ready(Ok(LookupPartitionPoll::Done(HashMap::new())))
+                }
+                Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(DataFusionError::Execution(format!(
+                    "lookup partition {} task failed: {e}",
+                    active.partition_id
+                )))),
+                Poll::Pending => Poll::Pending,
+            },
+        },
+        LookupPartitionHandle::Inline(active) => match active.stream.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(batch))) => {
+                let result = drain_colocated_sink(&active.sink).map(|colocated_delta| {
+                    LookupPartitionPoll::Batch(LookupBatchMessage {
+                        batch,
+                        colocated_delta,
+                    })
+                });
+                Poll::Ready(result)
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(DataFusionError::Execution(format!(
+                "lookup partition {} stream failed: {e}",
+                active.partition_id
+            )))),
+            Poll::Ready(None) => {
+                Poll::Ready(drain_colocated_sink(&active.sink).map(LookupPartitionPoll::Done))
+            }
+        },
+    }
+}
+
+fn apply_lookup_batch_message(ann: &mut ContigAnnotationState, message: LookupBatchMessage) {
+    record_contig_profile(&ann.worker.shared.profile, |profile| {
+        profile.lookup_batches += 1;
+    });
+    merge_colocated_delta(&mut ann.worker.colocated_map, message.colocated_delta);
+    if message.batch.num_rows() > 0 {
+        ann.contig_rows += message.batch.num_rows();
+        ann.worker.window_buffer.push(message.batch);
+    }
+}
+
 fn poll_lookup_partitions(
     ann: &mut ContigAnnotationState,
     cx: &mut TaskCtx<'_>,
@@ -9461,39 +9577,18 @@ fn poll_lookup_partitions(
             .active_lookup_partition
             .as_mut()
             .expect("active lookup partition must be present");
-        match active.receiver.poll_recv(cx) {
+        match poll_lookup_partition(active, cx) {
             Poll::Pending => return Poll::Pending,
-            Poll::Ready(Some(Ok(message))) => {
-                record_contig_profile(&ann.worker.shared.profile, |profile| {
-                    profile.lookup_batches += 1;
-                });
-                merge_colocated_delta(&mut ann.worker.colocated_map, message.colocated_delta);
-                if message.batch.num_rows() > 0 {
-                    ann.contig_rows += message.batch.num_rows();
-                    ann.worker.window_buffer.push(message.batch);
-                }
+            Poll::Ready(Ok(LookupPartitionPoll::Batch(message))) => {
+                apply_lookup_batch_message(ann, message);
             }
-            Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
-            Poll::Ready(None) => {
-                let mut done = ann
-                    .active_lookup_partition
-                    .take()
-                    .expect("active lookup partition must be present");
-                match Pin::new(&mut done.join_handle).poll(cx) {
-                    Poll::Ready(Ok(Ok(()))) => {}
-                    Poll::Ready(Ok(Err(e))) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Err(e)) => {
-                        return Poll::Ready(Err(DataFusionError::Execution(format!(
-                            "lookup partition {} task failed: {e}",
-                            done.partition_id
-                        ))));
-                    }
-                    Poll::Pending => {
-                        ann.active_lookup_partition = Some(done);
-                        return Poll::Pending;
-                    }
+            Poll::Ready(Ok(LookupPartitionPoll::Done(colocated_delta))) => {
+                if !colocated_delta.is_empty() {
+                    merge_colocated_delta(&mut ann.worker.colocated_map, colocated_delta);
                 }
+                ann.active_lookup_partition = None;
             }
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
         }
     }
 
@@ -9900,7 +9995,7 @@ impl Stream for ContigAnnotationStream {
                             ann.config.input_buffer_size,
                             &ann.worker.window_buffer,
                         );
-                    let target_ready_input_buffers = ann.config.target_partitions.max(1);
+                    let target_ready_input_buffers = ann.config.annotation_workers.max(1);
                     let has_target_ready_input_buffers =
                         ready_input_buffer_count >= target_ready_input_buffers;
                     let window_full = ann.worker.window_buffer.len() >= HYDRATION_WINDOW_SIZE;
@@ -10311,23 +10406,40 @@ async fn prepare_contig_context(
                 .get(partition_id)
                 .cloned()
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
-            handles.push_back(spawn_lookup_partition_worker(
-                Arc::clone(&plan),
-                Arc::clone(&task_ctx),
-                partition_id,
-                sink,
-                LOOKUP_PARTITION_QUEUE_BATCHES,
-            ));
+            if config.inline_lookup {
+                handles.push_back(inline_lookup_partition(
+                    Arc::clone(&plan),
+                    Arc::clone(&task_ctx),
+                    partition_id,
+                    sink,
+                )?);
+            } else {
+                handles.push_back(spawn_lookup_partition_worker(
+                    Arc::clone(&plan),
+                    Arc::clone(&task_ctx),
+                    partition_id,
+                    sink,
+                    LOOKUP_PARTITION_QUEUE_BATCHES,
+                ));
+            }
         }
         handles
     } else {
         let lookup_stream = plan.execute(0, session.task_ctx())?;
-        VecDeque::from([spawn_lookup_stream_worker(
-            lookup_stream,
-            plan.schema(),
-            fallback_coloc_sink,
-            LOOKUP_PARTITION_QUEUE_BATCHES,
-        )])
+        if config.inline_lookup {
+            VecDeque::from([LookupPartitionHandle::Inline(InlineLookupPartitionHandle {
+                partition_id: 0,
+                stream: lookup_stream,
+                sink: fallback_coloc_sink,
+            })])
+        } else {
+            VecDeque::from([spawn_lookup_stream_worker(
+                lookup_stream,
+                plan.schema(),
+                fallback_coloc_sink,
+                LOOKUP_PARTITION_QUEUE_BATCHES,
+            )])
+        }
     };
 
     // Context arm: load transcripts, exons, translations, etc.
@@ -10755,6 +10867,8 @@ mod tests {
             annotation_column_count: 0,
             fetch_limit: None,
             target_partitions: 1,
+            annotation_workers: 1,
+            inline_lookup: false,
             pick_flags: PickFlags::default(),
             #[cfg(feature = "kv-cache")]
             use_fjall: true,
@@ -12398,9 +12512,36 @@ mod tests {
     fn test_fjall_annotation_parallelizes_global_input_buffers() {
         let mut config = minimal_contig_annotation_config();
         config.target_partitions = 8;
+        config.annotation_workers = 8;
         config.use_fjall = true;
 
         assert!(should_parallelize_input_buffers(&config));
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[test]
+    fn test_annotation_parallelism_uses_annotation_workers() {
+        let mut config = minimal_contig_annotation_config();
+        config.target_partitions = 8;
+        config.annotation_workers = 1;
+        config.use_fjall = true;
+
+        assert!(!should_parallelize_input_buffers(&config));
+
+        config.annotation_workers = 2;
+        assert!(should_parallelize_input_buffers(&config));
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[test]
+    fn test_inline_lookup_keeps_annotation_serial() {
+        let mut config = minimal_contig_annotation_config();
+        config.target_partitions = 1;
+        config.annotation_workers = 8;
+        config.inline_lookup = true;
+        config.use_fjall = true;
+
+        assert!(!should_parallelize_input_buffers(&config));
     }
 
     #[test]
