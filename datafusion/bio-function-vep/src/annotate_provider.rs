@@ -77,7 +77,6 @@ use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext, col, lit};
 use futures::{Future, Stream, StreamExt};
 use noodles_core::{Position, Region};
 use noodles_fasta as fasta;
-use serde_json::Value;
 
 use crate::allele::{
     MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
@@ -1577,24 +1576,6 @@ struct CsqPlaceholderEntry<'a> {
     variant_class: &'a str,
     frequency_fields: &'a ColocatedFrequencyFields,
     variant_fields: &'a ColocatedVariantFields,
-}
-
-#[derive(Debug, Default)]
-struct TranscriptRawMetadata {
-    display_xref_id: Option<String>,
-    source: Option<String>,
-    source_cache: Option<String>,
-    gene_hgnc_id_native: Option<String>,
-    refseq_match: Option<String>,
-    refseq_edits: Vec<RefSeqEdit>,
-    cdna_mapper_segments: Vec<TranscriptCdnaMapperSegment>,
-    spliced_seq: Option<String>,
-    five_prime_utr_seq: Option<String>,
-    three_prime_utr_seq: Option<String>,
-    translateable_seq: Option<String>,
-    flags_str: Option<String>,
-    is_gencode_basic: bool,
-    is_gencode_primary: bool,
 }
 
 /// A single co-located variant entry with allele and clinical metadata.
@@ -3206,8 +3187,9 @@ impl AnnotateProvider {
                 "gene_hgnc_id_native",
                 "gene_hgnc_id",
                 "source",
+                "source_cache",
+                "display_xref_id",
                 "version",
-                "raw_object_json",
                 "cds_start_nf",
                 "cds_end_nf",
                 "mature_mirna_regions",
@@ -3215,8 +3197,14 @@ impl AnnotateProvider {
                 "bam_edit_status",
                 "has_non_polya_rna_edit",
                 "spliced_seq",
+                "five_prime_utr_seq",
+                "three_prime_utr_seq",
                 "translateable_seq",
                 "flags_str",
+                "refseq_match",
+                "refseq_edits",
+                "is_gencode_basic",
+                "is_gencode_primary",
                 "cdna_mapper_segments",
                 "is_canonical",
                 "tsl",
@@ -3283,13 +3271,13 @@ impl AnnotateProvider {
             let gene_hgnc_id_native_idx = schema.index_of("gene_hgnc_id_native").ok();
             let gene_hgnc_id_idx = schema.index_of("gene_hgnc_id").ok();
             let source_idx = schema.index_of("source").ok();
+            let source_cache_idx = schema.index_of("source_cache").ok();
+            let display_xref_id_idx = schema.index_of("display_xref_id").ok();
             let version_idx = schema.index_of("version").ok();
-            let raw_object_json_idx = schema.index_of("raw_object_json").ok();
             let cds_start_nf_idx = schema.index_of("cds_start_nf").ok();
             let cds_end_nf_idx = schema.index_of("cds_end_nf").ok();
             let mirna_regions_idx = schema.index_of("mature_mirna_regions").ok();
             let cdna_seq_idx = schema.index_of("cdna_seq").ok();
-            // Promoted columns (previously extracted from raw_object_json).
             let bam_edit_status_idx = schema.index_of("bam_edit_status").ok();
             let has_non_polya_rna_edit_idx = schema.index_of("has_non_polya_rna_edit").ok();
             let spliced_seq_idx = schema.index_of("spliced_seq").ok();
@@ -3297,6 +3285,10 @@ impl AnnotateProvider {
             let five_prime_utr_seq_idx = schema.index_of("five_prime_utr_seq").ok();
             let three_prime_utr_seq_idx = schema.index_of("three_prime_utr_seq").ok();
             let flags_str_idx = schema.index_of("flags_str").ok();
+            let refseq_match_idx = schema.index_of("refseq_match").ok();
+            let refseq_edits_idx = schema.index_of("refseq_edits").ok();
+            let is_gencode_basic_idx = schema.index_of("is_gencode_basic").ok();
+            let is_gencode_primary_idx = schema.index_of("is_gencode_primary").ok();
             let cdna_mapper_segments_idx = schema.index_of("cdna_mapper_segments").ok();
             // Batch 1 columns.
             let is_canonical_idx = schema.index_of("is_canonical").ok();
@@ -3371,73 +3363,65 @@ impl AnnotateProvider {
                         cdna_mapper_segments_from_list_column(batch.column(idx).as_ref(), row)
                     })
                     .unwrap_or_default();
-                let raw_metadata = raw_object_json_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .map(|raw| parse_transcript_raw_metadata(&raw))
+                let display_xref_id =
+                    display_xref_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let refseq_match =
+                    refseq_match_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let mut refseq_edits = refseq_edits_idx
+                    .map(|idx| refseq_edits_from_list_column(batch.column(idx).as_ref(), row))
                     .unwrap_or_default();
-                let TranscriptRawMetadata {
-                    display_xref_id,
-                    source: raw_source,
-                    source_cache: raw_source_cache,
-                    gene_hgnc_id_native: raw_gene_hgnc_id_native,
-                    refseq_match,
-                    refseq_edits,
-                    cdna_mapper_segments: raw_cdna_mapper_segments,
-                    spliced_seq: raw_spliced_seq,
-                    five_prime_utr_seq,
-                    three_prime_utr_seq,
-                    translateable_seq: raw_translateable_seq,
-                    flags_str: raw_flags_str,
-                    is_gencode_basic,
-                    is_gencode_primary,
-                } = raw_metadata;
-                let cdna_mapper_segments = if cdna_mapper_segments.is_empty() {
-                    raw_cdna_mapper_segments
-                } else {
-                    cdna_mapper_segments
-                };
+                refseq_edits.sort_by(|left, right| {
+                    left.start
+                        .cmp(&right.start)
+                        .then(left.end.cmp(&right.end))
+                        .then(left.replacement_len.cmp(&right.replacement_len))
+                });
+                let is_gencode_basic = is_gencode_basic_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
+                let is_gencode_primary = is_gencode_primary_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
                 // Ensembl release/115 computes alternate CDS from the live
                 // transcript object's `_translateable_seq()` / 3'UTR rather
                 // than reconstructing from genomic exons when that state is
                 // already cached on the transcript object.
                 // https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2470-L2481
                 let translateable_seq = translateable_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(raw_translateable_seq);
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let five_prime_utr_seq = five_prime_utr_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(five_prime_utr_seq);
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let three_prime_utr_seq = three_prime_utr_seq_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(three_prime_utr_seq);
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 if let Some(seq) = translateable_seq.as_ref() {
                     translateable_seq_by_tx.insert(transcript_id.clone(), seq.clone());
                 }
                 let flags_str = flags_str_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(raw_flags_str)
                     .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf));
 
-                let raw_object_json =
-                    raw_object_json_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
-                let gene_stable_id = gene_stable_id_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or_else(|| gene_stable_id_from_raw_object_json(raw_object_json.as_deref()));
+                let gene_stable_id =
+                    gene_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_symbol =
                     gene_symbol_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_symbol_source = gene_symbol_source_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_hgnc_id_native = gene_hgnc_id_native_idx
-                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(raw_gene_hgnc_id_native);
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let promoted_gene_hgnc_id =
                     gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_hgnc_id = gene_hgnc_id_native.clone().or(promoted_gene_hgnc_id);
-                let source_cache = raw_source_cache.or_else(|| {
-                    source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                });
-                let source =
-                    raw_source.or_else(|| source_cache.as_deref().and_then(normalize_source_label));
+                let source_col = source_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .filter(|source| !source.is_empty() && source != "-");
+                let source_cache = source_cache_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .filter(|source| !source.is_empty() && source != "-")
+                    .or_else(|| source_col.clone());
+                let source = source_cache
+                    .as_deref()
+                    .and_then(normalize_source_label)
+                    .or_else(|| source_col.as_deref().and_then(normalize_source_label));
                 let bam_edit_status =
                     bam_edit_status_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
@@ -3447,7 +3431,6 @@ impl AnnotateProvider {
                     cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let spliced_seq = spliced_seq_idx
                     .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                    .or(raw_spliced_seq)
                     .or_else(|| {
                         synthesize_spliced_seq(
                             five_prime_utr_seq.as_deref(),
@@ -6039,8 +6022,8 @@ fn parse_sv_event_kind(value: &str) -> Option<SvEventKind> {
     }
 }
 
-/// Reconstruct `FLAGS` string from promoted boolean columns when the ordered
-/// transcript attributes are unavailable in `raw_object_json`.
+/// Reconstruct `FLAGS` string from promoted boolean columns when `flags_str`
+/// is unavailable.
 fn flags_str_from_bools(cds_start_nf: bool, cds_end_nf: bool) -> Option<String> {
     match (cds_start_nf, cds_end_nf) {
         (true, true) => Some("cds_start_NF&cds_end_NF".to_string()),
@@ -6048,28 +6031,6 @@ fn flags_str_from_bools(cds_start_nf: bool, cds_end_nf: bool) -> Option<String> 
         (false, true) => Some("cds_end_NF".to_string()),
         (false, false) => None,
     }
-}
-
-fn gene_stable_id_from_raw_object_json(raw_object_json: Option<&str>) -> Option<String> {
-    let raw_object_json = raw_object_json?;
-    let parsed: Value = serde_json::from_str(raw_object_json).ok()?;
-    let transcript = parsed.get("__value")?;
-
-    // Traceability:
-    // - Ensembl VEP release 115 groups by `transcript->{_gene_stable_id}` and
-    //   otherwise fetches the gene stable ID from the transcript's gene object
-    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L849-L851>
-    transcript
-        .get("_gene_stable_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            transcript
-                .get("_gene")
-                .and_then(|gene| gene.get("stable_id"))
-                .and_then(Value::as_str)
-        })
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 fn normalize_source_label(source: &str) -> Option<String> {
@@ -6087,25 +6048,6 @@ fn normalize_source_label(source: &str) -> Option<String> {
         value if matches!(value, "BestRefSeq" | "RefSeq" | "Gnomon") => Some("RefSeq".to_string()),
         other => Some(other.to_string()),
     }
-}
-
-fn json_unwrap_value(value: &Value) -> &Value {
-    value.get("__value").unwrap_or(value)
-}
-
-fn json_extract_seq(value: &Value) -> Option<String> {
-    let value = json_unwrap_value(value);
-    value
-        .get("seq")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            value
-                .get("primary_seq")
-                .map(json_unwrap_value)
-                .and_then(|seq| seq.get("seq"))
-                .and_then(Value::as_str)
-        })
-        .map(|seq| seq.to_ascii_uppercase())
 }
 
 fn synthesize_spliced_seq(
@@ -6139,213 +6081,6 @@ fn synthesize_spliced_seq(
         spliced_seq.push_str(seq);
     }
     (!spliced_seq.is_empty()).then_some(spliced_seq.to_ascii_uppercase())
-}
-
-fn push_unique_string(out: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
-    if seen.insert(value.to_string()) {
-        out.push(value.to_string());
-    }
-}
-
-fn parse_refseq_edit_attribute(attribute: &Value) -> Option<RefSeqEdit> {
-    let value = attribute.get("value").and_then(Value::as_str)?;
-    let parts: Vec<&str> = value.split_whitespace().collect();
-    if !matches!(parts.len(), 2 | 3) {
-        return None;
-    }
-
-    let start = parts[0].parse::<i64>().ok()?;
-    let end = parts[1].parse::<i64>().ok()?;
-    let replacement_len = (parts.len() == 3).then(|| parts[2].len());
-    let same_len_substitution = replacement_len.is_some_and(|len| end - start + 1 == len as i64);
-    let op_x_edit = attribute
-        .get("description")
-        .and_then(Value::as_str)
-        .is_some_and(|description| description.contains("op=X"));
-
-    Some(RefSeqEdit {
-        start,
-        end,
-        replacement_len,
-        skip_refseq_offset: same_len_substitution || op_x_edit,
-    })
-}
-
-fn parse_raw_cdna_mapper_segments(vef_cache: Option<&Value>) -> Vec<TranscriptCdnaMapperSegment> {
-    let Some(pairs) = vef_cache
-        .and_then(|cache| cache.get("mapper"))
-        .map(json_unwrap_value)
-        .and_then(|mapper| mapper.get("exon_coord_mapper"))
-        .map(json_unwrap_value)
-        .and_then(|mapper| mapper.get("_pair_cdna"))
-        .map(json_unwrap_value)
-        .and_then(|pairs| pairs.get("CDNA"))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-
-    let mut segments = Vec::with_capacity(pairs.len());
-    for pair in pairs {
-        let pair = json_unwrap_value(pair);
-        let Some(from) = pair.get("from").map(json_unwrap_value) else {
-            continue;
-        };
-        let Some(to) = pair.get("to").map(json_unwrap_value) else {
-            continue;
-        };
-        let Some(ori) = pair
-            .get("ori")
-            .and_then(Value::as_i64)
-            .and_then(|v| i8::try_from(v).ok())
-        else {
-            continue;
-        };
-        let Some(cdna_start) = from
-            .get("start")
-            .and_then(Value::as_i64)
-            .and_then(|v| usize::try_from(v).ok())
-        else {
-            continue;
-        };
-        let Some(cdna_end) = from
-            .get("end")
-            .and_then(Value::as_i64)
-            .and_then(|v| usize::try_from(v).ok())
-        else {
-            continue;
-        };
-        let Some(genomic_start) = to.get("start").and_then(Value::as_i64) else {
-            continue;
-        };
-        let Some(genomic_end) = to.get("end").and_then(Value::as_i64) else {
-            continue;
-        };
-        segments.push(TranscriptCdnaMapperSegment {
-            genomic_start,
-            genomic_end,
-            cdna_start,
-            cdna_end,
-            ori,
-        });
-    }
-    segments.sort_by_key(|segment| {
-        (
-            segment.genomic_start,
-            segment.genomic_end,
-            segment.cdna_start,
-        )
-    });
-    // Ensembl TranscriptMapper can encode transcript-only insertions or other
-    // complex gap semantics as multiple adjacent genomic pairs with cDNA jumps.
-    // Our current fallback only replays simple monotonic pair mappings; if the
-    // serialized mapper contains an internal cDNA discontinuity across
-    // contiguous genomic bases, keep using the exon-based fallback until we
-    // implement full Mapper gap semantics.
-    // Traceability:
-    // - Ensembl `Bio::EnsEMBL::Mapper` stores both Pair and Gap units
-    // - VEP reuses the live TranscriptMapper via `genomic2cdna`
-    //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseTranscriptVariation.pm#L478-L492
-    segments
-}
-
-fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata {
-    let Ok(root) = serde_json::from_str::<Value>(raw_object_json) else {
-        return TranscriptRawMetadata::default();
-    };
-    let tx = json_unwrap_value(&root);
-    let vef_cache = tx
-        .get("_variation_effect_feature_cache")
-        .map(json_unwrap_value);
-    let display_xref_id = tx
-        .get("display_xref")
-        .map(json_unwrap_value)
-        .and_then(|xref| xref.get("display_id"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let source_cache = tx
-        .get("_source_cache")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && *value != "-")
-        .map(str::to_string);
-    let source = source_cache.as_deref().and_then(normalize_source_label);
-    let cdna_mapper_segments = parse_raw_cdna_mapper_segments(vef_cache);
-    let gene_hgnc_id_native = tx
-        .get("_gene_hgnc_id")
-        .or_else(|| tx.get("gene_hgnc_id"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let spliced_seq = tx.get("spliced_seq").and_then(json_extract_seq);
-    let five_prime_utr_seq = vef_cache
-        .and_then(|cache| cache.get("five_prime_utr"))
-        .and_then(json_extract_seq);
-    let three_prime_utr_seq = tx
-        .get("three_prime_utr")
-        .or_else(|| vef_cache.and_then(|cache| cache.get("three_prime_utr")))
-        .and_then(json_extract_seq);
-    let translateable_seq = tx
-        .get("translateable_seq")
-        .or_else(|| vef_cache.and_then(|cache| cache.get("translateable_seq")))
-        .and_then(|value| match value {
-            Value::String(seq) => Some(seq.to_ascii_uppercase()),
-            _ => json_extract_seq(value),
-        });
-
-    let mut refseq_match_codes = Vec::new();
-    let mut seen_refseq_match_codes = HashSet::new();
-    let mut flags = Vec::new();
-    let mut seen_flags = HashSet::new();
-    let mut refseq_edits = Vec::new();
-    let mut is_gencode_basic = false;
-    let mut is_gencode_primary = false;
-
-    if let Some(attributes) = tx.get("attributes").and_then(Value::as_array) {
-        for attribute in attributes {
-            let attribute = json_unwrap_value(attribute);
-            let Some(code) = attribute.get("code").and_then(Value::as_str) else {
-                continue;
-            };
-            match code {
-                "gencode_basic" => is_gencode_basic = true,
-                "gencode_primary" => is_gencode_primary = true,
-                "cds_start_NF" | "cds_end_NF" => {
-                    push_unique_string(&mut flags, &mut seen_flags, code)
-                }
-                _ if code.starts_with("rseq") => {
-                    push_unique_string(&mut refseq_match_codes, &mut seen_refseq_match_codes, code);
-                }
-                _ if code.starts_with("_rna_edit") => {
-                    if let Some(edit) = parse_refseq_edit_attribute(attribute) {
-                        refseq_edits.push(edit);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    refseq_edits.sort_by(|left, right| {
-        left.start
-            .cmp(&right.start)
-            .then(left.end.cmp(&right.end))
-            .then(left.replacement_len.cmp(&right.replacement_len))
-    });
-
-    TranscriptRawMetadata {
-        display_xref_id,
-        source,
-        source_cache,
-        gene_hgnc_id_native,
-        refseq_match: (!refseq_match_codes.is_empty()).then(|| refseq_match_codes.join("&")),
-        refseq_edits,
-        cdna_mapper_segments,
-        spliced_seq,
-        five_prime_utr_seq,
-        three_prime_utr_seq,
-        translateable_seq,
-        flags_str: (!flags.is_empty()).then(|| flags.join("&")),
-        is_gencode_basic,
-        is_gencode_primary,
-    }
 }
 
 fn row_source_is_refseq(tx: &TranscriptFeature) -> bool {
@@ -6488,18 +6223,8 @@ fn passes_transcript_selection(
     }
 }
 
-/// Parse mature miRNA genomic regions from the `raw_object_json` transcript
-/// attribute.  VEP stores miRNA cDNA coordinates in the transcript's attribute
-/// array as `{code: "miRNA", value: "42-59"}`.  We map those cDNA coords to
-/// genomic coordinates using the strand and transcript boundaries.
-///
-/// miRNA transcripts are almost always single-exon, so the mapping is trivial:
-/// - Plus strand:  `genomic = tx.start + cdna - 1`
-/// - Minus strand: `genomic_start = tx.end - cdna_end + 1`, `genomic_end = tx.end - cdna_start + 1`
-
 /// Read mature miRNA genomic regions from a promoted `List<Struct<start,end>>`
-/// column.  Returns `None` if the cell is NULL (letting the caller fall back
-/// to JSON parsing if needed).
+/// column. Returns `None` if the cell is NULL.
 fn read_mirna_regions(batch: &RecordBatch, col_idx: usize, row: usize) -> Option<Vec<(i64, i64)>> {
     let col = batch.column(col_idx);
     if col.is_null(row) {
@@ -7305,22 +7030,12 @@ fn interval_overlaps_any(intervals: &[(i64, i64)], start: i64, end: i64) -> bool
     idx < intervals.len() && intervals[idx].0 <= end
 }
 
-/// Parse cached TranscriptMapper exon-to-cDNA pairs from serialized transcript
-/// `raw_object_json`.
-///
-/// Traceability:
-/// - Ensembl VEP `AnnotationSource::Database::Transcript::prefetch_transcript_data()`
-///   caches `mapper` on `_variation_effect_feature_cache`
-///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSource/Database/Transcript.pm#L333-L352>
-/// - Ensembl Variation `TranscriptVariationAllele::_get_cDNA_position()`
-///   resolves transcript positions through TranscriptMapper `genomic2cdna`
-///   <https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/TranscriptVariationAllele.pm#L2683-L2765>
 /// Read cdna_mapper_segments from a promoted List<Struct> parquet column.
 fn cdna_mapper_segments_from_list_column(
     col: &dyn Array,
     row: usize,
 ) -> Vec<TranscriptCdnaMapperSegment> {
-    use datafusion::arrow::array::{AsArray, Int8Array, Int64Array, ListArray, StructArray};
+    use datafusion::arrow::array::{Int8Array, Int64Array, ListArray, StructArray};
 
     let list_array = col.as_any().downcast_ref::<ListArray>();
     let Some(list_array) = list_array else {
@@ -7368,6 +7083,61 @@ fn cdna_mapper_segments_from_list_column(
         });
     }
     segments
+}
+
+fn refseq_edits_from_list_column(col: &dyn Array, row: usize) -> Vec<RefSeqEdit> {
+    use datafusion::arrow::array::{BooleanArray, Int64Array, ListArray, StructArray};
+
+    let Some(list_array) = col.as_any().downcast_ref::<ListArray>() else {
+        return Vec::new();
+    };
+    if list_array.is_null(row) {
+        return Vec::new();
+    }
+    let start = list_array.value_offsets()[row] as usize;
+    let end = list_array.value_offsets()[row + 1] as usize;
+    if start == end {
+        return Vec::new();
+    }
+    let Some(struct_array) = list_array.values().as_any().downcast_ref::<StructArray>() else {
+        return Vec::new();
+    };
+    let start_col = struct_array
+        .column_by_name("start")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let end_col = struct_array
+        .column_by_name("end")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let replacement_len_col = struct_array
+        .column_by_name("replacement_len")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let skip_refseq_offset_col = struct_array
+        .column_by_name("skip_refseq_offset")
+        .and_then(|c| c.as_any().downcast_ref::<BooleanArray>());
+    let (Some(start_col), Some(end_col)) = (start_col, end_col) else {
+        return Vec::new();
+    };
+
+    let mut edits = Vec::with_capacity(end - start);
+    for i in start..end {
+        if struct_array.is_null(i) || start_col.is_null(i) || end_col.is_null(i) {
+            continue;
+        }
+        let replacement_len = replacement_len_col
+            .filter(|col| col.is_valid(i))
+            .and_then(|col| usize::try_from(col.value(i)).ok());
+        let skip_refseq_offset = skip_refseq_offset_col
+            .filter(|col| col.is_valid(i))
+            .map(|col| col.value(i))
+            .unwrap_or(false);
+        edits.push(RefSeqEdit {
+            start: start_col.value(i),
+            end: end_col.value(i),
+            replacement_len,
+            skip_refseq_offset,
+        });
+    }
+    edits
 }
 
 fn apply_cds_phase_padding(existing_cds: Option<&str>, mut hydrated_cds: String) -> String {
@@ -11127,21 +10897,198 @@ mod tests {
         assert!(err.contains("pick_order must contain at least one criterion"));
     }
 
-    #[test]
-    fn test_gene_stable_id_from_raw_object_json_prefers_transcript_slot_then_gene_slot() {
-        let from_transcript = r#"{"__class":"Bio::EnsEMBL::Transcript","__value":{"_gene_stable_id":"ENSG00000001","_gene":{"stable_id":"ENSGSHOULDNOTWIN"}}}"#;
-        assert_eq!(
-            gene_stable_id_from_raw_object_json(Some(from_transcript)).as_deref(),
-            Some("ENSG00000001")
-        );
+    fn refseq_edit_list_data_type() -> DataType {
+        let fields = datafusion::arrow::datatypes::Fields::from(vec![
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("replacement_len", DataType::Int64, true),
+            Field::new("skip_refseq_offset", DataType::Boolean, false),
+        ]);
+        DataType::List(Arc::new(Field::new("item", DataType::Struct(fields), true)))
+    }
 
-        let from_gene = r#"{"__class":"Bio::EnsEMBL::Transcript","__value":{"_gene":{"stable_id":"ENSG00000002"}}}"#;
-        assert_eq!(
-            gene_stable_id_from_raw_object_json(Some(from_gene)).as_deref(),
-            Some("ENSG00000002")
-        );
+    fn refseq_edit_array(rows: Vec<Option<Vec<RefSeqEdit>>>) -> Arc<dyn Array> {
+        use datafusion::arrow::array::{ArrayBuilder, BooleanBuilder, StructBuilder};
 
-        assert_eq!(gene_stable_id_from_raw_object_json(None), None);
+        let fields = vec![
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("replacement_len", DataType::Int64, true),
+            Field::new("skip_refseq_offset", DataType::Boolean, false),
+        ];
+        let struct_builder = StructBuilder::new(
+            fields,
+            vec![
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(BooleanBuilder::new()) as Box<dyn ArrayBuilder>,
+            ],
+        );
+        let mut list_builder = ListBuilder::new(struct_builder);
+
+        for row in rows {
+            match row {
+                Some(edits) => {
+                    for edit in edits {
+                        let values = list_builder.values();
+                        values
+                            .field_builder::<Int64Builder>(0)
+                            .unwrap()
+                            .append_value(edit.start);
+                        values
+                            .field_builder::<Int64Builder>(1)
+                            .unwrap()
+                            .append_value(edit.end);
+                        let replacement = values.field_builder::<Int64Builder>(2).unwrap();
+                        match edit.replacement_len {
+                            Some(len) => replacement.append_value(len as i64),
+                            None => replacement.append_null(),
+                        }
+                        values
+                            .field_builder::<BooleanBuilder>(3)
+                            .unwrap()
+                            .append_value(edit.skip_refseq_offset);
+                        values.append(true);
+                    }
+                    list_builder.append(true);
+                }
+                None => list_builder.append(false),
+            }
+        }
+
+        Arc::new(list_builder.finish())
+    }
+
+    #[tokio::test]
+    async fn load_transcripts_uses_typed_raw_free_columns_when_raw_json_is_present() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("strand", DataType::Int64, false),
+            Field::new("biotype", DataType::Utf8, false),
+            Field::new("gene_stable_id", DataType::Utf8, true),
+            Field::new("gene_symbol", DataType::Utf8, true),
+            Field::new("gene_symbol_source", DataType::Utf8, true),
+            Field::new("gene_hgnc_id_native", DataType::Utf8, true),
+            Field::new("source", DataType::Utf8, true),
+            Field::new("source_cache", DataType::Utf8, true),
+            Field::new("display_xref_id", DataType::Utf8, true),
+            Field::new("refseq_match", DataType::Utf8, true),
+            Field::new("refseq_edits", refseq_edit_list_data_type(), true),
+            Field::new("is_gencode_basic", DataType::Boolean, false),
+            Field::new("is_gencode_primary", DataType::Boolean, false),
+            Field::new("cdna_coding_start", DataType::Int64, true),
+            Field::new("cdna_coding_end", DataType::Int64, true),
+            Field::new("cdna_seq", DataType::Utf8, true),
+            Field::new("translateable_seq", DataType::Utf8, true),
+            Field::new("five_prime_utr_seq", DataType::Utf8, true),
+            Field::new("three_prime_utr_seq", DataType::Utf8, true),
+            Field::new("spliced_seq", DataType::Utf8, true),
+            Field::new("flags_str", DataType::Utf8, true),
+            Field::new("raw_object_json", DataType::Utf8, true),
+        ]));
+        let raw = r#"{
+          "__class":"Bio::EnsEMBL::Transcript",
+          "__value":{
+            "_source_cache":"Ensembl",
+            "_gene_stable_id":"ENSG_RAW",
+            "_gene_hgnc_id":"HGNC:RAW",
+            "display_xref":{"display_id":"RAW_DISPLAY"},
+            "attributes":[
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"rseq_raw","value":"1"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_primary","value":"1"}},
+              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"99 99 A"}}
+            ]
+          }
+        }"#;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["NM_TYPED.1"])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec!["1"])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![100_i64])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![200_i64])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![1_i64])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec!["protein_coding"])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("ENSG_TYPED")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("GENE_TYPED")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("HGNC")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("HGNC:TYPED")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("Ensembl")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("BestRefSeq")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("TYPED_DISPLAY")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("rseq_typed")])) as Arc<dyn Array>,
+                refseq_edit_array(vec![Some(vec![RefSeqEdit {
+                    start: 4,
+                    end: 4,
+                    replacement_len: Some(1),
+                    skip_refseq_offset: true,
+                }])]),
+                Arc::new(BooleanArray::from(vec![true])) as Arc<dyn Array>,
+                Arc::new(BooleanArray::from(vec![false])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![Some(4_i64)])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![Some(6_i64)])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("AAAATGGGG")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("ATG")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("AAA")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("GGG")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![None::<&str>])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some("cds_start_NF")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![Some(raw)])) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap();
+
+        let session = Arc::new(SessionContext::new());
+        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        session.register_table("tx", Arc::new(table)).unwrap();
+        let provider = AnnotateProvider::new(
+            Arc::clone(&session),
+            "vcf".to_string(),
+            String::new(),
+            AnnotationBackend::Parquet,
+            CacheSourceType::Ensembl,
+            None,
+            Schema::new(Vec::<Field>::new()),
+        )
+        .unwrap();
+
+        let (transcripts, translateable_seq_by_tx) = provider
+            .load_transcripts("tx", &MissWorklist::for_chrom("1"))
+            .await
+            .unwrap();
+
+        assert_eq!(transcripts.len(), 1);
+        let tx = &transcripts[0];
+        assert_eq!(tx.gene_stable_id.as_deref(), Some("ENSG_TYPED"));
+        assert_eq!(tx.gene_hgnc_id_native.as_deref(), Some("HGNC:TYPED"));
+        assert_eq!(tx.display_xref_id.as_deref(), Some("TYPED_DISPLAY"));
+        assert_eq!(tx.source_cache.as_deref(), Some("BestRefSeq"));
+        assert_eq!(tx.source.as_deref(), Some("RefSeq"));
+        assert_eq!(tx.refseq_match.as_deref(), Some("rseq_typed"));
+        assert_eq!(
+            tx.refseq_edits,
+            vec![RefSeqEdit {
+                start: 4,
+                end: 4,
+                replacement_len: Some(1),
+                skip_refseq_offset: true,
+            }]
+        );
+        assert!(tx.is_gencode_basic);
+        assert!(!tx.is_gencode_primary);
+        assert_eq!(tx.five_prime_utr_seq.as_deref(), Some("AAA"));
+        assert_eq!(tx.three_prime_utr_seq.as_deref(), Some("GGG"));
+        assert_eq!(tx.spliced_seq.as_deref(), Some("AAAATGGGG"));
+        assert_eq!(
+            translateable_seq_by_tx
+                .get("NM_TYPED.1")
+                .map(String::as_str),
+            Some("ATG")
+        );
     }
 
     #[test]
@@ -12395,68 +12342,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_transcript_raw_metadata_uses_direct_refseq_match_codes() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "_source_cache":"RefSeq",
-            "_gene_hgnc_id":"HGNC:5",
-            "display_xref":{"display_id":"NM_000001"},
-            "attributes":[
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_basic","value":"1"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"gencode_primary","value":"1"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only,ENST00000619216:whole_transcript"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"rseq_ens_match_cds","value":"1"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"cds_start_NF","value":"1"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"10 9 AAA"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"20 20 G"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"30 31"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"40 40 T","description":"op=X"}}
-            ]
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
-        assert_eq!(metadata.source_cache.as_deref(), Some("RefSeq"));
-        assert_eq!(metadata.display_xref_id.as_deref(), Some("NM_000001"));
-        assert_eq!(metadata.gene_hgnc_id_native.as_deref(), Some("HGNC:5"));
-        assert_eq!(metadata.refseq_match.as_deref(), Some("rseq_ens_match_cds"));
-        assert_eq!(metadata.flags_str.as_deref(), Some("cds_start_NF"));
-        assert!(metadata.is_gencode_basic);
-        assert!(metadata.is_gencode_primary);
-        assert_eq!(
-            metadata.refseq_edits,
-            vec![
-                RefSeqEdit {
-                    start: 10,
-                    end: 9,
-                    replacement_len: Some(3),
-                    skip_refseq_offset: false,
-                },
-                RefSeqEdit {
-                    start: 20,
-                    end: 20,
-                    replacement_len: Some(1),
-                    skip_refseq_offset: true,
-                },
-                RefSeqEdit {
-                    start: 30,
-                    end: 31,
-                    replacement_len: None,
-                    skip_refseq_offset: false,
-                },
-                RefSeqEdit {
-                    start: 40,
-                    end: 40,
-                    replacement_len: Some(1),
-                    skip_refseq_offset: true,
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn test_refseq_misalignment_offset_matches_vep_rules() {
         let mut tx = make_selection_tx("NM_000001", Some("RefSeq"));
         tx.refseq_edits = vec![
@@ -12497,49 +12382,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_transcript_raw_metadata_sorts_refseq_edits_by_cdna_position() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "_source_cache":"BestRefSeq",
-            "attributes":[
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"3723 3723 "}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"3228 3228 A"}},
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"_rna_edit","value":"1258 1258 "}}
-            ]
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-
-        assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
-        assert_eq!(metadata.source_cache.as_deref(), Some("BestRefSeq"));
-        assert_eq!(
-            metadata.refseq_edits,
-            vec![
-                RefSeqEdit {
-                    start: 1258,
-                    end: 1258,
-                    replacement_len: None,
-                    skip_refseq_offset: false,
-                },
-                RefSeqEdit {
-                    start: 3228,
-                    end: 3228,
-                    replacement_len: Some(1),
-                    skip_refseq_offset: true,
-                },
-                RefSeqEdit {
-                    start: 3723,
-                    end: 3723,
-                    replacement_len: None,
-                    skip_refseq_offset: false,
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn test_refseq_misalignment_offset_counts_same_coordinate_multibase_edit_as_full_insertion() {
         let mut tx = make_selection_tx("NM_001172437.2", Some("RefSeq"));
         tx.refseq_edits = vec![RefSeqEdit {
@@ -12568,176 +12410,6 @@ mod tests {
         tx.cdna_coding_end = Some(473);
         tx.cdna_seq = Some(format!("N{}TTAA", "A".repeat(473)));
         assert!(cdna_seq_has_explicit_three_prime_utr(&tx));
-    }
-
-    #[test]
-    fn test_parse_transcript_raw_metadata_ignores_refseq_compare_without_direct_code() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "attributes":[
-              {"__class":"Bio::EnsEMBL::Attribute","__value":{"code":"enst_refseq_compare","value":"ENST00000332831:cds_only"}}
-            ]
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(metadata.refseq_match, None);
-    }
-
-    #[test]
-    fn test_parse_transcript_raw_metadata_reads_gene_hgnc_id_fallback_key() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "gene_hgnc_id":"HGNC:1100"
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(metadata.gene_hgnc_id_native.as_deref(), Some("HGNC:1100"));
-    }
-
-    #[test]
-    fn test_parse_transcript_raw_metadata_reads_nested_transcript_sequences() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "_variation_effect_feature_cache":{
-              "five_prime_utr":{
-                "__class":"Bio::Seq",
-                "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"aaaccc"}}}
-              },
-              "three_prime_utr":{
-                "__class":"Bio::Seq",
-                "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"gggttt"}}}
-              },
-              "translateable_seq":"atggcc"
-            },
-            "spliced_seq":{
-              "__class":"Bio::Seq",
-              "__value":{"primary_seq":{"__class":"Bio::PrimarySeq","__value":{"seq":"aaacccatggccgggttt"}}}
-            }
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(metadata.five_prime_utr_seq.as_deref(), Some("AAACCC"));
-        assert_eq!(metadata.three_prime_utr_seq.as_deref(), Some("GGGTTT"));
-        assert_eq!(metadata.translateable_seq.as_deref(), Some("ATGGCC"));
-        assert_eq!(metadata.spliced_seq.as_deref(), Some("AAACCCATGGCCGGGTTT"));
-    }
-
-    #[test]
-    fn test_parse_transcript_raw_metadata_reads_nested_cdna_mapper_segments() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "_variation_effect_feature_cache":{
-              "mapper":{
-                "__class":"Bio::EnsEMBL::TranscriptMapper",
-                "__value":{
-                  "exon_coord_mapper":{
-                    "__class":"Bio::EnsEMBL::Mapper",
-                    "__value":{
-                      "_pair_cdna":{
-                        "CDNA":[
-                          {
-                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":1,"end":10,"id":"cdna"}},
-                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":101,"end":110,"id":"genome"}},
-                            "ori":1
-                          },
-                          {
-                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":11,"end":20,"id":"cdna"}},
-                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":201,"end":210,"id":"genome"}},
-                            "ori":1
-                          }
-                        ]
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(
-            metadata.cdna_mapper_segments,
-            vec![
-                TranscriptCdnaMapperSegment {
-                    genomic_start: 101,
-                    genomic_end: 110,
-                    cdna_start: 1,
-                    cdna_end: 10,
-                    ori: 1,
-                },
-                TranscriptCdnaMapperSegment {
-                    genomic_start: 201,
-                    genomic_end: 210,
-                    cdna_start: 11,
-                    cdna_end: 20,
-                    ori: 1,
-                }
-            ]
-        );
-    }
-
-    #[test]
-    fn test_parse_transcript_raw_metadata_preserves_gapped_cdna_mapper_segments() {
-        let raw = r#"{
-          "__class":"Bio::EnsEMBL::Transcript",
-          "__value":{
-            "_variation_effect_feature_cache":{
-              "mapper":{
-                "__class":"Bio::EnsEMBL::TranscriptMapper",
-                "__value":{
-                  "exon_coord_mapper":{
-                    "__class":"Bio::EnsEMBL::Mapper",
-                    "__value":{
-                      "_pair_cdna":{
-                        "CDNA":[
-                          {
-                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":1,"end":10,"id":"cdna"}},
-                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":101,"end":110,"id":"genome"}},
-                            "ori":1
-                          },
-                          {
-                            "from":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":17,"end":20,"id":"cdna"}},
-                            "to":{"__class":"Bio::EnsEMBL::Mapper::Unit","__value":{"start":111,"end":114,"id":"genome"}},
-                            "ori":1
-                          }
-                        ]
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }"#;
-
-        let metadata = parse_transcript_raw_metadata(raw);
-        assert_eq!(
-            metadata.cdna_mapper_segments,
-            vec![
-                TranscriptCdnaMapperSegment {
-                    genomic_start: 101,
-                    genomic_end: 110,
-                    cdna_start: 1,
-                    cdna_end: 10,
-                    ori: 1,
-                },
-                TranscriptCdnaMapperSegment {
-                    genomic_start: 111,
-                    genomic_end: 114,
-                    cdna_start: 17,
-                    cdna_end: 20,
-                    ori: 1,
-                }
-            ]
-        );
     }
 
     #[test]
