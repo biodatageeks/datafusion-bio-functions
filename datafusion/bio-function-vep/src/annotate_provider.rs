@@ -7946,7 +7946,7 @@ impl ParallelAnnotationState {
                 .expect("pending job queue must be non-empty");
             let shared = Arc::clone(&self.ann.worker.shared);
             let projection = self.projection.clone();
-            self.in_flight.spawn(async move {
+            self.in_flight.spawn_blocking(move || {
                 let started = Instant::now();
                 annotate_input_buffer_job(shared, job, projection)
                     .map(|annotated| (annotated, started.elapsed()))
