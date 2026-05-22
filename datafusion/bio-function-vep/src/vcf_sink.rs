@@ -3,14 +3,17 @@
 //! Provides [`annotate_to_vcf`] — a single-call function that reads a VCF,
 //! annotates it, and streams results to an output VCF file.
 
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion_bio_format_vcf::serializer::batch_to_vcf_lines;
+use datafusion_bio_format_vcf::serializer::{VcfRecordLine, batch_to_vcf_lines};
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -34,26 +37,141 @@ fn sink_profile_enabled() -> bool {
 struct VcfSinkProfile {
     stream_next: Duration,
     batch_to_lines: Duration,
+    format_wait: Duration,
     write_records: Duration,
     writer_finish: Duration,
     batches: usize,
     rows: usize,
     lines: usize,
+    body_chunk_bytes: usize,
+    format_jobs: usize,
+    format_inflight_max: usize,
 }
 
 impl VcfSinkProfile {
     fn summary_line(&self) -> String {
         format!(
-            "[VEP_PROFILE] vcf_sink_profile batches={} rows={} lines={} stream_next={:.3}s batch_to_lines={:.3}s write_records={:.3}s writer_finish={:.3}s",
+            "[VEP_PROFILE] vcf_sink_profile batches={} rows={} lines={} body_chunk_bytes={} format_jobs={} format_inflight_max={} stream_next={:.3}s batch_to_lines={:.3}s format_wait={:.3}s write_records={:.3}s writer_finish={:.3}s",
             self.batches,
             self.rows,
             self.lines,
+            self.body_chunk_bytes,
+            self.format_jobs,
+            self.format_inflight_max,
             self.stream_next.as_secs_f64(),
             self.batch_to_lines.as_secs_f64(),
+            self.format_wait.as_secs_f64(),
             self.write_records.as_secs_f64(),
             self.writer_finish.as_secs_f64(),
         )
     }
+}
+
+#[derive(Debug)]
+struct FormattedVcfBatch {
+    batch_id: usize,
+    input_rows: usize,
+    lines: usize,
+    bytes: Vec<u8>,
+    format_duration: Duration,
+}
+
+fn parallel_vcf_format_enabled(config: &AnnotateVcfConfig) -> bool {
+    config.target_partitions > 1
+        && std::env::var("VEP_VCF_PARALLEL_FORMAT")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+        && std::env::var("VEP_VCF_BYTE_CHUNKS")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+}
+
+fn parallel_vcf_format_jobs(config: &AnnotateVcfConfig) -> usize {
+    config.target_partitions.max(1)
+}
+
+fn vcf_lines_to_body_chunk(lines: Vec<VcfRecordLine>) -> (Vec<u8>, usize) {
+    let line_count = lines.len();
+    let byte_len = lines.iter().map(|record| record.line.len() + 1).sum();
+    let mut bytes = Vec::with_capacity(byte_len);
+    for record in lines {
+        bytes.extend_from_slice(record.line.as_bytes());
+        bytes.push(b'\n');
+    }
+    (bytes, line_count)
+}
+
+fn format_vcf_body_chunk(
+    batch_id: usize,
+    batch: RecordBatch,
+    vcf_info_fields: Arc<Vec<String>>,
+    unique_format_tags: Arc<Vec<String>>,
+    sample_names: Arc<Vec<String>>,
+    coordinate_zero_based: bool,
+) -> Result<FormattedVcfBatch> {
+    let input_rows = batch.num_rows();
+    let format_started = Instant::now();
+    let lines = batch_to_vcf_lines(
+        &batch,
+        vcf_info_fields.as_slice(),
+        unique_format_tags.as_slice(),
+        sample_names.as_slice(),
+        coordinate_zero_based,
+    )?;
+    let (bytes, line_count) = vcf_lines_to_body_chunk(lines);
+    Ok(FormattedVcfBatch {
+        batch_id,
+        input_rows,
+        lines: line_count,
+        bytes,
+        format_duration: format_started.elapsed(),
+    })
+}
+
+fn write_vcf_body_chunk(writer: &mut VcfLocalWriter, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    let write_result = match writer {
+        VcfLocalWriter::Plain(writer) => writer.write_all(bytes),
+        VcfLocalWriter::Gzip(writer) => writer.write_all(bytes),
+        VcfLocalWriter::Bgzf(writer) => writer.write_all(bytes),
+    };
+
+    write_result.map_err(|e| DataFusionError::Execution(format!("Failed to write VCF chunk: {e}")))
+}
+
+fn drain_ready_vcf_chunks(
+    ready: &mut BTreeMap<usize, FormattedVcfBatch>,
+    next_write_batch_id: &mut usize,
+    writer: &mut VcfLocalWriter,
+    pb: &ProgressBar,
+    config: &AnnotateVcfConfig,
+    total_input: usize,
+    total_rows: &mut usize,
+    sink_profile: &mut Option<VcfSinkProfile>,
+) -> Result<()> {
+    while let Some(chunk) = ready.remove(next_write_batch_id) {
+        let write_started = Instant::now();
+        write_vcf_body_chunk(writer, &chunk.bytes)?;
+        if let Some(profile) = sink_profile.as_mut() {
+            profile.write_records += write_started.elapsed();
+            profile.batch_to_lines += chunk.format_duration;
+            profile.batches += 1;
+            profile.rows += chunk.input_rows;
+            profile.lines += chunk.lines;
+            profile.body_chunk_bytes += chunk.bytes.len();
+        }
+        *total_rows += chunk.lines;
+        pb.inc(chunk.lines as u64);
+        if let Some(ref cb) = config.on_batch_written {
+            cb(chunk.lines, *total_rows, total_input);
+        }
+        *next_write_batch_id += 1;
+    }
+
+    Ok(())
 }
 
 /// Configuration for VCF annotation output.
@@ -509,40 +627,133 @@ pub async fn annotate_to_vcf(
     let mut stream = df.execute_stream().await?;
     let mut total_rows = 0;
     let mut sink_profile = sink_profile_enabled().then(VcfSinkProfile::default);
-    loop {
-        let stream_started = Instant::now();
-        let next_batch = stream.next().await;
-        if let Some(profile) = sink_profile.as_mut() {
-            profile.stream_next += stream_started.elapsed();
+
+    if parallel_vcf_format_enabled(config) {
+        let vcf_info_fields = Arc::new(vcf_info_fields);
+        let unique_format_tags = Arc::new(unique_format_tags);
+        let sample_names = Arc::new(sample_names);
+        let max_format_jobs = parallel_vcf_format_jobs(config);
+        let mut format_jobs = tokio::task::JoinSet::new();
+        let mut ready_chunks = BTreeMap::new();
+        let mut next_input_batch_id = 0;
+        let mut next_write_batch_id = 0;
+        let mut input_done = false;
+
+        loop {
+            while !input_done && format_jobs.len() < max_format_jobs {
+                let stream_started = Instant::now();
+                let next_batch = stream.next().await;
+                if let Some(profile) = sink_profile.as_mut() {
+                    profile.stream_next += stream_started.elapsed();
+                }
+
+                let Some(batch_result) = next_batch else {
+                    input_done = true;
+                    break;
+                };
+
+                let batch = batch_result?;
+                let batch_id = next_input_batch_id;
+                next_input_batch_id += 1;
+                let vcf_info_fields = Arc::clone(&vcf_info_fields);
+                let unique_format_tags = Arc::clone(&unique_format_tags);
+                let sample_names = Arc::clone(&sample_names);
+                format_jobs.spawn_blocking(move || {
+                    format_vcf_body_chunk(
+                        batch_id,
+                        batch,
+                        vcf_info_fields,
+                        unique_format_tags,
+                        sample_names,
+                        coordinate_zero_based,
+                    )
+                });
+                if let Some(profile) = sink_profile.as_mut() {
+                    profile.format_jobs += 1;
+                    profile.format_inflight_max =
+                        profile.format_inflight_max.max(format_jobs.len());
+                }
+            }
+
+            drain_ready_vcf_chunks(
+                &mut ready_chunks,
+                &mut next_write_batch_id,
+                &mut writer,
+                &pb,
+                config,
+                total_input,
+                &mut total_rows,
+                &mut sink_profile,
+            )?;
+
+            if input_done && format_jobs.is_empty() {
+                break;
+            }
+
+            if format_jobs.is_empty() {
+                continue;
+            }
+
+            let wait_started = Instant::now();
+            let join_result = format_jobs.join_next().await;
+            if let Some(profile) = sink_profile.as_mut() {
+                profile.format_wait += wait_started.elapsed();
+            }
+            let Some(join_result) = join_result else {
+                continue;
+            };
+            let formatted = join_result.map_err(|e| {
+                DataFusionError::Execution(format!("VCF formatter task failed: {e}"))
+            })??;
+            ready_chunks.insert(formatted.batch_id, formatted);
         }
-        let Some(batch_result) = next_batch else {
-            break;
-        };
-        let batch = batch_result?;
-        let input_rows = batch.num_rows();
-        let lines_started = Instant::now();
-        let lines = batch_to_vcf_lines(
-            &batch,
-            &vcf_info_fields,
-            &unique_format_tags,
-            &sample_names,
-            coordinate_zero_based,
+
+        drain_ready_vcf_chunks(
+            &mut ready_chunks,
+            &mut next_write_batch_id,
+            &mut writer,
+            &pb,
+            config,
+            total_input,
+            &mut total_rows,
+            &mut sink_profile,
         )?;
-        if let Some(profile) = sink_profile.as_mut() {
-            profile.batch_to_lines += lines_started.elapsed();
-            profile.batches += 1;
-            profile.rows += input_rows;
-            profile.lines += lines.len();
-        }
-        total_rows += lines.len();
-        let write_started = Instant::now();
-        writer.write_records(&lines)?;
-        if let Some(profile) = sink_profile.as_mut() {
-            profile.write_records += write_started.elapsed();
-        }
-        pb.inc(lines.len() as u64);
-        if let Some(ref cb) = config.on_batch_written {
-            cb(lines.len(), total_rows, total_input);
+    } else {
+        loop {
+            let stream_started = Instant::now();
+            let next_batch = stream.next().await;
+            if let Some(profile) = sink_profile.as_mut() {
+                profile.stream_next += stream_started.elapsed();
+            }
+            let Some(batch_result) = next_batch else {
+                break;
+            };
+            let batch = batch_result?;
+            let input_rows = batch.num_rows();
+            let lines_started = Instant::now();
+            let lines = batch_to_vcf_lines(
+                &batch,
+                &vcf_info_fields,
+                &unique_format_tags,
+                &sample_names,
+                coordinate_zero_based,
+            )?;
+            if let Some(profile) = sink_profile.as_mut() {
+                profile.batch_to_lines += lines_started.elapsed();
+                profile.batches += 1;
+                profile.rows += input_rows;
+                profile.lines += lines.len();
+            }
+            total_rows += lines.len();
+            let write_started = Instant::now();
+            writer.write_records(&lines)?;
+            if let Some(profile) = sink_profile.as_mut() {
+                profile.write_records += write_started.elapsed();
+            }
+            pb.inc(lines.len() as u64);
+            if let Some(ref cb) = config.on_batch_written {
+                cb(lines.len(), total_rows, total_input);
+            }
         }
     }
 
@@ -649,11 +860,15 @@ mod tests {
         let mut profile = VcfSinkProfile::default();
         profile.stream_next += std::time::Duration::from_millis(10);
         profile.batch_to_lines += std::time::Duration::from_millis(20);
+        profile.format_wait += std::time::Duration::from_millis(25);
         profile.write_records += std::time::Duration::from_millis(30);
         profile.writer_finish += std::time::Duration::from_millis(40);
         profile.batches = 2;
         profile.rows = 3;
         profile.lines = 4;
+        profile.body_chunk_bytes = 5;
+        profile.format_jobs = 6;
+        profile.format_inflight_max = 7;
 
         let line = profile.summary_line();
 
@@ -661,9 +876,31 @@ mod tests {
         assert!(line.contains("batches=2"));
         assert!(line.contains("rows=3"));
         assert!(line.contains("lines=4"));
+        assert!(line.contains("body_chunk_bytes=5"));
+        assert!(line.contains("format_jobs=6"));
+        assert!(line.contains("format_inflight_max=7"));
         assert!(line.contains("stream_next=0.010s"));
         assert!(line.contains("batch_to_lines=0.020s"));
+        assert!(line.contains("format_wait=0.025s"));
         assert!(line.contains("write_records=0.030s"));
         assert!(line.contains("writer_finish=0.040s"));
+    }
+
+    #[test]
+    fn test_vcf_lines_to_body_chunk_appends_record_newlines() {
+        let (chunk, lines) = vcf_lines_to_body_chunk(vec![
+            VcfRecordLine {
+                line: "chr1\t1\t.\tA\tC\t.\t.\t.".to_string(),
+            },
+            VcfRecordLine {
+                line: "chr1\t2\t.\tG\tT\t.\t.\t.".to_string(),
+            },
+        ]);
+
+        assert_eq!(lines, 2);
+        assert_eq!(
+            chunk,
+            b"chr1\t1\t.\tA\tC\t.\t.\t.\nchr1\t2\t.\tG\tT\t.\t.\t.\n"
+        );
     }
 }
