@@ -4527,80 +4527,82 @@ impl AnnotateProvider {
         /// Append NULL to all annotation column builders for the selected mode.
         macro_rules! append_null_annotation_row {
             () => {
-                b_allele.append_null();
-                b_consequence.append(false);
-                b_impact.append(false);
-                b_symbol.append(false);
-                b_gene.append(false);
-                b_feature_type.append(false);
-                b_feature.append(false);
-                b_biotype.append(false);
-                b_exon.append(false);
-                b_intron.append(false);
-                b_hgvsc.append(false);
-                b_hgvsp.append(false);
-                b_cdna_position.append(false);
-                b_cds_position.append(false);
-                b_protein_position.append(false);
-                b_amino_acids.append(false);
-                b_codons.append(false);
-                b_existing_variation.append(false);
-                b_distance.append(false);
-                b_strand.append(false);
-                b_flags.append(false);
-                b_pick.append(false);
-                b_variant_class.append_null();
-                b_symbol_source.append(false);
-                b_hgnc_id.append(false);
-                b_canonical.append(false);
-                b_mane.append(false);
-                b_mane_select.append(false);
-                b_mane_plus_clinical.append(false);
-                b_tsl.append(false);
-                b_appris.append(false);
-                b_ccds.append(false);
-                b_ensp.append(false);
-                b_swissprot.append(false);
-                b_trembl.append(false);
-                b_uniparc.append(false);
-                b_uniprot_isoform.append(false);
-                if include_refseq_fields {
-                    b_refseq_match.append(false);
-                    if include_source_field {
-                        b_source.append(false);
+                if !skip_typed_cols {
+                    b_allele.append_null();
+                    b_consequence.append(false);
+                    b_impact.append(false);
+                    b_symbol.append(false);
+                    b_gene.append(false);
+                    b_feature_type.append(false);
+                    b_feature.append(false);
+                    b_biotype.append(false);
+                    b_exon.append(false);
+                    b_intron.append(false);
+                    b_hgvsc.append(false);
+                    b_hgvsp.append(false);
+                    b_cdna_position.append(false);
+                    b_cds_position.append(false);
+                    b_protein_position.append(false);
+                    b_amino_acids.append(false);
+                    b_codons.append(false);
+                    b_existing_variation.append(false);
+                    b_distance.append(false);
+                    b_strand.append(false);
+                    b_flags.append(false);
+                    b_pick.append(false);
+                    b_variant_class.append_null();
+                    b_symbol_source.append(false);
+                    b_hgnc_id.append(false);
+                    b_canonical.append(false);
+                    b_mane.append(false);
+                    b_mane_select.append(false);
+                    b_mane_plus_clinical.append(false);
+                    b_tsl.append(false);
+                    b_appris.append(false);
+                    b_ccds.append(false);
+                    b_ensp.append(false);
+                    b_swissprot.append(false);
+                    b_trembl.append(false);
+                    b_uniparc.append(false);
+                    b_uniprot_isoform.append(false);
+                    if include_refseq_fields {
+                        b_refseq_match.append(false);
+                        if include_source_field {
+                            b_source.append(false);
+                        }
+                        b_refseq_offset.append(false);
+                        b_given_ref.append(false);
+                        b_used_ref.append(false);
+                        b_bam_edit.append(false);
                     }
-                    b_refseq_offset.append(false);
-                    b_given_ref.append(false);
-                    b_used_ref.append(false);
-                    b_bam_edit.append(false);
+                    b_gene_pheno.append(false);
+                    b_sift.append(false);
+                    b_polyphen.append(false);
+                    b_domains.append(false);
+                    b_mirna.append(false);
+                    b_hgvs_offset.append(false);
+                    for af_b in b_af.iter_mut() {
+                        af_b.append_null();
+                    }
+                    b_max_af.append_null();
+                    b_max_af_pops.append_null();
+                    b_clin_sig.append(false);
+                    b_somatic.append_null();
+                    b_pheno.append_null();
+                    b_pubmed.append(false);
+                    b_motif_name.append_null();
+                    b_motif_pos.append_null();
+                    b_high_inf_pos.append_null();
+                    b_motif_score_change.append_null();
+                    b_transcription_factors.append(false);
+                    b_clin_sig_allele.append(false);
+                    b_clinical_impact.append_null();
+                    b_minor_allele.append_null();
+                    b_minor_allele_freq.append_null();
+                    b_clinvar_ids.append(false);
+                    b_cosmic_ids.append(false);
+                    b_dbsnp_ids.append(false);
                 }
-                b_gene_pheno.append(false);
-                b_sift.append(false);
-                b_polyphen.append(false);
-                b_domains.append(false);
-                b_mirna.append(false);
-                b_hgvs_offset.append(false);
-                for af_b in b_af.iter_mut() {
-                    af_b.append_null();
-                }
-                b_max_af.append_null();
-                b_max_af_pops.append_null();
-                b_clin_sig.append(false);
-                b_somatic.append_null();
-                b_pheno.append_null();
-                b_pubmed.append(false);
-                b_motif_name.append_null();
-                b_motif_pos.append_null();
-                b_high_inf_pos.append_null();
-                b_motif_score_change.append_null();
-                b_transcription_factors.append(false);
-                b_clin_sig_allele.append(false);
-                b_clinical_impact.append_null();
-                b_minor_allele.append_null();
-                b_minor_allele_freq.append_null();
-                b_clinvar_ids.append(false);
-                b_cosmic_ids.append(false);
-                b_dbsnp_ids.append(false);
             };
         }
 
@@ -5192,7 +5194,7 @@ impl AnnotateProvider {
             // --- Populate structured annotation column builders for this row ---
             // Skip all typed column work when they're not in the projection.
             if skip_typed_cols {
-                append_null_annotation_row!();
+                // Typed columns are emitted as all-null arrays after the row loop.
             } else {
                 // -- Transcript-level columns (42, or 43 with PICK) --
                 // Allele (scalar, same for all transcripts)
