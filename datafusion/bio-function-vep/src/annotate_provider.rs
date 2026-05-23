@@ -89,6 +89,7 @@ use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::partitioned_cache::PartitionedParquetCache;
+use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, FeatureType, MirnaFeature, MotifFeature,
@@ -7655,6 +7656,8 @@ struct AnnotationWorkerState {
 struct LookupBatchMessage {
     batch: RecordBatch,
     colocated_delta: HashMap<ColocatedKey, ColocatedData>,
+    partition_id: usize,
+    batch_id: usize,
 }
 
 struct SpawnedLookupPartitionHandle {
@@ -7665,8 +7668,10 @@ struct SpawnedLookupPartitionHandle {
 
 struct InlineLookupPartitionHandle {
     partition_id: usize,
+    chrom: String,
     stream: SendableRecordBatchStream,
     sink: ColocatedSink,
+    next_batch_id: usize,
 }
 
 enum LookupPartitionHandle {
@@ -8013,6 +8018,9 @@ struct ContigAnnotationState {
 
 struct InputBufferAnnotationJob {
     buffer_id: usize,
+    chrom: String,
+    rows: usize,
+    queued_at: Instant,
     batches: Vec<RecordBatch>,
     context: BufferAnnotationContext,
     colocated_map: Arc<HashMap<ColocatedKey, ColocatedData>>,
@@ -8027,6 +8035,7 @@ struct BufferAnnotationContext {
 
 struct AnnotatedInputBuffer {
     buffer_id: usize,
+    rows: usize,
     batches: VecDeque<RecordBatch>,
 }
 
@@ -8179,6 +8188,7 @@ fn spawn_lookup_partition_worker(
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
     partition_id: usize,
+    chrom: String,
     sink: ColocatedSink,
     queue_batches: usize,
     profile: Option<SharedContigPipelineProfile>,
@@ -8186,14 +8196,31 @@ fn spawn_lookup_partition_worker(
     let (sender, receiver) = tokio::sync::mpsc::channel(queue_batches.max(1));
     let join_handle = tokio::spawn(async move {
         let mut stream = plan.execute(partition_id, task_ctx)?;
+        let mut next_batch_id = 0usize;
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
             let colocated_delta = drain_colocated_sink(&sink)?;
+            let rows = batch.num_rows();
+            let batch_id = next_batch_id;
+            next_batch_id += 1;
+            pipeline_trace::emit(
+                "lookup",
+                "ready",
+                &[
+                    ("chrom", TraceValue::Str(&chrom)),
+                    ("partition_id", TraceValue::Usize(partition_id)),
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(rows)),
+                    ("colocated_delta", TraceValue::Usize(colocated_delta.len())),
+                ],
+            );
             let send_started = profiling_enabled().then(Instant::now);
             let send_result = sender
                 .send(Ok(LookupBatchMessage {
                     batch,
                     colocated_delta,
+                    partition_id,
+                    batch_id,
                 }))
                 .await;
             if let Some(started) = send_started {
@@ -8213,6 +8240,8 @@ fn spawn_lookup_partition_worker(
                 .send(Ok(LookupBatchMessage {
                     batch: RecordBatch::new_empty(plan.schema()),
                     colocated_delta,
+                    partition_id,
+                    batch_id: next_batch_id,
                 }))
                 .await;
             if let Some(started) = send_started {
@@ -8235,20 +8264,39 @@ fn spawn_lookup_partition_worker(
 fn spawn_lookup_stream_worker(
     mut stream: SendableRecordBatchStream,
     schema: SchemaRef,
+    chrom: String,
     sink: ColocatedSink,
     queue_batches: usize,
     profile: Option<SharedContigPipelineProfile>,
 ) -> LookupPartitionHandle {
     let (sender, receiver) = tokio::sync::mpsc::channel(queue_batches.max(1));
     let join_handle = tokio::spawn(async move {
+        let partition_id = 0usize;
+        let mut next_batch_id = 0usize;
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
             let colocated_delta = drain_colocated_sink(&sink)?;
+            let rows = batch.num_rows();
+            let batch_id = next_batch_id;
+            next_batch_id += 1;
+            pipeline_trace::emit(
+                "lookup",
+                "ready",
+                &[
+                    ("chrom", TraceValue::Str(&chrom)),
+                    ("partition_id", TraceValue::Usize(partition_id)),
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(rows)),
+                    ("colocated_delta", TraceValue::Usize(colocated_delta.len())),
+                ],
+            );
             let send_started = profiling_enabled().then(Instant::now);
             let send_result = sender
                 .send(Ok(LookupBatchMessage {
                     batch,
                     colocated_delta,
+                    partition_id,
+                    batch_id,
                 }))
                 .await;
             if let Some(started) = send_started {
@@ -8268,6 +8316,8 @@ fn spawn_lookup_stream_worker(
                 .send(Ok(LookupBatchMessage {
                     batch: RecordBatch::new_empty(schema),
                     colocated_delta,
+                    partition_id,
+                    batch_id: next_batch_id,
                 }))
                 .await;
             if let Some(started) = send_started {
@@ -8291,13 +8341,16 @@ fn inline_lookup_partition(
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
     partition_id: usize,
+    chrom: String,
     sink: ColocatedSink,
 ) -> Result<LookupPartitionHandle> {
     let stream = plan.execute(partition_id, task_ctx)?;
     Ok(LookupPartitionHandle::Inline(InlineLookupPartitionHandle {
         partition_id,
+        chrom,
         stream,
         sink,
+        next_batch_id: 0,
     }))
 }
 
@@ -9500,9 +9553,39 @@ fn prepare_input_buffer_annotation_jobs(
 
         let buffer_context =
             prepare_buffer_annotation_context(worker, &buffer_batches, &chrom, min_start, max_end)?;
+        let buffer_id = worker.next_input_buffer_id;
+        let rows = buffer_batches
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>();
+        pipeline_trace::emit(
+            "annotation",
+            "queued",
+            &[
+                ("chrom", TraceValue::Str(&chrom)),
+                ("buffer_id", TraceValue::Usize(buffer_id)),
+                ("rows", TraceValue::Usize(rows)),
+                ("batches", TraceValue::Usize(buffer_batches.len())),
+                (
+                    "transcripts",
+                    TraceValue::Usize(buffer_context.transcripts.len()),
+                ),
+                (
+                    "exons",
+                    TraceValue::Usize(buffer_context.exon_indices.len()),
+                ),
+                (
+                    "translations",
+                    TraceValue::Usize(buffer_context.translation_indices.len()),
+                ),
+            ],
+        );
 
         jobs.push(InputBufferAnnotationJob {
-            buffer_id: worker.next_input_buffer_id,
+            buffer_id,
+            chrom,
+            rows,
+            queued_at: Instant::now(),
             batches: buffer_batches,
             context: buffer_context,
             colocated_map: Arc::clone(&colocated_map),
@@ -9518,6 +9601,17 @@ fn annotate_input_buffer_job(
     job: InputBufferAnnotationJob,
     projection: Option<Vec<usize>>,
 ) -> Result<AnnotatedInputBuffer> {
+    let job_started = Instant::now();
+    pipeline_trace::emit(
+        "annotation",
+        "start",
+        &[
+            ("chrom", TraceValue::Str(&job.chrom)),
+            ("buffer_id", TraceValue::Usize(job.buffer_id)),
+            ("rows", TraceValue::Usize(job.rows)),
+            ("queue_wait", TraceValue::Duration(job.queued_at.elapsed())),
+        ],
+    );
     let tmp_provider = shared.tmp_provider.as_ref();
     let engine = shared.engine.as_ref();
     let config = &shared.config;
@@ -9608,8 +9702,22 @@ fn annotate_input_buffer_job(
         }
     }
 
+    let output_batches = out.len();
+    pipeline_trace::emit(
+        "annotation",
+        "done",
+        &[
+            ("chrom", TraceValue::Str(&job.chrom)),
+            ("buffer_id", TraceValue::Usize(job.buffer_id)),
+            ("rows", TraceValue::Usize(job.rows)),
+            ("output_batches", TraceValue::Usize(output_batches)),
+            ("elapsed", TraceValue::Duration(job_started.elapsed())),
+        ],
+    );
+
     Ok(AnnotatedInputBuffer {
         buffer_id: job.buffer_id,
+        rows: job.rows,
         batches: out,
     })
 }
@@ -9618,9 +9726,20 @@ fn drain_ready_ordered_input_buffers(
     ready: &mut BTreeMap<usize, AnnotatedInputBuffer>,
     next_buffer_id: &mut usize,
     out: &mut VecDeque<RecordBatch>,
+    chrom: &str,
 ) {
     while let Some(mut annotated) = ready.remove(next_buffer_id) {
         debug_assert_eq!(annotated.buffer_id, *next_buffer_id);
+        pipeline_trace::emit(
+            "annotation",
+            "ordered_drain",
+            &[
+                ("chrom", TraceValue::Str(chrom)),
+                ("buffer_id", TraceValue::Usize(annotated.buffer_id)),
+                ("rows", TraceValue::Usize(annotated.rows)),
+                ("output_batches", TraceValue::Usize(annotated.batches.len())),
+            ],
+        );
         out.extend(annotated.batches.drain(..));
         *next_buffer_id += 1;
     }
@@ -9655,10 +9774,27 @@ fn poll_lookup_partition(
         LookupPartitionHandle::Inline(active) => match active.stream.as_mut().poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Ok(batch))) => {
+                let rows = batch.num_rows();
+                let partition_id = active.partition_id;
+                let batch_id = active.next_batch_id;
+                active.next_batch_id += 1;
                 let result = drain_colocated_sink(&active.sink).map(|colocated_delta| {
+                    pipeline_trace::emit(
+                        "lookup",
+                        "ready",
+                        &[
+                            ("chrom", TraceValue::Str(&active.chrom)),
+                            ("partition_id", TraceValue::Usize(partition_id)),
+                            ("batch_id", TraceValue::Usize(batch_id)),
+                            ("rows", TraceValue::Usize(rows)),
+                            ("colocated_delta", TraceValue::Usize(colocated_delta.len())),
+                        ],
+                    );
                     LookupPartitionPoll::Batch(LookupBatchMessage {
                         batch,
                         colocated_delta,
+                        partition_id,
+                        batch_id,
                     })
                 });
                 Poll::Ready(result)
@@ -9678,9 +9814,24 @@ fn apply_lookup_batch_message(ann: &mut ContigAnnotationState, message: LookupBa
     record_contig_profile(&ann.worker.shared.profile, |profile| {
         profile.lookup_batches += 1;
     });
+    let rows = message.batch.num_rows();
+    pipeline_trace::emit(
+        "lookup",
+        "ordered_batch",
+        &[
+            ("chrom", TraceValue::Str(&ann.chrom)),
+            ("partition_id", TraceValue::Usize(message.partition_id)),
+            ("batch_id", TraceValue::Usize(message.batch_id)),
+            ("rows", TraceValue::Usize(rows)),
+            (
+                "colocated_delta",
+                TraceValue::Usize(message.colocated_delta.len()),
+            ),
+        ],
+    );
     merge_colocated_delta(&mut ann.worker.colocated_map, message.colocated_delta);
-    if message.batch.num_rows() > 0 {
-        ann.contig_rows += message.batch.num_rows();
+    if rows > 0 {
+        ann.contig_rows += rows;
         ann.worker.window_buffer.push(message.batch);
     }
 }
@@ -9779,6 +9930,27 @@ fn poll_lookup_partitions(
                 if made_progress {
                     return Poll::Ready(Ok(()));
                 }
+                if ordered_blocked {
+                    pipeline_trace::emit(
+                        "lookup",
+                        "ordered_blocked",
+                        &[
+                            ("chrom", TraceValue::Str(&ann.chrom)),
+                            (
+                                "next_partition",
+                                TraceValue::Usize(ann.lookup_partitions.next_output_partition),
+                            ),
+                            (
+                                "buffered_batches",
+                                TraceValue::Usize(ann.lookup_partitions.buffered_batch_count()),
+                            ),
+                            (
+                                "buffered_partitions",
+                                TraceValue::Usize(ann.lookup_partitions.buffered_partition_count()),
+                            ),
+                        ],
+                    );
+                }
                 start_lookup_waits(ann, ordered_blocked);
                 return Poll::Pending;
             }
@@ -9789,6 +9961,22 @@ fn poll_lookup_partitions(
             }
             Poll::Ready(Ok(Some(LookupPartitionPoll::Done(colocated_delta)))) => {
                 finish_lookup_waits(ann);
+                pipeline_trace::emit(
+                    "lookup",
+                    "partition_done",
+                    &[
+                        ("chrom", TraceValue::Str(&ann.chrom)),
+                        (
+                            "partition_id",
+                            TraceValue::Usize(
+                                ann.lookup_partitions
+                                    .next_output_partition
+                                    .saturating_sub(1),
+                            ),
+                        ),
+                        ("colocated_delta", TraceValue::Usize(colocated_delta.len())),
+                    ],
+                );
                 if !colocated_delta.is_empty() {
                     merge_colocated_delta(&mut ann.worker.colocated_map, colocated_delta);
                 }
@@ -9857,6 +10045,7 @@ fn poll_completed_parallel_annotation_jobs(
                     &mut par.ready_buffers,
                     &mut par.next_output_buffer_id,
                     &mut par.output_queue,
+                    &par.ann.chrom,
                 );
                 record_contig_profile(&par.ann.worker.shared.profile, |profile| {
                     profile.annotation_ready_max =
@@ -10649,6 +10838,7 @@ async fn prepare_contig_context(
                     Arc::clone(&plan),
                     Arc::clone(&task_ctx),
                     partition_id,
+                    chrom.to_string(),
                     sink,
                 )?);
             } else {
@@ -10656,6 +10846,7 @@ async fn prepare_contig_context(
                     Arc::clone(&plan),
                     Arc::clone(&task_ctx),
                     partition_id,
+                    chrom.to_string(),
                     sink,
                     LOOKUP_PARTITION_QUEUE_BATCHES,
                     pipeline_profile.clone(),
@@ -10668,13 +10859,16 @@ async fn prepare_contig_context(
         if config.inline_lookup {
             VecDeque::from([LookupPartitionHandle::Inline(InlineLookupPartitionHandle {
                 partition_id: 0,
+                chrom: chrom.to_string(),
                 stream: lookup_stream,
                 sink: fallback_coloc_sink,
+                next_batch_id: 0,
             })])
         } else {
             VecDeque::from([spawn_lookup_stream_worker(
                 lookup_stream,
                 plan.schema(),
+                chrom.to_string(),
                 fallback_coloc_sink,
                 LOOKUP_PARTITION_QUEUE_BATCHES,
                 pipeline_profile.clone(),
@@ -10689,6 +10883,7 @@ async fn prepare_contig_context(
     // Context arm: load transcripts, exons, translations, etc.
     let context_result: Result<LoadedContigContext> = async {
         let t_ctx = profile_start!();
+        pipeline_trace::emit("context", "start", &[("chrom", TraceValue::Str(&chrom))]);
         let tmp_provider = AnnotateProvider::new(
             Arc::clone(&session),
             config.vcf_table.clone(),
@@ -10767,6 +10962,19 @@ async fn prepare_contig_context(
             Vec::new()
         };
         let context_elapsed = t_ctx.elapsed();
+        pipeline_trace::emit(
+            "context",
+            "done",
+            &[
+                ("chrom", TraceValue::Str(&chrom)),
+                ("transcripts", TraceValue::Usize(tx_vec.len())),
+                ("exons", TraceValue::Usize(ex.len())),
+                ("translations", TraceValue::Usize(tl.len())),
+                ("regulatory", TraceValue::Usize(rg.len())),
+                ("motifs", TraceValue::Usize(mt.len())),
+                ("elapsed", TraceValue::Duration(context_elapsed)),
+            ],
+        );
         record_contig_profile(&pipeline_profile, |profile| {
             profile.context_load += context_elapsed;
         });
@@ -12565,6 +12773,7 @@ mod tests {
             1,
             AnnotatedInputBuffer {
                 buffer_id: 1,
+                rows: 1,
                 batches: VecDeque::from(vec![make_buffer_batch("chr1", 2, 2)]),
             },
         );
@@ -12572,22 +12781,24 @@ mod tests {
             2,
             AnnotatedInputBuffer {
                 buffer_id: 2,
+                rows: 1,
                 batches: VecDeque::from(vec![make_buffer_batch("chr1", 3, 3)]),
             },
         );
 
-        drain_ready_ordered_input_buffers(&mut ready, &mut next_buffer_id, &mut out);
+        drain_ready_ordered_input_buffers(&mut ready, &mut next_buffer_id, &mut out, "chr1");
         assert!(out.is_empty());
 
         ready.insert(
             0,
             AnnotatedInputBuffer {
                 buffer_id: 0,
+                rows: 1,
                 batches: VecDeque::from(vec![make_buffer_batch("chr1", 1, 1)]),
             },
         );
 
-        drain_ready_ordered_input_buffers(&mut ready, &mut next_buffer_id, &mut out);
+        drain_ready_ordered_input_buffers(&mut ready, &mut next_buffer_id, &mut out, "chr1");
 
         assert_eq!(out.len(), 3);
         assert_eq!(
