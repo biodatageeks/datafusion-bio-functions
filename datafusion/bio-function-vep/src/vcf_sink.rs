@@ -19,6 +19,7 @@ use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cache_source::CacheSourceType;
+use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
 
 /// Callback invoked after each batch is written to VCF.
 /// Arguments: (rows_in_batch, total_rows_written_so_far, total_input_rows).
@@ -173,6 +174,14 @@ fn format_vcf_body_chunk(
 ) -> Result<FormattedVcfBatch> {
     let input_rows = batch.num_rows();
     let format_started = Instant::now();
+    pipeline_trace::emit(
+        "vcf_format",
+        "start",
+        &[
+            ("batch_id", TraceValue::Usize(batch_id)),
+            ("rows", TraceValue::Usize(input_rows)),
+        ],
+    );
     let lines = batch_to_vcf_lines(
         &batch,
         vcf_info_fields.as_slice(),
@@ -181,6 +190,17 @@ fn format_vcf_body_chunk(
         coordinate_zero_based,
     )?;
     let (bytes, line_count) = vcf_lines_to_body_chunk(lines);
+    pipeline_trace::emit(
+        "vcf_format",
+        "done",
+        &[
+            ("batch_id", TraceValue::Usize(batch_id)),
+            ("rows", TraceValue::Usize(input_rows)),
+            ("lines", TraceValue::Usize(line_count)),
+            ("bytes", TraceValue::Usize(bytes.len())),
+            ("elapsed", TraceValue::Duration(format_started.elapsed())),
+        ],
+    );
     Ok(FormattedVcfBatch {
         batch_id,
         input_rows,
@@ -217,8 +237,20 @@ fn drain_ready_vcf_chunks(
     while let Some(chunk) = ready.remove(next_write_batch_id) {
         let write_started = Instant::now();
         write_vcf_body_chunk(writer, &chunk.bytes)?;
+        let write_elapsed = write_started.elapsed();
+        pipeline_trace::emit(
+            "vcf_write",
+            "done",
+            &[
+                ("batch_id", TraceValue::Usize(chunk.batch_id)),
+                ("rows", TraceValue::Usize(chunk.input_rows)),
+                ("lines", TraceValue::Usize(chunk.lines)),
+                ("bytes", TraceValue::Usize(chunk.bytes.len())),
+                ("elapsed", TraceValue::Duration(write_elapsed)),
+            ],
+        );
         if let Some(profile) = sink_profile.as_mut() {
-            profile.write_records += write_started.elapsed();
+            profile.write_records += write_elapsed;
             profile.batch_to_lines += chunk.format_duration;
             profile.batches += 1;
             profile.rows += chunk.input_rows;
@@ -742,8 +774,9 @@ pub async fn annotate_to_vcf(
             while !input_done && format_jobs.len() < max_format_jobs {
                 let stream_started = Instant::now();
                 let next_batch = stream.next().await;
+                let stream_elapsed = stream_started.elapsed();
                 if let Some(profile) = sink_profile.as_mut() {
-                    profile.stream_next += stream_started.elapsed();
+                    profile.stream_next += stream_elapsed;
                 }
 
                 let Some(batch_result) = next_batch else {
@@ -754,6 +787,15 @@ pub async fn annotate_to_vcf(
                 let batch = batch_result?;
                 let batch_id = next_input_batch_id;
                 next_input_batch_id += 1;
+                pipeline_trace::emit(
+                    "vcf_stream",
+                    "batch_ready",
+                    &[
+                        ("batch_id", TraceValue::Usize(batch_id)),
+                        ("rows", TraceValue::Usize(batch.num_rows())),
+                        ("stream_wait", TraceValue::Duration(stream_elapsed)),
+                    ],
+                );
                 let vcf_info_fields = Arc::clone(&vcf_info_fields);
                 let unique_format_tags = Arc::clone(&unique_format_tags);
                 let sample_names = Arc::clone(&sample_names);
@@ -818,18 +860,39 @@ pub async fn annotate_to_vcf(
             &mut sink_profile,
         )?;
     } else {
+        let mut next_serial_batch_id = 0usize;
         loop {
             let stream_started = Instant::now();
             let next_batch = stream.next().await;
+            let stream_elapsed = stream_started.elapsed();
             if let Some(profile) = sink_profile.as_mut() {
-                profile.stream_next += stream_started.elapsed();
+                profile.stream_next += stream_elapsed;
             }
             let Some(batch_result) = next_batch else {
                 break;
             };
             let batch = batch_result?;
             let input_rows = batch.num_rows();
+            let batch_id = next_serial_batch_id;
+            next_serial_batch_id += 1;
+            pipeline_trace::emit(
+                "vcf_stream",
+                "batch_ready",
+                &[
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(input_rows)),
+                    ("stream_wait", TraceValue::Duration(stream_elapsed)),
+                ],
+            );
             let lines_started = Instant::now();
+            pipeline_trace::emit(
+                "vcf_format",
+                "start",
+                &[
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(input_rows)),
+                ],
+            );
             let lines = batch_to_vcf_lines(
                 &batch,
                 &vcf_info_fields,
@@ -837,8 +900,19 @@ pub async fn annotate_to_vcf(
                 &sample_names,
                 coordinate_zero_based,
             )?;
+            let format_elapsed = lines_started.elapsed();
+            pipeline_trace::emit(
+                "vcf_format",
+                "done",
+                &[
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(input_rows)),
+                    ("lines", TraceValue::Usize(lines.len())),
+                    ("elapsed", TraceValue::Duration(format_elapsed)),
+                ],
+            );
             if let Some(profile) = sink_profile.as_mut() {
-                profile.batch_to_lines += lines_started.elapsed();
+                profile.batch_to_lines += format_elapsed;
                 profile.batches += 1;
                 profile.rows += input_rows;
                 profile.lines += lines.len();
@@ -846,8 +920,19 @@ pub async fn annotate_to_vcf(
             total_rows += lines.len();
             let write_started = Instant::now();
             writer.write_records(&lines)?;
+            let write_elapsed = write_started.elapsed();
+            pipeline_trace::emit(
+                "vcf_write",
+                "done",
+                &[
+                    ("batch_id", TraceValue::Usize(batch_id)),
+                    ("rows", TraceValue::Usize(input_rows)),
+                    ("lines", TraceValue::Usize(lines.len())),
+                    ("elapsed", TraceValue::Duration(write_elapsed)),
+                ],
+            );
             if let Some(profile) = sink_profile.as_mut() {
-                profile.write_records += write_started.elapsed();
+                profile.write_records += write_elapsed;
             }
             pb.inc(lines.len() as u64);
             if let Some(ref cb) = config.on_batch_written {
