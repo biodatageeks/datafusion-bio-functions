@@ -7534,8 +7534,15 @@ struct ContigPipelineProfile {
     send_wait: Duration,
     ordered_drain_wait: Duration,
     workers: usize,
+    lookup_partitions: usize,
     lookup_batches: usize,
+    lookup_buffered_batches_max: usize,
+    lookup_buffered_partitions_max: usize,
     input_buffers: usize,
+    annotation_pending_max: usize,
+    annotation_inflight_max: usize,
+    annotation_ready_max: usize,
+    annotation_output_queue_max: usize,
     output_batches: usize,
     output_rows: usize,
 }
@@ -7543,10 +7550,17 @@ struct ContigPipelineProfile {
 impl ContigPipelineProfile {
     fn summary_line(&self, chrom: &str) -> String {
         format!(
-            "[VEP_PROFILE] {chrom}: pipeline_profile workers={} lookup_batches={} input_buffers={} output_batches={} output_rows={} context_load={:.3}s context_tx={:.3}s context_exons={:.3}s context_tl={:.3}s context_reg={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s",
+            "[VEP_PROFILE] {chrom}: pipeline_profile workers={} lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} annotation_pending_max={} annotation_inflight_max={} annotation_ready_max={} annotation_output_queue_max={} output_batches={} output_rows={} context_load={:.3}s context_tx={:.3}s context_exons={:.3}s context_tl={:.3}s context_reg={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s",
             self.workers,
+            self.lookup_partitions,
             self.lookup_batches,
+            self.lookup_buffered_batches_max,
+            self.lookup_buffered_partitions_max,
             self.input_buffers,
+            self.annotation_pending_max,
+            self.annotation_inflight_max,
+            self.annotation_ready_max,
+            self.annotation_output_queue_max,
             self.output_batches,
             self.output_rows,
             self.context_load.as_secs_f64(),
@@ -7661,10 +7675,91 @@ enum LookupPartitionHandle {
 }
 
 impl LookupPartitionHandle {
+    fn partition_id(&self) -> usize {
+        match self {
+            LookupPartitionHandle::Spawned(handle) => handle.partition_id,
+            LookupPartitionHandle::Inline(handle) => handle.partition_id,
+        }
+    }
+
     fn abort(&mut self) {
         if let LookupPartitionHandle::Spawned(handle) = self {
             handle.join_handle.abort();
         }
+    }
+}
+
+struct LookupPartitionState {
+    handle: Option<LookupPartitionHandle>,
+    ready: VecDeque<LookupBatchMessage>,
+    done_delta: Option<HashMap<ColocatedKey, ColocatedData>>,
+}
+
+impl LookupPartitionState {
+    fn new(handle: LookupPartitionHandle) -> Self {
+        Self {
+            handle: Some(handle),
+            ready: VecDeque::new(),
+            done_delta: None,
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.handle.is_none() && self.done_delta.is_some()
+    }
+}
+
+struct LookupPartitionFanIn {
+    partitions: Vec<LookupPartitionState>,
+    next_output_partition: usize,
+    queue_batches: usize,
+}
+
+impl LookupPartitionFanIn {
+    fn new(partitions: VecDeque<LookupPartitionHandle>, queue_batches: usize) -> Self {
+        let mut partitions: Vec<_> = partitions.into_iter().collect();
+        partitions.sort_by_key(LookupPartitionHandle::partition_id);
+        Self {
+            partitions: partitions
+                .into_iter()
+                .map(LookupPartitionState::new)
+                .collect(),
+            next_output_partition: 0,
+            queue_batches: queue_batches.max(1),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.partitions.len()
+    }
+
+    fn abort(&mut self) {
+        for partition in &mut self.partitions {
+            if let Some(handle) = &mut partition.handle {
+                handle.abort();
+            }
+        }
+    }
+
+    fn buffered_batch_count(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(|partition| partition.ready.len())
+            .sum()
+    }
+
+    fn buffered_partition_count(&self) -> usize {
+        self.partitions
+            .iter()
+            .filter(|partition| !partition.ready.is_empty())
+            .count()
+    }
+
+    fn has_buffered_after_next(&self) -> bool {
+        self.partitions
+            .iter()
+            .skip(self.next_output_partition.saturating_add(1))
+            .any(|partition| !partition.ready.is_empty() || partition.is_done())
     }
 }
 
@@ -7903,8 +7998,7 @@ struct ContigReadyState {
 
 /// Mutable annotation state for window-based streaming within a single contig.
 struct ContigAnnotationState {
-    lookup_partitions: VecDeque<LookupPartitionHandle>,
-    active_lookup_partition: Option<LookupPartitionHandle>,
+    lookup_partitions: LookupPartitionFanIn,
     worker: AnnotationWorkerState,
     // Cleanup + profiling.
     ephemeral_tables: Vec<String>,
@@ -7913,6 +8007,8 @@ struct ContigAnnotationState {
     session: Arc<SessionContext>,
     t_contig: Instant,
     contig_rows: usize,
+    lookup_wait_started: Option<Instant>,
+    ordered_lookup_wait_started: Option<Instant>,
 }
 
 struct InputBufferAnnotationJob {
@@ -7989,10 +8085,22 @@ impl ParallelAnnotationState {
                 .expect("pending job queue must be non-empty");
             let shared = Arc::clone(&self.ann.worker.shared);
             let projection = self.projection.clone();
+            let profile = self.ann.worker.shared.profile.clone();
             self.in_flight.spawn_blocking(move || {
                 let started = Instant::now();
                 annotate_input_buffer_job(shared, job, projection)
                     .map(|annotated| (annotated, started.elapsed()))
+            });
+            record_contig_profile(&profile, |profile| {
+                profile.annotation_pending_max =
+                    profile.annotation_pending_max.max(self.pending_jobs.len());
+                profile.annotation_inflight_max =
+                    profile.annotation_inflight_max.max(self.in_flight.len());
+                profile.annotation_ready_max =
+                    profile.annotation_ready_max.max(self.ready_buffers.len());
+                profile.annotation_output_queue_max = profile
+                    .annotation_output_queue_max
+                    .max(self.output_queue.len());
             });
         }
     }
@@ -8073,6 +8181,7 @@ fn spawn_lookup_partition_worker(
     partition_id: usize,
     sink: ColocatedSink,
     queue_batches: usize,
+    profile: Option<SharedContigPipelineProfile>,
 ) -> LookupPartitionHandle {
     let (sender, receiver) = tokio::sync::mpsc::channel(queue_batches.max(1));
     let join_handle = tokio::spawn(async move {
@@ -8080,26 +8189,38 @@ fn spawn_lookup_partition_worker(
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
             let colocated_delta = drain_colocated_sink(&sink)?;
-            if sender
+            let send_started = profiling_enabled().then(Instant::now);
+            let send_result = sender
                 .send(Ok(LookupBatchMessage {
                     batch,
                     colocated_delta,
                 }))
-                .await
-                .is_err()
-            {
+                .await;
+            if let Some(started) = send_started {
+                record_contig_profile(&profile, |profile| {
+                    profile.send_wait += started.elapsed();
+                });
+            }
+            if send_result.is_err() {
                 return Ok(());
             }
         }
 
         let colocated_delta = drain_colocated_sink(&sink)?;
         if !colocated_delta.is_empty() {
-            let _ = sender
+            let send_started = profiling_enabled().then(Instant::now);
+            let send_result = sender
                 .send(Ok(LookupBatchMessage {
                     batch: RecordBatch::new_empty(plan.schema()),
                     colocated_delta,
                 }))
                 .await;
+            if let Some(started) = send_started {
+                record_contig_profile(&profile, |profile| {
+                    profile.send_wait += started.elapsed();
+                });
+            }
+            let _ = send_result;
         }
         Ok(())
     });
@@ -8116,32 +8237,45 @@ fn spawn_lookup_stream_worker(
     schema: SchemaRef,
     sink: ColocatedSink,
     queue_batches: usize,
+    profile: Option<SharedContigPipelineProfile>,
 ) -> LookupPartitionHandle {
     let (sender, receiver) = tokio::sync::mpsc::channel(queue_batches.max(1));
     let join_handle = tokio::spawn(async move {
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
             let colocated_delta = drain_colocated_sink(&sink)?;
-            if sender
+            let send_started = profiling_enabled().then(Instant::now);
+            let send_result = sender
                 .send(Ok(LookupBatchMessage {
                     batch,
                     colocated_delta,
                 }))
-                .await
-                .is_err()
-            {
+                .await;
+            if let Some(started) = send_started {
+                record_contig_profile(&profile, |profile| {
+                    profile.send_wait += started.elapsed();
+                });
+            }
+            if send_result.is_err() {
                 return Ok(());
             }
         }
 
         let colocated_delta = drain_colocated_sink(&sink)?;
         if !colocated_delta.is_empty() {
-            let _ = sender
+            let send_started = profiling_enabled().then(Instant::now);
+            let send_result = sender
                 .send(Ok(LookupBatchMessage {
                     batch: RecordBatch::new_empty(schema),
                     colocated_delta,
                 }))
                 .await;
+            if let Some(started) = send_started {
+                record_contig_profile(&profile, |profile| {
+                    profile.send_wait += started.elapsed();
+                });
+            }
+            let _ = send_result;
         }
         Ok(())
     });
@@ -8174,10 +8308,7 @@ fn abort_lookup_partitions(partitions: &mut VecDeque<LookupPartitionHandle>) {
 }
 
 fn abort_annotation_lookup_workers(ann: &mut ContigAnnotationState) {
-    if let Some(mut active) = ann.active_lookup_partition.take() {
-        active.abort();
-    }
-    abort_lookup_partitions(&mut ann.lookup_partitions);
+    ann.lookup_partitions.abort();
 }
 
 impl AnnotationWorkerState {
@@ -8213,7 +8344,6 @@ impl AnnotationWorkerState {
         };
         record_contig_profile(&profile, |profile| {
             profile.worker_init += init_started.elapsed();
-            profile.workers += 1;
         });
         Ok(state)
     }
@@ -9555,14 +9685,117 @@ fn apply_lookup_batch_message(ann: &mut ContigAnnotationState, message: LookupBa
     }
 }
 
+fn record_lookup_fan_in_profile(
+    profile: &Option<SharedContigPipelineProfile>,
+    fan_in: &LookupPartitionFanIn,
+) {
+    if !profiling_enabled() {
+        return;
+    }
+    let buffered_batches = fan_in.buffered_batch_count();
+    let buffered_partitions = fan_in.buffered_partition_count();
+    record_contig_profile(profile, |profile| {
+        profile.lookup_buffered_batches_max =
+            profile.lookup_buffered_batches_max.max(buffered_batches);
+        profile.lookup_buffered_partitions_max = profile
+            .lookup_buffered_partitions_max
+            .max(buffered_partitions);
+    });
+}
+
+fn finish_lookup_waits(ann: &mut ContigAnnotationState) {
+    let profile = ann.worker.shared.profile.clone();
+    if let Some(started) = ann.lookup_wait_started.take() {
+        record_contig_profile(&profile, |profile| {
+            profile.lookup_wait += started.elapsed();
+        });
+    }
+    if let Some(started) = ann.ordered_lookup_wait_started.take() {
+        record_contig_profile(&profile, |profile| {
+            profile.ordered_drain_wait += started.elapsed();
+        });
+    }
+}
+
+fn start_lookup_waits(ann: &mut ContigAnnotationState, ordered_blocked: bool) {
+    if ann.lookup_wait_started.is_none() {
+        ann.lookup_wait_started = Some(Instant::now());
+    }
+    if ordered_blocked && ann.ordered_lookup_wait_started.is_none() {
+        ann.ordered_lookup_wait_started = Some(Instant::now());
+    }
+}
+
+fn poll_lookup_fan_in(
+    fan_in: &mut LookupPartitionFanIn,
+    cx: &mut TaskCtx<'_>,
+) -> Poll<Result<Option<LookupPartitionPoll>>> {
+    for partition in &mut fan_in.partitions {
+        while partition.ready.len() < fan_in.queue_batches {
+            let Some(handle) = partition.handle.as_mut() else {
+                break;
+            };
+            match poll_lookup_partition(handle, cx) {
+                Poll::Ready(Ok(LookupPartitionPoll::Batch(message))) => {
+                    partition.ready.push_back(message);
+                }
+                Poll::Ready(Ok(LookupPartitionPoll::Done(colocated_delta))) => {
+                    partition.done_delta = Some(colocated_delta);
+                    partition.handle = None;
+                    break;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => break,
+            }
+        }
+    }
+
+    let Some(partition) = fan_in.partitions.get_mut(fan_in.next_output_partition) else {
+        return Poll::Ready(Ok(None));
+    };
+    if let Some(message) = partition.ready.pop_front() {
+        return Poll::Ready(Ok(Some(LookupPartitionPoll::Batch(message))));
+    }
+    if partition.is_done() {
+        fan_in.next_output_partition += 1;
+        let colocated_delta = partition.done_delta.take().unwrap_or_default();
+        return Poll::Ready(Ok(Some(LookupPartitionPoll::Done(colocated_delta))));
+    }
+    Poll::Pending
+}
+
 fn poll_lookup_partitions(
     ann: &mut ContigAnnotationState,
     cx: &mut TaskCtx<'_>,
 ) -> Poll<Result<()>> {
+    let mut made_progress = false;
     while !ann.worker.lookup_done && ann.worker.window_buffer.len() < HYDRATION_WINDOW_SIZE {
-        if ann.active_lookup_partition.is_none() {
-            ann.active_lookup_partition = ann.lookup_partitions.pop_front();
-            if ann.active_lookup_partition.is_none() {
+        let profile = ann.worker.shared.profile.clone();
+        record_lookup_fan_in_profile(&profile, &ann.lookup_partitions);
+        match poll_lookup_fan_in(&mut ann.lookup_partitions, cx) {
+            Poll::Pending => {
+                record_lookup_fan_in_profile(&profile, &ann.lookup_partitions);
+                let ordered_blocked = ann.lookup_partitions.has_buffered_after_next();
+                if made_progress {
+                    return Poll::Ready(Ok(()));
+                }
+                start_lookup_waits(ann, ordered_blocked);
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(Some(LookupPartitionPoll::Batch(message)))) => {
+                finish_lookup_waits(ann);
+                apply_lookup_batch_message(ann, message);
+                made_progress = true;
+            }
+            Poll::Ready(Ok(Some(LookupPartitionPoll::Done(colocated_delta)))) => {
+                finish_lookup_waits(ann);
+                if !colocated_delta.is_empty() {
+                    merge_colocated_delta(&mut ann.worker.colocated_map, colocated_delta);
+                }
+                made_progress = true;
+            }
+            Poll::Ready(Ok(None)) => {
+                finish_lookup_waits(ann);
                 ann.worker.lookup_done = true;
                 profile_end!(
                     &format!("{}: 1. variation_lookup", ann.chrom),
@@ -9570,23 +9803,6 @@ fn poll_lookup_partitions(
                     format!("{} rows", ann.contig_rows)
                 );
                 return Poll::Ready(Ok(()));
-            }
-        }
-
-        let active = ann
-            .active_lookup_partition
-            .as_mut()
-            .expect("active lookup partition must be present");
-        match poll_lookup_partition(active, cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Ok(LookupPartitionPoll::Batch(message))) => {
-                apply_lookup_batch_message(ann, message);
-            }
-            Poll::Ready(Ok(LookupPartitionPoll::Done(colocated_delta))) => {
-                if !colocated_delta.is_empty() {
-                    merge_colocated_delta(&mut ann.worker.colocated_map, colocated_delta);
-                }
-                ann.active_lookup_partition = None;
             }
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
         }
@@ -9642,6 +9858,13 @@ fn poll_completed_parallel_annotation_jobs(
                     &mut par.next_output_buffer_id,
                     &mut par.output_queue,
                 );
+                record_contig_profile(&par.ann.worker.shared.profile, |profile| {
+                    profile.annotation_ready_max =
+                        profile.annotation_ready_max.max(par.ready_buffers.len());
+                    profile.annotation_output_queue_max = profile
+                        .annotation_output_queue_max
+                        .max(par.output_queue.len());
+                });
                 made_progress = true;
             }
             Poll::Ready(Some(Ok(Err(e)))) => {
@@ -9781,6 +10004,17 @@ fn poll_parallel_annotation_state(
                         par.pending_jobs.push_back(job);
                         prepared += 1;
                     }
+                    record_contig_profile(&par.ann.worker.shared.profile, |profile| {
+                        profile.annotation_pending_max =
+                            profile.annotation_pending_max.max(par.pending_jobs.len());
+                        profile.annotation_inflight_max =
+                            profile.annotation_inflight_max.max(par.in_flight.len());
+                        profile.annotation_ready_max =
+                            profile.annotation_ready_max.max(par.ready_buffers.len());
+                        profile.annotation_output_queue_max = profile
+                            .annotation_output_queue_max
+                            .max(par.output_queue.len());
+                    });
                     if prepared > 0 {
                         par.spawn_pending_jobs();
                     }
@@ -9874,8 +10108,10 @@ impl Stream for ContigAnnotationStream {
                                 }
                             };
                         let ann = ContigAnnotationState {
-                            lookup_partitions: ready.lookup_partitions,
-                            active_lookup_partition: None,
+                            lookup_partitions: LookupPartitionFanIn::new(
+                                ready.lookup_partitions,
+                                LOOKUP_PARTITION_QUEUE_BATCHES,
+                            ),
                             worker,
                             ephemeral_tables: ready.ephemeral_tables,
                             chrom: ready.chrom,
@@ -9883,6 +10119,8 @@ impl Stream for ContigAnnotationStream {
                             session,
                             t_contig: ready.t_contig,
                             contig_rows: 0,
+                            lookup_wait_started: None,
+                            ordered_lookup_wait_started: None,
                         };
                         if should_parallelize_input_buffers(&ann.config) {
                             self.state = StreamState::ParallelAnnotatingContig(
@@ -10420,6 +10658,7 @@ async fn prepare_contig_context(
                     partition_id,
                     sink,
                     LOOKUP_PARTITION_QUEUE_BATCHES,
+                    pipeline_profile.clone(),
                 ));
             }
         }
@@ -10438,9 +10677,14 @@ async fn prepare_contig_context(
                 plan.schema(),
                 fallback_coloc_sink,
                 LOOKUP_PARTITION_QUEUE_BATCHES,
+                pipeline_profile.clone(),
             )])
         }
     };
+    record_contig_profile(&pipeline_profile, |profile| {
+        profile.workers = config.annotation_workers.max(1);
+        profile.lookup_partitions = lookup_partitions.len();
+    });
 
     // Context arm: load transcripts, exons, translations, etc.
     let context_result: Result<LoadedContigContext> = async {
@@ -13745,7 +13989,14 @@ mod tests {
         profile.send_wait += std::time::Duration::from_millis(60);
         profile.ordered_drain_wait += std::time::Duration::from_millis(70);
         profile.workers = 2;
+        profile.lookup_partitions = 2;
         profile.lookup_batches = 3;
+        profile.lookup_buffered_batches_max = 6;
+        profile.lookup_buffered_partitions_max = 2;
+        profile.annotation_pending_max = 7;
+        profile.annotation_inflight_max = 8;
+        profile.annotation_ready_max = 9;
+        profile.annotation_output_queue_max = 10;
         profile.output_batches = 4;
         profile.output_rows = 5;
 
@@ -13753,7 +14004,14 @@ mod tests {
 
         assert!(line.contains("[VEP_PROFILE] chr1: pipeline_profile"));
         assert!(line.contains("workers=2"));
+        assert!(line.contains("lookup_partitions=2"));
         assert!(line.contains("lookup_batches=3"));
+        assert!(line.contains("lookup_buffered_batches_max=6"));
+        assert!(line.contains("lookup_buffered_partitions_max=2"));
+        assert!(line.contains("annotation_pending_max=7"));
+        assert!(line.contains("annotation_inflight_max=8"));
+        assert!(line.contains("annotation_ready_max=9"));
+        assert!(line.contains("annotation_output_queue_max=10"));
         assert!(line.contains("output_batches=4"));
         assert!(line.contains("output_rows=5"));
         assert!(line.contains("context_load=0.010s"));
