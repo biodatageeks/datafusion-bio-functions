@@ -858,7 +858,6 @@ impl KvLookupStream {
                     let vep_end = vep_norm_end(norm_start_i64, vcf_ref, vcf_alt);
 
                     // Compute genomic shift state (mirrors parquet path's BuildRow logic).
-                    let mut active_compare_allele_string = compare_allele_string.clone();
                     let mut active_compare_start = vep_start;
                     let mut active_compare_end = vep_end;
                     let mut unshifted_allele_string: Option<String> = None;
@@ -866,7 +865,7 @@ impl KvLookupStream {
                     let mut unshifted_end: Option<i64> = None;
 
                     if let Some(ref_reader) = self.reference_reader.as_mut() {
-                        if let Ok(Some((shifted_as, shifted_s, shifted_e))) =
+                        if let Ok(Some((_shifted_as, shifted_s, shifted_e))) =
                             build_shifted_compare_state(
                                 ref_reader,
                                 &chrom_norm,
@@ -878,15 +877,13 @@ impl KvLookupStream {
                             unshifted_allele_string = Some(compare_allele_string.clone());
                             unshifted_start = Some(vep_start);
                             unshifted_end = Some(vep_end);
-                            active_compare_allele_string = shifted_as;
                             active_compare_start = shifted_s;
                             active_compare_end = shifted_e;
                         }
                     }
 
                     let compare_output_allele =
-                        output_allele_from_allele_string(&active_compare_allele_string)
-                            .map(str::to_string);
+                        output_allele_from_allele_string(&input_allele_string).map(str::to_string);
                     let unshifted_output_allele = unshifted_allele_string
                         .as_deref()
                         .and_then(output_allele_from_allele_string)
@@ -932,12 +929,12 @@ impl KvLookupStream {
                         // Two-pass allele matching (shifted + unshifted) for parity
                         // with parquet path's compare_existing_variant().
                         let Some(matched_alleles) = compare_existing_variant_alleles(
-                            &active_compare_allele_string,
-                            active_compare_start,
-                            active_compare_end,
-                            unshifted_allele_string.as_deref(),
-                            unshifted_start,
-                            unshifted_end,
+                            &input_allele_string,
+                            input_start,
+                            norm_end_i64,
+                            None,
+                            None,
+                            None,
                             allele_str,
                             *probe_start,
                             existing_end,
