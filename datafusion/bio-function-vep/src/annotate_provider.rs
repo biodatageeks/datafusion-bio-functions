@@ -4326,11 +4326,13 @@ impl AnnotateProvider {
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "inline_lookup"))
             .unwrap_or(forks == Some(0));
-        let chunked_buffer_lookup = self
+        let requested_chunked_buffer_lookup = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "chunked_buffer_lookup"))
             .unwrap_or(false);
+        let chunked_buffer_lookup =
+            effective_chunked_buffer_lookup(requested_chunked_buffer_lookup, annotation_workers);
         #[cfg(feature = "kv-cache")]
         if chunked_buffer_lookup && kv_store.is_none() {
             return Err(DataFusionError::Execution(
@@ -8218,6 +8220,13 @@ fn should_parallelize_input_buffers(config: &ContigAnnotationConfig) -> bool {
         let _ = config;
         false
     }
+}
+
+fn effective_chunked_buffer_lookup(
+    requested_chunked_buffer_lookup: bool,
+    annotation_workers: usize,
+) -> bool {
+    requested_chunked_buffer_lookup && annotation_workers > 1
 }
 
 type PrepareFuture = Pin<Box<dyn Future<Output = Result<Option<ContigReadyState>>> + Send>>;
@@ -13300,14 +13309,32 @@ mod tests {
 
     #[cfg(feature = "kv-cache")]
     #[test]
-    fn test_chunked_lookup_also_runs_with_single_annotation_worker() {
+    fn test_chunked_lookup_is_disabled_for_single_annotation_worker() {
         let mut config = minimal_contig_annotation_config();
         config.annotation_workers = 1;
         config.chunked_buffer_lookup = true;
         config.use_fjall = true;
 
         assert!(!should_parallelize_input_buffers(&config));
-        assert!(config.chunked_buffer_lookup);
+        assert!(!effective_chunked_buffer_lookup(
+            config.chunked_buffer_lookup,
+            config.annotation_workers
+        ));
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[test]
+    fn test_chunked_lookup_is_enabled_for_multi_annotation_workers() {
+        let mut config = minimal_contig_annotation_config();
+        config.annotation_workers = 2;
+        config.chunked_buffer_lookup = true;
+        config.use_fjall = true;
+
+        assert!(should_parallelize_input_buffers(&config));
+        assert!(effective_chunked_buffer_lookup(
+            config.chunked_buffer_lookup,
+            config.annotation_workers
+        ));
     }
 
     #[cfg(feature = "kv-cache")]
