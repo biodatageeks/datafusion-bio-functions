@@ -9444,6 +9444,14 @@ fn annotate_worker_window(
             profile.prepared_context += prepared_context_started.elapsed();
         });
 
+        #[cfg(feature = "kv-cache")]
+        if config.chunked_buffer_lookup {
+            let (_, mut chunked_out) =
+                annotate_chunked_lookup_batches(&shared, &ctx, &chrom, buffer_batches, projection)?;
+            out.append(&mut chunked_out);
+            continue;
+        }
+
         for batch in &buffer_batches {
             // Lazy SIFT window loading (same pattern as before).
             if sift_enabled && worker.sift_direct.is_some() {
@@ -13241,6 +13249,18 @@ mod tests {
         let par = ParallelAnnotationState::new(ann);
 
         assert_eq!(par.max_parallel, 8);
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[test]
+    fn test_chunked_lookup_also_runs_with_single_annotation_worker() {
+        let mut config = minimal_contig_annotation_config();
+        config.annotation_workers = 1;
+        config.chunked_buffer_lookup = true;
+        config.use_fjall = true;
+
+        assert!(!should_parallelize_input_buffers(&config));
+        assert!(config.chunked_buffer_lookup);
     }
 
     #[cfg(feature = "kv-cache")]
