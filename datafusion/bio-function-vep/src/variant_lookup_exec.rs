@@ -423,11 +423,9 @@ fn existing_start_is_visible_to_input_row(input_row: &BuildRow, existing_start: 
 ///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L1098-L1258>
 ///
 /// This ports VEP's existing-variant decision for the offline cache path:
-/// unknown-allele records match only on the parser/input coordinates, while
-/// known-allele records are accepted when parser/input alleles produce
-/// non-empty `matched_alleles`. The caller may still use shifted coordinates
-/// to decide which cache rows are visible, mirroring VEP's separate fetch and
-/// compare phases.
+/// unknown-allele records match only on the active compare coordinates, while
+/// known-allele records are accepted when active compare alleles, or explicitly
+/// retained unshifted alleles, produce non-empty `matched_alleles`.
 fn compare_existing_variant(
     input_row: &BuildRow,
     existing_allele_string: &str,
@@ -435,12 +433,12 @@ fn compare_existing_variant(
     existing_end: i64,
 ) -> Option<Vec<MatchedVariantAllele>> {
     compare_existing_variant_alleles(
-        &input_row.input_allele_string,
-        input_row.input_start,
-        input_row.input_end,
-        None,
-        None,
-        None,
+        &input_row.compare_allele_string,
+        input_row.compare_start,
+        input_row.compare_end,
+        input_row.unshifted_allele_string.as_deref(),
+        input_row.unshifted_start,
+        input_row.unshifted_end,
         existing_allele_string,
         existing_start,
         existing_end,
@@ -462,14 +460,15 @@ pub(crate) fn compare_existing_variant_alleles(
     compare_end: i64,
     unshifted_allele_string: Option<&str>,
     unshifted_start: Option<i64>,
-    _unshifted_end: Option<i64>,
+    unshifted_end: Option<i64>,
     existing_allele_string: &str,
     existing_start: i64,
     existing_end: i64,
 ) -> Option<Vec<MatchedVariantAllele>> {
     if !existing_allele_string.contains('/') {
-        return (existing_start == compare_start && existing_end == compare_end)
-            .then_some(Vec::new());
+        let match_start = unshifted_start.unwrap_or(compare_start);
+        let match_end = unshifted_end.unwrap_or(compare_end);
+        return (existing_start == match_start && existing_end == match_end).then_some(Vec::new());
     }
 
     let mut matched_alleles = get_matched_variant_alleles(
@@ -524,8 +523,8 @@ pub struct ColocatedSinkValue {
     pub entries: Vec<ColocatedCacheEntry>,
     /// Output allele component used by VEP's `add_colocated_variant_info()`
     /// fallback (`VariationFeature->{shifted_allele_string}`). This is derived
-    /// from parser/input allele space so repeat-indel IDs can remain visible
-    /// even when the CSQ allele is further minimized.
+    /// from the active compare allele space, so IDs follow the same allele
+    /// representation that produced `matched_alleles`.
     pub compare_output_allele: Option<String>,
     /// Original compare-space output allele component retained only when VEP
     /// defines genomic shift metadata. This is the only fallback used for
@@ -1383,7 +1382,7 @@ impl VariantLookupStream {
                     let sink_value = local_buf.entry(key).or_insert_with(|| ColocatedSinkValue {
                         entries: Vec::new(),
                         compare_output_allele: output_allele_from_allele_string(
-                            &vcf_row.input_allele_string,
+                            &vcf_row.compare_allele_string,
                         )
                         .map(str::to_string),
                         unshifted_output_allele: vcf_row
@@ -1959,17 +1958,25 @@ mod tests {
         let matched = compare_existing_variant(&row, "AA/-", 101, 102).unwrap();
         assert_eq!(
             matched,
-            vec![MatchedVariantAllele {
-                a_allele: "-".to_string(),
-                a_index: 0,
-                b_allele: "-".to_string(),
-                b_index: 0,
-            }]
+            vec![
+                MatchedVariantAllele {
+                    a_allele: "-".to_string(),
+                    a_index: 0,
+                    b_allele: "-".to_string(),
+                    b_index: 0,
+                },
+                MatchedVariantAllele {
+                    a_allele: "A".to_string(),
+                    a_index: 0,
+                    b_allele: "-".to_string(),
+                    b_index: 0,
+                }
+            ]
         );
     }
 
     #[test]
-    fn compare_existing_variant_allows_unknown_alleles_on_exact_shifted_coords_only() {
+    fn compare_existing_variant_prefers_unshifted_coords_for_unknown_alleles() {
         let row = BuildRow {
             vcf_ref: "ACGT".to_string(),
             vcf_alt: "A".to_string(),
@@ -1988,11 +1995,11 @@ mod tests {
 
         assert_eq!(
             compare_existing_variant(&row, "HGMD_MUTATION", 101, 103),
-            Some(Vec::new())
+            None
         );
         assert_eq!(
             compare_existing_variant(&row, "HGMD_MUTATION", 100, 103),
-            None
+            Some(Vec::new())
         );
     }
 
@@ -2018,7 +2025,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_existing_variant_uses_parser_coords_for_unknown_insertions() {
+    fn compare_existing_variant_uses_minimized_coords_for_unknown_insertions() {
         let row = BuildRow {
             vcf_ref: "TTA".to_string(),
             vcf_alt: "TATATATA".to_string(),
@@ -2037,11 +2044,11 @@ mod tests {
 
         assert_eq!(
             compare_existing_variant(&row, "HGMD_MUTATION", 119247098, 119247097),
-            None
+            Some(Vec::new())
         );
         assert_eq!(
             compare_existing_variant(&row, "HGMD_MUTATION", 119247098, 119247099),
-            Some(Vec::new())
+            None
         );
     }
 
@@ -2172,7 +2179,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_existing_variant_rejects_unknown_alleles_on_unshifted_coords() {
+    fn compare_existing_variant_matches_unknown_alleles_on_unshifted_coords() {
         assert_eq!(
             compare_existing_variant_alleles(
                 "-/TTTT",
@@ -2185,7 +2192,7 @@ mod tests {
                 1735009,
                 1735008,
             ),
-            None
+            Some(Vec::new())
         );
     }
 
@@ -2268,7 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_existing_variant_uses_parser_allele_space_for_repeat_insertions() {
+    fn compare_existing_variant_uses_minimized_allele_space_for_repeat_insertions() {
         let row = BuildRow {
             vcf_ref: "TTA".to_string(),
             vcf_alt: "TATATATA".to_string(),
@@ -2291,7 +2298,7 @@ mod tests {
         assert_eq!(
             matched,
             vec![MatchedVariantAllele {
-                a_allele: "ATATATA".to_string(),
+                a_allele: "ATATA".to_string(),
                 a_index: 0,
                 b_allele: "ATATA".to_string(),
                 b_index: 2,
@@ -2300,7 +2307,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_existing_variant_matches_cosmic_insertion_on_parser_coords() {
+    fn compare_existing_variant_matches_cosmic_insertion_on_unshifted_coords() {
         let row = BuildRow {
             vcf_ref: "G".to_string(),
             vcf_alt: "GTTTT".to_string(),
@@ -2348,7 +2355,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_existing_variant_keeps_parser_allele_for_repeat_deletions() {
+    fn compare_existing_variant_rejects_parser_only_repeat_deletion_match() {
         let row = BuildRow {
             vcf_ref: "TAA".to_string(),
             vcf_alt: "TA".to_string(),
@@ -2356,31 +2363,107 @@ mod tests {
             input_start: 3_108_904,
             input_end: 3_108_905,
             compare_allele_string: "A/-".to_string(),
-            compare_start: 3_108_904,
+            compare_start: 3_108_905,
             compare_end: 3_108_904,
             unshifted_allele_string: None,
-            vep_start: 3_108_904,
+            vep_start: 3_108_905,
             vep_end: 3_108_904,
             unshifted_start: None,
             unshifted_end: None,
         };
 
-        let matched = compare_existing_variant(
-            &row,
-            "AAAAAAAAAAAAA/AAAAAAAAAA/AAAAAAAAAAA/AAAAAAAAAAAA/AAAAAAAAAAAAAA/AAAAAAAAAAAAAAA",
-            3_108_904,
-            3_108_916,
-        )
-        .unwrap();
+        assert_eq!(
+            compare_existing_variant(
+                &row,
+                "AAAAAAAAAAAAA/AAAAAAAAAA/AAAAAAAAAAA/AAAAAAAAAAAA/AAAAAAAAAAAAAA/AAAAAAAAAAAAAAA",
+                3_108_904,
+                3_108_916,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn compare_existing_variant_uses_minimized_deletion_for_frequency_match() {
+        let row = BuildRow {
+            vcf_ref: "CGGA".to_string(),
+            vcf_alt: "CA".to_string(),
+            input_allele_string: "GGA/A".to_string(),
+            input_start: 63_027_365,
+            input_end: 63_027_367,
+            compare_allele_string: "GG/-".to_string(),
+            compare_start: 63_027_365,
+            compare_end: 63_027_366,
+            unshifted_allele_string: None,
+            vep_start: 63_027_365,
+            vep_end: 63_027_366,
+            unshifted_start: None,
+            unshifted_end: None,
+        };
+
+        let matched = compare_existing_variant(&row, "GG/-", 63_027_365, 63_027_366).unwrap();
 
         assert_eq!(
             matched,
             vec![MatchedVariantAllele {
-                a_allele: "A".to_string(),
+                a_allele: "-".to_string(),
                 a_index: 0,
-                b_allele: "AAAAAAAAAAAA".to_string(),
-                b_index: 2,
+                b_allele: "-".to_string(),
+                b_index: 0,
             }]
+        );
+    }
+
+    #[test]
+    fn compare_existing_variant_rejects_parser_only_homopolymer_insertion_match() {
+        let row = BuildRow {
+            vcf_ref: "CA".to_string(),
+            vcf_alt: "CAA".to_string(),
+            input_allele_string: "A/AA".to_string(),
+            input_start: 1_861_111,
+            input_end: 1_861_111,
+            compare_allele_string: "-/A".to_string(),
+            compare_start: 1_861_112,
+            compare_end: 1_861_111,
+            unshifted_allele_string: None,
+            vep_start: 1_861_112,
+            vep_end: 1_861_111,
+            unshifted_start: None,
+            unshifted_end: None,
+        };
+
+        assert_eq!(
+            compare_existing_variant(
+                &row,
+                "AAAAAAAAAAAAAAAAAA/AAAAAAAAAA/AAAAAAAAAAAAA/AAAAAAAAAAAAAA/AAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAAAA",
+                1_861_111,
+                1_861_128,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn compare_existing_variant_matches_unknown_on_minimized_insertion_coords() {
+        let row = BuildRow {
+            vcf_ref: "AT".to_string(),
+            vcf_alt: "ATTTTT".to_string(),
+            input_allele_string: "T/TTTTT".to_string(),
+            input_start: 28_761_132,
+            input_end: 28_761_132,
+            compare_allele_string: "-/TTTT".to_string(),
+            compare_start: 28_761_133,
+            compare_end: 28_761_132,
+            unshifted_allele_string: None,
+            vep_start: 28_761_133,
+            vep_end: 28_761_132,
+            unshifted_start: None,
+            unshifted_end: None,
+        };
+
+        assert_eq!(
+            compare_existing_variant(&row, "COSMIC_MUTATION", 28_761_133, 28_761_132),
+            Some(Vec::new())
         );
     }
 

@@ -1599,7 +1599,8 @@ struct ColocatedEntry {
 #[derive(Debug, Default, Clone)]
 struct ColocatedData {
     entries: Vec<ColocatedEntry>,
-    /// Parser/input allele fallback for VEP `add_colocated_variant_info()`.
+    /// Active compare-space allele fallback for VEP
+    /// `add_colocated_variant_info()`.
     compare_output_allele: Option<String>,
     /// Genomic-shift original allele fallback for VEP
     /// `add_colocated_frequency_data()`.
