@@ -326,3 +326,43 @@ async fn test_roundtrip_golden_all_column_values() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_contig_parallelism_falls_back_for_single_output_partition() {
+    let input_vcf = workspace_path("vep-benchmark/data/golden/input_1000.vcf");
+    let cache_path = workspace_path("vep-benchmark/data/golden/cache");
+    let ref_fasta = workspace_path("vep-benchmark/data/golden/reference_chr1.fa");
+
+    if !input_vcf.exists() || is_lfs_pointer(&input_vcf) {
+        eprintln!(
+            "Skipping: test fixtures not found at {}",
+            input_vcf.display()
+        );
+        return;
+    }
+
+    let cache_with_metadata = common::cache_with_source_metadata(&cache_path, "ensembl");
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let output_path = tmp_dir.path().join("annotated_single_partition.vcf");
+
+    let config = vcf_sink::AnnotateVcfConfig {
+        everything: true,
+        extended_probes: true,
+        reference_fasta_path: Some(ref_fasta.to_str().unwrap().to_string()),
+        forks: Some(1),
+        contig_parallelism: 4,
+        ..Default::default()
+    };
+
+    let rows_written = vcf_sink::annotate_to_vcf(
+        input_vcf.to_str().unwrap(),
+        cache_with_metadata.path().to_str().unwrap(),
+        "parquet",
+        output_path.to_str().unwrap(),
+        &config,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(rows_written, 1000, "Should write 1000 annotated rows");
+}
