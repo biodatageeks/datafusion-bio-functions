@@ -95,6 +95,17 @@ pub struct LookupProvider {
     vcf_filter: Option<Expr>,
 }
 
+/// Runtime settings needed to execute a Fjall batch lookup outside the
+/// `LookupProvider` execution plan wrapper.
+#[cfg(feature = "kv-cache")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FjallLookupBatchSettings {
+    pub(crate) vcf_has_chr: bool,
+    pub(crate) vcf_zero_based: bool,
+    pub(crate) cache_zero_based: bool,
+    pub(crate) reference_fasta_path: Option<String>,
+}
+
 fn normalize_cache_output_type(data_type: &DataType) -> DataType {
     match data_type {
         DataType::Utf8View | DataType::LargeUtf8 => DataType::Utf8,
@@ -179,6 +190,18 @@ impl LookupProvider {
     pub fn set_vcf_filter(&mut self, filter: Option<Expr>) {
         self.vcf_filter = filter;
     }
+
+    /// Resolve the exact Fjall lookup settings used by the normal
+    /// `LookupProvider` scan path so direct per-buffer lookup can share them.
+    #[cfg(feature = "kv-cache")]
+    pub(crate) async fn fjall_batch_settings(&self) -> Result<FjallLookupBatchSettings> {
+        Ok(FjallLookupBatchSettings {
+            vcf_has_chr: has_chr_prefix(&self.session, &self.vcf_table).await?,
+            vcf_zero_based: self.coord_normalizer.input_zero_based,
+            cache_zero_based: self.coord_normalizer.cache_zero_based,
+            reference_fasta_path: self.reference_fasta_path.clone(),
+        })
+    }
 }
 
 /// Check whether the chrom column in the given table uses "chr" prefix (e.g. "chr1").
@@ -248,7 +271,7 @@ impl TableProvider for LookupProvider {
                 {
                     let store = kv_provider.store().clone();
 
-                    let vcf_has_chr = has_chr_prefix(&self.session, &self.vcf_table).await?;
+                    let fjall_settings = self.fjall_batch_settings().await?;
 
                     let vcf_df = self.session.table(&self.vcf_table).await?;
                     let vcf_df = if let Some(ref filter) = self.vcf_filter {
@@ -264,13 +287,14 @@ impl TableProvider for LookupProvider {
                         self.cache_columns.clone(),
                         KvMatchMode::Exact,
                         allele_matches as fn(&str, &str, &str) -> bool,
-                        vcf_has_chr,
-                        self.coord_normalizer.input_zero_based,
-                        self.coord_normalizer.cache_zero_based,
+                        fjall_settings.vcf_has_chr,
+                        fjall_settings.vcf_zero_based,
+                        fjall_settings.cache_zero_based,
                         self.extended_probes,
                         self.allowed_failed,
                     )?;
-                    exec = exec.with_reference_fasta_path(self.reference_fasta_path.clone());
+                    exec =
+                        exec.with_reference_fasta_path(fjall_settings.reference_fasta_path.clone());
                     if let Some(ref sink) = self.colocated_sink {
                         exec = exec.with_colocated_sink(Arc::clone(sink));
                     }
@@ -338,6 +362,8 @@ impl TableProvider for LookupProvider {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "kv-cache")]
+    use super::LookupProvider;
     use crate::create_vep_session;
     #[cfg(feature = "kv-cache")]
     use crate::kv_cache::{
@@ -453,6 +479,70 @@ mod tests {
         )
         .unwrap();
         MemTable::try_new(schema, vec![vec![batch]]).unwrap()
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fjall_batch_settings_match_lookup_provider_metadata() {
+        let ctx = create_vep_session();
+        let vcf_schema = schema_with_coord_metadata(
+            vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("ref", DataType::Utf8, false),
+                Field::new("alt", DataType::Utf8, false),
+            ],
+            true,
+        );
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"])),
+                Arc::new(Int64Array::from(vec![99])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(StringArray::from(vec!["G"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema.clone(), vec![vec![vcf_batch]]).unwrap();
+        ctx.register_table("vcf_fjall_settings", Arc::new(vcf))
+            .unwrap();
+
+        let cache_schema = schema_with_coord_metadata(
+            vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("variation_name", DataType::Utf8, true),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("failed", DataType::Int64, false),
+            ],
+            false,
+        );
+        let provider = LookupProvider::new(
+            Arc::new(ctx),
+            "vcf_fjall_settings".to_string(),
+            "cache_fjall_settings".to_string(),
+            vcf_schema.as_ref().clone(),
+            cache_schema.as_ref().clone(),
+            vec!["variation_name".to_string()],
+            true,
+            0,
+            Some("/tmp/reference.fa".to_string()),
+        )
+        .unwrap();
+
+        let settings = provider.fjall_batch_settings().await.unwrap();
+
+        assert!(settings.vcf_has_chr);
+        assert!(settings.vcf_zero_based);
+        assert!(!settings.cache_zero_based);
+        assert_eq!(
+            settings.reference_fasta_path.as_deref(),
+            Some("/tmp/reference.fa")
+        );
     }
 
     #[cfg(feature = "kv-cache")]
