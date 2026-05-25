@@ -84,7 +84,6 @@ use crate::allele::{
 use crate::annotation_store::{AnnotationBackend, build_store};
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 use crate::config;
-use crate::coordinate::CoordinateNormalizer;
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
 #[cfg(feature = "kv-cache")]
@@ -9762,7 +9761,7 @@ fn annotate_chunked_lookup_batches(
             config.extended_probes,
             config.allowed_failed,
             colocated_sink.clone(),
-            None,
+            config.reference_fasta_path.clone(),
         )?;
         looked_up_batches.push(looked_up);
     }
@@ -10955,14 +10954,6 @@ async fn prepare_contig_context(
         .as_arrow()
         .clone();
     let cache_schema = session.table(&var_table).await?.schema().as_arrow().clone();
-    if config.chunked_buffer_lookup {
-        let coord_normalizer = CoordinateNormalizer::from_schemas(
-            &Arc::new(vcf_schema.clone()),
-            &Arc::new(cache_schema.clone()),
-        );
-        config.lookup_vcf_zero_based = coord_normalizer.input_zero_based;
-        config.lookup_cache_zero_based = coord_normalizer.cache_zero_based;
-    }
     let mut provider = LookupProvider::new(
         Arc::clone(&session),
         config.vcf_table.clone(),
@@ -10972,9 +10963,16 @@ async fn prepare_contig_context(
         config.cache_columns.clone(),
         config.extended_probes,
         config.allowed_failed,
-        None, // reference_fasta_path is for HGVS hydration, not lookup
+        config.reference_fasta_path.clone(),
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
+    #[cfg(feature = "kv-cache")]
+    if use_fjall && config.chunked_buffer_lookup {
+        let fjall_settings = provider.fjall_batch_settings().await?;
+        config.lookup_vcf_has_chr = fjall_settings.vcf_has_chr;
+        config.lookup_vcf_zero_based = fjall_settings.vcf_zero_based;
+        config.lookup_cache_zero_based = fjall_settings.cache_zero_based;
+    }
     let mut lookup_partitions = if use_fjall && config.chunked_buffer_lookup {
         let raw_vcf_df = session
             .table(&config.vcf_table)
