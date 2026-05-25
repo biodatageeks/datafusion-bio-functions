@@ -84,8 +84,11 @@ use crate::allele::{
 use crate::annotation_store::{AnnotationBackend, build_store};
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 use crate::config;
+use crate::coordinate::CoordinateNormalizer;
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
+#[cfg(feature = "kv-cache")]
+use crate::kv_cache::cache_exec::lookup_batch_with_store;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::partitioned_cache::PartitionedParquetCache;
@@ -4306,11 +4309,40 @@ impl AnnotateProvider {
             .filter(|value| *value > 0)
             .or_else(|| forks.map(|value| value.max(1)))
             .unwrap_or(target_partitions);
+        let contig_parallelism = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "contig_parallelism"))
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
+        let contig_parallelism = if fetch_limit.is_some() {
+            1
+        } else {
+            contig_parallelism
+        };
         let inline_lookup = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "inline_lookup"))
             .unwrap_or(forks == Some(0));
+        let chunked_buffer_lookup = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_bool_option(opts, "chunked_buffer_lookup"))
+            .unwrap_or(false);
+        #[cfg(feature = "kv-cache")]
+        if chunked_buffer_lookup && kv_store.is_none() {
+            return Err(DataFusionError::Execution(
+                "annotate_vep(): chunked_buffer_lookup requires use_fjall=true".to_string(),
+            ));
+        }
+        #[cfg(not(feature = "kv-cache"))]
+        if chunked_buffer_lookup {
+            return Err(DataFusionError::Execution(
+                "annotate_vep(): chunked_buffer_lookup requires kv-cache feature".to_string(),
+            ));
+        }
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
 
@@ -4372,7 +4404,12 @@ impl AnnotateProvider {
             fetch_limit,
             target_partitions,
             annotation_workers,
+            chunked_buffer_lookup,
+            lookup_vcf_has_chr: true,
+            lookup_vcf_zero_based: true,
+            lookup_cache_zero_based: false,
             inline_lookup,
+            deregister_global_kv_on_finish: contig_parallelism <= 1,
             #[cfg(feature = "kv-cache")]
             use_fjall: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
@@ -4391,6 +4428,7 @@ impl AnnotateProvider {
             projected_schema,
             self.schema.clone(),
             contigs,
+            contig_parallelism,
             Arc::clone(&self.session),
             Arc::new(cache.clone()),
             config,
@@ -7310,8 +7348,17 @@ struct ContigAnnotationConfig {
     target_partitions: usize,
     /// Maximum number of VEP input-buffer annotation jobs to execute concurrently.
     annotation_workers: usize,
+    /// Experimental VEP-style flow: build raw VCF input buffers first, then
+    /// run fjall lookup + annotation inside each buffer chunk.
+    chunked_buffer_lookup: bool,
+    /// Coordinate metadata used by direct fjall lookup in the chunked-buffer path.
+    lookup_vcf_has_chr: bool,
+    lookup_vcf_zero_based: bool,
+    lookup_cache_zero_based: bool,
     /// Poll lookup streams inline instead of spawning lookup tasks.
     inline_lookup: bool,
+    /// Whether this stream owns the shared global Fjall variation table.
+    deregister_global_kv_on_finish: bool,
     pick_flags: PickFlags,
     /// When true, use fjall KV store for variation lookup + SIFT instead of parquet.
     #[cfg(feature = "kv-cache")]
@@ -7329,7 +7376,7 @@ struct ContigAnnotationConfig {
 struct ContigAnnotationExec {
     projected_schema: SchemaRef,
     full_schema: SchemaRef,
-    contigs: Vec<String>,
+    contig_partitions: Vec<Vec<String>>,
     session: Arc<SessionContext>,
     cache: Arc<PartitionedParquetCache>,
     config: ContigAnnotationConfig,
@@ -7341,20 +7388,22 @@ impl ContigAnnotationExec {
         projected_schema: SchemaRef,
         full_schema: SchemaRef,
         contigs: Vec<String>,
+        contig_parallelism: usize,
         session: Arc<SessionContext>,
         cache: Arc<PartitionedParquetCache>,
         config: ContigAnnotationConfig,
     ) -> Self {
+        let contig_partitions = partition_contigs_for_execution(contigs, contig_parallelism);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(contig_partitions.len()),
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
         Self {
             projected_schema,
             full_schema,
-            contigs,
+            contig_partitions,
             session,
             cache,
             config,
@@ -7367,8 +7416,9 @@ impl Debug for ContigAnnotationExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ContigAnnotationExec {{ contigs: {}, schema_fields: {} }}",
-            self.contigs.len(),
+            "ContigAnnotationExec {{ contig_partitions: {}, contigs: {}, schema_fields: {} }}",
+            self.contig_partitions.len(),
+            self.contig_partitions.iter().map(Vec::len).sum::<usize>(),
             self.projected_schema.fields().len()
         )
     }
@@ -7376,7 +7426,12 @@ impl Debug for ContigAnnotationExec {
 
 impl DisplayAs for ContigAnnotationExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ContigAnnotationExec: contigs={}", self.contigs.len())
+        write!(
+            f,
+            "ContigAnnotationExec: contig_partitions={} contigs={}",
+            self.contig_partitions.len(),
+            self.contig_partitions.iter().map(Vec::len).sum::<usize>()
+        )
     }
 }
 
@@ -7410,18 +7465,41 @@ impl ExecutionPlan for ContigAnnotationExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let contigs = self
+            .contig_partitions
+            .get(partition)
+            .cloned()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "ContigAnnotationExec partition {partition} out of range ({} partitions)",
+                    self.contig_partitions.len()
+                ))
+            })?;
         Ok(Box::pin(ContigAnnotationStream::new(
             self.projected_schema.clone(),
             self.full_schema.clone(),
-            self.contigs.clone(),
+            contigs,
             Arc::clone(&self.session),
             Arc::clone(&self.cache),
             self.config.clone(),
         )))
     }
+}
+
+fn partition_contigs_for_execution(
+    contigs: Vec<String>,
+    requested_parallelism: usize,
+) -> Vec<Vec<String>> {
+    if contigs.is_empty() {
+        return vec![Vec::new()];
+    }
+    if requested_parallelism <= 1 {
+        return vec![contigs];
+    }
+    contigs.into_iter().map(|contig| vec![contig]).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -8440,7 +8518,7 @@ impl ContigAnnotationStream {
             StreamState::AnnotatingContig(ann) => {
                 abort_annotation_lookup_workers(ann);
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
-                if ann.config.use_fjall {
+                if ann.config.use_fjall && ann.config.deregister_global_kv_on_finish {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
                 }
                 ann.ephemeral_tables.clear();
@@ -8448,7 +8526,7 @@ impl ContigAnnotationStream {
             StreamState::ParallelAnnotatingContig(par) => {
                 par.abort_background_work();
                 deregister_tables_sync(&par.ann.session, &par.ann.ephemeral_tables);
-                if par.ann.config.use_fjall {
+                if par.ann.config.use_fjall && par.ann.config.deregister_global_kv_on_finish {
                     let _ = par.ann.session.deregister_table("__vep_kv_variation");
                 }
                 par.ann.ephemeral_tables.clear();
@@ -8459,13 +8537,13 @@ impl ContigAnnotationStream {
             } => {
                 abort_annotation_lookup_workers(ann);
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
-                if ann.config.use_fjall {
+                if ann.config.use_fjall && ann.config.deregister_global_kv_on_finish {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
                 }
                 ann.ephemeral_tables.clear();
             }
             StreamState::CleaningUp(_) | StreamState::ErrorCleaningUp(_, _) => {
-                if self.config.use_fjall {
+                if self.config.use_fjall && self.config.deregister_global_kv_on_finish {
                     let _ = self.session.deregister_table("__vep_kv_variation");
                 }
             }
@@ -8473,7 +8551,7 @@ impl ContigAnnotationStream {
             | StreamState::PreparingContig(_)
             | StreamState::FinalCleanup(_)
             | StreamState::Done => {
-                if self.config.use_fjall {
+                if self.config.use_fjall && self.config.deregister_global_kv_on_finish {
                     let _ = self.session.deregister_table("__vep_kv_variation");
                 }
             }
@@ -9531,33 +9609,22 @@ fn prepare_input_buffer_annotation_jobs(
     Ok(jobs)
 }
 
-fn annotate_input_buffer_job(
-    shared: Arc<SharedContigAnnotationContext>,
-    job: InputBufferAnnotationJob,
-    projection: Option<Vec<usize>>,
-) -> Result<AnnotatedInputBuffer> {
-    let job_started = Instant::now();
-    pipeline_trace::emit(
-        "annotation",
-        "start",
-        &[
-            ("chrom", TraceValue::Str(&job.chrom)),
-            ("buffer_id", TraceValue::Usize(job.buffer_id)),
-            ("rows", TraceValue::Usize(job.rows)),
-            ("queue_wait", TraceValue::Duration(job.queued_at.elapsed())),
-        ],
-    );
+fn annotate_batches_with_prepared_context(
+    shared: &SharedContigAnnotationContext,
+    ctx: &PreparedContext<'_>,
+    colocated_map: &HashMap<ColocatedKey, ColocatedData>,
+    batches: &[RecordBatch],
+    projection: Option<&[usize]>,
+) -> Result<VecDeque<RecordBatch>> {
     let tmp_provider = shared.tmp_provider.as_ref();
     let engine = shared.engine.as_ref();
     let config = &shared.config;
     let profile = shared.profile.clone();
     let csq_col_idx = tmp_provider.vcf_field_count();
-    let skip_csq = projection
-        .as_deref()
-        .is_some_and(|indices| !indices.contains(&csq_col_idx));
+    let skip_csq = projection.is_some_and(|indices| !indices.contains(&csq_col_idx));
     let typed_cols_start = csq_col_idx + 2;
     let typed_cols_end = typed_cols_start + tmp_provider.annotation_column_defs.len();
-    let skip_typed_cols = projection.as_deref().map_or(false, |indices| {
+    let skip_typed_cols = projection.is_some_and(|indices| {
         !indices
             .iter()
             .any(|&i| i >= typed_cols_start && i < typed_cols_end)
@@ -9573,16 +9640,9 @@ fn annotate_input_buffer_job(
             .build_from_path(path)
             .ok()
     });
-    let mut out = VecDeque::with_capacity(job.batches.len());
+    let mut out = VecDeque::with_capacity(batches.len());
 
-    let prepared_context_started = Instant::now();
-    let materialized_translations = materialize_buffer_context_translations(&shared, &job.context);
-    let ctx = prepared_context_from_buffer(&job.context, &shared, &materialized_translations);
-    record_contig_profile(&profile, |profile| {
-        profile.prepared_context += prepared_context_started.elapsed();
-    });
-
-    for batch in &job.batches {
+    for batch in batches {
         if sift_enabled && shared.sift_direct.is_some() {
             let sift_started = Instant::now();
             load_sift_for_batch(
@@ -9606,8 +9666,8 @@ fn annotate_input_buffer_job(
         let annotated = tmp_provider.annotate_batch_with_transcript_engine(
             batch,
             engine,
-            &ctx,
-            &job.colocated_map,
+            ctx,
+            colocated_map,
             &mut sift_cache,
             #[cfg(feature = "kv-cache")]
             sift_kv,
@@ -9625,7 +9685,7 @@ fn annotate_input_buffer_job(
             profile.engine += engine_started.elapsed();
         });
 
-        if let Some(indices) = projection.as_deref() {
+        if let Some(indices) = projection {
             let projection_started = Instant::now();
             let projected = annotated.project(indices)?;
             record_contig_profile(&profile, |profile| {
@@ -9636,6 +9696,177 @@ fn annotate_input_buffer_job(
             out.push_back(annotated);
         }
     }
+
+    Ok(out)
+}
+
+fn annotate_batches_with_buffer_context(
+    shared: &SharedContigAnnotationContext,
+    buffer_context: &BufferAnnotationContext,
+    colocated_map: &HashMap<ColocatedKey, ColocatedData>,
+    batches: &[RecordBatch],
+    projection: Option<&[usize]>,
+) -> Result<VecDeque<RecordBatch>> {
+    let profile = shared.profile.clone();
+    let prepared_context_started = Instant::now();
+    let materialized_translations = materialize_buffer_context_translations(shared, buffer_context);
+    let ctx = prepared_context_from_buffer(buffer_context, shared, &materialized_translations);
+    record_contig_profile(&profile, |profile| {
+        profile.prepared_context += prepared_context_started.elapsed();
+    });
+
+    annotate_batches_with_prepared_context(shared, &ctx, colocated_map, batches, projection)
+}
+
+#[cfg(feature = "kv-cache")]
+fn annotate_chunked_lookup_batches(
+    shared: &SharedContigAnnotationContext,
+    ctx: &PreparedContext<'_>,
+    chrom: &str,
+    raw_batches: Vec<RecordBatch>,
+    projection: Option<&[usize]>,
+) -> Result<(usize, VecDeque<RecordBatch>)> {
+    let config = &shared.config;
+    let store = config.kv_store.as_ref().cloned().ok_or_else(|| {
+        DataFusionError::Execution(
+            "chunked_buffer_lookup requires an open fjall variation store".to_string(),
+        )
+    })?;
+    let rows = raw_batches
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum::<usize>();
+    pipeline_trace::emit(
+        "annotation",
+        "buffer_lookup_start",
+        &[
+            ("chrom", TraceValue::Str(chrom)),
+            ("rows", TraceValue::Usize(rows)),
+            ("batches", TraceValue::Usize(raw_batches.len())),
+        ],
+    );
+
+    let colocated_sink: Option<ColocatedSink> = config
+        .flags
+        .check_existing
+        .then(|| Arc::new(Mutex::new(HashMap::new())));
+    let mut looked_up_batches = Vec::with_capacity(raw_batches.len());
+    for raw_batch in &raw_batches {
+        let looked_up = lookup_batch_with_store(
+            raw_batch,
+            Arc::clone(&store),
+            config.cache_columns.clone(),
+            config.lookup_vcf_has_chr,
+            config.lookup_vcf_zero_based,
+            config.lookup_cache_zero_based,
+            config.extended_probes,
+            config.allowed_failed,
+            colocated_sink.clone(),
+            None,
+        )?;
+        looked_up_batches.push(looked_up);
+    }
+
+    let colocated_map = if let Some(sink) = colocated_sink {
+        drain_colocated_sink(&sink)?
+    } else {
+        HashMap::new()
+    };
+    let out = annotate_batches_with_prepared_context(
+        shared,
+        ctx,
+        &colocated_map,
+        &looked_up_batches,
+        projection,
+    )?;
+    pipeline_trace::emit(
+        "annotation",
+        "buffer_lookup_done",
+        &[
+            ("chrom", TraceValue::Str(chrom)),
+            ("rows", TraceValue::Usize(rows)),
+            ("output_batches", TraceValue::Usize(out.len())),
+        ],
+    );
+
+    Ok((rows, out))
+}
+
+#[cfg(feature = "kv-cache")]
+fn annotate_chunked_lookup_input_buffer_job(
+    shared: Arc<SharedContigAnnotationContext>,
+    job: InputBufferAnnotationJob,
+    projection: Option<Vec<usize>>,
+) -> Result<AnnotatedInputBuffer> {
+    if job.batches.is_empty() {
+        return Ok(AnnotatedInputBuffer {
+            buffer_id: job.buffer_id,
+            rows: job.rows,
+            batches: VecDeque::new(),
+        });
+    }
+
+    let profile = shared.profile.clone();
+    let prepared_context_started = Instant::now();
+    let materialized_translations = materialize_buffer_context_translations(&shared, &job.context);
+    let ctx = prepared_context_from_buffer(&job.context, &shared, &materialized_translations);
+    record_contig_profile(&profile, |profile| {
+        profile.prepared_context += prepared_context_started.elapsed();
+    });
+
+    let (_, out) = annotate_chunked_lookup_batches(
+        &shared,
+        &ctx,
+        &job.chrom,
+        job.batches,
+        projection.as_deref(),
+    )?;
+
+    Ok(AnnotatedInputBuffer {
+        buffer_id: job.buffer_id,
+        rows: job.rows,
+        batches: out,
+    })
+}
+
+#[cfg(not(feature = "kv-cache"))]
+fn annotate_chunked_lookup_input_buffer_job(
+    _shared: Arc<SharedContigAnnotationContext>,
+    _job: InputBufferAnnotationJob,
+    _projection: Option<Vec<usize>>,
+) -> Result<AnnotatedInputBuffer> {
+    Err(DataFusionError::Execution(
+        "chunked_buffer_lookup requires kv-cache feature".to_string(),
+    ))
+}
+
+fn annotate_input_buffer_job(
+    shared: Arc<SharedContigAnnotationContext>,
+    job: InputBufferAnnotationJob,
+    projection: Option<Vec<usize>>,
+) -> Result<AnnotatedInputBuffer> {
+    let job_started = Instant::now();
+    pipeline_trace::emit(
+        "annotation",
+        "start",
+        &[
+            ("chrom", TraceValue::Str(&job.chrom)),
+            ("buffer_id", TraceValue::Usize(job.buffer_id)),
+            ("rows", TraceValue::Usize(job.rows)),
+            ("queue_wait", TraceValue::Duration(job.queued_at.elapsed())),
+        ],
+    );
+    if shared.config.chunked_buffer_lookup {
+        return annotate_chunked_lookup_input_buffer_job(shared, job, projection);
+    }
+
+    let out = annotate_batches_with_buffer_context(
+        &shared,
+        &job.context,
+        job.colocated_map.as_ref(),
+        &job.batches,
+        projection.as_deref(),
+    )?;
 
     let output_batches = out.len();
     pipeline_trace::emit(
@@ -10179,7 +10410,7 @@ impl Stream for ContigAnnotationStream {
                         // variation table if fjall was used, via async cleanup
                         // future (safe on any Tokio runtime flavor).
                         #[cfg(feature = "kv-cache")]
-                        if self.config.use_fjall {
+                        if self.config.use_fjall && self.config.deregister_global_kv_on_finish {
                             let session = Arc::clone(&self.session);
                             let fut: CleanupFuture = Box::pin(async move {
                                 crate::partitioned_cache::deregister_table(
@@ -10575,7 +10806,7 @@ async fn prepare_contig_context(
     session: Arc<SessionContext>,
     cache: Arc<PartitionedParquetCache>,
     chrom: String,
-    config: ContigAnnotationConfig,
+    mut config: ContigAnnotationConfig,
     full_schema: SchemaRef,
 ) -> Result<Option<ContigReadyState>> {
     let t_contig = profile_start!();
@@ -10724,6 +10955,14 @@ async fn prepare_contig_context(
         .as_arrow()
         .clone();
     let cache_schema = session.table(&var_table).await?.schema().as_arrow().clone();
+    if config.chunked_buffer_lookup {
+        let coord_normalizer = CoordinateNormalizer::from_schemas(
+            &Arc::new(vcf_schema.clone()),
+            &Arc::new(cache_schema.clone()),
+        );
+        config.lookup_vcf_zero_based = coord_normalizer.input_zero_based;
+        config.lookup_cache_zero_based = coord_normalizer.cache_zero_based;
+    }
     let mut provider = LookupProvider::new(
         Arc::clone(&session),
         config.vcf_table.clone(),
@@ -10736,23 +10975,51 @@ async fn prepare_contig_context(
         None, // reference_fasta_path is for HGVS hydration, not lookup
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
-    let partition_coloc_sinks: Vec<ColocatedSink> = if config.flags.check_existing && use_fjall {
-        (0..config.target_partitions)
-            .map(|_| Arc::new(Mutex::new(HashMap::new())))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if config.flags.check_existing {
-        if use_fjall {
-            provider.set_partition_colocated_sinks(partition_coloc_sinks.clone());
-        } else {
-            provider.set_colocated_sink(Arc::clone(&fallback_coloc_sink));
+    let mut lookup_partitions = if use_fjall && config.chunked_buffer_lookup {
+        let raw_vcf_df = session
+            .table(&config.vcf_table)
+            .await?
+            .filter(col("chrom").eq(lit(&*chrom)))?;
+        let raw_plan = raw_vcf_df.create_physical_plan().await?;
+        let partition_count = raw_plan.output_partitioning().partition_count().max(1);
+        let task_ctx = session.task_ctx();
+        let mut handles = VecDeque::with_capacity(partition_count);
+        for partition_id in 0..partition_count {
+            let sink = Arc::new(Mutex::new(HashMap::new()));
+            if config.inline_lookup {
+                handles.push_back(inline_lookup_partition(
+                    Arc::clone(&raw_plan),
+                    Arc::clone(&task_ctx),
+                    partition_id,
+                    chrom.to_string(),
+                    sink,
+                )?);
+            } else {
+                handles.push_back(spawn_lookup_partition_worker(
+                    Arc::clone(&raw_plan),
+                    Arc::clone(&task_ctx),
+                    partition_id,
+                    chrom.to_string(),
+                    sink,
+                    LOOKUP_PARTITION_QUEUE_BATCHES,
+                    pipeline_profile.clone(),
+                ));
+            }
         }
-    }
-    let session_state = session.state();
-    let plan = provider.scan(&session_state, None, &[], None).await?;
-    let mut lookup_partitions = if use_fjall {
+        handles
+    } else if use_fjall {
+        let partition_coloc_sinks: Vec<ColocatedSink> = if config.flags.check_existing {
+            (0..config.target_partitions)
+                .map(|_| Arc::new(Mutex::new(HashMap::new())))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if config.flags.check_existing {
+            provider.set_partition_colocated_sinks(partition_coloc_sinks.clone());
+        }
+        let session_state = session.state();
+        let plan = provider.scan(&session_state, None, &[], None).await?;
         let partition_count = plan.output_partitioning().partition_count().max(1);
         if config.flags.check_existing && partition_count > partition_coloc_sinks.len() {
             return Err(DataFusionError::Execution(format!(
@@ -10790,6 +11057,11 @@ async fn prepare_contig_context(
         }
         handles
     } else {
+        if config.flags.check_existing {
+            provider.set_colocated_sink(Arc::clone(&fallback_coloc_sink));
+        }
+        let session_state = session.state();
+        let plan = provider.scan(&session_state, None, &[], None).await?;
         let lookup_stream = plan.execute(0, session.task_ctx())?;
         if config.inline_lookup {
             VecDeque::from([LookupPartitionHandle::Inline(InlineLookupPartitionHandle {
@@ -11104,6 +11376,16 @@ impl TableProvider for AnnotateProvider {
                 None
             };
 
+            #[cfg(feature = "kv-cache")]
+            if use_fjall && !self.session.table_exist("__vep_kv_variation")? {
+                let store = kv_store_arc
+                    .as_ref()
+                    .expect("kv_store must be set when use_fjall=true");
+                let kv_provider = KvCacheTableProvider::from_store(Arc::clone(store));
+                self.session
+                    .register_table("__vep_kv_variation", Arc::new(kv_provider))?;
+            }
+
             let (available_cache_columns, sample_table_to_deregister) = if use_fjall {
                 #[cfg(feature = "kv-cache")]
                 {
@@ -11255,7 +11537,12 @@ mod tests {
             fetch_limit: None,
             target_partitions: 1,
             annotation_workers: 1,
+            chunked_buffer_lookup: false,
+            lookup_vcf_has_chr: true,
+            lookup_vcf_zero_based: true,
+            lookup_cache_zero_based: false,
             inline_lookup: false,
+            deregister_global_kv_on_finish: true,
             pick_flags: PickFlags::default(),
             #[cfg(feature = "kv-cache")]
             use_fjall: true,
@@ -11322,6 +11609,28 @@ mod tests {
 
     fn minimal_shared_contig_annotation_context() -> Arc<SharedContigAnnotationContext> {
         minimal_shared_contig_annotation_context_with_features(Vec::new(), Vec::new())
+    }
+
+    fn minimal_contig_annotation_state(config: ContigAnnotationConfig) -> ContigAnnotationState {
+        let mut shared = minimal_shared_contig_annotation_context();
+        Arc::get_mut(&mut shared).unwrap().config = config.clone();
+        let worker = AnnotationWorkerState::new(shared).unwrap();
+
+        ContigAnnotationState {
+            lookup_partitions: LookupPartitionFanIn::new(
+                VecDeque::new(),
+                LOOKUP_PARTITION_QUEUE_BATCHES,
+            ),
+            worker,
+            ephemeral_tables: Vec::new(),
+            chrom: "chr1".to_string(),
+            config,
+            session: Arc::new(SessionContext::new()),
+            t_contig: Instant::now(),
+            contig_rows: 0,
+            lookup_wait_started: None,
+            ordered_lookup_wait_started: None,
+        }
     }
 
     #[test]
@@ -12920,6 +13229,20 @@ mod tests {
 
         config.annotation_workers = 2;
         assert!(should_parallelize_input_buffers(&config));
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[test]
+    fn test_chunked_lookup_keeps_buffer_level_parallelism() {
+        let mut config = minimal_contig_annotation_config();
+        config.annotation_workers = 8;
+        config.chunked_buffer_lookup = true;
+        config.use_fjall = true;
+        let ann = minimal_contig_annotation_state(config);
+
+        let par = ParallelAnnotationState::new(ann);
+
+        assert_eq!(par.max_parallel, 8);
     }
 
     #[cfg(feature = "kv-cache")]

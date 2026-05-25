@@ -28,8 +28,8 @@ use super::key_encoding::chrom_to_code;
 use super::kv_store::VepKvStore;
 use super::position_entry::{PositionEntryReader, make_builder};
 use crate::allele::{
-    VariantAlleleInput, get_matched_variant_alleles, vcf_to_vep_allele, vcf_to_vep_input_allele,
-    vep_norm_end, vep_norm_start,
+    VariantAlleleInput, allele_matches, get_matched_variant_alleles, vcf_to_vep_allele,
+    vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::variant_lookup_exec::{
     AF_COL_NAMES, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -76,6 +76,31 @@ pub struct KvLookupExec {
     reference_fasta_path: Option<String>,
 }
 
+fn build_lookup_output_schema(
+    input_schema: SchemaRef,
+    cache_schema: SchemaRef,
+    cache_columns: &[String],
+) -> (SchemaRef, Vec<usize>) {
+    let mut output_col_positions = Vec::new();
+    let mut fields: Vec<Arc<Field>> = input_schema.fields().iter().cloned().collect();
+    for col_name in cache_columns {
+        if let Ok(field) = cache_schema.field_with_name(col_name) {
+            fields.push(Arc::new(Field::new(
+                format!("cache_{}", field.name()),
+                normalize_cache_output_type(field.data_type()),
+                true,
+            )));
+            if let Ok(idx) = cache_schema.index_of(col_name) {
+                output_col_positions.push(idx);
+            }
+        }
+    }
+    (
+        Arc::new(datafusion::arrow::datatypes::Schema::new(fields)),
+        output_col_positions,
+    )
+}
+
 impl KvLookupExec {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -91,23 +116,8 @@ impl KvLookupExec {
         allowed_failed: i64,
     ) -> Result<Self> {
         let input_schema = input.schema();
-        let cache_schema = store.schema();
-
-        let mut output_col_positions = Vec::new();
-        let mut fields: Vec<Arc<Field>> = input_schema.fields().iter().cloned().collect();
-        for col_name in &cache_columns {
-            if let Ok(field) = cache_schema.field_with_name(col_name) {
-                fields.push(Arc::new(Field::new(
-                    format!("cache_{}", field.name()),
-                    normalize_cache_output_type(field.data_type()),
-                    true,
-                )));
-                if let Ok(idx) = cache_schema.index_of(col_name) {
-                    output_col_positions.push(idx);
-                }
-            }
-        }
-        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
+        let (schema, output_col_positions) =
+            build_lookup_output_schema(input_schema, store.schema().clone(), &cache_columns);
 
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -321,6 +331,13 @@ struct LookupProfile {
     batches: u64,
     input_rows: u64,
     output_rows: u64,
+    probes: u64,
+    point_gets: u64,
+    range_prefetch_batches: u64,
+    range_prefetch_entries: u64,
+    range_prefetch_bytes: u64,
+    range_prefetch_skipped: u64,
+    range_prefetch: Duration,
     extract_cols: Duration,
     match_loop: Duration,
     vcf_take: Duration,
@@ -329,7 +346,7 @@ struct LookupProfile {
 
 impl LookupProfile {
     fn total_known(&self) -> Duration {
-        self.extract_cols + self.match_loop + self.vcf_take + self.cache_build
+        self.extract_cols + self.range_prefetch + self.match_loop + self.vcf_take + self.cache_build
     }
 
     fn pct(stage: Duration, total: Duration) -> f64 {
@@ -353,18 +370,26 @@ impl LookupProfile {
             self.output_rows as f64 / total.as_secs_f64()
         };
         eprintln!(
-            "[vep-kv-profile] batches={} input_rows={} output_rows={} total_s={:.3} input_rows_per_s={:.1} output_rows_per_s={:.1}",
+            "[vep-kv-profile] batches={} input_rows={} output_rows={} probes={} point_gets={} range_prefetch_batches={} range_prefetch_entries={} range_prefetch_bytes={} range_prefetch_skipped={} total_s={:.3} input_rows_per_s={:.1} output_rows_per_s={:.1}",
             self.batches,
             self.input_rows,
             self.output_rows,
+            self.probes,
+            self.point_gets,
+            self.range_prefetch_batches,
+            self.range_prefetch_entries,
+            self.range_prefetch_bytes,
+            self.range_prefetch_skipped,
             total.as_secs_f64(),
             input_rate,
             output_rate
         );
         eprintln!(
-            "[vep-kv-profile] extract_cols={:.3}s ({:.1}%) match_loop={:.3}s ({:.1}%) vcf_take={:.3}s ({:.1}%) cache_build={:.3}s ({:.1}%)",
+            "[vep-kv-profile] extract_cols={:.3}s ({:.1}%) range_prefetch={:.3}s ({:.1}%) match_loop={:.3}s ({:.1}%) vcf_take={:.3}s ({:.1}%) cache_build={:.3}s ({:.1}%)",
             self.extract_cols.as_secs_f64(),
             Self::pct(self.extract_cols, total),
+            self.range_prefetch.as_secs_f64(),
+            Self::pct(self.range_prefetch, total),
             self.match_loop.as_secs_f64(),
             Self::pct(self.match_loop, total),
             self.vcf_take.as_secs_f64(),
@@ -373,6 +398,34 @@ impl LookupProfile {
             Self::pct(self.cache_build, total),
         );
     }
+}
+
+fn kv_range_prefetch_enabled() -> bool {
+    std::env::var("VEP_KV_RANGE_PREFETCH")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+}
+
+fn kv_range_prefetch_max_span() -> i64 {
+    std::env::var("VEP_KV_RANGE_PREFETCH_MAX_SPAN")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(10_000_000)
+        .max(0)
+}
+
+fn kv_range_prefetch_max_entries() -> usize {
+    std::env::var("VEP_KV_RANGE_PREFETCH_MAX_ENTRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100_000)
+}
+
+fn kv_range_prefetch_max_bytes() -> usize {
+    std::env::var("VEP_KV_RANGE_PREFETCH_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(128 * 1024 * 1024)
 }
 
 enum StringColumnView<'a> {
@@ -530,6 +583,95 @@ impl KvLookupStream {
         // Reusable allele match buffer — avoids alloc per row.
         let mut matched_allele_rows: Vec<usize> = Vec::new();
 
+        let range_prefetch_started = if self.profile_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let mut range_prefetch: Option<HashMap<i64, fjall::UserValue>> = None;
+        if kv_range_prefetch_enabled() && num_rows > 1 {
+            let mut batch_chrom_code: Option<u16> = None;
+            let mut min_probe = i64::MAX;
+            let mut max_probe = i64::MIN;
+            let mut eligible = true;
+
+            for row in 0..num_rows {
+                let raw_chrom = chroms.value_or_empty(row);
+                let chrom = if self.vcf_has_chr {
+                    raw_chrom.strip_prefix("chr").unwrap_or(raw_chrom)
+                } else {
+                    raw_chrom
+                };
+                let chrom_code = chrom_to_code(chrom);
+                if batch_chrom_code
+                    .replace(chrom_code)
+                    .is_some_and(|prev| prev != chrom_code)
+                {
+                    eligible = false;
+                    break;
+                }
+
+                let (norm_start, norm_end) = normalize_vcf_coords(
+                    starts[row],
+                    ends[row],
+                    self.vcf_zero_based,
+                    self.cache_zero_based,
+                )?;
+                let probes = build_probe_starts(
+                    i64::from(norm_start),
+                    i64::from(norm_end),
+                    refs.value_or_empty(row),
+                    alts.value_or_empty(row),
+                    self.extended_probes,
+                );
+                for probe in probes {
+                    min_probe = min_probe.min(probe);
+                    max_probe = max_probe.max(probe);
+                }
+            }
+
+            if eligible {
+                if let Some(chrom_code) = batch_chrom_code {
+                    let span = max_probe.saturating_sub(min_probe);
+                    if min_probe <= max_probe && span <= kv_range_prefetch_max_span() {
+                        match self.store.range_position_entries_limited(
+                            chrom_code,
+                            min_probe,
+                            max_probe,
+                            kv_range_prefetch_max_entries(),
+                            kv_range_prefetch_max_bytes(),
+                        )? {
+                            Some(entries) => {
+                                let mut prefetched = HashMap::with_capacity(entries.len());
+                                let mut bytes = 0usize;
+                                for (position, value) in entries {
+                                    bytes = bytes.saturating_add(value.as_ref().len());
+                                    prefetched.insert(position, value);
+                                }
+                                if self.profile_enabled {
+                                    self.profile.range_prefetch_batches += 1;
+                                    self.profile.range_prefetch_entries += prefetched.len() as u64;
+                                    self.profile.range_prefetch_bytes += bytes as u64;
+                                }
+                                range_prefetch = Some(prefetched);
+                            }
+                            None if self.profile_enabled => {
+                                self.profile.range_prefetch_skipped += 1;
+                            }
+                            None => {}
+                        }
+                    } else if self.profile_enabled {
+                        self.profile.range_prefetch_skipped += 1;
+                    }
+                }
+            } else if self.profile_enabled {
+                self.profile.range_prefetch_skipped += 1;
+            }
+        }
+        if let Some(t0) = range_prefetch_started {
+            self.profile.range_prefetch += t0.elapsed();
+        }
+
         // Determine which column indices in the entry correspond to our output columns.
         // Entry stores all columns except chrom/start, in schema order minus those 2.
         // (`end` is stored as a regular column inside the entry.)
@@ -614,12 +756,31 @@ impl KvLookupStream {
 
             let mut emitted_match = false;
             for probe_start in &probe_starts {
-                let found = self.store.get_position_entry_fast(
-                    chrom_code,
-                    *probe_start,
-                    decompressor.as_mut(),
-                    &mut decompress_buf,
-                )?;
+                if self.profile_enabled {
+                    self.profile.probes += 1;
+                }
+                let found = if let Some(prefetched) = range_prefetch.as_ref() {
+                    if let Some(raw) = prefetched.get(probe_start) {
+                        self.store.decode_position_entry_value(
+                            raw.as_ref(),
+                            decompressor.as_mut(),
+                            &mut decompress_buf,
+                        )?;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    if self.profile_enabled {
+                        self.profile.point_gets += 1;
+                    }
+                    self.store.get_position_entry_fast(
+                        chrom_code,
+                        *probe_start,
+                        decompressor.as_mut(),
+                        &mut decompress_buf,
+                    )?
+                };
                 if !found {
                     continue;
                 }
@@ -1248,6 +1409,73 @@ impl RecordBatchStream for KvLookupStream {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
+}
+
+struct EmptyLookupInput {
+    schema: SchemaRef,
+}
+
+impl Stream for EmptyLookupInput {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(None)
+    }
+}
+
+impl RecordBatchStream for EmptyLookupInput {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+/// Probe a single VCF batch against a fjall KV store without wrapping it in a
+/// DataFusion execution plan.
+///
+/// This is used by the VEP-buffer chunked path: each chunk owns raw VCF rows,
+/// performs KV lookup locally, then immediately feeds the looked-up batch into
+/// the transcript annotation engine.
+#[allow(clippy::too_many_arguments)]
+pub fn lookup_batch_with_store(
+    vcf_batch: &RecordBatch,
+    store: Arc<VepKvStore>,
+    cache_columns: Vec<String>,
+    vcf_has_chr: bool,
+    vcf_zero_based: bool,
+    cache_zero_based: bool,
+    extended_probes: bool,
+    allowed_failed: i64,
+    colocated_sink: Option<ColocatedSink>,
+    reference_fasta_path: Option<String>,
+) -> Result<RecordBatch> {
+    let input_schema = vcf_batch.schema();
+    let (schema, output_col_positions) =
+        build_lookup_output_schema(input_schema.clone(), store.schema().clone(), &cache_columns);
+    let input: SendableRecordBatchStream = Box::pin(EmptyLookupInput {
+        schema: input_schema,
+    });
+    let mut stream = KvLookupStream::new(
+        input,
+        store,
+        schema,
+        cache_columns,
+        KvMatchMode::Exact,
+        allele_matches as fn(&str, &str, &str) -> bool,
+        vcf_has_chr,
+        vcf_zero_based,
+        cache_zero_based,
+        extended_probes,
+        allowed_failed,
+        output_col_positions,
+        colocated_sink,
+        reference_fasta_path,
+    );
+    let batch = stream.process_batch(vcf_batch);
+    if stream.profile_enabled && !stream.profile_emitted {
+        stream.profile.emit();
+        stream.profile_emitted = true;
+    }
+    batch
 }
 
 #[cfg(test)]

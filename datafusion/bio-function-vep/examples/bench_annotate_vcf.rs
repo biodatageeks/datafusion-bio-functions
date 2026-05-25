@@ -14,7 +14,9 @@
 //!     [--reference-fasta <path>] \
 //!     [--target-partitions <n>] \
 //!     [--forks <n>] \
+//!     [--contig-parallelism <n>] \
 //!     [--buffer-size <n>] \
+//!     [--chunked-buffer-lookup] \
 //!     [--compression none|gzip|bgzf] \
 //!     [--limit <n>] \
 //!     [--no-progress]
@@ -36,7 +38,9 @@ struct Args {
     reference_fasta: Option<String>,
     target_partitions: usize,
     forks: Option<usize>,
+    contig_parallelism: usize,
     buffer_size: usize,
+    chunked_buffer_lookup: bool,
     compression: VcfCompressionType,
     limit: Option<usize>,
     show_progress: bool,
@@ -53,7 +57,9 @@ fn parse_args() -> Args {
     let mut reference_fasta = None;
     let mut target_partitions = 1;
     let mut forks = None;
+    let mut contig_parallelism = 1;
     let mut buffer_size = vcf_sink::VEP_DEFAULT_BUFFER_SIZE;
+    let mut chunked_buffer_lookup = false;
     let mut compression = VcfCompressionType::Plain;
     let mut limit = None;
     let mut show_progress = true;
@@ -91,10 +97,15 @@ fn parse_args() -> Args {
                 i += 1;
                 forks = args[i].parse().ok();
             }
+            "--contig-parallelism" => {
+                i += 1;
+                contig_parallelism = args[i].parse().unwrap_or(1);
+            }
             "--buffer-size" => {
                 i += 1;
                 buffer_size = args[i].parse().unwrap_or(vcf_sink::VEP_DEFAULT_BUFFER_SIZE);
             }
+            "--chunked-buffer-lookup" => chunked_buffer_lookup = true,
             "--compression" => {
                 i += 1;
                 compression = match args[i].as_str() {
@@ -143,7 +154,9 @@ fn parse_args() -> Args {
         reference_fasta,
         target_partitions,
         forks,
+        contig_parallelism,
         buffer_size,
+        chunked_buffer_lookup,
         compression,
         limit,
         show_progress,
@@ -172,7 +185,9 @@ async fn main() -> Result<()> {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "(legacy target_partitions)".to_string())
     );
+    eprintln!("  contig_parallelism: {}", args.contig_parallelism);
     eprintln!("  buffer_size: {}", args.buffer_size);
+    eprintln!("  chunked_buffer_lookup: {}", args.chunked_buffer_lookup);
     eprintln!(
         "  compress:   {}",
         match args.compression {
@@ -215,7 +230,9 @@ async fn main() -> Result<()> {
         use_fjall: args.backend == "fjall",
         target_partitions: args.target_partitions,
         forks: args.forks,
+        contig_parallelism: args.contig_parallelism,
         buffer_size: args.buffer_size,
+        chunked_buffer_lookup: args.chunked_buffer_lookup,
         compression: args.compression,
         show_progress: args.show_progress,
         ..Default::default()
