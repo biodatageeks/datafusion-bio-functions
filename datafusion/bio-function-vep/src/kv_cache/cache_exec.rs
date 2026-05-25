@@ -937,6 +937,7 @@ impl KvLookupStream {
                             active_compare_end,
                             unshifted_allele_string.as_deref(),
                             unshifted_start,
+                            unshifted_end,
                             allele_str,
                             *probe_start,
                             existing_end,

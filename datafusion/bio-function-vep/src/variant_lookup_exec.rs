@@ -439,6 +439,7 @@ fn compare_existing_variant(
         input_row.compare_end,
         input_row.unshifted_allele_string.as_deref(),
         input_row.unshifted_start,
+        input_row.unshifted_end,
         existing_allele_string,
         existing_start,
         existing_end,
@@ -460,13 +461,18 @@ pub(crate) fn compare_existing_variant_alleles(
     compare_end: i64,
     unshifted_allele_string: Option<&str>,
     unshifted_start: Option<i64>,
+    unshifted_end: Option<i64>,
     existing_allele_string: &str,
     existing_start: i64,
     existing_end: i64,
 ) -> Option<Vec<MatchedVariantAllele>> {
     if !existing_allele_string.contains('/') {
-        return (existing_start == compare_start && existing_end == compare_end)
-            .then_some(Vec::new());
+        let active_match = existing_start == compare_start && existing_end == compare_end;
+        let unshifted_match = match (unshifted_start, unshifted_end) {
+            (Some(start), Some(end)) => existing_start == start && existing_end == end,
+            _ => false,
+        };
+        return (active_match || unshifted_match).then_some(Vec::new());
     }
 
     let mut matched_alleles = get_matched_variant_alleles(
@@ -2172,6 +2178,42 @@ mod tests {
         ));
         assert!(parse_shiftable_indel("A/G").is_none());
         assert!(parse_shiftable_indel("A/G/T").is_none());
+    }
+
+    #[test]
+    fn compare_existing_variant_allows_unknown_alleles_on_unshifted_coords() {
+        assert_eq!(
+            compare_existing_variant_alleles(
+                "-/TTTT",
+                1735012,
+                1735011,
+                Some("-/TTTT"),
+                Some(1735009),
+                Some(1735008),
+                "COSMIC_MUTATION",
+                1735009,
+                1735008,
+            ),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn compare_existing_variant_rejects_unknown_alleles_outside_both_coords() {
+        assert_eq!(
+            compare_existing_variant_alleles(
+                "-/TTTT",
+                1735012,
+                1735011,
+                Some("-/TTTT"),
+                Some(1735009),
+                Some(1735008),
+                "COSMIC_MUTATION",
+                1735007,
+                1735006,
+            ),
+            None
+        );
     }
 
     #[test]
