@@ -1,3 +1,9 @@
 vep-benchmark/data/golden/**/*.fa filter=lfs diff=lfs merge=lfs -text
 vep-benchmark/data/golden/**/*.parquet filter=lfs diff=lfs merge=lfs -text
 vep-benchmark/data/golden/**/*.vcf filter=lfs diff=lfs merge=lfs -text
+vep-benchmark/data/port/**/*.fa filter=lfs diff=lfs merge=lfs -text
+vep-benchmark/data/port/**/*.fai filter=lfs diff=lfs merge=lfs -text
+vep-benchmark/data/port/**/*.parquet filter=lfs diff=lfs merge=lfs -text
+vep-benchmark/data/port/**/*.vcf filter=lfs diff=lfs merge=lfs -text
+vep-benchmark/data/port/**/*.gz filter=lfs diff=lfs merge=lfs -text
+vep-benchmark/data/port/**/*.tbi filter=lfs diff=lfs merge=lfs -text
