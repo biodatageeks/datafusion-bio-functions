@@ -1,8 +1,9 @@
 //! fjall KV store for position-keyed VEP cache entries.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -42,12 +43,21 @@ pub struct VepKvStore {
     zstd_dict: Option<Arc<Vec<u8>>>,
 }
 
+type SharedStoreKey = (PathBuf, u64);
+
+static SHARED_OPEN_STORES: LazyLock<Mutex<HashMap<SharedStoreKey, Weak<VepKvStore>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn arrow_err(e: datafusion::arrow::error::ArrowError) -> DataFusionError {
     DataFusionError::ArrowError(Box::new(e), None)
 }
 
 fn fjall_err(e: fjall::Error) -> DataFusionError {
     DataFusionError::External(Box::new(e))
+}
+
+fn canonical_store_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn is_destination_too_small_msg(msg: &str) -> bool {
@@ -129,9 +139,41 @@ impl VepKvStore {
         Self::open_with_cache_size(path, 1024 * 1024 * 1024)
     }
 
+    /// Open or reuse an existing process-local KV store handle with default settings.
+    ///
+    /// Fjall keeps an exclusive lock per database path. In embedded Python/Jupyter
+    /// workflows a previous annotation stream can remain alive briefly between
+    /// runs, so a second independent `open()` may hit `FjallError::Locked`.
+    /// Reusing the live handle for the same canonical path avoids opening a
+    /// second database while still allowing the store to close when all users
+    /// drop their `Arc`.
+    pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<Self>> {
+        Self::open_shared_with_cache_size(path, 1024 * 1024 * 1024)
+    }
+
+    /// Open or reuse an existing process-local KV store handle.
+    pub fn open_shared_with_cache_size(
+        path: impl AsRef<Path>,
+        cache_size_bytes: u64,
+    ) -> Result<Arc<Self>> {
+        let root_path = canonical_store_path(path.as_ref());
+        let key = (root_path.clone(), cache_size_bytes);
+        let mut stores = SHARED_OPEN_STORES.lock().map_err(|e| {
+            DataFusionError::Execution(format!("shared fjall store registry lock poisoned: {e}"))
+        })?;
+        stores.retain(|_, weak| weak.strong_count() > 0);
+        if let Some(store) = stores.get(&key).and_then(Weak::upgrade) {
+            return Ok(store);
+        }
+
+        let store = Arc::new(Self::open_with_cache_size(&root_path, cache_size_bytes)?);
+        stores.insert(key, Arc::downgrade(&store));
+        Ok(store)
+    }
+
     /// Open an existing KV store with a custom fjall block cache size (bytes).
     pub fn open_with_cache_size(path: impl AsRef<Path>, cache_size_bytes: u64) -> Result<Self> {
-        let root_path = path.as_ref().to_path_buf();
+        let root_path = canonical_store_path(path.as_ref());
         let db = Database::builder(&root_path)
             .worker_threads(1)
             .cache_size(cache_size_bytes)
@@ -604,6 +646,21 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("unsupported cache format version"));
+    }
+
+    #[test]
+    fn test_open_shared_reuses_live_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+
+        let store = VepKvStore::create(dir.path(), schema).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let first = VepKvStore::open_shared(dir.path()).unwrap();
+        let second = VepKvStore::open_shared(dir.path()).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

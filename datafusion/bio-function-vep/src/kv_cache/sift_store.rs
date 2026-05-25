@@ -8,8 +8,9 @@
 //!   [sift_count × 10B CompactPrediction]
 //!   [polyphen_count × 10B CompactPrediction]
 
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use datafusion::common::{DataFusionError, Result};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
@@ -25,7 +26,18 @@ fn fjall_err(e: fjall::Error) -> DataFusionError {
 /// Store for SIFT/PolyPhen predictions keyed by transcript_id.
 #[derive(Clone)]
 pub struct SiftKvStore {
+    inner: Arc<SiftKvStoreInner>,
+}
+
+struct SiftKvStoreInner {
     sift_ks: Keyspace,
+}
+
+static SHARED_SIFT_STORES: LazyLock<Mutex<HashMap<PathBuf, Weak<SiftKvStoreInner>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn canonical_store_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 impl SiftKvStore {
@@ -38,12 +50,25 @@ impl SiftKvStore {
         if !path.exists() {
             return Ok(None);
         }
-        let db = Database::builder(path)
+        let path = canonical_store_path(path);
+        let mut stores = SHARED_SIFT_STORES.lock().map_err(|e| {
+            DataFusionError::Execution(format!("shared fjall sift registry lock poisoned: {e}"))
+        })?;
+        stores.retain(|_, weak| weak.strong_count() > 0);
+        if let Some(inner) = stores.get(&path).and_then(Weak::upgrade) {
+            return Ok(Some(Self { inner }));
+        }
+
+        let db = Database::builder(&path)
             .cache_size(64 * 1024 * 1024)
             .worker_threads(1)
             .open()
             .map_err(fjall_err)?;
-        Self::open(&db)
+        let store = Self::open(&db)?;
+        if let Some(store) = &store {
+            stores.insert(path, Arc::downgrade(&store.inner));
+        }
+        Ok(store)
     }
 
     /// Open sift keyspace from an existing fjall database.
@@ -58,7 +83,9 @@ impl SiftKvStore {
         if ks.is_empty().unwrap_or(true) {
             Ok(None)
         } else {
-            Ok(Some(Self { sift_ks: ks }))
+            Ok(Some(Self {
+                inner: Arc::new(SiftKvStoreInner { sift_ks: ks }),
+            }))
         }
     }
 
@@ -74,18 +101,21 @@ impl SiftKvStore {
                     .data_block_compression_policy(fjall::config::CompressionPolicy::disabled())
             })
             .map_err(fjall_err)?;
-        Ok(Self { sift_ks })
+        Ok(Self {
+            inner: Arc::new(SiftKvStoreInner { sift_ks }),
+        })
     }
 
     /// Access the underlying keyspace (e.g. for compaction).
     pub fn keyspace(&self) -> &Keyspace {
-        &self.sift_ks
+        &self.inner.sift_ks
     }
 
     /// Store predictions for a transcript.
     pub fn put(&self, transcript_id: &str, preds: &CachedPredictions) -> Result<()> {
         let value = serialize_predictions(preds);
-        self.sift_ks
+        self.inner
+            .sift_ks
             .insert(transcript_id.as_bytes(), value)
             .map_err(fjall_err)?;
         Ok(())
@@ -100,7 +130,7 @@ impl SiftKvStore {
         sorted_iter: impl Iterator<Item = (String, CachedPredictions)>,
     ) -> Result<Self> {
         let store = Self::create(db)?;
-        let mut ingestion = store.sift_ks.start_ingestion().map_err(fjall_err)?;
+        let mut ingestion = store.inner.sift_ks.start_ingestion().map_err(fjall_err)?;
         for (transcript_id, preds) in sorted_iter {
             let value = serialize_predictions(&preds);
             ingestion
@@ -114,6 +144,7 @@ impl SiftKvStore {
     /// Retrieve predictions for a transcript. Returns None on miss.
     pub fn get(&self, transcript_id: &str) -> Result<Option<CachedPredictions>> {
         let Some(raw) = self
+            .inner
             .sift_ks
             .get(transcript_id.as_bytes())
             .map_err(fjall_err)?
@@ -316,6 +347,26 @@ mod tests {
         assert_eq!(preds.sift.len(), 2);
         assert_eq!(preds.polyphen.len(), 1);
         assert_eq!(preds.sift[0].position, 10);
+    }
+
+    #[test]
+    fn test_open_path_reuses_live_store() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let db = fjall::Database::builder(dir.path())
+                .cache_size(64 * 1024 * 1024)
+                .open()
+                .unwrap();
+            let store = SiftKvStore::create(&db).unwrap();
+            store.put("ENST00000111111", &make_predictions()).unwrap();
+            db.persist(fjall::PersistMode::SyncAll).unwrap();
+        }
+
+        let first = SiftKvStore::open_path(dir.path()).unwrap().unwrap();
+        let second = SiftKvStore::open_path(dir.path()).unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
     }
 
     #[test]

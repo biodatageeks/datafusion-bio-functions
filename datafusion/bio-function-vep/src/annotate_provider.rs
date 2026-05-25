@@ -11371,7 +11371,7 @@ impl TableProvider for AnnotateProvider {
                         fjall_path.display()
                     )));
                 }
-                Some(Arc::new(crate::kv_cache::VepKvStore::open(&fjall_path)?))
+                Some(crate::kv_cache::VepKvStore::open_shared(&fjall_path)?)
             } else {
                 None
             };
