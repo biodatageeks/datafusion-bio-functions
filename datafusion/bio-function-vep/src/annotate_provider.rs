@@ -1599,7 +1599,10 @@ struct ColocatedEntry {
 #[derive(Debug, Default, Clone)]
 struct ColocatedData {
     entries: Vec<ColocatedEntry>,
+    /// Parser/input allele fallback for VEP `add_colocated_variant_info()`.
     compare_output_allele: Option<String>,
+    /// Genomic-shift original allele fallback for VEP
+    /// `add_colocated_frequency_data()`.
     unshifted_output_allele: Option<String>,
 }
 
@@ -1685,11 +1688,11 @@ impl ColocatedData {
     /// - Ensembl VEP `add_colocated_variant_info()`
     ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1012-L1035>
     ///
-    /// Rust stores the active compare-space allele and any retained original
-    /// compare-space allele separately on the colocated sink. For the live CSQ
-    /// path, `Existing_variation` must prefer the active compare-space allele
-    /// and only fall back to the retained original allele when the output
-    /// allele already equals the active representation.
+    /// Rust stores the parser/input allele fallback and any retained
+    /// genomic-shift original allele separately on the colocated sink. For
+    /// the live CSQ path, `Existing_variation` must mirror VEP
+    /// `add_colocated_variant_info()` by checking the current CSQ allele plus
+    /// `VariationFeature->{shifted_allele_string}`.
     fn variant_match_output_allele<'a>(&'a self, output_allele: &str) -> Option<&'a str> {
         self.compare_output_allele
             .as_deref()
@@ -1707,17 +1710,14 @@ impl ColocatedData {
     ///
     /// Frequency output matches the current CSQ allele first, then
     /// `alt_orig_allele_string` when VEP retained original shift metadata.
-    /// Because Rust stores both active and retained compare-space alleles on
-    /// the sink, the live path must prefer the retained original allele here.
+    /// Unlike `Existing_variation`, this must not use the parser/input allele
+    /// fallback. VEP only supplies `alt_orig_allele_string` to this path when
+    /// a real genomic-shift `shift_hash` exists; otherwise repeat-indel IDs
+    /// remain visible but their allele-specific frequencies stay blank.
     fn frequency_match_output_allele<'a>(&'a self, output_allele: &str) -> Option<&'a str> {
         self.unshifted_output_allele
             .as_deref()
             .filter(|allele| *allele != output_allele)
-            .or_else(|| {
-                self.compare_output_allele
-                    .as_deref()
-                    .filter(|allele| *allele != output_allele)
-            })
     }
 
     /// Traceability:
@@ -11520,6 +11520,52 @@ mod tests {
         let drained = drain_colocated_sink(&sink).unwrap();
         assert_eq!(drained.len(), 1);
         assert!(sink.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn colocated_repeat_indel_id_fallback_does_not_drive_frequency_fields() {
+        let mut af_values = vec![String::new(); AF_COLUMNS.len()];
+        af_values[0] = "AAAAAAAAAAAA:0.3031".to_string();
+        af_values[1] = "AAAAAAAAAAAA:0.4024".to_string();
+        af_values[16] = "AAAAAAAAAAAA:0.2803".to_string();
+        af_values[17] = "AAAAAAAAAAAA:0.3704".to_string();
+
+        let data = ColocatedData {
+            entries: vec![ColocatedEntry {
+                variation_name: "rs34467003".to_string(),
+                allele_string: "AAAAAAAAAAAAA/AAAAAAAAAA/AAAAAAAAAAA/AAAAAAAAAAAA/AAAAAAAAAAAAAA"
+                    .to_string(),
+                matched_alleles: vec![MatchedVariantAllele {
+                    a_allele: "A".to_string(),
+                    a_index: 0,
+                    b_allele: "AAAAAAAAAAAA".to_string(),
+                    b_index: 2,
+                }],
+                somatic: 0,
+                pheno: 0,
+                clin_sig: None,
+                clin_sig_allele: None,
+                pubmed: None,
+                af_values,
+            }],
+            compare_output_allele: Some("A".to_string()),
+            unshifted_output_allele: None,
+        };
+        let flags = VepFlags::from_options_json(Some("{\"everything\":true}"));
+
+        let variant_fields = data.variant_fields("-", data.variant_match_output_allele("-"), false);
+        assert_eq!(variant_fields.existing_variation, "rs34467003");
+
+        let frequency_fields =
+            data.frequency_fields("-", data.frequency_match_output_allele("-"), &flags);
+        assert!(
+            frequency_fields
+                .af_values
+                .iter()
+                .all(|value| value.is_empty())
+        );
+        assert!(frequency_fields.max_af.is_empty());
+        assert!(frequency_fields.max_af_pops.is_empty());
     }
 
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
