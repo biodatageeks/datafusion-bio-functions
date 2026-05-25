@@ -32,7 +32,7 @@ impl KvCacheTableProvider {
 
     /// Open an existing KV cache with a custom fjall block cache size (bytes).
     pub fn open_with_cache_size(path: impl AsRef<Path>, cache_size_bytes: u64) -> Result<Self> {
-        let store = Arc::new(VepKvStore::open_with_cache_size(path, cache_size_bytes)?);
+        let store = VepKvStore::open_shared_with_cache_size(path, cache_size_bytes)?;
         let schema = store.schema().clone();
         Ok(Self { store, schema })
     }
