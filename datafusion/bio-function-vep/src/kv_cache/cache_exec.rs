@@ -33,8 +33,7 @@ use crate::allele::{
 };
 use crate::variant_lookup_exec::{
     AF_COL_NAMES, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
-    build_shifted_compare_state, compare_existing_variant_alleles,
-    output_allele_from_allele_string, read_reference_sequence,
+    compare_existing_variant_alleles, output_allele_from_allele_string, read_reference_sequence,
 };
 
 /// Lookup match mode.
@@ -857,51 +856,15 @@ impl KvLookupStream {
                     let vep_start = vep_norm_start(norm_start_i64, vcf_ref, vcf_alt);
                     let vep_end = vep_norm_end(norm_start_i64, vcf_ref, vcf_alt);
 
-                    // Compute genomic shift state (mirrors parquet path's BuildRow logic).
-                    let mut active_compare_allele_string = compare_allele_string.clone();
-                    let mut active_compare_start = vep_start;
-                    let mut active_compare_end = vep_end;
-                    let mut unshifted_allele_string: Option<String> = None;
-                    let mut unshifted_start: Option<i64> = None;
-                    let mut unshifted_end: Option<i64> = None;
-
-                    if let Some(ref_reader) = self.reference_reader.as_mut() {
-                        if let Ok(Some((shifted_as, shifted_s, shifted_e))) =
-                            build_shifted_compare_state(
-                                ref_reader,
-                                &chrom_norm,
-                                &compare_allele_string,
-                                vep_start,
-                                vep_end,
-                            )
-                        {
-                            unshifted_allele_string = Some(compare_allele_string.clone());
-                            unshifted_start = Some(vep_start);
-                            unshifted_end = Some(vep_end);
-                            active_compare_allele_string = shifted_as;
-                            active_compare_start = shifted_s;
-                            active_compare_end = shifted_e;
-                        }
-                    }
-
                     let compare_output_allele =
-                        output_allele_from_allele_string(&active_compare_allele_string)
+                        output_allele_from_allele_string(&compare_allele_string)
                             .map(str::to_string);
-                    let unshifted_output_allele = unshifted_allele_string
-                        .as_deref()
-                        .and_then(output_allele_from_allele_string)
-                        .map(str::to_string);
+                    let unshifted_output_allele: Option<String> = None;
 
                     // Visibility filter: mirrors VEP's Tabix query window.
                     // Only cache variants with START in [compare_start-1, compare_end+1]
                     // are visible, matching existing_start_is_visible_to_input_row().
-                    if !probe_start_visible_to_compare_windows(
-                        *probe_start,
-                        active_compare_start,
-                        active_compare_end,
-                        unshifted_start,
-                        unshifted_end,
-                    ) {
+                    if !probe_start_visible_to_window(*probe_start, vep_start, vep_end) {
                         continue;
                     }
 
@@ -929,15 +892,15 @@ impl KvLookupStream {
                             .and_then(|idx| reader.read_i64_value(idx, allele_idx))
                             .unwrap_or(*probe_start);
 
-                        // Two-pass allele matching (active compare + unshifted) for parity
-                        // with parquet path's compare_existing_variant().
+                        // VEP colocated matching uses parser-minimized input alleles.
+                        // Shifted/right-aligned coordinates are lookup candidates only.
                         let Some(matched_alleles) = compare_existing_variant_alleles(
-                            &active_compare_allele_string,
-                            active_compare_start,
-                            active_compare_end,
-                            unshifted_allele_string.as_deref(),
-                            unshifted_start,
-                            unshifted_end,
+                            &compare_allele_string,
+                            vep_start,
+                            vep_end,
+                            None,
+                            None,
+                            None,
                             allele_str,
                             *probe_start,
                             existing_end,
@@ -1314,21 +1277,6 @@ fn probe_start_visible_to_window(probe_start: i64, compare_start: i64, compare_e
 }
 
 #[inline]
-fn probe_start_visible_to_compare_windows(
-    probe_start: i64,
-    active_compare_start: i64,
-    active_compare_end: i64,
-    unshifted_start: Option<i64>,
-    unshifted_end: Option<i64>,
-) -> bool {
-    probe_start_visible_to_window(probe_start, active_compare_start, active_compare_end)
-        || match (unshifted_start, unshifted_end) {
-            (Some(start), Some(end)) => probe_start_visible_to_window(probe_start, start, end),
-            _ => false,
-        }
-}
-
-#[inline]
 fn common_prefix_len(left: &str, right: &str) -> usize {
     left.as_bytes()
         .iter()
@@ -1536,28 +1484,13 @@ mod tests {
     }
 
     #[test]
-    fn shifted_indel_visibility_keeps_unshifted_probe_window() {
-        // chr1:602113 T>TGCCCA shifts to active compare coordinates
-        // 602117..602116, while the matching existing variant is keyed at the
-        // original unshifted window around 602114.
-        assert!(probe_start_visible_to_compare_windows(
-            602114,
-            602117,
-            602116,
-            Some(602114),
-            Some(602113)
-        ));
+    fn colocated_visibility_uses_vep_minimized_probe_window() {
+        assert!(probe_start_visible_to_window(602114, 602114, 602113));
     }
 
     #[test]
-    fn shifted_indel_visibility_rejects_outside_both_windows() {
-        assert!(!probe_start_visible_to_compare_windows(
-            602110,
-            602117,
-            602116,
-            Some(602114),
-            Some(602113)
-        ));
+    fn colocated_visibility_rejects_outside_vep_minimized_probe_window() {
+        assert!(!probe_start_visible_to_window(602117, 602114, 602113));
     }
 
     // -----------------------------------------------------------------------
