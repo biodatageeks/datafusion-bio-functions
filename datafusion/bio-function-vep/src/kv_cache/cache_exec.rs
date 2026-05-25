@@ -863,6 +863,7 @@ impl KvLookupStream {
                     let mut active_compare_end = vep_end;
                     let mut unshifted_allele_string: Option<String> = None;
                     let mut unshifted_start: Option<i64> = None;
+                    let mut unshifted_end: Option<i64> = None;
 
                     if let Some(ref_reader) = self.reference_reader.as_mut() {
                         if let Ok(Some((shifted_as, shifted_s, shifted_e))) =
@@ -876,6 +877,7 @@ impl KvLookupStream {
                         {
                             unshifted_allele_string = Some(compare_allele_string.clone());
                             unshifted_start = Some(vep_start);
+                            unshifted_end = Some(vep_end);
                             active_compare_allele_string = shifted_as;
                             active_compare_start = shifted_s;
                             active_compare_end = shifted_e;
@@ -893,9 +895,13 @@ impl KvLookupStream {
                     // Visibility filter: mirrors VEP's Tabix query window.
                     // Only cache variants with START in [compare_start-1, compare_end+1]
                     // are visible, matching existing_start_is_visible_to_input_row().
-                    let vis_start = (active_compare_start - 1).min(active_compare_end + 1);
-                    let vis_end = (active_compare_start - 1).max(active_compare_end + 1);
-                    if *probe_start < vis_start || *probe_start > vis_end {
+                    if !probe_start_visible_to_compare_windows(
+                        *probe_start,
+                        active_compare_start,
+                        active_compare_end,
+                        unshifted_start,
+                        unshifted_end,
+                    ) {
                         continue;
                     }
 
@@ -1300,6 +1306,28 @@ fn build_probe_starts(
 }
 
 #[inline]
+fn probe_start_visible_to_window(probe_start: i64, compare_start: i64, compare_end: i64) -> bool {
+    let vis_start = (compare_start - 1).min(compare_end + 1);
+    let vis_end = (compare_start - 1).max(compare_end + 1);
+    probe_start >= vis_start && probe_start <= vis_end
+}
+
+#[inline]
+fn probe_start_visible_to_compare_windows(
+    probe_start: i64,
+    active_compare_start: i64,
+    active_compare_end: i64,
+    unshifted_start: Option<i64>,
+    unshifted_end: Option<i64>,
+) -> bool {
+    probe_start_visible_to_window(probe_start, active_compare_start, active_compare_end)
+        || match (unshifted_start, unshifted_end) {
+            (Some(start), Some(end)) => probe_start_visible_to_window(probe_start, start, end),
+            _ => false,
+        }
+}
+
+#[inline]
 fn common_prefix_len(left: &str, right: &str) -> usize {
     left.as_bytes()
         .iter()
@@ -1504,6 +1532,31 @@ mod tests {
         assert_eq!(probe_starts[0], 165387539);
         assert!(probe_starts.contains(&165387540));
         assert!(probe_starts.contains(&165387541));
+    }
+
+    #[test]
+    fn shifted_indel_visibility_keeps_unshifted_probe_window() {
+        // chr1:602113 T>TGCCCA shifts to active compare coordinates
+        // 602117..602116, while the matching existing variant is keyed at the
+        // original unshifted window around 602114.
+        assert!(probe_start_visible_to_compare_windows(
+            602114,
+            602117,
+            602116,
+            Some(602114),
+            Some(602113)
+        ));
+    }
+
+    #[test]
+    fn shifted_indel_visibility_rejects_outside_both_windows() {
+        assert!(!probe_start_visible_to_compare_windows(
+            602110,
+            602117,
+            602116,
+            Some(602114),
+            Some(602113)
+        ));
     }
 
     // -----------------------------------------------------------------------
