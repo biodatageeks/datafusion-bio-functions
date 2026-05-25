@@ -1,0 +1,76 @@
+t/AnnotationSource_Cache.t ......................... ok
+t/AnnotationSource.t ............................... ok
+t/AnnotationSourceAdaptor.t ........................ ok
+t/AnnotationSource_Cache_RegFeat.t ................. ok
+t/AnnotationSource_Cache_Transcript.t .............. ok
+t/AnnotationSource_Database_RegFeat.t .............. ok
+t/AnnotationSource_Database_StructuralVariation.t .. ok
+t/AnnotationSource_Cache_VariationTabix.t .......... ok
+t/AnnotationSource_Database_Transcript.t ........... ok
+t/AnnotationSource_Database_Variation.t ............ ok
+t/AnnotationSource_File.t .......................... ok
+t/AnnotationSource_File_BED.t ...................... ok
+Couldn't open foo
+t/AnnotationSource_File_BigWig.t ................... ok
+t/AnnotationSource_File_VCF.t ...................... ok
+t/AnnotationSource_File_GTF.t ...................... ok
+WARNING: Setting offline mode. To create database connection use either --database or --cache.
+t/AnnotationSource_File_GFF.t ...................... ok
+t/CacheDir.t ....................................... ok
+t/Config.t ......................................... ok
+t/FilterSet.t ...................................... ok
+t/BaseVEP.t ........................................ ok
+t/Haplo_AnnotationSource_Database_Transcript.t ..... ok
+t/Haplo_AnnotationSource_Cache_Transcript.t ........ ok
+WARNING: Ignoring 'three_prime_utr' feature_type from /opt/vep_src/t/testdata/custom/test.gtf.gz GFF/GTF file. This feature_type is not supported in VEP.
+WARNING: Ignoring 'start_codon' feature_type from /opt/vep_src/t/testdata/custom/test.gtf.gz GFF/GTF file. This feature_type is not supported in VEP.
+WARNING: Ignoring 'five_prime_utr' feature_type from /opt/vep_src/t/testdata/custom/test.gtf.gz GFF/GTF file. This feature_type is not supported in VEP.
+t/Haplo_AnnotationSource_File_GTF.t ................ ok
+t/Haplo_InputBuffer.t .............................. ok
+WARNING: Ignoring 'chromosome' feature_type from /opt/vep_src/t/testdata/custom/test.gff.gz GFF/GTF file. This feature_type is not supported in VEP.
+WARNING: Ignoring 'biological_region' feature_type from /opt/vep_src/t/testdata/custom/test.gff.gz GFF/GTF file. This feature_type is not supported in VEP.
+WARNING: Ignoring 'three_prime_UTR' feature_type from /opt/vep_src/t/testdata/custom/test.gff.gz GFF/GTF file. This feature_type is not supported in VEP.
+WARNING: Ignoring 'five_prime_UTR' feature_type from /opt/vep_src/t/testdata/custom/test.gff.gz GFF/GTF file. This feature_type is not supported in VEP.
+t/Haplo_AnnotationSource_File_GFF.t ................ ok
+t/Haplo_Parser_VCF.t ............................... ok
+t/InputBuffer.t .................................... ok
+t/Haplo_Runner.t ................................... ok
+t/AnnotationSource_Cache_Variation.t ............... ok
+t/OutputFactory_Tab.t .............................. ok
+t/OutputFactory_VCF.t .............................. ok
+t/Parser.t ......................................... ok
+t/Parser_CAID.t .................................... ok
+t/Parser_HGVS.t .................................... ok
+t/Parser_ID.t ...................................... ok
+t/OutputFactory_VEP_output.t ....................... ok
+t/Parser_SPDI.t .................................... ok
+t/Parser_Region.t .................................. ok
+t/Parser_VEP_input.t ............................... ok
+WARNING: found tandem repeats with different references per alternative allele: SVLEN=5,10; only using reference with largest size
+WARNING: found tandem repeats with different references per alternative allele: SVLEN=5,10; only using reference with largest size
+t/Parser_VCF.t ..................................... ok
+t/OutputFactory_JSON.t ............................. ok
+t/TranscriptTree.t ................................. ok
+t/Utils.t .......................................... ok
+t/VariantRecoder.t ................................. ok
+t/Stats.t .......................................... ok
+sh: 1: git: not found
+
+#   Failed test 'get current git branch'
+#   at t/version.t line 34.
+# Looks like you failed 1 test of 1.
+t/version.t ........................................ 
+Dubious, test returned 1 (wstat 256, 0x100)
+Failed 1/1 subtests 
+WARNING: Ignoring 'cDNA_match' feature_type from /opt/vep_src/t/testdata/custom/bam_edit.gff.gz GFF/GTF file. This feature_type is not supported in VEP.
+t/bam_edit.t ....................................... ok
+t/OutputFactory.t .................................. ok
+t/Runner.t ......................................... ok
+
+Test Summary Report
+-------------------
+t/version.t                                      (Wstat: 256 Tests: 1 Failed: 1)
+  Failed test:  1
+  Non-zero exit status: 1
+Files=49, Tests=1973, 29 wallclock secs ( 0.44 usr  0.08 sys + 94.50 cusr  5.80 csys = 100.82 CPU)
+Result: FAIL
