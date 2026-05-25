@@ -1,0 +1,5 @@
+##fileformat=VCFv4.2
+##source=vepyr-port-test-smoke
+##contig=<ID=21,length=46709983>
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+21	25587759	test_smoke_snv	T	C	.	PASS	.
