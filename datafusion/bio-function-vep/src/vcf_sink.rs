@@ -571,14 +571,35 @@ async fn stream_partitioned_vcf_body(
     sink_profile: &mut Option<VcfSinkProfile>,
 ) -> Result<usize> {
     let streams = df.execute_stream_partitioned().await?;
-    if streams.len() <= 1 {
-        return Err(DataFusionError::Internal(
-            "partitioned VCF body stream requested for a single output partition".to_string(),
-        ));
+    let partition_count = streams.len();
+    if partition_count <= 1 {
+        if let Some(profile) = sink_profile.as_mut() {
+            profile.contig_partitions = partition_count;
+        }
+
+        let Some(stream) = streams.into_iter().next() else {
+            return Ok(0);
+        };
+        let mut total_rows = 0usize;
+        stream_vcf_partition_to_writer(
+            0,
+            stream,
+            writer,
+            pb,
+            config,
+            total_input,
+            &mut total_rows,
+            vcf_info_fields,
+            unique_format_tags,
+            sample_names,
+            coordinate_zero_based,
+            sink_profile,
+        )
+        .await?;
+        return Ok(total_rows);
     }
 
     let tempdir = VcfBodyTempDir::new()?;
-    let partition_count = streams.len();
     let max_contig_jobs = max_contig_jobs.max(1).min(partition_count);
     if let Some(profile) = sink_profile.as_mut() {
         profile.contig_partitions = partition_count;
