@@ -1,0 +1,19 @@
+##fileformat=VCFv4.2
+##source=vepyr-port-test-cache_transcript-v115
+##contig=<ID=21,length=46709983>
+##INFO=<ID=NS,Number=1,Type=Integer,Description="Placeholder INFO; not consumed by VEP">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+21	25190000	ct_01	A	G	.	PASS	.
+21	25234567	ct_02	T	C	.	PASS	.
+21	25234587	ct_03	T	A	.	PASS	.
+21	25450000	ct_04	C	G	.	PASS	.
+21	25500000	ct_05	G	A	.	PASS	.
+21	25586000	ct_06	T	C	.	PASS	.
+21	25587759	ct_07	T	A	.	PASS	.
+21	25607517	ct_08_snv	T	A	.	PASS	.
+21	25607517	ct_09_ins	T	TA	.	PASS	.
+21	25700123	ct_10_del	TGT	T	.	PASS	.
+21	25700125	ct_11	T	G	.	PASS	.
+21	25800000	ct_12	C	T	.	PASS	.
+21	25900000	ct_13	C	T	.	PASS	.
+21	26000000	ct_14	G	A	.	PASS	.
