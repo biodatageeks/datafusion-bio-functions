@@ -412,9 +412,11 @@ impl LookupProfile {
 }
 
 fn kv_range_prefetch_enabled() -> bool {
-    std::env::var("VEP_KV_RANGE_PREFETCH")
-        .map(|value| value != "0")
-        .unwrap_or(true)
+    // Disabled while the coarse min/max batch range prefetch is replaced with
+    // a narrower clustered prefetch strategy. The current implementation often
+    // scans dense cache ranges only to hit the entry limit and fall back to
+    // point lookups.
+    false
 }
 
 fn kv_range_prefetch_max_span() -> i64 {
