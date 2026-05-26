@@ -392,6 +392,11 @@ fn copy_body_file_to_writer(path: &Path, writer: &mut VcfLocalWriter) -> Result<
     Ok(started.elapsed())
 }
 
+fn initial_partition_body_job_ids(partition_count: usize, max_contig_jobs: usize) -> Vec<usize> {
+    let max_contig_jobs = max_contig_jobs.max(1).min(partition_count);
+    (0..max_contig_jobs).collect()
+}
+
 async fn write_vcf_partition_body(
     partition_id: usize,
     mut stream: datafusion::physical_plan::SendableRecordBatchStream,
@@ -609,17 +614,10 @@ async fn stream_partitioned_vcf_body(
     let mut jobs = tokio::task::JoinSet::new();
     let mut ready: BTreeMap<usize, PartitionedVcfBody> = BTreeMap::new();
     let mut total_rows = 0usize;
+    let mut next_write_partition_id = 0usize;
+    let initial_job_target = initial_partition_body_job_ids(partition_count, max_contig_jobs).len();
 
-    let Some((direct_partition_id, direct_stream)) = stream_iter.next() else {
-        return Ok(0);
-    };
-    if direct_partition_id != 0 {
-        return Err(DataFusionError::Execution(format!(
-            "partitioned VCF body writer expected partition 0 first, got {direct_partition_id}"
-        )));
-    }
-
-    while jobs.len() < max_contig_jobs.saturating_sub(1) {
+    while jobs.len() < initial_job_target {
         let Some((partition_id, stream)) = stream_iter.next() else {
             break;
         };
@@ -639,26 +637,9 @@ async fn stream_partitioned_vcf_body(
             coordinate_zero_based,
         ));
         if let Some(profile) = sink_profile.as_mut() {
-            profile.contig_inflight_max = profile.contig_inflight_max.max(jobs.len() + 1);
+            profile.contig_inflight_max = profile.contig_inflight_max.max(jobs.len());
         }
     }
-
-    stream_vcf_partition_to_writer(
-        direct_partition_id,
-        direct_stream,
-        writer,
-        pb,
-        config,
-        total_input,
-        &mut total_rows,
-        Arc::clone(&vcf_info_fields),
-        Arc::clone(&unique_format_tags),
-        Arc::clone(&sample_names),
-        coordinate_zero_based,
-        sink_profile,
-    )
-    .await?;
-    let mut next_write_partition_id = 1usize;
 
     loop {
         while jobs.len() < max_contig_jobs {
@@ -1703,6 +1684,15 @@ mod tests {
         assert!(line.contains("format_wait=0.025s"));
         assert!(line.contains("write_records=0.030s"));
         assert!(line.contains("writer_finish=0.040s"));
+    }
+
+    #[test]
+    fn test_partitioned_body_writer_initial_jobs_include_partition_zero() {
+        assert_eq!(
+            initial_partition_body_job_ids(22, 12),
+            (0..12).collect::<Vec<_>>()
+        );
+        assert_eq!(initial_partition_body_job_ids(3, 12), vec![0, 1, 2]);
     }
 
     #[test]
