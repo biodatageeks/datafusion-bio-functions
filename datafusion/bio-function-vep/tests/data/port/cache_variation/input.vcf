@@ -1,0 +1,16 @@
+##fileformat=VCFv4.2
+##source=vepyr-port-test-cache_variation-v115
+##contig=<ID=21,length=46709983>
+##INFO=<ID=NS,Number=1,Type=Integer,Description="Placeholder INFO; not consumed by VEP">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+21	8987004	cv_01_nast1	C	CCGC	.	PASS	.
+21	8987004	cv_02_nast2	C	T,CCGC	.	PASS	.
+21	8987004	cv_03_nast3	CT	CCGCT	.	PASS	.
+21	8987004	cv_04_nast4	C	CCGC,CGGC	.	PASS	.
+21	25585733	cv_05_rs142513484	C	T	.	PASS	.
+21	25585735	cv_06_missbyone	T	A	.	PASS	.
+21	25891796	cv_07_rs63750066	C	T	.	PASS	.
+21	25585662	cv_08_cosmic	T	C	.	PASS	.
+21	25190001	cv_09_allelemiss	G	C	.	PASS	.
+21	25102899	cv_10_highmaf	C	T	.	PASS	.
+21	25500000	cv_11_outside	G	A	.	PASS	.
