@@ -187,9 +187,20 @@ async fn compare_csq_inner(
     case_label: &str,
 ) -> Result<bool> {
     // 1. Annotate input.vcf to a tmpfile.
-    let tmp_dir = tempfile::TempDir::new().unwrap();
-    let output_path = tmp_dir.path().join("annotated.vcf");
-    vcf_sink::annotate_to_vcf(
+    // NOTE: when PORT_DEBUG_OUTPUT_DIR is set, write to that dir instead of a
+    // tempdir so the failed-test output VCF persists for inspection.
+    let debug_dir = std::env::var("PORT_DEBUG_OUTPUT_DIR").ok();
+    let _tmp_dir_keepalive;
+    let output_path = if let Some(d) = debug_dir.as_deref() {
+        std::fs::create_dir_all(d).ok();
+        std::path::PathBuf::from(d).join(format!("{case_label}.annotated.vcf"))
+    } else {
+        let td = tempfile::TempDir::new().unwrap();
+        let p = td.path().join("annotated.vcf");
+        _tmp_dir_keepalive = td;
+        p
+    };
+    let rows_written = vcf_sink::annotate_to_vcf(
         input_vcf,
         cache_path,
         "parquet",
@@ -197,6 +208,10 @@ async fn compare_csq_inner(
         config,
     )
     .await?;
+    eprintln!(
+        "port_common[{case_label}]: annotate_to_vcf returned {rows_written} rows; output at {}",
+        output_path.display()
+    );
 
     // 2. Read engine output + golden via VcfTableProvider. The provider
     //    uses futures::executor::block_on() internally; wrap in

@@ -97,10 +97,15 @@ generate() {
 generate /work_golden_1.vcf
 generate /work_golden_2.vcf
 
-# Strip header timestamps before comparing (each run includes a generation-time stamp)
-docker exec "$C" bash -c '
-  grep -vE "^##VEP=" /work_golden_1.vcf > /work_golden_1_stripped.vcf
-  grep -vE "^##VEP=" /work_golden_2.vcf > /work_golden_2_stripped.vcf
+# Strip per-run header lines before comparing. Two known sources of nondeterminism
+# in VEP's output:
+#   - ##VEP=...time="YYYY-MM-DD HH:MM:SS"...   (wall-clock timestamp)
+#   - ##VEP-command-line=...                    (echoes the output_file path)
+# Strip both via the ^##VEP prefix. Use -u root for write access to /;
+# default container user is non-root.
+docker exec -u root "$C" bash -c '
+  grep -vE "^##VEP" /work_golden_1.vcf > /work_golden_1_stripped.vcf
+  grep -vE "^##VEP" /work_golden_2.vcf > /work_golden_2_stripped.vcf
   diff -q /work_golden_1_stripped.vcf /work_golden_2_stripped.vcf
 ' || { echo "Determinism check FAILED — two consecutive VEP runs produced different output" >&2; exit 1; }
 echo "Determinism check PASS"
@@ -109,15 +114,24 @@ echo "Determinism check PASS"
 CACHE_HASH=$(find "$CACHE_DIR/native_cache" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | awk '{print $1}')
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-docker exec "$C" bash -c "
-  cat > /work_golden_final.vcf <<EOH
-##vepyr_port_oracle_image=$IMG
-##vepyr_port_oracle_vep_version=115
-##vepyr_port_oracle_cache_hash=$CACHE_HASH
-##vepyr_port_oracle_generated_at=$TIMESTAMP
-##vepyr_port_oracle_perl_test_passed=$PERL_PASSED
-EOH
-  cat /work_golden_1.vcf >> /work_golden_final.vcf
+# Insert Layer 3 headers RIGHT AFTER ##fileformat= so the VCF stays
+# spec-conformant (##fileformat= must be the first line). awk reads the
+# original golden line-by-line and emits the 5 ##vepyr_port_oracle_*
+# lines once, immediately after the first ##fileformat= line.
+docker exec -u root "$C" bash -c "
+  awk -v img='$IMG' -v hash='$CACHE_HASH' -v ts='$TIMESTAMP' -v perl='$PERL_PASSED' '
+    /^##fileformat=/ && !done {
+      print
+      print \"##vepyr_port_oracle_image=\" img
+      print \"##vepyr_port_oracle_vep_version=115\"
+      print \"##vepyr_port_oracle_cache_hash=\" hash
+      print \"##vepyr_port_oracle_generated_at=\" ts
+      print \"##vepyr_port_oracle_perl_test_passed=\" perl
+      done=1
+      next
+    }
+    { print }
+  ' /work_golden_1.vcf > /work_golden_final.vcf
 "
 
 docker cp "$C:/work_golden_final.vcf" "$CASE_DIR/golden.vcf"
