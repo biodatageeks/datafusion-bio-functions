@@ -94,6 +94,12 @@ struct PartitionedVcfBody {
     temp_write_duration: Duration,
 }
 
+#[derive(Debug)]
+struct PartitionedVcfBodies {
+    ready: BTreeMap<usize, PartitionedVcfBody>,
+    inflight_max: usize,
+}
+
 struct VcfBodyTempDir {
     path: PathBuf,
 }
@@ -392,9 +398,17 @@ fn copy_body_file_to_writer(path: &Path, writer: &mut VcfLocalWriter) -> Result<
     Ok(started.elapsed())
 }
 
-fn initial_partition_body_job_ids(partition_count: usize, max_contig_jobs: usize) -> Vec<usize> {
-    let max_contig_jobs = max_contig_jobs.max(1).min(partition_count);
-    (0..max_contig_jobs).collect()
+fn background_partition_body_job_limit(max_contig_jobs: usize) -> usize {
+    max_contig_jobs.saturating_sub(1)
+}
+
+fn initial_background_partition_body_job_ids(
+    partition_count: usize,
+    max_contig_jobs: usize,
+) -> Vec<usize> {
+    let max_background_jobs =
+        background_partition_body_job_limit(max_contig_jobs).min(partition_count.saturating_sub(1));
+    (1..(1 + max_background_jobs)).collect()
 }
 
 async fn write_vcf_partition_body(
@@ -477,6 +491,61 @@ async fn write_vcf_partition_body(
     })?;
     result.temp_write_duration += write_started.elapsed();
     Ok(result)
+}
+
+async fn collect_partition_body_jobs(
+    streams: Vec<(usize, datafusion::physical_plan::SendableRecordBatchStream)>,
+    tempdir_path: PathBuf,
+    max_jobs: usize,
+    vcf_info_fields: Arc<Vec<String>>,
+    unique_format_tags: Arc<Vec<String>>,
+    sample_names: Arc<Vec<String>>,
+    coordinate_zero_based: bool,
+) -> Result<PartitionedVcfBodies> {
+    let mut stream_iter = streams.into_iter();
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut ready = BTreeMap::new();
+    let mut inflight_max = 0usize;
+    let max_jobs = max_jobs.max(1);
+
+    loop {
+        while jobs.len() < max_jobs {
+            let Some((partition_id, stream)) = stream_iter.next() else {
+                break;
+            };
+            let path = tempdir_path.join(format!("partition_{partition_id:04}.vcf.body"));
+            let vcf_info_fields = Arc::clone(&vcf_info_fields);
+            let unique_format_tags = Arc::clone(&unique_format_tags);
+            let sample_names = Arc::clone(&sample_names);
+            jobs.spawn(write_vcf_partition_body(
+                partition_id,
+                stream,
+                path,
+                vcf_info_fields,
+                unique_format_tags,
+                sample_names,
+                coordinate_zero_based,
+            ));
+            inflight_max = inflight_max.max(jobs.len());
+        }
+
+        if jobs.is_empty() {
+            break;
+        }
+
+        let Some(joined) = jobs.join_next().await else {
+            continue;
+        };
+        let body = joined.map_err(|e| {
+            DataFusionError::Execution(format!("VCF body shard task failed: {e}"))
+        })??;
+        ready.insert(body.partition_id, body);
+    }
+
+    Ok(PartitionedVcfBodies {
+        ready,
+        inflight_max,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -611,99 +680,103 @@ async fn stream_partitioned_vcf_body(
     }
 
     let mut stream_iter = streams.into_iter().enumerate();
-    let mut jobs = tokio::task::JoinSet::new();
-    let mut ready: BTreeMap<usize, PartitionedVcfBody> = BTreeMap::new();
+    let Some((first_partition_id, first_stream)) = stream_iter.next() else {
+        return Ok(0);
+    };
+    debug_assert_eq!(first_partition_id, 0);
+    let remaining_streams = stream_iter.collect::<Vec<_>>();
     let mut total_rows = 0usize;
-    let mut next_write_partition_id = 0usize;
-    let initial_job_target = initial_partition_body_job_ids(partition_count, max_contig_jobs).len();
+    let background_job_limit = background_partition_body_job_limit(max_contig_jobs);
+    let tempdir_path = tempdir.path().to_path_buf();
 
-    while jobs.len() < initial_job_target {
-        let Some((partition_id, stream)) = stream_iter.next() else {
-            break;
-        };
-        let path = tempdir
-            .path()
-            .join(format!("partition_{partition_id:04}.vcf.body"));
-        let vcf_info_fields = Arc::clone(&vcf_info_fields);
-        let unique_format_tags = Arc::clone(&unique_format_tags);
-        let sample_names = Arc::clone(&sample_names);
-        jobs.spawn(write_vcf_partition_body(
-            partition_id,
-            stream,
-            path,
-            vcf_info_fields,
-            unique_format_tags,
-            sample_names,
+    let mut bodies = if background_job_limit > 0 && !remaining_streams.is_empty() {
+        let background_future = collect_partition_body_jobs(
+            remaining_streams,
+            tempdir_path,
+            background_job_limit,
+            Arc::clone(&vcf_info_fields),
+            Arc::clone(&unique_format_tags),
+            Arc::clone(&sample_names),
             coordinate_zero_based,
-        ));
-        if let Some(profile) = sink_profile.as_mut() {
-            profile.contig_inflight_max = profile.contig_inflight_max.max(jobs.len());
-        }
+        );
+        let direct_future = stream_vcf_partition_to_writer(
+            first_partition_id,
+            first_stream,
+            writer,
+            pb,
+            config,
+            total_input,
+            &mut total_rows,
+            Arc::clone(&vcf_info_fields),
+            Arc::clone(&unique_format_tags),
+            Arc::clone(&sample_names),
+            coordinate_zero_based,
+            sink_profile,
+        );
+        let (direct_result, body_result) = tokio::join!(direct_future, background_future);
+        direct_result?;
+        body_result?
+    } else {
+        stream_vcf_partition_to_writer(
+            first_partition_id,
+            first_stream,
+            writer,
+            pb,
+            config,
+            total_input,
+            &mut total_rows,
+            Arc::clone(&vcf_info_fields),
+            Arc::clone(&unique_format_tags),
+            Arc::clone(&sample_names),
+            coordinate_zero_based,
+            sink_profile,
+        )
+        .await?;
+        collect_partition_body_jobs(
+            remaining_streams,
+            tempdir_path,
+            1,
+            Arc::clone(&vcf_info_fields),
+            Arc::clone(&unique_format_tags),
+            Arc::clone(&sample_names),
+            coordinate_zero_based,
+        )
+        .await?
+    };
+
+    if let Some(profile) = sink_profile.as_mut() {
+        let direct_partition = usize::from(partition_count > 0);
+        profile.contig_inflight_max = profile
+            .contig_inflight_max
+            .max(direct_partition + bodies.inflight_max);
     }
 
-    loop {
-        while jobs.len() < max_contig_jobs {
-            let Some((partition_id, stream)) = stream_iter.next() else {
-                break;
-            };
-            let path = tempdir
-                .path()
-                .join(format!("partition_{partition_id:04}.vcf.body"));
-            let vcf_info_fields = Arc::clone(&vcf_info_fields);
-            let unique_format_tags = Arc::clone(&unique_format_tags);
-            let sample_names = Arc::clone(&sample_names);
-            jobs.spawn(write_vcf_partition_body(
-                partition_id,
-                stream,
-                path,
-                vcf_info_fields,
-                unique_format_tags,
-                sample_names,
-                coordinate_zero_based,
-            ));
-            if let Some(profile) = sink_profile.as_mut() {
-                profile.contig_inflight_max = profile.contig_inflight_max.max(jobs.len());
-            }
-        }
-
-        while let Some(body) = ready.remove(&next_write_partition_id) {
-            let copy_duration = copy_body_file_to_writer(&body.path, writer)?;
-            let _ = std::fs::remove_file(&body.path);
-            if let Some(profile) = sink_profile.as_mut() {
-                profile.stream_next += body.stream_next;
-                profile.batch_to_lines += body.format_duration;
-                profile.write_records += body.temp_write_duration + copy_duration;
-                profile.batches += body.batches;
-                profile.rows += body.input_rows;
-                profile.lines += body.lines;
-                profile.body_chunk_bytes += body.bytes;
-                profile.format_jobs += body.batches;
-            }
-            total_rows += body.lines;
-            pb.inc(body.lines as u64);
-            if let Some(ref cb) = config.on_batch_written {
-                cb(body.lines, total_rows, total_input);
-            }
-            next_write_partition_id += 1;
-        }
-
-        if next_write_partition_id == partition_count {
-            break;
-        }
-
-        if jobs.is_empty() {
-            return Err(DataFusionError::Execution(
-                "partitioned VCF body writer stalled with no running jobs".to_string(),
-            ));
-        }
-
-        let Some(joined) = jobs.join_next().await else {
-            continue;
+    let mut next_write_partition_id = 1usize;
+    while next_write_partition_id < partition_count {
+        let Some(body) = bodies.ready.remove(&next_write_partition_id) else {
+            return Err(DataFusionError::Execution(format!(
+                "partitioned VCF body writer missing partition {next_write_partition_id}"
+            )));
         };
-        let body = joined.map_err(|e| {
-            DataFusionError::Execution(format!("VCF body shard task failed: {e}"))
-        })??;
-        ready.insert(body.partition_id, body);
+
+        let copy_duration = copy_body_file_to_writer(&body.path, writer)?;
+        let _ = std::fs::remove_file(&body.path);
+        if let Some(profile) = sink_profile.as_mut() {
+            profile.stream_next += body.stream_next;
+            profile.batch_to_lines += body.format_duration;
+            profile.write_records += body.temp_write_duration + copy_duration;
+            profile.batches += body.batches;
+            profile.rows += body.input_rows;
+            profile.lines += body.lines;
+            profile.body_chunk_bytes += body.bytes;
+            profile.format_jobs += body.batches;
+        }
+        total_rows += body.lines;
+        pb.inc(body.lines as u64);
+        if let Some(ref cb) = config.on_batch_written {
+            cb(body.lines, total_rows, total_input);
+        }
+        next_write_partition_id += 1;
     }
 
     Ok(total_rows)
@@ -1687,12 +1760,16 @@ mod tests {
     }
 
     #[test]
-    fn test_partitioned_body_writer_initial_jobs_include_partition_zero() {
+    fn test_partitioned_body_writer_initial_background_jobs_exclude_partition_zero() {
         assert_eq!(
-            initial_partition_body_job_ids(22, 12),
-            (0..12).collect::<Vec<_>>()
+            initial_background_partition_body_job_ids(22, 12),
+            (1..12).collect::<Vec<_>>()
         );
-        assert_eq!(initial_partition_body_job_ids(3, 12), vec![0, 1, 2]);
+        assert_eq!(initial_background_partition_body_job_ids(3, 12), vec![1, 2]);
+        assert_eq!(
+            initial_background_partition_body_job_ids(22, 1),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]
