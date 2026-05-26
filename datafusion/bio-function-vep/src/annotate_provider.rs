@@ -8229,12 +8229,7 @@ fn should_parallelize_input_buffers(config: &ContigAnnotationConfig) -> bool {
 }
 
 fn input_buffer_parallelism(config: &ContigAnnotationConfig) -> usize {
-    let requested = config.annotation_workers.max(1);
-    if config.chunked_buffer_lookup && config.contig_parallelism > 1 && requested == 1 {
-        2
-    } else {
-        requested
-    }
+    config.annotation_workers.max(1)
 }
 
 fn effective_chunked_buffer_lookup(
@@ -13352,16 +13347,16 @@ mod tests {
 
     #[cfg(feature = "kv-cache")]
     #[test]
-    fn test_chunked_lookup_is_enabled_for_multi_contig_single_worker() {
+    fn test_multi_contig_single_worker_keeps_one_buffer_inflight_per_contig() {
         let mut config = minimal_contig_annotation_config();
         config.annotation_workers = 1;
         config.contig_parallelism = 2;
         config.chunked_buffer_lookup = true;
         config.use_fjall = true;
 
-        assert!(should_parallelize_input_buffers(&config));
-        assert_eq!(input_buffer_parallelism(&config), 2);
-        assert_eq!(parallel_annotation_buffer_queue_target(&config), 2);
+        assert!(!should_parallelize_input_buffers(&config));
+        assert_eq!(input_buffer_parallelism(&config), 1);
+        assert_eq!(parallel_annotation_buffer_queue_target(&config), 1);
         assert!(effective_chunked_buffer_lookup(
             config.chunked_buffer_lookup,
             config.annotation_workers,
