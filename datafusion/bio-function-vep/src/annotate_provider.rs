@@ -4409,6 +4409,7 @@ impl AnnotateProvider {
             fetch_limit,
             target_partitions,
             annotation_workers,
+            contig_parallelism,
             chunked_buffer_lookup,
             lookup_vcf_has_chr: true,
             lookup_vcf_zero_based: true,
@@ -7353,6 +7354,8 @@ struct ContigAnnotationConfig {
     target_partitions: usize,
     /// Maximum number of VEP input-buffer annotation jobs to execute concurrently.
     annotation_workers: usize,
+    /// Maximum number of active contig lanes in the enclosing execution plan.
+    contig_parallelism: usize,
     /// Experimental VEP-style flow: build raw VCF input buffers first, then
     /// run fjall lookup + annotation inside each buffer chunk.
     chunked_buffer_lookup: bool,
@@ -8143,8 +8146,8 @@ enum ParallelAnnotationPoll {
 
 impl ParallelAnnotationState {
     fn new(ann: ContigAnnotationState) -> Self {
-        let max_parallel = ann.config.annotation_workers.max(1);
-        let max_queued_buffers = parallel_annotation_buffer_queue_target(max_parallel);
+        let max_parallel = input_buffer_parallelism(&ann.config);
+        let max_queued_buffers = parallel_annotation_buffer_queue_target(&ann.config);
         let projection = ann.config.projection.clone();
         Self {
             ann,
@@ -8216,12 +8219,21 @@ impl ParallelAnnotationState {
 fn should_parallelize_input_buffers(config: &ContigAnnotationConfig) -> bool {
     #[cfg(feature = "kv-cache")]
     {
-        config.use_fjall && !config.inline_lookup && config.annotation_workers > 1
+        config.use_fjall && !config.inline_lookup && input_buffer_parallelism(config) > 1
     }
     #[cfg(not(feature = "kv-cache"))]
     {
         let _ = config;
         false
+    }
+}
+
+fn input_buffer_parallelism(config: &ContigAnnotationConfig) -> usize {
+    let requested = config.annotation_workers.max(1);
+    if config.chunked_buffer_lookup && config.contig_parallelism > 1 && requested == 1 {
+        2
+    } else {
+        requested
     }
 }
 
@@ -9536,9 +9548,14 @@ fn annotate_window(
     annotate_worker_window(&mut ann.worker, window_batches, projection)
 }
 
-fn parallel_annotation_buffer_queue_target(target_partitions: usize) -> usize {
-    let target_partitions = target_partitions.max(1);
-    if target_partitions == 1 {
+fn parallel_annotation_buffer_queue_target(config: &ContigAnnotationConfig) -> usize {
+    let target_partitions = input_buffer_parallelism(config);
+    if config.chunked_buffer_lookup
+        && config.contig_parallelism > 1
+        && config.annotation_workers <= 1
+    {
+        target_partitions
+    } else if target_partitions == 1 {
         1
     } else {
         target_partitions * PARALLEL_INPUT_BUFFER_BACKLOG_FACTOR
@@ -11603,6 +11620,7 @@ mod tests {
             fetch_limit: None,
             target_partitions: 1,
             annotation_workers: 1,
+            contig_parallelism: 1,
             chunked_buffer_lookup: false,
             lookup_vcf_has_chr: true,
             lookup_vcf_zero_based: true,
@@ -13067,10 +13085,15 @@ mod tests {
 
     #[test]
     fn test_parallel_annotation_buffers_more_whole_vep_buffers_than_inflight_workers() {
-        assert_eq!(parallel_annotation_buffer_queue_target(0), 1);
-        assert_eq!(parallel_annotation_buffer_queue_target(1), 1);
-        assert_eq!(parallel_annotation_buffer_queue_target(2), 4);
-        assert_eq!(parallel_annotation_buffer_queue_target(12), 24);
+        let mut config = minimal_contig_annotation_config();
+        config.annotation_workers = 1;
+        assert_eq!(parallel_annotation_buffer_queue_target(&config), 1);
+
+        config.annotation_workers = 2;
+        assert_eq!(parallel_annotation_buffer_queue_target(&config), 4);
+
+        config.annotation_workers = 12;
+        assert_eq!(parallel_annotation_buffer_queue_target(&config), 24);
     }
 
     #[test]
@@ -13332,10 +13355,13 @@ mod tests {
     fn test_chunked_lookup_is_enabled_for_multi_contig_single_worker() {
         let mut config = minimal_contig_annotation_config();
         config.annotation_workers = 1;
+        config.contig_parallelism = 2;
         config.chunked_buffer_lookup = true;
         config.use_fjall = true;
 
-        assert!(!should_parallelize_input_buffers(&config));
+        assert!(should_parallelize_input_buffers(&config));
+        assert_eq!(input_buffer_parallelism(&config), 2);
+        assert_eq!(parallel_annotation_buffer_queue_target(&config), 2);
         assert!(effective_chunked_buffer_lookup(
             config.chunked_buffer_lookup,
             config.annotation_workers,
