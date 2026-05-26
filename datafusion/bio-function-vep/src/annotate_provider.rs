@@ -4331,8 +4331,11 @@ impl AnnotateProvider {
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "chunked_buffer_lookup"))
             .unwrap_or(false);
-        let chunked_buffer_lookup =
-            effective_chunked_buffer_lookup(requested_chunked_buffer_lookup, annotation_workers);
+        let chunked_buffer_lookup = effective_chunked_buffer_lookup(
+            requested_chunked_buffer_lookup,
+            annotation_workers,
+            contig_parallelism,
+        );
         #[cfg(feature = "kv-cache")]
         if chunked_buffer_lookup && kv_store.is_none() {
             return Err(DataFusionError::Execution(
@@ -8225,8 +8228,9 @@ fn should_parallelize_input_buffers(config: &ContigAnnotationConfig) -> bool {
 fn effective_chunked_buffer_lookup(
     requested_chunked_buffer_lookup: bool,
     annotation_workers: usize,
+    contig_parallelism: usize,
 ) -> bool {
-    requested_chunked_buffer_lookup && annotation_workers > 1
+    requested_chunked_buffer_lookup && (annotation_workers > 1 || contig_parallelism > 1)
 }
 
 type PrepareFuture = Pin<Box<dyn Future<Output = Result<Option<ContigReadyState>>> + Send>>;
@@ -13309,7 +13313,7 @@ mod tests {
 
     #[cfg(feature = "kv-cache")]
     #[test]
-    fn test_chunked_lookup_is_disabled_for_single_annotation_worker() {
+    fn test_chunked_lookup_is_disabled_for_single_lane_single_worker() {
         let mut config = minimal_contig_annotation_config();
         config.annotation_workers = 1;
         config.chunked_buffer_lookup = true;
@@ -13318,7 +13322,24 @@ mod tests {
         assert!(!should_parallelize_input_buffers(&config));
         assert!(!effective_chunked_buffer_lookup(
             config.chunked_buffer_lookup,
-            config.annotation_workers
+            config.annotation_workers,
+            1
+        ));
+    }
+
+    #[cfg(feature = "kv-cache")]
+    #[test]
+    fn test_chunked_lookup_is_enabled_for_multi_contig_single_worker() {
+        let mut config = minimal_contig_annotation_config();
+        config.annotation_workers = 1;
+        config.chunked_buffer_lookup = true;
+        config.use_fjall = true;
+
+        assert!(!should_parallelize_input_buffers(&config));
+        assert!(effective_chunked_buffer_lookup(
+            config.chunked_buffer_lookup,
+            config.annotation_workers,
+            2
         ));
     }
 
@@ -13333,7 +13354,8 @@ mod tests {
         assert!(should_parallelize_input_buffers(&config));
         assert!(effective_chunked_buffer_lookup(
             config.chunked_buffer_lookup,
-            config.annotation_workers
+            config.annotation_workers,
+            1
         ));
     }
 
