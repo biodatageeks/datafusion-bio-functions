@@ -25,6 +25,7 @@ use futures::{Stream, StreamExt};
 
 use super::allele_index::AlleleMatcher;
 use super::key_encoding::chrom_to_code;
+use super::kv_store::RangePrefetchLimitExceeded;
 use super::kv_store::VepKvStore;
 use super::position_entry::{PositionEntryReader, make_builder};
 use crate::allele::{
@@ -336,6 +337,10 @@ struct LookupProfile {
     range_prefetch_entries: u64,
     range_prefetch_bytes: u64,
     range_prefetch_skipped: u64,
+    range_prefetch_skip_multi_chrom: u64,
+    range_prefetch_skip_span: u64,
+    range_prefetch_skip_entries: u64,
+    range_prefetch_skip_bytes: u64,
     range_prefetch: Duration,
     extract_cols: Duration,
     match_loop: Duration,
@@ -382,6 +387,13 @@ impl LookupProfile {
             total.as_secs_f64(),
             input_rate,
             output_rate
+        );
+        eprintln!(
+            "[vep-kv-profile] range_prefetch_skip_reasons multi_chrom={} span={} entries={} bytes={}",
+            self.range_prefetch_skip_multi_chrom,
+            self.range_prefetch_skip_span,
+            self.range_prefetch_skip_entries,
+            self.range_prefetch_skip_bytes,
         );
         eprintln!(
             "[vep-kv-profile] extract_cols={:.3}s ({:.1}%) range_prefetch={:.3}s ({:.1}%) match_loop={:.3}s ({:.1}%) vcf_take={:.3}s ({:.1}%) cache_build={:.3}s ({:.1}%)",
@@ -633,14 +645,14 @@ impl KvLookupStream {
                 if let Some(chrom_code) = batch_chrom_code {
                     let span = max_probe.saturating_sub(min_probe);
                     if min_probe <= max_probe && span <= kv_range_prefetch_max_span() {
-                        match self.store.range_position_entries_limited(
+                        match self.store.range_position_entries_limited_with_reason(
                             chrom_code,
                             min_probe,
                             max_probe,
                             kv_range_prefetch_max_entries(),
                             kv_range_prefetch_max_bytes(),
                         )? {
-                            Some(entries) => {
+                            Ok(entries) => {
                                 let mut prefetched = HashMap::with_capacity(entries.len());
                                 let mut bytes = 0usize;
                                 for (position, value) in entries {
@@ -654,17 +666,27 @@ impl KvLookupStream {
                                 }
                                 range_prefetch = Some(prefetched);
                             }
-                            None if self.profile_enabled => {
+                            Err(reason) if self.profile_enabled => {
                                 self.profile.range_prefetch_skipped += 1;
+                                match reason {
+                                    RangePrefetchLimitExceeded::Entries => {
+                                        self.profile.range_prefetch_skip_entries += 1;
+                                    }
+                                    RangePrefetchLimitExceeded::Bytes => {
+                                        self.profile.range_prefetch_skip_bytes += 1;
+                                    }
+                                }
                             }
-                            None => {}
+                            Err(_) => {}
                         }
                     } else if self.profile_enabled {
                         self.profile.range_prefetch_skipped += 1;
+                        self.profile.range_prefetch_skip_span += 1;
                     }
                 }
             } else if self.profile_enabled {
                 self.profile.range_prefetch_skipped += 1;
+                self.profile.range_prefetch_skip_multi_chrom += 1;
             }
         }
         if let Some(t0) = range_prefetch_started {

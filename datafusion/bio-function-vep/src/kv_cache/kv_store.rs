@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::result::Result as StdResult;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use datafusion::arrow::array::RecordBatch;
@@ -26,6 +27,12 @@ const MAX_DECOMPRESSED_ENTRY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// the allele table and column-major data (including the `end` column).
 /// All variants at the same `(chrom, start)` are merged into one entry.
 pub const FORMAT_V0: u8 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangePrefetchLimitExceeded {
+    Entries,
+    Bytes,
+}
 
 /// Wrapper around fjall `Database` for VEP cache storage.
 ///
@@ -488,6 +495,28 @@ impl VepKvStore {
         max_entries: usize,
         max_bytes: usize,
     ) -> Result<Option<Vec<(i64, fjall::UserValue)>>> {
+        match self.range_position_entries_limited_with_reason(
+            chrom_code,
+            start,
+            end,
+            max_entries,
+            max_bytes,
+        )? {
+            Ok(entries) => Ok(Some(entries)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Read position entries for one chromosome/start range, returning the
+    /// exact budget that would be exceeded.
+    pub(crate) fn range_position_entries_limited_with_reason(
+        &self,
+        chrom_code: u16,
+        start: i64,
+        end: i64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<StdResult<Vec<(i64, fjall::UserValue)>, RangePrefetchLimitExceeded>> {
         let range_start = start.min(end);
         let range_end = start.max(end);
         let mut start_key = Vec::with_capacity(10);
@@ -511,13 +540,16 @@ impl VepKvStore {
                 DataFusionError::Execution("invalid fjall position key length".to_string())
             })?);
             total_bytes = total_bytes.saturating_add(value.as_ref().len());
-            if entries.len() >= max_entries || total_bytes > max_bytes {
-                return Ok(None);
+            if entries.len() >= max_entries {
+                return Ok(Err(RangePrefetchLimitExceeded::Entries));
+            }
+            if total_bytes > max_bytes {
+                return Ok(Err(RangePrefetchLimitExceeded::Bytes));
             }
             entries.push((position, value));
         }
 
-        Ok(Some(entries))
+        Ok(Ok(entries))
     }
 
     /// Batch-insert pre-serialized position entries into the data keyspace.
@@ -734,6 +766,22 @@ mod tests {
             .range_position_entries_limited(chrom_code, 100, 200, 1, usize::MAX)
             .unwrap();
         assert!(limited.is_none());
+
+        let entry_limited = store
+            .range_position_entries_limited_with_reason(chrom_code, 100, 200, 1, usize::MAX)
+            .unwrap();
+        assert!(matches!(
+            entry_limited,
+            Err(RangePrefetchLimitExceeded::Entries)
+        ));
+
+        let byte_limited = store
+            .range_position_entries_limited_with_reason(chrom_code, 100, 200, usize::MAX, 4)
+            .unwrap();
+        assert!(matches!(
+            byte_limited,
+            Err(RangePrefetchLimitExceeded::Bytes)
+        ));
     }
 
     #[test]
