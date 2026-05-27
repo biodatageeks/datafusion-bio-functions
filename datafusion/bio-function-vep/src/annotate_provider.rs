@@ -79,7 +79,8 @@ use noodles_fasta as fasta;
 use serde_json::Value;
 
 use crate::allele::{
-    MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
+    MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_allele_multi,
+    vcf_to_vep_input_allele_multi, vep_norm_end, vep_norm_start,
 };
 use crate::annotation_store::{AnnotationBackend, build_store};
 use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
@@ -1596,6 +1597,48 @@ struct TranscriptRawMetadata {
     is_gencode_primary: bool,
 }
 
+/// Per-ALT precomputed data used by the multi-ALT CSQ-expansion path in
+/// `annotate_batch_with_transcript_engine`.
+///
+/// VEP emits one CSQ allele-group per `(feature × ALT)` for multi-ALT VCF
+/// rows (e.g. `21:8987004 C T,CCGC` → 6 groups when 3 features overlap).
+/// The `VcfTableProvider` pipe-joins multi-ALT rows into a single
+/// `alt`-column string (`"T|CCGC"`) for downstream consumers, so this
+/// struct holds the per-ALT slice of all CSQ-relevant computations.
+///
+/// For single-ALT rows the surrounding code creates a single `PerAltCtx`
+/// instance; for multi-ALT rows it creates N, then iterates
+/// feature-outer / ALT-inner when assembling the CSQ string.
+struct PerAltCtx {
+    /// The raw VCF ALT allele string for this slice (e.g. `"T"` or `"CCGC"`).
+    alt_allele: String,
+    /// VEP-minimized REF (shared prefix/suffix trimmed); `"-"` for pure
+    /// insertions.
+    vep_ref: String,
+    /// VEP-minimized ALT (shared prefix/suffix trimmed); `"-"` for pure
+    /// deletions.
+    vep_allele: String,
+    /// SO variant class derived from (`vep_ref`, `vep_allele`).
+    variant_class: &'static str,
+    /// Per-ALT filtered view of the colocated cache entries (existing
+    /// variation id, clin_sig, somatic flag, etc.).
+    variant_fields: ColocatedVariantFields,
+    /// Per-ALT filtered view of the colocated frequency entries.
+    frequency_fields: ColocatedFrequencyFields,
+    /// Pre-rendered batch 3 (frequencies + variant-level) CSQ suffix.
+    batch3_suffix: String,
+    /// Transcript consequences computed by the engine for this ALT.
+    assignments: Vec<TranscriptConsequence>,
+    /// Sorted indices into `assignments` (feature-type-rank, then
+    /// transcript-idx). Determines the feature emission order in CSQ.
+    sorted_indices: Vec<usize>,
+    /// VariantInput used by the engine — retained for HGVS_OFFSET typed
+    /// column extraction.
+    variant: Option<VariantInput>,
+    /// Most severe SO term across this ALT's assignments.
+    most_str: String,
+}
+
 /// A single co-located variant entry with allele and clinical metadata.
 #[derive(Debug, Clone)]
 struct ColocatedEntry {
@@ -1618,7 +1661,7 @@ struct ColocatedData {
     unshifted_output_allele: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ColocatedVariantFields {
     existing_variation: String,
     clin_sig: String,
@@ -1627,7 +1670,7 @@ struct ColocatedVariantFields {
     pubmed: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ColocatedFrequencyFields {
     af_values: Vec<String>,
     max_af: String,
@@ -4622,8 +4665,6 @@ impl AnnotateProvider {
 
             // VEP-style allele minimization: strip shared prefix and suffix between REF and ALT.
             let ref_al = string_at(batch.column(ref_idx).as_ref(), row).unwrap_or_default();
-            let (vep_ref, vep_allele) = vcf_to_vep_allele(&ref_al, &alt_allele);
-            let variant_class = classify_variant(&vep_ref, &vep_allele);
 
             // Cache-hit fast path: use pre-computed consequence from variation cache.
             let cached_most =
@@ -4648,29 +4689,86 @@ impl AnnotateProvider {
             let start_val = int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0);
             let end_val = int64_at(batch.column(end_idx).as_ref(), row).unwrap_or(0);
             let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
-            let (input_ref, input_alt, input_start) =
-                vcf_to_vep_input_allele(start_val, &ref_al, &alt_allele);
-            let input_allele_string = format!("{input_ref}/{input_alt}");
+
+            // --- Multi-ALT split ---
+            // `VcfTableProvider` pipe-joins comma-separated ALTs in a VCF row
+            // (e.g., `T,CCGC` → `T|CCGC`) into the single `alt` column. To
+            // emit one CSQ allele-group per (feature × ALT) — matching real
+            // Ensembl VEP output — we split on `|` and process each ALT
+            // separately downstream. For single-ALT rows the split yields a
+            // 1-element vec and behavior is unchanged.
+            //
+            // Traceability:
+            // - Pipe-join site: `datafusion-bio-formats/datafusion/bio-format-vcf/src/physical_exec.rs`
+            //   (`join_into(...iter()...,'|')` in the ALT branch).
+            // - VEP per-ALT CSQ expansion: `OutputFactory::get_all_output_hashes_by_VariationFeature`
+            //   iterates `VariationFeatureOverlap::get_all_alternate_VariationFeatureOverlapAlleles`.
+            let alts: Vec<String> = alt_allele.split('|').map(str::to_string).collect();
+            let alts_ref: Vec<&str> = alts.iter().map(String::as_str).collect();
+
+            // Co-located lookup key uses the multi-ALT-aware parser-level
+            // input-allele string. For single-ALT rows this is bit-identical
+            // to `vcf_to_vep_input_allele(...)`. For multi-ALT rows it emits
+            // `REF/ALT1/ALT2/...`, matching the sink-key built on the
+            // `VariantLookupExec` side (`variant_lookup_exec.rs` line ~1009).
+            // The same `ColocatedData` row is reused for every per-ALT
+            // emission below; per-ALT filtering happens inside
+            // `variant_fields(output_allele=…)`, which keys off the
+            // multi-ALT-normalized `per_vep_allele` (untrimmed for `T,CCGC`
+            // style rows, joint-prefix-trimmed for `CCGC,CGGC` style rows).
+            let (row_input_ref, row_input_alts, row_input_start) =
+                vcf_to_vep_input_allele_multi(start_val, &ref_al, &alts_ref);
+            let mut row_input_allele_string = row_input_ref.clone();
+            for a in &row_input_alts {
+                row_input_allele_string.push('/');
+                row_input_allele_string.push_str(a);
+            }
             let coloc = colocated_map.get(&(
                 chrom_norm.to_string(),
-                input_start,
+                row_input_start,
                 end_val,
-                input_allele_string,
+                row_input_allele_string,
             ));
-            let (variant_fields, frequency_fields) = if flags.check_existing {
-                if let Some(data) = coloc {
-                    (
-                        data.variant_fields(
-                            &vep_allele,
-                            data.variant_match_output_allele(&vep_allele),
-                            flags.pubmed,
-                        ),
-                        data.frequency_fields(
-                            &vep_allele,
-                            data.frequency_match_output_allele(&vep_allele),
-                            flags,
-                        ),
-                    )
+
+            // Multi-ALT-aware VEP allele normalization. For single-ALT this
+            // equals biallelic `vcf_to_vep_allele(...)`. For multi-ALT, the
+            // shared prefix/suffix is taken jointly across REF + every ALT,
+            // so e.g. `C → T,CCGC` keeps both alts untrimmed (Allele="T",
+            // Allele="CCGC") whereas `C → CCGC,CGGC` strips the shared `C`
+            // anchor (Allele="CGC", Allele="GGC"). This matches VEP's
+            // `VariationFeature->allele_string` semantics.
+            let (multi_vep_ref, multi_vep_alts) = vcf_to_vep_allele_multi(&ref_al, &alts_ref);
+
+            let mut per_alt_data: Vec<PerAltCtx> = Vec::with_capacity(alts.len());
+            for (alt_idx, alt_one) in alts.iter().enumerate() {
+                let per_vep_ref = multi_vep_ref.clone();
+                let per_vep_allele = multi_vep_alts[alt_idx].clone();
+                let per_variant_class = classify_variant(&per_vep_ref, &per_vep_allele);
+
+                let (per_variant_fields, per_frequency_fields) = if flags.check_existing {
+                    if let Some(data) = coloc {
+                        (
+                            data.variant_fields(
+                                &per_vep_allele,
+                                data.variant_match_output_allele(&per_vep_allele),
+                                flags.pubmed,
+                            ),
+                            data.frequency_fields(
+                                &per_vep_allele,
+                                data.frequency_match_output_allele(&per_vep_allele),
+                                flags,
+                            ),
+                        )
+                    } else {
+                        (
+                            ColocatedVariantFields::default(),
+                            ColocatedFrequencyFields {
+                                af_values: vec![String::new(); AF_COLUMNS.len()],
+                                max_af: String::new(),
+                                max_af_pops: String::new(),
+                            },
+                        )
+                    }
                 } else {
                     (
                         ColocatedVariantFields::default(),
@@ -4680,30 +4778,51 @@ impl AnnotateProvider {
                             max_af_pops: String::new(),
                         },
                     )
-                }
-            } else {
-                (
-                    ColocatedVariantFields::default(),
-                    ColocatedFrequencyFields {
-                        af_values: vec![String::new(); AF_COLUMNS.len()],
-                        max_af: String::new(),
-                        max_af_pops: String::new(),
-                    },
-                )
-            };
-            let existing_var = variant_fields.existing_variation.as_str();
+                };
 
-            // Build the 33-field Batch 3 suffix (positions 41-73) shared across all transcripts.
-            let batch3_suffix = format!(
-                "{}|{}|{}|{}|{}|{}|{}",
-                frequency_fields.af_values.join("|"),
-                frequency_fields.max_af,
-                frequency_fields.max_af_pops,
-                variant_fields.clin_sig,
-                variant_fields.somatic,
-                variant_fields.pheno,
-                variant_fields.pubmed,
-            );
+                // 33-field Batch 3 suffix (positions 41-73) shared across all
+                // transcripts emitted for this specific ALT.
+                let per_batch3_suffix = format!(
+                    "{}|{}|{}|{}|{}|{}|{}",
+                    per_frequency_fields.af_values.join("|"),
+                    per_frequency_fields.max_af,
+                    per_frequency_fields.max_af_pops,
+                    per_variant_fields.clin_sig,
+                    per_variant_fields.somatic,
+                    per_variant_fields.pheno,
+                    per_variant_fields.pubmed,
+                );
+
+                per_alt_data.push(PerAltCtx {
+                    alt_allele: alt_one.clone(),
+                    vep_ref: per_vep_ref,
+                    vep_allele: per_vep_allele,
+                    variant_class: per_variant_class,
+                    variant_fields: per_variant_fields,
+                    frequency_fields: per_frequency_fields,
+                    batch3_suffix: per_batch3_suffix,
+                    assignments: Vec::new(),
+                    sorted_indices: Vec::new(),
+                    variant: None,
+                    most_str: String::new(),
+                });
+            }
+
+            // ALT[0] view exposed under the original variable names so the
+            // cache-hit fast path and typed-column writers (which are
+            // row-level, not per-ALT) keep their existing semantics — and
+            // single-ALT rows behave bit-for-bit identically to the
+            // pre-multi-ALT code path. We clone into owned values rather
+            // than holding references into `per_alt_data` because the
+            // cache-miss engine-evaluation loop below mutates the vec.
+            let vep_ref = per_alt_data[0].vep_ref.clone();
+            let vep_allele = per_alt_data[0].vep_allele.clone();
+            let variant_class = per_alt_data[0].variant_class;
+            let variant_fields = per_alt_data[0].variant_fields.clone();
+            let frequency_fields = per_alt_data[0].frequency_fields.clone();
+            let existing_var = variant_fields.existing_variation.clone();
+            let batch3_suffix = per_alt_data[0].batch3_suffix.clone();
+            let _ = (&vep_ref, &batch3_suffix); // silence unused for branches that may not read these
 
             let most_str;
             // Store assignment results from cache-miss path for annotation column population.
@@ -4728,7 +4847,7 @@ impl AnnotateProvider {
                         allele: &vep_allele,
                         consequence: csq_val.as_str(),
                         impact,
-                        existing_variation: existing_var,
+                        existing_variation: &existing_var,
                         variant_class,
                         frequency_fields: &frequency_fields,
                         variant_fields: &variant_fields,
@@ -4766,92 +4885,156 @@ impl AnnotateProvider {
                     continue;
                 }
 
-                let mut variant = VariantInput::from_vcf(
-                    chrom.clone(),
-                    start,
-                    end,
-                    ref_allele,
-                    alt_allele.clone(),
-                );
-                // Only compute genomic shift for indels (ref != alt length).
-                // SNVs/MNVs don't shift and skipping avoids allele normalization overhead.
-                if let Some(reader) = hgvs_reference_reader.as_mut() {
-                    if ref_al.len() != alt_allele.len() {
-                        let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
-                        let (vep_ref_norm, vep_alt_norm) = vcf_to_vep_allele(&ref_al, &alt_allele);
-                        let vep_start = vep_norm_start(start, &ref_al, &alt_allele);
-                        let vep_end = vep_norm_end(start, &ref_al, &alt_allele);
-                        variant.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
-                            reader,
-                            chrom_norm,
-                            &vep_ref_norm,
-                            &vep_alt_norm,
-                            vep_start,
-                            vep_end,
-                            1,
-                        )?;
-                        variant.hgvs_shift_reverse = crate::hgvs::build_hgvs_genomic_shift(
-                            reader,
-                            chrom_norm,
-                            &vep_ref_norm,
-                            &vep_alt_norm,
-                            vep_start,
-                            vep_end,
-                            -1,
-                        )?;
+                // --- Per-ALT engine evaluation (multi-ALT CSQ expansion) ---
+                // For multi-ALT VCF rows (e.g. `T,CCGC` → `alt = "T|CCGC"`),
+                // each ALT must drive its own engine evaluation: HGVSc and
+                // amino-acid impact differ per ALT, and each ALT may match
+                // a different existing-variant ID in the cache. Single-ALT
+                // rows (`alts.len() == 1`) take exactly one iteration and
+                // produce the same engine output as the pre-multi-ALT
+                // code path.
+                let mut row_most_so: Option<SoTerm> = None;
+                for (alt_idx, alt_one) in alts.iter().enumerate() {
+                    let mut variant = VariantInput::from_vcf(
+                        chrom.clone(),
+                        start,
+                        end,
+                        ref_allele.clone(),
+                        alt_one.clone(),
+                    );
+                    // Only compute genomic shift for indels (ref != alt length).
+                    // SNVs/MNVs don't shift and skipping avoids allele
+                    // normalization overhead.
+                    if let Some(reader) = hgvs_reference_reader.as_mut() {
+                        if ref_al.len() != alt_one.len() {
+                            let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
+                            let (vep_ref_norm, vep_alt_norm) =
+                                vcf_to_vep_allele(&ref_al, alt_one);
+                            let vep_start = vep_norm_start(start, &ref_al, alt_one);
+                            let vep_end = vep_norm_end(start, &ref_al, alt_one);
+                            variant.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
+                                reader,
+                                chrom_norm,
+                                &vep_ref_norm,
+                                &vep_alt_norm,
+                                vep_start,
+                                vep_end,
+                                1,
+                            )?;
+                            variant.hgvs_shift_reverse = crate::hgvs::build_hgvs_genomic_shift(
+                                reader,
+                                chrom_norm,
+                                &vep_ref_norm,
+                                &vep_alt_norm,
+                                vep_start,
+                                vep_end,
+                                -1,
+                            )?;
+                        }
                     }
-                }
-                let assignments = engine.evaluate_variant_prepared(&variant, ctx);
+                    let assignments_alt = engine.evaluate_variant_prepared(&variant, ctx);
 
-                // Derive the local scalar `most_severe_consequence` from all
-                // computed assignments, even when pick filtering later reduces
-                // emitted CSQ/typed entries. Ensembl VEP VCF output has no
-                // equivalent scalar field, so this preserves the existing
-                // annotate_vep API contract.
-                let mut all_terms =
-                    TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
-                if all_terms.is_empty() {
-                    all_terms.push(SoTerm::SequenceVariant);
-                }
-                let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
-                most_str = most.as_str().to_string();
-                row_assignments = apply_pick_mode(assignments, ctx, pick_flags, &vep_allele);
-                row_variant = Some(variant);
+                    // Track most-severe SO term across all ALTs so the
+                    // row-level `most_severe_consequence` scalar reflects
+                    // the entire VCF row (matches VEP's behavior on
+                    // multi-ALT rows).
+                    let mut all_terms_alt =
+                        TranscriptConsequenceEngine::collapse_variant_terms(&assignments_alt);
+                    if all_terms_alt.is_empty() {
+                        all_terms_alt.push(SoTerm::SequenceVariant);
+                    }
+                    if let Some(alt_most) = most_severe_term(all_terms_alt.iter()) {
+                        row_most_so = Some(match row_most_so {
+                            None => alt_most,
+                            Some(cur) => most_severe_term([cur, alt_most].iter())
+                                .unwrap_or(alt_most),
+                        });
+                    }
 
-                // Build VEP-compatible sorted permutation index.
-                // Used by both CSQ serialization and typed annotation columns
-                // so the Nth CSQ entry matches the Nth typed column element.
-                //
-                // Sort order: Transcript → Regulatory → Motif → Intergenic,
-                // then lexicographically by feature stable_id within each
-                // group. See ensembl-variation VariationFeature.pm lines 855-864.
-                //
-                // Source arrays are pre-sorted by feature ID in
-                // PreparedContext, so transcript_idx order equals
-                // lexicographic transcript_id order. We compare
-                // integer indices instead of heap-allocated strings.
-                // Non-transcript features (regulatory, motif) are
-                // already emitted in ID order by collect_overlapping_indices.
+                    let per_vep_allele = per_alt_data[alt_idx].vep_allele.clone();
+                    let assignments_alt =
+                        apply_pick_mode(assignments_alt, ctx, pick_flags, &per_vep_allele);
+
+                    // Build VEP-compatible sorted permutation index per ALT.
+                    // Used by both CSQ serialization and typed annotation
+                    // columns so the Nth CSQ entry matches the Nth typed
+                    // column element.
+                    //
+                    // Sort order: Transcript → Regulatory → Motif → Intergenic,
+                    // then lexicographically by feature stable_id within each
+                    // group. See ensembl-variation VariationFeature.pm lines 855-864.
+                    let mut sorted_indices_alt: Vec<usize> = (0..assignments_alt.len()).collect();
+                    if assignments_alt.len() > 1 {
+                        sorted_indices_alt.sort_unstable_by(|&i, &j| {
+                            let a = &assignments_alt[i];
+                            let b = &assignments_alt[j];
+                            a.feature_type
+                                .rank()
+                                .cmp(&b.feature_type.rank())
+                                .then_with(|| match (a.transcript_idx, b.transcript_idx) {
+                                    (Some(ai), Some(bj)) => ai.cmp(&bj),
+                                    _ => i.cmp(&j),
+                                })
+                        });
+                    }
+
+                    per_alt_data[alt_idx].assignments = assignments_alt;
+                    per_alt_data[alt_idx].sorted_indices = sorted_indices_alt;
+                    per_alt_data[alt_idx].variant = Some(variant);
+                }
+
+                // ALT[0] view exposed under the original names so the
+                // typed-column writers (row-level, not per-ALT) keep their
+                // existing semantics. Single-ALT rows produce the same
+                // `row_assignments` / `row_variant` / `sorted_indices` as
+                // the pre-multi-ALT code path.
+                row_assignments = per_alt_data[0].assignments.clone();
+                row_variant = per_alt_data[0].variant.clone();
                 sorted_indices.clear();
-                sorted_indices.extend(0..row_assignments.len());
-                if row_assignments.len() > 1 {
-                    sorted_indices.sort_unstable_by(|&i, &j| {
-                        let a = &row_assignments[i];
-                        let b = &row_assignments[j];
-                        a.feature_type
-                            .rank()
-                            .cmp(&b.feature_type.rank())
-                            .then_with(|| match (a.transcript_idx, b.transcript_idx) {
-                                (Some(ai), Some(bj)) => ai.cmp(&bj),
-                                _ => i.cmp(&j),
-                            })
-                    });
-                }
+                sorted_indices.extend(per_alt_data[0].sorted_indices.iter().copied());
 
-                // Build per-transcript CSQ entries into reusable buffer (already cleared above).
-                // Skip the entire CSQ formatting when the csq column is not projected.
+                most_str = row_most_so
+                    .unwrap_or(SoTerm::SequenceVariant)
+                    .as_str()
+                    .to_string();
+
+                // Build per-(feature × ALT) CSQ entries into reusable buffer
+                // (already cleared above). Skip the entire CSQ formatting when
+                // the csq column is not projected.
+                //
+                // Loop order is outer=feature, inner=ALT — matching real
+                // Ensembl VEP's `OutputFactory` (one CSQ allele-group per
+                // VariationFeatureOverlapAllele, grouped by feature). For
+                // single-ALT rows the inner loop has one iteration and the
+                // per-ALT shadowed variables resolve to the row-level
+                // values, preserving the pre-multi-ALT behavior.
                 if !skip_csq {
-                    for &si in &sorted_indices {
+                    let csq_sorted_indices: Vec<usize> =
+                        per_alt_data[0].sorted_indices.iter().copied().collect();
+                    for &si in &csq_sorted_indices {
+                        for alt_idx in 0..per_alt_data.len() {
+                            // Shadow row-level variables with per-ALT values
+                            // so the body below renders the right Allele,
+                            // VARIANT_CLASS, Existing_variation, frequencies,
+                            // and HGVSc for THIS ALT.
+                            let alt_ctx = &per_alt_data[alt_idx];
+                            let vep_allele = alt_ctx.vep_allele.as_str();
+                            let variant_class = alt_ctx.variant_class;
+                            let variant_fields = &alt_ctx.variant_fields;
+                            let frequency_fields = &alt_ctx.frequency_fields;
+                            let existing_var = variant_fields.existing_variation.as_str();
+                            let batch3_suffix = alt_ctx.batch3_suffix.as_str();
+                            let row_assignments = &alt_ctx.assignments;
+                            let row_variant = alt_ctx.variant.as_ref();
+                            // Feature ordering is taken from ALT[0]; per-ALT
+                            // assignments must contain the same feature set
+                            // at the same index (engine queries are
+                            // position-determined, identical across ALTs at
+                            // the same VCF position). Guard against missing
+                            // indices defensively.
+                            if si >= row_assignments.len() {
+                                continue;
+                            }
                         let tc = &row_assignments[si];
                         terms_buf.clear();
                         for (i, t) in tc.terms.iter().enumerate() {
@@ -5143,6 +5326,7 @@ impl AnnotateProvider {
                              {batch3_suffix}"
                             );
                         }
+                        } // end per-ALT inner loop (multi-ALT CSQ expansion)
                     }
                     if csq_buf.is_empty() {
                         let impact = impact_label(SoImpact::Modifier);
@@ -5150,7 +5334,7 @@ impl AnnotateProvider {
                             allele: &vep_allele,
                             consequence: "sequence_variant",
                             impact,
-                            existing_variation: existing_var,
+                            existing_variation: &existing_var,
                             variant_class,
                             frequency_fields: &frequency_fields,
                             variant_fields: &variant_fields,

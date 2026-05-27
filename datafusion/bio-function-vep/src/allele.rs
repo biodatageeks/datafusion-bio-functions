@@ -329,6 +329,167 @@ pub fn vcf_to_vep_allele(ref_allele: &str, alt_allele: &str) -> (String, String)
 }
 
 /// Traceability:
+/// - Ensembl Variation `trim_sequences()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
+///
+/// Multi-ALT analog of `vep_prefix_suffix_len`: returns the longest prefix
+/// and suffix shared between REF and EVERY alt in `alts`. For single-ALT
+/// inputs the result is identical to the biallelic version.
+///
+/// Suffix trimming only fires when at least one alt differs in length from
+/// REF (`is_indel`), matching VEP's `trim_sequences()` MNV-preserving rule.
+fn vep_prefix_suffix_len_multi(ref_allele: &str, alts: &[&str]) -> (usize, usize) {
+    if alts.is_empty() {
+        return (0, 0);
+    }
+    let ref_bytes = ref_allele.as_bytes();
+    if ref_bytes.is_empty() {
+        return (0, 0);
+    }
+
+    // Per-VEP: SNV-only multi-ALT (all single-base) gets no trimming.
+    if ref_bytes.len() == 1 && alts.iter().all(|a| a.as_bytes().len() == 1) {
+        return (0, 0);
+    }
+
+    // Longest prefix shared with ref AND every alt.
+    let mut prefix_len = 0;
+    let max_prefix = std::cmp::min(
+        ref_bytes.len(),
+        alts.iter().map(|a| a.as_bytes().len()).min().unwrap_or(0),
+    );
+    while prefix_len < max_prefix {
+        let r = ref_bytes[prefix_len];
+        if !alts
+            .iter()
+            .all(|a| a.as_bytes().get(prefix_len) == Some(&r))
+        {
+            break;
+        }
+        prefix_len += 1;
+    }
+
+    // Longest suffix shared with ref AND every alt, only when at least one
+    // alt has a different length from REF (indel context).
+    let any_indel = alts.iter().any(|a| a.as_bytes().len() != ref_bytes.len());
+    let mut suffix_len = 0;
+    if any_indel {
+        let ref_remaining = ref_bytes.len() - prefix_len;
+        let min_alt_remaining = alts
+            .iter()
+            .map(|a| a.as_bytes().len().saturating_sub(prefix_len))
+            .min()
+            .unwrap_or(0);
+        let max_suffix = std::cmp::min(ref_remaining, min_alt_remaining);
+        while suffix_len < max_suffix {
+            let r = ref_bytes[ref_bytes.len() - 1 - suffix_len];
+            if !alts.iter().all(|a| {
+                let ab = a.as_bytes();
+                ab.get(ab.len() - 1 - suffix_len) == Some(&r)
+            }) {
+                break;
+            }
+            suffix_len += 1;
+        }
+    }
+
+    (prefix_len, suffix_len)
+}
+
+/// Traceability:
+/// - Ensembl Variation `trim_sequences()`
+///   <https://github.com/Ensembl/ensembl-variation/blob/23c76f60b1592e4df86159cf5530bdc326120c3d/modules/Bio/EnsEMBL/Variation/Utils/Sequence.pm#L965-L1038>
+///
+/// Multi-ALT VEP allele normalization: trims the shared prefix/suffix across
+/// REF and ALL alts jointly. This matches VEP's behavior for multi-allelic
+/// VCF rows where the joint normalization may leave ALT bases that would
+/// have been stripped under per-ALT trimming.
+///
+/// Example: `C → T,CCGC` has no shared prefix (T differs), so `Allele` for
+/// the `CCGC` ALT stays `CCGC` (not the per-ALT-trimmed `CGC`). This is
+/// load-bearing for `port_cache_variation` cv_02 and cv_04.
+pub fn vcf_to_vep_allele_multi(ref_allele: &str, alts: &[&str]) -> (String, Vec<String>) {
+    if alts.is_empty() {
+        return (ref_allele.to_string(), Vec::new());
+    }
+    let (prefix_len, suffix_len) = vep_prefix_suffix_len_multi(ref_allele, alts);
+
+    let trim_dash = |s: &str| -> String {
+        if s.is_empty() {
+            "-".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+
+    let vep_ref = trim_dash(&ref_allele[prefix_len..ref_allele.len() - suffix_len]);
+    let vep_alts: Vec<String> = alts
+        .iter()
+        .map(|a| trim_dash(&a[prefix_len..a.len() - suffix_len]))
+        .collect();
+
+    (vep_ref, vep_alts)
+}
+
+/// Multi-ALT analog of `vep_norm_start`: shift by the joint common prefix.
+pub fn vep_norm_start_multi(vcf_pos: i64, ref_allele: &str, alts: &[&str]) -> i64 {
+    let (prefix_len, _) = vep_prefix_suffix_len_multi(ref_allele, alts);
+    vcf_pos + prefix_len as i64
+}
+
+/// Multi-ALT analog of `vep_norm_end`: shrink by the joint common suffix.
+pub fn vep_norm_end_multi(vcf_pos: i64, ref_allele: &str, alts: &[&str]) -> i64 {
+    let (_, suffix_len) = vep_prefix_suffix_len_multi(ref_allele, alts);
+    vcf_pos + ref_allele.len() as i64 - 1 - suffix_len as i64
+}
+
+/// Traceability:
+/// - Ensembl VEP `Parser::VCF::create_VariationFeatures()`
+///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Parser/VCF.pm#L321-L345>
+///
+/// Multi-ALT analog of `vcf_to_vep_input_allele`: strips a shared leading
+/// anchor base across REF and ALL alts (parser-level only, no suffix trim).
+/// Used to derive the sink-identity allele string for multi-allelic VCF rows
+/// so the lookup key matches between the build side (variant_lookup_exec)
+/// and the annotation side (annotate_provider).
+pub fn vcf_to_vep_input_allele_multi(
+    pos: i64,
+    ref_allele: &str,
+    alts: &[&str],
+) -> (String, Vec<String>, i64) {
+    if alts.is_empty() {
+        return (ref_allele.to_string(), Vec::new(), pos);
+    }
+
+    let any_indel = alts.iter().any(|a| a.len() != ref_allele.len());
+    let all_anchored = !ref_allele.is_empty()
+        && alts
+            .iter()
+            .all(|a| !a.is_empty() && a.as_bytes()[0] == ref_allele.as_bytes()[0]);
+
+    if any_indel && all_anchored {
+        let trim_dash = |s: &str| -> String {
+            if s.is_empty() {
+                "-".to_string()
+            } else {
+                s.to_string()
+            }
+        };
+        return (
+            trim_dash(&ref_allele[1..]),
+            alts.iter().map(|a| trim_dash(&a[1..])).collect(),
+            pos + 1,
+        );
+    }
+
+    (
+        ref_allele.to_string(),
+        alts.iter().map(|a| a.to_string()).collect(),
+        pos,
+    )
+}
+
+/// Traceability:
 /// - Ensembl VEP `Parser::VCF::create_VariationFeatures()`
 ///   <https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Parser/VCF.pm#L321-L345>
 ///
@@ -1170,5 +1331,77 @@ mod tests {
         // No suffix since alt_remaining=0. So: start=101, end=103
         assert_eq!(vep_norm_start(100, "TCAC", "T"), 101);
         assert_eq!(vep_norm_end(100, "TCAC", "T"), 103);
+    }
+
+    // ---- Multi-ALT helpers ---------------------------------------------------
+
+    #[test]
+    fn test_multi_alt_single_alt_matches_biallelic_snv() {
+        // Single ALT path must equal biallelic helper exactly.
+        let (r, a) = vcf_to_vep_allele_multi("A", &["G"]);
+        assert_eq!(r, "A");
+        assert_eq!(a, vec!["G".to_string()]);
+    }
+
+    #[test]
+    fn test_multi_alt_single_alt_matches_biallelic_insertion() {
+        // C → CCGC: shared prefix C → vep_ref="-", alts=["CGC"], start shift = 1.
+        let (r, a) = vcf_to_vep_allele_multi("C", &["CCGC"]);
+        assert_eq!(r, "-");
+        assert_eq!(a, vec!["CGC".to_string()]);
+        assert_eq!(vep_norm_start_multi(8987004, "C", &["CCGC"]), 8987005);
+    }
+
+    #[test]
+    fn test_multi_alt_snv_plus_insertion_no_trim() {
+        // cv_02: C → T,CCGC. No shared prefix (T != C in alt0). VEP keeps both
+        // alts untrimmed in the multi-allelic Allele string.
+        let (r, a) = vcf_to_vep_allele_multi("C", &["T", "CCGC"]);
+        assert_eq!(r, "C");
+        assert_eq!(a, vec!["T".to_string(), "CCGC".to_string()]);
+        // No prefix to strip → start stays put.
+        assert_eq!(vep_norm_start_multi(8987004, "C", &["T", "CCGC"]), 8987004);
+    }
+
+    #[test]
+    fn test_multi_alt_two_insertions_shared_prefix_trim() {
+        // cv_04: C → CCGC,CGGC. Shared prefix C (both alts and ref start
+        // with C) → trim 1 → ("-", ["CGC", "GGC"]) and start shifts by 1.
+        let (r, a) = vcf_to_vep_allele_multi("C", &["CCGC", "CGGC"]);
+        assert_eq!(r, "-");
+        assert_eq!(a, vec!["CGC".to_string(), "GGC".to_string()]);
+        assert_eq!(
+            vep_norm_start_multi(8987004, "C", &["CCGC", "CGGC"]),
+            8987005
+        );
+    }
+
+    #[test]
+    fn test_multi_alt_insertion_with_shared_suffix() {
+        // cv_03: CT → CCGCT. Shared prefix C, shared suffix T (indel).
+        // → ("-", ["CGC"]).
+        let (r, a) = vcf_to_vep_allele_multi("CT", &["CCGCT"]);
+        assert_eq!(r, "-");
+        assert_eq!(a, vec!["CGC".to_string()]);
+    }
+
+    #[test]
+    fn test_multi_alt_input_allele_multi_alt_no_anchor() {
+        // C → T,CCGC has no fully-shared anchor base (ALT[0]=T differs).
+        // Parser-level input-allele string must NOT strip anything.
+        let (r, a, p) = vcf_to_vep_input_allele_multi(8987004, "C", &["T", "CCGC"]);
+        assert_eq!(r, "C");
+        assert_eq!(a, vec!["T".to_string(), "CCGC".to_string()]);
+        assert_eq!(p, 8987004);
+    }
+
+    #[test]
+    fn test_multi_alt_input_allele_shared_anchor() {
+        // C → CCGC,CGGC: both ALTs share anchor C with REF. Parser-level
+        // strips one base and shifts position by 1.
+        let (r, a, p) = vcf_to_vep_input_allele_multi(8987004, "C", &["CCGC", "CGGC"]);
+        assert_eq!(r, "-");
+        assert_eq!(a, vec!["CGC".to_string(), "GGC".to_string()]);
+        assert_eq!(p, 8987005);
     }
 }
