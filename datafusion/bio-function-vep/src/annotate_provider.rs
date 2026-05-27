@@ -12005,4 +12005,77 @@ mod tests {
     //     let mm = buffer_min_max(&[batch]).unwrap();
     //     assert_eq!(mm.get("21"), Some(&(25_585_733_i64, 25_982_445_i64)));
     // }
+
+    // ── Axis B B1 — `up_down_size` is symmetric `max(upstream, downstream)` ─
+    //
+    // VEP's `AnnotationType::Transcript::up_down_size()` returns
+    // `max(UPSTREAM_DISTANCE, DOWNSTREAM_DISTANCE)` — a single scalar applied
+    // symmetrically to bound the coarse cache-region fetch. Strand-aware
+    // asymmetric upstream/downstream gating happens later in
+    // `upstream_downstream_term()`. This test pins the symmetric application.
+    //
+    // Position 1_500_000 with `upstream=100_000, downstream=600_000`:
+    //   - `up_down_size = max(100_000, 600_000) = 600_000`
+    //   - `query_start = 1_500_000 - 600_000 = 900_000` → region 0
+    //   - `query_end   = 1_500_000 + 600_000 = 2_100_000` → region 2
+    //   - Result: regions 0, 1, 2.
+    //
+    // If vepyr (incorrectly) applied upstream and downstream asymmetrically
+    // (start - upstream, end + downstream), the result would be
+    // `(1_400_000, 2_100_000)` → regions 1, 2 only. The test fails in that case.
+    #[test]
+    fn test_port_annotation_source_b1_up_down_size_symmetric_widening() {
+        let regions = cache_regions_for_coords("1", 1_500_000, 1_500_000, 100_000, 600_000);
+        assert_eq!(
+            regions,
+            (0..=2)
+                .map(|i| TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: i,
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Axis B B2 — `collect_buffer_cache_regions` dedup across multiple batches ─
+    //
+    // Perl row 13g covers single-batch dedup; vepyr's `HashSet` accumulation
+    // also dedupes ACROSS batches. Build batch1 covering region 0 and batch2
+    // covering region 1 twice (two positions both in region 1). Result must be
+    // a 2-element set, not 3.
+    #[test]
+    fn test_port_annotation_source_b2_cross_batch_dedup() {
+        let batch1 = make_buffer_batch_many("1", &[1_000_000]);
+        let batch2 = make_buffer_batch_many("1", &[1_000_001, 1_500_000]);
+        let regions = collect_buffer_cache_regions(&[batch1, batch2], 0, 0).unwrap();
+
+        let expected: HashSet<TranscriptCacheRegion> = [
+            TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 0,
+            },
+            TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 1,
+            },
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(regions, expected);
+        assert_eq!(regions.len(), 2, "two distinct regions after dedup");
+    }
+
+    // ── Axis B B3 — `cache_region_index` boundary at and below pos=1 ────────
+    //
+    // Pins the `saturating_sub(1) / 1_000_000` semantics at the lower edge.
+    // `pos=0`: i64 `0.saturating_sub(1) = -1`; `-1 / 1_000_000 == 0` (Rust
+    // integer division truncates toward zero). `pos=1`: `0 / 1_000_000 == 0`.
+    #[test]
+    fn test_port_annotation_source_b3_cache_region_index_at_zero_boundary() {
+        assert_eq!(cache_region_index(0), 0);
+        assert_eq!(cache_region_index(1), 0);
+        assert_eq!(cache_region_index(1_000_000), 0);
+        assert_eq!(cache_region_index(1_000_001), 1);
+    }
 }
