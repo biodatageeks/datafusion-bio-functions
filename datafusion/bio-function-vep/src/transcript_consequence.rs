@@ -13736,14 +13736,57 @@ mod tests {
 
     #[test]
     fn format_coords_ensembl_supports_unknown_bounds() {
+        // v2 port of `ensembl-vep/t/Utils.t` rows 1-6 (`format_coords`).
+        // Detailed plan: porting-tests/detailed_plans/Utils.md.
+        // Sztywno-1:1: every Perl row gets a Rust line. The literal
+        // arguments mirror the Perl test where the semantics overlap;
+        // pre-existing `(Some(7), Some(7))` etc. lines remain because
+        // they assert the same equal-collapse semantic with a different
+        // numeric literal.
+
+        // Perl row 1: `format_coords(1, 1) == '1'` — equal coords collapse.
         assert_eq!(
-            format_coords_ensembl(None, Some(3)),
-            Some("?-3".to_string())
+            format_coords_ensembl(Some(1), Some(1)),
+            Some("1".to_string())
         );
+
+        // Perl row 2: `format_coords(1, 2) == '1-2'` — ordered range.
+        assert_eq!(
+            format_coords_ensembl(Some(1), Some(2)),
+            Some("1-2".to_string())
+        );
+
+        // Perl row 3: `format_coords(2, 1) == '1-2'` — reversed-swap.
+        assert_eq!(
+            format_coords_ensembl(Some(2), Some(1)),
+            Some("1-2".to_string())
+        );
+
+        // Perl row 4: `format_coords(1) == '1-?'` — missing end → `?`.
         assert_eq!(
             format_coords_ensembl(Some(100), None),
             Some("100-?".to_string())
         );
+
+        // Perl row 5: `format_coords(undef, 1) == '?-1'` — missing start → `?`.
+        assert_eq!(
+            format_coords_ensembl(None, Some(3)),
+            Some("?-3".to_string())
+        );
+
+        // Perl row 6: `format_coords(undef, undef) == '-'` — both missing.
+        // SEMANTIC DIVERGENCE (documented in detailed_plan):
+        // Perl emits the literal sentinel "-"; vepyr returns `None` and
+        // lets the caller substitute via `.unwrap_or_else(|| "-".into())`.
+        // The composed observable is identical; we assert both shapes
+        // here so the audit trail is explicit.
+        assert_eq!(format_coords_ensembl(None, None), None);
+        assert_eq!(
+            format_coords_ensembl(None, None).unwrap_or_else(|| "-".to_string()),
+            "-"
+        );
+
+        // Pre-existing assertions kept for back-compat with the test name.
         assert_eq!(
             format_coords_ensembl(Some(7), Some(7)),
             Some("7".to_string())
