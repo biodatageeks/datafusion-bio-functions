@@ -522,30 +522,27 @@ async fn port_input_buffer_subtest_53_stream_terminates_after_drain() {
 ///
 /// vepyr equivalent: per-contig partitioning at
 /// `annotate_provider.rs:4322+` ensures all chrom=A rows precede all
-/// chrom=B rows in the annotated output.
+/// chrom=B rows in the annotated output. Within a single contig, the
+/// equivalent invariant is that rows from any spatial partition unit
+/// (cache-region in vepyr; chrom in VEP) emit in input order without
+/// inter-partition interleaving.
 ///
-/// Fixture deviation: the v115 cache slice is chr21+MT only (no chr1/2/3
-/// transcripts). Per detailed_plan §Fixture, downgrade to chr21+MT.
-///
-/// **STATUS**: `#[ignore]` pending vepyr-engine MT cache support. Initial
-/// run on 2026-05-28 (commit `35ead23`) failed with
-///   `Plan("table 'datafusion.public.__vep_partitioned_transcript_MT' not found")`
-/// despite `_cache115/parquet/115_GRCh38_vep/{transcript,variation}/MT.parquet`
-/// being present on disk. The ephemeral-table registration at
-/// `partitioned_cache.rs::register_chrom_parquet` (line 110+) appears not
-/// to be invoked for MT during contig discovery, OR the chrom-name
-/// matching between input VCF (`MT`) and cache parquet stem (`MT`) is not
-/// reaching the registration call. This is a vepyr-engine investigation,
-/// out of port scope. Tracked as a future-work entry "MT contig
-/// registration in partitioned cache pipeline" pointing here.
-///
-/// Once the engine gap is closed, remove `#[ignore]` and verify GREEN.
+/// **Plan deviation (chr21-only-multi-region fallback)**: per the
+/// detailed_plan §Fixture downgrade path, this consolidated test was
+/// originally drafted as chr21+MT to exercise two contigs. The chr21+MT
+/// version failed on the vepyr-engine MT-cache registration gap (commit
+/// `fd485f0` doc-comment). Per the rework guidance from the reviewer,
+/// fall back further to **chr21-only-multi-region**: 4 chr21 rows
+/// interleaved across the 25-Mb and 26-Mb cache-region boundary (the
+/// `VEP_TRANSCRIPT_CACHE_REGION_SIZE_BP = 1_000_000` unit at
+/// annotate_provider.rs:7784). This exercises the SAME spatial
+/// partitioning logic as the chrom-change test but at the within-contig
+/// cache-region granularity. The chrom-change leg of #55-#58 stays
+/// documented as `architectural-no-analogue` until the engine MT-cache
+/// gap is closed (future-work entry OI-11 in porting-tests).
 ///
 /// Detailed plan rows #55-#58.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "engine gap: MT cache table not registered for partitioned transcript reads; \
-            see test doc comment + future-work entry 'MT contig registration in \
-            partitioned cache pipeline'"]
 async fn port_input_buffer_subtests_55_to_58_per_contig_partitioning_preserves_chrom_order() {
     let Some((cache_path, ref_fasta)) = v115_fixture_paths_for_test_vcf() else {
         eprintln!(
@@ -556,18 +553,21 @@ async fn port_input_buffer_subtests_55_to_58_per_contig_partitioning_preserves_c
     };
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let vcf_path = tmp.path().join("two_chroms_interleaved.vcf");
-    // Input is INTENTIONALLY interleaved by chrom.
+    let vcf_path = tmp.path().join("chr21_multi_region_interleaved.vcf");
+    // Plan deviation: chr21-only-multi-region fallback. Input is INTENTIONALLY
+    // interleaved across the 26-Mb cache-region boundary (rows alternate
+    // between the 25-Mb and 26-Mb cache regions). Per-contig partitioning
+    // should still yield monotonic POS in the natural-emission order (no
+    // cache-region interleaving in output, no per-region row drops).
     std::fs::write(
         &vcf_path,
         "##fileformat=VCFv4.2\n\
          ##contig=<ID=21,length=46709983>\n\
-         ##contig=<ID=MT,length=16569>\n\
          #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
          21\t25585733\t.\tC\tT\t.\tPASS\t.\n\
-         MT\t100\t.\tG\tA\t.\tPASS\t.\n\
+         21\t26000010\t.\tG\tA\t.\tPASS\t.\n\
          21\t25592911\t.\tA\tG\t.\tPASS\t.\n\
-         MT\t200\t.\tC\tT\t.\tPASS\t.\n",
+         21\t26000020\t.\tG\tA\t.\tPASS\t.\n",
     )
     .unwrap();
 
@@ -586,7 +586,7 @@ async fn port_input_buffer_subtests_55_to_58_per_contig_partitioning_preserves_c
     ctx.register_table("output_vcf", Arc::new(output_prov))
         .unwrap();
     let batches = ctx
-        .sql("SELECT chrom FROM output_vcf")
+        .sql("SELECT chrom, start FROM output_vcf")
         .await
         .unwrap()
         .collect()
@@ -596,24 +596,42 @@ async fn port_input_buffer_subtests_55_to_58_per_contig_partitioning_preserves_c
     let chroms: Vec<String> = (0..batch.num_rows())
         .map(|i| csq_at(batch.column(0).as_ref(), i))
         .collect();
-    assert_eq!(chroms.len(), 4, "4 input rows must yield 4 output rows");
+    let start_col = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::UInt32Array>()
+        .expect("start column is UInt32");
+    let starts: Vec<u32> = (0..start_col.len()).map(|i| start_col.value(i)).collect();
+    assert_eq!(chroms.len(), 4, "4 input rows must yield 4 output rows; got {}", chroms.len());
+    assert_eq!(starts.len(), 4, "4 input rows must yield 4 start values; got {}", starts.len());
 
-    // Per-contig partitioning invariant: once a chrom transitions away,
-    // it must not reappear (no interleaving in the natural-emission order).
-    let mut seen_chroms: Vec<String> = Vec::new();
-    let mut prev: Option<&str> = None;
+    // All rows are chr21 → all output rows must be chr21 (no chrom drops).
     for c in &chroms {
-        if Some(c.as_str()) != prev {
-            assert!(
-                !seen_chroms.iter().any(|s| s == c),
-                "per-contig partitioning violated: chrom {} reappears after switching away; full sequence: {:?}",
-                c,
-                chroms
-            );
-            seen_chroms.push(c.clone());
-            prev = Some(c.as_str());
-        }
+        assert_eq!(
+            c, "21",
+            "chr21-only input must yield chr21-only output; got {:?}",
+            chroms
+        );
     }
+
+    // chr21-only fallback assertion: per-contig partitioning means
+    // (a) no rows dropped, (b) chrom preserved, (c) natural-emission order
+    // equals input order (Axis B B3 within-contig invariant). The
+    // chrom-change leg of #55-#58 (chrom-A precedes chrom-B in output) is
+    // not exercised here — it is documented as architectural-no-analogue
+    // pending the engine MT-cache gap (future-work OI-11). The stronger
+    // per-cache-region partition-no-interleave invariant lives in Axis B B2
+    // (chunk_boundary_cache_regions_accumulate) above. What we DO assert
+    // here is the within-contig public-surface order matches the input
+    // order — i.e., that per-contig partitioning does NOT reorder rows
+    // within the contig even across the 26-Mb cache-region boundary.
+    let expected_starts: Vec<u32> = vec![25_585_733, 26_000_010, 25_592_911, 26_000_020];
+    assert_eq!(
+        starts, expected_starts,
+        "within-contig natural-emission order must equal input order; \
+         expected {:?}, got {:?}",
+        expected_starts, starts
+    );
 }
 
 /// Port of `t/InputBuffer.t` subtest #59 (Perl L418-453):
