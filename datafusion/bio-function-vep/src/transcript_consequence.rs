@@ -21062,4 +21062,188 @@ mod tests {
             "In-frame insertion of Ala in Ala repeat should produce p.Ala3dup"
         );
     }
+
+    // =========================================================================
+    // V2 PORT — TranscriptTree.t (PreparedContext-surface subtests)
+    // =========================================================================
+    //
+    // Sztywno 1:1 Rust analogues of subtests from ensembl-vep/t/TranscriptTree.t
+    // that probe vepyr's typed PreparedContext / PreparedFeatureIndex surface.
+    // Pure-fn COITree / NearestIntervalIndex tests live in
+    // bio-function-ranges::nearest_index::tests.
+    // See porting-tests/detailed_plans/TranscriptTree.md.
+
+    // SUBTEST #4 — architectural-no-analogue.
+    // Perl: TranscriptTree->new() throws "reference.+undef".
+    // vepyr: PreparedContext::new takes `&[TranscriptFeature]` etc.; an
+    // "annotation_source" arg cannot be malformed at runtime. The Rust compiler
+    // enforces what Perl tests at runtime. Type system replaces runtime check.
+
+    // SUBTEST #5 — architectural-no-analogue.
+    // Perl: TranscriptTree->new({annotation_source => bless({},'test')}) throws
+    // "not an ISA of .+Transcript". vepyr: same as #4 — compile-time enforced.
+
+    // SUBTEST #6 — architectural-no-analogue.
+    // Perl: use_ok('Bio::EnsEMBL::VEP::Haplo::Runner'). Haplosaurus is project-wide
+    // out-of-scope per categorization.md row 40. No vepyr analogue.
+
+    // SUBTEST #7 — architectural-no-analogue.
+    // Perl: haplo runner instantiates. Same disposition as #6.
+
+    // SUBTEST #8 — Perl: ok($t = TranscriptTree->new({annotation_source => ...}))
+    // builds tree from cache. vepyr analogue: PreparedContext::new(...) populates
+    // ctx.tx_trees from a &[TranscriptFeature] slice.
+    #[test]
+    fn tt8_prepared_context_builds_tx_trees() {
+        let tx_a = tx("ENST21A", "21", 1_000, 2_000, 1, "protein_coding", None, None);
+        let ctx = PreparedContext::new(
+            std::slice::from_ref(&tx_a),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let tree = ctx
+            .tx_trees
+            .get("21")
+            .expect("tx_trees should expose key '21' after building");
+        // Sanity-check the tree actually contains the inserted transcript:
+        let mut hits = Vec::new();
+        tree.query(1_500_i32, 1_500_i32, |node| {
+            hits.push(*GenericInterval::<usize>::metadata(node));
+        });
+        assert!(!hits.is_empty(), "expected a hit for the inserted transcript");
+    }
+
+    // SUBTEST #9 — architectural-no-analogue.
+    // Perl: is(ref($t), 'Bio::EnsEMBL::VEP::TranscriptTree'). Pure compile-time
+    // type identity in Rust; PreparedContext is named differently and the type
+    // is checked by rustc, not by a runtime assertion.
+
+    // SUBTEST #10 — Perl: valid_chromosomes get == [21, 22, 'LRG_485'].
+    // vepyr analogue: ctx.tx_trees.keys() is the set of chromosomes derived
+    // from the input transcripts slice.
+    #[test]
+    fn tt10_prepared_context_exposes_chromosome_keyset() {
+        let txs = vec![
+            tx("ENST21", "21", 1_000, 2_000, 1, "protein_coding", None, None),
+            tx("ENST22", "22", 3_000, 4_000, 1, "protein_coding", None, None),
+            tx("ENSTLRG", "LRG_485", 100, 200, 1, "protein_coding", None, None),
+        ];
+        let ctx = PreparedContext::new(&txs, &[], &[], &[], &[], &[], &[]);
+        let keys: HashSet<String> = ctx.tx_trees.keys().cloned().collect();
+        let expected: HashSet<String> =
+            ["21", "22", "LRG_485"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(keys, expected);
+    }
+
+    // SUBTEST #11 — blocked-future-work.
+    // Perl: valid_chromosomes([21]) setter override returns [21].
+    // Missing API: PreparedContext::override_valid_chromosomes(set: HashSet<String>).
+    // Future-work entry: porting-tests/future-work-vepyr.md
+    //   "PreparedContext::override_valid_chromosomes". Effort: S.
+    //
+    // // #[test]
+    // // fn tt11_override_valid_chromosomes() {
+    // //     let txs = vec![
+    // //         tx("ENST21", "21", 1_000, 2_000, 1, "protein_coding", None, None),
+    // //         tx("ENST22", "22", 3_000, 4_000, 1, "protein_coding", None, None),
+    // //     ];
+    // //     let mut ctx = PreparedContext::new(&txs, &[], &[], &[], &[], &[], &[]);
+    // //     ctx.override_valid_chromosomes(HashSet::from(["21".to_string()]));
+    // //     assert_eq!(
+    // //         ctx.valid_chromosomes(),
+    // //         &HashSet::from(["21".to_string()])
+    // //     );
+    // // }
+
+    // SUBTEST #12 — architectural-no-analogue.
+    // Perl: get_chr_tree('foo') vivifies a per-chr Set::IntervalTree on demand.
+    // vepyr: PreparedFeatureIndex::new (transcript_consequence.rs:647) builds
+    // ALL per-chromosome COITrees up-front from the input slice. There is no
+    // lazy-vivify-empty-tree path — asking for a missing chrom returns
+    // ctx.tx_trees.get(chrom) == None. This is a deliberate eager-prep design;
+    // adding lazy vivification would contradict PreparedContext's
+    // immutable-per-batch contract.
+
+    // SUBTEST #18 — see nearest_index::tests::tt18 stub (arch-no-analogue:
+    // coitrees does not merge overlapping inserts).
+    // SUBTEST #19 — same.
+
+    // SUBTEST #20, #21, #23 — blocked-future-work.
+    // Perl: chromosome_synonyms($file) loader + NC_000021.9 / chr21 alias
+    // resolution. Missing API on PreparedContext:
+    //   pub fn set_chrom_synonyms(&mut self, syns: HashMap<String, String>)
+    //   pub fn canonical_chrom(&self, alias: &str) -> &str
+    // + rewiring tx_trees.get(chrom) call sites to route through canonical_chrom.
+    // Future-work entry: porting-tests/future-work-vepyr.md
+    //   "PreparedContext chromosome-synonyms alias table". Effort: M.
+    //
+    // // #[test]
+    // // fn tt20_load_chrom_synonyms() {
+    // //     // ctx.set_chrom_synonyms(HashMap::from([...])); assert it sticks.
+    // // }
+    // // #[test]
+    // // fn tt21_synonym_full_alias_resolves() {
+    // //     // tx on "21"; query "NC_000021.9" via synonyms; assert hit.
+    // // }
+    // // #[test]
+    // // fn tt23_canonicalize_adds_chr_prefix() {
+    // //     // tx keyed "chr21"; query bare "21" via alias table; assert hit.
+    // // }
+
+    // SUBTEST #22 — Perl: fetch('chr21', 25585733, 25585733) — chr prefix
+    // stripped. vepyr: normalize_chrom("chr21") == "21" (transcript_consequence.rs:2975)
+    // AND a flow test that the strip is integrated into PreparedContext.
+    #[test]
+    fn tt22_normalize_chrom_strips_chr_prefix() {
+        assert_eq!(normalize_chrom("chr21"), "21");
+        assert_eq!(normalize_chrom("chrX"), "X");
+        assert_eq!(normalize_chrom("chrMT"), "MT");
+        // Already-bare names pass through unchanged.
+        assert_eq!(normalize_chrom("21"), "21");
+        assert_eq!(normalize_chrom("MT"), "MT");
+        // LRG names pass through (no "chr" prefix to strip).
+        assert_eq!(normalize_chrom("LRG_485"), "LRG_485");
+    }
+
+    #[test]
+    fn tt22_prepared_context_normalizes_chr_prefix_at_build_time() {
+        // Build context with a transcript on "chr21"; normalize_chrom is invoked
+        // inside PreparedContext::new, so the tree should be keyed "21".
+        let tx_a = tx(
+            "ENSTCHR21",
+            "chr21",
+            25_585_700,
+            25_607_517,
+            1,
+            "protein_coding",
+            None,
+            None,
+        );
+        let ctx = PreparedContext::new(
+            std::slice::from_ref(&tx_a),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        // The tree was inserted under normalize_chrom("chr21") == "21".
+        assert!(ctx.tx_trees.contains_key("21"));
+        assert!(!ctx.tx_trees.contains_key("chr21"));
+    }
+
+    // SUBTEST #26, #27, #28, #29, #30 — architectural-no-analogue.
+    // Perl: _get_obj_start_end polymorphism — accepts [s,e] / {s,e} /
+    //   {start,end} / {s} (default e=s) / throws on {}.
+    // vepyr: callers pass typed (i32, i32) (Interval::new) or named accessors
+    // on typed structs (tx.start / tx.end). The helper exists only to handle
+    // Perl's loose typing; Rust's type system removes the need.
+
+    // SUBTEST #34 — see nearest_index::tests::tt34 stub (arch-no-analogue:
+    // vepyr biological coordinates are non-negative).
 }
