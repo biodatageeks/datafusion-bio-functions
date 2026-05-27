@@ -525,13 +525,16 @@ fn flush_positions_compressed(
 
     let mut total_bytes = 0u64;
     let mut num_positions = 0u64;
+    let mut lookup_key_buf = Vec::with_capacity(10);
 
     for ((chrom, start), rows) in &groups {
         let chrom_code = chrom_to_code(chrom);
         let mut raw_value = serialize_position_entry(rows, batch, &col_indices, allele_col_idx)?;
         // Per-position lock: only serializes merges at the same (chrom, start).
         let _guard = position_locks.lock_for(chrom_code, *start);
-        if let Some(existing_compressed) = store.get_position_entry(chrom_code, *start)? {
+        if let Some(existing_compressed) =
+            store.get_position_entry_with_key_buf(chrom_code, *start, &mut lookup_key_buf)?
+        {
             let mut existing_raw = Vec::new();
             decompress_into_buffer_with_retry(
                 decompressor,

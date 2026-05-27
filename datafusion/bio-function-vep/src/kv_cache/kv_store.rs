@@ -333,7 +333,20 @@ impl VepKvStore {
         start: i64,
     ) -> Result<Option<fjall::UserValue>> {
         let mut key_buf = Vec::with_capacity(10);
-        super::key_encoding::encode_position_key_buf(chrom_code, start, &mut key_buf);
+        self.get_position_entry_with_key_buf(chrom_code, start, &mut key_buf)
+    }
+
+    /// Read a position entry by chrom code + start using a caller-owned key buffer.
+    ///
+    /// This is the annotation hot-path variant. Reusing the 10-byte key buffer avoids
+    /// one small heap allocation per Fjall point probe.
+    pub fn get_position_entry_with_key_buf(
+        &self,
+        chrom_code: u16,
+        start: i64,
+        key_buf: &mut Vec<u8>,
+    ) -> Result<Option<fjall::UserValue>> {
+        super::key_encoding::encode_position_key_buf(chrom_code, start, key_buf);
         match self.data.get(&key_buf) {
             Ok(v) => Ok(v),
             Err(e) => Err(fjall_err(e)),
@@ -438,7 +451,27 @@ impl VepKvStore {
         decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
         buf: &mut Vec<u8>,
     ) -> Result<bool> {
-        let raw = self.get_position_entry(chrom_code, start)?;
+        let mut key_buf = Vec::with_capacity(10);
+        self.get_position_entry_fast_with_key_buf(
+            chrom_code,
+            start,
+            decompressor,
+            buf,
+            &mut key_buf,
+        )
+    }
+
+    /// Fetch and decompress a position entry using caller-owned buffers for both the
+    /// encoded key and decompressed value.
+    pub fn get_position_entry_fast_with_key_buf(
+        &self,
+        chrom_code: u16,
+        start: i64,
+        decompressor: Option<&mut zstd::bulk::Decompressor<'_>>,
+        buf: &mut Vec<u8>,
+        key_buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let raw = self.get_position_entry_with_key_buf(chrom_code, start, key_buf)?;
         match raw {
             None => Ok(false),
             Some(compressed) => {
@@ -737,6 +770,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&*loaded, value);
+    }
+
+    #[test]
+    fn test_kv_store_reusable_key_buffer_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+
+        let store = VepKvStore::create(dir.path(), schema).unwrap();
+        let value = b"test_position_data";
+        store.put_position_entry("1", 100, value).unwrap();
+        store.persist().unwrap();
+
+        let chrom_code = crate::kv_cache::key_encoding::chrom_to_code("1");
+        let mut key_buf = Vec::with_capacity(10);
+        let initial_capacity = key_buf.capacity();
+
+        let loaded = store
+            .get_position_entry_with_key_buf(chrom_code, 100, &mut key_buf)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*loaded, value);
+        assert_eq!(key_buf.len(), 10);
+        assert_eq!(key_buf.capacity(), initial_capacity);
+
+        let missing = store
+            .get_position_entry_with_key_buf(chrom_code, 999, &mut key_buf)
+            .unwrap();
+        assert!(missing.is_none());
+        assert_eq!(key_buf.len(), 10);
+        assert_eq!(key_buf.capacity(), initial_capacity);
     }
 
     #[test]

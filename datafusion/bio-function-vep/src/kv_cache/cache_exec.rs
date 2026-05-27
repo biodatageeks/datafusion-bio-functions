@@ -290,6 +290,7 @@ struct KvLookupStream {
     reference_reader:
         Option<noodles_fasta::IndexedReader<noodles_fasta::io::BufReader<std::fs::File>>>,
     profile_enabled: bool,
+    profile_detailed: bool,
     profile_emitted: bool,
     profile: LookupProfile,
     /// Buffered matched batches (used when colocated sink is present).
@@ -346,6 +347,32 @@ struct LookupProfile {
     match_loop: Duration,
     vcf_take: Duration,
     cache_build: Duration,
+    probe_build: Duration,
+    point_get_raw: Duration,
+    prefetch_map_lookup: Duration,
+    decompress: Duration,
+    reader_init: Duration,
+    primary_match: Duration,
+    cache_column_append: Duration,
+    colocated_prepare: Duration,
+    colocated_match: Duration,
+    colocated_flush: Duration,
+    null_append: Duration,
+    raw_get_hits: u64,
+    raw_get_misses: u64,
+    prefetch_hits: u64,
+    prefetch_misses: u64,
+    decode_calls: u64,
+    compressed_bytes: u64,
+    decompressed_bytes: u64,
+    primary_allele_rows: u64,
+    primary_failed_skips: u64,
+    primary_interval_skips: u64,
+    exact_match_calls: u64,
+    primary_matches: u64,
+    colocated_allele_rows: u64,
+    colocated_entries: u64,
+    null_rows: u64,
 }
 
 impl LookupProfile {
@@ -361,7 +388,74 @@ impl LookupProfile {
         }
     }
 
-    fn emit(&self) {
+    fn detail_known(&self) -> Duration {
+        self.probe_build
+            + self.point_get_raw
+            + self.prefetch_map_lookup
+            + self.decompress
+            + self.reader_init
+            + self.primary_match
+            + self.cache_column_append
+            + self.colocated_prepare
+            + self.colocated_match
+            + self.colocated_flush
+            + self.null_append
+    }
+
+    fn detail_lines(&self) -> Vec<String> {
+        let detail_total = self.detail_known();
+        vec![
+            format!(
+                "[vep-kv-profile-detail] stages total_s={:.3} probe_build={:.3}s ({:.1}%) point_get_raw={:.3}s ({:.1}%) prefetch_map_lookup={:.3}s ({:.1}%) decompress={:.3}s ({:.1}%) reader_init={:.3}s ({:.1}%) primary_match={:.3}s ({:.1}%) cache_column_append={:.3}s ({:.1}%) colocated_prepare={:.3}s ({:.1}%) colocated_match={:.3}s ({:.1}%) colocated_flush={:.3}s ({:.1}%) null_append={:.3}s ({:.1}%)",
+                detail_total.as_secs_f64(),
+                self.probe_build.as_secs_f64(),
+                Self::pct(self.probe_build, detail_total),
+                self.point_get_raw.as_secs_f64(),
+                Self::pct(self.point_get_raw, detail_total),
+                self.prefetch_map_lookup.as_secs_f64(),
+                Self::pct(self.prefetch_map_lookup, detail_total),
+                self.decompress.as_secs_f64(),
+                Self::pct(self.decompress, detail_total),
+                self.reader_init.as_secs_f64(),
+                Self::pct(self.reader_init, detail_total),
+                self.primary_match.as_secs_f64(),
+                Self::pct(self.primary_match, detail_total),
+                self.cache_column_append.as_secs_f64(),
+                Self::pct(self.cache_column_append, detail_total),
+                self.colocated_prepare.as_secs_f64(),
+                Self::pct(self.colocated_prepare, detail_total),
+                self.colocated_match.as_secs_f64(),
+                Self::pct(self.colocated_match, detail_total),
+                self.colocated_flush.as_secs_f64(),
+                Self::pct(self.colocated_flush, detail_total),
+                self.null_append.as_secs_f64(),
+                Self::pct(self.null_append, detail_total),
+            ),
+            format!(
+                "[vep-kv-profile-detail] io raw_get_hits={} raw_get_misses={} prefetch_hits={} prefetch_misses={} decode_calls={} compressed_bytes={} decompressed_bytes={}",
+                self.raw_get_hits,
+                self.raw_get_misses,
+                self.prefetch_hits,
+                self.prefetch_misses,
+                self.decode_calls,
+                self.compressed_bytes,
+                self.decompressed_bytes,
+            ),
+            format!(
+                "[vep-kv-profile-detail] match primary_allele_rows={} primary_failed_skips={} primary_interval_skips={} exact_match_calls={} primary_matches={} colocated_allele_rows={} colocated_entries={} null_rows={}",
+                self.primary_allele_rows,
+                self.primary_failed_skips,
+                self.primary_interval_skips,
+                self.exact_match_calls,
+                self.primary_matches,
+                self.colocated_allele_rows,
+                self.colocated_entries,
+                self.null_rows,
+            ),
+        ]
+    }
+
+    fn emit(&self, detailed: bool) {
         let total = self.total_known();
         let input_rate = if total.is_zero() {
             0.0
@@ -408,7 +502,21 @@ impl LookupProfile {
             self.cache_build.as_secs_f64(),
             Self::pct(self.cache_build, total),
         );
+        if detailed {
+            for line in self.detail_lines() {
+                eprintln!("{line}");
+            }
+        }
     }
+}
+
+fn kv_profile_enabled() -> bool {
+    std::env::var_os("VEP_KV_PROFILE").is_some()
+        || std::env::var_os("VEP_KV_PROFILE_DETAILED").is_some()
+}
+
+fn kv_profile_detailed_enabled() -> bool {
+    std::env::var_os("VEP_KV_PROFILE_DETAILED").is_some()
 }
 
 fn kv_range_prefetch_enabled() -> bool {
@@ -531,7 +639,8 @@ impl KvLookupStream {
             colocated_sink,
             coloc_col_indices,
             reference_reader,
-            profile_enabled: std::env::var_os("VEP_KV_PROFILE").is_some(),
+            profile_enabled: kv_profile_enabled(),
+            profile_detailed: kv_profile_detailed_enabled(),
             profile_emitted: false,
             profile: LookupProfile::default(),
             matched_batches: VecDeque::new(),
@@ -592,6 +701,9 @@ impl KvLookupStream {
 
         // Reusable decompression / raw-value buffer — avoids alloc per lookup.
         let mut decompress_buf: Vec<u8> = Vec::with_capacity(4096);
+
+        // Reusable encoded Fjall key buffer — avoids one tiny Vec allocation per point probe.
+        let mut position_key_buf: Vec<u8> = Vec::with_capacity(10);
 
         // Reusable allele match buffer — avoids alloc per row.
         let mut matched_allele_rows: Vec<usize> = Vec::new();
@@ -769,6 +881,7 @@ impl KvLookupStream {
             // Probe a small set of start positions used by VEP-style caches.
             // All variants at a given (chrom, start) are in one entry, so we
             // only need to probe distinct start values.
+            let probe_build_started = self.profile_detailed.then(Instant::now);
             let probe_starts = build_probe_starts(
                 norm_start_i64,
                 norm_end_i64,
@@ -776,6 +889,9 @@ impl KvLookupStream {
                 vcf_alt,
                 self.extended_probes,
             );
+            if let Some(t0) = probe_build_started {
+                self.profile.probe_build += t0.elapsed();
+            }
 
             let mut emitted_match = false;
             for probe_start in &probe_starts {
@@ -783,45 +899,105 @@ impl KvLookupStream {
                     self.profile.probes += 1;
                 }
                 let found = if let Some(prefetched) = range_prefetch.as_ref() {
-                    if let Some(raw) = prefetched.get(probe_start) {
+                    let map_lookup_started = self.profile_detailed.then(Instant::now);
+                    let raw = prefetched.get(probe_start);
+                    if let Some(t0) = map_lookup_started {
+                        self.profile.prefetch_map_lookup += t0.elapsed();
+                    }
+                    if let Some(raw) = raw {
+                        if self.profile_detailed {
+                            self.profile.prefetch_hits += 1;
+                            self.profile.compressed_bytes += raw.as_ref().len() as u64;
+                        }
+                        let decode_started = self.profile_detailed.then(Instant::now);
                         self.store.decode_position_entry_value(
                             raw.as_ref(),
                             decompressor.as_mut(),
                             &mut decompress_buf,
                         )?;
+                        if let Some(t0) = decode_started {
+                            self.profile.decompress += t0.elapsed();
+                            self.profile.decode_calls += 1;
+                            self.profile.decompressed_bytes += decompress_buf.len() as u64;
+                        }
                         true
                     } else {
+                        if self.profile_detailed {
+                            self.profile.prefetch_misses += 1;
+                        }
                         false
                     }
                 } else {
                     if self.profile_enabled {
                         self.profile.point_gets += 1;
                     }
-                    self.store.get_position_entry_fast(
-                        chrom_code,
-                        *probe_start,
-                        decompressor.as_mut(),
-                        &mut decompress_buf,
-                    )?
+                    if self.profile_detailed {
+                        let get_started = Instant::now();
+                        let raw = self.store.get_position_entry_with_key_buf(
+                            chrom_code,
+                            *probe_start,
+                            &mut position_key_buf,
+                        )?;
+                        self.profile.point_get_raw += get_started.elapsed();
+                        match raw {
+                            Some(compressed) => {
+                                self.profile.raw_get_hits += 1;
+                                self.profile.compressed_bytes += compressed.as_ref().len() as u64;
+                                let decode_started = Instant::now();
+                                self.store.decode_position_entry_value(
+                                    compressed.as_ref(),
+                                    decompressor.as_mut(),
+                                    &mut decompress_buf,
+                                )?;
+                                self.profile.decompress += decode_started.elapsed();
+                                self.profile.decode_calls += 1;
+                                self.profile.decompressed_bytes += decompress_buf.len() as u64;
+                                true
+                            }
+                            None => {
+                                self.profile.raw_get_misses += 1;
+                                false
+                            }
+                        }
+                    } else {
+                        self.store.get_position_entry_fast_with_key_buf(
+                            chrom_code,
+                            *probe_start,
+                            decompressor.as_mut(),
+                            &mut decompress_buf,
+                            &mut position_key_buf,
+                        )?
+                    }
                 };
                 if !found {
                     continue;
                 }
 
+                let reader_started = self.profile_detailed.then(Instant::now);
                 let reader = PositionEntryReader::new(&decompress_buf)?;
+                if let Some(t0) = reader_started {
+                    self.profile.reader_init += t0.elapsed();
+                }
 
                 // Match alleles within this position entry (reuse buffer).
                 // Filter by end-coordinate overlap: the cache allele's (start, end)
                 // must overlap the VCF variant's interval. This prevents matching
                 // alleles at the same start position but with non-overlapping end.
+                let primary_match_started = self.profile_detailed.then(Instant::now);
                 matched_allele_rows.clear();
                 let vcf_iv_start = norm_start_i64.min(norm_end_i64);
                 let vcf_iv_end = norm_start_i64.max(norm_end_i64);
                 for allele_idx in 0..reader.num_alleles() {
+                    if self.profile_detailed {
+                        self.profile.primary_allele_rows += 1;
+                    }
                     let failed = failed_stored_col_idx
                         .and_then(|idx| reader.read_i64_value(idx, allele_idx))
                         .unwrap_or(0);
                     if failed > self.allowed_failed {
+                        if self.profile_detailed {
+                            self.profile.primary_failed_skips += 1;
+                        }
                         continue;
                     }
 
@@ -831,16 +1007,27 @@ impl KvLookupStream {
                     let cache_iv_start = (*probe_start).min(existing_end);
                     let cache_iv_end = (*probe_start).max(existing_end);
                     if cache_iv_start > vcf_iv_end || cache_iv_end < vcf_iv_start {
+                        if self.profile_detailed {
+                            self.profile.primary_interval_skips += 1;
+                        }
                         continue;
                     }
 
                     let allele_str = reader.allele_string(allele_idx);
+                    if self.profile_detailed {
+                        self.profile.exact_match_calls += 1;
+                    }
                     if (self.exact_matcher)(vcf_ref, vcf_alt, allele_str) {
                         matched_allele_rows.push(allele_idx);
                     }
                 }
+                if let Some(t0) = primary_match_started {
+                    self.profile.primary_match += t0.elapsed();
+                    self.profile.primary_matches += matched_allele_rows.len() as u64;
+                }
 
                 if !matched_allele_rows.is_empty() && !emitted_match {
+                    let append_started = self.profile_detailed.then(Instant::now);
                     // Emit only the first matched allele per VCF row.
                     // Multiple alleles at the same position produce identical
                     // annotation output (same VCF coords → same transcript
@@ -862,6 +1049,9 @@ impl KvLookupStream {
                             )?;
                         }
                     }
+                    if let Some(t0) = append_started {
+                        self.profile.cache_column_append += t0.elapsed();
+                    }
                 }
 
                 // --- Co-located data collection (piggybacked on same probe) ---
@@ -871,6 +1061,7 @@ impl KvLookupStream {
                 if let (Some(buf), Some(ci)) = (coloc_buf.as_mut(), self.coloc_col_indices.as_ref())
                 {
                     // Compute VCF input allele key once per VCF row match.
+                    let coloc_prepare_started = self.profile_detailed.then(Instant::now);
                     let chrom_norm = chrom.to_string();
                     let (input_ref, input_alt, input_start) =
                         vcf_to_vep_input_allele(norm_start_i64, vcf_ref, vcf_alt);
@@ -884,16 +1075,26 @@ impl KvLookupStream {
                         output_allele_from_allele_string(&compare_allele_string)
                             .map(str::to_string);
                     let unshifted_output_allele: Option<String> = None;
+                    if let Some(t0) = coloc_prepare_started {
+                        self.profile.colocated_prepare += t0.elapsed();
+                    }
 
                     // Visibility filter: mirrors VEP's Tabix query window.
                     // Only cache variants with START in [compare_start-1, compare_end+1]
                     // are visible, matching existing_start_is_visible_to_input_row().
+                    let colocated_match_started = self.profile_detailed.then(Instant::now);
                     if !probe_start_visible_to_window(*probe_start, vep_start, vep_end) {
+                        if let Some(t0) = colocated_match_started {
+                            self.profile.colocated_match += t0.elapsed();
+                        }
                         continue;
                     }
 
                     // Iterate alleles at this position for colocated collection.
                     for allele_idx in 0..reader.num_alleles() {
+                        if self.profile_detailed {
+                            self.profile.colocated_allele_rows += 1;
+                        }
                         let failed = ci
                             .failed
                             .and_then(|idx| reader.read_i64_value(idx, allele_idx))
@@ -983,20 +1184,32 @@ impl KvLookupStream {
                             pubmed,
                             af_values,
                         });
+                        if self.profile_detailed {
+                            self.profile.colocated_entries += 1;
+                        }
+                    }
+                    if let Some(t0) = colocated_match_started {
+                        self.profile.colocated_match += t0.elapsed();
                     }
                 }
             }
 
             if !emitted_match {
+                let null_append_started = self.profile_detailed.then(Instant::now);
                 // No coordinate probe matched any allele -> null cache columns.
                 vcf_indices.push(row as u32);
                 for builder in &mut builders {
                     append_null_to_builder(builder.as_mut())?;
                 }
+                if let Some(t0) = null_append_started {
+                    self.profile.null_append += t0.elapsed();
+                    self.profile.null_rows += 1;
+                }
             }
         }
 
         // Flush colocated data to the shared sink.
+        let colocated_flush_started = self.profile_detailed.then(Instant::now);
         if let (Some(buf), Some(sink)) = (coloc_buf, &self.colocated_sink) {
             if !buf.is_empty() {
                 let mut guard = sink.lock().map_err(|e| {
@@ -1019,6 +1232,9 @@ impl KvLookupStream {
                         .or_insert(value);
                 }
             }
+        }
+        if let Some(t0) = colocated_flush_started {
+            self.profile.colocated_flush += t0.elapsed();
         }
 
         if let Some(t0) = match_started {
@@ -1396,7 +1612,7 @@ impl Stream for KvLookupStream {
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => {
                 if self.profile_enabled && !self.profile_emitted {
-                    self.profile.emit();
+                    self.profile.emit(self.profile_detailed);
                     self.profile_emitted = true;
                 }
                 Poll::Ready(None)
@@ -1473,7 +1689,7 @@ pub fn lookup_batch_with_store(
     );
     let batch = stream.process_batch(vcf_batch);
     if stream.profile_enabled && !stream.profile_emitted {
-        stream.profile.emit();
+        stream.profile.emit(stream.profile_detailed);
         stream.profile_emitted = true;
     }
     batch
@@ -1515,6 +1731,49 @@ mod tests {
     #[test]
     fn colocated_visibility_rejects_outside_vep_minimized_probe_window() {
         assert!(!probe_start_visible_to_window(602117, 602114, 602113));
+    }
+
+    #[test]
+    fn lookup_profile_detail_line_formats_probe_decode_match_breakdown() {
+        let mut profile = LookupProfile::default();
+        profile.probe_build += Duration::from_millis(1);
+        profile.point_get_raw += Duration::from_millis(2);
+        profile.prefetch_map_lookup += Duration::from_millis(3);
+        profile.decompress += Duration::from_millis(4);
+        profile.reader_init += Duration::from_millis(5);
+        profile.primary_match += Duration::from_millis(6);
+        profile.cache_column_append += Duration::from_millis(7);
+        profile.colocated_prepare += Duration::from_millis(8);
+        profile.colocated_match += Duration::from_millis(9);
+        profile.colocated_flush += Duration::from_millis(10);
+        profile.null_append += Duration::from_millis(11);
+        profile.raw_get_hits = 12;
+        profile.raw_get_misses = 13;
+        profile.prefetch_hits = 14;
+        profile.prefetch_misses = 15;
+        profile.decode_calls = 16;
+        profile.compressed_bytes = 17;
+        profile.decompressed_bytes = 18;
+        profile.primary_allele_rows = 19;
+        profile.primary_failed_skips = 20;
+        profile.primary_interval_skips = 21;
+        profile.exact_match_calls = 22;
+        profile.primary_matches = 23;
+        profile.colocated_allele_rows = 24;
+        profile.colocated_entries = 25;
+        profile.null_rows = 26;
+
+        let lines = profile.detail_lines();
+
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("probe_build=0.001s"));
+        assert!(lines[0].contains("point_get_raw=0.002s"));
+        assert!(lines[0].contains("decompress=0.004s"));
+        assert!(lines[1].contains("raw_get_hits=12"));
+        assert!(lines[1].contains("compressed_bytes=17"));
+        assert!(lines[2].contains("primary_allele_rows=19"));
+        assert!(lines[2].contains("colocated_entries=25"));
+        assert!(lines[2].contains("null_rows=26"));
     }
 
     // -----------------------------------------------------------------------
