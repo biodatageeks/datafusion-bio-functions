@@ -1368,14 +1368,18 @@ dependencies = [
  "fjall",
  "flate2",
  "futures",
+ "hashbrown 0.16.1",
  "indicatif",
  "log",
  "lz4_flex 0.12.2",
+ "nohash-hasher",
  "noodles-core 0.16.0",
  "noodles-fasta",
  "noodles-vcf 0.80.0 (git+https://github.com/biodatageeks/noodles.git?rev=9b7b2c5b6531373918302d4c07410e583f1b5b5c)",
  "parquet",
+ "rapidhash",
  "serde_json",
+ "smallvec",
  "tempfile",
  "tokio",
  "zstd",
@@ -3458,6 +3462,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
 name = "noodles"
 version = "0.93.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4753,6 +4763,15 @@ checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
 dependencies = [
  "num-traits",
  "rand 0.8.6",
+]
+
+[[package]]
+name = "rapidhash"
+version = "4.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e48930979c155e2f33aa36ab3119b5ee81332beb6482199a8ecd6029b80b59"
+dependencies = [
+ "rustversion",
 ]
 
 [[package]]

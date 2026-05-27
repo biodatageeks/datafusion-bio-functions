@@ -19,6 +19,10 @@ arrow-ipc = { version = "56", features = ["lz4", "zstd"], optional = true }
 lz4_flex = { version = "0.12.1", optional = true }
 zstd = { version = "0.13.3", optional = true }
 ahash = { version = "0.8.6", optional = true }
+hashbrown = { version = "0.16.1", optional = true }
+nohash-hasher = { version = "0.2.0", optional = true }
+rapidhash = { version = "4.4.1", optional = true }
+smallvec = { version = "1.15.1", optional = true }
 flate2 = "1.1.0"
 coitrees = "0.4.0"
 serde_json = "1"
@@ -80,9 +84,23 @@ required-features = []
 name = "bench_annotate_vcf"
 required-features = []
 
+[[example]]
+name = "build_warm_variation_cache"
+required-features = ["kv-cache"]
+
 [features]
 default = ["kv-cache"]
-kv-cache = ["dep:fjall", "dep:arrow-ipc", "dep:lz4_flex", "dep:zstd", "dep:ahash"]
+kv-cache = [
+    "dep:fjall",
+    "dep:arrow-ipc",
+    "dep:lz4_flex",
+    "dep:zstd",
+    "dep:ahash",
+    "dep:hashbrown",
+    "dep:nohash-hasher",
+    "dep:rapidhash",
+    "dep:smallvec",
+]
 cache-builder = ["kv-cache", "dep:datafusion-bio-format-ensembl-cache"]
 
 # Regression tests that bake per-transcript sequence fixtures via

@@ -60,6 +60,8 @@ pub mod table_function;
 pub mod transcript_consequence;
 pub mod variant_lookup_exec;
 pub mod vcf_sink;
+#[cfg(feature = "kv-cache")]
+pub mod warm_cache;
 
 pub use config::AnnotationConfig;
 
