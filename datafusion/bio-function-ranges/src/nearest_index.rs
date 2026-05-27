@@ -555,13 +555,21 @@ mod tests {
         assert_eq!(candidate_distance(1, 5, 4, 5), 0);
     }
 
-    // SUBTEST #34 — architectural-no-analogue.
-    // Perl: _get_dist(1, 5, -3, -1) == 2 (negative coordinates).
-    // vepyr coordinates are non-negative biological positions (u32-castable).
-    // `candidate_distance` accepts i32 and does signed math, so the value
-    // _would_ be representable, but no real vepyr caller passes negative
-    // coordinates. The Perl subtest exists only because Set::IntervalTree
-    // accepts signed values. See detailed_plan #34.
+    // SUBTEST #34 of TranscriptTree.t (reclassified architectural-no-analogue → unit-port
+    // per Phase D 2026-05-27 PORT re-audit). Perl Set::IntervalTree accepts negative
+    // coordinates as a side-effect of signed-int internals; the Perl test asserts that
+    // `_get_dist(1, 5, -3, -1) == 2` produces the unsigned distance correctly.
+    //
+    // vepyr's `candidate_distance` is the analogue, signed by design.
+    // verified via direct function call (no VEP 115 oracle needed; pure-fn arithmetic)
+    #[test]
+    fn tt34_candidate_distance_handles_negative_coords() {
+        let d = candidate_distance(1, 5, -3, -1);
+        assert_eq!(
+            d, 2,
+            "candidate_distance(1, 5, -3, -1) must equal 2 (negative-coord case)"
+        );
+    }
 
     // SUBTEST #35 — Perl: nearest('nearest', 1, 5) == [] (empty tree).
     // vepyr: NearestIntervalIndex built from an empty record list returns
