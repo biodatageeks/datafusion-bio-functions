@@ -414,4 +414,249 @@ mod tests {
         idx.nearest_k(10, 20, 3, true, &mut out);
         assert!(out.is_empty());
     }
+
+    // =========================================================================
+    // V2 PORT — TranscriptTree.t
+    // =========================================================================
+    //
+    // Sztywno 1:1 Rust analogues of subtests from ensembl-vep/t/TranscriptTree.t.
+    // See porting-tests/detailed_plans/TranscriptTree.md for the full mapping
+    // table. Coverage: 20 unit-port / 13 architectural-no-analogue /
+    // 3 blocked-future-work / 36 substantive rows = 56%.
+    //
+    // The COITree direct tests live here because they are pure interval-tree
+    // overlap / nearest assertions that do not touch any VEP-specific types.
+    // The PreparedContext-surface tests live in transcript_consequence.rs.
+
+    use coitrees::{COITree, GenericInterval, Interval, IntervalTree};
+
+    /// Builds a `COITree<usize, u32>` from a flat list of (first, last, metadata)
+    /// triples. Mirrors the construction used by `PreparedFeatureIndex::new` in
+    /// `bio-function-vep::transcript_consequence` so the port tests exercise
+    /// the same coitrees idiom vepyr uses in production.
+    fn mk_coitree(records: &[(i32, i32, usize)]) -> COITree<usize, u32> {
+        let intervals: Vec<Interval<usize>> = records
+            .iter()
+            .map(|(first, last, pos)| Interval::new(*first, *last, *pos))
+            .collect();
+        COITree::new(&intervals)
+    }
+
+    /// Wraps `tree.query` to return a sorted Vec of matched metadata values, so
+    /// assertions don't depend on coitrees' internal callback order.
+    fn fetch_hits(tree: &COITree<usize, u32>, start: i32, end: i32) -> Vec<usize> {
+        let mut out = Vec::new();
+        tree.query(start, end, |node| {
+            out.push(*GenericInterval::<usize>::metadata(node));
+        });
+        out.sort_unstable();
+        out
+    }
+
+    // SUBTEST #13 — Perl: insert(1,5); fetch(2,3) == [[1,5]] (centered overlap).
+    // vepyr analogue: COITree::query(2, 3, ...) on a tree containing only
+    // Interval::new(1, 5, 10) returns exactly metadata == 10.
+    #[test]
+    fn tt13_fetch_centered_overlap() {
+        let tree = mk_coitree(&[(1, 5, 10)]);
+        assert_eq!(fetch_hits(&tree, 2, 3), vec![10]);
+    }
+
+    // SUBTEST #14 — Perl: fetch(0,1) == [[1,5]] (left-boundary overlap).
+    // coitrees uses inclusive [first, last]; query (0, 1) touches first=1.
+    #[test]
+    fn tt14_fetch_left_boundary() {
+        let tree = mk_coitree(&[(1, 5, 10)]);
+        assert_eq!(fetch_hits(&tree, 0, 1), vec![10]);
+    }
+
+    // SUBTEST #15 — Perl: fetch(0,6) == [[1,5]] (superset query overlap).
+    #[test]
+    fn tt15_fetch_superset_query() {
+        let tree = mk_coitree(&[(1, 5, 10)]);
+        assert_eq!(fetch_hits(&tree, 0, 6), vec![10]);
+    }
+
+    // SUBTEST #16 — Perl: fetch(4,6) == [[1,5]] (right-boundary overlap).
+    #[test]
+    fn tt16_fetch_right_boundary() {
+        let tree = mk_coitree(&[(1, 5, 10)]);
+        assert_eq!(fetch_hits(&tree, 4, 6), vec![10]);
+    }
+
+    // SUBTEST #17 — Perl: fetch(6,7) == [] (no overlap).
+    #[test]
+    fn tt17_fetch_no_overlap() {
+        let tree = mk_coitree(&[(1, 5, 10)]);
+        let hits = fetch_hits(&tree, 6, 7);
+        assert!(hits.is_empty(), "expected no hits, got {hits:?}");
+    }
+
+    // SUBTEST #18 — architectural-no-analogue.
+    // Perl: insert(1,5) + insert(4,8); fetch(2,3) == [[1,8]] (merged).
+    // vepyr/coitrees does NOT merge overlapping inserts: after two inserts,
+    // a query that overlaps both returns BOTH intervals. This is the desired
+    // behavior for downstream NEAREST / per-transcript consequence calculation;
+    // merging would lose transcript identity. See detailed_plan #18 / #19.
+
+    // SUBTEST #19 — architectural-no-analogue.
+    // Same justification as #18. coitrees returns 3 separate intervals after
+    // 3 inserts; the Perl test's merged [[1,8],[9,10]] expectation is a
+    // wrapper-side artifact of Perl's `insert()` (TranscriptTree.pm:155-185).
+
+    // SUBTEST #24 — Perl: insert('chrobj',5,10,{foo=>'bar'});
+    //   fetch(7,8) == [{foo=>'bar', s=>5, e=>10}].
+    // vepyr analogue: build a COITree where each interval's metadata is an
+    // index into a parallel `Vec<Payload>`; query at (7,8) returns metadata
+    // 0; payloads[0] is the recovered "foo=bar" payload. This is exactly the
+    // pattern used by PreparedFeatureIndex (transcript_consequence.rs:641):
+    // metadata = usize index, payload = &T from a Vec<&T>.
+    #[test]
+    fn tt24_payload_recovery_by_index() {
+        #[derive(Debug, PartialEq)]
+        struct Payload {
+            tag: &'static str,
+        }
+        let payloads = vec![Payload { tag: "bar" }];
+        let tree = mk_coitree(&[(5, 10, 0)]);
+        let hits = fetch_hits(&tree, 7, 8);
+        assert_eq!(hits, vec![0]);
+        assert_eq!(payloads[hits[0]], Payload { tag: "bar" });
+    }
+
+    // SUBTEST #25 — Perl: second insert('chrobj',6,12,{goo=>'car'}) does NOT
+    // merge; fetch(7,8) returns BOTH payloads (Perl insert-with-payload
+    // skips the merge branch). vepyr/coitrees: 2 inserts → query returns 2
+    // metadata values, both deterministically present.
+    #[test]
+    fn tt25_multi_payload_no_merge() {
+        let tree = mk_coitree(&[(5, 10, 0), (6, 12, 1)]);
+        let hits = fetch_hits(&tree, 7, 8);
+        assert_eq!(hits, vec![0, 1]);
+    }
+
+    // SUBTEST #31 — Perl: _get_dist(1, 5, 6, 7) == 1 (non-overlap forward).
+    // vepyr analogue: `candidate_distance` from this module returns gap >= 0
+    // between two non-overlapping intervals.
+    #[test]
+    fn tt31_candidate_distance_non_overlap_forward() {
+        assert_eq!(candidate_distance(1, 5, 6, 7), 1);
+    }
+
+    // SUBTEST #32 — Perl: _get_dist(6, 8, 2, 4) == 2 (non-overlap reverse).
+    #[test]
+    fn tt32_candidate_distance_non_overlap_reverse() {
+        assert_eq!(candidate_distance(6, 8, 2, 4), 2);
+    }
+
+    // SUBTEST #33 — Perl: _get_dist(1, 5, 4, 5) == 0 (overlap).
+    #[test]
+    fn tt33_candidate_distance_overlap_zero() {
+        assert_eq!(candidate_distance(1, 5, 4, 5), 0);
+    }
+
+    // SUBTEST #34 — architectural-no-analogue.
+    // Perl: _get_dist(1, 5, -3, -1) == 2 (negative coordinates).
+    // vepyr coordinates are non-negative biological positions (u32-castable).
+    // `candidate_distance` accepts i32 and does signed math, so the value
+    // _would_ be representable, but no real vepyr caller passes negative
+    // coordinates. The Perl subtest exists only because Set::IntervalTree
+    // accepts signed values. See detailed_plan #34.
+
+    // SUBTEST #35 — Perl: nearest('nearest', 1, 5) == [] (empty tree).
+    // vepyr: NearestIntervalIndex built from an empty record list returns
+    // None on nearest_one for any query (overlap or non-overlap).
+    #[test]
+    fn tt35_nearest_on_empty_index_returns_none() {
+        let idx = mk(&[]);
+        assert_eq!(idx.nearest_one(1, 5, true), None);
+        assert_eq!(idx.nearest_one(1, 5, false), None);
+    }
+
+    // SUBTEST #36 — Perl: nearest('nearest', 6, 6) returns the LEFT interval
+    // (1,5) after inserting (1,5) and (11,16). Query at point 6 is distance 1
+    // from (1,5) (right edge) and distance 5 from (11,16) (left edge).
+    #[test]
+    fn tt36_nearest_one_picks_left() {
+        let idx = mk(&[(1, 5, 0), (11, 16, 1)]);
+        assert_eq!(idx.nearest_one(6, 6, false), Some(0));
+    }
+
+    // SUBTEST #37 — Perl: nearest('nearest', 9, 9) returns the RIGHT interval
+    // (11,16). Distance to (1,5) is 4; distance to (11,16) is 2.
+    #[test]
+    fn tt37_nearest_one_picks_right() {
+        let idx = mk(&[(1, 5, 0), (11, 16, 1)]);
+        assert_eq!(idx.nearest_one(9, 9, false), Some(1));
+    }
+
+    // SUBTEST #38 — Perl: nearest('nearest', 8, 8) returns BOTH intervals
+    // (tie at distance 3 from each). vepyr analogue: `nearest_k(8, 8, 2,
+    // false, &mut out)` returns both positions, with deterministic tie-break
+    // by (start, end, position).
+    #[test]
+    fn tt38_nearest_k_returns_tied_pair() {
+        let idx = mk(&[(1, 5, 0), (11, 16, 1)]);
+        let mut out = Vec::new();
+        idx.nearest_k(8, 8, 2, false, &mut out);
+        assert_eq!(out.len(), 2, "expected both ties; got {out:?}");
+        // Deterministic order: left interval (start=1) precedes right (start=11).
+        assert_eq!(out, vec![0, 1]);
+    }
+
+    // SUBTEST #39 — Perl: nearest('nearest', 7, 9) (non-point query) returns
+    // BOTH intervals — both tied at distance 2 from query interval [7,9].
+    #[test]
+    fn tt39_nearest_k_non_point_query_returns_tied_pair() {
+        let idx = mk(&[(1, 5, 0), (11, 16, 1)]);
+        let mut out = Vec::new();
+        idx.nearest_k(7, 9, 2, false, &mut out);
+        assert_eq!(out.len(), 2, "expected both ties; got {out:?}");
+        assert_eq!(out, vec![0, 1]);
+    }
+
+    // =========================================================================
+    // blocked-future-work stubs (TranscriptTree.t)
+    // =========================================================================
+    //
+    // SUBTEST #11 — Perl: valid_chromosomes([21]) setter override.
+    // Missing API: PreparedContext::override_valid_chromosomes(set: HashSet<String>).
+    // Future-work entry: porting-tests/future-work-vepyr.md
+    //   "PreparedContext::override_valid_chromosomes".
+    //
+    // // #[test]
+    // // fn tt11_override_valid_chromosomes() {
+    // //     let mut ctx = PreparedContext::new(...);
+    // //     ctx.override_valid_chromosomes(HashSet::from(["21".to_string()]));
+    // //     assert_eq!(
+    // //         ctx.valid_chromosomes(),
+    // //         &HashSet::from(["21".to_string()])
+    // //     );
+    // // }
+    //
+    // SUBTEST #20 + #21 + #23 — chromosome-synonyms alias table.
+    // Missing API: PreparedContext::set_chrom_synonyms(syns: HashMap<String, String>)
+    //   + canonical_chrom(alias: &str) -> &str, routed through every tx_trees.get(...)
+    //   call site in transcript_consequence.rs.
+    // Future-work entry: porting-tests/future-work-vepyr.md
+    //   "PreparedContext chromosome-synonyms alias table".
+    //
+    // // #[test]
+    // // fn tt20_load_chrom_synonyms_from_file() {
+    // //     let mut ctx = PreparedContext::new(...);
+    // //     let syns = HashMap::from([("NC_000021.9".to_string(), "21".to_string())]);
+    // //     ctx.set_chrom_synonyms(syns);
+    // //     // assert that a query keyed "NC_000021.9" reaches the "21" tree.
+    // // }
+    //
+    // // #[test]
+    // // fn tt21_synonym_NC_000021_9_resolves_to_canonical_21() {
+    // //     // Build ctx with a tx on "21"; set synonyms; query "NC_000021.9" hits.
+    // // }
+    //
+    // // #[test]
+    // // fn tt23_query_21_hits_tree_keyed_chr21() {
+    // //     // Build ctx with a tx keyed "chr21"; query "21" should hit. Requires the
+    // //     // alias table because normalize_chrom only STRIPS chr, never ADDS it.
+    // // }
 }
