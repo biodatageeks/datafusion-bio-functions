@@ -10506,6 +10506,128 @@ mod tests {
         assert_eq!(accumulator.pending_rows(), 0);
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // Port of `ensembl-vep/t/InputBuffer.t` — Axis A unit-ports
+    //
+    // See `porting-tests/detailed_plans/InputBuffer.md` (Phase D 2026-05-27).
+    // The Axis A reclassification (#17, #18) maps Perl's `$ib->min_max->{21}`
+    // assertion against vepyr's private `buffer_variant_bounds` helper at
+    // line 8108. The public-accessor form `buffer_min_max` lives as
+    // future-work entry in `porting-tests/future-work-vepyr.md`.
+    //
+    // Axis B B1 covers the missing Perl-side invariant on multi-chrom
+    // RecordBatch handling (first-chrom-wins binding at lines 8141-8143).
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Port of `t/InputBuffer.t` subtest #17 (Perl line 102):
+    ///   `is_deeply($ib->min_max->{'21'}, [25592911, 25603910], 'min_max')`.
+    ///
+    /// vepyr analogue: `buffer_variant_bounds` returns `(chrom, min_start,
+    /// max_end)` over a `&[RecordBatch]`. Build a batch with two SNVs on
+    /// chr21 covering the same range the Perl test asserts (rs148490508 at
+    /// 25592911 and the upper-bound row at 25603910, both start==end), and
+    /// assert the bounds tuple matches.
+    ///
+    /// Detailed plan: `porting-tests/detailed_plans/InputBuffer.md` row #17
+    /// (Axis A reclass — was architectural-no-analogue, now unit-port).
+    #[test]
+    fn port_input_buffer_subtest_17_buffer_variant_bounds_on_test_vcf_chr21_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["21", "21"])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![25_592_911i64, 25_603_910])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![25_592_911i64, 25_603_910])) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            buffer_variant_bounds(&[batch]).unwrap(),
+            Some(("21".to_string(), 25_592_911, 25_603_910))
+        );
+    }
+
+    /// Port of `t/InputBuffer.t` subtest #18 (Perl line 108):
+    ///   `is_deeply($tmp_ib->min_max->{'21'}, [25592911, 25592912], 'min_max with insertion')`.
+    ///
+    /// vepyr analogue: same `buffer_variant_bounds` helper. Perl's
+    /// "with insertion" case bumps `start` by 1 (insertion VF where
+    /// `start = N+1, end = N`). vepyr handles this symmetrically via
+    /// `min(start.min(end))` / `max(start.max(end))` at lines 8144-8145.
+    /// This is also the test queued as OI-9 in `future-work-vepyr.md`
+    /// (lines 943-949) — landing it today closes that orphan.
+    ///
+    /// Detailed plan: `porting-tests/detailed_plans/InputBuffer.md` row #18
+    /// (Axis A reclass — was architectural-no-analogue, now unit-port).
+    #[test]
+    fn port_input_buffer_subtest_18_buffer_variant_bounds_insertion_shape_symmetric() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]));
+        // Insertion convention: start = N+1, end = N.
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["21"])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![25_592_912i64])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![25_592_911i64])) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            buffer_variant_bounds(&[batch]).unwrap(),
+            Some(("21".to_string(), 25_592_911, 25_592_912))
+        );
+    }
+
+    /// Port of `porting-tests/detailed_plans/InputBuffer.md` Axis B row B1:
+    ///   "Multi-chrom RecordBatch handling: `buffer_variant_bounds` over a
+    ///    batch with chrom='1' and chrom='2' rows binds to the FIRST chrom
+    ///    encountered."
+    ///
+    /// vepyr code: lines 8141-8143 first-chrom-wins on
+    /// `if chrom.is_none()`. This invariant is what makes per-contig
+    /// partitioning at line 4218+ correct — partitioning depends on bounds
+    /// being per-contig (in production, batches are already partitioned per
+    /// contig before this helper runs).
+    ///
+    /// Detailed plan: `porting-tests/detailed_plans/InputBuffer.md` row B1.
+    #[test]
+    #[allow(non_snake_case)]
+    fn port_input_buffer_axisB1_buffer_variant_bounds_multi_chrom_binds_to_first_chrom() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["1", "2"])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![100i64, 200])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![100i64, 200])) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap();
+        let (chrom, min_start, max_end) =
+            buffer_variant_bounds(&[batch]).unwrap().unwrap();
+        // First-chrom-wins binding (lines 8141-8143).
+        assert_eq!(chrom, "1");
+        // Bounds still aggregate across all rows — documents current
+        // behavior, not a partitioning-correctness invariant. Per-contig
+        // partitioning happens BEFORE the bounds call in production (line
+        // 4322+).
+        assert_eq!(min_start, 100);
+        assert_eq!(max_end, 200);
+    }
+
     #[test]
     fn test_transcript_selection_flags_reject_invalid_combinations() {
         let err = TranscriptSelectionFlags::from_options_json(
