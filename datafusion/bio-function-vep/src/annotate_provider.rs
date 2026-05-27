@@ -11937,4 +11937,72 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    // ── Perl subtest #13g — dedup across two single-base variants ────────────
+    //
+    // `[[1 1000000 A>G], [1 1000001 A>G]]` → `{(1, 0), (1, 1)}`. The Perl
+    // `get_all_regions_by_InputBuffer` dedups regions across all variants in
+    // the buffer; vepyr's `collect_buffer_cache_regions` does the same via a
+    // `HashSet<TranscriptCacheRegion>` accumulator. (integration-port)
+    #[test]
+    fn test_port_annotation_source_13g_buffer_dedup_two_variants() {
+        let batch = make_buffer_batch_many("1", &[1_000_000, 1_000_001]);
+        let regions = collect_buffer_cache_regions(&[batch], 0, 0).unwrap();
+
+        let expected: HashSet<TranscriptCacheRegion> = [
+            TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 0,
+            },
+            TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 1,
+            },
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(regions, expected);
+    }
+
+    // ── Perl subtest #11 — `get_all_regions_by_InputBuffer($ib)` on test.vcf ─
+    //
+    // Perl test reads `t/testdata/input/test.vcf` and expects
+    // `[[21, 25]]` back — chr21, region index 25 (positions
+    // 25_000_001..26_000_000). We use a hand-built `RecordBatch` instead of
+    // depending on `test.vcf` per detailed_plan §Anti-goals; the load-bearing
+    // assertion is integer math. Position 25_500_000 lands in region 25 since
+    // `(25_500_000 - 1) / 1_000_000 = 25`. (integration-port)
+    #[test]
+    fn test_port_annotation_source_11_test_vcf_style_chr21_buffer() {
+        let batch = make_buffer_batch("21", 25_500_000, 25_500_000);
+        let regions = collect_buffer_cache_regions(&[batch], 0, 0).unwrap();
+
+        let expected: HashSet<TranscriptCacheRegion> = [TranscriptCacheRegion {
+            chrom: "21".to_string(),
+            region_index: 25,
+        }]
+        .into_iter()
+        .collect();
+
+        assert_eq!(regions, expected);
+    }
+
+    // ── Perl subtest #12 — `$ib->min_max->{21}` per-chrom min/max ────────────
+    //
+    // BLOCKED-FUTURE-WORK: vepyr has no public `buffer_min_max` helper. The
+    // per-chrom min/max is computed implicitly inside
+    // `collect_buffer_cache_regions` but never surfaced. See future-work entry
+    // `buffer_min_max — public per-chrom min/max helper` in
+    // `porting-tests/future-work-vepyr.md`.
+    //
+    // #[test]
+    // fn test_port_annotation_source_12_buffer_min_max_per_chrom() {
+    //     let batch = make_buffer_batch_many(
+    //         "21",
+    //         &[25_585_733, 25_700_000, 25_982_445],
+    //     );
+    //     let mm = buffer_min_max(&[batch]).unwrap();
+    //     assert_eq!(mm.get("21"), Some(&(25_585_733_i64, 25_982_445_i64)));
+    // }
 }
