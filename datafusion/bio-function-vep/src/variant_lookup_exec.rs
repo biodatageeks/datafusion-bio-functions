@@ -35,7 +35,8 @@ use noodles_fasta as fasta;
 
 use crate::allele::{
     MatchedVariantAllele, VariantAlleleInput, allele_matches, get_matched_variant_alleles,
-    vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
+    vcf_to_vep_allele_multi, vcf_to_vep_input_allele_multi, vep_norm_end_multi,
+    vep_norm_start_multi,
 };
 use crate::coordinate::CoordinateNormalizer;
 
@@ -1004,15 +1005,46 @@ impl VariantLookupStream {
                 start
             };
             let one_based_end = end;
-            let (input_ref, input_alt, input_start) =
-                vcf_to_vep_input_allele(one_based_start, &vcf_ref, &vcf_alt);
-            let input_allele_string = format!("{input_ref}/{input_alt}");
-            let (compare_ref, compare_alt) = vcf_to_vep_allele(&vcf_ref, &vcf_alt);
-            let compare_allele_string = format!("{compare_ref}/{compare_alt}");
+            // Pipe-joined ALT (`T|CCGC`) → list of per-ALT strings (`["T","CCGC"]`).
+            // For single-ALT rows this is a 1-element vec and the multi-ALT
+            // helpers below produce results bit-identical to the biallelic
+            // `vcf_to_vep_*` helpers.
+            //
+            // Traceability:
+            // - Pipe-join site: `datafusion-bio-formats/datafusion/bio-format-vcf/src/physical_exec.rs`
+            //   (`join_into(...iter()...,'|')` in the ALT branch).
+            let split_alts: Vec<&str> = vcf_alt.split('|').collect();
+
+            // Parser-level input allele string ("REF/ALT1/ALT2/..."): used as
+            // the sink-identity key. Must match the lookup key built in
+            // `annotate_provider.rs::annotate_batch_with_transcript_engine`.
+            let (input_ref, input_alts, input_start) =
+                vcf_to_vep_input_allele_multi(one_based_start, &vcf_ref, &split_alts);
+            let mut input_allele_string = input_ref.clone();
+            for a in &input_alts {
+                input_allele_string.push('/');
+                input_allele_string.push_str(a);
+            }
+
+            // VEP-normalized minimal allele string ("REF/ALT1/ALT2/..." with
+            // joint prefix+suffix trimmed): consumed by
+            // `compare_existing_variant_alleles` → `get_matched_variant_alleles`
+            // which iterates over the alt list, so a multi-ALT row produces
+            // one matched-allele entry per cache row × per matching ALT.
+            let (compare_ref, compare_alts) = vcf_to_vep_allele_multi(&vcf_ref, &split_alts);
+            let mut compare_allele_string = compare_ref.clone();
+            for a in &compare_alts {
+                compare_allele_string.push('/');
+                compare_allele_string.push_str(a);
+            }
 
             // VEP-normalized coordinates for the hash index (exact matching).
-            let vep_start = vep_norm_start(one_based_start, &vcf_ref, &vcf_alt);
-            let vep_end = vep_norm_end(one_based_start, &vcf_ref, &vcf_alt);
+            // Multi-ALT-aware so a SNV+indel row like `C → T,CCGC` (no shared
+            // prefix → vep_start = vcf_pos) and a pure-indel multi-row like
+            // `C → CCGC,CGGC` (shared `C` → vep_start = vcf_pos+1) both
+            // get the right coordinate keys.
+            let vep_start = vep_norm_start_multi(one_based_start, &vcf_ref, &split_alts);
+            let vep_end = vep_norm_end_multi(one_based_start, &vcf_ref, &split_alts);
 
             // Hash index: chrom → (vep_norm_start, vep_norm_end) → [row_indices].
             hash_index
