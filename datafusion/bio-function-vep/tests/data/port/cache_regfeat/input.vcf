@@ -1,0 +1,6 @@
+##fileformat=VCFv4.2
+##source=vepyr-port-test-cache_regfeat-v115
+##contig=<ID=21,length=46709983>
+##INFO=<ID=NS,Number=1,Type=Integer,Description="Placeholder INFO; not consumed by VEP">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+21	25039632	rf_overlap_enhancer	T	C	.	PASS	.
