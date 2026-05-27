@@ -11808,4 +11808,133 @@ mod tests {
         // Should be a borrowed Cow (no allocation)
         assert!(matches!(escaped, std::borrow::Cow::Borrowed(_)));
     }
+
+    // ── Port of ensembl-vep/t/AnnotationSource.t (Tier 2 port, 2026-05-28) ─────
+    //
+    // Maps Perl subtests in `AnnotationSource.t` to Rust unit-/integration-port
+    // tests against the file-private region-tuple math
+    // (`cache_region_index`, `cache_regions_for_coords`,
+    // `collect_buffer_cache_regions`). See
+    // `porting-tests/detailed_plans/AnnotationSource.md` for the full
+    // per-subtest table and v2 paradigm classification.
+    //
+    // Architectural-no-analogue rows (no Rust code per v2 sztywno-1:1):
+    //   - Subtest #3 (Config->new ok): vepyr has no Bio::EnsEMBL::VEP::Config
+    //     class; config is clap-derived (AnnotateVcfConfig), validated at parse
+    //     time.
+    //   - Subtest #4 (AnnotationSource->new ok): vepyr has no AnnotationSource
+    //     base class; annotation is implemented as DataFusion table providers +
+    //     AnnotateProvider.
+    //   - Subtest #5 (info round-trip): vepyr's CacheInfo is parsed from disk
+    //     (not arbitrary user input); round-trip semantics differ. CacheInfo
+    //     coverage owned by `detailed_plans/CacheDir.md`.
+    //   - Subtest #7 (Parser::VCF->new ok): vepyr's VcfTableProvider is a
+    //     DataFusion TableProvider; construction is implicit. Parser
+    //     construction owned by `detailed_plans/Parser_VCF.md`.
+    //   - Subtests #9, #10 (InputBuffer ref + ARRAY): vepyr has no InputBuffer
+    //     struct; buffering is implicit in RecordBatch streaming.
+
+    // ── Perl subtest #13a — `[1 999999 A>G]` → `[[1, 0]]` ────────────────────
+    #[test]
+    fn test_port_annotation_source_13a_1bp_before_boundary() {
+        let regions = cache_regions_for_coords("1", 999_999, 999_999, 0, 0);
+        assert_eq!(
+            regions,
+            vec![TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 0,
+            }]
+        );
+    }
+
+    // ── Perl subtest #13b — `[1 1000000 A>G]` → `[[1, 0]]` ───────────────────
+    //
+    // `(1_000_000 - 1) / 1_000_000 == 0` (Perl integer division and Rust i64
+    // floor-division agree on positive operands).
+    #[test]
+    fn test_port_annotation_source_13b_exact_lower_boundary() {
+        let regions = cache_regions_for_coords("1", 1_000_000, 1_000_000, 0, 0);
+        assert_eq!(
+            regions,
+            vec![TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 0,
+            }]
+        );
+    }
+
+    // ── Perl subtest #13c — `[1 1000001 A>G]` → `[[1, 1]]` ───────────────────
+    #[test]
+    fn test_port_annotation_source_13c_1bp_after_boundary() {
+        let regions = cache_regions_for_coords("1", 1_000_001, 1_000_001, 0, 0);
+        assert_eq!(
+            regions,
+            vec![TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 1,
+            }]
+        );
+    }
+
+    // ── Perl subtest #13d — `[1 1000000 AC>GT]` → `[[1, 0], [1, 1]]` ─────────
+    //
+    // 2bp MNV straddling the 1Mb boundary.
+    #[test]
+    fn test_port_annotation_source_13d_mnv_straddles_boundary() {
+        let regions = cache_regions_for_coords("1", 1_000_000, 1_000_001, 0, 0);
+        assert_eq!(
+            regions,
+            vec![
+                TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: 0,
+                },
+                TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: 1,
+                },
+            ]
+        );
+    }
+
+    // ── Perl subtest #13e — `[1 1000000 C>CT]` → `[[1, 0], [1, 1]]` ──────────
+    //
+    // VEP's parser advances `end = start + length(REF) = 1_000_001` for the
+    // insertion anchor; here we take the already-resolved `(start, end)` pair
+    // directly. VCF parser anchor normalisation belongs to Parser_VCF.md.
+    #[test]
+    fn test_port_annotation_source_13e_insertion_straddles_boundary() {
+        let regions = cache_regions_for_coords("1", 1_000_000, 1_000_001, 0, 0);
+        assert_eq!(
+            regions,
+            vec![
+                TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: 0,
+                },
+                TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: 1,
+                },
+            ]
+        );
+    }
+
+    // ── Perl subtest #13f — `[1 1 <DEL> END=3000001]` → `[[1, 0]..[1, 3]]` ───
+    //
+    // SV spans 4 regions. SV `END=` parsing belongs to Parser_VCF.md; here we
+    // take `(1, 3_000_001)` as already-resolved input.
+    #[test]
+    fn test_port_annotation_source_13f_sv_spans_four_regions() {
+        let regions = cache_regions_for_coords("1", 1, 3_000_001, 0, 0);
+        assert_eq!(
+            regions,
+            (0..=3)
+                .map(|i| TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: i,
+                })
+                .collect::<Vec<_>>()
+        );
+    }
 }
