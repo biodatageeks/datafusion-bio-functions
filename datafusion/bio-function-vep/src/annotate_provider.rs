@@ -11930,4 +11930,274 @@ mod tests {
         // Should be a borrowed Cow (no allocation)
         assert!(matches!(escaped, std::borrow::Cow::Borrowed(_)));
     }
+
+    // ── Port of ensembl-vep/t/AnnotationSource.t (Tier 2 port, 2026-05-28) ─────
+    //
+    // Maps Perl subtests in `AnnotationSource.t` to Rust unit-/integration-port
+    // tests against the file-private region-tuple math
+    // (`cache_region_index`, `cache_regions_for_coords`,
+    // `collect_buffer_cache_regions`). See
+    // `porting-tests/detailed_plans/AnnotationSource.md` for the full
+    // per-subtest table and v2 paradigm classification.
+    //
+    // Architectural-no-analogue rows (no Rust code per v2 sztywno-1:1):
+    //   - Subtest #3 (Config->new ok): vepyr has no Bio::EnsEMBL::VEP::Config
+    //     class; config is clap-derived (AnnotateVcfConfig), validated at parse
+    //     time.
+    //   - Subtest #4 (AnnotationSource->new ok): vepyr has no AnnotationSource
+    //     base class; annotation is implemented as DataFusion table providers +
+    //     AnnotateProvider.
+    //   - Subtest #5 (info round-trip): vepyr's CacheInfo is parsed from disk
+    //     (not arbitrary user input); round-trip semantics differ. CacheInfo
+    //     coverage owned by `detailed_plans/CacheDir.md`.
+    //   - Subtest #7 (Parser::VCF->new ok): vepyr's VcfTableProvider is a
+    //     DataFusion TableProvider; construction is implicit. Parser
+    //     construction owned by `detailed_plans/Parser_VCF.md`.
+    //   - Subtests #9, #10 (InputBuffer ref + ARRAY): vepyr has no InputBuffer
+    //     struct; buffering is implicit in RecordBatch streaming.
+
+    // ── Perl subtest #13a — `[1 999999 A>G]` → `[[1, 0]]` ────────────────────
+    #[test]
+    fn test_port_annotation_source_13a_1bp_before_boundary() {
+        let regions = cache_regions_for_coords("1", 999_999, 999_999, 0, 0);
+        assert_eq!(
+            regions,
+            vec![TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 0,
+            }]
+        );
+    }
+
+    // ── Perl subtest #13b — `[1 1000000 A>G]` → `[[1, 0]]` ───────────────────
+    //
+    // `(1_000_000 - 1) / 1_000_000 == 0` (Perl integer division and Rust i64
+    // floor-division agree on positive operands).
+    #[test]
+    fn test_port_annotation_source_13b_exact_lower_boundary() {
+        let regions = cache_regions_for_coords("1", 1_000_000, 1_000_000, 0, 0);
+        assert_eq!(
+            regions,
+            vec![TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 0,
+            }]
+        );
+    }
+
+    // ── Perl subtest #13c — `[1 1000001 A>G]` → `[[1, 1]]` ───────────────────
+    #[test]
+    fn test_port_annotation_source_13c_1bp_after_boundary() {
+        let regions = cache_regions_for_coords("1", 1_000_001, 1_000_001, 0, 0);
+        assert_eq!(
+            regions,
+            vec![TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 1,
+            }]
+        );
+    }
+
+    // ── Perl subtest #13d — `[1 1000000 AC>GT]` → `[[1, 0], [1, 1]]` ─────────
+    //
+    // 2bp MNV straddling the 1Mb boundary.
+    #[test]
+    fn test_port_annotation_source_13d_mnv_straddles_boundary() {
+        let regions = cache_regions_for_coords("1", 1_000_000, 1_000_001, 0, 0);
+        assert_eq!(
+            regions,
+            vec![
+                TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: 0,
+                },
+                TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: 1,
+                },
+            ]
+        );
+    }
+
+    // ── Perl subtest #13e — `[1 1000000 C>CT]` → `[[1, 0], [1, 1]]` ──────────
+    //
+    // VEP's parser advances `end = start + length(REF) = 1_000_001` for the
+    // insertion anchor; here we take the already-resolved `(start, end)` pair
+    // directly. VCF parser anchor normalisation belongs to Parser_VCF.md.
+    #[test]
+    fn test_port_annotation_source_13e_insertion_straddles_boundary() {
+        let regions = cache_regions_for_coords("1", 1_000_000, 1_000_001, 0, 0);
+        assert_eq!(
+            regions,
+            vec![
+                TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: 0,
+                },
+                TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: 1,
+                },
+            ]
+        );
+    }
+
+    // ── Perl subtest #13f — `[1 1 <DEL> END=3000001]` → `[[1, 0]..[1, 3]]` ───
+    //
+    // SV spans 4 regions. SV `END=` parsing belongs to Parser_VCF.md; here we
+    // take `(1, 3_000_001)` as already-resolved input.
+    #[test]
+    fn test_port_annotation_source_13f_sv_spans_four_regions() {
+        let regions = cache_regions_for_coords("1", 1, 3_000_001, 0, 0);
+        assert_eq!(
+            regions,
+            (0..=3)
+                .map(|i| TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: i,
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Perl subtest #13g — dedup across two single-base variants ────────────
+    //
+    // `[[1 1000000 A>G], [1 1000001 A>G]]` → `{(1, 0), (1, 1)}`. The Perl
+    // `get_all_regions_by_InputBuffer` dedups regions across all variants in
+    // the buffer; vepyr's `collect_buffer_cache_regions` does the same via a
+    // `HashSet<TranscriptCacheRegion>` accumulator. (integration-port)
+    #[test]
+    fn test_port_annotation_source_13g_buffer_dedup_two_variants() {
+        let batch = make_buffer_batch_many("1", &[1_000_000, 1_000_001]);
+        let regions = collect_buffer_cache_regions(&[batch], 0, 0).unwrap();
+
+        let expected: HashSet<TranscriptCacheRegion> = [
+            TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 0,
+            },
+            TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 1,
+            },
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(regions, expected);
+    }
+
+    // ── Perl subtest #11 — `get_all_regions_by_InputBuffer($ib)` on test.vcf ─
+    //
+    // Perl test reads `t/testdata/input/test.vcf` and expects
+    // `[[21, 25]]` back — chr21, region index 25 (positions
+    // 25_000_001..26_000_000). We use a hand-built `RecordBatch` instead of
+    // depending on `test.vcf` per detailed_plan §Anti-goals; the load-bearing
+    // assertion is integer math. Position 25_500_000 lands in region 25 since
+    // `(25_500_000 - 1) / 1_000_000 = 25`. (integration-port)
+    #[test]
+    fn test_port_annotation_source_11_test_vcf_style_chr21_buffer() {
+        let batch = make_buffer_batch("21", 25_500_000, 25_500_000);
+        let regions = collect_buffer_cache_regions(&[batch], 0, 0).unwrap();
+
+        let expected: HashSet<TranscriptCacheRegion> = [TranscriptCacheRegion {
+            chrom: "21".to_string(),
+            region_index: 25,
+        }]
+        .into_iter()
+        .collect();
+
+        assert_eq!(regions, expected);
+    }
+
+    // ── Perl subtest #12 — `$ib->min_max->{21}` per-chrom min/max ────────────
+    //
+    // BLOCKED-FUTURE-WORK: vepyr has no public `buffer_min_max` helper. The
+    // per-chrom min/max is computed implicitly inside
+    // `collect_buffer_cache_regions` but never surfaced. See future-work entry
+    // `buffer_min_max — public per-chrom min/max helper` in
+    // `porting-tests/future-work-vepyr.md`.
+    //
+    // #[test]
+    // fn test_port_annotation_source_12_buffer_min_max_per_chrom() {
+    //     let batch = make_buffer_batch_many(
+    //         "21",
+    //         &[25_585_733, 25_700_000, 25_982_445],
+    //     );
+    //     let mm = buffer_min_max(&[batch]).unwrap();
+    //     assert_eq!(mm.get("21"), Some(&(25_585_733_i64, 25_982_445_i64)));
+    // }
+
+    // ── Axis B B1 — `up_down_size` is symmetric `max(upstream, downstream)` ─
+    //
+    // VEP's `AnnotationType::Transcript::up_down_size()` returns
+    // `max(UPSTREAM_DISTANCE, DOWNSTREAM_DISTANCE)` — a single scalar applied
+    // symmetrically to bound the coarse cache-region fetch. Strand-aware
+    // asymmetric upstream/downstream gating happens later in
+    // `upstream_downstream_term()`. This test pins the symmetric application.
+    //
+    // Position 1_500_000 with `upstream=100_000, downstream=600_000`:
+    //   - `up_down_size = max(100_000, 600_000) = 600_000`
+    //   - `query_start = 1_500_000 - 600_000 = 900_000` → region 0
+    //   - `query_end   = 1_500_000 + 600_000 = 2_100_000` → region 2
+    //   - Result: regions 0, 1, 2.
+    //
+    // If vepyr (incorrectly) applied upstream and downstream asymmetrically
+    // (start - upstream, end + downstream), the result would be
+    // `(1_400_000, 2_100_000)` → regions 1, 2 only. The test fails in that case.
+    #[test]
+    fn test_port_annotation_source_b1_up_down_size_symmetric_widening() {
+        let regions = cache_regions_for_coords("1", 1_500_000, 1_500_000, 100_000, 600_000);
+        assert_eq!(
+            regions,
+            (0..=2)
+                .map(|i| TranscriptCacheRegion {
+                    chrom: "1".to_string(),
+                    region_index: i,
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Axis B B2 — `collect_buffer_cache_regions` dedup across multiple batches ─
+    //
+    // Perl row 13g covers single-batch dedup; vepyr's `HashSet` accumulation
+    // also dedupes ACROSS batches. Build batch1 covering region 0 and batch2
+    // covering region 1 twice (two positions both in region 1). Result must be
+    // a 2-element set, not 3.
+    #[test]
+    fn test_port_annotation_source_b2_cross_batch_dedup() {
+        let batch1 = make_buffer_batch_many("1", &[1_000_000]);
+        let batch2 = make_buffer_batch_many("1", &[1_000_001, 1_500_000]);
+        let regions = collect_buffer_cache_regions(&[batch1, batch2], 0, 0).unwrap();
+
+        let expected: HashSet<TranscriptCacheRegion> = [
+            TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 0,
+            },
+            TranscriptCacheRegion {
+                chrom: "1".to_string(),
+                region_index: 1,
+            },
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(regions, expected);
+        assert_eq!(regions.len(), 2, "two distinct regions after dedup");
+    }
+
+    // ── Axis B B3 — `cache_region_index` boundary at and below pos=1 ────────
+    //
+    // Pins the `saturating_sub(1) / 1_000_000` semantics at the lower edge.
+    // `pos=0`: i64 `0.saturating_sub(1) = -1`; `-1 / 1_000_000 == 0` (Rust
+    // integer division truncates toward zero). `pos=1`: `0 / 1_000_000 == 0`.
+    #[test]
+    fn test_port_annotation_source_b3_cache_region_index_at_zero_boundary() {
+        assert_eq!(cache_region_index(0), 0);
+        assert_eq!(cache_region_index(1), 0);
+        assert_eq!(cache_region_index(1_000_000), 0);
+        assert_eq!(cache_region_index(1_000_001), 1);
+    }
 }
