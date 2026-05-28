@@ -1404,4 +1404,51 @@ mod tests {
         assert_eq!(a, vec!["CGC".to_string(), "GGC".to_string()]);
         assert_eq!(p, 8987005);
     }
+
+    // ----------------------------------------------------------------
+    // Axis B (vepyr-side) tests for `AnnotationSource_Cache_Variation.t`.
+    // See `porting-tests/detailed_plans/AnnotationSource_Cache_Variation.md`
+    // §Axis-B additions B2 + B3.
+    //
+    // Perl's `minimise_alleles` trims regardless of REF/ALT shape. Vepyr's
+    // `vcf_to_vep_allele_multi` deliberately diverges in two cases:
+    //   * SNV-only multi-ALT → NO trimming (preserves the per-ALT base).
+    //   * MNV (equal-length REF/ALT) multi-ALT → prefix-only trim, never
+    //     suffix-trim (matches the documented comment block at
+    //     `allele.rs:28` "VEP keeps the multi-allelic Allele string aligned
+    //     to the per-position REF base").
+    // ----------------------------------------------------------------
+
+    // Axis B B2: subtest (Variation Phase D Axis B B2) — SNV-only multi-ALT
+    // does NO trimming. See `allele.rs:351` for the source comment.
+    #[test]
+    fn axis_b_b2_vcf_to_vep_allele_multi_snv_only_no_trim() {
+        // A → G,T: pure SNVs, no shared prefix beyond ALT[0]'s single base.
+        // Perl `minimise_alleles` would trim the shared base; vepyr keeps
+        // the per-position REF + per-allele ALT untouched.
+        let (r, a) = vcf_to_vep_allele_multi("A", &["G", "T"]);
+        assert_eq!(r, "A");
+        assert_eq!(a, vec!["G".to_string(), "T".to_string()]);
+        assert_eq!(vep_norm_start_multi(100, "A", &["G", "T"]), 100);
+    }
+
+    // Axis B B3: subtest (Variation Phase D Axis B B3) — Multi-ALT MNV
+    // (equal-length REF/ALT) prefix-only trim, never suffix-trim. See
+    // `allele.rs:28` for the design comment.
+    #[test]
+    fn axis_b_b3_vcf_to_vep_allele_multi_mnv_prefix_only_trim() {
+        // AAA → AAT,ACA: equal-length MNV with shared prefix `A` (the
+        // first base is common to REF + all ALTs; ALT2 also extends
+        // the shared prefix to `A`+anything, but ALT1 diverges at
+        // position 2 — so the longest shared prefix is `A`).
+        //
+        // Suffix is NOT shared (REF ends `A`, ALT1 ends `T`, ALT2 ends
+        // `A`) — and even if it were, the MNV rule states prefix-only.
+        let (r, a) = vcf_to_vep_allele_multi("AAA", &["AAT", "ACA"]);
+        // Expectation: shared prefix `A` trimmed → REF="AA", ALTs=["AT","CA"].
+        // If the helper instead strips both prefix `A` AND a shared
+        // suffix, the test fails — preserving the Axis B B3 invariant.
+        assert_eq!(r, "AA");
+        assert_eq!(a, vec!["AT".to_string(), "CA".to_string()]);
+    }
 }
