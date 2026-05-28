@@ -1,0 +1,10 @@
+##fileformat=VCFv4.2
+##source=vepyr-port-test-runner-v115
+##contig=<ID=21,length=46709983>
+##INFO=<ID=NS,Number=1,Type=Integer,Description="Placeholder INFO; not consumed by VEP">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+21	25585733	rs142513484	C	T	.	PASS	.
+21	25587758	rs187353664	G	A	.	PASS	.
+21	25587759	rs116645811	T	C	.	PASS	.
+21	25587760	rs199510789	A	G	.	PASS	.
+21	25585733	cv_05_ref_eq_alt	C	C	.	PASS	.
