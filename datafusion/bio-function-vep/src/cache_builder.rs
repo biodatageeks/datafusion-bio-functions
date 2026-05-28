@@ -39,7 +39,10 @@ use crate::kv_cache::kv_store::VepKvStore;
 use crate::kv_cache::position_entry::serialize_position_entry;
 use crate::kv_cache::sift_store::SiftKvStore;
 use crate::transcript_consequence::CachedPredictions;
-use crate::warm_cache::build::{WarmVariationTierOptions, build_warm_variation_tier};
+use crate::warm_cache::build::{
+    WarmVariationTierOptions, WarmVariationTierPartsOptions, build_warm_variation_tier,
+    build_warm_variation_tier_from_parts,
+};
 
 /// Progress callback: `(entity, format, batch_rows, total_rows, total_expected)`.
 ///
@@ -428,9 +431,12 @@ impl CacheBuilder {
             };
 
             let mut chrom_rows = 0usize;
+            let mut variation_tier_written = false;
 
             if let Some(inner) = inner_plan.filter(|_| num_partitions > 1 && !is_other) {
-                // --- Parallel path: write N temp parquet files, then merge ---
+                // --- Parallel path: write N temp parquet files, then build
+                // warm/cold tiers directly from those parts. This avoids the
+                // previous serial chrN.parquet -> warm/cold split pass.
                 let temp_dir = format!("{}/variation/_tmp_{chrom}", self.output_dir);
                 std::fs::create_dir_all(&temp_dir).map_err(|e| {
                     DataFusionError::Execution(format!("Failed to create temp dir: {e}"))
@@ -486,14 +492,9 @@ impl CacheBuilder {
                     num_partitions
                 );
 
-                // Phase 2: Merge temp parquet files by appending row groups
-                // (no decompression/recompression — just copies raw bytes).
-                //
-                // Close the main writer first (it wrote nothing yet), then
-                // concatenate row groups from each partition file into the
-                // final output file.
+                // Close and remove the empty base parquet writer; the final
+                // output for main chromosomes is chrN_warm/chrN_cold.
                 {
-                    // Drop the empty ArrowWriter so we can overwrite the file
                     let empty_writer = main_writer.take().unwrap();
                     empty_writer.close().map_err(|e| {
                         DataFusionError::Execution(format!(
@@ -501,20 +502,27 @@ impl CacheBuilder {
                         ))
                     })?;
                 }
+                if let Err(error) = std::fs::remove_file(output_file) {
+                    log::debug!(
+                        "variation: failed to remove empty base parquet {output_file}: {error}"
+                    );
+                }
 
-                let part_paths: Vec<String> = part_files
-                    .iter()
-                    .map(|(_, part_file, _)| part_file.clone())
-                    .collect();
-                let merged_rows =
-                    merge_parquet_row_groups(&part_paths, output_file, Some(self.zstd_level))?;
-                if merged_rows != parallel_rows {
+                let tier_results = self.build_variation_tier_from_partition_parquets(
+                    chrom,
+                    &part_files,
+                    Path::new(&temp_dir).join("tier"),
+                )?;
+                let tier_rows: usize = tier_results.iter().map(|(_, rows)| *rows).sum();
+                if tier_rows != parallel_rows {
                     return Err(DataFusionError::Execution(format!(
-                        "merged parquet row count mismatch for {output_file}: copied {merged_rows}, expected {parallel_rows}"
+                        "warm/cold tier row count mismatch for {chrom}: wrote {tier_rows}, expected {parallel_rows}"
                     )));
                 }
-                chrom_rows += merged_rows;
-                total_parquet_rows += merged_rows;
+                chrom_rows += tier_rows;
+                total_parquet_rows += tier_rows;
+                parquet_results.extend(tier_results);
+                variation_tier_written = true;
 
                 if let Some(ref cb) = self.on_progress {
                     cb("variation", "parquet", chrom_rows, total_parquet_rows, 0);
@@ -562,6 +570,8 @@ impl CacheBuilder {
 
             if *is_other {
                 other_total_rows += chrom_rows;
+            } else if variation_tier_written {
+                info!("variation: {chrom} {} rows", format_rows(chrom_rows));
             } else if chrom_rows > 0 {
                 parquet_results.extend(self.split_variation_base_parquet(output_file)?);
                 info!("variation: {chrom} {} rows", format_rows(chrom_rows));
@@ -619,6 +629,43 @@ impl CacheBuilder {
             parquet_results.extend(self.split_variation_base_parquet(&path)?);
         }
         Ok(parquet_results)
+    }
+
+    fn build_variation_tier_from_partition_parquets(
+        &self,
+        chrom: &str,
+        part_files: &[(usize, String, usize)],
+        work_dir: impl AsRef<Path>,
+    ) -> Result<Vec<(String, usize)>> {
+        let output_dir = Path::new(&self.output_dir).join("variation");
+        let chrom_name = format!("chr{chrom}");
+        let inputs: Vec<PathBuf> = part_files
+            .iter()
+            .map(|(_, path, _)| PathBuf::from(path))
+            .collect();
+        let mut options = WarmVariationTierPartsOptions::new(
+            inputs,
+            &output_dir,
+            work_dir.as_ref().to_path_buf(),
+            chrom_name,
+        );
+        options.af_threshold = self.variation_af_threshold;
+        options.position_radius = self.variation_position_radius;
+        options.row_group_rows = self.variation_row_group_rows;
+        options.batch_size = self.variation_tier_batch_size;
+
+        let stats = build_warm_variation_tier_from_parts(options).map_err(|error| {
+            DataFusionError::Execution(format!(
+                "failed to build warm/cold variation tier from partition parquets for {chrom}: {error}"
+            ))
+        })?;
+
+        let warm = output_dir.join(format!("{}_warm.parquet", stats.chrom));
+        let cold = output_dir.join(format!("{}_cold.parquet", stats.chrom));
+        Ok(vec![
+            (warm.to_string_lossy().to_string(), stats.warm_rows),
+            (cold.to_string_lossy().to_string(), stats.cold_rows),
+        ])
     }
 
     fn split_variation_base_parquet(

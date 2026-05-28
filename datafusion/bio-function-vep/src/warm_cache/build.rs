@@ -47,6 +47,38 @@ impl WarmVariationTierOptions {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct WarmVariationTierPartsOptions {
+    pub inputs: Vec<PathBuf>,
+    pub output_dir: PathBuf,
+    pub work_dir: PathBuf,
+    pub chrom: String,
+    pub af_threshold: f64,
+    pub position_radius: i64,
+    pub row_group_rows: usize,
+    pub batch_size: usize,
+}
+
+impl WarmVariationTierPartsOptions {
+    pub fn new(
+        inputs: Vec<PathBuf>,
+        output_dir: impl Into<PathBuf>,
+        work_dir: impl Into<PathBuf>,
+        chrom: impl Into<String>,
+    ) -> Self {
+        Self {
+            inputs,
+            output_dir: output_dir.into(),
+            work_dir: work_dir.into(),
+            chrom: chrom.into(),
+            af_threshold: 0.01,
+            position_radius: 1,
+            row_group_rows: 500_000,
+            batch_size: 65_536,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WarmVariationTierStats {
     pub chrom: String,
@@ -101,6 +133,118 @@ pub fn build_warm_variation_tier(
         cold_row_groups: written.cold_row_groups,
         cold_rows_sharing_warm_positions: written.cold_rows_sharing_warm_positions,
         row_group_position_splits: written.row_group_position_splits,
+    })
+}
+
+pub fn build_warm_variation_tier_from_parts(
+    options: WarmVariationTierPartsOptions,
+) -> Result<WarmVariationTierStats> {
+    if options.inputs.is_empty() {
+        return Err("warm/cold variation tier requires at least one input part".into());
+    }
+
+    std::fs::create_dir_all(&options.output_dir)?;
+    if options.work_dir.exists() {
+        std::fs::remove_dir_all(&options.work_dir)?;
+    }
+    std::fs::create_dir_all(&options.work_dir)?;
+
+    let args_for = |input: PathBuf| Args {
+        input,
+        output_dir: options.output_dir.clone(),
+        af_threshold: options.af_threshold,
+        position_radius: options.position_radius,
+        row_group_rows: options.row_group_rows,
+        batch_size: options.batch_size,
+    };
+
+    let mut collect_handles = Vec::with_capacity(options.inputs.len());
+    for input in &options.inputs {
+        let args = args_for(input.clone());
+        collect_handles.push(std::thread::spawn(move || collect_warm_positions(&args)));
+    }
+
+    let mut warm_positions = BTreeSet::new();
+    for handle in collect_handles {
+        let positions = handle
+            .join()
+            .map_err(|_| "warm position collection thread panicked")??;
+        warm_positions.extend(positions);
+    }
+
+    let warm_positions = Arc::new(warm_positions);
+    let mut split_handles = Vec::with_capacity(options.inputs.len());
+    for (idx, input) in options.inputs.iter().enumerate() {
+        let args = args_for(input.clone());
+        let chrom = options.chrom.clone();
+        let warm_positions = Arc::clone(&warm_positions);
+        let warm_path = options.work_dir.join(format!("part_{idx}_warm.parquet"));
+        let cold_path = options.work_dir.join(format!("part_{idx}_cold.parquet"));
+        split_handles.push(std::thread::spawn(move || {
+            let written =
+                write_split_files_to_paths(&args, &chrom, &warm_positions, &warm_path, &cold_path)?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((idx, warm_path, cold_path, written))
+        }));
+    }
+
+    let mut split_parts = Vec::with_capacity(options.inputs.len());
+    let mut cold_rows_sharing_warm_positions = 0usize;
+    for handle in split_handles {
+        let (idx, warm_path, cold_path, written) = handle
+            .join()
+            .map_err(|_| "warm/cold split thread panicked")??;
+        cold_rows_sharing_warm_positions += written.cold_rows_sharing_warm_positions;
+        split_parts.push((idx, warm_path, cold_path));
+    }
+    split_parts.sort_by_key(|(idx, _, _)| *idx);
+
+    let warm_part_paths: Vec<PathBuf> = split_parts
+        .iter()
+        .map(|(_, warm_path, _)| warm_path.clone())
+        .collect();
+    let cold_part_paths: Vec<PathBuf> = split_parts
+        .iter()
+        .map(|(_, _, cold_path)| cold_path.clone())
+        .collect();
+
+    let merge_args = args_for(options.inputs[0].clone());
+    let warm_path = options
+        .output_dir
+        .join(format!("{}_warm.parquet", options.chrom));
+    let cold_path = options
+        .output_dir
+        .join(format!("{}_cold.parquet", options.chrom));
+
+    let (warm_rows, warm_row_groups) =
+        merge_position_aligned_files(&warm_part_paths, &warm_path, "warm", &merge_args)?;
+    let (cold_rows, cold_row_groups) =
+        merge_position_aligned_files(&cold_part_paths, &cold_path, "cold", &merge_args)?;
+    let row_group_position_splits =
+        verify_position_aligned_row_groups(&warm_path, options.batch_size)?
+            + verify_position_aligned_row_groups(&cold_path, options.batch_size)?;
+    write_cold_position_index(
+        &options.output_dir,
+        &options.chrom,
+        &cold_path,
+        options.batch_size,
+    )?;
+
+    if let Err(error) = std::fs::remove_dir_all(&options.work_dir) {
+        eprintln!(
+            "warning: failed to remove warm/cold tier work dir {}: {error}",
+            options.work_dir.display()
+        );
+    }
+
+    Ok(WarmVariationTierStats {
+        chrom: options.chrom,
+        warm_positions: warm_positions.len(),
+        warm_rows,
+        cold_rows,
+        warm_row_groups,
+        cold_row_groups,
+        cold_rows_sharing_warm_positions,
+        row_group_position_splits,
     })
 }
 
@@ -174,15 +318,27 @@ fn write_split_files(
     chrom: &str,
     warm_positions: &BTreeSet<i64>,
 ) -> Result<WrittenRows> {
+    let warm_path = args.output_dir.join(format!("{chrom}_warm.parquet"));
+    let cold_path = args.output_dir.join(format!("{chrom}_cold.parquet"));
+    let written = write_split_files_to_paths(args, chrom, warm_positions, &warm_path, &cold_path)?;
+    write_cold_position_index(&args.output_dir, chrom, &cold_path, args.batch_size)?;
+    Ok(written)
+}
+
+fn write_split_files_to_paths(
+    args: &Args,
+    chrom: &str,
+    warm_positions: &BTreeSet<i64>,
+    warm_path: &Path,
+    cold_path: &Path,
+) -> Result<WrittenRows> {
     let file = File::open(&args.input)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let source_schema = builder.schema().clone();
     let output_schema = output_schema(&source_schema)?;
 
-    let warm_path = args.output_dir.join(format!("{chrom}_warm.parquet"));
-    let cold_path = args.output_dir.join(format!("{chrom}_cold.parquet"));
-    let warm_writer = create_writer(&warm_path, output_schema.clone(), "warm", args)?;
-    let cold_writer = create_writer(&cold_path, output_schema.clone(), "cold", args)?;
+    let warm_writer = create_writer(warm_path, output_schema.clone(), "warm", args)?;
+    let cold_writer = create_writer(cold_path, output_schema.clone(), "cold", args)?;
     let mut warm_writer =
         PositionAlignedWriter::new(warm_writer, output_schema.clone(), args.row_group_rows)?;
     let mut cold_writer =
@@ -215,10 +371,46 @@ fn write_split_files(
     written.warm_row_groups = warm_writer.close()?;
     written.cold_row_groups = cold_writer.close()?;
     written.row_group_position_splits =
-        verify_position_aligned_row_groups(&warm_path, args.batch_size)?
-            + verify_position_aligned_row_groups(&cold_path, args.batch_size)?;
-    write_cold_position_index(&args.output_dir, chrom, &cold_path, args.batch_size)?;
+        verify_position_aligned_row_groups(warm_path, args.batch_size)?
+            + verify_position_aligned_row_groups(cold_path, args.batch_size)?;
     Ok(written)
+}
+
+fn merge_position_aligned_files(
+    inputs: &[PathBuf],
+    output_path: &Path,
+    tier: &str,
+    args: &Args,
+) -> Result<(usize, usize)> {
+    let first = inputs
+        .first()
+        .ok_or("position-aligned merge requires at least one input file")?;
+    let first_file = File::open(first)?;
+    let first_builder = ParquetRecordBatchReaderBuilder::try_new(first_file)?;
+    let schema = first_builder.schema().clone();
+    drop(first_builder);
+
+    let writer = create_writer(output_path, schema.clone(), tier, args)?;
+    let mut writer = PositionAlignedWriter::new(writer, schema, args.row_group_rows)?;
+    let mut rows = 0usize;
+
+    for input in inputs {
+        let file = File::open(input)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+            .with_batch_size(args.batch_size)
+            .build()?;
+        for batch in reader {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            rows += batch.num_rows();
+            writer.write(&batch)?;
+        }
+    }
+
+    let row_groups = writer.close()?;
+    Ok((rows, row_groups))
 }
 
 fn write_cold_position_index(
@@ -635,5 +827,82 @@ fn string_value(array: &dyn Array, row: usize) -> Option<&str> {
         Some(a.value(row))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_input_part(path: &Path, starts: Vec<i64>, mafs: Vec<f64>) {
+        let rows = starts.len();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, true),
+            Field::new("minor_allele_freq", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"; rows])) as ArrayRef,
+                Arc::new(Int64Array::from(starts)) as ArrayRef,
+                Arc::new(StringArray::from(vec!["A/G"; rows])) as ArrayRef,
+                Arc::new(Float64Array::from(mafs)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn count_rows(path: &Path) -> usize {
+        let file = File::open(path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        reader.map(|batch| batch.unwrap().num_rows()).sum()
+    }
+
+    #[test]
+    fn build_warm_variation_tier_from_parts_writes_final_split_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("variation");
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let part_0 = dir.path().join("part_0.parquet");
+        let part_1 = dir.path().join("part_1.parquet");
+        write_input_part(&part_0, vec![100, 200], vec![0.02, 0.0]);
+        write_input_part(&part_1, vec![101, 300], vec![0.0, 0.0]);
+
+        let mut options = WarmVariationTierPartsOptions::new(
+            vec![part_0, part_1],
+            &output_dir,
+            &work_dir,
+            "chr1",
+        );
+        options.af_threshold = 0.01;
+        options.position_radius = 1;
+        options.row_group_rows = 2;
+        options.batch_size = 2;
+
+        let stats = build_warm_variation_tier_from_parts(options).unwrap();
+
+        let warm_path = output_dir.join("chr1_warm.parquet");
+        let cold_path = output_dir.join("chr1_cold.parquet");
+        assert_eq!(stats.warm_rows, 2);
+        assert_eq!(stats.cold_rows, 2);
+        assert_eq!(count_rows(&warm_path), 2);
+        assert_eq!(count_rows(&cold_path), 2);
+        assert!(
+            dir.path()
+                .join("variation.position_index/chr1.posidx")
+                .exists()
+        );
+        assert!(!work_dir.exists());
     }
 }
