@@ -21246,4 +21246,64 @@ mod tests {
 
     // SUBTEST #34 — see nearest_index::tests::tt34 stub (arch-no-analogue:
     // vepyr biological coordinates are non-negative).
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Port of `ensembl-vep/t/Parser.t` `_have_chr` rows (subtests #31, #32,
+    // #34) — chr-membership check + chr-prefix normalisation.
+    //
+    // Detailed plan: `porting-tests/detailed_plans/Parser.md`.
+    // v2 paradigm: sztywno 1:1, standalone. Anchor:
+    // `~/.claude/skills/port-to-vepyr/references/v2-paradigm.md`.
+    //
+    // Perl `_have_chr` walks `valid_chromosomes`, optionally adds/strips
+    // `chr` prefix, M→MT alias, and synonym table. Vepyr replaces the
+    // strip-only branch via `normalize_chrom` (line 2975, this file). The
+    // add-prefix branch and M→MT/synonym lookups are blocked-future-work
+    // (rows #33, #35-#37 in detailed_plan, all tracked under the existing
+    // `PreparedContext chromosome-synonyms alias table` entry in
+    // `porting-tests/future-work-vepyr.md`).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Port of `Parser.t` subtest #31 (Perl l.137):
+    ///   `_have_chr({chr=>1, valid_chromosomes={1=>1,21=>1,...}})` → 1.
+    ///
+    /// Vepyr analogue: `valid.contains(normalize_chrom("1"))` after
+    /// stripping any `chr` prefix. With input "1" already bare, the
+    /// strip is a no-op and the set lookup succeeds.
+    #[test]
+    fn port_parser_subtest_31_have_chr_bare_chrom_in_valid_set() {
+        let valid: std::collections::HashSet<&str> =
+            ["1", "21", "CHR_1", "MT", "chromosome", "chr12"]
+                .into_iter()
+                .collect();
+        assert!(valid.contains(normalize_chrom("1")));
+    }
+
+    /// Port of `Parser.t` subtest #32 (Perl l.138):
+    ///   `_have_chr({chr=>'chr1'})` → 1 (remove chr prefix).
+    ///
+    /// Vepyr analogue: `normalize_chrom("chr1") == "1"` then `valid.contains("1")`.
+    /// Already covered by `tt22_normalize_chrom_strips_chr_prefix` for the
+    /// pure-strip half; this row adds the set-membership pairing.
+    #[test]
+    fn port_parser_subtest_32_have_chr_chr_prefix_stripped_then_matches() {
+        let valid: std::collections::HashSet<&str> =
+            ["1", "21", "CHR_1", "MT", "chromosome", "chr12"]
+                .into_iter()
+                .collect();
+        let normalized = normalize_chrom("chr1");
+        assert_eq!(normalized, "1");
+        assert!(valid.contains(normalized));
+    }
+
+    /// Port of `Parser.t` subtest #34 (Perl l.140):
+    ///   `_have_chr({chr=>2, valid_chromosomes={1=>1,21=>1,...}})` → 0.
+    ///
+    /// Vepyr analogue: `valid.contains(normalize_chrom("2"))` → false.
+    /// Pin the negative-case behaviour explicitly to mirror Perl row #34.
+    #[test]
+    fn port_parser_subtest_34_have_chr_unknown_chrom_rejected() {
+        let valid: std::collections::HashSet<&str> = ["1", "21"].into_iter().collect();
+        assert!(!valid.contains(normalize_chrom("2")));
+    }
 }
