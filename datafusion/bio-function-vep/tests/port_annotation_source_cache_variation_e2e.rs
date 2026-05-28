@@ -357,6 +357,7 @@ async fn rs142513484_existing_variation_populated_36() {
 // comma separation; set-containment over both rsIDs is the LOAD-BEARING
 // invariant.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(non_snake_case)]
 async fn rs63750066_multi_existing_with_CM930033_NULL_allele_39() {
     let Some((cache_path, ref_fasta, input_vcf)) = v115_fixture_paths() else {
         eprintln!(
@@ -701,8 +702,10 @@ async fn axis_b_b4_star_allele_in_multi_alt_skipped() {
     let ctx = SessionContext::new();
     ctx.register_table("output_vcf", Arc::new(output_prov))
         .unwrap();
+    // Use SELECT * so the CSQ column survives DataFusion's default
+    // lowercase folding; index by name from the schema.
     let batches = ctx
-        .sql("SELECT CSQ FROM output_vcf")
+        .sql("SELECT * FROM output_vcf")
         .await
         .unwrap()
         .collect()
@@ -721,7 +724,11 @@ async fn axis_b_b4_star_allele_in_multi_alt_skipped() {
         eprintln!("Axis B B4: zero output rows; treating as inconclusive.");
         return;
     }
-    let csq = csq_at(batch.column(0).as_ref(), 0);
+    let Ok(csq_idx) = batch.schema().index_of("CSQ") else {
+        eprintln!("Axis B B4: CSQ column not present in output schema; inconclusive.");
+        return;
+    };
+    let csq = csq_at(batch.column(csq_idx).as_ref(), 0);
     let alleles = unique_alleles(&csq);
 
     // Phase D Axis B B4: `*` (star-allele) must NOT appear as a CSQ
