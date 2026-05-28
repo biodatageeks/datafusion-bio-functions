@@ -4908,8 +4908,7 @@ impl AnnotateProvider {
                     if let Some(reader) = hgvs_reference_reader.as_mut() {
                         if ref_al.len() != alt_one.len() {
                             let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
-                            let (vep_ref_norm, vep_alt_norm) =
-                                vcf_to_vep_allele(&ref_al, alt_one);
+                            let (vep_ref_norm, vep_alt_norm) = vcf_to_vep_allele(&ref_al, alt_one);
                             let vep_start = vep_norm_start(start, &ref_al, alt_one);
                             let vep_end = vep_norm_end(start, &ref_al, alt_one);
                             variant.hgvs_shift_forward = crate::hgvs::build_hgvs_genomic_shift(
@@ -4946,8 +4945,9 @@ impl AnnotateProvider {
                     if let Some(alt_most) = most_severe_term(all_terms_alt.iter()) {
                         row_most_so = Some(match row_most_so {
                             None => alt_most,
-                            Some(cur) => most_severe_term([cur, alt_most].iter())
-                                .unwrap_or(alt_most),
+                            Some(cur) => {
+                                most_severe_term([cur, alt_most].iter()).unwrap_or(alt_most)
+                            }
                         });
                     }
 
@@ -5035,24 +5035,31 @@ impl AnnotateProvider {
                             if si >= row_assignments.len() {
                                 continue;
                             }
-                        let tc = &row_assignments[si];
-                        terms_buf.clear();
-                        for (i, t) in tc.terms.iter().enumerate() {
-                            if i > 0 {
-                                terms_buf.push('&');
+                            let tc = &row_assignments[si];
+                            terms_buf.clear();
+                            for (i, t) in tc.terms.iter().enumerate() {
+                                if i > 0 {
+                                    terms_buf.push('&');
+                                }
+                                terms_buf.push_str(t.as_str());
                             }
-                            terms_buf.push_str(t.as_str());
-                        }
-                        let terms_str = terms_buf.as_str();
-                        let tc_impact = most_severe_term(tc.terms.iter())
-                            .map(|t| impact_label(t.impact()))
-                            .unwrap_or_else(|| impact_label(SoImpact::Modifier));
-                        let feature_type = tc.feature_type.as_str();
-                        let feature = tc.transcript_id.as_deref().unwrap_or("");
-                        // Look up transcript metadata via index (zero-copy).
-                        let tx_opt = tc.transcript_idx.map(|idx| &ctx.transcripts[idx]);
-                        let (symbol, gene, biotype_tx, strand_str, symbol_source, hgnc_id, source) =
-                            if let Some(tx) = tx_opt {
+                            let terms_str = terms_buf.as_str();
+                            let tc_impact = most_severe_term(tc.terms.iter())
+                                .map(|t| impact_label(t.impact()))
+                                .unwrap_or_else(|| impact_label(SoImpact::Modifier));
+                            let feature_type = tc.feature_type.as_str();
+                            let feature = tc.transcript_id.as_deref().unwrap_or("");
+                            // Look up transcript metadata via index (zero-copy).
+                            let tx_opt = tc.transcript_idx.map(|idx| &ctx.transcripts[idx]);
+                            let (
+                                symbol,
+                                gene,
+                                biotype_tx,
+                                strand_str,
+                                symbol_source,
+                                hgnc_id,
+                                source,
+                            ) = if let Some(tx) = tx_opt {
                                 (
                                     tx.gene_symbol.as_deref().unwrap_or(""),
                                     tx.gene_stable_id.as_deref().unwrap_or(""),
@@ -5065,227 +5072,228 @@ impl AnnotateProvider {
                             } else {
                                 ("", "", "", "", "", "", "")
                             };
-                        let biotype = tc.biotype_override.as_deref().unwrap_or(biotype_tx);
-                        let exon = tc.exon_str.as_deref().unwrap_or("");
-                        let intron = tc.intron_str.as_deref().unwrap_or("");
-                        let cdna_pos = tc.cdna_position.as_deref().unwrap_or("");
-                        let cds_pos = tc.cds_position.as_deref().unwrap_or("");
-                        let protein_pos = tc.protein_position.as_deref().unwrap_or("");
-                        let amino_acids = tc.amino_acids.as_deref().unwrap_or("");
-                        let codons_str = tc.codons.as_deref().unwrap_or("");
-                        // Write comma separator between CSQ entries.
-                        if !csq_buf.is_empty() {
-                            csq_buf.push(',');
-                        }
-                        let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
-                        let tc_flags = tc.flags.as_deref().unwrap_or("");
-                        let pick_str = if tc.picked { "1" } else { "" };
-                        let hgvsc = if hgvs_flags.hgvsc {
-                            tc.hgvsc.as_deref().unwrap_or("")
-                        } else {
-                            ""
-                        };
-                        let hgvsp = if hgvs_flags.hgvsp {
-                            tc.hgvsp
-                                .as_deref()
-                                .map(|value| {
-                                    Self::format_hgvsp_output(
-                                        value,
-                                        hgvs_flags.remove_hgvsp_version,
-                                        hgvs_flags.no_escape,
-                                        hgvs_flags.hgvsp_use_prediction,
-                                    )
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
-                        let refseq_match = tx_opt
-                            .and_then(|tx| tx.refseq_match.as_deref())
-                            .unwrap_or("");
-                        let bam_edit = tx_opt
-                            .and_then(|tx| tx.bam_edit_status.as_deref())
-                            .map(str::to_ascii_uppercase)
-                            .unwrap_or_default();
-                        let source_val = if include_source_field { source } else { "" };
-                        let refseq_offset_value = tx_opt
-                            .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
-                            .and_then(|tx| {
-                                tc.cdna_position
+                            let biotype = tc.biotype_override.as_deref().unwrap_or(biotype_tx);
+                            let exon = tc.exon_str.as_deref().unwrap_or("");
+                            let intron = tc.intron_str.as_deref().unwrap_or("");
+                            let cdna_pos = tc.cdna_position.as_deref().unwrap_or("");
+                            let cds_pos = tc.cds_position.as_deref().unwrap_or("");
+                            let protein_pos = tc.protein_position.as_deref().unwrap_or("");
+                            let amino_acids = tc.amino_acids.as_deref().unwrap_or("");
+                            let codons_str = tc.codons.as_deref().unwrap_or("");
+                            // Write comma separator between CSQ entries.
+                            if !csq_buf.is_empty() {
+                                csq_buf.push(',');
+                            }
+                            let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
+                            let tc_flags = tc.flags.as_deref().unwrap_or("");
+                            let pick_str = if tc.picked { "1" } else { "" };
+                            let hgvsc = if hgvs_flags.hgvsc {
+                                tc.hgvsc.as_deref().unwrap_or("")
+                            } else {
+                                ""
+                            };
+                            let hgvsp = if hgvs_flags.hgvsp {
+                                tc.hgvsp
                                     .as_deref()
-                                    .and_then(parse_cdna_position_start)
-                                    .and_then(|cdna_start| {
-                                        refseq_misalignment_offset(tx, cdna_start)
-                                    })
-                            });
-                        let refseq_offset = refseq_offset_value
-                            .map(|offset| offset.to_string())
-                            .unwrap_or_default();
-                        let given_ref = tc.given_ref.as_deref().unwrap_or("");
-                        let used_ref = tc.used_ref.as_deref().unwrap_or("");
-
-                        // Batch 1 fields from transcript metadata.
-                        let canonical = tx_opt
-                            .map(|tx| if tx.is_canonical { "YES" } else { "" })
-                            .unwrap_or("");
-                        let tsl_str = tx_opt
-                            .and_then(|tx| tx.tsl)
-                            .map(|v| v.to_string())
-                            .unwrap_or_default();
-                        let mane_select = tx_opt
-                            .and_then(|tx| tx.mane_select.as_deref())
-                            .unwrap_or("");
-                        let mane_plus = tx_opt
-                            .and_then(|tx| tx.mane_plus_clinical.as_deref())
-                            .unwrap_or("");
-                        let ensp = tx_opt
-                            .and_then(|tx| tx.translation_stable_id.as_deref())
-                            .unwrap_or("");
-                        let gene_pheno = tx_opt
-                            .map(|tx| if tx.gene_phenotype { "1" } else { "" })
-                            .unwrap_or("");
-                        let ccds = tx_opt.and_then(|tx| tx.ccds.as_deref()).unwrap_or("");
-                        let swissprot_raw =
-                            tx_opt.and_then(|tx| tx.swissprot.as_deref()).unwrap_or("");
-                        let swissprot = csq_escape(swissprot_raw);
-                        let trembl_raw = tx_opt.and_then(|tx| tx.trembl.as_deref()).unwrap_or("");
-                        let trembl = csq_escape(trembl_raw);
-                        let uniparc = tx_opt.and_then(|tx| tx.uniparc.as_deref()).unwrap_or("");
-                        let uniprot_isoform = tx_opt
-                            .and_then(|tx| tx.uniprot_isoform.as_deref())
-                            .unwrap_or("");
-
-                        if flags.everything {
-                            // HGVS_OFFSET mirrors the transcript-level HGVSc shift
-                            // decision. RefSeq rows with failed BAM edit replay can
-                            // still emit transcript-space HGVSc, but VEP suppresses
-                            // the exposed genomic shift for those transcripts.
-                            let hgvs_offset = if hgvs_flags.hgvsc {
-                                tx_opt
-                                    .zip(row_variant.as_ref())
-                                    .and_then(|(tx, variant)| {
-                                        let ref_allele = tc
-                                            .used_ref
-                                            .as_deref()
-                                            .unwrap_or(variant.ref_allele.as_str());
-                                        crate::hgvs::hgvsc_offset_for_output(
-                                            tx,
-                                            variant,
-                                            ref_allele,
-                                            tc.hgvsc.as_deref(),
+                                    .map(|value| {
+                                        Self::format_hgvsp_output(
+                                            value,
+                                            hgvs_flags.remove_hgvsp_version,
+                                            hgvs_flags.no_escape,
+                                            hgvs_flags.hgvsp_use_prediction,
                                         )
                                     })
-                                    .map(|offset| offset.to_string())
                                     .unwrap_or_default()
                             } else {
                                 String::new()
                             };
-                            // MANE generic: VEP emits "MANE_Select" or "MANE_Plus_Clinical"
-                            // depending on the transcript's MANE annotation.
-                            // Traceability:
-                            // - VEP OutputFactory.pm MANE output
-                            //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1548-L1560
-                            let mane = if tx_opt.and_then(|tx| tx.mane_select.as_deref()).is_some()
-                            {
-                                "MANE_Select"
-                            } else if tx_opt
-                                .and_then(|tx| tx.mane_plus_clinical.as_deref())
-                                .is_some()
-                            {
-                                "MANE_Plus_Clinical"
-                            } else {
-                                ""
-                            };
-                            // APPRIS: abbreviate principal1→P1, alternative2→A2.
-                            // Traceability:
-                            // - VEP OutputFactory.pm APPRIS output
-                            //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1563-L1570
-                            let appris_str = tx_opt
-                                .and_then(|tx| tx.appris.as_deref())
-                                .map(format_appris)
+                            let refseq_match = tx_opt
+                                .and_then(|tx| tx.refseq_match.as_deref())
+                                .unwrap_or("");
+                            let bam_edit = tx_opt
+                                .and_then(|tx| tx.bam_edit_status.as_deref())
+                                .map(str::to_ascii_uppercase)
                                 .unwrap_or_default();
-                            // SIFT/PolyPhen: lookup by (protein_position, alt_amino_acid).
-                            // Traceability:
-                            // - VEP OutputFactory.pm SIFT/PolyPhen output
-                            //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799
-                            let (sift_str, polyphen_str) = lookup_sift_polyphen(
-                                tc.transcript_id.as_deref(),
-                                tc.protein_position.as_deref(),
-                                tc.amino_acids.as_deref(),
-                                sift_cache,
-                                #[cfg(feature = "kv-cache")]
-                                sift_kv,
-                                #[cfg(not(feature = "kv-cache"))]
-                                _sift_kv,
-                            );
-                            // DOMAINS: overlapping protein domain features.
-                            // VEP gates DOMAINS on $pre->{coding} which requires
-                            // a valid CDS coordinate mapping. Our cds_position is
-                            // only set when the variant falls within the CDS region.
-                            // Traceability:
-                            // - VEP OutputFactory.pm line 1434: if($self->{domains} && $pre->{coding})
-                            // - VEP BaseVariationFeatureOverlapAllele.pm _bvfo_preds lines 449-471
-                            //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm
-                            let is_coding =
-                                tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
-                            let domains = if is_coding {
-                                lookup_domains(
+                            let source_val = if include_source_field { source } else { "" };
+                            let refseq_offset_value = tx_opt
+                                .filter(|_| hgvs_flags.hgvsc && tc.hgvsc.is_some())
+                                .and_then(|tx| {
+                                    tc.cdna_position
+                                        .as_deref()
+                                        .and_then(parse_cdna_position_start)
+                                        .and_then(|cdna_start| {
+                                            refseq_misalignment_offset(tx, cdna_start)
+                                        })
+                                });
+                            let refseq_offset = refseq_offset_value
+                                .map(|offset| offset.to_string())
+                                .unwrap_or_default();
+                            let given_ref = tc.given_ref.as_deref().unwrap_or("");
+                            let used_ref = tc.used_ref.as_deref().unwrap_or("");
+
+                            // Batch 1 fields from transcript metadata.
+                            let canonical = tx_opt
+                                .map(|tx| if tx.is_canonical { "YES" } else { "" })
+                                .unwrap_or("");
+                            let tsl_str = tx_opt
+                                .and_then(|tx| tx.tsl)
+                                .map(|v| v.to_string())
+                                .unwrap_or_default();
+                            let mane_select = tx_opt
+                                .and_then(|tx| tx.mane_select.as_deref())
+                                .unwrap_or("");
+                            let mane_plus = tx_opt
+                                .and_then(|tx| tx.mane_plus_clinical.as_deref())
+                                .unwrap_or("");
+                            let ensp = tx_opt
+                                .and_then(|tx| tx.translation_stable_id.as_deref())
+                                .unwrap_or("");
+                            let gene_pheno = tx_opt
+                                .map(|tx| if tx.gene_phenotype { "1" } else { "" })
+                                .unwrap_or("");
+                            let ccds = tx_opt.and_then(|tx| tx.ccds.as_deref()).unwrap_or("");
+                            let swissprot_raw =
+                                tx_opt.and_then(|tx| tx.swissprot.as_deref()).unwrap_or("");
+                            let swissprot = csq_escape(swissprot_raw);
+                            let trembl_raw =
+                                tx_opt.and_then(|tx| tx.trembl.as_deref()).unwrap_or("");
+                            let trembl = csq_escape(trembl_raw);
+                            let uniparc = tx_opt.and_then(|tx| tx.uniparc.as_deref()).unwrap_or("");
+                            let uniprot_isoform = tx_opt
+                                .and_then(|tx| tx.uniprot_isoform.as_deref())
+                                .unwrap_or("");
+
+                            if flags.everything {
+                                // HGVS_OFFSET mirrors the transcript-level HGVSc shift
+                                // decision. RefSeq rows with failed BAM edit replay can
+                                // still emit transcript-space HGVSc, but VEP suppresses
+                                // the exposed genomic shift for those transcripts.
+                                let hgvs_offset = if hgvs_flags.hgvsc {
+                                    tx_opt
+                                        .zip(row_variant.as_ref())
+                                        .and_then(|(tx, variant)| {
+                                            let ref_allele = tc
+                                                .used_ref
+                                                .as_deref()
+                                                .unwrap_or(variant.ref_allele.as_str());
+                                            crate::hgvs::hgvsc_offset_for_output(
+                                                tx,
+                                                variant,
+                                                ref_allele,
+                                                tc.hgvsc.as_deref(),
+                                            )
+                                        })
+                                        .map(|offset| offset.to_string())
+                                        .unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
+                                // MANE generic: VEP emits "MANE_Select" or "MANE_Plus_Clinical"
+                                // depending on the transcript's MANE annotation.
+                                // Traceability:
+                                // - VEP OutputFactory.pm MANE output
+                                //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1548-L1560
+                                let mane =
+                                    if tx_opt.and_then(|tx| tx.mane_select.as_deref()).is_some() {
+                                        "MANE_Select"
+                                    } else if tx_opt
+                                        .and_then(|tx| tx.mane_plus_clinical.as_deref())
+                                        .is_some()
+                                    {
+                                        "MANE_Plus_Clinical"
+                                    } else {
+                                        ""
+                                    };
+                                // APPRIS: abbreviate principal1→P1, alternative2→A2.
+                                // Traceability:
+                                // - VEP OutputFactory.pm APPRIS output
+                                //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1563-L1570
+                                let appris_str = tx_opt
+                                    .and_then(|tx| tx.appris.as_deref())
+                                    .map(format_appris)
+                                    .unwrap_or_default();
+                                // SIFT/PolyPhen: lookup by (protein_position, alt_amino_acid).
+                                // Traceability:
+                                // - VEP OutputFactory.pm SIFT/PolyPhen output
+                                //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799
+                                let (sift_str, polyphen_str) = lookup_sift_polyphen(
                                     tc.transcript_id.as_deref(),
                                     tc.protein_position.as_deref(),
                                     tc.amino_acids.as_deref(),
-                                    ctx,
-                                )
-                            } else {
-                                String::new()
-                            };
-                            // miRNA: ncRNA secondary structure overlap.
-                            let mirna_str = {
-                                let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
-                                // Parse cDNA position range from the "N" or "N-M" string.
-                                let (cs, ce) = tc
-                                    .cdna_position
-                                    .as_deref()
-                                    .and_then(|p| {
-                                        if let Some((a, b)) = p.split_once('-') {
-                                            Some((
-                                                a.parse::<usize>().ok()?,
-                                                b.parse::<usize>().ok()?,
-                                            ))
-                                        } else {
-                                            let v = p.parse::<usize>().ok()?;
-                                            Some((v, v))
-                                        }
-                                    })
-                                    .unwrap_or((0, 0));
-                                if cs > 0 {
-                                    mirna_structure_field(ncrna, biotype, Some(cs), Some(ce))
+                                    sift_cache,
+                                    #[cfg(feature = "kv-cache")]
+                                    sift_kv,
+                                    #[cfg(not(feature = "kv-cache"))]
+                                    _sift_kv,
+                                );
+                                // DOMAINS: overlapping protein domain features.
+                                // VEP gates DOMAINS on $pre->{coding} which requires
+                                // a valid CDS coordinate mapping. Our cds_position is
+                                // only set when the variant falls within the CDS region.
+                                // Traceability:
+                                // - VEP OutputFactory.pm line 1434: if($self->{domains} && $pre->{coding})
+                                // - VEP BaseVariationFeatureOverlapAllele.pm _bvfo_preds lines 449-471
+                                //   https://github.com/Ensembl/ensembl-variation/blob/release/115/modules/Bio/EnsEMBL/Variation/BaseVariationFeatureOverlapAllele.pm
+                                let is_coding =
+                                    tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
+                                let domains = if is_coding {
+                                    lookup_domains(
+                                        tc.transcript_id.as_deref(),
+                                        tc.protein_position.as_deref(),
+                                        tc.amino_acids.as_deref(),
+                                        ctx,
+                                    )
                                 } else {
                                     String::new()
-                                }
-                            };
-                            // 80-field CSQ base layout, with optional PICK and RefSeq fields.
-                            // Traceability:
-                            // - VEP Constants.pm CSQ field order for --everything
-                            //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
-                            let pick_field = if include_pick_output {
-                                format!("|{pick_str}")
-                            } else {
-                                String::new()
-                            };
-                            let refseq_block = if include_source_field {
-                                format!(
-                                    "|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else if include_refseq_fields {
-                                format!(
-                                    "|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else {
-                                String::new()
-                            };
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                                };
+                                // miRNA: ncRNA secondary structure overlap.
+                                let mirna_str = {
+                                    let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
+                                    // Parse cDNA position range from the "N" or "N-M" string.
+                                    let (cs, ce) = tc
+                                        .cdna_position
+                                        .as_deref()
+                                        .and_then(|p| {
+                                            if let Some((a, b)) = p.split_once('-') {
+                                                Some((
+                                                    a.parse::<usize>().ok()?,
+                                                    b.parse::<usize>().ok()?,
+                                                ))
+                                            } else {
+                                                let v = p.parse::<usize>().ok()?;
+                                                Some((v, v))
+                                            }
+                                        })
+                                        .unwrap_or((0, 0));
+                                    if cs > 0 {
+                                        mirna_structure_field(ncrna, biotype, Some(cs), Some(ce))
+                                    } else {
+                                        String::new()
+                                    }
+                                };
+                                // 80-field CSQ base layout, with optional PICK and RefSeq fields.
+                                // Traceability:
+                                // - VEP Constants.pm CSQ field order for --everything
+                                //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
+                                let pick_field = if include_pick_output {
+                                    format!("|{pick_str}")
+                                } else {
+                                    String::new()
+                                };
+                                let refseq_block = if include_source_field {
+                                    format!(
+                                        "|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                    )
+                                } else if include_refseq_fields {
+                                    format!(
+                                        "|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                    )
+                                } else {
+                                    String::new()
+                                };
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                              {existing_var}|{distance}|{strand_str}|{tc_flags}{pick_field}|\
@@ -5295,28 +5303,28 @@ impl AnnotateProvider {
                              {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
                              {batch3_suffix}|||||"
-                            );
-                        } else {
-                            // 74-field CSQ base layout, with optional PICK and RefSeq fields.
-                            let pick_field = if include_pick_output {
-                                format!("|{pick_str}")
+                                );
                             } else {
-                                String::new()
-                            };
-                            let source_block = if include_source_field {
-                                format!(
-                                    "|||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else if include_refseq_fields {
-                                format!(
-                                    "|||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else {
-                                format!("|||||{source_val}")
-                            };
-                            let _ = write!(
-                                csq_buf,
-                                "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                                // 74-field CSQ base layout, with optional PICK and RefSeq fields.
+                                let pick_field = if include_pick_output {
+                                    format!("|{pick_str}")
+                                } else {
+                                    String::new()
+                                };
+                                let source_block = if include_source_field {
+                                    format!(
+                                        "|||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                    )
+                                } else if include_refseq_fields {
+                                    format!(
+                                        "|||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                    )
+                                } else {
+                                    format!("|||||{source_val}")
+                                };
+                                let _ = write!(
+                                    csq_buf,
+                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
                              {existing_var}|{distance}|{strand_str}|{tc_flags}{pick_field}|{symbol_source}|{hgnc_id}|\
@@ -5324,8 +5332,8 @@ impl AnnotateProvider {
                              {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                              {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                              {batch3_suffix}"
-                            );
-                        }
+                                );
+                            }
                         } // end per-ALT inner loop (multi-ALT CSQ expansion)
                     }
                     if csq_buf.is_empty() {
@@ -10616,8 +10624,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let (chrom, min_start, max_end) =
-            buffer_variant_bounds(&[batch]).unwrap().unwrap();
+        let (chrom, min_start, max_end) = buffer_variant_bounds(&[batch]).unwrap().unwrap();
         // First-chrom-wins binding (lines 8141-8143).
         assert_eq!(chrom, "1");
         // Bounds still aggregate across all rows — documents current

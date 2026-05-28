@@ -410,7 +410,10 @@ mod tests {
         // and `motif`. `motif` must be the trailing one (matching
         // Perl `$features->[-1]` == MotifFeature).
         let motif_pos = CONTEXT_TYPES.iter().position(|t| *t == "motif").unwrap();
-        let reg_pos = CONTEXT_TYPES.iter().position(|t| *t == "regulatory").unwrap();
+        let reg_pos = CONTEXT_TYPES
+            .iter()
+            .position(|t| *t == "regulatory")
+            .unwrap();
         // No regulatory-family context_type appears after motif.
         // (Other context_types like translation_core may appear after
         // motif in CONTEXT_TYPES — that's fine; the invariant is that

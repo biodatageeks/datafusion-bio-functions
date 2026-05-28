@@ -168,8 +168,7 @@ async fn annotate_and_read(
         drop(tmp);
         return Vec::new();
     }
-    let batch = datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches)
-        .unwrap();
+    let batch = datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
     let csq_idx = batch.schema().index_of("CSQ").ok();
     let mut out = Vec::new();
     for row in 0..batch.num_rows() {

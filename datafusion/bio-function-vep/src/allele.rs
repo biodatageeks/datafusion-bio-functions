@@ -1506,8 +1506,14 @@ mod tests {
         // the MNV-rule at allele.rs:300-302 forbids suffix-trim when
         // REF and ALT have equal length.
         let (vep_ref, vep_alt) = vcf_to_vep_allele("GAC", "GTC");
-        assert_eq!(vep_ref, "AC", "vepyr preserves MNV suffix (divergent from Perl)");
-        assert_eq!(vep_alt, "TC", "vepyr preserves MNV suffix (divergent from Perl)");
+        assert_eq!(
+            vep_ref, "AC",
+            "vepyr preserves MNV suffix (divergent from Perl)"
+        );
+        assert_eq!(
+            vep_alt, "TC",
+            "vepyr preserves MNV suffix (divergent from Perl)"
+        );
     }
 
     /// Port of `Parser.t` subtest #19 (Perl l.100-104):

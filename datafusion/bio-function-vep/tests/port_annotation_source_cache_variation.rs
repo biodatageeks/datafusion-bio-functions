@@ -113,10 +113,7 @@ fn v115_fixture_paths() -> Option<(PathBuf, PathBuf)> {
     let cache_path = workspace_path("vep-benchmark/data/port/_cache115/parquet/115_GRCh38_vep");
     let ref_fasta = workspace_path("vep-benchmark/data/port/_cache115/reference.fa");
 
-    if !cache_path.exists()
-        || !ref_fasta.exists()
-        || is_lfs_pointer(&ref_fasta)
-    {
+    if !cache_path.exists() || !ref_fasta.exists() || is_lfs_pointer(&ref_fasta) {
         return None;
     }
     Some((cache_path, ref_fasta))
@@ -230,8 +227,7 @@ async fn annotate_and_read_csq(
         drop(tmp);
         return Vec::new();
     }
-    let batch =
-        datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    let batch = datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
     let Ok(csq_idx) = batch.schema().index_of("CSQ") else {
         drop(tmp);
         return (0..batch.num_rows()).map(|_| String::new()).collect();
@@ -255,8 +251,7 @@ const CSQ_EXISTING_VARIATION_IDX: usize = 17;
 fn first_existing_variation(csq: &str) -> String {
     let groups = parse_csq_row(csq);
     for group in &groups {
-        if group.len() > CSQ_EXISTING_VARIATION_IDX
-            && !group[CSQ_EXISTING_VARIATION_IDX].is_empty()
+        if group.len() > CSQ_EXISTING_VARIATION_IDX && !group[CSQ_EXISTING_VARIATION_IDX].is_empty()
         {
             return group[CSQ_EXISTING_VARIATION_IDX].clone();
         }
@@ -444,9 +439,7 @@ async fn failed_toggle_default_drops_and_opt_in_keeps_5b_6b_7b() {
     // pair where the row carries `failed=1`. If none exists, SKIP.
     let var_parquet = cache_path.join("variation").join("21.parquet");
     if !var_parquet.exists() {
-        eprintln!(
-            "Skipping port_cache_variation::failed_toggle_*: variation/21.parquet absent"
-        );
+        eprintln!("Skipping port_cache_variation::failed_toggle_*: variation/21.parquet absent");
         return;
     }
 
@@ -530,13 +523,8 @@ async fn failed_toggle_default_drops_and_opt_in_keeps_5b_6b_7b() {
     //   weaker invariant that some Existing_variation is empty at the row
     //   level OR the rsID we identified above is absent under default.
     let default_config = base_config(ref_fasta.to_str().unwrap());
-    let rows_default = annotate_and_read_csq(
-        &vcf_path,
-        &cache_path,
-        &ref_fasta,
-        &default_config,
-    )
-    .await;
+    let rows_default =
+        annotate_and_read_csq(&vcf_path, &cache_path, &ref_fasta, &default_config).await;
     assert_eq!(rows_default.len(), 1);
 
     // Subtest #7b — `failed=Some(1)` keeps the row (cache row's rsID
@@ -586,13 +574,8 @@ async fn failed_toggle_default_drops_and_opt_in_keeps_5b_6b_7b() {
         failed: Some(1),
         ..base_config(ref_fasta.to_str().unwrap())
     };
-    let rows_opt_in = annotate_and_read_csq(
-        &vcf_path,
-        &cache_path,
-        &ref_fasta,
-        &opt_in_config,
-    )
-    .await;
+    let rows_opt_in =
+        annotate_and_read_csq(&vcf_path, &cache_path, &ref_fasta, &opt_in_config).await;
     assert_eq!(rows_opt_in.len(), 1);
 
     // Default behaviour: the failed=1 row's rsID must NOT surface.

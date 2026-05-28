@@ -242,16 +242,12 @@ async fn compare_csq_inner(
         .await?
         .collect()
         .await?;
-    let output_batch = datafusion::arrow::compute::concat_batches(
-        &output_batches[0].schema(),
-        &output_batches,
-    )
-    .unwrap();
-    let golden_batch = datafusion::arrow::compute::concat_batches(
-        &golden_batches[0].schema(),
-        &golden_batches,
-    )
-    .unwrap();
+    let output_batch =
+        datafusion::arrow::compute::concat_batches(&output_batches[0].schema(), &output_batches)
+            .unwrap();
+    let golden_batch =
+        datafusion::arrow::compute::concat_batches(&golden_batches[0].schema(), &golden_batches)
+            .unwrap();
 
     let ours = read_csq_column(&output_batch);
     let golden = read_csq_column(&golden_batch);
@@ -437,9 +433,7 @@ pub async fn run_and_compare_csq_with_flags(
         || is_lfs_pointer(&input_vcf)
         || is_lfs_pointer(&golden_vcf)
     {
-        eprintln!(
-            "Skipping port case '{name}/{flag_subdir}': fixture(s) missing or LFS-stubbed"
-        );
+        eprintln!("Skipping port case '{name}/{flag_subdir}': fixture(s) missing or LFS-stubbed");
         return Ok(false);
     }
 

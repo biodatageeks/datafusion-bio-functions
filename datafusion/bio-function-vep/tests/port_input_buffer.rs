@@ -153,7 +153,8 @@ async fn annotate_and_read_csq(
     .unwrap();
 
     let ctx = SessionContext::new();
-    ctx.register_table("output_vcf", Arc::new(output_prov)).ok()?;
+    ctx.register_table("output_vcf", Arc::new(output_prov))
+        .ok()?;
     let batches = ctx
         .sql("SELECT * FROM output_vcf ORDER BY start")
         .await
@@ -462,9 +463,9 @@ async fn port_input_buffer_subtest_51_intergenic_consequence() {
     // Consequence is field index 1 in default --everything layout
     // (field 0 = Allele).
     let consequence_idx = 1;
-    let has_intergenic = groups.iter().any(|g| {
-        g.len() > consequence_idx && g[consequence_idx].contains("intergenic_variant")
-    });
+    let has_intergenic = groups
+        .iter()
+        .any(|g| g.len() > consequence_idx && g[consequence_idx].contains("intergenic_variant"));
     assert!(
         has_intergenic,
         "expected ≥1 CSQ group with Consequence=intergenic_variant for chr21:6000000; got groups: {:?}",
@@ -602,8 +603,18 @@ async fn port_input_buffer_subtests_55_to_58_per_contig_partitioning_preserves_c
         .downcast_ref::<datafusion::arrow::array::UInt32Array>()
         .expect("start column is UInt32");
     let starts: Vec<u32> = (0..start_col.len()).map(|i| start_col.value(i)).collect();
-    assert_eq!(chroms.len(), 4, "4 input rows must yield 4 output rows; got {}", chroms.len());
-    assert_eq!(starts.len(), 4, "4 input rows must yield 4 start values; got {}", starts.len());
+    assert_eq!(
+        chroms.len(),
+        4,
+        "4 input rows must yield 4 output rows; got {}",
+        chroms.len()
+    );
+    assert_eq!(
+        starts.len(),
+        4,
+        "4 input rows must yield 4 start values; got {}",
+        starts.len()
+    );
 
     // All rows are chr21 → all output rows must be chr21 (no chrom drops).
     for c in &chroms {

@@ -141,7 +141,11 @@ async fn port_parser_subtest_12_gzipped_vcf_reads() {
     }
     // Sanity-check: file must look gzip-magic 0x1f 0x8b on disk.
     let raw = std::fs::read(&gz_path).expect("read gz");
-    assert_eq!(&raw[..2], &[0x1f, 0x8b], "gz file must start with gzip magic");
+    assert_eq!(
+        &raw[..2],
+        &[0x1f, 0x8b],
+        "gz file must start with gzip magic"
+    );
 
     let rows = count_vcf_rows(gz_path.to_str().unwrap())
         .await
