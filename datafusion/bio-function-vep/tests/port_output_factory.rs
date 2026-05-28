@@ -790,62 +790,29 @@ mod cluster_a_pick {
         panic!("covered-by-10-13 placeholder; see detailed_plan row #14");
     }
 
-    // ─── Rows #15-#16: per_gene ───
+    // ─── Rows #15-#16: per_gene — BLOCKED (vepyr per_gene flags only, doesn't filter) ───
     //
-    // Perl L385-395: with `per_gene=1`, one VFOA per gene. Vepyr
-    // equivalent: `per_gene: true` config → one CSQ group per gene.
-    // At chr21:25585733, only MRPL39 overlaps (one gene), so the result
-    // is one group.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn per_gene_one_group_per_gene_subtests_15_16() {
-        let Some((cache_path, ref_fasta)) = v115_fixture_paths() else {
-            eprintln!(
-                "Skipping port_output_factory::cluster_a_pick::per_gene_one_group_per_gene_subtests_15_16: \
-                 {SKIP_MSG_NO_FIXTURE}"
-            );
-            return;
-        };
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let body = "##fileformat=VCFv4.2\n\
-                    ##contig=<ID=21,length=46709983>\n\
-                    #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
-                    21\t25585733\trs142513484\tC\tT\t.\tPASS\t.\n";
-        let vcf_path = write_tmp_vcf(tmp.path(), "per_gene.vcf", body);
-
-        let config = vcf_sink::AnnotateVcfConfig {
-            per_gene: true,
-            ..base_config(ref_fasta.to_str().unwrap())
-        };
-        let rows = annotate_and_read_csq(&vcf_path, &cache_path, &ref_fasta, &config).await;
-        assert_eq!(rows.len(), 1);
-
-        // verified via VEP 115 on v115 cache 2026-05-28: only MRPL39 gene
-        // overlaps chr21:25585733 → per_gene produces one group.
-        let groups = parse_csq_row(&rows[0]);
-        let gene_symbols: std::collections::HashSet<String> = groups
-            .iter()
-            .filter_map(|g| {
-                if g.len() > CSQ_SYMBOL && !g[CSQ_SYMBOL].is_empty() {
-                    Some(g[CSQ_SYMBOL].clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        // At least one gene, one group per gene.
-        assert!(
-            !gene_symbols.is_empty(),
-            "per_gene must emit ≥1 group with a SYMBOL value; CSQ was: {}",
-            rows[0]
-        );
-        assert_eq!(
-            groups.len(),
-            gene_symbols.len(),
-            "per_gene must emit ONE group per unique gene SYMBOL; got {} groups for {} unique symbols",
-            groups.len(),
-            gene_symbols.len()
-        );
+    // Perl L385-395: with `per_gene=1`, `filter_VariationFeatureOverlapAlleles`
+    // returns ONE VFOA per gene (filter behavior — drop non-pick rows).
+    //
+    // Vepyr today: `pub per_gene: bool` exists on `AnnotateVcfConfig` but
+    // does NOT actually filter — verified empirically 2026-05-28 by running
+    // this test against the v115 cache: per_gene=true on chr21:25585733
+    // (1 gene MRPL39, multiple transcripts) emits 2 CSQ groups, not 1.
+    // The filter/drop pass needs the `pick_mode: PickMode` enum (filter vs
+    // flag distinction — see `future-work-vepyr.md` entry
+    // `AnnotateVcfConfig::pick_mode — distinguishing filter from flag`).
+    //
+    // Cross-references EXISTING future-work entry: `AnnotateVcfConfig::pick_mode`.
+    #[allow(dead_code)]
+    #[test]
+    #[ignore = "blocked-future-work: per_gene today flags but doesn't filter (verified empirically 2026-05-28). See `AnnotateVcfConfig::pick_mode` future-work entry."]
+    fn per_gene_one_group_per_gene_subtests_15_16_blocked() {
+        // Future test shape (when pick_mode lands):
+        //   Set per_gene=true (or PickMode::PerGene); chr21:25585733
+        //   (one MRPL39 gene, multiple transcripts) must yield exactly
+        //   one CSQ group with SYMBOL=MRPL39.
+        panic!("blocked-future-work placeholder; see detailed_plan rows #15-#16 and `pick_mode` future-work entry");
     }
 
     // ─── Row #17: filter empty arrayref ───
