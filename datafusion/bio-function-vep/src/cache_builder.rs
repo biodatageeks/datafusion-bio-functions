@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -39,6 +39,7 @@ use crate::kv_cache::kv_store::VepKvStore;
 use crate::kv_cache::position_entry::serialize_position_entry;
 use crate::kv_cache::sift_store::SiftKvStore;
 use crate::transcript_consequence::CachedPredictions;
+use crate::warm_cache::build::{WarmVariationTierOptions, build_warm_variation_tier};
 
 /// Progress callback: `(entity, format, batch_rows, total_rows, total_expected)`.
 ///
@@ -106,6 +107,10 @@ pub struct CacheBuilder {
     zstd_level: i32,
     dict_size_kb: u32,
     cache_source_type: BioFormatsCacheSourceType,
+    variation_af_threshold: f64,
+    variation_position_radius: i64,
+    variation_row_group_rows: usize,
+    variation_tier_batch_size: usize,
     on_progress: Option<Arc<OnProgress>>,
 }
 
@@ -120,6 +125,10 @@ impl CacheBuilder {
             zstd_level: 3,
             dict_size_kb: 112,
             cache_source_type: BioFormatsCacheSourceType::Ensembl,
+            variation_af_threshold: 0.01,
+            variation_position_radius: 1,
+            variation_row_group_rows: 500_000,
+            variation_tier_batch_size: 65_536,
             on_progress: None,
         }
     }
@@ -151,6 +160,20 @@ impl CacheBuilder {
 
     pub fn with_cache_source_type(mut self, cache_source_type: BioFormatsCacheSourceType) -> Self {
         self.cache_source_type = cache_source_type;
+        self
+    }
+
+    pub fn with_variation_tier_options(
+        mut self,
+        af_threshold: f64,
+        position_radius: i64,
+        row_group_rows: usize,
+        batch_size: usize,
+    ) -> Self {
+        self.variation_af_threshold = af_threshold;
+        self.variation_position_radius = position_radius;
+        self.variation_row_group_rows = row_group_rows.max(1);
+        self.variation_tier_batch_size = batch_size.max(1);
         self
     }
 
@@ -256,12 +279,13 @@ impl CacheBuilder {
         let kind = EnsemblEntityKind::Variation;
         let table_name = "var";
         let parquet_dir = format!("{}/variation", self.output_dir);
-        let parquet_exists = dir_has_parquet_files(&parquet_dir);
+        let variation_tier_exists = dir_has_variation_tier_files(&parquet_dir);
+        let base_parquet_exists = dir_has_base_variation_parquet_files(&parquet_dir);
         let fjall_dir_path = format!("{}/variation.fjall", self.output_dir);
         let fjall_exists = Path::new(&fjall_dir_path).exists();
 
         if !self.overwrite {
-            let need_parquet = !parquet_exists;
+            let need_parquet = !variation_tier_exists;
             let need_fjall = self.build_fjall && !fjall_exists;
 
             if !need_parquet && !need_fjall {
@@ -273,9 +297,32 @@ impl CacheBuilder {
                 }]);
             }
 
+            // Legacy cache exists as chrN.parquet / other.parquet. Convert it
+            // in place to chrN_warm.parquet + chrN_cold.parquet before any
+            // fjall rebuild, then remove the old base files.
+            if need_parquet && base_parquet_exists {
+                info!(
+                    "variation: base parquet exists, building warm/cold tier from existing files"
+                );
+                let parquet_results = self.build_variation_tier_from_base_parquet(&parquet_dir)?;
+                let fjall_stats = if need_fjall {
+                    let fjall_result = self.build_variation_fjall_from_parquet().await?;
+                    fjall_result.into_iter().next().and_then(|s| s.fjall_stats)
+                } else {
+                    None
+                };
+                return Ok(vec![EntityStats {
+                    entity: "variation".to_string(),
+                    parquet_files: parquet_results,
+                    fjall_stats,
+                }]);
+            }
+
             // Parquet exists but fjall missing → rebuild fjall from parquet
             if !need_parquet && need_fjall {
-                info!("variation: parquet exists, building fjall from existing parquet files");
+                info!(
+                    "variation: warm/cold parquet exists, building fjall from existing parquet files"
+                );
                 return self.build_variation_fjall_from_parquet().await;
             }
         }
@@ -516,8 +563,10 @@ impl CacheBuilder {
             if *is_other {
                 other_total_rows += chrom_rows;
             } else if chrom_rows > 0 {
-                parquet_results.push((output_file.clone(), chrom_rows));
+                parquet_results.extend(self.split_variation_base_parquet(output_file)?);
                 info!("variation: {chrom} {} rows", format_rows(chrom_rows));
+            } else if let Err(error) = std::fs::remove_file(output_file) {
+                log::debug!("variation: failed to remove empty parquet {output_file}: {error}");
             }
         }
 
@@ -529,7 +578,7 @@ impl CacheBuilder {
         }
         if other_total_rows > 0 {
             let other_out = format!("{}/variation/other.parquet", self.output_dir);
-            parquet_results.push((other_out, other_total_rows));
+            parquet_results.extend(self.split_variation_base_parquet(&other_out)?);
             info!(
                 "variation: other {} rows ({} contigs)",
                 format_rows(other_total_rows),
@@ -561,6 +610,55 @@ impl CacheBuilder {
         }])
     }
 
+    fn build_variation_tier_from_base_parquet(
+        &self,
+        parquet_dir: &str,
+    ) -> Result<Vec<(String, usize)>> {
+        let mut parquet_results = Vec::new();
+        for path in base_variation_parquet_files(parquet_dir)? {
+            parquet_results.extend(self.split_variation_base_parquet(&path)?);
+        }
+        Ok(parquet_results)
+    }
+
+    fn split_variation_base_parquet(
+        &self,
+        input: impl AsRef<Path>,
+    ) -> Result<Vec<(String, usize)>> {
+        let input = input.as_ref();
+        let output_dir = input.parent().ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "variation parquet has no parent directory: {}",
+                input.display()
+            ))
+        })?;
+        let mut options = WarmVariationTierOptions::new(input, output_dir);
+        options.af_threshold = self.variation_af_threshold;
+        options.position_radius = self.variation_position_radius;
+        options.row_group_rows = self.variation_row_group_rows;
+        options.batch_size = self.variation_tier_batch_size;
+
+        let stats = build_warm_variation_tier(options).map_err(|error| {
+            DataFusionError::Execution(format!(
+                "failed to build warm/cold variation tier from {}: {error}",
+                input.display()
+            ))
+        })?;
+        std::fs::remove_file(input).map_err(|error| {
+            DataFusionError::Execution(format!(
+                "failed to remove base variation parquet {} after tier split: {error}",
+                input.display()
+            ))
+        })?;
+
+        let warm = output_dir.join(format!("{}_warm.parquet", stats.chrom));
+        let cold = output_dir.join(format!("{}_cold.parquet", stats.chrom));
+        Ok(vec![
+            (warm.to_string_lossy().to_string(), stats.warm_rows),
+            (cold.to_string_lossy().to_string(), stats.cold_rows),
+        ])
+    }
+
     /// Build variation fjall from existing parquet files.
     ///
     /// Reads chr*.parquet and other.parquet in chrom_code order and feeds fjall.
@@ -568,32 +666,7 @@ impl CacheBuilder {
         let parquet_dir = format!("{}/variation", self.output_dir);
         let fjall_dir = format!("{}/variation.fjall", self.output_dir);
 
-        // Discover parquet files and sort in chrom_code order
-        let mut parquet_files: Vec<(u16, String)> = Vec::new();
-        for entry in std::fs::read_dir(&parquet_dir).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to read dir {parquet_dir}: {e}"))
-        })? {
-            let entry = entry.map_err(|e| {
-                DataFusionError::Execution(format!("Failed to read dir entry: {e}"))
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
-                continue;
-            }
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            // chr1.parquet → "1", other.parquet → sort last
-            let chrom = stem.strip_prefix("chr").unwrap_or(stem);
-            let code = if chrom == "other" {
-                u16::MAX
-            } else {
-                chrom_to_code(chrom)
-            };
-            parquet_files.push((code, path.to_string_lossy().to_string()));
-        }
-        parquet_files.sort_by_key(|(code, _)| *code);
+        let parquet_files = discover_variation_parquet_files_for_fjall(&parquet_dir)?;
 
         if parquet_files.is_empty() {
             return Err(DataFusionError::Execution(
@@ -622,7 +695,8 @@ impl CacheBuilder {
             .register_parquet("_probe", &parquet_files[0].1, Default::default())
             .await?;
         let probe_df = read_ctx.sql("SELECT * FROM _probe LIMIT 0").await?;
-        let schema: SchemaRef = Arc::new(probe_df.schema().as_arrow().clone());
+        let file_schema: SchemaRef = Arc::new(probe_df.schema().as_arrow().clone());
+        let schema = variation_cache_schema_without_tier_helpers(&file_schema);
         read_ctx.deregister_table("_probe")?;
 
         let store = VepKvStore::create(Path::new(&fjall_dir), schema.clone())?;
@@ -690,11 +764,18 @@ impl CacheBuilder {
                 .await?
         };
 
-        let chrom_col_idx = schema.index_of("chrom")?;
-        let start_col_idx = schema.index_of("start")?;
-        let allele_col_idx = schema.index_of("allele_string")?;
-        let col_indices: Vec<usize> = (0..schema.fields().len())
-            .filter(|&i| i != chrom_col_idx && i != start_col_idx)
+        let chrom_col_idx = file_schema.index_of("chrom")?;
+        let start_col_idx = file_schema.index_of("start")?;
+        let allele_col_idx = file_schema.index_of("allele_string")?;
+        let col_indices: Vec<usize> = (0..file_schema.fields().len())
+            .filter(|&i| {
+                i != chrom_col_idx
+                    && i != start_col_idx
+                    && !matches!(
+                        file_schema.field(i).name().as_str(),
+                        "position_key" | "variant_keys"
+                    )
+            })
             .collect();
 
         let mut total_positions = 0u64;
@@ -2100,6 +2181,144 @@ fn dir_has_parquet_files(dir: &str) -> bool {
                     .any(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("parquet"))
             })
             .unwrap_or(false)
+}
+
+fn dir_has_variation_tier_files(dir: &str) -> bool {
+    Path::new(dir).is_dir()
+        && std::fs::read_dir(dir)
+            .ok()
+            .map(|entries| {
+                let mut has_warm = false;
+                let mut has_cold = false;
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("parquet") {
+                        continue;
+                    }
+                    let stem = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("");
+                    has_warm |= stem.ends_with("_warm");
+                    has_cold |= stem.ends_with("_cold");
+                }
+                has_warm && has_cold
+            })
+            .unwrap_or(false)
+}
+
+fn dir_has_base_variation_parquet_files(dir: &str) -> bool {
+    base_variation_parquet_files(dir)
+        .map(|files| !files.is_empty())
+        .unwrap_or(false)
+}
+
+fn base_variation_parquet_files(dir: &str) -> Result<Vec<PathBuf>> {
+    if !Path::new(dir).is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|error| {
+        DataFusionError::Execution(format!("Failed to read variation dir {dir}: {error}"))
+    })? {
+        let path = entry
+            .map_err(|error| {
+                DataFusionError::Execution(format!("Failed to read variation dir entry: {error}"))
+            })?
+            .path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("parquet") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        if stem.ends_with("_warm") || stem.ends_with("_cold") {
+            continue;
+        }
+        files.push(path);
+    }
+    files.sort_by_key(|path| {
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        variation_chrom_sort_code(stem)
+    });
+    Ok(files)
+}
+
+fn discover_variation_parquet_files_for_fjall(dir: &str) -> Result<Vec<(u16, String)>> {
+    if !Path::new(dir).is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut split_files: Vec<(u16, u8, String)> = Vec::new();
+    let mut base_files: Vec<(u16, String)> = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .map_err(|error| DataFusionError::Execution(format!("Failed to read dir {dir}: {error}")))?
+    {
+        let path = entry
+            .map_err(|error| {
+                DataFusionError::Execution(format!("Failed to read dir entry: {error}"))
+            })?
+            .path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("parquet") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        if let Some(base) = stem.strip_suffix("_warm") {
+            split_files.push((
+                variation_chrom_sort_code(base),
+                0,
+                path.to_string_lossy().to_string(),
+            ));
+        } else if let Some(base) = stem.strip_suffix("_cold") {
+            split_files.push((
+                variation_chrom_sort_code(base),
+                1,
+                path.to_string_lossy().to_string(),
+            ));
+        } else {
+            base_files.push((
+                variation_chrom_sort_code(stem),
+                path.to_string_lossy().to_string(),
+            ));
+        }
+    }
+
+    if !split_files.is_empty() {
+        split_files.sort_by_key(|(code, tier, path)| (*code, *tier, path.clone()));
+        return Ok(split_files
+            .into_iter()
+            .map(|(code, _, path)| (code, path))
+            .collect());
+    }
+
+    base_files.sort_by_key(|(code, path)| (*code, path.clone()));
+    Ok(base_files)
+}
+
+fn variation_chrom_sort_code(stem: &str) -> u16 {
+    let chrom = stem.strip_prefix("chr").unwrap_or(stem);
+    if chrom == "other" {
+        u16::MAX
+    } else {
+        chrom_to_code(chrom)
+    }
+}
+
+fn variation_cache_schema_without_tier_helpers(schema: &SchemaRef) -> SchemaRef {
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .filter(|field| !matches!(field.name().as_str(), "position_key" | "variant_keys"))
+        .cloned()
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 fn make_ctx_and_register(
@@ -3585,6 +3804,65 @@ mod tests {
         assert!(!dir_has_parquet_files(dir.path().to_str().unwrap()));
     }
 
+    #[test]
+    fn test_variation_tier_files_are_detected_separately_from_base_parquet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chr1_warm.parquet"), b"PAR1").unwrap();
+        std::fs::write(dir.path().join("chr1_cold.parquet"), b"PAR1").unwrap();
+
+        assert!(dir_has_variation_tier_files(dir.path().to_str().unwrap()));
+        assert!(!dir_has_base_variation_parquet_files(
+            dir.path().to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_variation_fjall_discovery_prefers_split_files_over_base_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("chr1.parquet"), b"PAR1").unwrap();
+        std::fs::write(dir.path().join("chr1_warm.parquet"), b"PAR1").unwrap();
+        std::fs::write(dir.path().join("chr1_cold.parquet"), b"PAR1").unwrap();
+
+        let files = discover_variation_parquet_files_for_fjall(dir.path().to_str().unwrap())
+            .expect("discover variation parquet files");
+        let names: Vec<_> = files
+            .iter()
+            .map(|(_, path)| {
+                Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(names, vec!["chr1_warm.parquet", "chr1_cold.parquet"]);
+    }
+
+    #[test]
+    fn test_variation_cache_schema_drops_tier_helper_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, true),
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new(
+                "variant_keys",
+                DataType::List(Arc::new(Field::new_list_field(DataType::UInt64, true))),
+                false,
+            ),
+        ]));
+
+        let projected = variation_cache_schema_without_tier_helpers(&schema);
+        let names: Vec<_> = projected
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+
+        assert_eq!(names, vec!["chrom", "start", "allele_string"]);
+    }
+
     // -----------------------------------------------------------------------
     // overwrite flag
     // -----------------------------------------------------------------------
@@ -3652,10 +3930,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().to_str().unwrap();
 
-        // Create fake variation parquet + fjall
+        // Create fake warm/cold variation parquet + fjall
         let var_dir = dir.path().join("variation");
         std::fs::create_dir_all(&var_dir).unwrap();
-        std::fs::write(var_dir.join("chr1.parquet"), b"PAR1").unwrap();
+        std::fs::write(var_dir.join("chr1_warm.parquet"), b"PAR1").unwrap();
+        std::fs::write(var_dir.join("chr1_cold.parquet"), b"PAR1").unwrap();
         let fjall_dir = dir.path().join("variation.fjall");
         std::fs::create_dir_all(&fjall_dir).unwrap();
 
@@ -3672,10 +3951,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().to_str().unwrap();
 
-        // Create fake variation parquet but NO fjall
+        // Create fake warm/cold variation parquet but NO fjall
         let var_dir = dir.path().join("variation");
         std::fs::create_dir_all(&var_dir).unwrap();
-        std::fs::write(var_dir.join("chr1.parquet"), b"PAR1").unwrap();
+        std::fs::write(var_dir.join("chr1_warm.parquet"), b"PAR1").unwrap();
+        std::fs::write(var_dir.join("chr1_cold.parquet"), b"PAR1").unwrap();
 
         let builder = CacheBuilder::new("/nonexistent_cache", output);
         let result = builder.build_entity("variation").await;
