@@ -165,6 +165,7 @@ mod csq_idx {
     // Lookup helper: scan a group for a field by name, returning value or "".
 }
 
+#[allow(dead_code)]
 fn first_existing_variation(csq: &str) -> String {
     for group in parse_csq_row(csq) {
         if group.len() > csq_idx::EXISTING_VARIATION
