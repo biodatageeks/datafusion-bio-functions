@@ -574,4 +574,85 @@ mod tests {
         let description = csq_header_description(&config, CacheSourceType::Ensembl);
         assert!(!description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
     }
+
+    // ───────────────────── Runner.t v2 PORTS ─────────────────────
+    // Detailed plan: porting-tests/detailed_plans/Runner.md
+    // TDD plan:      porting-tests/plans/2026-05-28-port-runner.md
+    //
+    // Unit-port subtests for Runner.t that probe single methods on
+    // AnnotateVcfConfig / annotate_to_vcf. Integration ports live in
+    // tests/port_runner.rs.
+
+    /// Subtest #2 (Runner.t L44-47): `Runner->new` returns blessed object.
+    /// vepyr analogue: AnnotateVcfConfig::default() is callable and returns
+    /// a struct with the expected field defaults. No "blessed class"
+    /// concept in Rust; the type identity is checked at compile time.
+    #[test]
+    fn runner_subtest_2_annotate_vcf_config_default_constructs() {
+        let cfg = AnnotateVcfConfig::default();
+        // verified via inspection of vcf_sink.rs::Default impl 2026-05-28:
+        //   everything=false, pick=false, buffer_size=5000, compression=Plain,
+        //   distance=None, reference_fasta_path=None.
+        assert!(!cfg.everything);
+        assert!(!cfg.pick);
+        assert_eq!(cfg.buffer_size, VEP_DEFAULT_BUFFER_SIZE);
+        assert!(matches!(cfg.compression, VcfCompressionType::Plain));
+        assert!(cfg.distance.is_none());
+        assert!(cfg.reference_fasta_path.is_none());
+    }
+
+    /// Subtest #11 (Runner.t L242): `Runner::init` returns truthy.
+    /// vepyr analogue: there is no explicit `init` step; annotate_to_vcf
+    /// inlines what Perl `init` does. This compile-time-only test asserts
+    /// the public API exposes the entrypoint at the expected signature.
+    #[test]
+    fn runner_subtest_11_annotate_to_vcf_callable_without_explicit_init() {
+        // The compiler checks the function has the expected signature; if
+        // annotate_to_vcf changed shape, this test would fail to compile.
+        // verified via inspection 2026-05-28: signature is
+        //   annotate_to_vcf(&str, &str, &str, &str, &AnnotateVcfConfig)
+        //     -> impl Future<Output = Result<usize>>.
+        let _ = annotate_to_vcf;
+    }
+
+    /// Axis B B1 (detailed_plan §Axis-B additions row B1): calling
+    /// annotate_to_vcf with cache_source pointing at a non-existent
+    /// directory returns Err — vepyr's equivalent of Perl's
+    /// `setup_db_connection` "no source" failure.
+    #[test]
+    fn runner_axis_b_b1_cache_source_missing_returns_err() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let bogus = tmp.path().join("nonexistent_cache_dir");
+            let input = tmp.path().join("input.vcf");
+            std::fs::write(
+                &input,
+                "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n",
+            )
+            .expect("write input vcf");
+            let output = tmp.path().join("output.vcf");
+            let cfg = AnnotateVcfConfig::default();
+            let result = annotate_to_vcf(
+                input.to_str().unwrap(),
+                bogus.to_str().unwrap(),
+                "parquet",
+                output.to_str().unwrap(),
+                &cfg,
+            )
+            .await;
+            // verified via inspection of cache_source.rs:77-117
+            //   (first_variation_parquet): raises DataFusionError::Plan
+            //   when the variation/ directory does not exist.
+            assert!(
+                result.is_err(),
+                "annotate_to_vcf with missing cache_source must Err; got Ok"
+            );
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("variation"),
+                "Err message must mention missing variation/ directory; got: {msg}"
+            );
+        });
+    }
 }

@@ -534,4 +534,50 @@ mod tests {
             );
         }
     }
+
+    // ───────────────────── Runner.t v2 PORTS ─────────────────────
+    // Detailed plan: porting-tests/detailed_plans/Runner.md
+    // TDD plan:      porting-tests/plans/2026-05-28-port-runner.md
+
+    /// Subtest #3 (Runner.t L54-92): get_all_AnnotationSources returns
+    /// single Cache::Transcript with cache_region_size + valid_chromosomes.
+    /// vepyr analogue: PartitionedParquetCache::detect(path) returns
+    /// Some(_) when the layout is valid; vepyr has no `cache_region_size`
+    /// knob (per-chrom files, not 1Mb slices). Remaining contract — "the
+    /// cache exposes a list of chromosomes" — is covered in subtest #5
+    /// below.
+    #[test]
+    fn runner_subtest_3_partitioned_cache_detects_v115_style_layout() {
+        let (_tmp, cache) = tmp_variation_layout();
+        // The detect() helper already returned Some(_) inside the fixture
+        // setup; confirm the layout round-trips through a re-detect.
+        let redetected = PartitionedParquetCache::detect(cache.base_dir().to_str().unwrap());
+        assert!(
+            redetected.is_some(),
+            "PartitionedParquetCache::detect must succeed on a valid variation/<chrom>.parquet layout"
+        );
+        // The Perl test asserts the source is a Cache::Transcript blessed
+        // object. In vepyr the analogue "this is a valid cache" is the
+        // Some(_) return — there is no separate Transcript/Variation class
+        // because the layout is uniform across context_types.
+        // verified via inspection of partitioned_cache.rs:47-78 2026-05-28.
+    }
+
+    /// Subtest #5 (Runner.t L97): valid_chromosomes == ['21', '22',
+    /// 'LRG_485']. vepyr analogue: available_chroms() exposes the per-
+    /// cache chromosome list. The Perl v84 fixture had LRG_485; the v115
+    /// fixture build differs. The contract under test is "available_chroms
+    /// is non-empty and matches the directory layout".
+    #[test]
+    fn runner_subtest_5_available_chroms_matches_variation_layout() {
+        let (_tmp, cache) = tmp_variation_layout();
+        let chroms = cache.available_chroms();
+        // verified via inspection of partitioned_cache.rs::tmp_variation_layout
+        //   2026-05-28: helper writes exactly one chromosome (chr21).
+        assert_eq!(
+            chroms,
+            &["chr21"],
+            "available_chroms must reflect the variation/ directory layout"
+        );
+    }
 }
