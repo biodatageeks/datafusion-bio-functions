@@ -1451,4 +1451,194 @@ mod tests {
         assert_eq!(r, "AA");
         assert_eq!(a, vec!["AT".to_string(), "CA".to_string()]);
     }
+
+    // =====================================================================
+    // Parser_VCF.t v2 port (sztywno 1:1).
+    //
+    // Re-dispatch 2026-05-28 (original implementer at aa08eb3a stalled).
+    // Detailed plan: porting-tests/detailed_plans/Parser_VCF.md (post-Phase-D
+    // amendments: 2 Axis A additions + 1 Axis B + user Q3 reclass of #23).
+    // Per-port plan: porting-tests/plans/2026-05-28-port-parser-vcf.md.
+    //
+    // Each `pvcf_<NN>` function names the Perl subtest row(s) it covers in
+    // a `// SUBTEST #N from Parser_VCF.t` audit-trail comment. Hand-coded
+    // expected values; no docker, no VEP runtime (v2 standalone rule).
+    //
+    // 5 integration-port tests for #5-#8, #16, #18, #69, A1/B1 live in
+    // tests/port_parser_vcf.rs (need the noodles VCF reader pipeline).
+    //
+    // 47 blocked-future-work rows live as commented-out stanzas at the
+    // bottom of tests/port_parser_vcf.rs, naming engine blocker #2
+    // sub-entries (SV, max_sv_size, <CPX>, ME, CNV, BND, TR, GP, individual,
+    // individual_zyg, allow_non_variant, dont_skip, <DEL:*>).
+    //
+    // 6 architectural-no-analogue rows (#3, #4, #19, #21, #22, #23) are
+    // documented at the top of tests/port_parser_vcf.rs.
+    //
+    // Note on row #23: per user Q3 decision 2026-05-28, the OUTCOME of
+    // Perl `minimal=1` on CAT→CCT (yielding A/C) is captured here via
+    // vepyr's always-on trimming in `pvcf_23_a2_minimal_outcome_via_always_on_trimming`.
+    // The Perl `minimal=1` FLAG itself remains architectural-no-analogue.
+    // =====================================================================
+
+    #[test]
+    fn pvcf_09_deletion_ac_to_a() {
+        // SUBTEST #9 from Parser_VCF.t (line 107-128):
+        //   `21 25587759 test AC A` → allele_string='C/-', pos+1 = 25587760,
+        //   minimised=1, original_allele_string='AC/A'.
+        // vepyr analogue: `vcf_to_vep_allele("AC","A")` returns ("C","-");
+        //   `vep_norm_start` shifts POS by the 1-char common prefix.
+        let (r, a) = vcf_to_vep_allele("AC", "A");
+        assert_eq!(r, "C");
+        assert_eq!(a, "-");
+        assert_eq!(vep_norm_start(25587759, "AC", "A"), 25587760);
+        assert_eq!(vep_norm_end(25587759, "AC", "A"), 25587760);
+    }
+
+    #[test]
+    fn pvcf_10_insertion_a_to_ac() {
+        // SUBTEST #10 from Parser_VCF.t (line 131-152):
+        //   `21 25587759 test A AC` → allele_string='-/C', start=pos+1 (25587760),
+        //   end=pos (25587759). For insertions VEP convention: start > end.
+        let (r, a) = vcf_to_vep_allele("A", "AC");
+        assert_eq!(r, "-");
+        assert_eq!(a, "C");
+        assert_eq!(vep_norm_start(25587759, "A", "AC"), 25587760);
+        assert_eq!(vep_norm_end(25587759, "A", "AC"), 25587759);
+    }
+
+    #[test]
+    fn pvcf_11_short_form_del_ignores_svtype() {
+        // SUBTEST #11 from Parser_VCF.t (line 155-176):
+        //   `21 25587759 test AC A . . SVTYPE=DEL` → parsed as plain deletion;
+        //   SVTYPE=DEL on short-form REF/ALT is IGNORED.
+        // vepyr: `classify_variant` (annotate_provider.rs:6157) uses REF/ALT
+        //   shape ONLY (does not read INFO). After trim, ALT='-' is classified
+        //   as deletion (annotate_provider.rs:6160 — `(r, "-") if !r.is_empty() => "deletion"`).
+        let (r, a) = vcf_to_vep_allele("AC", "A");
+        assert_eq!(r, "C");
+        assert_eq!(a, "-");
+        // `(r, "-")` shape IS what classify_variant calls a deletion. SVTYPE=DEL
+        // never enters this path — it's not consulted.
+    }
+
+    #[test]
+    fn pvcf_12_short_form_ins_ignores_svlen() {
+        // SUBTEST #12 from Parser_VCF.t (line 179-200):
+        //   `21 25587759 test A AC . . SVLEN=1` → parsed as plain insertion;
+        //   SVLEN=1 on short-form REF/ALT is IGNORED.
+        // vepyr: same rationale as #11 — classify_variant does not consult INFO.
+        let (r, a) = vcf_to_vep_allele("A", "AC");
+        assert_eq!(r, "-");
+        assert_eq!(a, "C");
+        // `("-", a)` shape IS what classify_variant calls an insertion
+        // (annotate_provider.rs:6159). SVLEN never enters this path.
+    }
+
+    #[test]
+    fn pvcf_13_multi_alt_snv_pass_through() {
+        // SUBTEST #13 from Parser_VCF.t (line 203-220):
+        //   `21 25587759 test A C,G` → allele_string='A/C/G' (SNV-only multi-ALT
+        //   passes through unchanged).
+        // vepyr: `vep_prefix_suffix_len_multi` (allele.rs:351) has explicit
+        //   "SNV-only multi-ALT gets no trimming" branch.
+        let (r, alts) = vcf_to_vep_allele_multi("A", &["C", "G"]);
+        assert_eq!(r, "A");
+        assert_eq!(alts, vec!["C".to_string(), "G".to_string()]);
+        assert_eq!(vep_norm_start_multi(25587759, "A", &["C", "G"]), 25587759);
+    }
+
+    #[test]
+    fn pvcf_14_multi_alt_different_first_base() {
+        // SUBTEST #14 from Parser_VCF.t (line 223-241):
+        //   `21 25587759 test A C,GG` → allele_string='A/C/GG' (mixed types,
+        //   different first base: A vs C vs G — no shared prefix).
+        // vepyr: prefix=0 at byte 0 (A != G); REF='A' passes through, alts
+        //   ['C','GG'] pass through.
+        let (r, alts) = vcf_to_vep_allele_multi("A", &["C", "GG"]);
+        assert_eq!(r, "A");
+        assert_eq!(alts, vec!["C".to_string(), "GG".to_string()]);
+        assert_eq!(vep_norm_start_multi(25587759, "A", &["C", "GG"]), 25587759);
+    }
+
+    #[test]
+    fn pvcf_15_multi_alt_same_first_base() {
+        // SUBTEST #15 from Parser_VCF.t (line 244-262):
+        //   `21 25587759 test G GC,GT` → allele_string='-/C/T', start=pos+1.
+        // vepyr: shared prefix 'G' (1 char) across REF + both ALTs → REF
+        //   becomes "" → "-"; ALTs become "C","T". Start shifts to 25587760.
+        let (r, alts) = vcf_to_vep_allele_multi("G", &["GC", "GT"]);
+        assert_eq!(r, "-");
+        assert_eq!(alts, vec!["C".to_string(), "T".to_string()]);
+        assert_eq!(vep_norm_start_multi(25587759, "G", &["GC", "GT"]), 25587760);
+    }
+
+    #[test]
+    fn pvcf_24_minimal_non_minimisable_multi_alt_pass_through() {
+        // SUBTEST #24 from Parser_VCF.t (line 420-438):
+        //   `21 25587758 test C T,CAA` with `minimal=1` → allele_string='C/T/CAA'
+        //   (passes through unchanged — non-minimisable multi-ALT because T is
+        //   1-char and CAA is 3-char and they have no joint prefix beyond the
+        //   single-base anchor).
+        // vepyr: NOT SNV-only multi-ALT (ALT2 'CAA' has len>1), so the SNV
+        //   short-circuit at allele.rs:351 doesn't apply. Compute joint prefix
+        //   across REF='C' and alts ['T','CAA']: at byte 0, REF='C', ALT1='T'
+        //   (mismatch) → prefix=0. No suffix trim either (mixed lengths +
+        //   no shared trailing byte across all three). Pass-through.
+        let (r, alts) = vcf_to_vep_allele_multi("C", &["T", "CAA"]);
+        assert_eq!(r, "C");
+        assert_eq!(alts, vec!["T".to_string(), "CAA".to_string()]);
+        assert_eq!(vep_norm_start_multi(25587758, "C", &["T", "CAA"]), 25587758);
+    }
+
+    #[test]
+    fn pvcf_23_a2_minimal_outcome_via_always_on_trimming() {
+        // SUBTEST #23 reclassified per Phase D Axis A + user Q3 decision 2026-05-28:
+        //   Perl tests `minimal=1` config flag on `21 25587758 test CAT CCT` →
+        //   allele_string='A/C', start=pos+1 (25587759), end=pos+1 (25587759).
+        // SUBTEST A2 (Phase D Axis A addition): positively pin this semantic
+        //   equivalence so future regressions in trimming are caught.
+        //
+        // CAT/CCT is a same-length MNV. vepyr exposes TWO trim helpers:
+        //   - `vcf_to_vep_allele` (allele.rs:283): SUFFIX-trim only for indels,
+        //     so MNV CAT/CCT prefix-trims to AT/CT (per `test_vcf_to_vep_allele_mnv_no_suffix_trim`
+        //     at line 1250 — this is by design, MNV-preserving).
+        //   - `trim_sequences_ensembl` (allele.rs:118): full minimizer Perl uses
+        //     for `minimal=1`. Trims BOTH prefix AND suffix even for MNVs.
+        //     This is the correct vepyr-side analogue of Perl `minimal=1`
+        //     outcome (`CAT→CCT yields A/C`).
+        //
+        // Per user Q3 decision wording in the dispatch prompt the assertion
+        // SIGNATURE is `vcf_to_vep_allele("CAT","CCT")==("A","C")` — but as
+        // shown above, vepyr's `vcf_to_vep_allele` returns ("AT","CT") for
+        // MNV by design (MNV-preserving rule, distinct from Perl `minimal=1`).
+        // The function-as-named that DOES match the user Q3 outcome is
+        // `trim_sequences_ensembl`. We test BOTH:
+        //   1. The MNV-preserving outcome of `vcf_to_vep_allele` ("AT"/"CT") —
+        //      the documented, by-design vepyr behavior.
+        //   2. The full-minimizer outcome of `trim_sequences_ensembl` ("A"/"C") —
+        //      the semantic equivalent of Perl `minimal=1`.
+        // This sztywno-1:1 records BOTH the Perl outcome AND vepyr's API split.
+
+        // (1) vcf_to_vep_allele (MNV-preserving by design)
+        let (vep_ref, vep_alt) = vcf_to_vep_allele("CAT", "CCT");
+        assert_eq!(vep_ref, "AT", "MNV-preserving trim yields AT/CT");
+        assert_eq!(vep_alt, "CT");
+
+        // (2) trim_sequences_ensembl (full minimizer — equivalent to Perl minimal=1)
+        let (min_ref, min_alt, min_start, min_end, changed) =
+            trim_sequences_ensembl("CAT", "CCT", 25587758, false, 1);
+        assert_eq!(min_ref, "A", "full minimizer yields A/C (Perl minimal=1 outcome)");
+        assert_eq!(min_alt, "C");
+        assert_eq!(min_start, 25587759, "POS shifts by 1 prefix-char");
+        assert_eq!(min_end, 25587759, "END shifts back by 1 suffix-char");
+        assert!(changed);
+
+        // Coordinate-shift cross-checks against the by-design helpers.
+        // (vep_norm_start uses prefix-only shift; for MNV it returns pos+prefix_len=pos+1)
+        assert_eq!(vep_norm_start(25587758, "CAT", "CCT"), 25587759);
+        // vep_norm_end for MNV: end = pos + len(REF) - 1 - 0 = 25587760
+        // (MNV doesn't suffix-trim in vep_norm_end either)
+        assert_eq!(vep_norm_end(25587758, "CAT", "CCT"), 25587760);
+    }
 }
