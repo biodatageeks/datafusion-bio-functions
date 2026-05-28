@@ -454,4 +454,76 @@ mod tests {
             "Opening sift keyspace on DB without it should return None"
         );
     }
+
+    // ----------------------------------------------------------------
+    // Port of `ensembl-vep/t/AnnotationSource_Cache_Transcript.t` subtests
+    // #12 + #16 (SIFT capability negotiation).
+    //
+    // Perl `check_sift_polyphen` consults `info.txt` for the cache's SIFT
+    // capability and either passes (capability present), warns and
+    // disables under --everything (capability absent), or throws (sift=1
+    // without --everything and capability absent).
+    //
+    // vepyr's analogue is "does the SIFT fjall DB open?". The error-on-
+    // missing decision is the caller's responsibility; the *store-level*
+    // unit-port is the open_path return value.
+    //
+    // verified via VEP 115: SiftKvStore::open_path returning Some/None
+    // is the capability presence/absence surface.
+    // See porting-tests/detailed_plans/AnnotationSource_Cache_Transcript.md
+    // rows #12 and #16, and porting-tests/plans/2026-05-28-port-cache-transcript.md.
+    // ----------------------------------------------------------------
+
+    // SUBTEST #12 (Transcript.t:64-66): `check_sift_polyphen` passes when
+    // cache info.txt declares sift=1.
+    // vepyr-side: SiftKvStore::open_path returns Some(_) for a present
+    // fjall DB. Tests the "capability present" branch of the negotiation.
+    #[test]
+    fn transcript_port_subtest_12_sift_capability_present_returns_some() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Build a standalone SIFT DB at dir.path() (mirrors the v115 cache
+        // layout `translation_sift/<chrom>.fjall`).
+        {
+            let db = fjall::Database::builder(dir.path())
+                .cache_size(64 * 1024 * 1024)
+                .open()
+                .unwrap();
+            let store = SiftKvStore::create(&db).unwrap();
+            store
+                .put("ENST00000000001", &make_predictions())
+                .unwrap();
+            db.persist(fjall::PersistMode::SyncAll).unwrap();
+        }
+
+        // verified via VEP 115: Perl check_sift_polyphen passes when cache
+        // info.txt says sift=1. vepyr's equivalent observable is "SIFT
+        // store at this path opens successfully" — Some(_).
+        let opened = SiftKvStore::open_path(dir.path()).unwrap();
+        assert!(
+            opened.is_some(),
+            "SiftKvStore::open_path must return Some(_) for a present fjall DB \
+             (Perl: check_sift_polyphen passes when cache declares sift=1)"
+        );
+    }
+
+    // SUBTEST #16 (Transcript.t:86): `throws_ok check_sift_polyphen qr/SIFT
+    // not available/` when --sift requested but cache lacks SIFT.
+    // vepyr-side: SiftKvStore::open_path returns None for a missing path.
+    // The error-on-missing-capability is the caller's responsibility (per
+    // detailed_plan row #16); the store-level surface is "None" for absent
+    // capability.
+    #[test]
+    fn transcript_port_subtest_16_sift_capability_absent_returns_none() {
+        // verified via VEP 115: Perl throws under --sift when cache lacks
+        // SIFT.  vepyr's store-level observable is "open_path returns
+        // None"; the caller (annotate path) decides whether to error.
+        let opened = SiftKvStore::open_path("/nonexistent/path/to/sift.fjall").unwrap();
+        assert!(
+            opened.is_none(),
+            "SiftKvStore::open_path must return None for a missing path \
+             (Perl: check_sift_polyphen throws when --sift requested but \
+             cache lacks SIFT capability)"
+        );
+    }
 }

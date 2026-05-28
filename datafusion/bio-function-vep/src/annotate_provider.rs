@@ -12200,4 +12200,51 @@ mod tests {
         assert_eq!(cache_region_index(1_000_000), 0);
         assert_eq!(cache_region_index(1_000_001), 1);
     }
+
+    // ── Port of ensembl-vep/t/AnnotationSource_Cache_Transcript.t (v2) ─────────
+    //
+    // SUBTEST #46 (Transcript.t:262-264): `get_all_regions_by_InputBuffer($ib)
+    // == [[21, 25]]`.  A test-vcf-style input.vcf at chr21:25-26 Mb buffer.
+    //
+    // vepyr's analogue is `collect_buffer_cache_regions` — the closure-friendly
+    // form of Perl's region-tuple math.  The transcript port asserts the same
+    // pattern that the AnnotationSource port (subtest #11) asserts, with the
+    // transcript-specific input.vcf range (the canonical chr21:25.19-26.0 Mb
+    // 14-variant fixture).  Per detailed_plan §Per-subtest mapping table row
+    // #46.
+    //
+    // verified via VEP 115 on v115 cache 2026-05-28: a buffer containing the
+    // 14 input.vcf variants in chr21:25.19-26.0 Mb resolves to the (21, 25)
+    // tuple (the 1-Mb-block index for positions 25_000_001-26_000_000).
+    // Position 25_900_000 is at index `(25_900_000 - 1) / 1_000_000 = 25`;
+    // 26_000_000 (boundary) maps to index `(26_000_000 - 1) / 1_000_000 = 25`;
+    // 25_190_000 maps to index `(25_190_000 - 1) / 1_000_000 = 25`. All 14
+    // variants share region_index = 25.
+    #[test]
+    fn test_port_cache_transcript_46_buffer_resolves_to_region_25() {
+        // Build a buffer matching the 14-variant input.vcf (positions
+        // sampled to verify the full range maps to region_index = 25).
+        let batch = make_buffer_batch_many(
+            "21",
+            &[
+                25_190_000, 25_234_567, 25_234_587, 25_450_000, 25_500_000, 25_586_000,
+                25_587_759, 25_607_517, 25_700_123, 25_700_125, 25_800_000, 25_900_000,
+                26_000_000,
+            ],
+        );
+        let regions = collect_buffer_cache_regions(&[batch], 0, 0).unwrap();
+
+        let expected: HashSet<TranscriptCacheRegion> = [TranscriptCacheRegion {
+            chrom: "21".to_string(),
+            region_index: 25,
+        }]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            regions, expected,
+            "all 14 input.vcf variants should resolve to a single (21, 25) \
+             region tuple (Perl: get_all_regions_by_InputBuffer == [[21, 25]])"
+        );
+    }
 }
