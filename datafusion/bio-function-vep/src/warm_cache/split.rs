@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::ops::Range;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FrequencyFields<'a> {
@@ -173,6 +174,28 @@ where
     warm_positions
 }
 
+pub fn plan_position_aligned_row_groups(
+    position_keys: &[i64],
+    target_rows: usize,
+) -> Vec<Range<usize>> {
+    if position_keys.is_empty() {
+        return Vec::new();
+    }
+
+    let target_rows = target_rows.max(1);
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    for idx in 1..position_keys.len() {
+        if idx - start >= target_rows && position_keys[idx] != position_keys[idx - 1] {
+            groups.push(start..idx);
+            start = idx;
+        }
+    }
+
+    groups.push(start..position_keys.len());
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +256,19 @@ mod tests {
         assert!(selected.contains(&100));
         assert!(selected.contains(&101));
         assert!(!selected.contains(&103));
+    }
+
+    #[test]
+    fn row_group_planner_never_splits_position_key() {
+        let positions = vec![1, 1, 2, 3, 3, 3, 4];
+        let groups = plan_position_aligned_row_groups(&positions, 2);
+
+        assert_eq!(groups, vec![0..2, 2..6, 6..7]);
+        for pair in groups.windows(2) {
+            let left_last = positions[pair[0].end - 1];
+            let right_first = positions[pair[1].start];
+            assert!(left_last < right_first);
+        }
     }
 
     #[test]

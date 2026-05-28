@@ -7,10 +7,11 @@ use std::time::Instant;
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanBuilder, Float32Array, Float64Array, Int32Array, Int64Array,
     LargeStringArray, ListBuilder, RecordBatch, StringArray, StringViewArray, UInt32Array,
-    UInt64Builder,
+    UInt64Array, UInt64Builder,
 };
-use datafusion::arrow::compute::filter_record_batch;
+use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
+use datafusion_bio_function_vep::kv_cache::position_index::{PositionIndex, position_index_file};
 use datafusion_bio_function_vep::warm_cache::key::{position_key, variant_keys_from_allele_string};
 use datafusion_bio_function_vep::warm_cache::reader::projection_for_existing_roots;
 use datafusion_bio_function_vep::warm_cache::split::{
@@ -54,6 +55,13 @@ fn main() -> Result<()> {
         written.cold_rows,
         started.elapsed().as_secs_f64()
     );
+    eprintln!(
+        "warm_row_groups={} cold_row_groups={} cold_rows_sharing_warm_positions={} row_group_position_splits={}",
+        written.warm_row_groups,
+        written.cold_row_groups,
+        written.cold_rows_sharing_warm_positions,
+        written.row_group_position_splits
+    );
 
     Ok(())
 }
@@ -62,6 +70,10 @@ fn main() -> Result<()> {
 struct WrittenRows {
     warm_rows: usize,
     cold_rows: usize,
+    warm_row_groups: usize,
+    cold_row_groups: usize,
+    cold_rows_sharing_warm_positions: usize,
+    row_group_position_splits: usize,
 }
 
 impl Args {
@@ -70,7 +82,7 @@ impl Args {
         let mut output_dir = None;
         let mut af_threshold = 0.01;
         let mut position_radius = 1_i64;
-        let mut row_group_rows = 250_000_usize;
+        let mut row_group_rows = 500_000_usize;
         let mut batch_size = 65_536_usize;
 
         let mut args = std::env::args().skip(1);
@@ -117,7 +129,7 @@ fn require_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<
 fn print_usage() {
     eprintln!(
         "Usage: build_warm_variation_cache --input chrN.parquet --output-dir variation \
-         [--af-threshold 0.01] [--position-radius 1] [--row-group-rows 250000]"
+         [--af-threshold 0.01] [--position-radius 1] [--row-group-rows 500000]"
     );
 }
 
@@ -188,8 +200,12 @@ fn write_split_files(
 
     let warm_path = args.output_dir.join(format!("{chrom}_warm.parquet"));
     let cold_path = args.output_dir.join(format!("{chrom}_cold.parquet"));
-    let mut warm_writer = create_writer(&warm_path, output_schema.clone(), "warm", args)?;
-    let mut cold_writer = create_writer(&cold_path, output_schema.clone(), "cold", args)?;
+    let warm_writer = create_writer(&warm_path, output_schema.clone(), "warm", args)?;
+    let cold_writer = create_writer(&cold_path, output_schema.clone(), "cold", args)?;
+    let mut warm_writer =
+        PositionAlignedWriter::new(warm_writer, output_schema.clone(), args.row_group_rows)?;
+    let mut cold_writer =
+        PositionAlignedWriter::new(cold_writer, output_schema.clone(), args.row_group_rows)?;
 
     let reader = builder.with_batch_size(args.batch_size).build()?;
     let mut written = WrittenRows::default();
@@ -208,14 +224,258 @@ fn write_split_files(
 
         let cold_batch = filter_record_batch(&enriched, &cold_mask)?;
         if cold_batch.num_rows() > 0 {
+            written.cold_rows_sharing_warm_positions +=
+                count_rows_with_warm_positions(&cold_batch, warm_positions)?;
             written.cold_rows += cold_batch.num_rows();
             cold_writer.write(&cold_batch)?;
         }
     }
 
-    warm_writer.close()?;
-    cold_writer.close()?;
+    written.warm_row_groups = warm_writer.close()?;
+    written.cold_row_groups = cold_writer.close()?;
+    written.row_group_position_splits =
+        verify_position_aligned_row_groups(&warm_path, args.batch_size)?
+            + verify_position_aligned_row_groups(&cold_path, args.batch_size)?;
+    write_cold_position_index(&args.output_dir, chrom, &cold_path, args.batch_size)?;
     Ok(written)
+}
+
+fn write_cold_position_index(
+    output_dir: &Path,
+    chrom: &str,
+    cold_path: &Path,
+    batch_size: usize,
+) -> Result<()> {
+    let index_dir = position_index_output_dir(output_dir);
+    let index_path = position_index_file(&index_dir, chrom);
+    let index = PositionIndex::from_parquet(cold_path, batch_size)?;
+    index.write_to_path(&index_path)?;
+    eprintln!(
+        "cold_position_index={} positions={} source={}",
+        index_path.display(),
+        index.len(),
+        cold_path.display()
+    );
+    Ok(())
+}
+
+fn position_index_output_dir(output_dir: &Path) -> PathBuf {
+    if output_dir.file_name().and_then(|name| name.to_str()) == Some("variation") {
+        output_dir
+            .parent()
+            .unwrap_or(output_dir)
+            .join("variation.position_index")
+    } else {
+        output_dir.join("variation.position_index")
+    }
+}
+
+struct PositionAlignedWriter {
+    writer: ArrowWriter<File>,
+    schema: SchemaRef,
+    position_idx: usize,
+    target_rows: usize,
+    pending: Vec<RecordBatch>,
+    pending_rows: usize,
+    row_groups: usize,
+}
+
+impl PositionAlignedWriter {
+    fn new(writer: ArrowWriter<File>, schema: SchemaRef, target_rows: usize) -> Result<Self> {
+        let position_idx = schema.index_of("position_key")?;
+        Ok(Self {
+            writer,
+            schema,
+            position_idx,
+            target_rows: target_rows.max(1),
+            pending: Vec::new(),
+            pending_rows: 0,
+            row_groups: 0,
+        })
+    }
+
+    fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        self.pending_rows += batch.num_rows();
+        self.pending.push(batch.clone());
+        self.flush_ready(false)
+    }
+
+    fn close(mut self) -> Result<usize> {
+        self.flush_ready(true)?;
+        self.writer.close()?;
+        Ok(self.row_groups)
+    }
+
+    fn flush_ready(&mut self, final_flush: bool) -> Result<()> {
+        loop {
+            let cutoff = if final_flush {
+                self.pending_rows
+            } else {
+                match self.next_flush_cutoff()? {
+                    Some(cutoff) => cutoff,
+                    None => return Ok(()),
+                }
+            };
+
+            if cutoff == 0 {
+                return Ok(());
+            }
+
+            self.flush_prefix(cutoff)?;
+
+            if final_flush || self.pending_rows < self.target_rows {
+                return Ok(());
+            }
+        }
+    }
+
+    fn next_flush_cutoff(&self) -> Result<Option<usize>> {
+        if self.pending_rows < self.target_rows {
+            return Ok(None);
+        }
+
+        let mut previous = None;
+        let mut global_row = 0usize;
+        for batch in &self.pending {
+            let positions = position_key_array(batch, self.position_idx)?;
+            for row in 0..batch.num_rows() {
+                if positions.is_null(row) {
+                    return Err("position_key must be non-null UInt64".into());
+                }
+                let current = positions.value(row);
+                if global_row >= self.target_rows && previous.is_some_and(|prev| prev != current) {
+                    return Ok(Some(global_row));
+                }
+                previous = Some(current);
+                global_row += 1;
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn flush_prefix(&mut self, cutoff: usize) -> Result<()> {
+        debug_assert!(cutoff <= self.pending_rows);
+        let mut remaining = cutoff;
+        let mut flush_batches = Vec::new();
+        let mut keep_batches = Vec::new();
+
+        for batch in self.pending.drain(..) {
+            let rows = batch.num_rows();
+            if remaining == 0 {
+                keep_batches.push(batch);
+            } else if rows <= remaining {
+                remaining -= rows;
+                flush_batches.push(batch);
+            } else {
+                flush_batches.push(batch.slice(0, remaining));
+                keep_batches.push(batch.slice(remaining, rows - remaining));
+                remaining = 0;
+            }
+        }
+
+        if remaining != 0 {
+            return Err("internal error while splitting position-aligned row group".into());
+        }
+
+        let batch = concat_batches(&self.schema, flush_batches.iter())?;
+        self.writer.write(&batch)?;
+        self.writer.flush()?;
+        self.row_groups += 1;
+        self.pending = keep_batches;
+        self.pending_rows -= cutoff;
+        Ok(())
+    }
+}
+
+fn position_key_array(batch: &RecordBatch, idx: usize) -> Result<&UInt64Array> {
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| "position_key must be UInt64".into())
+}
+
+fn count_rows_with_warm_positions(
+    batch: &RecordBatch,
+    warm_positions: &BTreeSet<i64>,
+) -> Result<usize> {
+    let start_idx = batch.schema().index_of("start")?;
+    let mut count = 0usize;
+    for row in 0..batch.num_rows() {
+        let start = int64_value(batch.column(start_idx).as_ref(), row)
+            .ok_or("start must be non-null Int64/Int32/UInt32")?;
+        if warm_positions.contains(&start) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn verify_position_aligned_row_groups(path: &Path, batch_size: usize) -> Result<usize> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let row_groups = builder.metadata().num_row_groups();
+    let mut previous_max = None;
+    let mut splits = 0usize;
+
+    for row_group in 0..row_groups {
+        let (min, max) = row_group_position_range(path, row_group, batch_size)?;
+        if previous_max.is_some_and(|previous| previous >= min) {
+            splits += 1;
+        }
+        previous_max = Some(max);
+    }
+
+    Ok(splits)
+}
+
+fn row_group_position_range(
+    path: &Path,
+    row_group: usize,
+    batch_size: usize,
+) -> Result<(u64, u64)> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let mask = projection_for_existing_roots(
+        builder.schema(),
+        builder.parquet_schema(),
+        &["position_key"],
+    );
+    let reader = builder
+        .with_projection(mask)
+        .with_row_groups(vec![row_group])
+        .with_batch_size(batch_size)
+        .build()?;
+
+    let mut first = None;
+    let mut last = None;
+    for batch in reader {
+        let batch = batch?;
+        let idx = batch.schema().index_of("position_key")?;
+        let positions = position_key_array(&batch, idx)?;
+        for row in 0..batch.num_rows() {
+            if positions.is_null(row) {
+                return Err("position_key must be non-null UInt64".into());
+            }
+            let value = positions.value(row);
+            first.get_or_insert(value);
+            last = Some(value);
+        }
+    }
+
+    match (first, last) {
+        (Some(first), Some(last)) => Ok((first, last)),
+        _ => Err(format!(
+            "row group {row_group} in {} has no position_key values",
+            path.display()
+        )
+        .into()),
+    }
 }
 
 #[derive(Debug)]
@@ -273,7 +533,7 @@ fn create_writer(
 ) -> Result<ArrowWriter<File>> {
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(args.row_group_rows)
+        .set_max_row_group_size(usize::MAX)
         .set_key_value_metadata(Some(vec![
             KeyValue::new("vepyr.cache_tier".to_string(), tier.to_string()),
             KeyValue::new(
