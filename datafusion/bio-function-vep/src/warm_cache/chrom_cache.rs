@@ -11,6 +11,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReader
 use parquet::file::statistics::Statistics;
 
 use crate::kv_cache::position_index::{PositionIndex, PositionIndexSource};
+use crate::variant_lookup_exec::AF_COL_NAMES;
 use crate::warm_cache::chunk::{WarmChunkContext, WarmChunkProbe};
 use crate::warm_cache::reader::projection_for_existing_roots;
 
@@ -141,6 +142,14 @@ impl WarmChromCache {
 
     pub fn cold_position_source(&self) -> PositionIndexSource {
         self.cold_position_source
+    }
+
+    pub fn cold_position_len(&self) -> usize {
+        self.cold_positions.len()
+    }
+
+    pub fn cold_position_storage_bytes(&self) -> usize {
+        self.cold_positions.storage_bytes()
     }
 
     fn find_plan(&self, position_key: u64) -> Option<usize> {
@@ -327,6 +336,9 @@ pub fn projection_columns_for_cache(
             "clin_sig_allele",
             "pubmed",
         ] {
+            push_unique_column(&mut columns, name);
+        }
+        for name in AF_COL_NAMES {
             push_unique_column(&mut columns, name);
         }
     }
