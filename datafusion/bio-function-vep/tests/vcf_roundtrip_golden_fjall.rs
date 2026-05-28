@@ -270,10 +270,10 @@ async fn prepare_metadata_fjall_cache() -> Option<tempfile::TempDir> {
 
 async fn collect_fjall_annotation_starts_and_csq(
     cache_path: &std::path::Path,
-    target_partitions: usize,
+    forks: usize,
 ) -> Vec<(String, i64, String)> {
     let input_vcf = workspace_path("vep-benchmark/data/golden/input_1000.vcf");
-    let config = SessionConfig::new().with_target_partitions(target_partitions);
+    let config = SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(config);
     datafusion_bio_function_vep::register_vep_functions(&ctx);
 
@@ -293,6 +293,7 @@ async fn collect_fjall_annotation_starts_and_csq(
         "partitioned": true,
         "use_fjall": true,
         "everything": true,
+        "forks": forks,
         "reference_fasta_path": ref_fasta.to_string_lossy(),
     })
     .to_string()
@@ -319,7 +320,7 @@ async fn collect_fjall_annotation_starts_and_csq(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_fjall_parallel_lookup_and_annotation_output_is_invariant_across_target_partitions() {
+async fn test_fjall_annotation_output_is_invariant_across_forks() {
     let Some(cache_with_metadata) = prepare_metadata_fjall_cache().await else {
         eprintln!("Skipping: test fixtures not available");
         return;

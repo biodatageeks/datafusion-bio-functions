@@ -328,7 +328,7 @@ async fn test_roundtrip_golden_all_column_values() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_contig_parallelism_falls_back_for_single_output_partition() {
+async fn test_forks_one_uses_single_chromosome_lane() {
     let input_vcf = workspace_path("vep-benchmark/data/golden/input_1000.vcf");
     let cache_path = workspace_path("vep-benchmark/data/golden/cache");
     let ref_fasta = workspace_path("vep-benchmark/data/golden/reference_chr1.fa");
@@ -350,7 +350,6 @@ async fn test_contig_parallelism_falls_back_for_single_output_partition() {
         extended_probes: true,
         reference_fasta_path: Some(ref_fasta.to_str().unwrap().to_string()),
         forks: Some(1),
-        contig_parallelism: 4,
         ..Default::default()
     };
 
