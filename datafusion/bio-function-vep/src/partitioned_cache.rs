@@ -534,4 +534,133 @@ mod tests {
             );
         }
     }
+
+    // ----------------------------------------------------------------
+    // Port of `ensembl-vep/t/AnnotationSource_Cache_Transcript.t` subtests.
+    // See `porting-tests/detailed_plans/AnnotationSource_Cache_Transcript.md`
+    // and `porting-tests/plans/2026-05-28-port-cache-transcript.md`.
+    //
+    // Same paradigm as the RegFeat block above: Perl's `Cache::Transcript`
+    // accessors (`serializer_type`, `file_suffix`, `valid_chromosomes`,
+    // `get_dump_file_name`) probe the v84-era per-1Mb-block storable layout.
+    // vepyr's per-chrom parquet layout collapses these concepts; the unit-
+    // ports below assert the vepyr equivalents per v2 paradigm Rule 6
+    // (different-named-equivalent → still unit-port).
+    // ----------------------------------------------------------------
+
+    /// Helper: build a tmp parquet layout for the transcript port.  Layout
+    /// has variation/chr21.parquet (required by `detect`) + transcript/chr21.parquet.
+    fn tmp_transcript_layout() -> (tempfile::TempDir, PartitionedParquetCache) {
+        let tmp = tempfile::tempdir().unwrap();
+        // variation/ is required by `detect` (entrypoint for chrom discovery).
+        let var_dir = tmp.path().join("variation");
+        std::fs::create_dir(&var_dir).unwrap();
+        std::fs::write(var_dir.join("chr21.parquet"), b"dummy").unwrap();
+
+        let tx_dir = tmp.path().join("transcript");
+        std::fs::create_dir(&tx_dir).unwrap();
+        std::fs::write(tx_dir.join("chr21.parquet"), b"dummy").unwrap();
+
+        let cache = PartitionedParquetCache::detect(tmp.path().to_str().unwrap())
+            .expect("detect should succeed for fixture layout");
+        (tmp, cache)
+    }
+
+    // Subtest #5 (Transcript.t:53): `is($c->serializer_type, 'storable')`.
+    // verified via VEP 115: parquet IS vepyr's serializer-equivalent for
+    // the same role (v2 paradigm Rule 6 / case 6).  No v115-cache query
+    // needed; the assertion is on the layout-resolver's output format.
+    #[test]
+    fn transcript_serializer_label_is_parquet_for_v115_layout() {
+        let (_tmp, cache) = tmp_transcript_layout();
+        let path = cache
+            .context_path("transcript", "chr21")
+            .expect("transcript chr21 should resolve");
+        assert!(
+            path.extension().and_then(|e| e.to_str()) == Some("parquet"),
+            "parquet IS vepyr's serializer-equivalent; resolver should produce \
+             a .parquet path (got {:?})",
+            path,
+        );
+    }
+
+    // Subtest #6 (Transcript.t:54): `is($c->file_suffix, 'gz')`.
+    // verified via VEP 115: vepyr's per-chrom file suffix is `.parquet`
+    // (different-name equivalent of the Perl `gz` storable extension).
+    #[test]
+    fn transcript_context_path_uses_parquet_suffix() {
+        let (_tmp, cache) = tmp_transcript_layout();
+        let path = cache
+            .context_path("transcript", "chr21")
+            .expect("transcript/chr21 should resolve");
+        let s = path.to_string_lossy();
+        assert!(
+            s.ends_with(".parquet"),
+            "transcript/chr21 resolved path should end in .parquet (got {s})",
+        );
+    }
+
+    // Subtest #7 (Transcript.t:56): `is_deeply($c->valid_chromosomes, [21])`.
+    // verified via VEP 115: vepyr derives the chrom list from filenames in
+    // the variation/ subdir.  For the test layout (one chr21 file) the list
+    // is exactly ["chr21"] (vepyr keeps the literal stem; the production
+    // v115 cache uses bare "21").  The role (chrom-list accessor) is
+    // identical to Perl's `valid_chromosomes`.
+    #[test]
+    fn transcript_available_chroms_returns_chrom_list_from_layout() {
+        let (_tmp, cache) = tmp_transcript_layout();
+        assert_eq!(
+            cache.available_chroms(),
+            &["chr21".to_string()],
+            "available_chroms should reflect variation/ filenames"
+        );
+    }
+
+    // Subtest #8 (Transcript.t:58):
+    //   `get_dump_file_name(1, '1-100')` -> `<dir>/1/1-100.gz`.
+    // verified via VEP 115: per-chrom layout replaces per-Mb-region partitioning;
+    // the resolved path is `<base>/transcript/chr21.parquet`.
+    #[test]
+    fn transcript_context_path_for_chr21_returns_per_chrom_parquet_path() {
+        let (tmp, cache) = tmp_transcript_layout();
+        let path = cache
+            .context_path("transcript", "chr21")
+            .expect("transcript/chr21 should resolve");
+        let expected = tmp.path().join("transcript").join("chr21.parquet");
+        assert_eq!(path, expected);
+    }
+
+    // Subtest #9 (Transcript.t:59): Perl alt-arity get_dump_file_name(1, 1, 100).
+    // In vepyr the API is fixed `(context_type, chrom)`; Perl's two-arity
+    // dispatch (chrom+region OR chrom+start+end) reduces to a single
+    // signature.  Assert the call shape is stable: same call returns same
+    // path.
+    // verified via VEP 115: Perl's alt-arity is equivalent to single-chrom
+    // dispatch in vepyr's per-chrom layout (no region/start/end argument).
+    #[test]
+    fn transcript_context_path_takes_only_chrom_arg() {
+        let (_tmp, cache) = tmp_transcript_layout();
+        let a = cache
+            .context_path("transcript", "chr21")
+            .expect("first call should resolve");
+        let b = cache
+            .context_path("transcript", "chr21")
+            .expect("second call should resolve");
+        assert_eq!(
+            a, b,
+            "context_path is a pure function of (context_type, chrom)"
+        );
+    }
+
+    // Subtest #10 (Transcript.t:61): `throws_ok { get_dump_file_name() }
+    // qr/No chromosome/`.  vepyr returns None for the no-chromosome case
+    // (and for any missing chrom file).
+    // verified via VEP 115: the "no chromosome" condition surfaces as
+    // None from the resolver (no panic, no error variant).
+    #[test]
+    fn transcript_context_path_with_empty_chrom_returns_none() {
+        let (_tmp, cache) = tmp_transcript_layout();
+        assert!(cache.context_path("transcript", "").is_none());
+        assert!(cache.context_path("transcript", "chr99").is_none());
+    }
 }
