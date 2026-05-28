@@ -31,7 +31,7 @@ use super::key_encoding::chrom_to_code;
 use super::kv_store::RangePrefetchLimitExceeded;
 use super::kv_store::VepKvStore;
 use super::position_entry::{PositionEntryReader, make_builder};
-use super::position_index::cold_variation_file_for_chrom;
+use super::position_index::{PositionIndexSource, cold_variation_file_for_chrom};
 use crate::allele::{
     VariantAlleleInput, allele_matches, get_matched_variant_alleles, vcf_to_vep_allele,
     vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
@@ -468,12 +468,16 @@ struct LookupProfile {
     warm_definitive_misses: u64,
     warm_not_covered: u64,
     warm_boundary_fallbacks: u64,
+    warm_candidate_rows: u64,
+    warm_rows_scanned: u64,
     warm_chunks_loaded: u64,
     warm_chunk_rows: u64,
     position_index_checks: u64,
     position_index_negative_skips: u64,
     position_index_positive_gets: u64,
     position_index_loaded: u64,
+    position_index_persisted_loads: u64,
+    position_index_parquet_fallback_loads: u64,
     position_index_rows: u64,
     position_index_bytes: u64,
 }
@@ -565,21 +569,25 @@ impl LookupProfile {
                 self.null_rows,
             ),
             format!(
-                "[vep-kv-profile-detail] warm probes={} matches={} definitive_misses={} not_covered={} boundary_fallbacks={} chunks_loaded={} chunk_rows={}",
+                "[vep-kv-profile-detail] warm probes={} matches={} definitive_misses={} not_covered={} boundary_fallbacks={} candidate_rows={} rows_scanned={} chunks_loaded={} chunk_rows={}",
                 self.warm_probes,
                 self.warm_matches,
                 self.warm_definitive_misses,
                 self.warm_not_covered,
                 self.warm_boundary_fallbacks,
+                self.warm_candidate_rows,
+                self.warm_rows_scanned,
                 self.warm_chunks_loaded,
                 self.warm_chunk_rows,
             ),
             format!(
-                "[vep-kv-profile-detail] position_index checks={} negative_skips={} positive_gets={} loaded={} rows={} bytes={}",
+                "[vep-kv-profile-detail] position_index checks={} negative_skips={} positive_gets={} loaded={} persisted_loads={} parquet_fallback_loads={} rows={} bytes={}",
                 self.position_index_checks,
                 self.position_index_negative_skips,
                 self.position_index_positive_gets,
                 self.position_index_loaded,
+                self.position_index_persisted_loads,
+                self.position_index_parquet_fallback_loads,
                 self.position_index_rows,
                 self.position_index_bytes,
             ),
@@ -897,6 +905,14 @@ impl KvLookupStream {
                                 self.profile.position_index_load += t0.elapsed();
                             }
                             self.profile.position_index_loaded += 1;
+                            match cache.cold_position_source() {
+                                PositionIndexSource::Persisted => {
+                                    self.profile.position_index_persisted_loads += 1;
+                                }
+                                PositionIndexSource::ParquetFallback => {
+                                    self.profile.position_index_parquet_fallback_loads += 1;
+                                }
+                            }
                             self.profile.position_index_rows += cache.cold_position_len() as u64;
                             self.profile.position_index_bytes +=
                                 cache.cold_position_storage_bytes() as u64;
@@ -930,6 +946,8 @@ impl KvLookupStream {
         let mut exact_match_calls = 0_u64;
         let mut colocated_allele_rows = 0_u64;
         let mut colocated_entries = 0_u64;
+        let mut warm_candidate_rows = 0_u64;
+        let mut warm_rows_scanned = 0_u64;
         let started = self.profile_enabled.then(Instant::now);
         let warm_chrom = self
             .warm_chroms
@@ -991,6 +1009,7 @@ impl KvLookupStream {
             let chunk = warm_chrom
                 .current_chunk()
                 .ok_or_else(|| DataFusionError::Execution("warm chunk not loaded".into()))?;
+            warm_rows_scanned += 1;
             let matched = chunk
                 .allele_string(row as usize)?
                 .map(|allele_string| row_matches(chunk, row, allele_string))
@@ -1007,6 +1026,7 @@ impl KvLookupStream {
                     .current_chunk()
                     .ok_or_else(|| DataFusionError::Execution("warm chunk not loaded".into()))?;
                 for row in rows {
+                    warm_rows_scanned += 1;
                     let Some(allele_string) = chunk.allele_string(row as usize)? else {
                         continue;
                     };
@@ -1165,6 +1185,9 @@ impl KvLookupStream {
         } else {
             WarmProbeForDecision::NotCovered
         };
+        if let Some(rows) = position_rows.as_ref() {
+            warm_candidate_rows += u64::from(rows.end.saturating_sub(rows.start));
+        }
 
         let mut position_index_checks = 0_u64;
         let mut position_index_positive_gets = 0_u64;
@@ -1200,6 +1223,8 @@ impl KvLookupStream {
             self.profile.position_index_checks += position_index_checks;
             self.profile.position_index_positive_gets += position_index_positive_gets;
             self.profile.position_index_negative_skips += position_index_negative_skips;
+            self.profile.warm_candidate_rows += warm_candidate_rows;
+            self.profile.warm_rows_scanned += warm_rows_scanned;
             if decision == LookupDecision::EmitWarmExact {
                 self.profile.warm_matches += 1;
             } else if decision == LookupDecision::SkipFjall {
@@ -2713,8 +2738,11 @@ mod tests {
         profile.warm_definitive_misses = 29;
         profile.warm_not_covered = 30;
         profile.warm_boundary_fallbacks = 31;
-        profile.warm_chunks_loaded = 32;
-        profile.warm_chunk_rows = 33;
+        profile.warm_candidate_rows = 32;
+        profile.warm_rows_scanned = 33;
+        profile.warm_chunks_loaded = 34;
+        profile.warm_chunk_rows = 35;
+        profile.position_index_persisted_loads = 1;
 
         let lines = profile.detail_lines();
 
@@ -2731,8 +2759,11 @@ mod tests {
         assert!(lines[2].contains("null_rows=26"));
         assert!(lines[3].contains("probes=27"));
         assert!(lines[3].contains("definitive_misses=29"));
-        assert!(lines[3].contains("chunk_rows=33"));
+        assert!(lines[3].contains("candidate_rows=32"));
+        assert!(lines[3].contains("rows_scanned=33"));
+        assert!(lines[3].contains("chunk_rows=35"));
         assert!(lines[4].contains("position_index checks=0"));
+        assert!(lines[4].contains("persisted_loads=1"));
     }
 
     #[test]
