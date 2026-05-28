@@ -11,6 +11,7 @@ pub mod key_encoding;
 pub mod kv_store;
 pub mod loader;
 pub mod position_entry;
+pub mod position_index;
 pub mod sift_store;
 
 pub use cache_provider::KvCacheTableProvider;
