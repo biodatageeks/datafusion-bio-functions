@@ -34,7 +34,8 @@
     clippy::assigning_clones,
     clippy::map_entry,
     clippy::cloned_ref_to_slice_refs,
-    clippy::unwrap_or_default
+    clippy::unwrap_or_default,
+    clippy::needless_option_as_deref
 )]
 
 pub mod allele;

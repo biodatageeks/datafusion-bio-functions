@@ -129,126 +129,35 @@ impl Drop for VcfBodyTempDir {
     }
 }
 
-fn parallel_vcf_format_env_enabled() -> bool {
-    std::env::var("VEP_VCF_PARALLEL_FORMAT")
-        .map(|value| value != "0")
-        .unwrap_or(true)
-        && std::env::var("VEP_VCF_BYTE_CHUNKS")
-            .map(|value| value != "0")
-            .unwrap_or(true)
-}
-
-fn parallel_vcf_format_enabled(plan: VepConcurrencyPlan) -> bool {
-    plan.formatter_workers > 0 && parallel_vcf_format_env_enabled()
-}
-
-fn parallel_vcf_format_jobs(plan: VepConcurrencyPlan) -> usize {
-    plan.formatter_workers.max(1)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VepConcurrencyPlan {
     lookup_partitions: usize,
-    annotation_workers: usize,
-    formatter_workers: usize,
-    contig_parallelism: usize,
+    chromosome_lanes: usize,
     inline_lookup: bool,
     spawn_vcf_provider_open: bool,
 }
 
 impl VepConcurrencyPlan {
     fn from_config(config: &AnnotateVcfConfig) -> Self {
-        if let Some(forks) = config.forks {
-            return Self::from_forks(forks, config.contig_parallelism);
-        }
-
-        let target_partitions = config.target_partitions.max(1);
-        Self::from_parallel_budget(target_partitions, config.contig_parallelism, false)
+        Self::from_forks(config.forks.unwrap_or(0))
     }
 
-    fn from_forks(forks: usize, requested_contig_parallelism: usize) -> Self {
+    fn from_forks(forks: usize) -> Self {
         if forks == 0 {
             return Self {
                 lookup_partitions: 1,
-                annotation_workers: 1,
-                formatter_workers: 0,
-                contig_parallelism: 1,
+                chromosome_lanes: 1,
                 inline_lookup: true,
                 spawn_vcf_provider_open: false,
             };
         }
 
-        let forks = forks.max(1);
-        let contig_parallelism = requested_contig_parallelism.max(1);
-        if forks == 1 && contig_parallelism == 1 {
-            return Self {
-                lookup_partitions: 1,
-                annotation_workers: 1,
-                formatter_workers: 0,
-                contig_parallelism: 1,
-                inline_lookup: false,
-                spawn_vcf_provider_open: true,
-            };
-        }
-
-        if contig_parallelism > 1 {
-            Self {
-                lookup_partitions: forks,
-                annotation_workers: forks,
-                formatter_workers: 0,
-                contig_parallelism,
-                inline_lookup: false,
-                spawn_vcf_provider_open: true,
-            }
-        } else {
-            Self {
-                lookup_partitions: forks,
-                annotation_workers: forks,
-                formatter_workers: forks,
-                contig_parallelism: 1,
-                inline_lookup: false,
-                spawn_vcf_provider_open: true,
-            }
-        }
-    }
-
-    fn from_parallel_budget(
-        total_workers: usize,
-        requested_contig_parallelism: usize,
-        preserve_single_partition_path: bool,
-    ) -> Self {
-        let total_workers = total_workers.max(1);
-        if preserve_single_partition_path || total_workers == 1 {
-            return Self {
-                lookup_partitions: 1,
-                annotation_workers: 1,
-                formatter_workers: 0,
-                contig_parallelism: 1,
-                inline_lookup: false,
-                spawn_vcf_provider_open: true,
-            };
-        }
-
-        let contig_parallelism = requested_contig_parallelism.max(1).min(total_workers);
-        if contig_parallelism > 1 {
-            let per_contig_workers = (total_workers / contig_parallelism).max(1);
-            Self {
-                lookup_partitions: per_contig_workers,
-                annotation_workers: per_contig_workers,
-                formatter_workers: 0,
-                contig_parallelism,
-                inline_lookup: false,
-                spawn_vcf_provider_open: true,
-            }
-        } else {
-            Self {
-                lookup_partitions: total_workers,
-                annotation_workers: total_workers,
-                formatter_workers: total_workers,
-                contig_parallelism: 1,
-                inline_lookup: false,
-                spawn_vcf_provider_open: true,
-            }
+        let chromosome_lanes = forks.max(1);
+        Self {
+            lookup_partitions: 1,
+            chromosome_lanes,
+            inline_lookup: false,
+            spawn_vcf_provider_open: true,
         }
     }
 }
@@ -885,20 +794,10 @@ pub struct AnnotateVcfConfig {
     pub distance: Option<String>,
     /// Number of input variants per VEP-style annotation buffer.
     pub buffer_size: usize,
-    /// Experimental VEP-style path that builds raw VCF buffers first, then
-    /// runs fjall lookup + annotation over chunks inside each buffer.
-    pub chunked_buffer_lookup: bool,
-    /// DataFusion target partitions for the annotation session.
-    pub target_partitions: usize,
-    /// User-facing fork count. `None` preserves legacy `target_partitions`
-    /// behavior; `Some(0)` is a strict single-lane path with no helper lookup
-    /// or formatting tasks; `Some(n)` uses `n` lookup, annotation, and
-    /// formatter workers.
+    /// User-facing chromosome lane count. Missing or `Some(0)` is a strict
+    /// single-lane path with no helper lookup task; `Some(n)` runs up to `n`
+    /// contigs concurrently.
     pub forks: Option<usize>,
-    /// Number of chromosome streams to run concurrently. When greater than
-    /// one, the total fork budget is split across active chromosomes and the
-    /// final VCF body is merged in input contig order.
-    pub contig_parallelism: usize,
     /// Output compression type.
     pub compression: VcfCompressionType,
     /// Show an indicatif progress bar on stderr (for Rust CLI).
@@ -940,10 +839,7 @@ impl Default for AnnotateVcfConfig {
             failed: None,
             distance: None,
             buffer_size: VEP_DEFAULT_BUFFER_SIZE,
-            chunked_buffer_lookup: false,
-            target_partitions: 1,
-            forks: None,
-            contig_parallelism: 1,
+            forks: Some(0),
             compression: VcfCompressionType::Plain,
             show_progress: false,
             on_batch_written: None,
@@ -956,10 +852,7 @@ impl std::fmt::Debug for AnnotateVcfConfig {
         f.debug_struct("AnnotateVcfConfig")
             .field("everything", &self.everything)
             .field("buffer_size", &self.buffer_size)
-            .field("chunked_buffer_lookup", &self.chunked_buffer_lookup)
-            .field("target_partitions", &self.target_partitions)
             .field("forks", &self.forks)
-            .field("contig_parallelism", &self.contig_parallelism)
             .field("compression", &self.compression)
             .field("show_progress", &self.show_progress)
             .field("on_batch_written", &self.on_batch_written.is_some())
@@ -1051,32 +944,12 @@ impl AnnotateVcfConfig {
             "buffer_size".into(),
             serde_json::Value::Number(serde_json::Number::from(self.buffer_size)),
         );
-        if self.chunked_buffer_lookup {
-            opts.insert(
-                "chunked_buffer_lookup".into(),
-                serde_json::Value::Bool(true),
-            );
-        }
-        if self.contig_parallelism > 1 {
-            opts.insert(
-                "contig_parallelism".into(),
-                serde_json::Value::Number(serde_json::Number::from(self.contig_parallelism)),
-            );
-        }
         if let Some(forks) = self.forks {
-            let plan = VepConcurrencyPlan::from_config(self);
             opts.insert(
                 "forks".into(),
                 serde_json::Value::Number(serde_json::Number::from(forks)),
             );
-            opts.insert(
-                "annotation_workers".into(),
-                serde_json::Value::Number(serde_json::Number::from(plan.annotation_workers)),
-            );
-            opts.insert(
-                "inline_lookup".into(),
-                serde_json::Value::Bool(plan.inline_lookup),
-            );
+            opts.insert("inline_lookup".into(), serde_json::Value::Bool(forks == 0));
         }
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
@@ -1134,11 +1007,9 @@ pub async fn annotate_to_vcf(
     let concurrency_plan = VepConcurrencyPlan::from_config(config);
     if sink_profile_enabled() {
         eprintln!(
-            "[VEP_PROFILE] concurrency_plan lookup_partitions={} annotation_workers={} formatter_workers={} contig_parallelism={} inline_lookup={} spawn_vcf_provider_open={}",
+            "[VEP_PROFILE] concurrency_plan lookup_partitions={} chromosome_lanes={} inline_lookup={} spawn_vcf_provider_open={}",
             concurrency_plan.lookup_partitions,
-            concurrency_plan.annotation_workers,
-            concurrency_plan.formatter_workers,
-            concurrency_plan.contig_parallelism,
+            concurrency_plan.chromosome_lanes,
             concurrency_plan.inline_lookup,
             concurrency_plan.spawn_vcf_provider_open
         );
@@ -1339,7 +1210,7 @@ pub async fn annotate_to_vcf(
     let mut total_rows = 0;
     let mut sink_profile = sink_profile_enabled().then(VcfSinkProfile::default);
 
-    if concurrency_plan.contig_parallelism > 1 {
+    if concurrency_plan.chromosome_lanes > 1 {
         total_rows = stream_partitioned_vcf_body(
             df,
             &mut writer,
@@ -1350,112 +1221,10 @@ pub async fn annotate_to_vcf(
             Arc::new(unique_format_tags),
             Arc::new(sample_names),
             coordinate_zero_based,
-            concurrency_plan.contig_parallelism,
+            concurrency_plan.chromosome_lanes,
             &mut sink_profile,
         )
         .await?;
-    } else if parallel_vcf_format_enabled(concurrency_plan) {
-        use futures::StreamExt;
-        let mut stream = df.execute_stream().await?;
-        let vcf_info_fields = Arc::new(vcf_info_fields);
-        let unique_format_tags = Arc::new(unique_format_tags);
-        let sample_names = Arc::new(sample_names);
-        let max_format_jobs = parallel_vcf_format_jobs(concurrency_plan);
-        let mut format_jobs = tokio::task::JoinSet::new();
-        let mut ready_chunks = BTreeMap::new();
-        let mut next_input_batch_id = 0;
-        let mut next_write_batch_id = 0;
-        let mut input_done = false;
-
-        loop {
-            while !input_done && format_jobs.len() < max_format_jobs {
-                let stream_started = Instant::now();
-                let next_batch = stream.next().await;
-                let stream_elapsed = stream_started.elapsed();
-                if let Some(profile) = sink_profile.as_mut() {
-                    profile.stream_next += stream_elapsed;
-                }
-
-                let Some(batch_result) = next_batch else {
-                    input_done = true;
-                    break;
-                };
-
-                let batch = batch_result?;
-                let batch_id = next_input_batch_id;
-                next_input_batch_id += 1;
-                pipeline_trace::emit(
-                    "vcf_stream",
-                    "batch_ready",
-                    &[
-                        ("batch_id", TraceValue::Usize(batch_id)),
-                        ("rows", TraceValue::Usize(batch.num_rows())),
-                        ("stream_wait", TraceValue::Duration(stream_elapsed)),
-                    ],
-                );
-                let vcf_info_fields = Arc::clone(&vcf_info_fields);
-                let unique_format_tags = Arc::clone(&unique_format_tags);
-                let sample_names = Arc::clone(&sample_names);
-                format_jobs.spawn_blocking(move || {
-                    format_vcf_body_chunk(
-                        batch_id,
-                        batch,
-                        vcf_info_fields,
-                        unique_format_tags,
-                        sample_names,
-                        coordinate_zero_based,
-                    )
-                });
-                if let Some(profile) = sink_profile.as_mut() {
-                    profile.format_jobs += 1;
-                    profile.format_inflight_max =
-                        profile.format_inflight_max.max(format_jobs.len());
-                }
-            }
-
-            drain_ready_vcf_chunks(
-                &mut ready_chunks,
-                &mut next_write_batch_id,
-                &mut writer,
-                &pb,
-                config,
-                total_input,
-                &mut total_rows,
-                &mut sink_profile,
-            )?;
-
-            if input_done && format_jobs.is_empty() {
-                break;
-            }
-
-            if format_jobs.is_empty() {
-                continue;
-            }
-
-            let wait_started = Instant::now();
-            let join_result = format_jobs.join_next().await;
-            if let Some(profile) = sink_profile.as_mut() {
-                profile.format_wait += wait_started.elapsed();
-            }
-            let Some(join_result) = join_result else {
-                continue;
-            };
-            let formatted = join_result.map_err(|e| {
-                DataFusionError::Execution(format!("VCF formatter task failed: {e}"))
-            })??;
-            ready_chunks.insert(formatted.batch_id, formatted);
-        }
-
-        drain_ready_vcf_chunks(
-            &mut ready_chunks,
-            &mut next_write_batch_id,
-            &mut writer,
-            &pb,
-            config,
-            total_input,
-            &mut total_rows,
-            &mut sink_profile,
-        )?;
     } else {
         use futures::StreamExt;
         let mut stream = df.execute_stream().await?;
@@ -1596,35 +1365,16 @@ mod tests {
     }
 
     #[test]
-    fn test_to_options_json_emits_chunked_buffer_lookup() {
-        let config = AnnotateVcfConfig {
-            chunked_buffer_lookup: true,
-            ..Default::default()
-        };
-
-        let json = config.to_options_json();
-        assert!(json.contains("\"chunked_buffer_lookup\":true"));
-    }
-
-    #[test]
-    fn test_default_target_partitions_is_one() {
-        assert_eq!(AnnotateVcfConfig::default().target_partitions, 1);
-    }
-
-    #[test]
     fn test_forks_zero_derives_strict_inline_concurrency_plan() {
         let config = AnnotateVcfConfig {
             forks: Some(0),
-            target_partitions: 8,
             ..Default::default()
         };
 
         let plan = VepConcurrencyPlan::from_config(&config);
 
         assert_eq!(plan.lookup_partitions, 1);
-        assert_eq!(plan.annotation_workers, 1);
-        assert_eq!(plan.formatter_workers, 0);
-        assert_eq!(plan.contig_parallelism, 1);
+        assert_eq!(plan.chromosome_lanes, 1);
         assert!(plan.inline_lookup);
         assert!(!plan.spawn_vcf_provider_open);
     }
@@ -1633,77 +1383,36 @@ mod tests {
     fn test_forks_one_preserves_legacy_single_partition_plan() {
         let config = AnnotateVcfConfig {
             forks: Some(1),
-            target_partitions: 8,
             ..Default::default()
         };
 
         let plan = VepConcurrencyPlan::from_config(&config);
 
         assert_eq!(plan.lookup_partitions, 1);
-        assert_eq!(plan.annotation_workers, 1);
-        assert_eq!(plan.formatter_workers, 0);
-        assert_eq!(plan.contig_parallelism, 1);
+        assert_eq!(plan.chromosome_lanes, 1);
         assert!(!plan.inline_lookup);
         assert!(plan.spawn_vcf_provider_open);
     }
 
     #[test]
-    fn test_forks_nonzero_uses_fork_count_for_parallel_stages() {
+    fn test_forks_nonzero_uses_fork_count_for_chromosome_lanes() {
         let config = AnnotateVcfConfig {
             forks: Some(4),
-            target_partitions: 1,
             ..Default::default()
         };
 
         let plan = VepConcurrencyPlan::from_config(&config);
 
-        assert_eq!(plan.lookup_partitions, 4);
-        assert_eq!(plan.annotation_workers, 4);
-        assert_eq!(plan.formatter_workers, 4);
-        assert_eq!(plan.contig_parallelism, 1);
+        assert_eq!(plan.lookup_partitions, 1);
+        assert_eq!(plan.chromosome_lanes, 4);
         assert!(!plan.inline_lookup);
         assert!(plan.spawn_vcf_provider_open);
-    }
-
-    #[test]
-    fn test_missing_forks_preserves_target_partitions_behavior() {
-        let config = AnnotateVcfConfig {
-            forks: None,
-            target_partitions: 4,
-            ..Default::default()
-        };
-
-        let plan = VepConcurrencyPlan::from_config(&config);
-
-        assert_eq!(plan.lookup_partitions, 4);
-        assert_eq!(plan.annotation_workers, 4);
-        assert_eq!(plan.formatter_workers, 4);
-        assert_eq!(plan.contig_parallelism, 1);
-        assert!(!plan.inline_lookup);
-        assert!(plan.spawn_vcf_provider_open);
-    }
-
-    #[test]
-    fn test_contig_parallelism_keeps_forks_per_chromosome() {
-        let config = AnnotateVcfConfig {
-            forks: Some(8),
-            contig_parallelism: 4,
-            ..Default::default()
-        };
-
-        let plan = VepConcurrencyPlan::from_config(&config);
-
-        assert_eq!(plan.lookup_partitions, 8);
-        assert_eq!(plan.annotation_workers, 8);
-        assert_eq!(plan.formatter_workers, 0);
-        assert_eq!(plan.contig_parallelism, 4);
     }
 
     #[test]
     fn test_to_options_json_emits_forks_plan_when_set() {
         let config = AnnotateVcfConfig {
             forks: Some(0),
-            target_partitions: 8,
             ..Default::default()
         };
 
@@ -1711,23 +1420,20 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(value["forks"], 0);
-        assert_eq!(value["annotation_workers"], 1);
         assert_eq!(value["inline_lookup"], true);
     }
 
     #[test]
-    fn test_to_options_json_emits_contig_parallelism() {
+    fn test_to_options_json_emits_only_forks_for_chromosome_lanes() {
         let config = AnnotateVcfConfig {
             forks: Some(8),
-            contig_parallelism: 4,
             ..Default::default()
         };
 
         let json = config.to_options_json();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(value["contig_parallelism"], 4);
-        assert_eq!(value["annotation_workers"], 8);
+        assert_eq!(value["forks"], 8);
     }
 
     #[test]

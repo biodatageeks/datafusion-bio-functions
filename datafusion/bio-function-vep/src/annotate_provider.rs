@@ -7,7 +7,6 @@
 //! - otherwise falls back to phase-1.5 known-variant CSQ placeholders.
 
 use std::any::Any;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -23,6 +22,11 @@ use std::time::{Duration, Instant};
 /// Returns true when VEP_PROFILE env var is set (any value).
 fn profiling_enabled() -> bool {
     std::env::var("VEP_PROFILE").is_ok()
+}
+
+/// Returns true when detailed annotation-engine profiling is enabled.
+fn engine_profiling_enabled() -> bool {
+    std::env::var("VEP_ENGINE_PROFILE").is_ok()
 }
 
 macro_rules! profile_start {
@@ -53,6 +57,97 @@ macro_rules! profile_end {
             );
         }
     };
+}
+
+macro_rules! engine_profile_time {
+    ($enabled:expr, $profile:expr, $field:ident, $block:block) => {{
+        if $enabled {
+            let __engine_profile_started = Instant::now();
+            let __engine_profile_result = { $block };
+            $profile.$field += __engine_profile_started.elapsed();
+            __engine_profile_result
+        } else {
+            $block
+        }
+    }};
+}
+
+#[derive(Debug, Default)]
+struct EngineAnnotationProfile {
+    rows: usize,
+    null_chrom_rows: usize,
+    null_alt_rows: usize,
+    star_allele_rows: usize,
+    cached_fast_rows: usize,
+    engine_rows: usize,
+    assignments: usize,
+    picked_assignments: usize,
+    csq_entries: usize,
+    typed_rows: usize,
+    skip_csq: bool,
+    skip_typed_cols: bool,
+    everything: bool,
+    row_setup: Duration,
+    colocated_fields: Duration,
+    batch3_suffix: Duration,
+    cached_fast_path: Duration,
+    variant_construct: Duration,
+    hgvs_shift: Duration,
+    evaluate_prepared: Duration,
+    collapse_pick_sort: Duration,
+    csq_format: Duration,
+    sift_polyphen: Duration,
+    domains: Duration,
+    mirna: Duration,
+    append_scalars: Duration,
+    typed_columns: Duration,
+    finish_builders: Duration,
+}
+
+impl EngineAnnotationProfile {
+    fn new(rows: usize, skip_csq: bool, skip_typed_cols: bool, everything: bool) -> Self {
+        Self {
+            rows,
+            skip_csq,
+            skip_typed_cols,
+            everything,
+            ..Self::default()
+        }
+    }
+
+    fn summary_line(&self) -> String {
+        format!(
+            "[VEP_ENGINE_PROFILE] rows={} null_chrom_rows={} null_alt_rows={} star_allele_rows={} cached_fast_rows={} engine_rows={} assignments={} picked_assignments={} csq_entries={} typed_rows={} skip_csq={} skip_typed_cols={} everything={} row_setup={:.6}s colocated_fields={:.6}s batch3_suffix={:.6}s cached_fast_path={:.6}s variant_construct={:.6}s hgvs_shift={:.6}s evaluate_prepared={:.6}s collapse_pick_sort={:.6}s csq_format={:.6}s sift_polyphen={:.6}s domains={:.6}s mirna={:.6}s append_scalars={:.6}s typed_columns={:.6}s finish_builders={:.6}s",
+            self.rows,
+            self.null_chrom_rows,
+            self.null_alt_rows,
+            self.star_allele_rows,
+            self.cached_fast_rows,
+            self.engine_rows,
+            self.assignments,
+            self.picked_assignments,
+            self.csq_entries,
+            self.typed_rows,
+            self.skip_csq,
+            self.skip_typed_cols,
+            self.everything,
+            self.row_setup.as_secs_f64(),
+            self.colocated_fields.as_secs_f64(),
+            self.batch3_suffix.as_secs_f64(),
+            self.cached_fast_path.as_secs_f64(),
+            self.variant_construct.as_secs_f64(),
+            self.hgvs_shift.as_secs_f64(),
+            self.evaluate_prepared.as_secs_f64(),
+            self.collapse_pick_sort.as_secs_f64(),
+            self.csq_format.as_secs_f64(),
+            self.sift_polyphen.as_secs_f64(),
+            self.domains.as_secs_f64(),
+            self.mirna.as_secs_f64(),
+            self.append_scalars.as_secs_f64(),
+            self.typed_columns.as_secs_f64(),
+            self.finish_builders.as_secs_f64(),
+        )
+    }
 }
 
 use async_trait::async_trait;
@@ -86,8 +181,6 @@ use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 use crate::config;
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
-#[cfg(feature = "kv-cache")]
-use crate::kv_cache::cache_exec::lookup_batch_with_store;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::partitioned_cache::PartitionedParquetCache;
@@ -97,8 +190,9 @@ use crate::transcript_consequence::{
     CachedPredictions, CompactPrediction, ExonFeature, FeatureType, MirnaFeature, MotifFeature,
     PreparedContext, ProteinDomainFeature, RefSeqEdit, RegulatoryFeature, SiftPolyphenCache,
     StructuralFeature, SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment,
-    TranscriptConsequence, TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature,
-    VariantInput, infer_refseq_deletion_edits_from_sequences, refseq_edit_offset_delta,
+    TranscriptConsequence, TranscriptConsequenceEngine, TranscriptEngineProfile, TranscriptFeature,
+    TranslationFeature, VariantInput, infer_refseq_deletion_edits_from_sequences,
+    refseq_edit_offset_delta,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -4295,59 +4389,23 @@ impl AnnotateProvider {
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0)
             .unwrap_or(VEP_INPUT_BUFFER_SIZE);
-        let target_partitions = state.config().target_partitions().max(1);
         let forks = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_i64_option(opts, "forks"))
-            .and_then(|value| usize::try_from(value).ok());
-        let annotation_workers = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_i64_option(opts, "annotation_workers"))
             .and_then(|value| usize::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .or_else(|| forks.map(|value| value.max(1)))
-            .unwrap_or(target_partitions);
-        let contig_parallelism = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_i64_option(opts, "contig_parallelism"))
-            .and_then(|value| usize::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(1);
-        let contig_parallelism = if fetch_limit.is_some() {
+            .unwrap_or(0);
+        let chromosome_lanes = if forks > 0 { forks } else { 1 };
+        let chromosome_lanes = if fetch_limit.is_some() {
             1
         } else {
-            contig_parallelism
+            chromosome_lanes
         };
         let inline_lookup = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "inline_lookup"))
-            .unwrap_or(forks == Some(0));
-        let requested_chunked_buffer_lookup = self
-            .options_json
-            .as_deref()
-            .and_then(|opts| Self::parse_json_bool_option(opts, "chunked_buffer_lookup"))
-            .unwrap_or(false);
-        let chunked_buffer_lookup = effective_chunked_buffer_lookup(
-            requested_chunked_buffer_lookup,
-            annotation_workers,
-            contig_parallelism,
-        );
-        #[cfg(feature = "kv-cache")]
-        if chunked_buffer_lookup && kv_store.is_none() {
-            return Err(DataFusionError::Execution(
-                "annotate_vep(): chunked_buffer_lookup requires use_fjall=true".to_string(),
-            ));
-        }
-        #[cfg(not(feature = "kv-cache"))]
-        if chunked_buffer_lookup {
-            return Err(DataFusionError::Execution(
-                "annotate_vep(): chunked_buffer_lookup requires kv-cache feature".to_string(),
-            ));
-        }
+            .unwrap_or(forks == 0);
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
 
@@ -4407,15 +4465,9 @@ impl AnnotateProvider {
             projection: projection.cloned(),
             annotation_column_count: self.annotation_column_count(),
             fetch_limit,
-            target_partitions,
-            annotation_workers,
-            contig_parallelism,
-            chunked_buffer_lookup,
-            lookup_vcf_has_chr: true,
-            lookup_vcf_zero_based: true,
-            lookup_cache_zero_based: false,
+            chromosome_lanes,
             inline_lookup,
-            deregister_global_kv_on_finish: contig_parallelism <= 1,
+            deregister_global_kv_on_finish: chromosome_lanes <= 1,
             #[cfg(feature = "kv-cache")]
             use_fjall: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
@@ -4434,7 +4486,7 @@ impl AnnotateProvider {
             projected_schema,
             self.schema.clone(),
             contigs,
-            contig_parallelism,
+            chromosome_lanes,
             Arc::clone(&self.session),
             Arc::new(cache.clone()),
             config,
@@ -4686,15 +4738,32 @@ impl AnnotateProvider {
             transcript_selection,
             include_pick_output,
         );
+        let engine_profile_enabled = engine_profiling_enabled();
+        let mut engine_profile = EngineAnnotationProfile::new(
+            batch.num_rows(),
+            skip_csq,
+            skip_typed_cols,
+            flags.everything,
+        );
+        let mut tx_engine_profile = engine_profile_enabled.then(TranscriptEngineProfile::default);
 
         for row in 0..batch.num_rows() {
+            let row_setup_started = engine_profile_enabled.then(Instant::now);
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                if let Some(started) = row_setup_started {
+                    engine_profile.null_chrom_rows += 1;
+                    engine_profile.row_setup += started.elapsed();
+                }
                 csq_builder.append_null();
                 most_builder.append_null();
                 append_null_annotation_row!();
                 continue;
             };
             let Some(alt_allele) = string_at(batch.column(alt_idx).as_ref(), row) else {
+                if let Some(started) = row_setup_started {
+                    engine_profile.null_alt_rows += 1;
+                    engine_profile.row_setup += started.elapsed();
+                }
                 csq_builder.append_null();
                 most_builder.append_null();
                 append_null_annotation_row!();
@@ -4703,6 +4772,10 @@ impl AnnotateProvider {
 
             // VEP skips star alleles entirely — no CSQ produced.
             if alt_allele == "*" {
+                if let Some(started) = row_setup_started {
+                    engine_profile.star_allele_rows += 1;
+                    engine_profile.row_setup += started.elapsed();
+                }
                 csq_builder.append_null();
                 most_builder.append_null();
                 append_null_annotation_row!();
@@ -4723,6 +4796,9 @@ impl AnnotateProvider {
             let _variation_name = variation_name_idx
                 .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 .unwrap_or_default();
+            if let Some(started) = row_setup_started {
+                engine_profile.row_setup += started.elapsed();
+            }
 
             // --- Batch 3: per-variant fields (same for every transcript entry) ---
             // Look up co-located variant aggregation (all variants at same position).
@@ -4734,6 +4810,7 @@ impl AnnotateProvider {
             //
             // VEP keys the existing-variant overlap/matching flow in parser/input
             // coordinate space, not the fully minimized VEP-normalized allele space.
+            let colocated_started = engine_profile_enabled.then(Instant::now);
             let start_val = int64_at(batch.column(start_idx).as_ref(), row).unwrap_or(0);
             let end_val = int64_at(batch.column(end_idx).as_ref(), row).unwrap_or(0);
             let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
@@ -4781,18 +4858,24 @@ impl AnnotateProvider {
                 )
             };
             let existing_var = variant_fields.existing_variation.as_str();
+            if let Some(started) = colocated_started {
+                engine_profile.colocated_fields += started.elapsed();
+            }
 
             // Build the 33-field Batch 3 suffix (positions 41-73) shared across all transcripts.
-            let batch3_suffix = format!(
-                "{}|{}|{}|{}|{}|{}|{}",
-                frequency_fields.af_values.join("|"),
-                frequency_fields.max_af,
-                frequency_fields.max_af_pops,
-                variant_fields.clin_sig,
-                variant_fields.somatic,
-                variant_fields.pheno,
-                variant_fields.pubmed,
-            );
+            let batch3_suffix =
+                engine_profile_time!(engine_profile_enabled, engine_profile, batch3_suffix, {
+                    format!(
+                        "{}|{}|{}|{}|{}|{}|{}",
+                        frequency_fields.af_values.join("|"),
+                        frequency_fields.max_af,
+                        frequency_fields.max_af_pops,
+                        variant_fields.clin_sig,
+                        variant_fields.somatic,
+                        variant_fields.pheno,
+                        variant_fields.pubmed,
+                    )
+                });
 
             let most_str;
             // Store assignment results from cache-miss path for annotation column population.
@@ -4806,9 +4889,16 @@ impl AnnotateProvider {
             }
             let use_cached_fast_path = cached_most.is_some() && !require_transcript_annotations;
             if use_cached_fast_path {
+                let cached_fast_started = engine_profile_enabled.then(Instant::now);
+                if engine_profile_enabled {
+                    engine_profile.cached_fast_rows += 1;
+                }
                 use std::fmt::Write;
                 let most_val = cached_most.as_deref().unwrap_or_default();
                 if !skip_csq {
+                    if engine_profile_enabled {
+                        engine_profile.csq_entries += 1;
+                    }
                     let csq_val = cached_csq.unwrap_or_default();
                     let impact = SoTerm::from_str(most_val)
                         .map(|t| impact_label(t.impact()))
@@ -4825,22 +4915,38 @@ impl AnnotateProvider {
                     placeholder_layout.append_entry(&mut csq_buf, &entry);
                 }
                 most_str = most_val.to_string();
+                if let Some(started) = cached_fast_started {
+                    engine_profile.cached_fast_path += started.elapsed();
+                }
             } else {
+                if engine_profile_enabled {
+                    engine_profile.engine_rows += 1;
+                }
                 use std::fmt::Write;
                 // Cache miss — compute via transcript engine and produce per-transcript CSQ.
+                let variant_construct_started = engine_profile_enabled.then(Instant::now);
                 let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    if let Some(started) = variant_construct_started {
+                        engine_profile.variant_construct += started.elapsed();
+                    }
                     csq_builder.append_null();
                     most_builder.append_null();
                     append_null_annotation_row!();
                     continue;
                 };
                 let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    if let Some(started) = variant_construct_started {
+                        engine_profile.variant_construct += started.elapsed();
+                    }
                     csq_builder.append_null();
                     most_builder.append_null();
                     append_null_annotation_row!();
                     continue;
                 };
                 let Some(ref_allele) = string_at(batch.column(ref_idx).as_ref(), row) else {
+                    if let Some(started) = variant_construct_started {
+                        engine_profile.variant_construct += started.elapsed();
+                    }
                     csq_builder.append_null();
                     most_builder.append_null();
                     append_null_annotation_row!();
@@ -4862,8 +4968,12 @@ impl AnnotateProvider {
                     ref_allele,
                     alt_allele.clone(),
                 );
+                if let Some(started) = variant_construct_started {
+                    engine_profile.variant_construct += started.elapsed();
+                }
                 // Only compute genomic shift for indels (ref != alt length).
                 // SNVs/MNVs don't shift and skipping avoids allele normalization overhead.
+                let hgvs_shift_started = engine_profile_enabled.then(Instant::now);
                 if let Some(reader) = hgvs_reference_reader.as_mut() {
                     if ref_al.len() != alt_allele.len() {
                         let chrom_norm = chrom.strip_prefix("chr").unwrap_or(&chrom);
@@ -4890,13 +5000,31 @@ impl AnnotateProvider {
                         )?;
                     }
                 }
-                let assignments = engine.evaluate_variant_prepared(&variant, ctx);
+                if let Some(started) = hgvs_shift_started {
+                    engine_profile.hgvs_shift += started.elapsed();
+                }
+                let assignments = engine_profile_time!(
+                    engine_profile_enabled,
+                    engine_profile,
+                    evaluate_prepared,
+                    {
+                        if let Some(profile) = tx_engine_profile.as_mut() {
+                            engine.evaluate_variant_prepared_profiled(&variant, ctx, profile)
+                        } else {
+                            engine.evaluate_variant_prepared(&variant, ctx)
+                        }
+                    }
+                );
+                if engine_profile_enabled {
+                    engine_profile.assignments += assignments.len();
+                }
 
                 // Derive the local scalar `most_severe_consequence` from all
                 // computed assignments, even when pick filtering later reduces
                 // emitted CSQ/typed entries. Ensembl VEP VCF output has no
                 // equivalent scalar field, so this preserves the existing
                 // annotate_vep API contract.
+                let collapse_pick_sort_started = engine_profile_enabled.then(Instant::now);
                 let mut all_terms =
                     TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
                 if all_terms.is_empty() {
@@ -4905,6 +5033,9 @@ impl AnnotateProvider {
                 let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
                 most_str = most.as_str().to_string();
                 row_assignments = apply_pick_mode(assignments, ctx, pick_flags, &vep_allele);
+                if engine_profile_enabled {
+                    engine_profile.picked_assignments += row_assignments.len();
+                }
                 row_variant = Some(variant);
 
                 // Build VEP-compatible sorted permutation index.
@@ -4936,10 +5067,17 @@ impl AnnotateProvider {
                             })
                     });
                 }
+                if let Some(started) = collapse_pick_sort_started {
+                    engine_profile.collapse_pick_sort += started.elapsed();
+                }
 
                 // Build per-transcript CSQ entries into reusable buffer (already cleared above).
                 // Skip the entire CSQ formatting when the csq column is not projected.
+                let csq_format_started = engine_profile_enabled.then(Instant::now);
                 if !skip_csq {
+                    if engine_profile_enabled {
+                        engine_profile.csq_entries += sorted_indices.len();
+                    }
                     for &si in &sorted_indices {
                         let tc = &row_assignments[si];
                         terms_buf.clear();
@@ -5114,15 +5252,22 @@ impl AnnotateProvider {
                             // Traceability:
                             // - VEP OutputFactory.pm SIFT/PolyPhen output
                             //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1746-L1799
-                            let (sift_str, polyphen_str) = lookup_sift_polyphen(
-                                tc.transcript_id.as_deref(),
-                                tc.protein_position.as_deref(),
-                                tc.amino_acids.as_deref(),
-                                sift_cache,
-                                #[cfg(feature = "kv-cache")]
-                                sift_kv,
-                                #[cfg(not(feature = "kv-cache"))]
-                                _sift_kv,
+                            let (sift_str, polyphen_str) = engine_profile_time!(
+                                engine_profile_enabled,
+                                engine_profile,
+                                sift_polyphen,
+                                {
+                                    lookup_sift_polyphen(
+                                        tc.transcript_id.as_deref(),
+                                        tc.protein_position.as_deref(),
+                                        tc.amino_acids.as_deref(),
+                                        sift_cache,
+                                        #[cfg(feature = "kv-cache")]
+                                        sift_kv,
+                                        #[cfg(not(feature = "kv-cache"))]
+                                        _sift_kv,
+                                    )
+                                }
                             );
                             // DOMAINS: overlapping protein domain features.
                             // VEP gates DOMAINS on $pre->{coding} which requires
@@ -5135,98 +5280,120 @@ impl AnnotateProvider {
                             let is_coding =
                                 tc.cds_position.as_deref().is_some_and(|s| !s.is_empty());
                             let domains = if is_coding {
-                                lookup_domains(
-                                    tc.transcript_id.as_deref(),
-                                    tc.protein_position.as_deref(),
-                                    tc.amino_acids.as_deref(),
-                                    ctx,
+                                engine_profile_time!(
+                                    engine_profile_enabled,
+                                    engine_profile,
+                                    domains,
+                                    {
+                                        lookup_domains(
+                                            tc.transcript_id.as_deref(),
+                                            tc.protein_position.as_deref(),
+                                            tc.amino_acids.as_deref(),
+                                            ctx,
+                                        )
+                                    }
                                 )
                             } else {
                                 String::new()
                             };
                             // miRNA: ncRNA secondary structure overlap.
-                            let mirna_str = {
-                                let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
-                                // Parse cDNA position range from the "N" or "N-M" string.
-                                let (cs, ce) = tc
-                                    .cdna_position
-                                    .as_deref()
-                                    .and_then(|p| {
-                                        if let Some((a, b)) = p.split_once('-') {
-                                            Some((
-                                                a.parse::<usize>().ok()?,
-                                                b.parse::<usize>().ok()?,
-                                            ))
-                                        } else {
-                                            let v = p.parse::<usize>().ok()?;
-                                            Some((v, v))
-                                        }
-                                    })
-                                    .unwrap_or((0, 0));
-                                if cs > 0 {
-                                    mirna_structure_field(ncrna, biotype, Some(cs), Some(ce))
-                                } else {
-                                    String::new()
+                            let mirna_str = engine_profile_time!(
+                                engine_profile_enabled,
+                                engine_profile,
+                                mirna,
+                                {
+                                    let ncrna = tx_opt.and_then(|tx| tx.ncrna_structure.as_deref());
+                                    // Parse cDNA position range from the "N" or "N-M" string.
+                                    let (cs, ce) = tc
+                                        .cdna_position
+                                        .as_deref()
+                                        .and_then(|p| {
+                                            if let Some((a, b)) = p.split_once('-') {
+                                                Some((
+                                                    a.parse::<usize>().ok()?,
+                                                    b.parse::<usize>().ok()?,
+                                                ))
+                                            } else {
+                                                let v = p.parse::<usize>().ok()?;
+                                                Some((v, v))
+                                            }
+                                        })
+                                        .unwrap_or((0, 0));
+                                    if cs > 0 {
+                                        mirna_structure_field(ncrna, biotype, Some(cs), Some(ce))
+                                    } else {
+                                        String::new()
+                                    }
                                 }
-                            };
+                            );
                             // 80-field CSQ base layout, with optional PICK and RefSeq fields.
                             // Traceability:
                             // - VEP Constants.pm CSQ field order for --everything
                             //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
-                            let pick_field = if include_pick_output {
-                                format!("|{pick_str}")
-                            } else {
-                                String::new()
-                            };
-                            let refseq_block = if include_source_field {
-                                format!(
-                                    "|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else if include_refseq_fields {
-                                format!(
-                                    "|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else {
-                                String::new()
-                            };
                             let _ = write!(
                                 csq_buf,
                                 "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                             {existing_var}|{distance}|{strand_str}|{tc_flags}{pick_field}|\
+                             {existing_var}|{distance}|{strand_str}|{tc_flags}"
+                            );
+                            if include_pick_output {
+                                let _ = write!(csq_buf, "|{pick_str}");
+                            }
+                            let _ = write!(
+                                csq_buf,
+                                "|\
                              {variant_class}|{symbol_source}|{hgnc_id}|\
                              {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                             {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}{refseq_block}|{gene_pheno}|\
+                             {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}"
+                            );
+                            if include_source_field {
+                                let _ = write!(
+                                    csq_buf,
+                                    "|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                );
+                            } else if include_refseq_fields {
+                                let _ = write!(
+                                    csq_buf,
+                                    "|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                );
+                            }
+                            let _ = write!(
+                                csq_buf,
+                                "|{gene_pheno}|\
                              {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
                              {hgvs_offset}|\
                              {batch3_suffix}|||||"
                             );
                         } else {
                             // 74-field CSQ base layout, with optional PICK and RefSeq fields.
-                            let pick_field = if include_pick_output {
-                                format!("|{pick_str}")
-                            } else {
-                                String::new()
-                            };
-                            let source_block = if include_source_field {
-                                format!(
-                                    "|||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else if include_refseq_fields {
-                                format!(
-                                    "|||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
-                                )
-                            } else {
-                                format!("|||||{source_val}")
-                            };
                             let _ = write!(
                                 csq_buf,
                                 "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
                              {exon}|{intron}|{hgvsc}|{hgvsp}|\
                              {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                             {existing_var}|{distance}|{strand_str}|{tc_flags}{pick_field}|{symbol_source}|{hgnc_id}|\
-                             {source_block}|\
+                             {existing_var}|{distance}|{strand_str}|{tc_flags}"
+                            );
+                            if include_pick_output {
+                                let _ = write!(csq_buf, "|{pick_str}");
+                            }
+                            let _ = write!(csq_buf, "|{symbol_source}|{hgnc_id}|");
+                            if include_source_field {
+                                let _ = write!(
+                                    csq_buf,
+                                    "|||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                );
+                            } else if include_refseq_fields {
+                                let _ = write!(
+                                    csq_buf,
+                                    "|||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                );
+                            } else {
+                                let _ = write!(csq_buf, "|||||{source_val}");
+                            }
+                            let _ = write!(
+                                csq_buf,
+                                "|\
                              {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
                              {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
                              {batch3_suffix}"
@@ -5234,6 +5401,9 @@ impl AnnotateProvider {
                         }
                     }
                     if csq_buf.is_empty() {
+                        if engine_profile_enabled {
+                            engine_profile.csq_entries += 1;
+                        }
                         let impact = impact_label(SoImpact::Modifier);
                         let entry = CsqPlaceholderEntry {
                             allele: &vep_allele,
@@ -5247,20 +5417,31 @@ impl AnnotateProvider {
                         placeholder_layout.append_entry(&mut csq_buf, &entry);
                     }
                 } // end if !skip_csq (cache-miss CSQ formatting)
+                if let Some(started) = csq_format_started {
+                    engine_profile.csq_format += started.elapsed();
+                }
             };
 
+            let append_scalars_started = engine_profile_enabled.then(Instant::now);
             if skip_csq {
                 csq_builder.append_null();
             } else {
                 csq_builder.append_value(&csq_buf);
             }
             most_builder.append_value(&most_str);
+            if let Some(started) = append_scalars_started {
+                engine_profile.append_scalars += started.elapsed();
+            }
 
             // --- Populate structured annotation column builders for this row ---
             // Skip all typed column work when they're not in the projection.
             if skip_typed_cols {
                 // Typed columns are emitted as all-null arrays after the row loop.
             } else {
+                let typed_columns_started = engine_profile_enabled.then(Instant::now);
+                if engine_profile_enabled {
+                    engine_profile.typed_rows += 1;
+                }
                 // -- Transcript-level columns (42, or 43 with PICK) --
                 // Allele (scalar, same for all transcripts)
                 b_allele.append_value(&vep_allele);
@@ -5926,10 +6107,14 @@ impl AnnotateProvider {
                     }
                     _ => b_dbsnp_ids.append(false),
                 }
+                if let Some(started) = typed_columns_started {
+                    engine_profile.typed_columns += started.elapsed();
+                }
             } // end if !skip_typed_cols
         } // end per-row loop
 
         // --- Build output columns ---
+        let finish_builders_started = engine_profile_enabled.then(Instant::now);
         let mut out_cols =
             Vec::with_capacity(self.vcf_field_count() + self.annotation_column_count());
         for name in self.vcf_field_names() {
@@ -6037,7 +6222,15 @@ impl AnnotateProvider {
             "annotate_vep(): output column builder order is out of sync with provider schema"
         );
 
-        Ok(RecordBatch::try_new(self.schema.clone(), out_cols)?)
+        let batch = RecordBatch::try_new(self.schema.clone(), out_cols)?;
+        if let Some(started) = finish_builders_started {
+            engine_profile.finish_builders += started.elapsed();
+            eprintln!("{}", engine_profile.summary_line());
+            if let Some(profile) = tx_engine_profile {
+                eprintln!("{}", profile.summary_line());
+            }
+        }
+        Ok(batch)
     }
 }
 
@@ -7350,19 +7543,8 @@ struct ContigAnnotationConfig {
     annotation_column_count: usize,
     /// Maximum number of output rows (LIMIT pushdown).
     fetch_limit: Option<usize>,
-    /// Maximum number of ordered fjall lookup partitions to execute per chromosome.
-    target_partitions: usize,
-    /// Maximum number of VEP input-buffer annotation jobs to execute concurrently.
-    annotation_workers: usize,
-    /// Maximum number of active contig lanes in the enclosing execution plan.
-    contig_parallelism: usize,
-    /// Experimental VEP-style flow: build raw VCF input buffers first, then
-    /// run fjall lookup + annotation inside each buffer chunk.
-    chunked_buffer_lookup: bool,
-    /// Coordinate metadata used by direct fjall lookup in the chunked-buffer path.
-    lookup_vcf_has_chr: bool,
-    lookup_vcf_zero_based: bool,
-    lookup_cache_zero_based: bool,
+    /// Maximum number of active chromosome lanes in the enclosing execution plan.
+    chromosome_lanes: usize,
     /// Poll lookup streams inline instead of spawning lookup tasks.
     inline_lookup: bool,
     /// Whether this stream owns the shared global Fjall variation table.
@@ -7396,12 +7578,12 @@ impl ContigAnnotationExec {
         projected_schema: SchemaRef,
         full_schema: SchemaRef,
         contigs: Vec<String>,
-        contig_parallelism: usize,
+        chromosome_lanes: usize,
         session: Arc<SessionContext>,
         cache: Arc<PartitionedParquetCache>,
         config: ContigAnnotationConfig,
     ) -> Self {
-        let contig_partitions = partition_contigs_for_execution(contigs, contig_parallelism);
+        let contig_partitions = partition_contigs_for_execution(contigs, chromosome_lanes);
         let properties = PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
             datafusion::physical_plan::Partitioning::UnknownPartitioning(contig_partitions.len()),
@@ -7522,8 +7704,6 @@ const HYDRATION_WINDOW_SIZE: usize = 1000;
 const LOOKUP_PARTITION_QUEUE_BATCHES: usize = 2;
 /// Ensembl VEP release/115 default `buffer_size`.
 const VEP_INPUT_BUFFER_SIZE: usize = 5000;
-/// Keep one queue of whole VEP buffers ahead of the active workers.
-const PARALLEL_INPUT_BUFFER_BACKLOG_FACTOR: usize = 2;
 /// Ensembl VEP transcript cache region size (`cache_region_size`).
 const VEP_TRANSCRIPT_CACHE_REGION_SIZE_BP: i64 = 1_000_000;
 
@@ -7620,16 +7800,11 @@ struct ContigPipelineProfile {
     projection: Duration,
     send_wait: Duration,
     ordered_drain_wait: Duration,
-    workers: usize,
     lookup_partitions: usize,
     lookup_batches: usize,
     lookup_buffered_batches_max: usize,
     lookup_buffered_partitions_max: usize,
     input_buffers: usize,
-    annotation_pending_max: usize,
-    annotation_inflight_max: usize,
-    annotation_ready_max: usize,
-    annotation_output_queue_max: usize,
     output_batches: usize,
     output_rows: usize,
 }
@@ -7637,17 +7812,12 @@ struct ContigPipelineProfile {
 impl ContigPipelineProfile {
     fn summary_line(&self, chrom: &str) -> String {
         format!(
-            "[VEP_PROFILE] {chrom}: pipeline_profile workers={} lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} annotation_pending_max={} annotation_inflight_max={} annotation_ready_max={} annotation_output_queue_max={} output_batches={} output_rows={} context_load={:.3}s context_tx={:.3}s context_exons={:.3}s context_tl={:.3}s context_reg={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s",
-            self.workers,
+            "[VEP_PROFILE] {chrom}: pipeline_profile lookup_partitions={} lookup_batches={} lookup_buffered_batches_max={} lookup_buffered_partitions_max={} input_buffers={} output_batches={} output_rows={} context_load={:.3}s context_tx={:.3}s context_exons={:.3}s context_tl={:.3}s context_reg={:.3}s context_motif={:.3}s worker_init={:.3}s lookup_wait={:.3}s hydrate={:.3}s annotate={:.3}s input_buffer={:.3}s variant_bounds={:.3}s tx_window={:.3}s exon_filter={:.3}s tl_filter={:.3}s prepared_ctx={:.3}s sift_load={:.3}s engine={:.3}s projection={:.3}s send_wait={:.3}s ordered_drain_wait={:.3}s",
             self.lookup_partitions,
             self.lookup_batches,
             self.lookup_buffered_batches_max,
             self.lookup_buffered_partitions_max,
             self.input_buffers,
-            self.annotation_pending_max,
-            self.annotation_inflight_max,
-            self.annotation_ready_max,
-            self.annotation_output_queue_max,
             self.output_batches,
             self.output_rows,
             self.context_load.as_secs_f64(),
@@ -8102,147 +8272,11 @@ struct ContigAnnotationState {
     ordered_lookup_wait_started: Option<Instant>,
 }
 
-struct InputBufferAnnotationJob {
-    buffer_id: usize,
-    chrom: String,
-    rows: usize,
-    queued_at: Instant,
-    batches: Vec<RecordBatch>,
-    context: BufferAnnotationContext,
-    colocated_map: Arc<HashMap<ColocatedKey, ColocatedData>>,
-}
-
 struct BufferAnnotationContext {
     transcripts: Vec<TranscriptFeature>,
     exon_indices: Vec<usize>,
     translation_indices: Vec<usize>,
     translation_overrides: HashMap<String, TranslationPartitionState>,
-}
-
-struct AnnotatedInputBuffer {
-    buffer_id: usize,
-    rows: usize,
-    batches: VecDeque<RecordBatch>,
-}
-
-struct ParallelAnnotationState {
-    ann: ContigAnnotationState,
-    pending_jobs: VecDeque<InputBufferAnnotationJob>,
-    in_flight: tokio::task::JoinSet<Result<(AnnotatedInputBuffer, Duration)>>,
-    ready_buffers: BTreeMap<usize, AnnotatedInputBuffer>,
-    output_queue: VecDeque<RecordBatch>,
-    queued_input_rows: usize,
-    next_output_buffer_id: usize,
-    projection: Option<Vec<usize>>,
-    max_parallel: usize,
-    max_queued_buffers: usize,
-}
-
-enum ParallelAnnotationPoll {
-    Batch(RecordBatch, usize),
-    Complete,
-    Failed(DataFusionError),
-}
-
-impl ParallelAnnotationState {
-    fn new(ann: ContigAnnotationState) -> Self {
-        let max_parallel = input_buffer_parallelism(&ann.config);
-        let max_queued_buffers = parallel_annotation_buffer_queue_target(&ann.config);
-        let projection = ann.config.projection.clone();
-        Self {
-            ann,
-            pending_jobs: VecDeque::new(),
-            in_flight: tokio::task::JoinSet::new(),
-            ready_buffers: BTreeMap::new(),
-            output_queue: VecDeque::new(),
-            queued_input_rows: 0,
-            next_output_buffer_id: 0,
-            projection,
-            max_parallel,
-            max_queued_buffers,
-        }
-    }
-
-    fn queued_buffer_count(&self) -> usize {
-        self.pending_jobs.len() + self.in_flight.len() + self.ready_buffers.len()
-    }
-
-    fn remaining_buffer_capacity(&self) -> usize {
-        self.max_queued_buffers
-            .saturating_sub(self.queued_buffer_count())
-    }
-
-    fn spawn_pending_jobs(&mut self) {
-        while self.in_flight.len() < self.max_parallel && !self.pending_jobs.is_empty() {
-            let job = self
-                .pending_jobs
-                .pop_front()
-                .expect("pending job queue must be non-empty");
-            let shared = Arc::clone(&self.ann.worker.shared);
-            let projection = self.projection.clone();
-            let profile = self.ann.worker.shared.profile.clone();
-            self.in_flight.spawn_blocking(move || {
-                let started = Instant::now();
-                annotate_input_buffer_job(shared, job, projection)
-                    .map(|annotated| (annotated, started.elapsed()))
-            });
-            record_contig_profile(&profile, |profile| {
-                profile.annotation_pending_max =
-                    profile.annotation_pending_max.max(self.pending_jobs.len());
-                profile.annotation_inflight_max =
-                    profile.annotation_inflight_max.max(self.in_flight.len());
-                profile.annotation_ready_max =
-                    profile.annotation_ready_max.max(self.ready_buffers.len());
-                profile.annotation_output_queue_max = profile
-                    .annotation_output_queue_max
-                    .max(self.output_queue.len());
-            });
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.ann.worker.lookup_done
-            && self.ann.worker.window_buffer.is_empty()
-            && self.ann.worker.input_buffer_accumulator.pending_rows() == 0
-            && self.pending_jobs.is_empty()
-            && self.in_flight.is_empty()
-            && self.ready_buffers.is_empty()
-            && self.output_queue.is_empty()
-    }
-
-    fn abort_background_work(&mut self) {
-        self.in_flight.abort_all();
-        abort_annotation_lookup_workers(&mut self.ann);
-    }
-}
-
-fn should_parallelize_input_buffers(config: &ContigAnnotationConfig) -> bool {
-    #[cfg(feature = "kv-cache")]
-    {
-        config.use_fjall && !config.inline_lookup && input_buffer_parallelism(config) > 1
-    }
-    #[cfg(not(feature = "kv-cache"))]
-    {
-        let _ = config;
-        false
-    }
-}
-
-fn input_buffer_parallelism(config: &ContigAnnotationConfig) -> usize {
-    let requested = config.annotation_workers.max(1);
-    if config.chunked_buffer_lookup && config.contig_parallelism > 1 && requested == 1 {
-        2
-    } else {
-        requested
-    }
-}
-
-fn effective_chunked_buffer_lookup(
-    requested_chunked_buffer_lookup: bool,
-    annotation_workers: usize,
-    contig_parallelism: usize,
-) -> bool {
-    requested_chunked_buffer_lookup && (annotation_workers > 1 || contig_parallelism > 1)
 }
 
 type PrepareFuture = Pin<Box<dyn Future<Output = Result<Option<ContigReadyState>>> + Send>>;
@@ -8254,8 +8288,6 @@ enum StreamState {
     PreparingContig(PrepareFuture),
     /// Pull from lookup stream, accumulate windows, hydrate + annotate.
     AnnotatingContig(ContigAnnotationState),
-    /// Pull, hydrate, annotate, and drain whole VEP input buffers concurrently.
-    ParallelAnnotatingContig(ParallelAnnotationState),
     /// Yield annotated batches from the current window, then resume annotation.
     DrainingWindow {
         batches: VecDeque<RecordBatch>,
@@ -8463,7 +8495,7 @@ fn abort_lookup_partitions(partitions: &mut VecDeque<LookupPartitionHandle>) {
     }
 }
 
-fn abort_annotation_lookup_workers(ann: &mut ContigAnnotationState) {
+fn abort_annotation_lookup_partitions(ann: &mut ContigAnnotationState) {
     ann.lookup_partitions.abort();
 }
 
@@ -8541,26 +8573,18 @@ impl ContigAnnotationStream {
     fn cleanup_registered_tables_on_drop(&mut self) {
         match &mut self.state {
             StreamState::AnnotatingContig(ann) => {
-                abort_annotation_lookup_workers(ann);
+                abort_annotation_lookup_partitions(ann);
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
                 if ann.config.use_fjall && ann.config.deregister_global_kv_on_finish {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
                 }
                 ann.ephemeral_tables.clear();
             }
-            StreamState::ParallelAnnotatingContig(par) => {
-                par.abort_background_work();
-                deregister_tables_sync(&par.ann.session, &par.ann.ephemeral_tables);
-                if par.ann.config.use_fjall && par.ann.config.deregister_global_kv_on_finish {
-                    let _ = par.ann.session.deregister_table("__vep_kv_variation");
-                }
-                par.ann.ephemeral_tables.clear();
-            }
             StreamState::DrainingWindow {
                 annotation_state: ann,
                 ..
             } => {
-                abort_annotation_lookup_workers(ann);
+                abort_annotation_lookup_partitions(ann);
                 deregister_tables_sync(&ann.session, &ann.ephemeral_tables);
                 if ann.config.use_fjall && ann.config.deregister_global_kv_on_finish {
                     let _ = ann.session.deregister_table("__vep_kv_variation");
@@ -9470,14 +9494,6 @@ fn annotate_worker_window(
             profile.prepared_context += prepared_context_started.elapsed();
         });
 
-        #[cfg(feature = "kv-cache")]
-        if config.chunked_buffer_lookup {
-            let (_, mut chunked_out) =
-                annotate_chunked_lookup_batches(&shared, &ctx, &chrom, buffer_batches, projection)?;
-            out.append(&mut chunked_out);
-            continue;
-        }
-
         for batch in &buffer_batches {
             // Lazy SIFT window loading (same pattern as before).
             if sift_enabled && worker.sift_direct.is_some() {
@@ -9546,407 +9562,6 @@ fn annotate_window(
     projection: Option<&[usize]>,
 ) -> Result<VecDeque<RecordBatch>> {
     annotate_worker_window(&mut ann.worker, window_batches, projection)
-}
-
-fn parallel_annotation_buffer_queue_target(config: &ContigAnnotationConfig) -> usize {
-    let target_partitions = input_buffer_parallelism(config);
-    if config.chunked_buffer_lookup
-        && config.contig_parallelism > 1
-        && config.annotation_workers <= 1
-    {
-        target_partitions
-    } else if target_partitions == 1 {
-        1
-    } else {
-        target_partitions * PARALLEL_INPUT_BUFFER_BACKLOG_FACTOR
-    }
-}
-
-fn prepare_input_buffer_annotation_jobs(
-    worker: &mut AnnotationWorkerState,
-    window_batches: Vec<RecordBatch>,
-    max_ready_buffers: usize,
-) -> Result<Vec<InputBufferAnnotationJob>> {
-    let shared = Arc::clone(&worker.shared);
-    let profile = shared.profile.clone();
-    let config = &shared.config;
-
-    let flush_partial = worker.lookup_done && worker.window_buffer.is_empty();
-    let input_buffer_started = Instant::now();
-    let ready_input_buffers = worker
-        .input_buffer_accumulator
-        .push_window_and_drain_ready_limited(
-            window_batches,
-            config.input_buffer_size,
-            flush_partial,
-            max_ready_buffers,
-        );
-    let ready_input_buffer_count = ready_input_buffers.len();
-    record_contig_profile(&profile, |profile| {
-        profile.input_buffer += input_buffer_started.elapsed();
-        profile.input_buffers += ready_input_buffer_count;
-    });
-
-    let colocated_map = if config.flags.check_existing {
-        Arc::clone(&worker.colocated_map)
-    } else {
-        Arc::new(HashMap::new())
-    };
-    let mut jobs = Vec::with_capacity(ready_input_buffer_count);
-    for buffer_batches in ready_input_buffers {
-        let bounds_started = Instant::now();
-        let Some((chrom, min_start, max_end)) = buffer_variant_bounds(&buffer_batches)? else {
-            continue;
-        };
-        record_contig_profile(&profile, |profile| {
-            profile.variant_bounds += bounds_started.elapsed();
-        });
-
-        let buffer_context =
-            prepare_buffer_annotation_context(worker, &buffer_batches, &chrom, min_start, max_end)?;
-        let buffer_id = worker.next_input_buffer_id;
-        let rows = buffer_batches
-            .iter()
-            .map(|batch| batch.num_rows())
-            .sum::<usize>();
-        pipeline_trace::emit(
-            "annotation",
-            "queued",
-            &[
-                ("chrom", TraceValue::Str(&chrom)),
-                ("buffer_id", TraceValue::Usize(buffer_id)),
-                ("rows", TraceValue::Usize(rows)),
-                ("batches", TraceValue::Usize(buffer_batches.len())),
-                (
-                    "transcripts",
-                    TraceValue::Usize(buffer_context.transcripts.len()),
-                ),
-                (
-                    "exons",
-                    TraceValue::Usize(buffer_context.exon_indices.len()),
-                ),
-                (
-                    "translations",
-                    TraceValue::Usize(buffer_context.translation_indices.len()),
-                ),
-            ],
-        );
-
-        jobs.push(InputBufferAnnotationJob {
-            buffer_id,
-            chrom,
-            rows,
-            queued_at: Instant::now(),
-            batches: buffer_batches,
-            context: buffer_context,
-            colocated_map: Arc::clone(&colocated_map),
-        });
-        worker.next_input_buffer_id += 1;
-    }
-
-    Ok(jobs)
-}
-
-fn annotate_batches_with_prepared_context(
-    shared: &SharedContigAnnotationContext,
-    ctx: &PreparedContext<'_>,
-    colocated_map: &HashMap<ColocatedKey, ColocatedData>,
-    batches: &[RecordBatch],
-    projection: Option<&[usize]>,
-) -> Result<VecDeque<RecordBatch>> {
-    let tmp_provider = shared.tmp_provider.as_ref();
-    let engine = shared.engine.as_ref();
-    let config = &shared.config;
-    let profile = shared.profile.clone();
-    let csq_col_idx = tmp_provider.vcf_field_count();
-    let skip_csq = projection.is_some_and(|indices| !indices.contains(&csq_col_idx));
-    let typed_cols_start = csq_col_idx + 2;
-    let typed_cols_end = typed_cols_start + tmp_provider.annotation_column_defs.len();
-    let skip_typed_cols = projection.is_some_and(|indices| {
-        !indices
-            .iter()
-            .any(|&i| i >= typed_cols_start && i < typed_cols_end)
-    });
-    let pick_requires_full_annotations = config
-        .pick_flags
-        .requires_transcript_annotations(skip_csq, skip_typed_cols);
-    let sift_enabled = config.flags.everything;
-    let mut sift_cache = SiftPolyphenCache::new();
-    let mut loaded_sift_windows = HashSet::new();
-    let mut hgvs_reader = config.reference_fasta_path.as_deref().and_then(|path| {
-        fasta::io::indexed_reader::Builder::default()
-            .build_from_path(path)
-            .ok()
-    });
-    let mut out = VecDeque::with_capacity(batches.len());
-
-    for batch in batches {
-        if sift_enabled && shared.sift_direct.is_some() {
-            let sift_started = Instant::now();
-            load_sift_for_batch(
-                batch,
-                pick_requires_full_annotations,
-                shared.sift_direct.as_deref(),
-                &mut loaded_sift_windows,
-                &mut sift_cache,
-            )?;
-            record_contig_profile(&profile, |profile| {
-                profile.sift_load += sift_started.elapsed();
-            });
-        }
-
-        #[cfg(not(feature = "kv-cache"))]
-        let sift_kv: Option<()> = None;
-        #[cfg(feature = "kv-cache")]
-        let sift_kv = &shared.sift_kv;
-
-        let engine_started = Instant::now();
-        let annotated = tmp_provider.annotate_batch_with_transcript_engine(
-            batch,
-            engine,
-            ctx,
-            colocated_map,
-            &mut sift_cache,
-            #[cfg(feature = "kv-cache")]
-            sift_kv,
-            #[cfg(not(feature = "kv-cache"))]
-            &sift_kv,
-            skip_csq,
-            skip_typed_cols,
-            &config.flags,
-            &config.hgvs_flags,
-            config.transcript_selection,
-            &config.pick_flags,
-            &mut hgvs_reader,
-        )?;
-        record_contig_profile(&profile, |profile| {
-            profile.engine += engine_started.elapsed();
-        });
-
-        if let Some(indices) = projection {
-            let projection_started = Instant::now();
-            let projected = annotated.project(indices)?;
-            record_contig_profile(&profile, |profile| {
-                profile.projection += projection_started.elapsed();
-            });
-            out.push_back(projected);
-        } else {
-            out.push_back(annotated);
-        }
-    }
-
-    Ok(out)
-}
-
-fn annotate_batches_with_buffer_context(
-    shared: &SharedContigAnnotationContext,
-    buffer_context: &BufferAnnotationContext,
-    colocated_map: &HashMap<ColocatedKey, ColocatedData>,
-    batches: &[RecordBatch],
-    projection: Option<&[usize]>,
-) -> Result<VecDeque<RecordBatch>> {
-    let profile = shared.profile.clone();
-    let prepared_context_started = Instant::now();
-    let materialized_translations = materialize_buffer_context_translations(shared, buffer_context);
-    let ctx = prepared_context_from_buffer(buffer_context, shared, &materialized_translations);
-    record_contig_profile(&profile, |profile| {
-        profile.prepared_context += prepared_context_started.elapsed();
-    });
-
-    annotate_batches_with_prepared_context(shared, &ctx, colocated_map, batches, projection)
-}
-
-#[cfg(feature = "kv-cache")]
-fn annotate_chunked_lookup_batches(
-    shared: &SharedContigAnnotationContext,
-    ctx: &PreparedContext<'_>,
-    chrom: &str,
-    raw_batches: Vec<RecordBatch>,
-    projection: Option<&[usize]>,
-) -> Result<(usize, VecDeque<RecordBatch>)> {
-    let config = &shared.config;
-    let store = config.kv_store.as_ref().cloned().ok_or_else(|| {
-        DataFusionError::Execution(
-            "chunked_buffer_lookup requires an open fjall variation store".to_string(),
-        )
-    })?;
-    let rows = raw_batches
-        .iter()
-        .map(|batch| batch.num_rows())
-        .sum::<usize>();
-    pipeline_trace::emit(
-        "annotation",
-        "buffer_lookup_start",
-        &[
-            ("chrom", TraceValue::Str(chrom)),
-            ("rows", TraceValue::Usize(rows)),
-            ("batches", TraceValue::Usize(raw_batches.len())),
-        ],
-    );
-
-    let colocated_sink: Option<ColocatedSink> = config
-        .flags
-        .check_existing
-        .then(|| Arc::new(Mutex::new(HashMap::new())));
-    let mut looked_up_batches = Vec::with_capacity(raw_batches.len());
-    for raw_batch in &raw_batches {
-        let looked_up = lookup_batch_with_store(
-            raw_batch,
-            Arc::clone(&store),
-            config.cache_columns.clone(),
-            config.lookup_vcf_has_chr,
-            config.lookup_vcf_zero_based,
-            config.lookup_cache_zero_based,
-            config.extended_probes,
-            config.allowed_failed,
-            colocated_sink.clone(),
-            config.reference_fasta_path.clone(),
-        )?;
-        looked_up_batches.push(looked_up);
-    }
-
-    let colocated_map = if let Some(sink) = colocated_sink {
-        drain_colocated_sink(&sink)?
-    } else {
-        HashMap::new()
-    };
-    let out = annotate_batches_with_prepared_context(
-        shared,
-        ctx,
-        &colocated_map,
-        &looked_up_batches,
-        projection,
-    )?;
-    pipeline_trace::emit(
-        "annotation",
-        "buffer_lookup_done",
-        &[
-            ("chrom", TraceValue::Str(chrom)),
-            ("rows", TraceValue::Usize(rows)),
-            ("output_batches", TraceValue::Usize(out.len())),
-        ],
-    );
-
-    Ok((rows, out))
-}
-
-#[cfg(feature = "kv-cache")]
-fn annotate_chunked_lookup_input_buffer_job(
-    shared: Arc<SharedContigAnnotationContext>,
-    job: InputBufferAnnotationJob,
-    projection: Option<Vec<usize>>,
-) -> Result<AnnotatedInputBuffer> {
-    if job.batches.is_empty() {
-        return Ok(AnnotatedInputBuffer {
-            buffer_id: job.buffer_id,
-            rows: job.rows,
-            batches: VecDeque::new(),
-        });
-    }
-
-    let profile = shared.profile.clone();
-    let prepared_context_started = Instant::now();
-    let materialized_translations = materialize_buffer_context_translations(&shared, &job.context);
-    let ctx = prepared_context_from_buffer(&job.context, &shared, &materialized_translations);
-    record_contig_profile(&profile, |profile| {
-        profile.prepared_context += prepared_context_started.elapsed();
-    });
-
-    let (_, out) = annotate_chunked_lookup_batches(
-        &shared,
-        &ctx,
-        &job.chrom,
-        job.batches,
-        projection.as_deref(),
-    )?;
-
-    Ok(AnnotatedInputBuffer {
-        buffer_id: job.buffer_id,
-        rows: job.rows,
-        batches: out,
-    })
-}
-
-#[cfg(not(feature = "kv-cache"))]
-fn annotate_chunked_lookup_input_buffer_job(
-    _shared: Arc<SharedContigAnnotationContext>,
-    _job: InputBufferAnnotationJob,
-    _projection: Option<Vec<usize>>,
-) -> Result<AnnotatedInputBuffer> {
-    Err(DataFusionError::Execution(
-        "chunked_buffer_lookup requires kv-cache feature".to_string(),
-    ))
-}
-
-fn annotate_input_buffer_job(
-    shared: Arc<SharedContigAnnotationContext>,
-    job: InputBufferAnnotationJob,
-    projection: Option<Vec<usize>>,
-) -> Result<AnnotatedInputBuffer> {
-    let job_started = Instant::now();
-    pipeline_trace::emit(
-        "annotation",
-        "start",
-        &[
-            ("chrom", TraceValue::Str(&job.chrom)),
-            ("buffer_id", TraceValue::Usize(job.buffer_id)),
-            ("rows", TraceValue::Usize(job.rows)),
-            ("queue_wait", TraceValue::Duration(job.queued_at.elapsed())),
-        ],
-    );
-    if shared.config.chunked_buffer_lookup {
-        return annotate_chunked_lookup_input_buffer_job(shared, job, projection);
-    }
-
-    let out = annotate_batches_with_buffer_context(
-        &shared,
-        &job.context,
-        job.colocated_map.as_ref(),
-        &job.batches,
-        projection.as_deref(),
-    )?;
-
-    let output_batches = out.len();
-    pipeline_trace::emit(
-        "annotation",
-        "done",
-        &[
-            ("chrom", TraceValue::Str(&job.chrom)),
-            ("buffer_id", TraceValue::Usize(job.buffer_id)),
-            ("rows", TraceValue::Usize(job.rows)),
-            ("output_batches", TraceValue::Usize(output_batches)),
-            ("elapsed", TraceValue::Duration(job_started.elapsed())),
-        ],
-    );
-
-    Ok(AnnotatedInputBuffer {
-        buffer_id: job.buffer_id,
-        rows: job.rows,
-        batches: out,
-    })
-}
-
-fn drain_ready_ordered_input_buffers(
-    ready: &mut BTreeMap<usize, AnnotatedInputBuffer>,
-    next_buffer_id: &mut usize,
-    out: &mut VecDeque<RecordBatch>,
-    chrom: &str,
-) {
-    while let Some(mut annotated) = ready.remove(next_buffer_id) {
-        debug_assert_eq!(annotated.buffer_id, *next_buffer_id);
-        pipeline_trace::emit(
-            "annotation",
-            "ordered_drain",
-            &[
-                ("chrom", TraceValue::Str(chrom)),
-                ("buffer_id", TraceValue::Usize(annotated.buffer_id)),
-                ("rows", TraceValue::Usize(annotated.rows)),
-                ("output_batches", TraceValue::Usize(annotated.batches.len())),
-            ],
-        );
-        out.extend(annotated.batches.drain(..));
-        *next_buffer_id += 1;
-    }
 }
 
 enum LookupPartitionPoll {
@@ -10203,230 +9818,6 @@ fn poll_lookup_partitions(
     Poll::Ready(Ok(()))
 }
 
-fn pop_parallel_output_batch(
-    par: &mut ParallelAnnotationState,
-    rows_emitted: usize,
-    fetch_limit: Option<usize>,
-) -> Option<(RecordBatch, usize)> {
-    if fetch_limit.is_some_and(|limit| rows_emitted >= limit) {
-        return None;
-    }
-    let batch = par.output_queue.pop_front()?;
-    par.queued_input_rows = par.queued_input_rows.saturating_sub(batch.num_rows());
-    let profile = par.ann.worker.shared.profile.clone();
-    if let Some(limit) = fetch_limit {
-        let remaining = limit.saturating_sub(rows_emitted);
-        if batch.num_rows() > remaining {
-            record_contig_profile(&profile, |profile| {
-                profile.output_batches += 1;
-                profile.output_rows += remaining;
-            });
-            return Some((batch.slice(0, remaining), remaining));
-        }
-    }
-
-    let rows = batch.num_rows();
-    record_contig_profile(&profile, |profile| {
-        profile.output_batches += 1;
-        profile.output_rows += rows;
-    });
-    Some((batch, rows))
-}
-
-fn poll_completed_parallel_annotation_jobs(
-    par: &mut ParallelAnnotationState,
-    cx: &mut TaskCtx<'_>,
-) -> Poll<Result<bool>> {
-    let mut made_progress = false;
-    loop {
-        match par.in_flight.poll_join_next(cx) {
-            Poll::Ready(Some(Ok(Ok((annotated, elapsed))))) => {
-                record_contig_profile(&par.ann.worker.shared.profile, |profile| {
-                    profile.annotation_compute += elapsed;
-                });
-                par.ready_buffers.insert(annotated.buffer_id, annotated);
-                drain_ready_ordered_input_buffers(
-                    &mut par.ready_buffers,
-                    &mut par.next_output_buffer_id,
-                    &mut par.output_queue,
-                    &par.ann.chrom,
-                );
-                record_contig_profile(&par.ann.worker.shared.profile, |profile| {
-                    profile.annotation_ready_max =
-                        profile.annotation_ready_max.max(par.ready_buffers.len());
-                    profile.annotation_output_queue_max = profile
-                        .annotation_output_queue_max
-                        .max(par.output_queue.len());
-                });
-                made_progress = true;
-            }
-            Poll::Ready(Some(Ok(Err(e)))) => {
-                par.in_flight.abort_all();
-                return Poll::Ready(Err(e));
-            }
-            Poll::Ready(Some(Err(e))) => {
-                par.in_flight.abort_all();
-                return Poll::Ready(Err(DataFusionError::Execution(format!(
-                    "input-buffer annotation task failed: {e}"
-                ))));
-            }
-            Poll::Ready(None) => return Poll::Ready(Ok(made_progress)),
-            Poll::Pending if made_progress => return Poll::Ready(Ok(true)),
-            Poll::Pending => return Poll::Pending,
-        }
-    }
-}
-
-fn hydrate_and_prepare_parallel_window(
-    par: &mut ParallelAnnotationState,
-    window_batches: Vec<RecordBatch>,
-    max_ready_buffers: usize,
-) -> Result<Vec<InputBufferAnnotationJob>> {
-    if !window_batches.is_empty() {
-        let shared = Arc::clone(&par.ann.worker.shared);
-        let hydration_started = Instant::now();
-        hydrate_worker_window(
-            &mut par.ann.worker,
-            &window_batches,
-            par.ann.config.cache_source_type,
-        )?;
-        record_contig_profile(&shared.profile, |profile| {
-            profile.hydration += hydration_started.elapsed();
-        });
-    }
-
-    prepare_input_buffer_annotation_jobs(&mut par.ann.worker, window_batches, max_ready_buffers)
-}
-
-fn poll_parallel_annotation_state(
-    par: &mut ParallelAnnotationState,
-    cx: &mut TaskCtx<'_>,
-    rows_emitted: usize,
-    fetch_limit: Option<usize>,
-) -> Poll<ParallelAnnotationPoll> {
-    loop {
-        if let Some((batch, rows)) = pop_parallel_output_batch(par, rows_emitted, fetch_limit) {
-            return Poll::Ready(ParallelAnnotationPoll::Batch(batch, rows));
-        }
-
-        let mut made_progress = match poll_completed_parallel_annotation_jobs(par, cx) {
-            Poll::Ready(Ok(progress)) => progress,
-            Poll::Ready(Err(e)) => return Poll::Ready(ParallelAnnotationPoll::Failed(e)),
-            Poll::Pending => false,
-        };
-        if let Some((batch, rows)) = pop_parallel_output_batch(par, rows_emitted, fetch_limit) {
-            return Poll::Ready(ParallelAnnotationPoll::Batch(batch, rows));
-        }
-
-        par.spawn_pending_jobs();
-        if par.is_complete() {
-            return Poll::Ready(ParallelAnnotationPoll::Complete);
-        }
-
-        let remaining_capacity = par.remaining_buffer_capacity();
-        let limit_scheduled =
-            fetch_limit.is_some_and(|limit| rows_emitted + par.queued_input_rows >= limit);
-        if limit_scheduled && !par.ann.worker.lookup_done {
-            abort_annotation_lookup_workers(&mut par.ann);
-            par.ann.worker.lookup_done = true;
-        }
-        let ready_input_buffer_count = par
-            .ann
-            .worker
-            .input_buffer_accumulator
-            .ready_input_buffer_count_with_batches(
-                par.ann.config.input_buffer_size,
-                &par.ann.worker.window_buffer,
-            );
-        let target_ready_input_buffers = remaining_capacity.min(par.max_parallel).max(1);
-        let window_full = par.ann.worker.window_buffer.len() >= HYDRATION_WINDOW_SIZE;
-
-        if remaining_capacity > 0
-            && !par.ann.worker.lookup_done
-            && !limit_scheduled
-            && ready_input_buffer_count < target_ready_input_buffers
-            && !window_full
-        {
-            match poll_lookup_partitions(&mut par.ann, cx) {
-                Poll::Pending => {}
-                Poll::Ready(Ok(())) => made_progress = true,
-                Poll::Ready(Err(e)) => return Poll::Ready(ParallelAnnotationPoll::Failed(e)),
-            }
-        }
-
-        let remaining_capacity = par.remaining_buffer_capacity();
-        let ready_input_buffer_count = par
-            .ann
-            .worker
-            .input_buffer_accumulator
-            .ready_input_buffer_count_with_batches(
-                par.ann.config.input_buffer_size,
-                &par.ann.worker.window_buffer,
-            );
-        let window_full = par.ann.worker.window_buffer.len() >= HYDRATION_WINDOW_SIZE;
-        let has_final_partial = par.ann.worker.lookup_done
-            && (!par.ann.worker.window_buffer.is_empty()
-                || par.ann.worker.input_buffer_accumulator.pending_rows() > 0);
-        let should_prepare = remaining_capacity > 0
-            && !limit_scheduled
-            && (ready_input_buffer_count > 0 || window_full || has_final_partial);
-
-        if should_prepare {
-            let window_end = par
-                .ann
-                .worker
-                .window_buffer
-                .len()
-                .min(HYDRATION_WINDOW_SIZE);
-            let window_batches: Vec<RecordBatch> =
-                par.ann.worker.window_buffer.drain(..window_end).collect();
-            match hydrate_and_prepare_parallel_window(par, window_batches, remaining_capacity) {
-                Ok(jobs) => {
-                    let mut prepared = 0usize;
-                    for job in jobs {
-                        if fetch_limit
-                            .is_some_and(|limit| rows_emitted + par.queued_input_rows >= limit)
-                        {
-                            break;
-                        }
-                        par.queued_input_rows += job
-                            .batches
-                            .iter()
-                            .map(|batch| batch.num_rows())
-                            .sum::<usize>();
-                        par.pending_jobs.push_back(job);
-                        prepared += 1;
-                    }
-                    record_contig_profile(&par.ann.worker.shared.profile, |profile| {
-                        profile.annotation_pending_max =
-                            profile.annotation_pending_max.max(par.pending_jobs.len());
-                        profile.annotation_inflight_max =
-                            profile.annotation_inflight_max.max(par.in_flight.len());
-                        profile.annotation_ready_max =
-                            profile.annotation_ready_max.max(par.ready_buffers.len());
-                        profile.annotation_output_queue_max = profile
-                            .annotation_output_queue_max
-                            .max(par.output_queue.len());
-                    });
-                    if prepared > 0 {
-                        par.spawn_pending_jobs();
-                    }
-                    continue;
-                }
-                Err(e) => return Poll::Ready(ParallelAnnotationPoll::Failed(e)),
-            }
-        }
-
-        if par.is_complete() {
-            return Poll::Ready(ParallelAnnotationPoll::Complete);
-        }
-        if made_progress {
-            continue;
-        }
-        return Poll::Pending;
-    }
-}
-
 impl Stream for ContigAnnotationStream {
     type Item = Result<RecordBatch>;
 
@@ -10515,101 +9906,13 @@ impl Stream for ContigAnnotationStream {
                             lookup_wait_started: None,
                             ordered_lookup_wait_started: None,
                         };
-                        if should_parallelize_input_buffers(&ann.config) {
-                            self.state = StreamState::ParallelAnnotatingContig(
-                                ParallelAnnotationState::new(ann),
-                            );
-                        } else {
-                            self.state = StreamState::AnnotatingContig(ann);
-                        }
+                        self.state = StreamState::AnnotatingContig(ann);
                     }
                 },
 
-                StreamState::ParallelAnnotatingContig(par) => {
-                    if fetch_limit.is_some_and(|limit| rows_emitted >= limit) {
-                        let StreamState::ParallelAnnotatingContig(mut par) =
-                            std::mem::replace(&mut self.state, StreamState::Done)
-                        else {
-                            unreachable!()
-                        };
-                        par.abort_background_work();
-                        profile_end!(
-                            &format!("{}: TOTAL", par.ann.chrom),
-                            par.ann.t_contig,
-                            format!("{} rows", par.ann.contig_rows)
-                        );
-                        emit_contig_pipeline_profile(
-                            &par.ann.worker.shared.profile,
-                            &par.ann.chrom,
-                        );
-                        if profiling_enabled() {
-                            eprintln!("[VEP_PROFILE] ------ contig {} END ------", par.ann.chrom);
-                        }
-                        let fut = make_cleanup_future(
-                            Arc::clone(&par.ann.session),
-                            std::mem::take(&mut par.ann.ephemeral_tables),
-                        );
-                        self.state = StreamState::CleaningUp(fut);
-                        continue;
-                    }
-
-                    match poll_parallel_annotation_state(par, cx, rows_emitted, fetch_limit) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(ParallelAnnotationPoll::Batch(batch, rows)) => {
-                            self.rows_emitted += rows;
-                            return Poll::Ready(Some(Ok(batch)));
-                        }
-                        Poll::Ready(ParallelAnnotationPoll::Failed(e)) => {
-                            let StreamState::ParallelAnnotatingContig(mut par) =
-                                std::mem::replace(&mut self.state, StreamState::Done)
-                            else {
-                                unreachable!()
-                            };
-                            par.abort_background_work();
-                            let fut = make_cleanup_future(
-                                Arc::clone(&par.ann.session),
-                                std::mem::take(&mut par.ann.ephemeral_tables),
-                            );
-                            self.state = StreamState::ErrorCleaningUp(fut, e);
-                            continue;
-                        }
-                        Poll::Ready(ParallelAnnotationPoll::Complete) => {
-                            let StreamState::ParallelAnnotatingContig(mut par) =
-                                std::mem::replace(&mut self.state, StreamState::Done)
-                            else {
-                                unreachable!()
-                            };
-                            profile_end!(
-                                &format!("{}: TOTAL", par.ann.chrom),
-                                par.ann.t_contig,
-                                format!("{} rows", par.ann.contig_rows)
-                            );
-                            emit_contig_pipeline_profile(
-                                &par.ann.worker.shared.profile,
-                                &par.ann.chrom,
-                            );
-                            if profiling_enabled() {
-                                eprintln!(
-                                    "[VEP_PROFILE] ------ contig {} END ------",
-                                    par.ann.chrom
-                                );
-                            }
-                            par.ann.worker.colocated_map = Arc::new(HashMap::new());
-                            par.ann.worker.transcript_overrides = HashMap::new();
-                            par.ann.worker.translation_overrides = HashMap::new();
-                            let fut = make_cleanup_future(
-                                Arc::clone(&par.ann.session),
-                                std::mem::take(&mut par.ann.ephemeral_tables),
-                            );
-                            self.state = StreamState::CleaningUp(fut);
-                            continue;
-                        }
-                    }
-                }
-
                 StreamState::AnnotatingContig(ann) => {
                     // Pull looked-up batches into the window buffer. For fjall,
-                    // partition workers run concurrently, but this state machine
+                    // lookup partitions run concurrently, but this state machine
                     // drains their bounded receivers strictly by partition id.
                     //
                     // LIMIT pushdown: once we have enough buffered rows to
@@ -10626,9 +9929,7 @@ impl Stream for ContigAnnotationStream {
                             ann.config.input_buffer_size,
                             &ann.worker.window_buffer,
                         );
-                    let target_ready_input_buffers = ann.config.annotation_workers.max(1);
-                    let has_target_ready_input_buffers =
-                        ready_input_buffer_count >= target_ready_input_buffers;
+                    let has_target_ready_input_buffers = ready_input_buffer_count >= 1;
                     let window_full = ann.worker.window_buffer.len() >= HYDRATION_WINDOW_SIZE;
                     if !ann.worker.lookup_done
                         && !limit_buffered
@@ -10650,7 +9951,7 @@ impl Stream for ContigAnnotationStream {
                             }
                             Poll::Ready(Ok(())) => {}
                             Poll::Ready(Err(e)) => {
-                                abort_annotation_lookup_workers(ann);
+                                abort_annotation_lookup_partitions(ann);
                                 let session = Arc::clone(&ann.session);
                                 let tables = ann.ephemeral_tables.clone();
                                 self.state = StreamState::ErrorCleaningUp(
@@ -10679,7 +9980,7 @@ impl Stream for ContigAnnotationStream {
                         || (ann.worker.window_buffer.is_empty() && !has_pending_input_buffer)
                     {
                         // No more data (or limit reached) — clean up.
-                        abort_annotation_lookup_workers(&mut ann);
+                        abort_annotation_lookup_partitions(&mut ann);
                         // Drop heavy state eagerly before the async cleanup future runs.
                         profile_end!(
                             &format!("{}: TOTAL", ann.chrom),
@@ -10716,7 +10017,7 @@ impl Stream for ContigAnnotationStream {
                             &window_batches,
                             ann.config.cache_source_type,
                         ) {
-                            abort_annotation_lookup_workers(&mut ann);
+                            abort_annotation_lookup_partitions(&mut ann);
                             let fut = make_cleanup_future(
                                 Arc::clone(&ann.session),
                                 std::mem::take(&mut ann.ephemeral_tables),
@@ -10733,7 +10034,7 @@ impl Stream for ContigAnnotationStream {
                     let projection = ann.config.projection.clone();
                     match annotate_window(&mut ann, &window_batches, projection.as_deref()) {
                         Err(e) => {
-                            abort_annotation_lookup_workers(&mut ann);
+                            abort_annotation_lookup_partitions(&mut ann);
                             let fut = make_cleanup_future(
                                 Arc::clone(&ann.session),
                                 std::mem::take(&mut ann.ephemeral_tables),
@@ -10844,7 +10145,7 @@ async fn prepare_contig_context(
     session: Arc<SessionContext>,
     cache: Arc<PartitionedParquetCache>,
     chrom: String,
-    mut config: ContigAnnotationConfig,
+    config: ContigAnnotationConfig,
     full_schema: SchemaRef,
 ) -> Result<Option<ContigReadyState>> {
     let t_contig = profile_start!();
@@ -11005,50 +10306,9 @@ async fn prepare_contig_context(
         config.reference_fasta_path.clone(),
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
-    #[cfg(feature = "kv-cache")]
-    if use_fjall && config.chunked_buffer_lookup {
-        let fjall_settings = provider.fjall_batch_settings().await?;
-        config.lookup_vcf_has_chr = fjall_settings.vcf_has_chr;
-        config.lookup_vcf_zero_based = fjall_settings.vcf_zero_based;
-        config.lookup_cache_zero_based = fjall_settings.cache_zero_based;
-    }
-    let mut lookup_partitions = if use_fjall && config.chunked_buffer_lookup {
-        let raw_vcf_df = session
-            .table(&config.vcf_table)
-            .await?
-            .filter(col("chrom").eq(lit(&*chrom)))?;
-        let raw_plan = raw_vcf_df.create_physical_plan().await?;
-        let partition_count = raw_plan.output_partitioning().partition_count().max(1);
-        let task_ctx = session.task_ctx();
-        let mut handles = VecDeque::with_capacity(partition_count);
-        for partition_id in 0..partition_count {
-            let sink = Arc::new(Mutex::new(HashMap::new()));
-            if config.inline_lookup {
-                handles.push_back(inline_lookup_partition(
-                    Arc::clone(&raw_plan),
-                    Arc::clone(&task_ctx),
-                    partition_id,
-                    chrom.to_string(),
-                    sink,
-                )?);
-            } else {
-                handles.push_back(spawn_lookup_partition_worker(
-                    Arc::clone(&raw_plan),
-                    Arc::clone(&task_ctx),
-                    partition_id,
-                    chrom.to_string(),
-                    sink,
-                    LOOKUP_PARTITION_QUEUE_BATCHES,
-                    pipeline_profile.clone(),
-                ));
-            }
-        }
-        handles
-    } else if use_fjall {
+    let mut lookup_partitions = if use_fjall {
         let partition_coloc_sinks: Vec<ColocatedSink> = if config.flags.check_existing {
-            (0..config.target_partitions)
-                .map(|_| Arc::new(Mutex::new(HashMap::new())))
-                .collect()
+            vec![Arc::new(Mutex::new(HashMap::new()))]
         } else {
             Vec::new()
         };
@@ -11120,7 +10380,6 @@ async fn prepare_contig_context(
         }
     };
     record_contig_profile(&pipeline_profile, |profile| {
-        profile.workers = config.annotation_workers.max(1);
         profile.lookup_partitions = lookup_partitions.len();
     });
 
@@ -11618,13 +10877,7 @@ mod tests {
             projection: None,
             annotation_column_count: 0,
             fetch_limit: None,
-            target_partitions: 1,
-            annotation_workers: 1,
-            contig_parallelism: 1,
-            chunked_buffer_lookup: false,
-            lookup_vcf_has_chr: true,
-            lookup_vcf_zero_based: true,
-            lookup_cache_zero_based: false,
+            chromosome_lanes: 1,
             inline_lookup: false,
             deregister_global_kv_on_finish: true,
             pick_flags: PickFlags::default(),
@@ -13084,73 +12337,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_annotation_buffers_more_whole_vep_buffers_than_inflight_workers() {
-        let mut config = minimal_contig_annotation_config();
-        config.annotation_workers = 1;
-        assert_eq!(parallel_annotation_buffer_queue_target(&config), 1);
-
-        config.annotation_workers = 2;
-        assert_eq!(parallel_annotation_buffer_queue_target(&config), 4);
-
-        config.annotation_workers = 12;
-        assert_eq!(parallel_annotation_buffer_queue_target(&config), 24);
-    }
-
-    #[test]
-    fn test_ordered_input_buffer_drain_waits_for_missing_prefix() {
-        let mut ready = BTreeMap::new();
-        let mut next_buffer_id = 0;
-        let mut out = VecDeque::new();
-
-        ready.insert(
-            1,
-            AnnotatedInputBuffer {
-                buffer_id: 1,
-                rows: 1,
-                batches: VecDeque::from(vec![make_buffer_batch("chr1", 2, 2)]),
-            },
-        );
-        ready.insert(
-            2,
-            AnnotatedInputBuffer {
-                buffer_id: 2,
-                rows: 1,
-                batches: VecDeque::from(vec![make_buffer_batch("chr1", 3, 3)]),
-            },
-        );
-
-        drain_ready_ordered_input_buffers(&mut ready, &mut next_buffer_id, &mut out, "chr1");
-        assert!(out.is_empty());
-
-        ready.insert(
-            0,
-            AnnotatedInputBuffer {
-                buffer_id: 0,
-                rows: 1,
-                batches: VecDeque::from(vec![make_buffer_batch("chr1", 1, 1)]),
-            },
-        );
-
-        drain_ready_ordered_input_buffers(&mut ready, &mut next_buffer_id, &mut out, "chr1");
-
-        assert_eq!(out.len(), 3);
-        assert_eq!(
-            buffer_variant_bounds(&[out.pop_front().unwrap()]).unwrap(),
-            Some(("chr1".to_string(), 1, 1))
-        );
-        assert_eq!(
-            buffer_variant_bounds(&[out.pop_front().unwrap()]).unwrap(),
-            Some(("chr1".to_string(), 2, 2))
-        );
-        assert_eq!(
-            buffer_variant_bounds(&[out.pop_front().unwrap()]).unwrap(),
-            Some(("chr1".to_string(), 3, 3))
-        );
-        assert!(ready.is_empty());
-        assert_eq!(next_buffer_id, 3);
-    }
-
-    #[test]
     fn test_prepare_buffer_annotation_context_selects_buffer_features() {
         let included_tx = make_tx("tx1", None, None, None, None);
         let mut skipped_tx = make_tx("tx2", None, None, None, None);
@@ -13292,150 +12478,6 @@ mod tests {
         assert_eq!(
             indexes.translation_indices_for_transcripts(&buffer_tx_ids),
             vec![0, 1]
-        );
-    }
-
-    #[cfg(feature = "kv-cache")]
-    #[test]
-    fn test_fjall_annotation_parallelizes_global_input_buffers() {
-        let mut config = minimal_contig_annotation_config();
-        config.target_partitions = 8;
-        config.annotation_workers = 8;
-        config.use_fjall = true;
-
-        assert!(should_parallelize_input_buffers(&config));
-    }
-
-    #[cfg(feature = "kv-cache")]
-    #[test]
-    fn test_annotation_parallelism_uses_annotation_workers() {
-        let mut config = minimal_contig_annotation_config();
-        config.target_partitions = 8;
-        config.annotation_workers = 1;
-        config.use_fjall = true;
-
-        assert!(!should_parallelize_input_buffers(&config));
-
-        config.annotation_workers = 2;
-        assert!(should_parallelize_input_buffers(&config));
-    }
-
-    #[cfg(feature = "kv-cache")]
-    #[test]
-    fn test_chunked_lookup_keeps_buffer_level_parallelism() {
-        let mut config = minimal_contig_annotation_config();
-        config.annotation_workers = 8;
-        config.chunked_buffer_lookup = true;
-        config.use_fjall = true;
-        let ann = minimal_contig_annotation_state(config);
-
-        let par = ParallelAnnotationState::new(ann);
-
-        assert_eq!(par.max_parallel, 8);
-    }
-
-    #[cfg(feature = "kv-cache")]
-    #[test]
-    fn test_chunked_lookup_is_disabled_for_single_lane_single_worker() {
-        let mut config = minimal_contig_annotation_config();
-        config.annotation_workers = 1;
-        config.chunked_buffer_lookup = true;
-        config.use_fjall = true;
-
-        assert!(!should_parallelize_input_buffers(&config));
-        assert!(!effective_chunked_buffer_lookup(
-            config.chunked_buffer_lookup,
-            config.annotation_workers,
-            1
-        ));
-    }
-
-    #[cfg(feature = "kv-cache")]
-    #[test]
-    fn test_chunked_lookup_is_enabled_for_multi_contig_single_worker() {
-        let mut config = minimal_contig_annotation_config();
-        config.annotation_workers = 1;
-        config.contig_parallelism = 2;
-        config.chunked_buffer_lookup = true;
-        config.use_fjall = true;
-
-        assert!(should_parallelize_input_buffers(&config));
-        assert_eq!(input_buffer_parallelism(&config), 2);
-        assert_eq!(parallel_annotation_buffer_queue_target(&config), 2);
-        assert!(effective_chunked_buffer_lookup(
-            config.chunked_buffer_lookup,
-            config.annotation_workers,
-            2
-        ));
-    }
-
-    #[cfg(feature = "kv-cache")]
-    #[test]
-    fn test_chunked_lookup_is_enabled_for_multi_annotation_workers() {
-        let mut config = minimal_contig_annotation_config();
-        config.annotation_workers = 2;
-        config.chunked_buffer_lookup = true;
-        config.use_fjall = true;
-
-        assert!(should_parallelize_input_buffers(&config));
-        assert!(effective_chunked_buffer_lookup(
-            config.chunked_buffer_lookup,
-            config.annotation_workers,
-            1
-        ));
-    }
-
-    #[cfg(feature = "kv-cache")]
-    #[test]
-    fn test_inline_lookup_keeps_annotation_serial() {
-        let mut config = minimal_contig_annotation_config();
-        config.target_partitions = 1;
-        config.annotation_workers = 8;
-        config.inline_lookup = true;
-        config.use_fjall = true;
-
-        assert!(!should_parallelize_input_buffers(&config));
-    }
-
-    #[test]
-    fn test_input_buffer_annotation_jobs_have_global_ordered_ids() {
-        let mut shared = minimal_shared_contig_annotation_context();
-        Arc::get_mut(&mut shared)
-            .unwrap()
-            .config
-            .flags
-            .check_existing = true;
-        let mut worker = AnnotationWorkerState::new(shared).unwrap();
-        let starts: Vec<i64> = (1..=5001).collect();
-
-        let first_jobs = prepare_input_buffer_annotation_jobs(
-            &mut worker,
-            vec![make_buffer_batch_many("chr1", &starts)],
-            usize::MAX,
-        )
-        .unwrap();
-
-        assert_eq!(first_jobs.len(), 1);
-        assert_eq!(first_jobs[0].buffer_id, 0);
-        assert!(Arc::ptr_eq(
-            &first_jobs[0].colocated_map,
-            &worker.colocated_map
-        ));
-        assert_eq!(
-            buffer_variant_bounds(&first_jobs[0].batches).unwrap(),
-            Some(("chr1".to_string(), 1, 5000))
-        );
-        assert_eq!(worker.input_buffer_accumulator.pending_rows(), 1);
-
-        worker.lookup_done = true;
-        let final_jobs =
-            prepare_input_buffer_annotation_jobs(&mut worker, Vec::new(), usize::MAX).unwrap();
-
-        assert_eq!(final_jobs.len(), 1);
-        assert_eq!(final_jobs[0].buffer_id, 1);
-        assert_eq!(
-            buffer_variant_bounds(&final_jobs[0].batches).unwrap(),
-            Some(("chr1".to_string(), 5001, 5001))
         );
     }
 
@@ -14663,30 +13705,20 @@ mod tests {
         profile.annotation_compute += std::time::Duration::from_millis(50);
         profile.send_wait += std::time::Duration::from_millis(60);
         profile.ordered_drain_wait += std::time::Duration::from_millis(70);
-        profile.workers = 2;
         profile.lookup_partitions = 2;
         profile.lookup_batches = 3;
         profile.lookup_buffered_batches_max = 6;
         profile.lookup_buffered_partitions_max = 2;
-        profile.annotation_pending_max = 7;
-        profile.annotation_inflight_max = 8;
-        profile.annotation_ready_max = 9;
-        profile.annotation_output_queue_max = 10;
         profile.output_batches = 4;
         profile.output_rows = 5;
 
         let line = profile.summary_line("chr1");
 
         assert!(line.contains("[VEP_PROFILE] chr1: pipeline_profile"));
-        assert!(line.contains("workers=2"));
         assert!(line.contains("lookup_partitions=2"));
         assert!(line.contains("lookup_batches=3"));
         assert!(line.contains("lookup_buffered_batches_max=6"));
         assert!(line.contains("lookup_buffered_partitions_max=2"));
-        assert!(line.contains("annotation_pending_max=7"));
-        assert!(line.contains("annotation_inflight_max=8"));
-        assert!(line.contains("annotation_ready_max=9"));
-        assert!(line.contains("annotation_output_queue_max=10"));
         assert!(line.contains("output_batches=4"));
         assert!(line.contains("output_rows=5"));
         assert!(line.contains("context_load=0.010s"));

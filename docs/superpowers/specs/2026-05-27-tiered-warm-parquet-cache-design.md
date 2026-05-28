@@ -26,7 +26,7 @@ Measured on the full benchmark VCF over chromosomes 1-22 with selector `max_glob
 ## Non-Goals
 
 - Do not replace Fjall in the first implementation.
-- Do not use cold Parquet for runtime lookup in the first implementation.
+- Do not use cold Parquet for per-probe cache-row lookup in the first implementation. Cold Parquet may be scanned once at chromosome startup, projected to `position_key` only, to build the cold-position bitmap when `.posidx` is missing.
 - Do not load full chromosome warm Parquet files into memory.
 - Do not load all 78 variation columns for each active warm chunk.
 - Do not change transcript/regulatory context loading in this change.
@@ -42,9 +42,14 @@ variation/
   chr2_warm.parquet
   chr2_cold.parquet
   ...
+variation.position_index/
+  chr1.posidx
+  chr2.posidx
+  ...
 ```
 
 The original `chrN.parquet` may remain for compatibility, but the tiered runtime reads only `chrN_warm.parquet` for acceleration and uses `variation.fjall` for fallback.
+The cache generator must also write `variation.position_index/chrN.posidx` from `chrN_cold.parquet` during the same warm/cold split workflow. Runtime must construct a cold-position bitmap before enabling the warm tier for a chromosome. It reads `.posidx` when present and generates the bitmap once from the projected `position_key` column of `chrN_cold.parquet` when `.posidx` is missing. If neither source is available, warm cache is disabled for that chromosome and the existing Fjall-only path is used.
 
 Warm/cold split is based on complete positions, not individual rows:
 
@@ -134,9 +139,9 @@ Warm Parquet row groups are the runtime chunks. Row groups should be sorted by:
 position_key, start, end, variant_keys
 ```
 
-The first implementation should use `250,000` warm rows per row group and benchmark `100,000`, `250,000`, and `500,000`.
+The first implementation should use `500,000` warm rows per row group. Benchmark `250,000`, `500,000`, and `1,000,000` after correctness is stable.
 
-Runtime loads one active warm chunk per chromosome lane, with one adjacent chunk allowed for boundary-crossing VCF buffers.
+Runtime loads one active warm chunk per chromosome lane. A chunk is exactly one Parquet row group. The runtime must not concatenate multiple row groups into one chunk in the first implementation; if boundary reloads show up in profiling, add a bounded two-entry current/previous chunk cache later.
 
 ## Runtime Data Structure
 
@@ -147,16 +152,22 @@ struct WarmChunkContext {
     row_group_id: usize,
     min_position_key: u64,
     max_position_key: u64,
-    position_keys: Vec<u64>,
+    position_rows: Vec<PositionRowRange>,
     variant_index: HashMap<u64, SmallVec<[u32; 1]>>,
     batch: RecordBatch,
     columns: WarmColumnIndices,
 }
+
+struct PositionRowRange {
+    position_key: u64,
+    start: u32,
+    end: u32,
+}
 ```
 
-`position_keys` is sorted and deduplicated. Use binary search for the completeness check.
+`position_rows` is sorted and deduplicated. Use binary search for the completeness check and to return the local row-id range for colocated collection.
 
-`variant_index` maps each `variant_key` to one or more row numbers in `batch`. Multiple rows are allowed because of collisions, duplicate sources, or multi-allelic representations.
+`variant_index` maps each `variant_key` to one or more row ids in `batch`. The row ids are local `u32` offsets within the loaded row-group `RecordBatch`; they are built when the row group is loaded and are not persisted in `.posidx`. Multiple rows are allowed because of collisions, duplicate sources, or multi-allelic representations.
 
 `batch` is a projected Arrow `RecordBatch` for the active row group only. It must not include source metadata columns that are not used by lookup/CSQ output.
 
@@ -202,15 +213,47 @@ if active warm chunk covers position_key:
             emit warm cache values
             skip Fjall for this probe
 
-    if position_key exists in position_keys:
+    if position_key exists in position_rows:
         definitive warm miss
         skip Fjall for this probe
+
+if position_key is absent from the cold position bitmap:
+    definitive cold miss
+    skip Fjall for this probe
 
 fallback:
     call existing Fjall position lookup
 ```
 
-Worst-case cold probe cost is two cheap in-memory checks plus the existing Fjall lookup. Warm probes avoid Fjall entirely.
+Worst-case cold probe cost is two cheap in-memory checks plus the existing Fjall lookup. Warm probes avoid Fjall entirely. Cold positions absent from the startup-loaded bitmap also avoid Fjall entirely. The hot loop must not branch on whether `.posidx` exists; that decision is resolved at chromosome startup.
+
+## Single-Chromosome Processing
+
+For each active chromosome lane:
+
+```text
+1. Load immutable chromosome annotation context.
+2. Open Fjall fallback.
+3. Open chrN_warm.parquet and read warm row-group metadata.
+4. Load cold-position bitmap:
+   - preferred: variation.position_index/chrN.posidx
+   - fallback: scan chrN_cold.parquet with projection [position_key]
+   - if neither exists: disable warm tier for this chromosome.
+5. Stream sorted chrN VCF records into 5000-variant VEP buffers.
+6. For each probe, compute position_key and variant_key.
+7. Load the covering 500k-row warm row group if needed.
+8. Probe variant_index and position_rows.
+9. Skip Fjall for warm hits, warm covered misses, and cold bitmap misses.
+10. Query Fjall only for cold-positive positions.
+11. Annotate the 5000-variant buffer, format CSQ/VCF lines, and write in order.
+```
+
+The two processing sizes are intentionally different:
+
+```text
+VCF annotation buffer: 5000 input variants
+warm cache chunk: one position-aligned Parquet row group, target 500,000 cache rows
+```
 
 ## Expected Improvement
 
@@ -244,11 +287,17 @@ warm_chunks_loaded
 warm_chunk_rows
 warm_chunk_load_s
 warm_chunk_index_s
+warm_chunk_reloads
 warm_variant_key_hits
 warm_variant_key_misses
+warm_candidate_rows
+warm_rows_scanned
 warm_verified_hits
 warm_definitive_misses
 warm_position_misses
+variant_key_hash_s
+cold_position_source
+cold_position_load_s
 fjall_fallbacks
 fjall_fallback_saved
 ```
@@ -271,5 +320,13 @@ Auto-detection should require:
 variation/chrN_warm.parquet
 variation.fjall/
 ```
+
+Auto-detection should additionally check for:
+
+```text
+variation.position_index/chrN.posidx
+```
+
+If present, load it once per chromosome lane and use it as the cold-position oracle. If absent, build the same oracle once from the projected `position_key` column in `variation/chrN_cold.parquet`. If neither source exists, disable warm cache for that chromosome and use the current Fjall-only path.
 
 If warm files are missing or malformed, the system must silently fall back to current Fjall-only behavior unless profiling/debug mode is enabled.
