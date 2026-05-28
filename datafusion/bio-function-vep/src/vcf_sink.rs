@@ -574,4 +574,40 @@ mod tests {
         let description = csq_header_description(&config, CacheSourceType::Ensembl);
         assert!(!description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
     }
+
+    // ── Port of ensembl-vep/t/OutputFactory_VCF.t (v2, 2026-05-28) ────────────
+    //
+    // See `porting-tests/detailed_plans/OutputFactory_VCF.md` for the full
+    // per-subtest table.
+
+    /// Port of `t/OutputFactory_VCF.t` subtest #4 (Perl L44).
+    ///
+    /// Perl: `ref($of) eq 'Bio::EnsEMBL::VEP::OutputFactory::VCF'` — the
+    /// constructor returns a blessed VCF-output-factory object.
+    ///
+    /// Vepyr analogue: `AnnotateVcfConfig::default()` returns a usable
+    /// config struct consumable by `annotate_to_vcf`. The "constructor
+    /// returns an object of the right type" assertion in a static-typed
+    /// language reduces to: the struct compiles, has a `Default` impl,
+    /// and exposes the expected fields. Asserted by construction and
+    /// field-existence checks below.
+    ///
+    /// Detailed plan row #4.
+    #[test]
+    fn port_output_factory_vcf_subtest_4_constructor_default_config() {
+        let config = AnnotateVcfConfig::default();
+        // Default config does NOT enable --everything mode.
+        assert!(!config.everything);
+        // Default cache mode is Ensembl (refseq=false, merged=false).
+        assert!(!config.refseq);
+        assert!(!config.merged);
+        // Default buffer_size matches VEP release/115.
+        assert_eq!(config.buffer_size, VEP_DEFAULT_BUFFER_SIZE);
+        // No HGVS by default.
+        assert!(!config.hgvs);
+        assert!(!config.hgvsc);
+        assert!(!config.hgvsp);
+        // Default compression is Plain (uncompressed).
+        assert!(matches!(config.compression, VcfCompressionType::Plain));
+    }
 }

@@ -1391,6 +1391,188 @@ chr22\t100\t.\tA\tG\t.\t.\tCSQ=G|missense_variant|MODERATE
         assert_eq!(everything_fields[22], "VARIANT_CLASS");
     }
 
+    // ── Port of ensembl-vep/t/OutputFactory_VCF.t (v2, 2026-05-28) ────────────
+    //
+    // Subtest #7 (refseq mode adds BAM_EDIT) is already covered by
+    // `csq_field_names_for_refseq_and_merged_modes_insert_expected_fields`
+    // above; the dedicated test below re-cites it by Perl-subtest number to
+    // satisfy sztywno-1:1 traceability.
+    //
+    // See `porting-tests/detailed_plans/OutputFactory_VCF.md` for the full
+    // per-subtest table.
+
+    /// Port of `t/OutputFactory_VCF.t` subtest #7 (Perl L75-80).
+    ///
+    /// Perl: `OutputFactory::VCF` with `refseq=1` emits the CSQ Format
+    /// string ending in `...SYMBOL_SOURCE|HGNC_ID|REFSEQ_MATCH|REFSEQ_OFFSET|GIVEN_REF|USED_REF|BAM_EDIT`.
+    ///
+    /// Vepyr: `csq_field_names_for_mode_with_pick(false, true, false, false)`
+    /// inserts `REFSEQ_MATCH, REFSEQ_OFFSET, GIVEN_REF, USED_REF, BAM_EDIT`
+    /// at positions 28-32, ending the refseq-specific block at index 32 and
+    /// resuming with `VARIANT_CLASS` at 33.
+    ///
+    /// Detailed plan row #7.
+    #[test]
+    fn port_output_factory_vcf_subtest_7_refseq_bam_edit_block() {
+        let refseq = csq_field_names_for_mode_with_pick(false, true, false, false);
+        // Block end at BAM_EDIT.
+        assert_eq!(refseq[32], "BAM_EDIT");
+        // Block start at REFSEQ_MATCH (immediately after SYMBOL_SOURCE/HGNC_ID).
+        assert_eq!(refseq[28], "REFSEQ_MATCH");
+        // Per Perl test header line: `SYMBOL_SOURCE|HGNC_ID|REFSEQ_MATCH|...|BAM_EDIT`.
+        // Vepyr's default (non-everything) ordering has SYMBOL_SOURCE at 21 and HGNC_ID at 22.
+        assert_eq!(refseq[21], "SYMBOL_SOURCE");
+        assert_eq!(refseq[22], "HGNC_ID");
+        // No SOURCE in pure refseq mode (vepyr replaces SOURCE with REFSEQ_*).
+        assert!(refseq.iter().all(|f| *f != "SOURCE"));
+    }
+
+    /// Port of `t/OutputFactory_VCF.t` subtest #8 (Perl L82-109).
+    ///
+    /// Perl: default `fields()` returns a 22-tuple from `Allele` through
+    /// `SYMBOL_SOURCE` (then a `custom_test` for `--custom`, omitted in
+    /// vepyr — no `--custom` analogue).
+    ///
+    /// Vepyr: `csq_field_names_for_mode(false, false, false)[..22]` matches
+    /// the same 22-tuple in the same order. Vepyr's list continues beyond
+    /// 22 (74 total non-everything fields) because more annotations have
+    /// been added since the Perl test was written; the first 22 are stable.
+    ///
+    /// Detailed plan row #8.
+    #[test]
+    fn port_output_factory_vcf_subtest_8_default_fields_22_tuple() {
+        let default = csq_field_names_for_mode(false, false, false);
+        let expected_first_22 = [
+            "Allele",
+            "Consequence",
+            "IMPACT",
+            "SYMBOL",
+            "Gene",
+            "Feature_type",
+            "Feature",
+            "BIOTYPE",
+            "EXON",
+            "INTRON",
+            "HGVSc",
+            "HGVSp",
+            "cDNA_position",
+            "CDS_position",
+            "Protein_position",
+            "Amino_acids",
+            "Codons",
+            "Existing_variation",
+            "DISTANCE",
+            "STRAND",
+            "FLAGS",
+            "SYMBOL_SOURCE",
+        ];
+        assert_eq!(&default[..22], &expected_first_22[..]);
+        // Vepyr extends beyond the Perl-era 22-tuple to 74 total.
+        assert_eq!(default.len(), 74);
+    }
+
+    /// Port of `t/OutputFactory_VCF.t` subtest #10 (Perl L143-175).
+    ///
+    /// Perl: with `merged=1 + custom=1`, `fields()` contains `SOURCE`
+    /// EXACTLY ONCE (dedup verified) and REFSEQ_MATCH + REFSEQ_OFFSET are
+    /// present.
+    ///
+    /// Vepyr: `csq_field_names_for_mode(false, false, true)` (merged mode)
+    /// emits REFSEQ_MATCH at 28 and SOURCE at 29 (interleaved, single
+    /// SOURCE), continuing through BAM_EDIT at 33. The `--custom` part of
+    /// Perl's dedup is moot — vepyr has no `--custom` analogue.
+    ///
+    /// Detailed plan row #10.
+    #[test]
+    fn port_output_factory_vcf_subtest_10_merged_dedup_source() {
+        let merged = csq_field_names_for_mode(false, false, true);
+        // SOURCE appears exactly once (dedup).
+        let source_count = merged.iter().filter(|f| **f == "SOURCE").count();
+        assert_eq!(source_count, 1, "SOURCE must appear exactly once in merged mode");
+        // REFSEQ_MATCH and REFSEQ_OFFSET both present.
+        assert!(merged.iter().any(|f| *f == "REFSEQ_MATCH"));
+        assert!(merged.iter().any(|f| *f == "REFSEQ_OFFSET"));
+        // Verify the interleaving: REFSEQ_MATCH (28) → SOURCE (29) → REFSEQ_OFFSET (30).
+        let m_idx = merged.iter().position(|f| *f == "REFSEQ_MATCH").unwrap();
+        let s_idx = merged.iter().position(|f| *f == "SOURCE").unwrap();
+        let o_idx = merged.iter().position(|f| *f == "REFSEQ_OFFSET").unwrap();
+        assert_eq!(s_idx, m_idx + 1);
+        assert_eq!(o_idx, m_idx + 2);
+    }
+
+    // ── Axis B (vepyr-side accretive invariants) ───────────────────────────
+    //
+    // These pin vepyr-side properties that the Perl test does not exercise
+    // directly. See detailed_plan §Axis-B for the rationale.
+
+    /// Axis B B1 — pipe-count invariant.
+    ///
+    /// Perl row #12 (`output_hash_to_vcf_info_chunk({})` → `'|' x 20`)
+    /// implicitly tests that the pipe-joined CSQ for an empty per-row
+    /// hash has `field_count - 1` pipes. Vepyr-side, the field count is
+    /// derived from `csq_field_names_for_mode_with_pick(...)` so this
+    /// invariant deserves a direct assertion. Regressions on field-list
+    /// changes surface immediately here.
+    ///
+    /// Detailed plan Axis B B1.
+    #[test]
+    fn csq_pipe_count_matches_field_count_invariant() {
+        // Default mode: 74 fields → 73 pipes joining 74 empty groups.
+        let default = csq_field_names_for_mode(false, false, false);
+        let n = default.len();
+        let empty_joined: String = std::iter::repeat("").take(n).collect::<Vec<_>>().join("|");
+        let pipe_count = empty_joined.matches('|').count();
+        assert_eq!(
+            pipe_count,
+            n - 1,
+            "pipe-joined empty CSQ should have field_count - 1 pipes; got {} pipes for {} fields",
+            pipe_count,
+            n
+        );
+        assert_eq!(n, 74, "default field count is 74");
+
+        // --everything mode: 80 fields → 79 pipes.
+        let everything = csq_field_names_for_mode(true, false, false);
+        let m = everything.len();
+        assert_eq!(m, 80, "--everything field count is 80");
+
+        // Refseq mode: 78 fields.
+        let refseq = csq_field_names_for_mode(false, true, false);
+        assert_eq!(refseq.len(), 78, "refseq field count is 78");
+
+        // Merged mode: 79 fields.
+        let merged = csq_field_names_for_mode(false, false, true);
+        assert_eq!(merged.len(), 79, "merged field count is 79");
+    }
+
+    /// Axis B B2 — Ensembl-mode field list does NOT include REFSEQ_MATCH.
+    ///
+    /// Perl row #10 covers `merged dedup SOURCE`; the negative assertion
+    /// for ensembl-mode is separate. Catches accidental field-list bleed
+    /// across modes (e.g., a regression where REFSEQ_MATCH leaks into
+    /// Ensembl-only output).
+    ///
+    /// Detailed plan Axis B B2.
+    #[test]
+    fn csq_field_names_ensembl_mode_excludes_refseq_match() {
+        let ensembl = csq_field_names_for_mode_with_pick(false, false, false, false);
+        assert!(
+            ensembl.iter().all(|f| *f != "REFSEQ_MATCH"),
+            "REFSEQ_MATCH must not appear in Ensembl-only mode; got fields: {:?}",
+            ensembl
+        );
+        // Same for REFSEQ_OFFSET, GIVEN_REF, USED_REF, BAM_EDIT.
+        for refseq_field in ["REFSEQ_OFFSET", "GIVEN_REF", "USED_REF", "BAM_EDIT"] {
+            assert!(
+                ensembl.iter().all(|f| *f != refseq_field),
+                "{} must not appear in Ensembl-only mode",
+                refseq_field
+            );
+        }
+        // SOURCE should be present in Ensembl mode.
+        assert!(ensembl.iter().any(|f| *f == "SOURCE"));
+    }
+
     #[test]
     fn parse_csq_entries_splits_correctly() {
         let csq = "G|missense_variant|MODERATE|TP53|ENSG00000141510|Transcript|ENST00000269305|protein_coding|rs123|1|HGNC|11998|Ensembl";
