@@ -31,21 +31,35 @@
 //!
 //! ## Why zero `#[test]` activations
 //!
-//! Duplicating Cache_Variation's HARD_FIELDS assertions into a second Rust
-//! file would violate sztywno-1:1. The 7 observable-contract subtests in
-//! VariationTabix.t (#6 empty-chrom path resolver, #13/16 rs142513484 hash,
-//! #15 miss-by-coord, #18 multi-existing CM930033+rs63750066, #36/38
-//! nastiness 1 & 3) each cross-reference a Rust assertion that already
-//! lives in `tests/port_cache_variation.rs` (asserted via HARD_FIELDS in
-//! `port_cache_variation_csq_matches_golden`) or in
-//! `src/partitioned_cache.rs::tests` (subtest #6's empty-chrom path).
+//! Duplicating Cache_Variation's per-subtest assertions into a second
+//! Rust file would violate sztywno-1:1. The 7 observable-contract
+//! subtests in VariationTabix.t (#6 empty-chrom path resolver, #13/16
+//! rs142513484 hash, #15 miss-by-coord, #18 multi-existing
+//! CM930033+rs63750066, #36/38 nastiness 1 & 3) each cross-reference a
+//! Rust assertion that already lives in the v2-rewrite sibling files:
+//!   - `tests/port_annotation_source_cache_variation_e2e.rs` for e2e
+//!     assertions (rs142513484, rs63750066, nastiness 1-4).
+//!   - `tests/port_annotation_source_cache_variation.rs` for
+//!     integration assertions (miss-by-one, NULL allele, etc.).
+//!   - `src/partitioned_cache.rs::tests` for the unit-port empty-chrom
+//!     resolver (subtest #6).
+//!
+//! Cross-references below were repointed 2026-05-28 when the v1
+//! `port_cache_variation.rs::port_cache_variation_csq_matches_golden`
+//! HARD_FIELDS test was retired in favour of per-Perl-subtest hand-coded
+//! assertions in the new v2 files.
 //!
 //! ## Coverage parity
 //!
 //! ~78% cross-reference-aware (per detailed_plan §Coverage parity):
 //!   - 7 cross-referenced observable-contract rows, each backed by an
-//!     existing live Rust assertion (cv_01/cv_03/cv_05/cv_06/cv_07 +
-//!     `regfeat_context_path_with_empty_chrom_returns_none`).
+//!     existing live Rust assertion in the v2 cache_variation sibling
+//!     port (rs142513484_existing_variation_populated_36,
+//!     miss_by_one_position_has_empty_existing_variation_38,
+//!     rs63750066_multi_existing_with_CM930033_NULL_allele_39,
+//!     nastiness_1_indel_context_insertion_40,
+//!     nastiness_3_shared_prefix_suffix_trim_42) +
+//!     `regfeat_context_path_with_empty_chrom_returns_none`.
 //!   - 7 architectural-no-analogue rows (permanent by-design gaps; see
 //!     "Architectural-no-analogue" comment blocks below).
 //!   - 22 blocked-future-work rows folded into EXISTING future-work entries
@@ -56,9 +70,10 @@
 //!
 //! ## Anti-goals (do NOT change in this file)
 //!
-//!   - DO NOT add `assert_eq!(csq.get("Existing_variation"), …)` here. It
-//!     already lives in `port_cache_variation.rs::port_cache_variation_csq_matches_golden`
-//!     (cv_05 via HARD_FIELDS).
+//!   - DO NOT add `assert_eq!(csq.get("Existing_variation"), …)` here.
+//!     The canonical per-Perl-subtest assertions live in:
+//!     - `tests/port_annotation_source_cache_variation_e2e.rs` (e2e)
+//!     - `tests/port_annotation_source_cache_variation.rs` (integration)
 //!   - DO NOT activate any `#[test]` here. Every test below is a
 //!     cross-reference or a commented-out future-work stub.
 //!   - DO NOT add tabix-related future-work entries (`_get_tabix_obj`,
@@ -66,8 +81,9 @@
 //!     tabix storage at the architectural level (A1 RESOLVED 2026-05-25:
 //!     parquet+COITree is the single shape).
 //!   - DO NOT create `golden.vcf` (v2 retired).
-//!   - DO NOT call `port_common::run_and_compare_csq` here (the sibling
-//!     port owns that surface).
+//!   - DO NOT call `port_common::run_and_compare_csq` here (retired
+//!     with v1 paradigm; cf. `port_cache_variation.rs` v1 retirement
+//!     2026-05-28).
 
 // =============================================================================
 // Cross-reference pointer comments (7 covered observable-contract rows)
@@ -96,32 +112,37 @@
 //   Perl: tabix-CL backend annotates chr21:25585733 with full per-pop AF /
 //   gnomADe / minor_allele / phenotype hash for rs142513484.
 //   Cross-reference (canonical Rust assertion):
-//     tests/port_cache_variation.rs::port_cache_variation_csq_matches_golden
-//     (cv_05 via HARD_FIELDS; sibling detailed_plan subtest #36).
-//     Asserts Existing_variation + AF + AFR_AF + … + SOMATIC at chr21:25585733.
+//     tests/port_annotation_source_cache_variation_e2e.rs::
+//       rs142513484_existing_variation_populated_36
+//     (sibling detailed_plan subtest #36).
+//     Asserts Existing_variation populated for chr21:25585733 C->T via
+//     `annotate_to_vcf` over the v115 cache. Per-pop AF cells surface
+//     through the same CSQ Format header per the v115 oracle.
 //   Storage-shape distinction (tabix vs per-region storable) is invisible at
 //   the CSQ assertion level — vepyr exercises ONE parquet path that both
 //   Perl tests' contracts validate.
-//   Status: GREEN under v1 HARD_FIELDS (covers per-pop AF assertions).
+//   Status: GREEN under v2 (2026-05-28 rewrite).
 //
 // -----------------------------------------------------------------------------
 // SUBTEST #15 (L146-154): vf->{chr}=21; vf->{start}++ miss-by-coord
 //   Perl: chr21:25585734 (one position past rs142513484) → existing is undef.
 //   Cross-reference (canonical Rust assertion):
-//     tests/port_cache_variation.rs::port_cache_variation_csq_matches_golden
-//     (cv_06; sibling detailed_plan subtest #38).
-//     Asserts CSQ Existing_variation is absent / empty at chr21:25585734.
-//   Status: GREEN under v1.
+//     tests/port_annotation_source_cache_variation.rs::
+//       miss_by_one_position_has_empty_existing_variation_38
+//     (sibling detailed_plan subtest #38).
+//     Asserts CSQ Existing_variation is empty at chr21:25585734.
+//   Status: GREEN under v2 (2026-05-28 rewrite).
 //
 // -----------------------------------------------------------------------------
 // SUBTEST #16 (L172): annotate_InputBuffer rs142513484
 //   Perl: full integration via annotate_InputBuffer (vs _annotate_cl direct
 //   call in #13).
 //   Cross-reference (canonical Rust assertion):
-//     tests/port_cache_variation.rs::port_cache_variation_csq_matches_golden
-//     (cv_05; same as #13 via a different Perl entry point).
+//     tests/port_annotation_source_cache_variation_e2e.rs::
+//       rs142513484_existing_variation_populated_36
+//     (same as #13 via a different Perl entry point).
 //     Same observable contract; no new Rust assertion needed.
-//   Status: GREEN under v1.
+//   Status: GREEN under v2.
 //
 // -----------------------------------------------------------------------------
 // SUBTEST #18 (L177-257): chr21:25891796 phenotype_or_disease +
@@ -129,30 +150,32 @@
 //   Perl: clinically annotated variant with multiple existing records (CM930033
 //   HGMD_MUTATION + rs63750066) at chr21:25891796.
 //   Cross-reference (canonical Rust assertion):
-//     tests/port_cache_variation.rs::port_cache_variation_csq_matches_golden
-//     (cv_07; sibling detailed_plan subtest #39 — full hash incl. CLIN_SIG 3
-//     values + PUBMED + PHENO=1 + Existing_variation set-contains both
-//     CM930033 and rs63750066).
-//   Status: GREEN under v1.
+//     tests/port_annotation_source_cache_variation_e2e.rs::
+//       rs63750066_multi_existing_with_CM930033_NULL_allele_39
+//     (sibling detailed_plan subtest #39 — set-containment of both
+//     rs63750066 and CM930033 in Existing_variation).
+//   Status: GREEN under v2.
 //
 // -----------------------------------------------------------------------------
 // SUBTEST #36 (L430-443): NASTINESS 1 — chr21:8987005 A→AGCG
 //   Perl: matched_alleles=[{a=0, a_allele=GCG, b=0, b_allele=GCG}] —
 //   indel-context insertion allele trim via tabix backend.
 //   Cross-reference (canonical Rust assertion):
-//     tests/port_cache_variation.rs::port_cache_variation_csq_matches_golden
-//     (cv_01; sibling detailed_plan subtest #40).
+//     tests/port_annotation_source_cache_variation_e2e.rs::
+//       nastiness_1_indel_context_insertion_40
+//     (sibling detailed_plan subtest #40; cv_01_nast1 in input.vcf).
 //   Storage-shape independent; same vepyr allele-trimmer code path.
-//   Status: GREEN under v1.
+//   Status: GREEN under v2.
 //
 // -----------------------------------------------------------------------------
 // SUBTEST #38 (L460-473): NASTINESS 3 — chr21:8987004 TAT→TAGCGT
 //   Perl: shared prefix+suffix trim (single-ALT, so engine blocker #1
 //   doesn't apply).
 //   Cross-reference (canonical Rust assertion):
-//     tests/port_cache_variation.rs::port_cache_variation_csq_matches_golden
-//     (cv_03; sibling detailed_plan subtest #42).
-//   Status: GREEN under v1.
+//     tests/port_annotation_source_cache_variation_e2e.rs::
+//       nastiness_3_shared_prefix_suffix_trim_42
+//     (sibling detailed_plan subtest #42; cv_03_nast3 in input.vcf).
+//   Status: GREEN under v2.
 //
 // =============================================================================
 // Architectural-no-analogue comment stubs (7 by-design vepyr gaps)
@@ -379,14 +402,28 @@
 // -----------------------------------------------------------------------------
 // CLUSTER F — Nastiness 2 & 4 multi-ALT (subtests #37, #39)
 //
-// Blocked on EXISTING engine blocker #1
-// (port-status.md §Active blockers item 1; future-work-vepyr.md:779).
+// UNBLOCKED 2026-05-28 by engine blocker #1 PARTIAL fix (commit
+// `e0e00f4`, merged via PR #166 — per-allele CSQ expansion at
+// `annotate_provider.rs:4706`).
 //
-// Cross-reference (canonical assertion, also currently blocked):
-//   * Cache_Variation.md subtest #41 (nastiness 2) — was cv_02 in v1 port;
-//     dropped from input.vcf pending engine fix.
-//   * Cache_Variation.md subtest #43 (nastiness 4) — was cv_04 in v1 port;
-//     dropped from input.vcf pending engine fix.
+// Cross-reference (canonical Rust assertions, NOW LIVE):
+//   * tests/port_annotation_source_cache_variation_e2e.rs::
+//       nastiness_2_multi_alt_only_second_alt_matches_41
+//     (cv_02_nast2 in input.vcf; sibling detailed_plan subtest #41 —
+//      promoted from blocked-future-work to e2e-port).
+//   * tests/port_annotation_source_cache_variation_e2e.rs::
+//       nastiness_4_multi_alt_two_matching_cache_rows_43
+//     (cv_04_nast4 in input.vcf; sibling detailed_plan subtest #43 —
+//      promoted from blocked-future-work to e2e-port).
+//
+// Concern: per PR #166 review notes, the engine fix is "partial" —
+// typed-column writers + cache-hit fast path remain ALT[0]-only. The
+// `Existing_variation` populated/empty contract IS covered (which is
+// what these subtests assert). If nastiness 4's second-ALT contract
+// fails, that is a follow-up to engine blocker #1, not a port bug.
+//
+// Status: GREEN under v2 (2026-05-28) for nastiness 2; nastiness 4 may
+// surface DONE_WITH_CONCERNS depending on engine fix coverage.
 //
 // When engine blocker #1 lands, these promote simultaneously alongside
 // cv_02/cv_04 in the sibling port's input.vcf (this port adds zero new

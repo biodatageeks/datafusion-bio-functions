@@ -439,4 +439,99 @@ mod tests {
             );
         }
     }
+
+    // ----------------------------------------------------------------
+    // Port of `ensembl-vep/t/AnnotationSource_Cache_Variation.t` subtests
+    // for the per-chrom path resolver.
+    // See `porting-tests/detailed_plans/AnnotationSource_Cache_Variation.md`
+    // and `porting-tests/plans/2026-05-28-port-cache-variation.md`.
+    //
+    // The Perl `Cache::Variation::get_dump_file_name` returned a path of the
+    // shape `<dir>/<chr>/<region>_var.gz` — a per-(chrom, 1-Mb region)
+    // layout. vepyr's `PartitionedParquetCache::context_path("variation",
+    // chrom)` produces `<base>/variation/<chrom>.parquet` — per-chrom only.
+    // Following the v2 paradigm "different-named equivalent → unit-port"
+    // rule, the Perl path-shape subtests map onto vepyr's per-chrom
+    // resolver. The region-arg dimension (1-Mb block) has no vepyr
+    // analogue and is documented `architectural-no-analogue` in the
+    // detailed_plan row #21.
+    // ----------------------------------------------------------------
+
+    /// Helper: build a tmp parquet layout for a chr21-only variation
+    /// fixture. Returns the resolver.
+    fn tmp_variation_layout() -> (tempfile::TempDir, PartitionedParquetCache) {
+        let tmp = tempfile::tempdir().unwrap();
+        let var_dir = tmp.path().join("variation");
+        std::fs::create_dir(&var_dir).unwrap();
+        std::fs::write(var_dir.join("chr21.parquet"), b"dummy").unwrap();
+
+        let cache = PartitionedParquetCache::detect(tmp.path().to_str().unwrap())
+            .expect("detect should succeed for variation fixture layout");
+        (tmp, cache)
+    }
+
+    // Subtest #18 (Variation.t:186): `get_dump_file_name(1, '1-100')` →
+    // `<dir>/1/1-100_var.gz`. vepyr's analogue is per-chrom-only —
+    // `<base>/variation/<chrom>.parquet`.
+    #[test]
+    fn variation_context_path_returns_per_chrom_parquet_path() {
+        let (tmp, cache) = tmp_variation_layout();
+        let path = cache
+            .context_path("variation", "chr21")
+            .expect("variation chr21 should resolve");
+        let expected = tmp.path().join("variation").join("chr21.parquet");
+        assert_eq!(path, expected);
+    }
+
+    // Subtest #19 (Variation.t:187): `get_dump_file_name(1, 1, 100)` —
+    // same path as #18 via alternate Perl arity. vepyr's resolver has a
+    // single arity (`context_type`, `chrom`); the call shape is identical
+    // regardless of how Perl would have spelled the region. Assert the
+    // resolved path uses the `.parquet` suffix.
+    #[test]
+    fn variation_context_path_uses_parquet_suffix() {
+        let (_tmp, cache) = tmp_variation_layout();
+        let path = cache
+            .context_path("variation", "chr21")
+            .expect("variation chr21 should resolve");
+        let s = path.to_string_lossy();
+        assert!(
+            s.ends_with(".parquet"),
+            "variation/chr21 resolved path should end in .parquet (got {s})",
+        );
+    }
+
+    // Subtest #20 (Variation.t:189): `throws_ok { get_dump_file_name() }
+    // qr/No chromosome/`. vepyr's resolver returns `None` for an empty
+    // chrom (no file exists at `<base>/variation/.parquet`) instead of
+    // throwing — the equivalent observable behaviour.
+    #[test]
+    fn variation_context_path_with_empty_chrom_returns_none() {
+        let (_tmp, cache) = tmp_variation_layout();
+        // Empty chrom → "<base>/variation/.parquet" — does not exist.
+        assert!(cache.context_path("variation", "").is_none());
+        // Missing chrom for an existing context_type → None.
+        assert!(cache.context_path("variation", "chr99").is_none());
+    }
+
+    // Subtest #32 (Variation.t:253-257): `is_deeply(
+    //   $c->get_all_regions_by_InputBuffer($ib), [[21, 25]])`. Perl
+    // computes (chrom, 1-Mb-block) tuples for a buffer in chr21:25-26 Mb.
+    // vepyr's per-chrom layout drops the 1-Mb-block dimension; the region
+    // tuple reduces to a single chrom selector. Assert `has_chrom` is
+    // true for the present chrom and false for absent chroms.
+    #[test]
+    fn variation_region_tuple_for_chr21_resolves_to_single_chrom_file() {
+        let (_tmp, cache) = tmp_variation_layout();
+        assert!(
+            cache.has_chrom("variation", "chr21"),
+            "buffer on chr21 → variation/chr21.parquet"
+        );
+        for other in ["chr22", "chrX", "chrMT"] {
+            assert!(
+                !cache.has_chrom("variation", other),
+                "buffer on chr21 must not falsely resolve variation/{other}.parquet",
+            );
+        }
+    }
 }
