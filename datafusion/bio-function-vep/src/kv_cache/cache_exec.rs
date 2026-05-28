@@ -4,14 +4,16 @@
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
+use std::ops::Range;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch,
+    StringArray, StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
@@ -22,12 +24,14 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use futures::{Stream, StreamExt};
+use smallvec::SmallVec;
 
 use super::allele_index::AlleleMatcher;
 use super::key_encoding::chrom_to_code;
 use super::kv_store::RangePrefetchLimitExceeded;
 use super::kv_store::VepKvStore;
 use super::position_entry::{PositionEntryReader, make_builder};
+use super::position_index::cold_variation_file_for_chrom;
 use crate::allele::{
     VariantAlleleInput, allele_matches, get_matched_variant_alleles, vcf_to_vep_allele,
     vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
@@ -35,6 +39,14 @@ use crate::allele::{
 use crate::variant_lookup_exec::{
     AF_COL_NAMES, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
     compare_existing_variant_alleles, output_allele_from_allele_string, read_reference_sequence,
+};
+use crate::warm_cache::chrom_cache::{
+    WarmChromCache, WarmChromOpen, WarmProbe, projection_columns_for_cache,
+};
+use crate::warm_cache::chunk::WarmChunkContext;
+use crate::warm_cache::key::{
+    position_key_from_code as warm_position_key_from_code,
+    variant_key_from_position as warm_variant_key_from_position,
 };
 
 /// Lookup match mode.
@@ -74,6 +86,8 @@ pub struct KvLookupExec {
     /// Optional indexed reference FASTA for genomic shift state in colocated
     /// matching (parity with parquet path's two-pass allele matching).
     reference_fasta_path: Option<String>,
+    #[cfg(test)]
+    warm_cache_dir_override: Option<PathBuf>,
 }
 
 fn build_lookup_output_schema(
@@ -143,6 +157,8 @@ impl KvLookupExec {
             colocated_sink: None,
             colocated_partition_sinks: None,
             reference_fasta_path: None,
+            #[cfg(test)]
+            warm_cache_dir_override: None,
         })
     }
 
@@ -161,6 +177,12 @@ impl KvLookupExec {
     /// Set the reference FASTA path for genomic shift state in colocated matching.
     pub fn with_reference_fasta_path(mut self, path: Option<String>) -> Self {
         self.reference_fasta_path = path;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_warm_cache_dir_override(mut self, path: PathBuf) -> Self {
+        self.warm_cache_dir_override = Some(path);
         self
     }
 }
@@ -230,6 +252,10 @@ impl ExecutionPlan for KvLookupExec {
             exec = exec.with_colocated_partition_sinks(sinks.clone());
         }
         exec = exec.with_reference_fasta_path(self.reference_fasta_path.clone());
+        #[cfg(test)]
+        if let Some(path) = &self.warm_cache_dir_override {
+            exec = exec.with_warm_cache_dir_override(path.clone());
+        }
         Ok(Arc::new(exec))
     }
 
@@ -245,7 +271,7 @@ impl ExecutionPlan for KvLookupExec {
             .and_then(|sinks| sinks.get(partition).cloned())
             .or_else(|| self.colocated_sink.clone());
 
-        Ok(Box::pin(KvLookupStream::new(
+        let stream = KvLookupStream::new(
             input_stream,
             self.store.clone(),
             self.schema.clone(),
@@ -260,7 +286,18 @@ impl ExecutionPlan for KvLookupExec {
             self.output_col_positions.clone(),
             colocated_sink,
             self.reference_fasta_path.clone(),
-        )))
+        );
+
+        #[cfg(test)]
+        if let Some(path) = &self.warm_cache_dir_override {
+            let mut stream = stream;
+            stream.warm_cache_dir = Some(path.clone());
+            stream.cold_variation_dir = Some(path.clone());
+            stream.position_index_dir = Some(path.join("variation.position_index"));
+            return Ok(Box::pin(stream));
+        }
+
+        Ok(Box::pin(stream))
     }
 }
 
@@ -289,6 +326,10 @@ struct KvLookupStream {
     /// Optional indexed reference FASTA reader for genomic shift state.
     reference_reader:
         Option<noodles_fasta::IndexedReader<noodles_fasta::io::BufReader<std::fs::File>>>,
+    warm_cache_dir: Option<PathBuf>,
+    warm_chroms: HashMap<String, Option<Box<WarmChromCache>>>,
+    cold_variation_dir: Option<PathBuf>,
+    position_index_dir: Option<PathBuf>,
     profile_enabled: bool,
     profile_detailed: bool,
     profile_emitted: bool,
@@ -312,6 +353,52 @@ struct KvColocIndices {
     clin_sig_allele: Option<usize>,
     pubmed: Option<usize>,
     af_indices: Vec<Option<usize>>,
+}
+
+struct WarmColocIndices {
+    variation_name: usize,
+    end_col: Option<usize>,
+    failed: Option<usize>,
+    somatic: Option<usize>,
+    pheno: Option<usize>,
+    clin_sig: Option<usize>,
+    clin_sig_allele: Option<usize>,
+    pubmed: Option<usize>,
+    af_indices: Vec<Option<usize>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmProbeForDecision {
+    Exact,
+    PositionCoveredNoExact,
+    NotCovered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdPositionDecision {
+    Present,
+    Absent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LookupDecision {
+    EmitWarmExact,
+    SkipFjall,
+    UseFjall,
+}
+
+fn decide_after_warm_probe(
+    warm: WarmProbeForDecision,
+    cold: ColdPositionDecision,
+) -> LookupDecision {
+    match warm {
+        WarmProbeForDecision::Exact => LookupDecision::EmitWarmExact,
+        WarmProbeForDecision::PositionCoveredNoExact => LookupDecision::SkipFjall,
+        WarmProbeForDecision::NotCovered => match cold {
+            ColdPositionDecision::Absent => LookupDecision::SkipFjall,
+            ColdPositionDecision::Present => LookupDecision::UseFjall,
+        },
+    }
 }
 
 /// Open an indexed FASTA reader from a file path.
@@ -358,6 +445,9 @@ struct LookupProfile {
     colocated_match: Duration,
     colocated_flush: Duration,
     null_append: Duration,
+    warm_probe: Duration,
+    warm_chunk_load: Duration,
+    position_index_load: Duration,
     raw_get_hits: u64,
     raw_get_misses: u64,
     prefetch_hits: u64,
@@ -373,6 +463,19 @@ struct LookupProfile {
     colocated_allele_rows: u64,
     colocated_entries: u64,
     null_rows: u64,
+    warm_probes: u64,
+    warm_matches: u64,
+    warm_definitive_misses: u64,
+    warm_not_covered: u64,
+    warm_boundary_fallbacks: u64,
+    warm_chunks_loaded: u64,
+    warm_chunk_rows: u64,
+    position_index_checks: u64,
+    position_index_negative_skips: u64,
+    position_index_positive_gets: u64,
+    position_index_loaded: u64,
+    position_index_rows: u64,
+    position_index_bytes: u64,
 }
 
 impl LookupProfile {
@@ -400,13 +503,16 @@ impl LookupProfile {
             + self.colocated_match
             + self.colocated_flush
             + self.null_append
+            + self.warm_probe
+            + self.warm_chunk_load
+            + self.position_index_load
     }
 
     fn detail_lines(&self) -> Vec<String> {
         let detail_total = self.detail_known();
         vec![
             format!(
-                "[vep-kv-profile-detail] stages total_s={:.3} probe_build={:.3}s ({:.1}%) point_get_raw={:.3}s ({:.1}%) prefetch_map_lookup={:.3}s ({:.1}%) decompress={:.3}s ({:.1}%) reader_init={:.3}s ({:.1}%) primary_match={:.3}s ({:.1}%) cache_column_append={:.3}s ({:.1}%) colocated_prepare={:.3}s ({:.1}%) colocated_match={:.3}s ({:.1}%) colocated_flush={:.3}s ({:.1}%) null_append={:.3}s ({:.1}%)",
+                "[vep-kv-profile-detail] stages total_s={:.3} probe_build={:.3}s ({:.1}%) point_get_raw={:.3}s ({:.1}%) prefetch_map_lookup={:.3}s ({:.1}%) decompress={:.3}s ({:.1}%) reader_init={:.3}s ({:.1}%) primary_match={:.3}s ({:.1}%) cache_column_append={:.3}s ({:.1}%) colocated_prepare={:.3}s ({:.1}%) colocated_match={:.3}s ({:.1}%) colocated_flush={:.3}s ({:.1}%) null_append={:.3}s ({:.1}%) warm_probe={:.3}s ({:.1}%) warm_chunk_load={:.3}s ({:.1}%) position_index_load={:.3}s ({:.1}%)",
                 detail_total.as_secs_f64(),
                 self.probe_build.as_secs_f64(),
                 Self::pct(self.probe_build, detail_total),
@@ -430,6 +536,12 @@ impl LookupProfile {
                 Self::pct(self.colocated_flush, detail_total),
                 self.null_append.as_secs_f64(),
                 Self::pct(self.null_append, detail_total),
+                self.warm_probe.as_secs_f64(),
+                Self::pct(self.warm_probe, detail_total),
+                self.warm_chunk_load.as_secs_f64(),
+                Self::pct(self.warm_chunk_load, detail_total),
+                self.position_index_load.as_secs_f64(),
+                Self::pct(self.position_index_load, detail_total),
             ),
             format!(
                 "[vep-kv-profile-detail] io raw_get_hits={} raw_get_misses={} prefetch_hits={} prefetch_misses={} decode_calls={} compressed_bytes={} decompressed_bytes={}",
@@ -451,6 +563,25 @@ impl LookupProfile {
                 self.colocated_allele_rows,
                 self.colocated_entries,
                 self.null_rows,
+            ),
+            format!(
+                "[vep-kv-profile-detail] warm probes={} matches={} definitive_misses={} not_covered={} boundary_fallbacks={} chunks_loaded={} chunk_rows={}",
+                self.warm_probes,
+                self.warm_matches,
+                self.warm_definitive_misses,
+                self.warm_not_covered,
+                self.warm_boundary_fallbacks,
+                self.warm_chunks_loaded,
+                self.warm_chunk_rows,
+            ),
+            format!(
+                "[vep-kv-profile-detail] position_index checks={} negative_skips={} positive_gets={} loaded={} rows={} bytes={}",
+                self.position_index_checks,
+                self.position_index_negative_skips,
+                self.position_index_positive_gets,
+                self.position_index_loaded,
+                self.position_index_rows,
+                self.position_index_bytes,
             ),
         ]
     }
@@ -517,6 +648,52 @@ fn kv_profile_enabled() -> bool {
 
 fn kv_profile_detailed_enabled() -> bool {
     std::env::var_os("VEP_KV_PROFILE_DETAILED").is_some()
+}
+
+fn warm_variation_cache_enabled() -> bool {
+    std::env::var("VEP_WARM_VARIATION_CACHE")
+        .map(|value| value != "0")
+        .unwrap_or(false)
+}
+
+fn warm_variation_cache_dir(store: &VepKvStore) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("VEP_WARM_VARIATION_DIR") {
+        return Some(PathBuf::from(path));
+    }
+
+    store
+        .root_path()
+        .parent()
+        .map(|parent| parent.join("variation"))
+}
+
+fn warm_variation_batch_size() -> usize {
+    std::env::var("VEP_WARM_VARIATION_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(262_144)
+}
+
+fn variation_cold_dir(store: &VepKvStore) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("VEP_VARIATION_COLD_DIR") {
+        return Some(PathBuf::from(path));
+    }
+
+    store
+        .root_path()
+        .parent()
+        .map(|parent| parent.join("variation"))
+}
+
+fn variation_position_index_dir(store: &VepKvStore) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("VEP_VARIATION_POSITION_INDEX_DIR") {
+        return Some(PathBuf::from(path));
+    }
+
+    store
+        .root_path()
+        .parent()
+        .map(|parent| parent.join("variation.position_index"))
 }
 
 fn kv_range_prefetch_enabled() -> bool {
@@ -622,6 +799,21 @@ impl KvLookupStream {
         } else {
             None
         };
+        let warm_cache_dir = if warm_variation_cache_enabled() {
+            warm_variation_cache_dir(&store)
+        } else {
+            None
+        };
+        let cold_variation_dir = if warm_cache_dir.is_some() {
+            variation_cold_dir(&store)
+        } else {
+            None
+        };
+        let position_index_dir = if warm_cache_dir.is_some() {
+            variation_position_index_dir(&store)
+        } else {
+            None
+        };
 
         Self {
             input,
@@ -639,6 +831,10 @@ impl KvLookupStream {
             colocated_sink,
             coloc_col_indices,
             reference_reader,
+            warm_cache_dir,
+            warm_chroms: HashMap::new(),
+            cold_variation_dir,
+            position_index_dir,
             profile_enabled: kv_profile_enabled(),
             profile_detailed: kv_profile_detailed_enabled(),
             profile_emitted: false,
@@ -652,6 +848,380 @@ impl KvLookupStream {
     ///
     /// For each VCF row, fetch the per-position entry from fjall, match alleles,
     /// and append matched column values directly into ArrayBuilders.
+    fn probe_warm_position(
+        &mut self,
+        chrom: &str,
+        chrom_code: u16,
+        probe_start: i64,
+        vcf_ref: &str,
+        vcf_alt: &str,
+        vcf_iv_start: i64,
+        vcf_iv_end: i64,
+        emit_output: bool,
+        vcf_row: u32,
+        cache_columns: &[String],
+        col_map: &[usize],
+        builders: &mut [Box<dyn datafusion::arrow::array::ArrayBuilder>],
+        vcf_indices: &mut Vec<u32>,
+        coloc_buf: Option<&mut HashMap<ColocatedKey, ColocatedSinkValue>>,
+    ) -> Result<Option<LookupDecision>> {
+        let Some(warm_cache_dir) = self.warm_cache_dir.clone() else {
+            return Ok(None);
+        };
+        let Some(position_index_dir) = self.position_index_dir.clone() else {
+            return Ok(None);
+        };
+        let collect_colocated = coloc_buf.is_some();
+
+        if !self.warm_chroms.contains_key(chrom) {
+            let warm_path = warm_file_for_chrom(&warm_cache_dir, chrom);
+            let warm_chrom = if let Some(warm_path) = warm_path {
+                let warm_cache_columns =
+                    projection_columns_for_cache(cache_columns, collect_colocated);
+                let cold_path = self
+                    .cold_variation_dir
+                    .as_ref()
+                    .and_then(|dir| cold_variation_file_for_chrom(dir, chrom));
+                let started = self.profile_enabled.then(Instant::now);
+                match WarmChromCache::open(
+                    &warm_path,
+                    chrom,
+                    &position_index_dir,
+                    cold_path.as_deref(),
+                    warm_variation_batch_size(),
+                    warm_cache_columns,
+                )? {
+                    WarmChromOpen::Available(cache) => {
+                        if self.profile_enabled {
+                            if let Some(t0) = started {
+                                self.profile.position_index_load += t0.elapsed();
+                            }
+                            self.profile.position_index_loaded += 1;
+                            self.profile.position_index_rows += cache.cold_position_len() as u64;
+                            self.profile.position_index_bytes +=
+                                cache.cold_position_storage_bytes() as u64;
+                        }
+                        Some(cache)
+                    }
+                    WarmChromOpen::Unavailable(_) => None,
+                }
+            } else {
+                None
+            };
+            self.warm_chroms.insert(chrom.to_string(), warm_chrom);
+        }
+
+        let position_key = warm_position_key_from_code(chrom_code, probe_start).map_err(|e| {
+            DataFusionError::Execution(format!("failed to build warm position key: {e}"))
+        })?;
+        let variant_keys = warm_variant_key_candidates(position_key, vcf_ref, vcf_alt);
+        if variant_keys.is_empty() {
+            return Ok(None);
+        }
+
+        let exact_matcher = self.exact_matcher;
+        let allowed_failed = self.allowed_failed;
+        let profile_detailed = self.profile_detailed;
+        let mut append_elapsed = Duration::ZERO;
+        let mut emitted = false;
+        let mut colocated_prepare_elapsed = Duration::ZERO;
+        let mut colocated_match_elapsed = Duration::ZERO;
+        let mut primary_allele_rows = 0_u64;
+        let mut exact_match_calls = 0_u64;
+        let mut colocated_allele_rows = 0_u64;
+        let mut colocated_entries = 0_u64;
+        let started = self.profile_enabled.then(Instant::now);
+        let warm_chrom = self
+            .warm_chroms
+            .get_mut(chrom)
+            .and_then(Option::as_deref_mut);
+        let Some(warm_chrom) = warm_chrom else {
+            return Ok(None);
+        };
+        let before_chunks = warm_chrom.chunks_loaded;
+        let before_rows = warm_chrom.chunk_rows;
+        let before_load = warm_chrom.chunk_load;
+        let mut coloc_indices_cache: HashMap<usize, Option<WarmColocIndices>> = HashMap::new();
+        let mut coloc_buf = coloc_buf;
+        let row_matches =
+            |chunk: &WarmChunkContext, row: u32, allele_string: &str| -> Result<bool> {
+                let failed = chunk
+                    .i64_value(chunk.columns.failed, row as usize)
+                    .unwrap_or(0);
+                if failed > allowed_failed {
+                    return Ok(false);
+                }
+
+                let existing_end = chunk
+                    .i64_value(chunk.columns.end, row as usize)
+                    .unwrap_or(probe_start);
+                let cache_iv_start = probe_start.min(existing_end);
+                let cache_iv_end = probe_start.max(existing_end);
+                if cache_iv_start > vcf_iv_end || cache_iv_end < vcf_iv_start {
+                    return Ok(false);
+                }
+
+                Ok(exact_matcher(vcf_ref, vcf_alt, allele_string))
+            };
+
+        let mut exact_row: Option<u32> = None;
+        let mut position_rows: Option<Range<u32>> = None;
+        for variant_key in variant_keys {
+            match warm_chrom.probe(position_key, variant_key, |_, allele_string| {
+                Ok(exact_matcher(vcf_ref, vcf_alt, allele_string))
+            })? {
+                WarmProbe::Exact {
+                    row,
+                    position_rows: rows,
+                } => {
+                    exact_row = Some(row);
+                    position_rows = Some(rows);
+                    break;
+                }
+                WarmProbe::PositionCoveredNoExact {
+                    position_rows: rows,
+                } => {
+                    position_rows.get_or_insert(rows);
+                }
+                WarmProbe::NotCovered => {}
+            }
+        }
+
+        if let Some(row) = exact_row {
+            let chunk = warm_chrom
+                .current_chunk()
+                .ok_or_else(|| DataFusionError::Execution("warm chunk not loaded".into()))?;
+            let matched = chunk
+                .allele_string(row as usize)?
+                .map(|allele_string| row_matches(chunk, row, allele_string))
+                .transpose()?
+                .unwrap_or(false);
+            if !matched {
+                exact_row = None;
+            }
+        }
+
+        if exact_row.is_none() {
+            if let Some(rows) = position_rows.clone() {
+                let chunk = warm_chrom
+                    .current_chunk()
+                    .ok_or_else(|| DataFusionError::Execution("warm chunk not loaded".into()))?;
+                for row in rows {
+                    let Some(allele_string) = chunk.allele_string(row as usize)? else {
+                        continue;
+                    };
+                    if profile_detailed {
+                        primary_allele_rows += 1;
+                        exact_match_calls += 1;
+                    }
+                    if row_matches(chunk, row, allele_string)? {
+                        exact_row = Some(row);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if collect_colocated {
+            if let Some(rows) = position_rows.clone() {
+                let prepare_started = Instant::now();
+                let chrom_norm = chrom.to_string();
+                let (input_ref, input_alt, input_start) =
+                    vcf_to_vep_input_allele(vcf_iv_start, vcf_ref, vcf_alt);
+                let input_allele_string = format!("{input_ref}/{input_alt}");
+                let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
+                let compare_allele_string = format!("{compare_ref}/{compare_alt}");
+                let vep_start = vep_norm_start(vcf_iv_start, vcf_ref, vcf_alt);
+                let vep_end = vep_norm_end(vcf_iv_start, vcf_ref, vcf_alt);
+                let compare_output_allele =
+                    output_allele_from_allele_string(&compare_allele_string).map(str::to_string);
+                let unshifted_output_allele: Option<String> = None;
+                colocated_prepare_elapsed += prepare_started.elapsed();
+
+                let chunk = warm_chrom
+                    .current_chunk()
+                    .ok_or_else(|| DataFusionError::Execution("warm chunk not loaded".into()))?;
+                for row in rows {
+                    let Some(allele_string) = chunk.allele_string(row as usize)? else {
+                        continue;
+                    };
+                    let colocated_started = Instant::now();
+                    let Some(buf) = coloc_buf.as_deref_mut() else {
+                        continue;
+                    };
+                    if !probe_start_visible_to_window(probe_start, vep_start, vep_end) {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    }
+                    let ci = coloc_indices_cache
+                        .entry(chunk.row_group_id)
+                        .or_insert_with(|| resolve_warm_coloc_indices(chunk));
+                    let Some(ci) = ci.as_ref() else {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    };
+                    if profile_detailed {
+                        colocated_allele_rows += 1;
+                    }
+                    let failed = chunk.i64_value(ci.failed, row as usize).unwrap_or(0);
+                    if failed > allowed_failed {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    }
+
+                    let Some(var_name) =
+                        warm_string_value(chunk, Some(ci.variation_name), row as usize)?
+                    else {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    };
+                    if var_name.is_empty() {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    }
+
+                    let existing_end = chunk
+                        .i64_value(ci.end_col, row as usize)
+                        .unwrap_or(probe_start);
+                    let Some(matched_alleles) = compare_existing_variant_alleles(
+                        &compare_allele_string,
+                        vep_start,
+                        vep_end,
+                        None,
+                        None,
+                        None,
+                        allele_string,
+                        probe_start,
+                        existing_end,
+                    ) else {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    };
+
+                    let key: ColocatedKey = (
+                        chrom_norm.clone(),
+                        input_start,
+                        vcf_iv_end,
+                        input_allele_string.clone(),
+                    );
+                    let sink_value = buf.entry(key).or_insert_with(|| ColocatedSinkValue {
+                        entries: Vec::new(),
+                        compare_output_allele: compare_output_allele.clone(),
+                        unshifted_output_allele: unshifted_output_allele.clone(),
+                    });
+                    let af_values: Vec<String> = ci
+                        .af_indices
+                        .iter()
+                        .map(|idx| {
+                            warm_string_value(chunk, *idx, row as usize)
+                                .map(|value| value.unwrap_or_default())
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    sink_value.entries.push(ColocatedCacheEntry {
+                        variation_name: var_name,
+                        allele_string: allele_string.to_string(),
+                        matched_alleles,
+                        somatic: chunk.i64_value(ci.somatic, row as usize).unwrap_or(0),
+                        pheno: chunk.i64_value(ci.pheno, row as usize).unwrap_or(0),
+                        clin_sig: warm_string_value(chunk, ci.clin_sig, row as usize)?,
+                        clin_sig_allele: warm_string_value(
+                            chunk,
+                            ci.clin_sig_allele,
+                            row as usize,
+                        )?,
+                        pubmed: warm_string_value(chunk, ci.pubmed, row as usize)?,
+                        af_values,
+                    });
+                    if profile_detailed {
+                        colocated_entries += 1;
+                    }
+                    colocated_match_elapsed += colocated_started.elapsed();
+                }
+            }
+        }
+
+        if emit_output {
+            if let Some(row) = exact_row {
+                let chunk = warm_chrom
+                    .current_chunk()
+                    .ok_or_else(|| DataFusionError::Execution("warm chunk not loaded".into()))?;
+                let append_started = Instant::now();
+                let Some(indices) = chunk.output_indices(cache_columns, col_map) else {
+                    return Err(DataFusionError::Execution(
+                        "warm chunk missing one or more requested cache output columns".into(),
+                    ));
+                };
+                vcf_indices.push(vcf_row);
+                append_warm_row_values(chunk, row as usize, indices, builders)?;
+                append_elapsed += append_started.elapsed();
+                emitted = true;
+            }
+        }
+
+        let warm_decision = if exact_row.is_some() {
+            WarmProbeForDecision::Exact
+        } else if position_rows.is_some() {
+            WarmProbeForDecision::PositionCoveredNoExact
+        } else {
+            WarmProbeForDecision::NotCovered
+        };
+
+        let mut position_index_checks = 0_u64;
+        let mut position_index_positive_gets = 0_u64;
+        let mut position_index_negative_skips = 0_u64;
+        let cold_decision = if warm_decision == WarmProbeForDecision::NotCovered {
+            position_index_checks += 1;
+            if warm_chrom.cold_may_contain(position_key) {
+                position_index_positive_gets += 1;
+                ColdPositionDecision::Present
+            } else {
+                position_index_negative_skips += 1;
+                ColdPositionDecision::Absent
+            }
+        } else {
+            ColdPositionDecision::Present
+        };
+        let decision = decide_after_warm_probe(warm_decision, cold_decision);
+        let warm_chunks_loaded = warm_chrom.chunks_loaded - before_chunks;
+        let warm_chunk_rows = warm_chrom.chunk_rows - before_rows;
+        let warm_chunk_load = warm_chrom.chunk_load - before_load;
+
+        if self.profile_enabled {
+            self.profile.warm_probes += 1;
+            if let Some(t0) = started {
+                self.profile.warm_probe += t0.elapsed();
+            }
+            self.profile.warm_chunks_loaded += warm_chunks_loaded;
+            self.profile.warm_chunk_rows += warm_chunk_rows;
+            self.profile.warm_chunk_load += warm_chunk_load;
+            self.profile.cache_column_append += append_elapsed;
+            self.profile.colocated_prepare += colocated_prepare_elapsed;
+            self.profile.colocated_match += colocated_match_elapsed;
+            self.profile.position_index_checks += position_index_checks;
+            self.profile.position_index_positive_gets += position_index_positive_gets;
+            self.profile.position_index_negative_skips += position_index_negative_skips;
+            if decision == LookupDecision::EmitWarmExact {
+                self.profile.warm_matches += 1;
+            } else if decision == LookupDecision::SkipFjall {
+                self.profile.warm_definitive_misses += 1;
+            } else {
+                self.profile.warm_not_covered += 1;
+            }
+            if profile_detailed {
+                self.profile.primary_allele_rows += primary_allele_rows;
+                self.profile.exact_match_calls += exact_match_calls;
+                self.profile.colocated_allele_rows += colocated_allele_rows;
+                self.profile.colocated_entries += colocated_entries;
+            }
+        }
+
+        if exact_row.is_some() && emitted && self.profile_detailed {
+            self.profile.primary_matches += 1;
+        }
+
+        Ok(Some(decision))
+    }
+
     fn process_batch(&mut self, vcf_batch: &RecordBatch) -> Result<RecordBatch> {
         let vcf_schema = vcf_batch.schema();
         let chrom_idx = vcf_schema.index_of("chrom")?;
@@ -714,7 +1284,7 @@ impl KvLookupStream {
             None
         };
         let mut range_prefetch: Option<HashMap<i64, fjall::UserValue>> = None;
-        if kv_range_prefetch_enabled() && num_rows > 1 {
+        if kv_range_prefetch_enabled() && self.warm_cache_dir.is_none() && num_rows > 1 {
             let mut batch_chrom_code: Option<u16> = None;
             let mut min_probe = i64::MAX;
             let mut max_probe = i64::MIN;
@@ -839,6 +1409,7 @@ impl KvLookupStream {
                     .unwrap_or(usize::MAX)
             })
             .collect();
+        let cache_columns = self.cache_columns.clone();
 
         let match_started = if self.profile_enabled {
             Some(Instant::now())
@@ -894,10 +1465,40 @@ impl KvLookupStream {
             }
 
             let mut emitted_match = false;
+            let vcf_iv_start = norm_start_i64.min(norm_end_i64);
+            let vcf_iv_end = norm_start_i64.max(norm_end_i64);
             for probe_start in &probe_starts {
                 if self.profile_enabled {
                     self.profile.probes += 1;
                 }
+                if let Some(warm_decision) = self.probe_warm_position(
+                    chrom,
+                    chrom_code,
+                    *probe_start,
+                    vcf_ref,
+                    vcf_alt,
+                    vcf_iv_start,
+                    vcf_iv_end,
+                    !emitted_match,
+                    row as u32,
+                    &cache_columns,
+                    &col_map,
+                    &mut builders,
+                    &mut vcf_indices,
+                    coloc_buf.as_mut(),
+                )? {
+                    match warm_decision {
+                        LookupDecision::EmitWarmExact => {
+                            emitted_match = true;
+                            continue;
+                        }
+                        LookupDecision::SkipFjall => {
+                            continue;
+                        }
+                        LookupDecision::UseFjall => {}
+                    }
+                }
+
                 let found = if let Some(prefetched) = range_prefetch.as_ref() {
                     let map_lookup_started = self.profile_detailed.then(Instant::now);
                     let raw = prefetched.get(probe_start);
@@ -1279,6 +1880,319 @@ impl KvLookupStream {
         RecordBatch::try_new(self.schema.clone(), output_columns)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
+}
+
+fn warm_file_for_chrom(warm_cache_dir: &std::path::Path, chrom: &str) -> Option<PathBuf> {
+    let direct = warm_cache_dir.join(format!("{chrom}_warm.parquet"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+
+    if let Some(stripped) = chrom.strip_prefix("chr") {
+        let stripped = warm_cache_dir.join(format!("{stripped}_warm.parquet"));
+        if stripped.is_file() {
+            return Some(stripped);
+        }
+    } else {
+        let prefixed = warm_cache_dir.join(format!("chr{chrom}_warm.parquet"));
+        if prefixed.is_file() {
+            return Some(prefixed);
+        }
+    }
+
+    None
+}
+
+fn warm_variant_key_candidates(
+    position_key: u64,
+    vcf_ref: &str,
+    vcf_alt: &str,
+) -> SmallVec<[u64; 4]> {
+    let mut keys = SmallVec::<[u64; 4]>::new();
+    for alt in vcf_alt.split(['|', ',']).filter(|alt| !alt.is_empty()) {
+        let (vep_ref, vep_alt) = vcf_to_vep_allele(vcf_ref, alt);
+        push_unique_variant_key(
+            &mut keys,
+            warm_variant_key_from_position(position_key, &vep_ref, &vep_alt),
+        );
+        push_unique_variant_key(
+            &mut keys,
+            warm_variant_key_from_position(position_key, vcf_ref, alt),
+        );
+    }
+    keys
+}
+
+#[inline]
+fn push_unique_variant_key(keys: &mut SmallVec<[u64; 4]>, key: u64) {
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+fn resolve_warm_coloc_indices(chunk: &WarmChunkContext) -> Option<WarmColocIndices> {
+    let schema = chunk.batch.schema();
+    let find = |name: &str| schema.index_of(name).ok();
+    Some(WarmColocIndices {
+        variation_name: find("variation_name")?,
+        end_col: find("end"),
+        failed: find("failed"),
+        somatic: find("somatic"),
+        pheno: find("phenotype_or_disease"),
+        clin_sig: find("clin_sig"),
+        clin_sig_allele: find("clin_sig_allele"),
+        pubmed: find("pubmed"),
+        af_indices: AF_COL_NAMES.iter().map(|name| find(name)).collect(),
+    })
+}
+
+fn warm_output_indices(
+    chunk: &WarmChunkContext,
+    cache_columns: &[String],
+    col_map: &[usize],
+) -> Option<Vec<Option<usize>>> {
+    cache_columns
+        .iter()
+        .zip(col_map.iter())
+        .map(|(name, entry_idx)| {
+            if *entry_idx == usize::MAX {
+                Some(None)
+            } else {
+                chunk.batch.schema().index_of(name).ok().map(Some)
+            }
+        })
+        .collect()
+}
+
+fn append_warm_row_values(
+    chunk: &WarmChunkContext,
+    row: usize,
+    output_indices: &[Option<usize>],
+    builders: &mut [Box<dyn datafusion::arrow::array::ArrayBuilder>],
+) -> Result<()> {
+    for (idx, builder) in output_indices.iter().zip(builders.iter_mut()) {
+        if let Some(idx) = idx {
+            append_array_value_to_builder(
+                chunk.batch.column(*idx).as_ref(),
+                row,
+                builder.as_mut(),
+            )?;
+        } else {
+            append_null_to_builder(builder.as_mut())?;
+        }
+    }
+    Ok(())
+}
+
+fn warm_string_value(
+    chunk: &WarmChunkContext,
+    column_idx: Option<usize>,
+    row: usize,
+) -> Result<Option<String>> {
+    let Some(column_idx) = column_idx else {
+        return Ok(None);
+    };
+    let array = chunk.batch.column(column_idx);
+    if row >= array.len() || array.is_null(row) {
+        return Ok(None);
+    }
+
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        Ok(Some(array.value(row).to_string()))
+    } else if let Some(array) = array.as_any().downcast_ref::<StringViewArray>() {
+        Ok(Some(array.value(row).to_string()))
+    } else if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
+        Ok(Some(array.value(row).to_string()))
+    } else {
+        Err(DataFusionError::Execution(format!(
+            "warm colocated column expected string array, got {:?}",
+            array.data_type()
+        )))
+    }
+}
+
+fn append_array_value_to_builder(
+    array: &dyn Array,
+    row: usize,
+    builder: &mut dyn datafusion::arrow::array::ArrayBuilder,
+) -> Result<()> {
+    use datafusion::arrow::array::*;
+
+    if row >= array.len() || array.is_null(row) {
+        return append_null_to_builder(builder);
+    }
+
+    match array.data_type() {
+        DataType::Utf8 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("warm Utf8 column is not StringArray".into())
+                })?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<StringBuilder>()
+                .ok_or_else(|| DataFusionError::Execution("expected StringBuilder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::Utf8View => {
+            let array = array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("warm Utf8View column is not StringViewArray".into())
+                })?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<StringBuilder>()
+                .ok_or_else(|| DataFusionError::Execution("expected StringBuilder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::LargeUtf8 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "warm LargeUtf8 column is not LargeStringArray".into(),
+                    )
+                })?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<StringBuilder>()
+                .ok_or_else(|| DataFusionError::Execution("expected StringBuilder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::Int8 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| DataFusionError::Execution("warm Int8 column mismatch".into()))?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Int8Builder>()
+                .ok_or_else(|| DataFusionError::Execution("expected Int8Builder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::Int16 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| DataFusionError::Execution("warm Int16 column mismatch".into()))?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Int16Builder>()
+                .ok_or_else(|| DataFusionError::Execution("expected Int16Builder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::Int32 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| DataFusionError::Execution("warm Int32 column mismatch".into()))?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Int32Builder>()
+                .ok_or_else(|| DataFusionError::Execution("expected Int32Builder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::Int64 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| DataFusionError::Execution("warm Int64 column mismatch".into()))?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Int64Builder>()
+                .ok_or_else(|| DataFusionError::Execution("expected Int64Builder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::UInt8 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| DataFusionError::Execution("warm UInt8 column mismatch".into()))?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<UInt8Builder>()
+                .ok_or_else(|| DataFusionError::Execution("expected UInt8Builder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::UInt16 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .ok_or_else(|| DataFusionError::Execution("warm UInt16 column mismatch".into()))?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<UInt16Builder>()
+                .ok_or_else(|| DataFusionError::Execution("expected UInt16Builder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::UInt32 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| DataFusionError::Execution("warm UInt32 column mismatch".into()))?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<UInt32Builder>()
+                .ok_or_else(|| DataFusionError::Execution("expected UInt32Builder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::UInt64 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| DataFusionError::Execution("warm UInt64 column mismatch".into()))?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<UInt64Builder>()
+                .ok_or_else(|| DataFusionError::Execution("expected UInt64Builder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::Float32 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| DataFusionError::Execution("warm Float32 column mismatch".into()))?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Float32Builder>()
+                .ok_or_else(|| DataFusionError::Execution("expected Float32Builder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::Float64 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| DataFusionError::Execution("warm Float64 column mismatch".into()))?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Float64Builder>()
+                .ok_or_else(|| DataFusionError::Execution("expected Float64Builder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        DataType::Boolean => {
+            let array = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| DataFusionError::Execution("warm Boolean column mismatch".into()))?;
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<BooleanBuilder>()
+                .ok_or_else(|| DataFusionError::Execution("expected BooleanBuilder".into()))?;
+            builder.append_value(array.value(row));
+        }
+        other => {
+            return Err(DataFusionError::Execution(format!(
+                "warm direct append: unsupported column type {other}"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Append a single null value to any supported ArrayBuilder.
@@ -1700,6 +2614,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn warm_position_covered_no_exact_skips_fjall() {
+        let decision = decide_after_warm_probe(
+            WarmProbeForDecision::PositionCoveredNoExact,
+            ColdPositionDecision::Present,
+        );
+
+        assert_eq!(decision, LookupDecision::SkipFjall);
+    }
+
+    #[test]
+    fn warm_not_covered_and_cold_negative_skips_fjall() {
+        let decision = decide_after_warm_probe(
+            WarmProbeForDecision::NotCovered,
+            ColdPositionDecision::Absent,
+        );
+
+        assert_eq!(decision, LookupDecision::SkipFjall);
+    }
+
+    #[test]
+    fn warm_not_covered_and_cold_positive_uses_fjall() {
+        let decision = decide_after_warm_probe(
+            WarmProbeForDecision::NotCovered,
+            ColdPositionDecision::Present,
+        );
+
+        assert_eq!(decision, LookupDecision::UseFjall);
+    }
+
+    #[test]
     fn build_probe_starts_includes_parser_input_start_for_shifted_insertions() {
         let probe_starts = build_probe_starts(
             215230092,
@@ -1747,6 +2691,8 @@ mod tests {
         profile.colocated_match += Duration::from_millis(9);
         profile.colocated_flush += Duration::from_millis(10);
         profile.null_append += Duration::from_millis(11);
+        profile.warm_probe += Duration::from_millis(12);
+        profile.warm_chunk_load += Duration::from_millis(13);
         profile.raw_get_hits = 12;
         profile.raw_get_misses = 13;
         profile.prefetch_hits = 14;
@@ -1762,18 +2708,109 @@ mod tests {
         profile.colocated_allele_rows = 24;
         profile.colocated_entries = 25;
         profile.null_rows = 26;
+        profile.warm_probes = 27;
+        profile.warm_matches = 28;
+        profile.warm_definitive_misses = 29;
+        profile.warm_not_covered = 30;
+        profile.warm_boundary_fallbacks = 31;
+        profile.warm_chunks_loaded = 32;
+        profile.warm_chunk_rows = 33;
 
         let lines = profile.detail_lines();
 
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 5);
         assert!(lines[0].contains("probe_build=0.001s"));
         assert!(lines[0].contains("point_get_raw=0.002s"));
         assert!(lines[0].contains("decompress=0.004s"));
+        assert!(lines[0].contains("warm_probe=0.012s"));
+        assert!(lines[0].contains("warm_chunk_load=0.013s"));
         assert!(lines[1].contains("raw_get_hits=12"));
         assert!(lines[1].contains("compressed_bytes=17"));
         assert!(lines[2].contains("primary_allele_rows=19"));
         assert!(lines[2].contains("colocated_entries=25"));
         assert!(lines[2].contains("null_rows=26"));
+        assert!(lines[3].contains("probes=27"));
+        assert!(lines[3].contains("definitive_misses=29"));
+        assert!(lines[3].contains("chunk_rows=33"));
+        assert!(lines[4].contains("position_index checks=0"));
+    }
+
+    #[test]
+    fn warm_row_values_append_to_cache_builders() {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+
+        use crate::warm_cache::chunk::WarmChunkContext;
+        use crate::warm_cache::key::{position_key, variant_keys_from_allele_string};
+
+        let mut variant_keys = datafusion::arrow::array::ListBuilder::new(
+            datafusion::arrow::array::UInt64Builder::new(),
+        );
+        for key in variant_keys_from_allele_string("1", 101, "A/G").unwrap() {
+            variant_keys.values().append_value(key);
+        }
+        variant_keys.append(true);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new_list(
+                "variant_keys",
+                Arc::new(Field::new_list_field(DataType::UInt64, true)),
+                false,
+            ),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("end", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![position_key("1", 101).unwrap()])) as ArrayRef,
+                Arc::new(variant_keys.finish()) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("rs1")])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(101)])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let chunk = WarmChunkContext::try_new(0, batch).unwrap();
+        let cache_columns = vec![
+            "variation_name".to_string(),
+            "end".to_string(),
+            "missing_from_cache".to_string(),
+        ];
+        let col_map = vec![0, 1, usize::MAX];
+        let output_types = [DataType::Utf8, DataType::Int64, DataType::Utf8];
+        let mut builders = output_types
+            .iter()
+            .map(|dt| make_builder(dt, 1).unwrap())
+            .collect::<Vec<_>>();
+
+        let indices = warm_output_indices(&chunk, &cache_columns, &col_map).unwrap();
+        append_warm_row_values(&chunk, 0, &indices, &mut builders).unwrap();
+
+        let variation = builders[0]
+            .finish()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        let end = builders[1]
+            .finish()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .clone();
+        let missing = builders[2]
+            .finish()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+
+        assert_eq!(variation.value(0), "rs1");
+        assert_eq!(end.value(0), 101);
+        assert!(missing.is_null(0));
     }
 
     // -----------------------------------------------------------------------
@@ -1782,11 +2819,15 @@ mod tests {
 
     use crate::allele::allele_matches;
     use crate::kv_cache::position_entry::serialize_position_entry;
+    use crate::warm_cache::key::position_key;
     use datafusion::arrow::array::Int8Array;
     use datafusion::arrow::datatypes::Schema;
     use datafusion::datasource::MemTable;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
     use std::collections::HashMap as StdHashMap;
     use std::sync::Mutex;
+
     fn test_temp_dir(_prefix: &str) -> tempfile::TempDir {
         tempfile::tempdir().expect("create temp dir")
     }
@@ -1852,6 +2893,63 @@ mod tests {
         // cache_dir dropped here → temp directory cleaned up
     }
 
+    async fn run_kv_with_colocated_sink_and_warm_dir(
+        vcf_batch: RecordBatch,
+        cache_schema: Arc<Schema>,
+        cache_columns: Vec<String>,
+        warm_dir: &std::path::Path,
+    ) -> (
+        StdHashMap<ColocatedKey, ColocatedSinkValue>,
+        Vec<RecordBatch>,
+    ) {
+        let cache_dir = test_temp_dir("vep-kv-warm-coloc");
+        let store = VepKvStore::create(cache_dir.path(), cache_schema).unwrap();
+        store.persist().unwrap();
+        drop(store);
+
+        let reopened_store = Arc::new(VepKvStore::open(cache_dir.path()).expect("reopen KV store"));
+
+        let vcf_schema = vcf_batch.schema();
+        let vcf_mem = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("vcf_warm_coloc", Arc::new(vcf_mem))
+            .unwrap();
+        let vcf_plan = ctx
+            .table("vcf_warm_coloc")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        let sink: ColocatedSink = Arc::new(Mutex::new(StdHashMap::new()));
+
+        let exec = KvLookupExec::new(
+            vcf_plan,
+            reopened_store,
+            cache_columns,
+            KvMatchMode::Exact,
+            allele_matches as fn(&str, &str, &str) -> bool,
+            false,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap()
+        .with_colocated_sink(Arc::clone(&sink))
+        .with_warm_cache_dir_override(warm_dir.to_path_buf());
+
+        let task_ctx = ctx.task_ctx();
+        let stream = exec.execute(0, task_ctx).unwrap();
+        let batches: Vec<_> = datafusion::physical_plan::common::collect(stream)
+            .await
+            .unwrap();
+
+        let coloc = sink.lock().unwrap().clone();
+        (coloc, batches)
+    }
+
     fn simple_cache_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -1885,6 +2983,102 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn write_single_group_warm_parquet(path: &std::path::Path, batch: &RecordBatch) {
+        let file = std::fs::File::create(path).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(batch.num_rows())
+            .build();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_lookup_populates_colocated_sink_when_check_existing_is_active() {
+        let cache_schema = simple_cache_schema();
+        let warm_dir = tempfile::tempdir().unwrap();
+        let mut variant_keys = datafusion::arrow::array::ListBuilder::new(
+            datafusion::arrow::array::UInt64Builder::new(),
+        );
+        for key in crate::warm_cache::key::variant_keys_from_allele_string("1", 100, "A/G").unwrap()
+        {
+            variant_keys.values().append_value(key);
+        }
+        variant_keys.append(true);
+        let warm_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("position_key", DataType::UInt64, false),
+                Field::new_list(
+                    "variant_keys",
+                    Arc::new(Field::new_list_field(DataType::UInt64, true)),
+                    false,
+                ),
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("variation_name", DataType::Utf8, true),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("clin_sig", DataType::Utf8, true),
+                Field::new("failed", DataType::Int64, false),
+                Field::new("somatic", DataType::Int64, true),
+                Field::new("phenotype_or_disease", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![position_key("1", 100).unwrap()])) as ArrayRef,
+                Arc::new(variant_keys.finish()) as ArrayRef,
+                Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["rs_warm"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["A/G"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["pathogenic"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        write_single_group_warm_parquet(&warm_dir.path().join("chr1_warm.parquet"), &warm_batch);
+        crate::kv_cache::position_index::PositionIndex::from_positions([])
+            .unwrap()
+            .write_to_path(warm_dir.path().join("variation.position_index/chr1.posidx"))
+            .unwrap();
+
+        let vcf = simple_vcf_batch("1", 100, 100, "A", "G");
+        let (coloc, batches) = run_kv_with_colocated_sink_and_warm_dir(
+            vcf,
+            cache_schema,
+            vec!["variation_name".into(), "clin_sig".into()],
+            warm_dir.path(),
+        )
+        .await;
+
+        let output_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(output_rows, 1);
+        let variation_idx = batches[0]
+            .schema()
+            .index_of("cache_variation_name")
+            .unwrap();
+        let variation = batches[0]
+            .column(variation_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(variation.value(0), "rs_warm");
+
+        let all_names: Vec<&str> = coloc
+            .values()
+            .flat_map(|value| value.entries.iter())
+            .map(|entry| entry.variation_name.as_str())
+            .collect();
+        assert_eq!(all_names, vec!["rs_warm"]);
+        let entry = &coloc.values().next().unwrap().entries[0];
+        assert_eq!(entry.allele_string, "A/G");
+        assert_eq!(entry.somatic, 1);
+        assert_eq!(entry.pheno, 1);
+        assert_eq!(entry.clin_sig, Some("pathogenic".to_string()));
     }
 
     /// Empty VCF input should produce zero output rows.
