@@ -282,13 +282,13 @@ impl CacheBuilder {
         let kind = EnsemblEntityKind::Variation;
         let table_name = "var";
         let parquet_dir = format!("{}/variation", self.output_dir);
-        let variation_tier_exists = dir_has_variation_tier_files(&parquet_dir);
         let base_parquet_exists = dir_has_base_variation_parquet_files(&parquet_dir);
+        let variation_tier_exists = dir_has_variation_tier_files(&parquet_dir);
         let fjall_dir_path = format!("{}/variation.fjall", self.output_dir);
         let fjall_exists = Path::new(&fjall_dir_path).exists();
 
         if !self.overwrite {
-            let need_parquet = !variation_tier_exists;
+            let need_parquet = base_parquet_exists || !variation_tier_exists;
             let need_fjall = self.build_fjall && !fjall_exists;
 
             if !need_parquet && !need_fjall {
