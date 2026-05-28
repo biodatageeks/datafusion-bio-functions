@@ -1,3 +1,4 @@
+pub mod chrom_cache;
 pub mod chunk;
 pub mod key;
 pub mod reader;
