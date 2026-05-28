@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,7 +121,7 @@ pub fn build_warm_variation_tier(
     std::fs::create_dir_all(&args.output_dir)?;
 
     let chrom = chrom_from_input(&args.input)?;
-    let warm_positions = collect_warm_positions(&args)?;
+    let warm_positions = collect_warm_positions(&args, &chrom)?;
     let written = write_split_files(&args, &chrom, &warm_positions)?;
 
     Ok(WarmVariationTierStats {
@@ -161,7 +161,10 @@ pub fn build_warm_variation_tier_from_parts(
     let mut collect_handles = Vec::with_capacity(options.inputs.len());
     for input in &options.inputs {
         let args = args_for(input.clone());
-        collect_handles.push(std::thread::spawn(move || collect_warm_positions(&args)));
+        let chrom = options.chrom.clone();
+        collect_handles.push(std::thread::spawn(move || {
+            collect_warm_positions(&args, &chrom)
+        }));
     }
 
     let mut warm_positions = BTreeSet::new();
@@ -272,26 +275,37 @@ fn chrom_from_input(input: &Path) -> Result<String> {
         .to_string())
 }
 
-fn collect_warm_positions(args: &Args) -> Result<BTreeSet<i64>> {
+fn collect_warm_positions(args: &Args, default_chrom: &str) -> Result<BTreeSet<u64>> {
     let file = File::open(&args.input)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let mask = projection_for_existing_roots(
         builder.schema(),
         builder.parquet_schema(),
-        &["start", "minor_allele_freq", "AF", "gnomADg", "gnomADe"],
+        &[
+            "chrom",
+            "start",
+            "minor_allele_freq",
+            "AF",
+            "gnomADg",
+            "gnomADe",
+        ],
     );
     let reader = builder
         .with_projection(mask)
         .with_batch_size(args.batch_size)
         .build()?;
 
-    let mut collector = WarmPositionCollector::new(args.af_threshold, args.position_radius);
+    let mut collectors: BTreeMap<String, WarmPositionCollector> = BTreeMap::new();
     for batch in reader {
         let batch = batch?;
         let columns = FrequencyColumnIndices::new(batch.schema())?;
         for row in 0..batch.num_rows() {
             let start = int64_value(batch.column(columns.start).as_ref(), row)
                 .ok_or("start must be non-null Int64/Int32/UInt32")?;
+            let chrom = columns
+                .chrom
+                .and_then(|idx| string_value(batch.column(idx).as_ref(), row))
+                .unwrap_or(default_chrom);
             let fields = FrequencyFields {
                 minor_allele_freq: columns
                     .minor_allele_freq
@@ -306,17 +320,29 @@ fn collect_warm_positions(args: &Args) -> Result<BTreeSet<i64>> {
                     .gnomade
                     .and_then(|idx| string_value(batch.column(idx).as_ref(), row)),
             };
-            collector.push(start, max_global_af(&fields))?;
+            collectors
+                .entry(chrom.to_string())
+                .or_insert_with(|| {
+                    WarmPositionCollector::new(args.af_threshold, args.position_radius)
+                })
+                .push(start, max_global_af(&fields))?;
         }
     }
 
-    Ok(collector.finish())
+    let mut warm_positions = BTreeSet::new();
+    for (chrom, collector) in collectors {
+        for start in collector.finish() {
+            warm_positions.insert(position_key(&chrom, start)?);
+        }
+    }
+
+    Ok(warm_positions)
 }
 
 fn write_split_files(
     args: &Args,
     chrom: &str,
-    warm_positions: &BTreeSet<i64>,
+    warm_positions: &BTreeSet<u64>,
 ) -> Result<WrittenRows> {
     let warm_path = args.output_dir.join(format!("{chrom}_warm.parquet"));
     let cold_path = args.output_dir.join(format!("{chrom}_cold.parquet"));
@@ -328,7 +354,7 @@ fn write_split_files(
 fn write_split_files_to_paths(
     args: &Args,
     chrom: &str,
-    warm_positions: &BTreeSet<i64>,
+    warm_positions: &BTreeSet<u64>,
     warm_path: &Path,
     cold_path: &Path,
 ) -> Result<WrittenRows> {
@@ -350,7 +376,7 @@ fn write_split_files_to_paths(
     for batch in reader {
         let batch = batch?;
         let enriched = append_key_columns(&batch, &output_schema, chrom)?;
-        let warm_mask = warm_mask(&batch, warm_positions)?;
+        let warm_mask = warm_mask(&batch, chrom, warm_positions)?;
         let cold_mask = invert_mask(&warm_mask);
 
         let warm_batch = filter_record_batch(&enriched, &warm_mask)?;
@@ -362,7 +388,7 @@ fn write_split_files_to_paths(
         let cold_batch = filter_record_batch(&enriched, &cold_mask)?;
         if cold_batch.num_rows() > 0 {
             written.cold_rows_sharing_warm_positions +=
-                count_rows_with_warm_positions(&cold_batch, warm_positions)?;
+                count_rows_with_warm_positions(&cold_batch, chrom, warm_positions)?;
             written.cold_rows += cold_batch.num_rows();
             cold_writer.write(&cold_batch)?;
         }
@@ -575,14 +601,19 @@ fn position_key_array(batch: &RecordBatch, idx: usize) -> Result<&UInt64Array> {
 
 fn count_rows_with_warm_positions(
     batch: &RecordBatch,
-    warm_positions: &BTreeSet<i64>,
+    default_chrom: &str,
+    warm_positions: &BTreeSet<u64>,
 ) -> Result<usize> {
     let start_idx = batch.schema().index_of("start")?;
+    let chrom_idx = batch.schema().index_of("chrom").ok();
     let mut count = 0usize;
     for row in 0..batch.num_rows() {
         let start = int64_value(batch.column(start_idx).as_ref(), row)
             .ok_or("start must be non-null Int64/Int32/UInt32")?;
-        if warm_positions.contains(&start) {
+        let chrom = chrom_idx
+            .and_then(|idx| string_value(batch.column(idx).as_ref(), row))
+            .unwrap_or(default_chrom);
+        if warm_positions.contains(&position_key(chrom, start)?) {
             count += 1;
         }
     }
@@ -653,6 +684,7 @@ fn row_group_position_range(
 
 #[derive(Debug)]
 struct FrequencyColumnIndices {
+    chrom: Option<usize>,
     start: usize,
     minor_allele_freq: Option<usize>,
     af: Option<usize>,
@@ -663,6 +695,7 @@ struct FrequencyColumnIndices {
 impl FrequencyColumnIndices {
     fn new(schema: SchemaRef) -> Result<Self> {
         Ok(Self {
+            chrom: schema.index_of("chrom").ok(),
             start: schema
                 .index_of("start")
                 .map_err(|_| "required column 'start' not found")?,
@@ -764,14 +797,19 @@ fn append_key_columns(
 
 fn warm_mask(
     batch: &RecordBatch,
-    warm_positions: &BTreeSet<i64>,
+    default_chrom: &str,
+    warm_positions: &BTreeSet<u64>,
 ) -> Result<datafusion::arrow::array::BooleanArray> {
     let start_idx = batch.schema().index_of("start")?;
+    let chrom_idx = batch.schema().index_of("chrom").ok();
     let mut builder = BooleanBuilder::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
         let start = int64_value(batch.column(start_idx).as_ref(), row)
             .ok_or("start must be non-null Int64/Int32/UInt32")?;
-        builder.append_value(warm_positions.contains(&start));
+        let chrom = chrom_idx
+            .and_then(|idx| string_value(batch.column(idx).as_ref(), row))
+            .unwrap_or(default_chrom);
+        builder.append_value(warm_positions.contains(&position_key(chrom, start)?));
     }
     Ok(builder.finish())
 }
@@ -835,6 +873,15 @@ mod tests {
     use super::*;
 
     fn write_input_part(path: &Path, starts: Vec<i64>, mafs: Vec<f64>) {
+        write_input_part_with_chroms(path, vec!["1"; starts.len()], starts, mafs);
+    }
+
+    fn write_input_part_with_chroms(
+        path: &Path,
+        chroms: Vec<&str>,
+        starts: Vec<i64>,
+        mafs: Vec<f64>,
+    ) {
         let rows = starts.len();
         let schema = Arc::new(Schema::new(vec![
             Field::new("chrom", DataType::Utf8, false),
@@ -845,7 +892,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec!["1"; rows])) as ArrayRef,
+                Arc::new(StringArray::from(chroms)) as ArrayRef,
                 Arc::new(Int64Array::from(starts)) as ArrayRef,
                 Arc::new(StringArray::from(vec!["A/G"; rows])) as ArrayRef,
                 Arc::new(Float64Array::from(mafs)) as ArrayRef,
@@ -904,5 +951,58 @@ mod tests {
                 .exists()
         );
         assert!(!work_dir.exists());
+    }
+
+    #[test]
+    fn build_warm_variation_tier_handles_other_parquet_start_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("variation");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let input = output_dir.join("other.parquet");
+        write_input_part_with_chroms(
+            &input,
+            vec!["GL000001.1", "GL000001.1", "GL000002.1", "GL000002.1"],
+            vec![493_165, 493_166, 1, 2],
+            vec![0.02, 0.0, 0.02, 0.0],
+        );
+
+        let mut options = WarmVariationTierOptions::new(&input, &output_dir);
+        options.af_threshold = 0.01;
+        options.position_radius = 0;
+        options.batch_size = 2;
+
+        let stats = build_warm_variation_tier(options).unwrap();
+
+        assert_eq!(stats.chrom, "other");
+        assert_eq!(stats.warm_rows, 2);
+        assert_eq!(stats.cold_rows, 2);
+        assert_eq!(count_rows(&output_dir.join("other_warm.parquet")), 2);
+        assert_eq!(count_rows(&output_dir.join("other_cold.parquet")), 2);
+    }
+
+    #[test]
+    fn build_warm_variation_tier_does_not_share_warm_starts_across_contigs() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("variation");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let input = output_dir.join("other.parquet");
+        write_input_part_with_chroms(
+            &input,
+            vec!["GL000001.1", "GL000002.1"],
+            vec![100, 100],
+            vec![0.02, 0.0],
+        );
+
+        let mut options = WarmVariationTierOptions::new(&input, &output_dir);
+        options.af_threshold = 0.01;
+        options.position_radius = 0;
+        options.batch_size = 2;
+
+        let stats = build_warm_variation_tier(options).unwrap();
+
+        assert_eq!(stats.warm_rows, 1);
+        assert_eq!(stats.cold_rows, 1);
     }
 }
