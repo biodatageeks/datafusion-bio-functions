@@ -10307,23 +10307,26 @@ async fn prepare_contig_context(
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
     let mut lookup_partitions = if use_fjall {
+        let session_state = session.state();
+        let mut plan = provider.scan(&session_state, None, &[], None).await?;
+        let mut partition_count = plan.output_partitioning().partition_count().max(1);
         let partition_coloc_sinks: Vec<ColocatedSink> = if config.flags.check_existing {
-            vec![Arc::new(Mutex::new(HashMap::new()))]
+            let sinks = (0..partition_count)
+                .map(|_| Arc::new(Mutex::new(HashMap::new())) as ColocatedSink)
+                .collect::<Vec<_>>();
+            provider.set_partition_colocated_sinks(sinks.clone());
+            plan = provider.scan(&session_state, None, &[], None).await?;
+            partition_count = plan.output_partitioning().partition_count().max(1);
+            if partition_count > sinks.len() {
+                return Err(DataFusionError::Execution(format!(
+                    "lookup plan produced {partition_count} partitions but only {} colocated sinks were configured",
+                    sinks.len()
+                )));
+            }
+            sinks
         } else {
             Vec::new()
         };
-        if config.flags.check_existing {
-            provider.set_partition_colocated_sinks(partition_coloc_sinks.clone());
-        }
-        let session_state = session.state();
-        let plan = provider.scan(&session_state, None, &[], None).await?;
-        let partition_count = plan.output_partitioning().partition_count().max(1);
-        if config.flags.check_existing && partition_count > partition_coloc_sinks.len() {
-            return Err(DataFusionError::Execution(format!(
-                "lookup plan produced {partition_count} partitions but only {} colocated sinks were configured",
-                partition_coloc_sinks.len()
-            )));
-        }
 
         let task_ctx = session.task_ctx();
         let mut handles = VecDeque::with_capacity(partition_count);
