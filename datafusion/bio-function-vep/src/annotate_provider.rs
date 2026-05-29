@@ -172,6 +172,8 @@ use datafusion::prelude::{Expr, ParquetReadOptions, SessionContext, col, lit};
 use futures::{Future, Stream, StreamExt};
 use noodles_core::{Position, Region};
 use noodles_fasta as fasta;
+use std::borrow::Cow;
+use std::fmt::Write;
 
 use crate::allele::{
     MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
@@ -1615,14 +1617,9 @@ impl CsqPlaceholderField {
             Self::Impact => entry.impact,
             Self::ExistingVariation => entry.existing_variation,
             Self::VariantClass => entry.variant_class,
-            Self::AfValue(idx) => entry
-                .frequency_fields
-                .af_values
-                .get(idx)
-                .map(String::as_str)
-                .unwrap_or(""),
-            Self::MaxAf => entry.frequency_fields.max_af.as_str(),
-            Self::MaxAfPops => entry.frequency_fields.max_af_pops.as_str(),
+            Self::AfValue(idx) => entry.frequency_fields.af_value(idx),
+            Self::MaxAf => entry.frequency_fields.max_af(),
+            Self::MaxAfPops => entry.frequency_fields.max_af_pops(),
             Self::ClinSig => entry.variant_fields.clin_sig.as_str(),
             Self::Somatic => entry.variant_fields.somatic.as_str(),
             Self::Pheno => entry.variant_fields.pheno.as_str(),
@@ -1671,7 +1668,7 @@ struct CsqPlaceholderEntry<'a> {
     impact: &'a str,
     existing_variation: &'a str,
     variant_class: &'a str,
-    frequency_fields: &'a ColocatedFrequencyFields,
+    frequency_fields: ColocatedFrequencyFieldRef<'a>,
     variant_fields: &'a ColocatedVariantFields,
 }
 
@@ -1715,6 +1712,86 @@ struct ColocatedFrequencyFields {
     af_values: Vec<String>,
     max_af: String,
     max_af_pops: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ColocatedFrequencyFieldRef<'a> {
+    Empty,
+    Resolved(&'a ColocatedFrequencyFields),
+}
+
+impl<'a> ColocatedFrequencyFieldRef<'a> {
+    fn af_value(self, idx: usize) -> &'a str {
+        match self {
+            Self::Empty => "",
+            Self::Resolved(fields) => fields.af_values.get(idx).map(String::as_str).unwrap_or(""),
+        }
+    }
+
+    fn max_af(self) -> &'a str {
+        match self {
+            Self::Empty => "",
+            Self::Resolved(fields) => fields.max_af.as_str(),
+        }
+    }
+
+    fn max_af_pops(self) -> &'a str {
+        match self {
+            Self::Empty => "",
+            Self::Resolved(fields) => fields.max_af_pops.as_str(),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Resolved(fields) => {
+                fields.af_values.iter().all(String::is_empty)
+                    && fields.max_af.is_empty()
+                    && fields.max_af_pops.is_empty()
+            }
+        }
+    }
+}
+
+impl ColocatedVariantFields {
+    fn is_empty(&self) -> bool {
+        self.existing_variation.is_empty()
+            && self.clin_sig.is_empty()
+            && self.somatic.is_empty()
+            && self.pheno.is_empty()
+            && self.pubmed.is_empty()
+    }
+}
+
+const EMPTY_BATCH3_SUFFIX: &str = "||||||||||||||||||||||||||||||||";
+
+fn batch3_suffix_for_csq<'a>(
+    frequency_fields: ColocatedFrequencyFieldRef<'a>,
+    variant_fields: &ColocatedVariantFields,
+) -> Cow<'static, str> {
+    if frequency_fields.is_empty() && variant_fields.is_empty() {
+        return Cow::Borrowed(EMPTY_BATCH3_SUFFIX);
+    }
+
+    let mut suffix = String::with_capacity(128);
+    for idx in 0..AF_COLUMNS.len() {
+        if idx > 0 {
+            suffix.push('|');
+        }
+        suffix.push_str(frequency_fields.af_value(idx));
+    }
+    let _ = write!(
+        suffix,
+        "|{}|{}|{}|{}|{}|{}",
+        frequency_fields.max_af(),
+        frequency_fields.max_af_pops(),
+        variant_fields.clin_sig,
+        variant_fields.somatic,
+        variant_fields.pheno,
+        variant_fields.pubmed,
+    );
+    Cow::Owned(suffix)
 }
 
 fn variant_prefix_rank(variation_name: &str) -> u8 {
@@ -4823,40 +4900,29 @@ impl AnnotateProvider {
                 end_val,
                 input_allele_string,
             ));
-            let (variant_fields, frequency_fields) = if flags.check_existing {
+            let mut frequency_fields_storage = None;
+            let variant_fields = if flags.check_existing {
                 if let Some(data) = coloc {
-                    (
-                        data.variant_fields(
-                            &vep_allele,
-                            data.variant_match_output_allele(&vep_allele),
-                            flags.pubmed,
-                        ),
-                        data.frequency_fields(
-                            &vep_allele,
-                            data.frequency_match_output_allele(&vep_allele),
-                            flags,
-                        ),
+                    frequency_fields_storage = Some(data.frequency_fields(
+                        &vep_allele,
+                        data.frequency_match_output_allele(&vep_allele),
+                        flags,
+                    ));
+                    data.variant_fields(
+                        &vep_allele,
+                        data.variant_match_output_allele(&vep_allele),
+                        flags.pubmed,
                     )
                 } else {
-                    (
-                        ColocatedVariantFields::default(),
-                        ColocatedFrequencyFields {
-                            af_values: vec![String::new(); AF_COLUMNS.len()],
-                            max_af: String::new(),
-                            max_af_pops: String::new(),
-                        },
-                    )
+                    ColocatedVariantFields::default()
                 }
             } else {
-                (
-                    ColocatedVariantFields::default(),
-                    ColocatedFrequencyFields {
-                        af_values: vec![String::new(); AF_COLUMNS.len()],
-                        max_af: String::new(),
-                        max_af_pops: String::new(),
-                    },
-                )
+                ColocatedVariantFields::default()
             };
+            let frequency_fields = frequency_fields_storage
+                .as_ref()
+                .map(ColocatedFrequencyFieldRef::Resolved)
+                .unwrap_or(ColocatedFrequencyFieldRef::Empty);
             let existing_var = variant_fields.existing_variation.as_str();
             if let Some(started) = colocated_started {
                 engine_profile.colocated_fields += started.elapsed();
@@ -4865,16 +4931,7 @@ impl AnnotateProvider {
             // Build the 33-field Batch 3 suffix (positions 41-73) shared across all transcripts.
             let batch3_suffix =
                 engine_profile_time!(engine_profile_enabled, engine_profile, batch3_suffix, {
-                    format!(
-                        "{}|{}|{}|{}|{}|{}|{}",
-                        frequency_fields.af_values.join("|"),
-                        frequency_fields.max_af,
-                        frequency_fields.max_af_pops,
-                        variant_fields.clin_sig,
-                        variant_fields.somatic,
-                        variant_fields.pheno,
-                        variant_fields.pubmed,
-                    )
+                    batch3_suffix_for_csq(frequency_fields, &variant_fields)
                 });
 
             let most_str;
@@ -4909,7 +4966,7 @@ impl AnnotateProvider {
                         impact,
                         existing_variation: existing_var,
                         variant_class,
-                        frequency_fields: &frequency_fields,
+                        frequency_fields,
                         variant_fields: &variant_fields,
                     };
                     placeholder_layout.append_entry(&mut csq_buf, &entry);
@@ -5411,7 +5468,7 @@ impl AnnotateProvider {
                             impact,
                             existing_variation: existing_var,
                             variant_class,
-                            frequency_fields: &frequency_fields,
+                            frequency_fields,
                             variant_fields: &variant_fields,
                         };
                         placeholder_layout.append_entry(&mut csq_buf, &entry);
@@ -5932,38 +5989,35 @@ impl AnnotateProvider {
 
                 // -- Frequency columns (29) --
                 // AF columns: parse resolved frequency strings to Float32.
-                for (i, af_val) in frequency_fields.af_values.iter().enumerate() {
-                    if i < b_af.len() {
-                        if af_val.is_empty() {
-                            b_af[i].append_null();
-                        } else {
-                            match af_val.parse::<f32>() {
-                                Ok(v) => b_af[i].append_value(v),
-                                Err(_) => b_af[i].append_null(),
-                            }
+                for (i, af_b) in b_af.iter_mut().enumerate() {
+                    let af_val = frequency_fields.af_value(i);
+                    if af_val.is_empty() {
+                        af_b.append_null();
+                    } else {
+                        match af_val.parse::<f32>() {
+                            Ok(v) => af_b.append_value(v),
+                            Err(_) => af_b.append_null(),
                         }
                     }
                 }
-                // Pad any missing AF columns (if frequency_fields has fewer than 27 entries).
-                for i in frequency_fields.af_values.len()..b_af.len() {
-                    b_af[i].append_null();
-                }
                 // MAX_AF
-                if frequency_fields.max_af.is_empty() {
+                let max_af = frequency_fields.max_af();
+                if max_af.is_empty() {
                     b_max_af.append_null();
                 } else {
-                    match frequency_fields.max_af.parse::<f32>() {
+                    match max_af.parse::<f32>() {
                         Ok(v) => b_max_af.append_value(v),
                         Err(_) => b_max_af.append_null(),
                     }
                 }
                 // MAX_AF_POPS
+                let max_af_pops = frequency_fields.max_af_pops();
                 append_opt_str(
                     &mut b_max_af_pops,
-                    if frequency_fields.max_af_pops.is_empty() {
+                    if max_af_pops.is_empty() {
                         None
                     } else {
-                        Some(&frequency_fields.max_af_pops)
+                        Some(max_af_pops)
                     },
                 );
 
@@ -12577,7 +12631,7 @@ mod tests {
             impact: "MODIFIER",
             existing_variation: variant_fields.existing_variation.as_str(),
             variant_class: "SNV",
-            frequency_fields: &frequency_fields,
+            frequency_fields: ColocatedFrequencyFieldRef::Resolved(&frequency_fields),
             variant_fields: &variant_fields,
         };
 
@@ -12630,6 +12684,16 @@ mod tests {
         assert_eq!(merged_values[merged_index("PUBMED")], "12345");
         assert_eq!(merged_values[merged_index("MOTIF_NAME")], "");
         assert_eq!(merged_values[merged_index("TRANSCRIPTION_FACTORS")], "");
+    }
+
+    #[test]
+    fn test_empty_batch3_suffix_uses_static_no_colocated_path() {
+        let variant_fields = ColocatedVariantFields::default();
+        let suffix = batch3_suffix_for_csq(ColocatedFrequencyFieldRef::Empty, &variant_fields);
+
+        assert!(matches!(suffix, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(suffix.len(), AF_COLUMNS.len() + 5);
+        assert!(suffix.chars().all(|ch| ch == '|'));
     }
 
     #[test]
