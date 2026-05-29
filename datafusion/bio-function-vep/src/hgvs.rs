@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::fmt::Write;
 use std::io::{BufRead, Seek};
+use std::time::{Duration, Instant};
 
 use crate::transcript_consequence::{
     ExonFeature, TranscriptCdnaMapperSegment, TranscriptFeature, TranslationFeature, VariantInput,
@@ -45,6 +46,18 @@ pub struct HgvsGenomicShift {
     pub three_prime_flanking_seq: String,
     pub five_prime_context: String,
     pub three_prime_context: String,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct HgvscProfile {
+    pub simple_fast: Duration,
+    pub coord_map: Duration,
+    pub refseq_edit: Duration,
+    pub fallback: Duration,
+    pub format_string: Duration,
+    pub simple_fast_calls: usize,
+    pub simple_fast_outputs: usize,
+    pub fallback_calls: usize,
 }
 
 impl HgvsGenomicShift {
@@ -166,6 +179,60 @@ pub fn format_hgvsc(
     variant_end: i64,
     genomic_shift: Option<&HgvsGenomicShift>,
 ) -> Option<String> {
+    format_hgvsc_inner(
+        tx,
+        tx_exons,
+        cdna_position,
+        cds_position,
+        ref_allele,
+        alt_allele,
+        variant_start,
+        variant_end,
+        genomic_shift,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn format_hgvsc_profiled(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    cdna_position: Option<&str>,
+    cds_position: Option<&str>,
+    ref_allele: &str,
+    alt_allele: &str,
+    variant_start: i64,
+    variant_end: i64,
+    genomic_shift: Option<&HgvsGenomicShift>,
+    profile: &mut HgvscProfile,
+) -> Option<String> {
+    format_hgvsc_inner(
+        tx,
+        tx_exons,
+        cdna_position,
+        cds_position,
+        ref_allele,
+        alt_allele,
+        variant_start,
+        variant_end,
+        genomic_shift,
+        Some(profile),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_hgvsc_inner(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    cdna_position: Option<&str>,
+    cds_position: Option<&str>,
+    ref_allele: &str,
+    alt_allele: &str,
+    variant_start: i64,
+    variant_end: i64,
+    genomic_shift: Option<&HgvsGenomicShift>,
+    mut profile: Option<&mut HgvscProfile>,
+) -> Option<String> {
     // Traceability:
     // - Ensembl Variation `TranscriptVariationAllele::hgvs_transcript()`
     //   returns undef when `_get_cDNA_position()` can't map a position
@@ -179,7 +246,11 @@ pub fn format_hgvsc(
             return None;
         }
     }
-    if let Some(hgvsc) = format_hgvsc_simple_substitution_fast(
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.simple_fast_calls += 1;
+    }
+    let simple_fast_started = profile.is_some().then(Instant::now);
+    let simple_hgvsc = format_hgvsc_simple_substitution_fast_inner(
         tx,
         tx_exons,
         cdna_position,
@@ -188,9 +259,52 @@ pub fn format_hgvsc(
         alt_allele,
         variant_start,
         variant_end,
-    ) {
+        profile.as_deref_mut(),
+    );
+    if let (Some(started), Some(profile)) = (simple_fast_started, profile.as_deref_mut()) {
+        profile.simple_fast += started.elapsed();
+        if simple_hgvsc.is_some() {
+            profile.simple_fast_outputs += 1;
+        }
+    }
+    if let Some(hgvsc) = simple_hgvsc {
         return Some(hgvsc);
     }
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.fallback_calls += 1;
+    }
+    let fallback_started = profile.is_some().then(Instant::now);
+    let fallback_hgvsc = format_hgvsc_fallback(
+        tx,
+        tx_exons,
+        cdna_position,
+        cds_position,
+        ref_allele,
+        alt_allele,
+        variant_start,
+        variant_end,
+        genomic_shift,
+        profile.as_deref_mut(),
+    );
+    if let (Some(started), Some(profile)) = (fallback_started, profile.as_deref_mut()) {
+        profile.fallback += started.elapsed();
+    }
+    fallback_hgvsc
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_hgvsc_fallback(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    cdna_position: Option<&str>,
+    cds_position: Option<&str>,
+    ref_allele: &str,
+    alt_allele: &str,
+    variant_start: i64,
+    variant_end: i64,
+    genomic_shift: Option<&HgvsGenomicShift>,
+    mut profile: Option<&mut HgvscProfile>,
+) -> Option<String> {
     let tx_id = versioned_id(&tx.transcript_id, tx.version);
     let numbering = if tx.cds_start.is_some() && tx.cds_end.is_some() {
         'c'
@@ -224,13 +338,18 @@ pub fn format_hgvsc(
             (ref_allele, alt_allele, variant_start, variant_end)
         };
     let (mut feature_ref, feature_alt) = hgvs_feature_strand_alleles(tx, ref_allele, alt_allele)?;
-    if let Some(transcript_ref) = edited_transcript_reference_allele_for_hgvsc(
+    let refseq_edit_started = profile.is_some().then(Instant::now);
+    let transcript_ref = edited_transcript_reference_allele_for_hgvsc(
         tx,
         tx_exons,
         ref_allele,
         variant_start,
         variant_end,
-    ) {
+    );
+    if let (Some(started), Some(profile)) = (refseq_edit_started, profile.as_deref_mut()) {
+        profile.refseq_edit += started.elapsed();
+    }
+    if let Some(transcript_ref) = transcript_ref {
         feature_ref = transcript_ref;
     }
     let mut notation =
@@ -275,6 +394,7 @@ pub fn format_hgvsc(
         notation.ref_allele = feature_ref.clone();
         notation.alt_allele = feature_alt.clone();
     }
+    let coord_map_started = profile.is_some().then(Instant::now);
     let (mut start, mut end) = if notation.kind == ">"
         && numbering == 'c'
         && cds_position.is_some_and(|value| !value.is_empty() && !value.contains('_'))
@@ -298,16 +418,48 @@ pub fn format_hgvsc(
     } else {
         notation_to_hgvsc_coords(tx, tx_exons, &notation)?
     };
+    if let (Some(started), Some(profile)) = (coord_map_started, profile.as_deref_mut()) {
+        profile.coord_map += started.elapsed();
+    }
     if matches!(
         compare_hgvs_positions(&start, &end),
         Some(Ordering::Greater)
     ) {
         std::mem::swap(&mut start, &mut end);
     }
-    format_hgvs_string(&tx_id, numbering, &start, &end, &notation)
+    let format_started = profile.is_some().then(Instant::now);
+    let hgvsc = format_hgvs_string(&tx_id, numbering, &start, &end, &notation);
+    if let (Some(started), Some(profile)) = (format_started, profile.as_deref_mut()) {
+        profile.format_string += started.elapsed();
+    }
+    hgvsc
 }
 
 fn format_hgvsc_simple_substitution_fast(
+    tx: &TranscriptFeature,
+    tx_exons: &[&ExonFeature],
+    cdna_position: Option<&str>,
+    cds_position: Option<&str>,
+    ref_allele: &str,
+    alt_allele: &str,
+    variant_start: i64,
+    variant_end: i64,
+) -> Option<String> {
+    format_hgvsc_simple_substitution_fast_inner(
+        tx,
+        tx_exons,
+        cdna_position,
+        cds_position,
+        ref_allele,
+        alt_allele,
+        variant_start,
+        variant_end,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_hgvsc_simple_substitution_fast_inner(
     tx: &TranscriptFeature,
     tx_exons: &[&ExonFeature],
     _cdna_position: Option<&str>,
@@ -316,6 +468,7 @@ fn format_hgvsc_simple_substitution_fast(
     alt_allele: &str,
     variant_start: i64,
     variant_end: i64,
+    mut profile: Option<&mut HgvscProfile>,
 ) -> Option<String> {
     if variant_start != variant_end
         || !tx.refseq_edits.is_empty()
@@ -340,13 +493,21 @@ fn format_hgvsc_simple_substitution_fast(
     {
         cds_position?
     } else {
+        let coord_map_started = profile.is_some().then(Instant::now);
         coord_storage = hgvs_cdna_position_from_genomic(tx, tx_exons, variant_start)?;
+        if let (Some(started), Some(profile)) = (coord_map_started, profile.as_deref_mut()) {
+            profile.coord_map += started.elapsed();
+        }
         coord_storage.as_str()
     };
 
+    let format_started = profile.is_some().then(Instant::now);
     let mut out = String::with_capacity(tx.transcript_id.len() + coord.len() + 16);
     push_versioned_id(&mut out, &tx.transcript_id, tx.version);
     let _ = write!(out, ":{numbering}.{coord}{feature_ref}>{feature_alt}");
+    if let (Some(started), Some(profile)) = (format_started, profile.as_deref_mut()) {
+        profile.format_string += started.elapsed();
+    }
     Some(out)
 }
 
