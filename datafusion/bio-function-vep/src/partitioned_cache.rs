@@ -60,7 +60,7 @@ impl PartitionedParquetCache {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if let Some(stem) = name_str.strip_suffix(".parquet") {
-                chroms.push(stem.to_string());
+                chroms.push(canonical_variation_chrom_stem(stem).to_string());
             }
         }
 
@@ -70,6 +70,7 @@ impl PartitionedParquetCache {
 
         // Sort chromosomes naturally: chr1, chr2, ..., chr10, ..., chrX, chrY, chrMT
         chroms.sort_by_key(|a| natural_chrom_order(a));
+        chroms.dedup();
 
         Some(Self {
             base_dir: base.to_path_buf(),
@@ -169,6 +170,12 @@ fn natural_chrom_order(chrom: &str) -> (u8, u32, String) {
     }
 }
 
+fn canonical_variation_chrom_stem(stem: &str) -> &str {
+    stem.strip_suffix("_warm")
+        .or_else(|| stem.strip_suffix("_cold"))
+        .unwrap_or(stem)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +244,22 @@ mod tests {
 
         let cache = PartitionedParquetCache::detect(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(cache.available_chroms(), &["chr1", "chr22", "chrX"]);
+    }
+
+    #[test]
+    fn test_detect_normalizes_variation_tier_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let var_dir = tmp.path().join("variation");
+        std::fs::create_dir(&var_dir).unwrap();
+        // Warm/cold tiers replace the base variation parquet for fjall-backed
+        // annotation, but contig discovery must still expose canonical chroms.
+        std::fs::write(var_dir.join("chr1_warm.parquet"), b"dummy").unwrap();
+        std::fs::write(var_dir.join("chr1_cold.parquet"), b"dummy").unwrap();
+        std::fs::write(var_dir.join("chr2_cold.parquet"), b"dummy").unwrap();
+        std::fs::write(var_dir.join("chr10_warm.parquet"), b"dummy").unwrap();
+
+        let cache = PartitionedParquetCache::detect(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(cache.available_chroms(), &["chr1", "chr2", "chr10"]);
     }
 
     #[test]
