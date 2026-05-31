@@ -13,6 +13,7 @@ pub mod loader;
 pub mod position_entry;
 pub mod position_index;
 pub mod sift_store;
+pub mod variant_bloom_index;
 
 pub use cache_provider::KvCacheTableProvider;
 pub use context_store::{ExonKvStore, TranslationKvStore};
