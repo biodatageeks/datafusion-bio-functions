@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use datafusion::arrow::compute::concat_batches;
 use datafusion::common::{DataFusionError, Result};
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
 };
 use parquet::file::page_index::index::Index;
 use parquet::file::statistics::Statistics;
@@ -53,10 +53,29 @@ pub struct ColdParquetLookupSet {
     cursor: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ColdParquetPositionGroup {
+    lookup_idx: usize,
+    row_group_id: usize,
+}
+
 #[derive(Debug)]
 struct CachedColdRowGroup {
     row_group_id: usize,
+    row_ranges: Option<Vec<Range<usize>>>,
     chunk: WarmChunkContext,
+}
+
+#[derive(Debug, Default)]
+struct PageProbeStats {
+    probes: u64,
+    available_probes: u64,
+    unavailable_probes: u64,
+    pages_in_probed_row_groups: u64,
+    candidate_pages: u64,
+    candidate_rows: u64,
+    candidate_misses: u64,
+    unique_candidate_pages: Vec<(usize, usize, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,8 +206,11 @@ impl ColdParquetLookup {
         let Some(row_group_id) = self.cursor.find_row_group(position_key) else {
             return Ok(ColdProbeResult::NotCovered);
         };
-        self.record_page_index_probe(row_group_id, position_key);
-        let cache_idx = self.ensure_row_group(row_group_id)?;
+        let row_ranges = self.candidate_page_row_ranges(row_group_id, position_key);
+        if row_ranges.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(ColdProbeResult::NotCovered);
+        }
+        let cache_idx = self.ensure_row_group(row_group_id, row_ranges)?;
         let chunk = &self.cache[cache_idx].chunk;
         let rows = chunk.rows_for_position(position_key);
         if rows.is_empty() {
@@ -214,19 +236,122 @@ impl ColdParquetLookup {
         }
     }
 
-    fn ensure_row_group(&mut self, row_group_id: usize) -> Result<usize> {
-        if let Some(idx) = self
-            .cache
+    pub fn prefetch_positions<I>(&mut self, position_keys: I) -> Result<()>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        self.prefetch_positions_inner(position_keys, false)
+    }
+
+    pub fn prefetch_positions_retaining<I>(&mut self, position_keys: I) -> Result<()>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        self.prefetch_positions_inner(position_keys, true)
+    }
+
+    fn prefetch_positions_inner<I>(
+        &mut self,
+        position_keys: I,
+        retain_prefetched: bool,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut full_row_groups = HashSet::new();
+        let mut ranges_by_row_group: HashMap<usize, Vec<Range<usize>>> = HashMap::new();
+        let mut probe_stats = PageProbeStats::default();
+        for position_key in position_keys {
+            let Some(row_group_id) = self.cursor.find_row_group(position_key) else {
+                continue;
+            };
+            let Some(row_ranges) = self.candidate_page_row_ranges_for_probe(
+                row_group_id,
+                position_key,
+                &mut probe_stats,
+            ) else {
+                full_row_groups.insert(row_group_id);
+                continue;
+            };
+            if row_ranges.is_empty() {
+                continue;
+            }
+            ranges_by_row_group
+                .entry(row_group_id)
+                .or_default()
+                .extend(row_ranges);
+        }
+
+        let ranged_row_groups = ranges_by_row_group
+            .keys()
+            .filter(|row_group_id| !full_row_groups.contains(row_group_id))
+            .count();
+        let old_max_cached_row_groups = self.max_cached_row_groups;
+        if retain_prefetched {
+            let required_capacity = self
+                .cache
+                .len()
+                .saturating_add(full_row_groups.len())
+                .saturating_add(ranged_row_groups);
+            self.max_cached_row_groups = self.max_cached_row_groups.max(required_capacity);
+        }
+
+        let result = (|| {
+            let mut full_row_group_ids = full_row_groups.iter().copied().collect::<Vec<_>>();
+            full_row_group_ids.sort_unstable();
+            for row_group_id in full_row_group_ids {
+                self.ensure_row_group(row_group_id, None)?;
+            }
+
+            let mut ranged_row_groups = ranges_by_row_group.into_iter().collect::<Vec<_>>();
+            ranged_row_groups.sort_by_key(|(row_group_id, _)| *row_group_id);
+            for (row_group_id, mut row_ranges) in ranged_row_groups {
+                if full_row_groups.contains(&row_group_id) {
+                    continue;
+                }
+                merge_row_ranges(&mut row_ranges);
+                self.ensure_row_group(row_group_id, Some(row_ranges))?;
+            }
+
+            self.record_page_probe_stats(probe_stats);
+            Ok(())
+        })();
+
+        self.max_cached_row_groups = old_max_cached_row_groups;
+        result
+    }
+
+    pub fn trim_cache_to_capacity(&mut self) {
+        while self.cache.len() > self.max_cached_row_groups {
+            self.cache.pop_front();
+        }
+    }
+
+    pub fn cached_chunk_for_position(&self, position_key: u64) -> Option<&WarmChunkContext> {
+        let row_group_id = self.find_row_group_without_stats(position_key)?;
+        self.cache
             .iter()
-            .position(|cached| cached.row_group_id == row_group_id)
-        {
+            .rev()
+            .find(|cached| cached.row_group_id == row_group_id)
+            .map(|cached| &cached.chunk)
+    }
+
+    fn ensure_row_group(
+        &mut self,
+        row_group_id: usize,
+        row_ranges: Option<Vec<Range<usize>>>,
+    ) -> Result<usize> {
+        if let Some(idx) = self.cache.iter().position(|cached| {
+            cached.row_group_id == row_group_id
+                && cached_row_ranges_cover(cached.row_ranges.as_deref(), row_ranges.as_deref())
+        }) {
             self.row_group_cache_hits += 1;
             return Ok(idx);
         }
 
         self.row_group_cache_misses += 1;
         let started = Instant::now();
-        let chunk = self.load_row_group(row_group_id)?;
+        let chunk = self.load_row_group(row_group_id, row_ranges.as_deref())?;
         self.load_time += started.elapsed();
         self.rows_loaded += chunk.batch.num_rows() as u64;
         self.row_groups_loaded += 1;
@@ -237,6 +362,7 @@ impl ColdParquetLookup {
 
         self.cache.push_back(CachedColdRowGroup {
             row_group_id,
+            row_ranges,
             chunk,
         });
         while self.cache.len() > self.max_cached_row_groups {
@@ -245,7 +371,11 @@ impl ColdParquetLookup {
         Ok(self.cache.len() - 1)
     }
 
-    fn load_row_group(&self, row_group_id: usize) -> Result<WarmChunkContext> {
+    fn load_row_group(
+        &self,
+        row_group_id: usize,
+        row_ranges: Option<&[Range<usize>]>,
+    ) -> Result<WarmChunkContext> {
         let mask = projection_for_existing_roots(
             self.metadata.schema(),
             self.metadata.parquet_schema(),
@@ -257,12 +387,20 @@ impl ColdParquetLookup {
                 self.path.display()
             ))
         })?;
-        let reader =
+        let mut builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.metadata.clone())
                 .with_projection(mask)
                 .with_row_groups(vec![row_group_id])
-                .with_batch_size(self.batch_size)
-                .build()?;
+                .with_batch_size(self.batch_size);
+        if let Some(row_ranges) = row_ranges
+            && !row_ranges.is_empty()
+        {
+            let row_group_rows = self.cursor.row_groups[row_group_id].rows;
+            let selection =
+                RowSelection::from_consecutive_ranges(row_ranges.iter().cloned(), row_group_rows);
+            builder = builder.with_row_selection(selection);
+        }
+        let reader = builder.build()?;
         let batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
         let batch = match batches.as_slice() {
             [] => {
@@ -278,50 +416,78 @@ impl ColdParquetLookup {
         WarmChunkContext::try_new_without_variant_index(row_group_id, batch)
     }
 
-    fn record_page_index_probe(&mut self, row_group_id: usize, position_key: u64) {
-        self.page_index_probes += 1;
+    fn candidate_page_row_ranges(
+        &mut self,
+        row_group_id: usize,
+        position_key: u64,
+    ) -> Option<Vec<Range<usize>>> {
+        let mut probe_stats = PageProbeStats::default();
+        let row_ranges =
+            self.candidate_page_row_ranges_for_probe(row_group_id, position_key, &mut probe_stats);
+        self.record_page_probe_stats(probe_stats);
+        row_ranges
+    }
+
+    fn candidate_page_row_ranges_without_recording(
+        &self,
+        row_group_id: usize,
+        position_key: u64,
+    ) -> Option<Vec<Range<usize>>> {
+        let mut probe_stats = PageProbeStats::default();
+        self.candidate_page_row_ranges_for_probe(row_group_id, position_key, &mut probe_stats)
+    }
+
+    fn candidate_page_row_ranges_for_probe(
+        &self,
+        row_group_id: usize,
+        position_key: u64,
+        stats: &mut PageProbeStats,
+    ) -> Option<Vec<Range<usize>>> {
+        stats.probes += 1;
         let metadata = self.metadata.metadata();
         let Some(column_index) = metadata.column_index() else {
-            self.page_index_unavailable_probes += 1;
-            return;
+            stats.unavailable_probes += 1;
+            return None;
         };
         let Some(offset_index) = metadata.offset_index() else {
-            self.page_index_unavailable_probes += 1;
-            return;
+            stats.unavailable_probes += 1;
+            return None;
         };
         let Some(row_group_offsets) = offset_index.get(row_group_id) else {
-            self.page_index_unavailable_probes += 1;
-            return;
+            stats.unavailable_probes += 1;
+            return None;
         };
         let Some(position_offsets) = row_group_offsets.get(self.position_leaf) else {
-            self.page_index_unavailable_probes += 1;
-            return;
+            stats.unavailable_probes += 1;
+            return None;
         };
         let Some(row_group_indexes) = column_index.get(row_group_id) else {
-            self.page_index_unavailable_probes += 1;
-            return;
+            stats.unavailable_probes += 1;
+            return None;
         };
         let Some(position_index) = row_group_indexes.get(self.position_leaf) else {
-            self.page_index_unavailable_probes += 1;
-            return;
+            stats.unavailable_probes += 1;
+            return None;
         };
         let Index::INT64(position_index) = position_index else {
-            self.page_index_unavailable_probes += 1;
-            return;
+            stats.unavailable_probes += 1;
+            return None;
         };
 
         let page_locations = position_offsets.page_locations();
         if page_locations.is_empty() {
-            self.page_index_unavailable_probes += 1;
-            return;
+            stats.unavailable_probes += 1;
+            return None;
         }
 
-        self.page_index_available_probes += 1;
-        self.page_index_pages_in_probed_row_groups += page_locations.len() as u64;
+        stats.available_probes += 1;
+        stats.pages_in_probed_row_groups += page_locations.len() as u64;
 
-        let mut candidate_pages = 0_u64;
-        let mut candidate_rows = 0_u64;
+        let mut row_ranges = Vec::new();
         for (page_idx, page_index) in position_index.indexes.iter().enumerate() {
+            if page_idx >= page_locations.len() {
+                continue;
+            }
             let Some(min) = page_index.min.and_then(|value| u64::try_from(value).ok()) else {
                 continue;
             };
@@ -337,8 +503,39 @@ impl ColdParquetLookup {
                 page_idx,
                 self.cursor.row_groups[row_group_id].rows,
             );
-            candidate_pages += 1;
-            candidate_rows += rows as u64;
+            let start = page_locations[page_idx].first_row_index as usize;
+            let end = start.saturating_add(rows);
+            stats.candidate_pages += 1;
+            stats.candidate_rows += rows as u64;
+            stats
+                .unique_candidate_pages
+                .push((row_group_id, page_idx, rows));
+            row_ranges.push(start..end);
+        }
+
+        if stats.candidate_pages == 0 {
+            stats.candidate_misses += 1;
+        }
+
+        if row_ranges.len() == 1
+            && row_ranges[0].start == 0
+            && row_ranges[0].end == self.cursor.row_groups[row_group_id].rows
+        {
+            None
+        } else {
+            Some(row_ranges)
+        }
+    }
+
+    fn record_page_probe_stats(&mut self, stats: PageProbeStats) {
+        self.page_index_probes += stats.probes;
+        self.page_index_available_probes += stats.available_probes;
+        self.page_index_unavailable_probes += stats.unavailable_probes;
+        self.page_index_pages_in_probed_row_groups += stats.pages_in_probed_row_groups;
+        self.page_index_candidate_pages += stats.candidate_pages;
+        self.page_index_candidate_rows += stats.candidate_rows;
+        self.page_index_candidate_misses += stats.candidate_misses;
+        for (row_group_id, page_idx, rows) in stats.unique_candidate_pages {
             if self
                 .page_index_unique_candidate_pages
                 .insert((row_group_id, page_idx))
@@ -346,12 +543,21 @@ impl ColdParquetLookup {
                 self.page_index_unique_candidate_rows += rows as u64;
             }
         }
+    }
 
-        if candidate_pages == 0 {
-            self.page_index_candidate_misses += 1;
-        }
-        self.page_index_candidate_pages += candidate_pages;
-        self.page_index_candidate_rows += candidate_rows;
+    fn find_row_group_without_stats(&self, position_key: u64) -> Option<usize> {
+        self.cursor
+            .row_groups
+            .binary_search_by(|row_group| {
+                if position_key < row_group.min_position_key {
+                    std::cmp::Ordering::Greater
+                } else if position_key > row_group.max_position_key {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()
     }
 
     pub fn stats_snapshot(&self) -> ColdParquetStats {
@@ -462,6 +668,94 @@ impl ColdParquetLookupSet {
         )
     }
 
+    pub fn prefetch_positions<I>(&mut self, position_keys: I) -> Result<()>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        self.prefetch_positions_inner(position_keys, false)
+    }
+
+    pub fn prefetch_positions_retaining<I>(&mut self, position_keys: I) -> Result<()>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        self.prefetch_positions_inner(position_keys, true)
+    }
+
+    fn prefetch_positions_inner<I>(
+        &mut self,
+        position_keys: I,
+        retain_prefetched: bool,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut keys_by_lookup: HashMap<usize, Vec<u64>> = HashMap::new();
+        for position_key in position_keys {
+            if let Some(lookup_idx) = self.find_lookup_without_stats(position_key) {
+                keys_by_lookup
+                    .entry(lookup_idx)
+                    .or_default()
+                    .push(position_key);
+            }
+        }
+
+        let mut keys_by_lookup = keys_by_lookup.into_iter().collect::<Vec<_>>();
+        keys_by_lookup.sort_by_key(|(lookup_idx, _)| *lookup_idx);
+        for (lookup_idx, position_keys) in keys_by_lookup {
+            if retain_prefetched {
+                self.lookups[lookup_idx].prefetch_positions_retaining(position_keys)?;
+            } else {
+                self.lookups[lookup_idx].prefetch_positions(position_keys)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn cached_chunk_for_position(&self, position_key: u64) -> Option<&WarmChunkContext> {
+        let lookup_idx = self.find_lookup_without_stats(position_key)?;
+        self.lookups[lookup_idx].cached_chunk_for_position(position_key)
+    }
+
+    pub fn trim_cache_to_capacity(&mut self) {
+        for lookup in &mut self.lookups {
+            lookup.trim_cache_to_capacity();
+        }
+    }
+
+    pub fn position_group(&self, position_key: u64) -> Option<ColdParquetPositionGroup> {
+        let lookup_idx = self.find_lookup_without_stats(position_key)?;
+        let row_group_id = self.lookups[lookup_idx].find_row_group_without_stats(position_key)?;
+        Some(ColdParquetPositionGroup {
+            lookup_idx,
+            row_group_id,
+        })
+    }
+
+    pub fn prefetch_position_group<I>(
+        &mut self,
+        group: ColdParquetPositionGroup,
+        position_keys: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let Some(lookup) = self.lookups.get_mut(group.lookup_idx) else {
+            return Ok(());
+        };
+
+        let row_group_position_keys = position_keys
+            .into_iter()
+            .filter(|position_key| {
+                lookup
+                    .find_row_group_without_stats(*position_key)
+                    .is_some_and(|row_group_id| row_group_id == group.row_group_id)
+            })
+            .collect::<Vec<_>>();
+        lookup.prefetch_positions(row_group_position_keys)
+    }
+
     pub fn stats_snapshot(&self) -> ColdParquetStats {
         let mut aggregate = ColdParquetStats::default();
         for lookup in &self.lookups {
@@ -517,6 +811,23 @@ impl ColdParquetLookupSet {
             self.cursor = idx;
         }
         result
+    }
+
+    fn find_lookup_without_stats(&self, position_key: u64) -> Option<usize> {
+        self.lookups
+            .binary_search_by(|lookup| {
+                let Some((min, max)) = lookup.position_range() else {
+                    return std::cmp::Ordering::Less;
+                };
+                if position_key < min {
+                    std::cmp::Ordering::Greater
+                } else if position_key > max {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()
     }
 }
 
@@ -845,6 +1156,44 @@ fn page_row_count(
     end.saturating_sub(start)
 }
 
+fn merge_row_ranges(ranges: &mut Vec<Range<usize>>) {
+    ranges.retain(|range| range.start < range.end);
+    ranges.sort_by_key(|range| range.start);
+
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    *ranges = merged;
+}
+
+fn cached_row_ranges_cover(
+    cached: Option<&[Range<usize>]>,
+    requested: Option<&[Range<usize>]>,
+) -> bool {
+    match (cached, requested) {
+        // A full-row-group cache satisfies any page-level request.
+        (None, _) => true,
+        // A page-level cache does not satisfy a full-row-group request.
+        (Some(_), None) => false,
+        (Some(cached), Some(requested)) => ranges_cover(cached, requested),
+    }
+}
+
+fn ranges_cover(cached: &[Range<usize>], requested: &[Range<usize>]) -> bool {
+    requested.iter().all(|requested| {
+        cached
+            .iter()
+            .any(|cached| cached.start <= requested.start && cached.end >= requested.end)
+    })
+}
+
 pub fn cold_parquet_batch_size() -> usize {
     std::env::var("VEP_COLD_PARQUET_BATCH_SIZE")
         .ok()
@@ -876,6 +1225,14 @@ fn push_unique_column(columns: &mut Vec<String>, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    use crate::warm_cache::key::position_key;
 
     #[test]
     fn cold_cursor_advances_monotonically_and_can_step_back_to_cached_group() {
@@ -933,5 +1290,241 @@ mod tests {
             err.to_string()
                 .contains("position_key split across cold row groups")
         );
+    }
+
+    fn open_test_lookup_with_page_index(path: &Path) -> ColdParquetLookup {
+        let file = File::open(path).unwrap();
+        let metadata_options = ArrowReaderOptions::new().with_page_index(true);
+        let metadata = ArrowReaderMetadata::load(&file, metadata_options).unwrap();
+        let position_leaf = cold_position_leaf_index(&metadata).unwrap();
+        let row_groups = cold_row_group_metadata(&metadata, position_leaf).unwrap();
+        let page_layout = cold_page_layout_stats(&metadata, position_leaf);
+        let row_group_count = metadata.metadata().num_row_groups();
+
+        ColdParquetLookup {
+            path: path.to_path_buf(),
+            metadata,
+            projection_columns: cold_parquet_projection_columns(&[], false),
+            batch_size: 64,
+            max_cached_row_groups: 2,
+            position_leaf,
+            page_layout,
+            cursor: ColdRowGroupCursor::new(row_groups),
+            cache: VecDeque::new(),
+            row_groups_touched: vec![false; row_group_count],
+            row_groups_unique_touched: 0,
+            row_groups_loaded: 0,
+            row_group_cache_hits: 0,
+            row_group_cache_misses: 0,
+            rows_loaded: 0,
+            load_time: Duration::ZERO,
+            page_index_probes: 0,
+            page_index_available_probes: 0,
+            page_index_unavailable_probes: 0,
+            page_index_pages_in_probed_row_groups: 0,
+            page_index_candidate_pages: 0,
+            page_index_candidate_rows: 0,
+            page_index_candidate_misses: 0,
+            page_index_unique_candidate_pages: HashSet::new(),
+            page_index_unique_candidate_rows: 0,
+        }
+    }
+
+    #[test]
+    fn cold_lookup_uses_page_index_row_selection_to_load_candidate_page_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("cold.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![
+                    position_key("1", 10).unwrap(),
+                    position_key("1", 10).unwrap(),
+                    position_key("1", 20).unwrap(),
+                    position_key("1", 20).unwrap(),
+                    position_key("1", 30).unwrap(),
+                    position_key("1", 30).unwrap(),
+                    position_key("1", 40).unwrap(),
+                    position_key("1", 40).unwrap(),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "A/G", "A/T", "A/G", "A/T", "A/G", "A/T", "A/G", "A/T",
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 10, 20, 20, 30, 30, 40, 40])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0, 0, 0, 0, 0, 0, 0, 0])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(batch.num_rows())
+            .set_write_batch_size(2)
+            .set_data_page_row_count_limit(2)
+            .build();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut lookup = open_test_lookup_with_page_index(&path);
+        assert!(lookup.page_layout.position_page_index_loaded);
+        assert!(lookup.page_layout.position_column_index_loaded);
+        assert_eq!(lookup.page_layout.position_pages_total, 4);
+
+        let mut emitted = 0;
+        let mut visited = Vec::new();
+        let result = lookup
+            .probe_position_emit_and_visit(
+                position_key("1", 30).unwrap(),
+                |_, _, allele_string| Ok(allele_string == "A/G"),
+                |_, _| {
+                    emitted += 1;
+                    Ok(())
+                },
+                |_, row, allele_string| {
+                    visited.push((row, allele_string.to_string()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result, ColdProbeResult::Match);
+        assert_eq!(emitted, 1);
+        assert_eq!(
+            visited,
+            vec![(0, "A/G".to_string()), (1, "A/T".to_string())]
+        );
+        assert_eq!(lookup.page_index_available_probes, 1);
+        assert_eq!(lookup.page_index_candidate_pages, 1);
+        assert_eq!(lookup.page_index_candidate_rows, 2);
+        assert_eq!(lookup.rows_loaded, 2);
+    }
+
+    #[test]
+    fn cold_lookup_prefetch_merges_page_ranges_for_same_row_group() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("cold.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![
+                    position_key("1", 10).unwrap(),
+                    position_key("1", 10).unwrap(),
+                    position_key("1", 20).unwrap(),
+                    position_key("1", 20).unwrap(),
+                    position_key("1", 30).unwrap(),
+                    position_key("1", 30).unwrap(),
+                    position_key("1", 40).unwrap(),
+                    position_key("1", 40).unwrap(),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "A/G", "A/T", "A/G", "A/T", "A/G", "A/T", "A/G", "A/T",
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 10, 20, 20, 30, 30, 40, 40])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0, 0, 0, 0, 0, 0, 0, 0])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(batch.num_rows())
+            .set_write_batch_size(2)
+            .set_data_page_row_count_limit(2)
+            .build();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut lookup = open_test_lookup_with_page_index(&path);
+        lookup
+            .prefetch_positions([
+                position_key("1", 10).unwrap(),
+                position_key("1", 30).unwrap(),
+            ])
+            .unwrap();
+
+        assert_eq!(lookup.row_groups_loaded, 1);
+        assert_eq!(lookup.rows_loaded, 4);
+
+        for key in [
+            position_key("1", 10).unwrap(),
+            position_key("1", 30).unwrap(),
+        ] {
+            let result = lookup
+                .probe_position_emit_and_visit(
+                    key,
+                    |_, _, allele_string| Ok(allele_string == "A/G"),
+                    |_, _| Ok(()),
+                    |_, _, _| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(result, ColdProbeResult::Match);
+        }
+
+        assert_eq!(lookup.row_groups_loaded, 1);
+        assert_eq!(lookup.row_group_cache_hits, 2);
+    }
+
+    #[test]
+    fn cold_lookup_prefetch_records_page_index_and_exposes_cached_chunk() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("cold.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![
+                    position_key("1", 10).unwrap(),
+                    position_key("1", 10).unwrap(),
+                    position_key("1", 20).unwrap(),
+                    position_key("1", 20).unwrap(),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["A/G", "A/T", "A/G", "A/T"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 10, 20, 20])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0, 0, 0, 0])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(batch.num_rows())
+            .set_write_batch_size(2)
+            .set_data_page_row_count_limit(2)
+            .build();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut lookup = open_test_lookup_with_page_index(&path);
+        let key = position_key("1", 20).unwrap();
+        lookup.prefetch_positions_retaining([key]).unwrap();
+
+        assert_eq!(lookup.page_index_probes, 1);
+        assert_eq!(lookup.page_index_available_probes, 1);
+        assert_eq!(lookup.row_groups_loaded, 1);
+        assert_eq!(lookup.rows_loaded, 2);
+
+        let chunk = lookup.cached_chunk_for_position(key).unwrap();
+        let rows = chunk.rows_for_position(key);
+        assert_eq!(rows, 0..2);
+        assert_eq!(chunk.allele_string(0).unwrap(), Some("A/G"));
+        assert_eq!(chunk.allele_string(1).unwrap(), Some("A/T"));
+        assert_eq!(lookup.page_index_probes, 1);
     }
 }
