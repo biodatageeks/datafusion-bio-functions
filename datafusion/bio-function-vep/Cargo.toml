@@ -93,6 +93,10 @@ name = "build_variation_position_index"
 required-features = ["kv-cache"]
 
 [[example]]
+name = "build_variation_variant_bloom_index"
+required-features = ["kv-cache"]
+
+[[example]]
 name = "bench_warm_tier_chr1"
 required-features = ["kv-cache"]
 

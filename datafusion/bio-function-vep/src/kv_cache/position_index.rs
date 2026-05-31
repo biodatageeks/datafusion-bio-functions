@@ -86,6 +86,37 @@ impl PositionIndex {
         Ok(index)
     }
 
+    pub fn from_parquet_files<I, P>(paths: I, batch_size: usize) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let mut index = Self::default();
+        for path in paths {
+            let file = File::open(path.as_ref()).map_err(io_err)?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+            let projection_columns = if builder.schema().index_of("position_key").is_ok() {
+                vec!["position_key"]
+            } else {
+                vec!["start"]
+            };
+            let mask = projection_for_existing_roots(
+                builder.schema(),
+                builder.parquet_schema(),
+                &projection_columns,
+            );
+            let reader = builder
+                .with_projection(mask)
+                .with_batch_size(batch_size)
+                .build()?;
+
+            for batch in reader {
+                index.append_batch(&batch?)?;
+            }
+        }
+        Ok(index)
+    }
+
     pub fn shared_from_parquet(
         path: impl AsRef<Path>,
         batch_size: usize,
@@ -295,6 +326,46 @@ pub fn cold_variation_file_for_chrom(
     chrom: &str,
 ) -> Option<std::path::PathBuf> {
     variation_split_file_for_chrom(variation_dir, chrom, "cold")
+}
+
+pub fn cold_variation_files_for_chrom(
+    variation_dir: impl AsRef<Path>,
+    chrom: &str,
+) -> Vec<std::path::PathBuf> {
+    if let Some(single) = cold_variation_file_for_chrom(&variation_dir, chrom) {
+        return vec![single];
+    }
+
+    let mut files = Vec::new();
+    push_cold_variation_part_files(&mut files, &variation_dir, chrom);
+    if let Some(stripped) = chrom.strip_prefix("chr") {
+        push_cold_variation_part_files(&mut files, &variation_dir, stripped);
+    } else {
+        push_cold_variation_part_files(&mut files, &variation_dir, &format!("chr{chrom}"));
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn push_cold_variation_part_files(
+    files: &mut Vec<std::path::PathBuf>,
+    variation_dir: impl AsRef<Path>,
+    chrom: &str,
+) {
+    let Ok(entries) = std::fs::read_dir(variation_dir.as_ref()) else {
+        return;
+    };
+    let prefix = format!("{chrom}_cold.part");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix) && name.ends_with(".parquet") {
+            files.push(path);
+        }
+    }
 }
 
 fn variation_split_file_for_chrom(

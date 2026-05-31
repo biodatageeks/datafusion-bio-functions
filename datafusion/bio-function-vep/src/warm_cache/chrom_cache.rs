@@ -29,8 +29,8 @@ pub struct WarmChromCache {
     plans: Vec<WarmChunkPlan>,
     current_plan_idx: Option<usize>,
     current: Option<WarmChunkContext>,
-    cold_positions: Arc<PositionIndex>,
-    cold_position_source: PositionIndexSource,
+    cold_positions: Option<Arc<PositionIndex>>,
+    cold_position_source: Option<PositionIndexSource>,
     batch_size: usize,
     pub chunks_loaded: u64,
     pub chunk_rows: u64,
@@ -69,6 +69,24 @@ impl WarmChromCache {
         batch_size: usize,
         projection_columns: Vec<String>,
     ) -> Result<WarmChromOpen> {
+        Self::open_with_optional_position_index(
+            path,
+            chrom,
+            Some(index_dir.as_ref()),
+            cold_parquet,
+            batch_size,
+            projection_columns,
+        )
+    }
+
+    pub fn open_with_optional_position_index(
+        path: impl AsRef<Path>,
+        chrom: &str,
+        index_dir: Option<&Path>,
+        cold_parquet: Option<&Path>,
+        batch_size: usize,
+        projection_columns: Vec<String>,
+    ) -> Result<WarmChromOpen> {
         let path = path.as_ref().to_path_buf();
         let file = match File::open(&path) {
             Ok(file) => file,
@@ -77,11 +95,14 @@ impl WarmChromCache {
         let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
         let row_groups = warm_row_group_metadata(&metadata)?;
         let plans = plan_warm_chunks_from_row_groups(&row_groups)?;
-        let (cold_positions, cold_position_source) =
+        let (cold_positions, cold_position_source) = if let Some(index_dir) = index_dir {
             match PositionIndex::shared_for_chrom(index_dir, chrom, cold_parquet, batch_size) {
-                Ok(index) => index,
+                Ok((index, source)) => (Some(index), Some(source)),
                 Err(error) => return Ok(WarmChromOpen::Unavailable(error.to_string())),
-            };
+            }
+        } else {
+            (None, None)
+        };
 
         Ok(WarmChromOpen::Available(Box::new(Self {
             path,
@@ -137,19 +158,25 @@ impl WarmChromCache {
 
     #[inline]
     pub fn cold_may_contain(&self, position_key: u64) -> bool {
-        self.cold_positions.contains_position_key(position_key)
+        self.cold_positions
+            .as_ref()
+            .is_none_or(|index| index.contains_position_key(position_key))
     }
 
-    pub fn cold_position_source(&self) -> PositionIndexSource {
+    pub fn cold_position_source(&self) -> Option<PositionIndexSource> {
         self.cold_position_source
     }
 
     pub fn cold_position_len(&self) -> usize {
-        self.cold_positions.len()
+        self.cold_positions
+            .as_ref()
+            .map_or(0, |positions| positions.len())
     }
 
     pub fn cold_position_storage_bytes(&self) -> usize {
-        self.cold_positions.storage_bytes()
+        self.cold_positions
+            .as_ref()
+            .map_or(0, |positions| positions.storage_bytes())
     }
 
     fn find_plan(&self, position_key: u64) -> Option<usize> {

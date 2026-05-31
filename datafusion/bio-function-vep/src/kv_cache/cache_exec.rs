@@ -31,7 +31,10 @@ use super::key_encoding::chrom_to_code;
 use super::kv_store::RangePrefetchLimitExceeded;
 use super::kv_store::VepKvStore;
 use super::position_entry::{PositionEntryReader, make_builder};
-use super::position_index::{PositionIndexSource, cold_variation_file_for_chrom};
+use super::position_index::{
+    PositionIndexSource, cold_variation_file_for_chrom, cold_variation_files_for_chrom,
+};
+use super::variant_bloom_index::{VariantBloomIndex, find_variant_bloom_index_file};
 use crate::allele::{
     VariantAlleleInput, allele_matches, get_matched_variant_alleles, vcf_to_vep_allele,
     vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
@@ -44,6 +47,9 @@ use crate::warm_cache::chrom_cache::{
     WarmChromCache, WarmChromOpen, WarmProbe, projection_columns_for_cache,
 };
 use crate::warm_cache::chunk::WarmChunkContext;
+use crate::warm_cache::cold_parquet::{
+    ColdParquetLookupSet, ColdParquetStats, ColdProbeResult, cold_parquet_projection_columns,
+};
 use crate::warm_cache::key::{
     position_key_from_code as warm_position_key_from_code,
     variant_key_from_position as warm_variant_key_from_position,
@@ -294,6 +300,7 @@ impl ExecutionPlan for KvLookupExec {
             stream.warm_cache_dir = Some(path.clone());
             stream.cold_variation_dir = Some(path.clone());
             stream.position_index_dir = Some(path.join("variation.position_index"));
+            stream.variant_bloom_index_dir = Some(path.join("variation.variant_bloom_index"));
             return Ok(Box::pin(stream));
         }
 
@@ -328,8 +335,13 @@ struct KvLookupStream {
         Option<noodles_fasta::IndexedReader<noodles_fasta::io::BufReader<std::fs::File>>>,
     warm_cache_dir: Option<PathBuf>,
     warm_chroms: HashMap<String, Option<Box<WarmChromCache>>>,
+    cold_parquet_chroms: HashMap<String, Option<ColdParquetLookupSet>>,
+    variant_bloom_chroms: HashMap<String, Option<Arc<VariantBloomIndex>>>,
     cold_variation_dir: Option<PathBuf>,
     position_index_dir: Option<PathBuf>,
+    variant_bloom_index_dir: Option<PathBuf>,
+    warm_cold_backend: WarmColdVariationBackend,
+    warm_cold_index_mode: WarmColdVariationIndexMode,
     profile_enabled: bool,
     profile_detailed: bool,
     profile_emitted: bool,
@@ -385,6 +397,54 @@ enum LookupDecision {
     EmitWarmExact,
     SkipFjall,
     UseFjall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmColdVariationBackend {
+    Fjall,
+    Parquet,
+}
+
+impl WarmColdVariationBackend {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("fjall").to_ascii_lowercase().as_str() {
+            "fjall" => Ok(Self::Fjall),
+            "parquet" => Ok(Self::Parquet),
+            other => Err(DataFusionError::Execution(format!(
+                "VEP_WARM_COLD_VARIATION_BACKEND must be 'fjall' or 'parquet', got '{other}'"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmColdVariationIndexMode {
+    Position,
+    PositionThenVariantBloom,
+    VariantBloom,
+}
+
+impl WarmColdVariationIndexMode {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("posidx").to_ascii_lowercase().as_str() {
+            "posidx" | "position" => Ok(Self::Position),
+            "posidx_bloom" | "position_bloom" | "position_then_bloom" => {
+                Ok(Self::PositionThenVariantBloom)
+            }
+            "bloom" | "variant_bloom" => Ok(Self::VariantBloom),
+            other => Err(DataFusionError::Execution(format!(
+                "VEP_WARM_COLD_VARIATION_INDEX_MODE must be 'posidx', 'posidx_bloom', or 'bloom', got '{other}'"
+            ))),
+        }
+    }
+
+    fn uses_position_index(self) -> bool {
+        matches!(self, Self::Position | Self::PositionThenVariantBloom)
+    }
+
+    fn uses_variant_bloom(self) -> bool {
+        matches!(self, Self::PositionThenVariantBloom | Self::VariantBloom)
+    }
 }
 
 fn decide_after_warm_probe(
@@ -448,6 +508,7 @@ struct LookupProfile {
     warm_probe: Duration,
     warm_chunk_load: Duration,
     position_index_load: Duration,
+    variant_bloom_load: Duration,
     raw_get_hits: u64,
     raw_get_misses: u64,
     prefetch_hits: u64,
@@ -480,6 +541,47 @@ struct LookupProfile {
     position_index_parquet_fallback_loads: u64,
     position_index_rows: u64,
     position_index_bytes: u64,
+    variant_bloom_checks: u64,
+    variant_bloom_negative_skips: u64,
+    variant_bloom_positive_gets: u64,
+    variant_bloom_loaded: u64,
+    variant_bloom_entries: u64,
+    variant_bloom_bits: u64,
+    variant_bloom_hashes: u64,
+    variant_bloom_bytes: u64,
+    cold_parquet_probes: u64,
+    cold_parquet_matches: u64,
+    cold_parquet_position_misses: u64,
+    cold_parquet_not_covered: u64,
+    cold_parquet_rows_scanned: u64,
+    cold_parquet_row_groups_total: u64,
+    cold_parquet_row_groups_unique_touched: u64,
+    cold_parquet_row_group_metadata_probes: u64,
+    cold_parquet_row_group_current_hits: u64,
+    cold_parquet_row_group_previous_hits: u64,
+    cold_parquet_row_group_advanced_hits: u64,
+    cold_parquet_row_group_binary_search_hits: u64,
+    cold_parquet_row_group_metadata_misses: u64,
+    cold_parquet_row_group_skipped_ahead: u64,
+    cold_parquet_row_groups_loaded: u64,
+    cold_parquet_row_group_cache_hits: u64,
+    cold_parquet_row_group_cache_misses: u64,
+    cold_parquet_rows_loaded: u64,
+    cold_parquet_position_page_index_loaded: bool,
+    cold_parquet_position_column_index_loaded: bool,
+    cold_parquet_position_pages_total: u64,
+    cold_parquet_position_bloom_filter_row_groups: u64,
+    cold_parquet_position_bloom_filter_bytes: u64,
+    cold_parquet_page_index_probes: u64,
+    cold_parquet_page_index_available_probes: u64,
+    cold_parquet_page_index_unavailable_probes: u64,
+    cold_parquet_page_index_pages_in_probed_row_groups: u64,
+    cold_parquet_page_index_candidate_pages: u64,
+    cold_parquet_page_index_candidate_rows: u64,
+    cold_parquet_page_index_candidate_misses: u64,
+    cold_parquet_page_index_unique_candidate_pages: u64,
+    cold_parquet_page_index_unique_candidate_rows: u64,
+    cold_parquet_load: Duration,
 }
 
 impl LookupProfile {
@@ -510,13 +612,15 @@ impl LookupProfile {
             + self.warm_probe
             + self.warm_chunk_load
             + self.position_index_load
+            + self.variant_bloom_load
+            + self.cold_parquet_load
     }
 
     fn detail_lines(&self) -> Vec<String> {
         let detail_total = self.detail_known();
         vec![
             format!(
-                "[vep-kv-profile-detail] stages total_s={:.3} probe_build={:.3}s ({:.1}%) point_get_raw={:.3}s ({:.1}%) prefetch_map_lookup={:.3}s ({:.1}%) decompress={:.3}s ({:.1}%) reader_init={:.3}s ({:.1}%) primary_match={:.3}s ({:.1}%) cache_column_append={:.3}s ({:.1}%) colocated_prepare={:.3}s ({:.1}%) colocated_match={:.3}s ({:.1}%) colocated_flush={:.3}s ({:.1}%) null_append={:.3}s ({:.1}%) warm_probe={:.3}s ({:.1}%) warm_chunk_load={:.3}s ({:.1}%) position_index_load={:.3}s ({:.1}%)",
+                "[vep-kv-profile-detail] stages total_s={:.3} probe_build={:.3}s ({:.1}%) point_get_raw={:.3}s ({:.1}%) prefetch_map_lookup={:.3}s ({:.1}%) decompress={:.3}s ({:.1}%) reader_init={:.3}s ({:.1}%) primary_match={:.3}s ({:.1}%) cache_column_append={:.3}s ({:.1}%) colocated_prepare={:.3}s ({:.1}%) colocated_match={:.3}s ({:.1}%) colocated_flush={:.3}s ({:.1}%) null_append={:.3}s ({:.1}%) warm_probe={:.3}s ({:.1}%) warm_chunk_load={:.3}s ({:.1}%) position_index_load={:.3}s ({:.1}%) variant_bloom_load={:.3}s ({:.1}%) cold_parquet_load={:.3}s ({:.1}%)",
                 detail_total.as_secs_f64(),
                 self.probe_build.as_secs_f64(),
                 Self::pct(self.probe_build, detail_total),
@@ -546,6 +650,10 @@ impl LookupProfile {
                 Self::pct(self.warm_chunk_load, detail_total),
                 self.position_index_load.as_secs_f64(),
                 Self::pct(self.position_index_load, detail_total),
+                self.variant_bloom_load.as_secs_f64(),
+                Self::pct(self.variant_bloom_load, detail_total),
+                self.cold_parquet_load.as_secs_f64(),
+                Self::pct(self.cold_parquet_load, detail_total),
             ),
             format!(
                 "[vep-kv-profile-detail] io raw_get_hits={} raw_get_misses={} prefetch_hits={} prefetch_misses={} decode_calls={} compressed_bytes={} decompressed_bytes={}",
@@ -590,6 +698,60 @@ impl LookupProfile {
                 self.position_index_parquet_fallback_loads,
                 self.position_index_rows,
                 self.position_index_bytes,
+            ),
+            format!(
+                "[vep-kv-profile-detail] variant_bloom checks={} negative_skips={} positive_gets={} loaded={} entries={} bits={} hashes={} bytes={}",
+                self.variant_bloom_checks,
+                self.variant_bloom_negative_skips,
+                self.variant_bloom_positive_gets,
+                self.variant_bloom_loaded,
+                self.variant_bloom_entries,
+                self.variant_bloom_bits,
+                self.variant_bloom_hashes,
+                self.variant_bloom_bytes,
+            ),
+            format!(
+                "[vep-kv-profile-detail] cold_parquet probes={} matches={} position_misses={} not_covered={} rows_scanned={}",
+                self.cold_parquet_probes,
+                self.cold_parquet_matches,
+                self.cold_parquet_position_misses,
+                self.cold_parquet_not_covered,
+                self.cold_parquet_rows_scanned,
+            ),
+            format!(
+                "[vep-kv-profile-detail] cold_parquet_row_groups total={} unique_touched={} untouched={} metadata_probes={} current_hits={} previous_hits={} advanced_hits={} binary_search_hits={} metadata_misses={} skipped_ahead={} loaded={} cache_hits={} cache_misses={} rows_loaded={}",
+                self.cold_parquet_row_groups_total,
+                self.cold_parquet_row_groups_unique_touched,
+                self.cold_parquet_row_groups_total
+                    .saturating_sub(self.cold_parquet_row_groups_unique_touched),
+                self.cold_parquet_row_group_metadata_probes,
+                self.cold_parquet_row_group_current_hits,
+                self.cold_parquet_row_group_previous_hits,
+                self.cold_parquet_row_group_advanced_hits,
+                self.cold_parquet_row_group_binary_search_hits,
+                self.cold_parquet_row_group_metadata_misses,
+                self.cold_parquet_row_group_skipped_ahead,
+                self.cold_parquet_row_groups_loaded,
+                self.cold_parquet_row_group_cache_hits,
+                self.cold_parquet_row_group_cache_misses,
+                self.cold_parquet_rows_loaded,
+            ),
+            format!(
+                "[vep-kv-profile-detail] cold_parquet_pages position_page_index_loaded={} position_column_index_loaded={} position_pages_total={} position_bloom_filter_row_groups={} position_bloom_filter_bytes={} page_index_probes={} available_probes={} unavailable_probes={} pages_in_probed_row_groups={} candidate_pages={} candidate_rows={} unique_candidate_pages={} unique_candidate_rows={} candidate_misses={}",
+                self.cold_parquet_position_page_index_loaded,
+                self.cold_parquet_position_column_index_loaded,
+                self.cold_parquet_position_pages_total,
+                self.cold_parquet_position_bloom_filter_row_groups,
+                self.cold_parquet_position_bloom_filter_bytes,
+                self.cold_parquet_page_index_probes,
+                self.cold_parquet_page_index_available_probes,
+                self.cold_parquet_page_index_unavailable_probes,
+                self.cold_parquet_page_index_pages_in_probed_row_groups,
+                self.cold_parquet_page_index_candidate_pages,
+                self.cold_parquet_page_index_candidate_rows,
+                self.cold_parquet_page_index_unique_candidate_pages,
+                self.cold_parquet_page_index_unique_candidate_rows,
+                self.cold_parquet_page_index_candidate_misses,
             ),
         ]
     }
@@ -682,6 +844,34 @@ fn warm_variation_batch_size() -> usize {
         .unwrap_or(262_144)
 }
 
+fn warm_cold_variation_backend_from_env() -> WarmColdVariationBackend {
+    match WarmColdVariationBackend::parse(
+        std::env::var("VEP_WARM_COLD_VARIATION_BACKEND")
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!("[KvLookupStream] warning: {error}; falling back to fjall");
+            WarmColdVariationBackend::Fjall
+        }
+    }
+}
+
+fn warm_cold_variation_index_mode_from_env() -> WarmColdVariationIndexMode {
+    match WarmColdVariationIndexMode::parse(
+        std::env::var("VEP_WARM_COLD_VARIATION_INDEX_MODE")
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("[KvLookupStream] warning: {error}; falling back to posidx");
+            WarmColdVariationIndexMode::Position
+        }
+    }
+}
+
 fn variation_cold_dir(store: &VepKvStore) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("VEP_VARIATION_COLD_DIR") {
         return Some(PathBuf::from(path));
@@ -702,6 +892,17 @@ fn variation_position_index_dir(store: &VepKvStore) -> Option<PathBuf> {
         .root_path()
         .parent()
         .map(|parent| parent.join("variation.position_index"))
+}
+
+fn variation_variant_bloom_index_dir(store: &VepKvStore) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("VEP_VARIATION_BLOOM_INDEX_DIR") {
+        return Some(PathBuf::from(path));
+    }
+
+    store
+        .root_path()
+        .parent()
+        .map(|parent| parent.join("variation.variant_bloom_index"))
 }
 
 fn kv_range_prefetch_enabled() -> bool {
@@ -822,6 +1023,11 @@ impl KvLookupStream {
         } else {
             None
         };
+        let variant_bloom_index_dir = if warm_cache_dir.is_some() {
+            variation_variant_bloom_index_dir(&store)
+        } else {
+            None
+        };
 
         Self {
             input,
@@ -841,8 +1047,13 @@ impl KvLookupStream {
             reference_reader,
             warm_cache_dir,
             warm_chroms: HashMap::new(),
+            cold_parquet_chroms: HashMap::new(),
+            variant_bloom_chroms: HashMap::new(),
             cold_variation_dir,
             position_index_dir,
+            variant_bloom_index_dir,
+            warm_cold_backend: warm_cold_variation_backend_from_env(),
+            warm_cold_index_mode: warm_cold_variation_index_mode_from_env(),
             profile_enabled: kv_profile_enabled(),
             profile_detailed: kv_profile_detailed_enabled(),
             profile_emitted: false,
@@ -876,8 +1087,13 @@ impl KvLookupStream {
         let Some(warm_cache_dir) = self.warm_cache_dir.clone() else {
             return Ok(None);
         };
-        let Some(position_index_dir) = self.position_index_dir.clone() else {
-            return Ok(None);
+        let position_index_dir = if self.warm_cold_index_mode.uses_position_index() {
+            let Some(position_index_dir) = self.position_index_dir.clone() else {
+                return Ok(None);
+            };
+            Some(position_index_dir)
+        } else {
+            None
         };
         let collect_colocated = coloc_buf.is_some();
 
@@ -891,26 +1107,28 @@ impl KvLookupStream {
                     .as_ref()
                     .and_then(|dir| cold_variation_file_for_chrom(dir, chrom));
                 let started = self.profile_enabled.then(Instant::now);
-                match WarmChromCache::open(
+                match WarmChromCache::open_with_optional_position_index(
                     &warm_path,
                     chrom,
-                    &position_index_dir,
+                    position_index_dir.as_deref(),
                     cold_path.as_deref(),
                     warm_variation_batch_size(),
                     warm_cache_columns,
                 )? {
                     WarmChromOpen::Available(cache) => {
                         if self.profile_enabled {
-                            if let Some(t0) = started {
-                                self.profile.position_index_load += t0.elapsed();
-                            }
-                            self.profile.position_index_loaded += 1;
-                            match cache.cold_position_source() {
-                                PositionIndexSource::Persisted => {
-                                    self.profile.position_index_persisted_loads += 1;
+                            if let Some(source) = cache.cold_position_source() {
+                                if let Some(t0) = started {
+                                    self.profile.position_index_load += t0.elapsed();
                                 }
-                                PositionIndexSource::ParquetFallback => {
-                                    self.profile.position_index_parquet_fallback_loads += 1;
+                                self.profile.position_index_loaded += 1;
+                                match source {
+                                    PositionIndexSource::Persisted => {
+                                        self.profile.position_index_persisted_loads += 1;
+                                    }
+                                    PositionIndexSource::ParquetFallback => {
+                                        self.profile.position_index_parquet_fallback_loads += 1;
+                                    }
                                 }
                             }
                             self.profile.position_index_rows += cache.cold_position_len() as u64;
@@ -1192,7 +1410,9 @@ impl KvLookupStream {
         let mut position_index_checks = 0_u64;
         let mut position_index_positive_gets = 0_u64;
         let mut position_index_negative_skips = 0_u64;
-        let cold_decision = if warm_decision == WarmProbeForDecision::NotCovered {
+        let cold_decision = if warm_decision == WarmProbeForDecision::NotCovered
+            && self.warm_cold_index_mode.uses_position_index()
+        {
             position_index_checks += 1;
             if warm_chrom.cold_may_contain(position_key) {
                 position_index_positive_gets += 1;
@@ -1245,6 +1465,374 @@ impl KvLookupStream {
         }
 
         Ok(Some(decision))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cold_parquet_aggregate_stats(&self) -> ColdParquetStats {
+        let mut aggregate = ColdParquetStats::default();
+        for lookup in self.cold_parquet_chroms.values().filter_map(Option::as_ref) {
+            aggregate += lookup.stats_snapshot();
+        }
+        aggregate
+    }
+
+    fn cold_variant_bloom_may_contain(
+        &mut self,
+        chrom: &str,
+        chrom_code: u16,
+        probe_start: i64,
+        vcf_ref: &str,
+        vcf_alt: &str,
+    ) -> Result<bool> {
+        if !self.warm_cold_index_mode.uses_variant_bloom() {
+            return Ok(true);
+        }
+        let Some(index_dir) = self.variant_bloom_index_dir.clone() else {
+            return Err(DataFusionError::Execution(
+                "VEP_WARM_COLD_VARIATION_INDEX_MODE uses bloom but no variant bloom index directory is configured".into(),
+            ));
+        };
+
+        if !self.variant_bloom_chroms.contains_key(chrom) {
+            let path = find_variant_bloom_index_file(&index_dir, chrom).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "VEP_WARM_COLD_VARIATION_INDEX_MODE uses bloom but no variant bloom index file for {chrom} in {}",
+                    index_dir.display()
+                ))
+            })?;
+            let started = self.profile_enabled.then(Instant::now);
+            let index = Arc::new(VariantBloomIndex::read_from_path(&path)?);
+            if self.profile_enabled {
+                if let Some(t0) = started {
+                    self.profile.variant_bloom_load += t0.elapsed();
+                }
+                self.profile.variant_bloom_loaded += 1;
+                self.profile.variant_bloom_entries += index.inserted();
+                self.profile.variant_bloom_bits += index.bit_count();
+                self.profile.variant_bloom_hashes = u64::from(index.hash_count());
+                self.profile.variant_bloom_bytes += index.storage_bytes() as u64;
+            }
+            self.variant_bloom_chroms
+                .insert(chrom.to_string(), Some(index));
+        }
+
+        let position_key = warm_position_key_from_code(chrom_code, probe_start).map_err(|e| {
+            DataFusionError::Execution(format!("failed to build cold variant bloom key: {e}"))
+        })?;
+        let variant_keys = warm_variant_key_candidates(position_key, vcf_ref, vcf_alt);
+        let maybe_present = self
+            .variant_bloom_chroms
+            .get(chrom)
+            .and_then(Option::as_ref)
+            .is_some_and(|index| index.contains_any(variant_keys));
+
+        if self.profile_enabled {
+            self.profile.variant_bloom_checks += 1;
+            if maybe_present {
+                self.profile.variant_bloom_positive_gets += 1;
+            } else {
+                self.profile.variant_bloom_negative_skips += 1;
+            }
+        }
+
+        Ok(maybe_present)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe_cold_parquet_position(
+        &mut self,
+        chrom: &str,
+        chrom_code: u16,
+        probe_start: i64,
+        vcf_ref: &str,
+        vcf_alt: &str,
+        vcf_iv_start: i64,
+        vcf_iv_end: i64,
+        emit_output: bool,
+        vcf_row: u32,
+        cache_columns: &[String],
+        col_map: &[usize],
+        builders: &mut [Box<dyn datafusion::arrow::array::ArrayBuilder>],
+        vcf_indices: &mut Vec<u32>,
+        coloc_buf: Option<&mut HashMap<ColocatedKey, ColocatedSinkValue>>,
+    ) -> Result<ColdProbeResult> {
+        let Some(cold_variation_dir) = self.cold_variation_dir.clone() else {
+            return Err(DataFusionError::Execution(
+                "VEP_WARM_COLD_VARIATION_BACKEND=parquet requires a cold variation directory"
+                    .into(),
+            ));
+        };
+        let collect_colocated = coloc_buf.is_some();
+
+        if !self.cold_parquet_chroms.contains_key(chrom) {
+            let cold_paths = cold_variation_files_for_chrom(&cold_variation_dir, chrom);
+            if cold_paths.is_empty() {
+                return Err(DataFusionError::Execution(format!(
+                    "VEP_WARM_COLD_VARIATION_BACKEND=parquet but no cold variation parquet for {chrom}"
+                )));
+            }
+            let projection = cold_parquet_projection_columns(cache_columns, collect_colocated);
+            let lookup = ColdParquetLookupSet::from_env(cold_paths, projection)?;
+            self.cold_parquet_chroms
+                .insert(chrom.to_string(), Some(lookup));
+        }
+
+        let position_key = warm_position_key_from_code(chrom_code, probe_start).map_err(|e| {
+            DataFusionError::Execution(format!("failed to build cold position key: {e}"))
+        })?;
+        let exact_matcher = self.exact_matcher;
+        let allowed_failed = self.allowed_failed;
+        let profile_detailed = self.profile_detailed;
+        let mut primary_allele_rows = 0_u64;
+        let mut exact_match_calls = 0_u64;
+        let mut colocated_allele_rows = 0_u64;
+        let mut colocated_entries = 0_u64;
+        let mut cold_rows_scanned = 0_u64;
+        let mut append_elapsed = Duration::ZERO;
+        let mut colocated_prepare_elapsed = Duration::ZERO;
+        let mut colocated_match_elapsed = Duration::ZERO;
+        let mut emitted = false;
+        let mut coloc_indices_cache: HashMap<usize, Option<WarmColocIndices>> = HashMap::new();
+        let mut coloc_buf = coloc_buf;
+
+        let row_matches =
+            |chunk: &WarmChunkContext, row: u32, allele_string: &str| -> Result<bool> {
+                let failed = chunk
+                    .i64_value(chunk.columns.failed, row as usize)
+                    .unwrap_or(0);
+                if failed > allowed_failed {
+                    return Ok(false);
+                }
+
+                let existing_end = chunk
+                    .i64_value(chunk.columns.end, row as usize)
+                    .unwrap_or(probe_start);
+                let cache_iv_start = probe_start.min(existing_end);
+                let cache_iv_end = probe_start.max(existing_end);
+                if cache_iv_start > vcf_iv_end || cache_iv_end < vcf_iv_start {
+                    return Ok(false);
+                }
+
+                Ok(exact_matcher(vcf_ref, vcf_alt, allele_string))
+            };
+
+        let mut emit_match = |chunk: &WarmChunkContext, row: u32| -> Result<()> {
+            if !emit_output {
+                return Ok(());
+            }
+            let append_started = Instant::now();
+            let Some(indices) = chunk.output_indices(cache_columns, col_map) else {
+                return Err(DataFusionError::Execution(
+                    "cold parquet chunk missing one or more requested cache output columns".into(),
+                ));
+            };
+            vcf_indices.push(vcf_row);
+            append_warm_row_values(chunk, row as usize, indices, builders)?;
+            append_elapsed += append_started.elapsed();
+            emitted = true;
+            Ok(())
+        };
+
+        let mut visit_row =
+            |chunk: &WarmChunkContext, row: u32, allele_string: &str| -> Result<()> {
+                cold_rows_scanned += 1;
+                if profile_detailed {
+                    primary_allele_rows += 1;
+                    exact_match_calls += 1;
+                }
+                let Some(buf) = coloc_buf.as_deref_mut() else {
+                    return Ok(());
+                };
+
+                let prepare_started = Instant::now();
+                let chrom_norm = chrom.to_string();
+                let (input_ref, input_alt, input_start) =
+                    vcf_to_vep_input_allele(vcf_iv_start, vcf_ref, vcf_alt);
+                let input_allele_string = format!("{input_ref}/{input_alt}");
+                let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
+                let compare_allele_string = format!("{compare_ref}/{compare_alt}");
+                let vep_start = vep_norm_start(vcf_iv_start, vcf_ref, vcf_alt);
+                let vep_end = vep_norm_end(vcf_iv_start, vcf_ref, vcf_alt);
+                let compare_output_allele =
+                    output_allele_from_allele_string(&compare_allele_string).map(str::to_string);
+                let unshifted_output_allele: Option<String> = None;
+                colocated_prepare_elapsed += prepare_started.elapsed();
+
+                let colocated_started = Instant::now();
+                if !probe_start_visible_to_window(probe_start, vep_start, vep_end) {
+                    colocated_match_elapsed += colocated_started.elapsed();
+                    return Ok(());
+                }
+
+                let ci = coloc_indices_cache
+                    .entry(chunk.row_group_id)
+                    .or_insert_with(|| resolve_warm_coloc_indices(chunk));
+                let Some(ci) = ci.as_ref() else {
+                    colocated_match_elapsed += colocated_started.elapsed();
+                    return Ok(());
+                };
+                if profile_detailed {
+                    colocated_allele_rows += 1;
+                }
+                let failed = chunk.i64_value(ci.failed, row as usize).unwrap_or(0);
+                if failed > allowed_failed {
+                    colocated_match_elapsed += colocated_started.elapsed();
+                    return Ok(());
+                }
+
+                let Some(var_name) =
+                    warm_string_value(chunk, Some(ci.variation_name), row as usize)?
+                else {
+                    colocated_match_elapsed += colocated_started.elapsed();
+                    return Ok(());
+                };
+                if var_name.is_empty() {
+                    colocated_match_elapsed += colocated_started.elapsed();
+                    return Ok(());
+                }
+
+                let existing_end = chunk
+                    .i64_value(ci.end_col, row as usize)
+                    .unwrap_or(probe_start);
+                let Some(matched_alleles) = compare_existing_variant_alleles(
+                    &compare_allele_string,
+                    vep_start,
+                    vep_end,
+                    None,
+                    None,
+                    None,
+                    allele_string,
+                    probe_start,
+                    existing_end,
+                ) else {
+                    colocated_match_elapsed += colocated_started.elapsed();
+                    return Ok(());
+                };
+
+                let key: ColocatedKey = (chrom_norm, input_start, vcf_iv_end, input_allele_string);
+                let sink_value = buf.entry(key).or_insert_with(|| ColocatedSinkValue {
+                    entries: Vec::new(),
+                    compare_output_allele,
+                    unshifted_output_allele,
+                });
+                let af_values: Vec<String> = ci
+                    .af_indices
+                    .iter()
+                    .map(|idx| {
+                        warm_string_value(chunk, *idx, row as usize)
+                            .map(|value| value.unwrap_or_default())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                sink_value.entries.push(ColocatedCacheEntry {
+                    variation_name: var_name,
+                    allele_string: allele_string.to_string(),
+                    matched_alleles,
+                    somatic: chunk.i64_value(ci.somatic, row as usize).unwrap_or(0),
+                    pheno: chunk.i64_value(ci.pheno, row as usize).unwrap_or(0),
+                    clin_sig: warm_string_value(chunk, ci.clin_sig, row as usize)?,
+                    clin_sig_allele: warm_string_value(chunk, ci.clin_sig_allele, row as usize)?,
+                    pubmed: warm_string_value(chunk, ci.pubmed, row as usize)?,
+                    af_values,
+                });
+                if profile_detailed {
+                    colocated_entries += 1;
+                }
+                colocated_match_elapsed += colocated_started.elapsed();
+                Ok(())
+            };
+
+        let result = {
+            let lookup = self
+                .cold_parquet_chroms
+                .get_mut(chrom)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("cold parquet lookup not open for {chrom}"))
+                })?;
+            lookup.probe_position_emit_and_visit(
+                position_key,
+                row_matches,
+                &mut emit_match,
+                &mut visit_row,
+            )?
+        };
+
+        if self.profile_enabled {
+            let aggregate_stats = self.cold_parquet_aggregate_stats();
+            self.profile.cold_parquet_probes += 1;
+            self.profile.cache_column_append += append_elapsed;
+            self.profile.colocated_prepare += colocated_prepare_elapsed;
+            self.profile.colocated_match += colocated_match_elapsed;
+            self.profile.cold_parquet_rows_scanned += cold_rows_scanned;
+            self.profile.cold_parquet_row_groups_total = aggregate_stats.row_groups_total;
+            self.profile.cold_parquet_row_groups_unique_touched =
+                aggregate_stats.row_groups_unique_touched;
+            self.profile.cold_parquet_row_group_metadata_probes =
+                aggregate_stats.row_group_metadata_probes;
+            self.profile.cold_parquet_row_group_current_hits =
+                aggregate_stats.row_group_current_hits;
+            self.profile.cold_parquet_row_group_previous_hits =
+                aggregate_stats.row_group_previous_hits;
+            self.profile.cold_parquet_row_group_advanced_hits =
+                aggregate_stats.row_group_advanced_hits;
+            self.profile.cold_parquet_row_group_binary_search_hits =
+                aggregate_stats.row_group_binary_search_hits;
+            self.profile.cold_parquet_row_group_metadata_misses =
+                aggregate_stats.row_group_metadata_misses;
+            self.profile.cold_parquet_row_group_skipped_ahead =
+                aggregate_stats.row_group_skipped_ahead;
+            self.profile.cold_parquet_row_groups_loaded = aggregate_stats.row_groups_loaded;
+            self.profile.cold_parquet_row_group_cache_hits = aggregate_stats.row_group_cache_hits;
+            self.profile.cold_parquet_row_group_cache_misses =
+                aggregate_stats.row_group_cache_misses;
+            self.profile.cold_parquet_rows_loaded = aggregate_stats.rows_loaded;
+            self.profile.cold_parquet_position_page_index_loaded =
+                aggregate_stats.position_page_index_loaded;
+            self.profile.cold_parquet_position_column_index_loaded =
+                aggregate_stats.position_column_index_loaded;
+            self.profile.cold_parquet_position_pages_total = aggregate_stats.position_pages_total;
+            self.profile.cold_parquet_position_bloom_filter_row_groups =
+                aggregate_stats.position_bloom_filter_row_groups;
+            self.profile.cold_parquet_position_bloom_filter_bytes =
+                aggregate_stats.position_bloom_filter_bytes;
+            self.profile.cold_parquet_page_index_probes = aggregate_stats.page_index_probes;
+            self.profile.cold_parquet_page_index_available_probes =
+                aggregate_stats.page_index_available_probes;
+            self.profile.cold_parquet_page_index_unavailable_probes =
+                aggregate_stats.page_index_unavailable_probes;
+            self.profile
+                .cold_parquet_page_index_pages_in_probed_row_groups =
+                aggregate_stats.page_index_pages_in_probed_row_groups;
+            self.profile.cold_parquet_page_index_candidate_pages =
+                aggregate_stats.page_index_candidate_pages;
+            self.profile.cold_parquet_page_index_candidate_rows =
+                aggregate_stats.page_index_candidate_rows;
+            self.profile.cold_parquet_page_index_candidate_misses =
+                aggregate_stats.page_index_candidate_misses;
+            self.profile.cold_parquet_page_index_unique_candidate_pages =
+                aggregate_stats.page_index_unique_candidate_pages;
+            self.profile.cold_parquet_page_index_unique_candidate_rows =
+                aggregate_stats.page_index_unique_candidate_rows;
+            self.profile.cold_parquet_load = aggregate_stats.load_time;
+            match result {
+                ColdProbeResult::Match => self.profile.cold_parquet_matches += 1,
+                ColdProbeResult::PositionCoveredNoExact => {
+                    self.profile.cold_parquet_position_misses += 1;
+                }
+                ColdProbeResult::NotCovered => self.profile.cold_parquet_not_covered += 1,
+            }
+            if profile_detailed {
+                self.profile.primary_allele_rows += primary_allele_rows;
+                self.profile.exact_match_calls += exact_match_calls;
+                self.profile.colocated_allele_rows += colocated_allele_rows;
+                self.profile.colocated_entries += colocated_entries;
+            }
+            if emitted && profile_detailed {
+                self.profile.primary_matches += 1;
+            }
+        }
+
+        Ok(result)
     }
 
     fn process_batch(&mut self, vcf_batch: &RecordBatch) -> Result<RecordBatch> {
@@ -1518,6 +2106,42 @@ impl KvLookupStream {
                             continue;
                         }
                         LookupDecision::SkipFjall => {
+                            continue;
+                        }
+                        LookupDecision::UseFjall
+                            if self.warm_cold_backend == WarmColdVariationBackend::Parquet =>
+                        {
+                            if !self.cold_variant_bloom_may_contain(
+                                chrom,
+                                chrom_code,
+                                *probe_start,
+                                vcf_ref,
+                                vcf_alt,
+                            )? {
+                                continue;
+                            }
+                            match self.probe_cold_parquet_position(
+                                chrom,
+                                chrom_code,
+                                *probe_start,
+                                vcf_ref,
+                                vcf_alt,
+                                vcf_iv_start,
+                                vcf_iv_end,
+                                !emitted_match,
+                                row as u32,
+                                &cache_columns,
+                                &col_map,
+                                &mut builders,
+                                &mut vcf_indices,
+                                coloc_buf.as_mut(),
+                            )? {
+                                ColdProbeResult::Match => {
+                                    emitted_match = true;
+                                }
+                                ColdProbeResult::PositionCoveredNoExact
+                                | ColdProbeResult::NotCovered => {}
+                            }
                             continue;
                         }
                         LookupDecision::UseFjall => {}
@@ -1943,6 +2567,14 @@ fn warm_variant_key_candidates(
         push_unique_variant_key(
             &mut keys,
             warm_variant_key_from_position(position_key, vcf_ref, alt),
+        );
+        push_unique_variant_key(
+            &mut keys,
+            warm_variant_key_from_position(position_key, vcf_ref, &vep_alt),
+        );
+        push_unique_variant_key(
+            &mut keys,
+            warm_variant_key_from_position(position_key, &vep_ref, alt),
         );
     }
     keys
@@ -2669,6 +3301,44 @@ mod tests {
     }
 
     #[test]
+    fn warm_cold_backend_parser_defaults_to_fjall_and_accepts_parquet() {
+        assert_eq!(
+            WarmColdVariationBackend::parse(None).unwrap(),
+            WarmColdVariationBackend::Fjall
+        );
+        assert_eq!(
+            WarmColdVariationBackend::parse(Some("parquet")).unwrap(),
+            WarmColdVariationBackend::Parquet
+        );
+        assert_eq!(
+            WarmColdVariationBackend::parse(Some("fjall")).unwrap(),
+            WarmColdVariationBackend::Fjall
+        );
+    }
+
+    #[test]
+    fn warm_cold_backend_parser_rejects_unknown_values() {
+        let err = WarmColdVariationBackend::parse(Some("rocksdb")).unwrap_err();
+        assert!(err.to_string().contains("VEP_WARM_COLD_VARIATION_BACKEND"));
+    }
+
+    #[test]
+    fn warm_cold_index_mode_parser_accepts_position_and_bloom_modes() {
+        assert_eq!(
+            WarmColdVariationIndexMode::parse(None).unwrap(),
+            WarmColdVariationIndexMode::Position
+        );
+        assert_eq!(
+            WarmColdVariationIndexMode::parse(Some("posidx_bloom")).unwrap(),
+            WarmColdVariationIndexMode::PositionThenVariantBloom
+        );
+        assert_eq!(
+            WarmColdVariationIndexMode::parse(Some("bloom")).unwrap(),
+            WarmColdVariationIndexMode::VariantBloom
+        );
+    }
+
+    #[test]
     fn build_probe_starts_includes_parser_input_start_for_shifted_insertions() {
         let probe_starts = build_probe_starts(
             215230092,
@@ -2743,15 +3413,51 @@ mod tests {
         profile.warm_chunks_loaded = 34;
         profile.warm_chunk_rows = 35;
         profile.position_index_persisted_loads = 1;
+        profile.variant_bloom_checks = 2;
+        profile.variant_bloom_negative_skips = 3;
+        profile.variant_bloom_positive_gets = 4;
+        profile.variant_bloom_loaded = 5;
+        profile.variant_bloom_entries = 6;
+        profile.variant_bloom_bits = 7;
+        profile.variant_bloom_hashes = 8;
+        profile.variant_bloom_bytes = 9;
+        profile.cold_parquet_probes = 36;
+        profile.cold_parquet_matches = 37;
+        profile.cold_parquet_rows_scanned = 38;
+        profile.cold_parquet_row_groups_total = 50;
+        profile.cold_parquet_row_groups_unique_touched = 40;
+        profile.cold_parquet_row_group_metadata_probes = 41;
+        profile.cold_parquet_row_group_current_hits = 42;
+        profile.cold_parquet_row_group_previous_hits = 43;
+        profile.cold_parquet_row_group_advanced_hits = 44;
+        profile.cold_parquet_row_group_binary_search_hits = 45;
+        profile.cold_parquet_row_group_metadata_misses = 46;
+        profile.cold_parquet_row_group_skipped_ahead = 47;
+        profile.cold_parquet_row_groups_loaded = 39;
+        profile.cold_parquet_position_page_index_loaded = true;
+        profile.cold_parquet_position_column_index_loaded = true;
+        profile.cold_parquet_position_pages_total = 51;
+        profile.cold_parquet_position_bloom_filter_row_groups = 52;
+        profile.cold_parquet_position_bloom_filter_bytes = 53;
+        profile.cold_parquet_page_index_probes = 54;
+        profile.cold_parquet_page_index_available_probes = 55;
+        profile.cold_parquet_page_index_unavailable_probes = 56;
+        profile.cold_parquet_page_index_pages_in_probed_row_groups = 57;
+        profile.cold_parquet_page_index_candidate_pages = 58;
+        profile.cold_parquet_page_index_candidate_rows = 59;
+        profile.cold_parquet_page_index_unique_candidate_pages = 60;
+        profile.cold_parquet_page_index_unique_candidate_rows = 61;
+        profile.cold_parquet_page_index_candidate_misses = 62;
 
         let lines = profile.detail_lines();
 
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 9);
         assert!(lines[0].contains("probe_build=0.001s"));
         assert!(lines[0].contains("point_get_raw=0.002s"));
         assert!(lines[0].contains("decompress=0.004s"));
         assert!(lines[0].contains("warm_probe=0.012s"));
         assert!(lines[0].contains("warm_chunk_load=0.013s"));
+        assert!(lines[0].contains("variant_bloom_load=0.000s"));
         assert!(lines[1].contains("raw_get_hits=12"));
         assert!(lines[1].contains("compressed_bytes=17"));
         assert!(lines[2].contains("primary_allele_rows=19"));
@@ -2764,6 +3470,23 @@ mod tests {
         assert!(lines[3].contains("chunk_rows=35"));
         assert!(lines[4].contains("position_index checks=0"));
         assert!(lines[4].contains("persisted_loads=1"));
+        assert!(lines[5].contains("variant_bloom checks=2"));
+        assert!(lines[5].contains("negative_skips=3"));
+        assert!(lines[5].contains("positive_gets=4"));
+        assert!(lines[5].contains("entries=6"));
+        assert!(lines[6].contains("cold_parquet probes=36"));
+        assert!(lines[6].contains("matches=37"));
+        assert!(lines[6].contains("rows_scanned=38"));
+        assert!(lines[7].contains("cold_parquet_row_groups total=50"));
+        assert!(lines[7].contains("unique_touched=40"));
+        assert!(lines[7].contains("untouched=10"));
+        assert!(lines[7].contains("metadata_probes=41"));
+        assert!(lines[7].contains("loaded=39"));
+        assert!(lines[8].contains("cold_parquet_pages position_page_index_loaded=true"));
+        assert!(lines[8].contains("position_pages_total=51"));
+        assert!(lines[8].contains("position_bloom_filter_row_groups=52"));
+        assert!(lines[8].contains("page_index_probes=54"));
+        assert!(lines[8].contains("unique_candidate_rows=61"));
     }
 
     #[test]
