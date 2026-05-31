@@ -7,6 +7,7 @@
 //!     --index-dir <dir-containing-chrN.posidx> \
 //!     --chrom chrN \
 //!     --row-group-rows 64000 \
+//!     [--data-page-row-count 8192] \
 //!     [--batch-size 262144] \
 //!     [--bin-bits 20] \
 //!     [--max-row-groups-per-file 30000]
@@ -38,6 +39,7 @@ struct Args {
     index_dir: PathBuf,
     chrom: String,
     row_group_rows: usize,
+    data_page_row_count: Option<usize>,
     batch_size: usize,
     bin_bits: Option<u8>,
     max_row_groups_per_file: Option<usize>,
@@ -52,12 +54,21 @@ struct RewriteStats {
 }
 
 fn parse_args() -> Result<Args> {
-    let args: Vec<String> = std::env::args().collect();
+    parse_args_from(std::env::args())
+}
+
+fn parse_args_from<I, S>(args: I) -> Result<Args>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args: Vec<String> = args.into_iter().map(Into::into).collect();
     let mut input = None;
     let mut output_dir = None;
     let mut index_dir = None;
     let mut chrom = None;
     let mut row_group_rows = None;
+    let mut data_page_row_count = None;
     let mut batch_size = 262_144usize;
     let mut bin_bits = None;
     let mut max_row_groups_per_file = None;
@@ -91,6 +102,19 @@ fn parse_args() -> Result<Args> {
                                 "invalid --row-group-rows value: {error}"
                             ))
                         })?,
+                );
+            }
+            "--data-page-row-count" => {
+                i += 1;
+                data_page_row_count = Some(
+                    require_arg(&args, i, "--data-page-row-count")?
+                        .parse::<usize>()
+                        .map_err(|error| {
+                            DataFusionError::Execution(format!(
+                                "invalid --data-page-row-count value: {error}"
+                            ))
+                        })?
+                        .max(1),
                 );
             }
             "--batch-size" => {
@@ -141,6 +165,7 @@ fn parse_args() -> Result<Args> {
         row_group_rows: row_group_rows
             .ok_or_else(|| DataFusionError::Execution("--row-group-rows is required".into()))?
             .max(1),
+        data_page_row_count,
         batch_size: batch_size.max(1),
         bin_bits,
         max_row_groups_per_file,
@@ -173,6 +198,12 @@ fn main() -> Result<()> {
     eprintln!("output={}", output.display());
     eprintln!("index_dir={}", args.index_dir.display());
     eprintln!("row_group_rows={}", args.row_group_rows);
+    eprintln!(
+        "data_page_row_count={}",
+        args.data_page_row_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "default".to_string())
+    );
     eprintln!("batch_size={}", args.batch_size);
     eprintln!(
         "bin_bits={}",
@@ -266,11 +297,20 @@ fn create_writer(path: &Path, schema: SchemaRef, args: &Args) -> Result<ArrowWri
             bits.to_string(),
         ));
     }
-    let props = WriterProperties::builder()
+    if let Some(rows) = args.data_page_row_count {
+        metadata.push(KeyValue::new(
+            "vepyr.data_page_row_count".to_string(),
+            rows.to_string(),
+        ));
+    }
+    let mut props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .set_max_row_group_size(usize::MAX)
-        .set_key_value_metadata(Some(metadata))
-        .build();
+        .set_key_value_metadata(Some(metadata));
+    if let Some(rows) = args.data_page_row_count {
+        props = props.set_data_page_row_count_limit(rows);
+    }
+    let props = props.build();
     let file = File::create(path).map_err(|error| {
         DataFusionError::Execution(format!(
             "failed to create output '{}': {error}",
@@ -311,6 +351,7 @@ impl PositionAlignedWriter {
                 index_dir: args.index_dir.clone(),
                 chrom: args.chrom.clone(),
                 row_group_rows: args.row_group_rows,
+                data_page_row_count: args.data_page_row_count,
                 batch_size: args.batch_size,
                 bin_bits: args.bin_bits,
                 max_row_groups_per_file: args.max_row_groups_per_file,
@@ -471,4 +512,31 @@ fn position_key_array(batch: &RecordBatch, idx: usize) -> Result<&UInt64Array> {
 fn genomic_bin(position_key: u64, bits: u8) -> u64 {
     const POSITION_MASK: u64 = (1_u64 << 48) - 1;
     (position_key & POSITION_MASK) >> bits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_page_row_count_arg_is_parsed() {
+        let args = parse_args_from([
+            "rewrite_cold_variation_layout",
+            "--input",
+            "chr4_cold.parquet",
+            "--output-dir",
+            "variation",
+            "--index-dir",
+            "variation.position_index",
+            "--chrom",
+            "chr4",
+            "--row-group-rows",
+            "8192",
+            "--data-page-row-count",
+            "2048",
+        ])
+        .unwrap();
+
+        assert_eq!(args.data_page_row_count, Some(2048));
+    }
 }
