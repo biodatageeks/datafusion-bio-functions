@@ -421,13 +421,34 @@ Rust pyo3 API:
 cache_format = "indexed_parquet"
 ```
 
-Remove public `use_fjall`. Existing behavior should be expressible as:
+Remove public `use_fjall` and `build_fjall`. Existing behavior should be expressible as:
 
 ```python
 cache_format="legacy_fjall"
 ```
 
 The VEPyR wrapper must stop forcing Fjall when `forks > 0` or when warm variation is enabled.
+
+VEPyR wiring requirements:
+
+- add `cache_format` to `src/vepyr/__init__.py`, `src/vepyr/_core.pyi`, and `src/lib.rs`
+- thread `cache_format` through `src/annotate.rs` into the Rust annotation call
+- thread `cache_format` through cache generation into this repository's `CacheBuilder`
+- default `build_cache()` and `annotate()` to `indexed_parquet`
+- remove the `forks > 0 requires use_fjall=True` guard
+- remove the `warm_variation_cache=True requires use_fjall=True` guard
+- remove public warm/cold artifact override parameters that are no longer normal API:
+  - `warm_variation_cache`
+  - `warm_variation_dir`
+  - `variation_cold_dir`
+  - `variation_position_index_dir`
+  - `variation_bloom_index_dir`
+- remove public `use_fjall`
+- remove public `build_fjall`
+- update Python docstrings and type stubs to describe `cache_format`
+- ensure no removed parameter becomes a silent no-op
+
+Normal VEPyR annotation should discover indexed artifacts from the cache root. Developer-only environment overrides may remain in the Rust crate during migration, but they must not be part of the VEPyR public API.
 
 ## Testing Requirements
 
@@ -452,6 +473,39 @@ Integration tests:
 - assert compact SIFT predictions match legacy Fjall predictions
 - assert VCF body hash matches `cache_format=legacy_fjall` on the same fixture
 - run annotation with `forks=1` and `forks=0`
+
+VEPyR smoke tests:
+
+- `vepyr.build_cache(cache_format="indexed_parquet")` succeeds on the small fixture cache
+- `vepyr.build_cache()` defaults to `indexed_parquet`
+- generated cache contains:
+  - `variation/chrN_warm.parquet`
+  - `variation/chrN_cold.parquet`
+  - `variation.position_index/chrN.posidx`
+  - `variation.variant_bloom_index/chrN.varbf`
+  - compact `translation_sift/chrN.parquet`
+- generated cache does not contain:
+  - `variation.fjall`
+  - `translation_sift.fjall`
+  - `translation_sift_lookup/`
+- compact `translation_sift/` schema is exactly `transcript_id,predictions`
+- generated variation Parquet has no `region_bin`
+- generated variation Parquet has no `vepyr.echtvar_bin_bits`
+- cold variation `position_key` page index is present
+- adjacent cold row groups never share a `position_key`
+- `vepyr.annotate(cache_format="indexed_parquet", forks=0)` succeeds
+- `vepyr.annotate(cache_format="indexed_parquet", forks=1)` succeeds
+- default `vepyr.annotate()` uses `indexed_parquet`
+- indexed output VCF body hash matches the expected golden fixture
+- if the fixture also builds `legacy_fjall`, indexed output body hash matches `legacy_fjall`
+- removed parameters are rejected by Python instead of silently ignored:
+  - `use_fjall`
+  - `build_fjall`
+  - `warm_variation_cache`
+  - `warm_variation_dir`
+  - `variation_cold_dir`
+  - `variation_position_index_dir`
+  - `variation_bloom_index_dir`
 
 Benchmark acceptance:
 
