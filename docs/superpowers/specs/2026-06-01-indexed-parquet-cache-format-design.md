@@ -348,6 +348,50 @@ For `cache_format=indexed_parquet`, the cache builder must:
 
 For `cache_format=legacy_fjall`, the cache builder may keep the existing legacy outputs and Fjall stores.
 
+## Implementation References
+
+The implementation should reuse existing library code rather than shelling out to examples.
+
+Variation builder/library references:
+
+- `datafusion/bio-function-vep/src/warm_cache/build.rs`
+  - current warm/cold variation split
+  - current `PositionAlignedWriter`
+  - current `.posidx` generation from cold Parquet
+- `datafusion/bio-function-vep/src/kv_cache/position_index.rs`
+  - `PositionIndex::from_parquet`
+  - `PositionIndex::from_parquet_files`
+  - `PositionIndex::write_to_path`
+- `datafusion/bio-function-vep/src/kv_cache/variant_bloom_index.rs`
+  - `VariantBloomIndex::from_parquet`
+  - `VariantBloomIndex::write_to_path`
+
+Example prototypes to fold into library code:
+
+- `datafusion/bio-function-vep/examples/rewrite_cold_variation_layout.rs`
+  - reuse the `data_page_row_count` writer behavior
+  - reuse the 8,192-row cold row-group layout behavior
+  - reuse position-key-aligned row-group flushing
+  - do not reuse `--bin-bits`, `genomic_bin`, or `vepyr.echtvar_bin_bits`
+- `datafusion/bio-function-vep/examples/build_variation_position_index.rs`
+  - keep only as a CLI wrapper over library code
+- `datafusion/bio-function-vep/examples/build_variation_variant_bloom_index.rs`
+  - keep only as a CLI wrapper over library code
+
+Compact SIFT references:
+
+- `datafusion/bio-function-vep/src/kv_cache/sift_parquet_store.rs`
+  - runtime compact parquet lookup store
+  - required compact schema reader: `transcript_id`, `predictions`
+- `datafusion/bio-function-vep/examples/build_sift_lookup_parquet.rs`
+  - fold the compact writer behavior into the cache builder
+  - keep the 16-row group default
+  - write to `translation_sift/`, not `translation_sift_lookup/`
+- `datafusion/bio-function-vep/src/kv_cache/sift_store.rs`
+  - reuse the existing Fjall-compatible prediction serialization/deserialization semantics
+
+The examples are useful prototypes and benchmark tools. They must not be required steps in normal cache generation.
+
 ## Annotation Responsibilities
 
 For `cache_format=indexed_parquet`, annotation must:
