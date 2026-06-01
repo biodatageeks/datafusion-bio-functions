@@ -3,8 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use datafusion::arrow::array::{
-    Array, Int64Array, LargeStringArray, ListArray, RecordBatch, StringArray, StringViewArray,
-    UInt64Array,
+    Array, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray, UInt64Array,
 };
 use datafusion::common::{DataFusionError, Result};
 use parquet::arrow::ProjectionMask;
@@ -54,6 +53,20 @@ impl VariantBloomIndex {
     ) -> Result<Self> {
         let file = File::open(path.as_ref()).map_err(io_err)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        if builder.schema().index_of("variant_keys").is_ok() {
+            return Err(DataFusionError::Execution(format!(
+                "cold variation parquet '{}' contains deprecated variant_keys; rebuild indexed_parquet cache",
+                path.as_ref().display()
+            )));
+        }
+        if builder.schema().index_of("position_key").is_err()
+            || builder.schema().index_of("allele_string").is_err()
+        {
+            return Err(DataFusionError::Execution(format!(
+                "cold variation parquet '{}' missing position_key or allele_string required for variant bloom index",
+                path.as_ref().display()
+            )));
+        }
         let expected_items = u64::try_from(builder.metadata().file_metadata().num_rows())
             .unwrap_or(1)
             .saturating_mul(4)
@@ -61,7 +74,7 @@ impl VariantBloomIndex {
         let mask = projection_for_existing_roots(
             builder.schema(),
             builder.parquet_schema(),
-            &["position_key", "allele_string", "variant_keys"],
+            &["position_key", "allele_string"],
         );
         let reader = builder
             .with_projection(mask)
@@ -200,9 +213,6 @@ impl VariantBloomIndex {
                 batch.column(allele_idx).as_ref(),
             )?;
         }
-        if let Ok(variant_idx) = schema.index_of("variant_keys") {
-            append_variant_keys(self, batch.column(variant_idx).as_ref())?;
-        }
         Ok(())
     }
 }
@@ -230,32 +240,6 @@ pub fn find_variant_bloom_index_file(dir: impl AsRef<Path>, chrom: &str) -> Opti
     }
 
     None
-}
-
-fn append_variant_keys(index: &mut VariantBloomIndex, array: &dyn Array) -> Result<()> {
-    let variant_array = array
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| DataFusionError::Execution("variant_keys must be List<UInt64>".into()))?;
-    let variant_values = variant_array
-        .values()
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| DataFusionError::Execution("variant_keys values must be UInt64".into()))?;
-    let offsets = variant_array.offsets();
-    for row in 0..variant_array.len() {
-        if variant_array.is_null(row) {
-            continue;
-        }
-        let start = offsets[row] as usize;
-        let end = offsets[row + 1] as usize;
-        for value_idx in start..end {
-            if !variant_values.is_null(value_idx) {
-                index.insert(variant_values.value(value_idx));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn append_allele_match_keys(
@@ -445,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn variant_bloom_index_builds_from_parquet_variant_keys() {
+    fn variant_bloom_index_rejects_deprecated_parquet_variant_keys() {
         use std::sync::Arc;
 
         use datafusion::arrow::array::{ArrayRef, ListBuilder, UInt64Builder};
@@ -472,12 +456,9 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
-        let index = VariantBloomIndex::from_parquet(&path, 1024, 10).unwrap();
+        let err = VariantBloomIndex::from_parquet(&path, 1024, 10).unwrap_err();
 
-        assert_eq!(index.inserted(), 3);
-        assert!(index.contains(11));
-        assert!(index.contains(42));
-        assert!(index.contains(99));
+        assert!(err.to_string().contains("deprecated variant_keys"));
     }
 
     #[test]

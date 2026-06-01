@@ -390,13 +390,17 @@ fn write_split_files_to_paths(
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let source_schema = builder.schema().clone();
     let output_schema = output_schema(&source_schema)?;
+    let cold_output_schema = cold_output_schema(&output_schema)?;
 
     let warm_writer = create_writer(warm_path, output_schema.clone(), "warm", args)?;
-    let cold_writer = create_writer(cold_path, output_schema.clone(), "cold", args)?;
+    let cold_writer = create_writer(cold_path, cold_output_schema.clone(), "cold", args)?;
     let mut warm_writer =
         PositionAlignedWriter::new(warm_writer, output_schema.clone(), args.warm_row_group_rows)?;
-    let mut cold_writer =
-        PositionAlignedWriter::new(cold_writer, output_schema.clone(), args.cold_row_group_rows)?;
+    let mut cold_writer = PositionAlignedWriter::new(
+        cold_writer,
+        cold_output_schema.clone(),
+        args.cold_row_group_rows,
+    )?;
 
     let reader = builder.with_batch_size(args.batch_size).build()?;
     let mut written = WrittenRows::default();
@@ -418,6 +422,7 @@ fn write_split_files_to_paths(
             written.cold_rows_sharing_warm_positions +=
                 count_rows_with_warm_positions(&cold_batch, chrom, warm_positions)?;
             written.cold_rows += cold_batch.num_rows();
+            let cold_batch = project_batch_to_schema(&cold_batch, &cold_output_schema)?;
             cold_writer.write(&cold_batch)?;
         }
     }
@@ -754,20 +759,7 @@ fn row_group_position_ranges_from_metadata(path: &Path) -> Result<Vec<(u64, u64)
                         path.display()
                     )
                 })?;
-                (
-                    u64::try_from(min).map_err(|_| {
-                        format!(
-                            "row group {row_group} in {} has negative position_key min: {min}",
-                            path.display()
-                        )
-                    })?,
-                    u64::try_from(max).map_err(|_| {
-                        format!(
-                            "row group {row_group} in {} has negative position_key max: {max}",
-                            path.display()
-                        )
-                    })?,
-                )
+                (min as u64, max as u64)
             }
             other => {
                 return Err(format!(
@@ -835,6 +827,33 @@ fn output_schema(source_schema: &SchemaRef) -> Result<SchemaRef> {
         fields,
         source_schema.metadata().clone(),
     )))
+}
+
+fn cold_output_schema(enriched_schema: &SchemaRef) -> Result<SchemaRef> {
+    let fields: Vec<FieldRef> = enriched_schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() != "variant_keys")
+        .cloned()
+        .collect();
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        enriched_schema.metadata().clone(),
+    )))
+}
+
+fn project_batch_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            batch
+                .schema()
+                .index_of(field.name())
+                .map(|idx| Arc::clone(batch.column(idx)))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
 fn create_writer(
@@ -1181,9 +1200,17 @@ mod tests {
             .unwrap()
             .schema()
             .clone();
+        let cold_file = File::open(output_dir.join("chr1_cold.parquet")).unwrap();
+        let cold_schema = ParquetRecordBatchReaderBuilder::try_new(cold_file)
+            .unwrap()
+            .schema()
+            .clone();
         assert!(warm_schema.index_of("region_bin").is_err());
         assert!(warm_schema.index_of("position_key").is_ok());
         assert!(warm_schema.index_of("variant_keys").is_ok());
+        assert!(cold_schema.index_of("region_bin").is_err());
+        assert!(cold_schema.index_of("position_key").is_ok());
+        assert!(cold_schema.index_of("variant_keys").is_err());
     }
 
     #[test]
