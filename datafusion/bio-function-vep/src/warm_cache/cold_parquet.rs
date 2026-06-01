@@ -136,6 +136,7 @@ impl ColdParquetLookup {
         let metadata_options =
             ArrowReaderOptions::new().with_page_index(cold_parquet_load_page_index());
         let metadata = ArrowReaderMetadata::load(&file, metadata_options)?;
+        reject_deprecated_cold_variant_keys(&metadata, &path)?;
         let position_leaf = cold_position_leaf_index(&metadata)?;
         let row_groups = cold_row_group_metadata(&metadata, position_leaf)?;
         validate_cold_row_group_order(&row_groups)?;
@@ -1051,6 +1052,16 @@ fn cold_position_leaf_index(metadata: &ArrowReaderMetadata) -> Result<usize> {
         })
 }
 
+fn reject_deprecated_cold_variant_keys(metadata: &ArrowReaderMetadata, path: &Path) -> Result<()> {
+    if metadata.schema().index_of("variant_keys").is_ok() {
+        return Err(DataFusionError::Execution(format!(
+            "cold variation parquet '{}' contains deprecated variant_keys; rebuild indexed_parquet cache",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn cold_row_group_metadata(
     metadata: &ArrowReaderMetadata,
     position_leaf: usize,
@@ -1078,18 +1089,7 @@ fn cold_row_group_metadata(
                             "cold row group {row_group} missing position_key max"
                         ))
                     })?;
-                    (
-                        u64::try_from(min).map_err(|_| {
-                            DataFusionError::Execution(format!(
-                                "cold row group {row_group} has negative position_key min: {min}"
-                            ))
-                        })?,
-                        u64::try_from(max).map_err(|_| {
-                            DataFusionError::Execution(format!(
-                                "cold row group {row_group} has negative position_key max: {max}"
-                            ))
-                        })?,
-                    )
+                    (min as u64, max as u64)
                 }
                 other => {
                     return Err(DataFusionError::Execution(format!(
@@ -1228,7 +1228,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
+    use datafusion::arrow::array::{
+        ArrayRef, Int64Array, ListBuilder, RecordBatch, StringArray, UInt64Array, UInt64Builder,
+    };
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
@@ -1291,6 +1293,47 @@ mod tests {
             err.to_string()
                 .contains("position_key split across cold row groups")
         );
+    }
+
+    #[test]
+    fn cold_lookup_rejects_deprecated_variant_keys_column() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("cold_with_variant_keys.parquet");
+        let mut variant_keys = ListBuilder::new(UInt64Builder::new());
+        variant_keys.values().append_value(42);
+        variant_keys.append(true);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new_list(
+                "variant_keys",
+                Arc::new(Field::new_list_field(DataType::UInt64, true)),
+                false,
+            ),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![position_key("1", 10).unwrap()])) as ArrayRef,
+                Arc::new(variant_keys.finish()) as ArrayRef,
+                Arc::new(StringArray::from(vec!["A/G"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let err =
+            ColdParquetLookup::open(&path, cold_parquet_projection_columns(&[], false), 64, 2)
+                .unwrap_err();
+
+        assert!(err.to_string().contains("deprecated variant_keys"));
     }
 
     fn open_test_lookup_with_page_index(path: &Path) -> ColdParquetLookup {
