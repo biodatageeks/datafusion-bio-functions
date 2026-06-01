@@ -852,7 +852,19 @@ fn append_key_columns(
         variants_builder.append(true);
     }
 
-    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    let mut columns: Vec<ArrayRef> = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(batch.columns().iter())
+        .filter_map(|(field, column)| {
+            if field.name() == "region_bin" {
+                None
+            } else {
+                Some(Arc::clone(column))
+            }
+        })
+        .collect();
     columns.push(Arc::new(position_builder.finish()));
     columns.push(Arc::new(variants_builder.finish()));
 
@@ -940,6 +952,32 @@ mod tests {
         write_input_part_with_chroms(path, vec!["1"; starts.len()], starts, mafs);
     }
 
+    fn write_input_part_with_region_bin(path: &Path, starts: Vec<i64>, mafs: Vec<f64>) {
+        let rows = starts.len();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("region_bin", DataType::Int64, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, true),
+            Field::new("minor_allele_freq", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1"; rows])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0; rows])) as ArrayRef,
+                Arc::new(Int64Array::from(starts)) as ArrayRef,
+                Arc::new(StringArray::from(vec!["A/G"; rows])) as ArrayRef,
+                Arc::new(Float64Array::from(mafs)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
     fn write_input_part_with_chroms(
         path: &Path,
         chroms: Vec<&str>,
@@ -1021,6 +1059,44 @@ mod tests {
                 .exists()
         );
         assert!(!work_dir.exists());
+    }
+
+    #[test]
+    fn build_warm_variation_tier_from_parts_drops_region_bin_helper_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("variation");
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let part_0 = dir.path().join("part_0.parquet");
+        let part_1 = dir.path().join("part_1.parquet");
+        write_input_part_with_region_bin(&part_0, vec![100, 200], vec![0.02, 0.0]);
+        write_input_part_with_region_bin(&part_1, vec![101, 300], vec![0.0, 0.0]);
+
+        let mut options = WarmVariationTierPartsOptions::new(
+            vec![part_0, part_1],
+            &output_dir,
+            &work_dir,
+            "chr1",
+        );
+        options.af_threshold = 0.01;
+        options.position_radius = 1;
+        options.warm_row_group_rows = 2;
+        options.cold_row_group_rows = 2;
+        options.batch_size = 2;
+
+        let stats = build_warm_variation_tier_from_parts(options).unwrap();
+        assert_eq!(stats.warm_rows, 2);
+        assert_eq!(stats.cold_rows, 2);
+
+        let warm_file = File::open(output_dir.join("chr1_warm.parquet")).unwrap();
+        let warm_schema = ParquetRecordBatchReaderBuilder::try_new(warm_file)
+            .unwrap()
+            .schema()
+            .clone();
+        assert!(warm_schema.index_of("region_bin").is_err());
+        assert!(warm_schema.index_of("position_key").is_ok());
+        assert!(warm_schema.index_of("variant_keys").is_ok());
     }
 
     #[test]
