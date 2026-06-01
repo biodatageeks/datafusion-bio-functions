@@ -234,6 +234,16 @@ impl CacheBuilder {
         self
     }
 
+    pub fn with_variation_tier_filter_options(
+        mut self,
+        af_threshold: f64,
+        position_radius: i64,
+    ) -> Self {
+        self.variation_af_threshold = af_threshold;
+        self.variation_position_radius = position_radius;
+        self
+    }
+
     pub fn with_indexed_variation_layout_options(
         mut self,
         warm_row_group_rows: usize,
@@ -241,6 +251,16 @@ impl CacheBuilder {
         cold_data_page_row_count: usize,
     ) -> Self {
         self.variation_warm_row_group_rows = warm_row_group_rows.max(1);
+        self.variation_cold_row_group_rows = cold_row_group_rows.max(1);
+        self.variation_cold_data_page_row_count = cold_data_page_row_count.max(1);
+        self
+    }
+
+    pub fn with_indexed_variation_cold_layout_options(
+        mut self,
+        cold_row_group_rows: usize,
+        cold_data_page_row_count: usize,
+    ) -> Self {
         self.variation_cold_row_group_rows = cold_row_group_rows.max(1);
         self.variation_cold_data_page_row_count = cold_data_page_row_count.max(1);
         self
@@ -3320,6 +3340,42 @@ mod tests {
         assert!(builder.build_fjall);
         assert_eq!(builder.zstd_level, 9);
         assert_eq!(builder.dict_size_kb, 256);
+    }
+
+    #[test]
+    fn variation_tier_filter_options_preserve_layout_defaults() {
+        let builder =
+            CacheBuilder::new("/cache", "/output").with_variation_tier_filter_options(0.05, 2);
+
+        assert_eq!(builder.variation_af_threshold, 0.05);
+        assert_eq!(builder.variation_position_radius, 2);
+        assert_eq!(
+            builder.variation_warm_row_group_rows,
+            DEFAULT_VARIATION_WARM_ROW_GROUP_ROWS
+        );
+        assert_eq!(
+            builder.variation_cold_row_group_rows,
+            DEFAULT_VARIATION_COLD_ROW_GROUP_ROWS
+        );
+        assert_eq!(
+            builder.variation_cold_data_page_row_count,
+            DEFAULT_VARIATION_COLD_DATA_PAGE_ROW_COUNT
+        );
+        assert_eq!(builder.variation_tier_batch_size, 65_536);
+    }
+
+    #[test]
+    fn indexed_variation_cold_layout_options_preserve_warm_and_batch_defaults() {
+        let builder = CacheBuilder::new("/cache", "/output")
+            .with_indexed_variation_cold_layout_options(4_096, 512);
+
+        assert_eq!(
+            builder.variation_warm_row_group_rows,
+            DEFAULT_VARIATION_WARM_ROW_GROUP_ROWS
+        );
+        assert_eq!(builder.variation_cold_row_group_rows, 4_096);
+        assert_eq!(builder.variation_cold_data_page_row_count, 512);
+        assert_eq!(builder.variation_tier_batch_size, 65_536);
     }
 
     #[test]
