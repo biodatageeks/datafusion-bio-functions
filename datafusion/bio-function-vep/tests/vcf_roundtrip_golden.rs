@@ -30,6 +30,20 @@ fn workspace_path(rel: &str) -> std::path::PathBuf {
         .join(rel)
 }
 
+fn has_indexed_variation_cache(cache_path: &std::path::Path) -> bool {
+    let variation_dir = cache_path.join("variation");
+    variation_dir.join("chr1_warm.parquet").is_file()
+        && variation_dir.join("chr1_cold.parquet").is_file()
+        && cache_path
+            .join("variation.position_index")
+            .join("chr1.posidx")
+            .is_file()
+        && cache_path
+            .join("variation.variant_bloom_index")
+            .join("chr1.varbf")
+            .is_file()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_roundtrip_golden_all_column_values() {
     let input_vcf = workspace_path("vep-benchmark/data/golden/input_1000.vcf");
@@ -41,6 +55,13 @@ async fn test_roundtrip_golden_all_column_values() {
         eprintln!(
             "Skipping: test fixtures not found at {}",
             input_vcf.display()
+        );
+        return;
+    }
+    if !has_indexed_variation_cache(&cache_path) {
+        eprintln!(
+            "Skipping: golden cache at {} is not indexed_parquet layout",
+            cache_path.display()
         );
         return;
     }
@@ -337,6 +358,13 @@ async fn test_forks_one_uses_single_chromosome_lane() {
         eprintln!(
             "Skipping: test fixtures not found at {}",
             input_vcf.display()
+        );
+        return;
+    }
+    if !has_indexed_variation_cache(&cache_path) {
+        eprintln!(
+            "Skipping: golden cache at {} is not indexed_parquet layout",
+            cache_path.display()
         );
         return;
     }

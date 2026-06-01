@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::kv_cache::position_index::{PositionIndex, position_index_file};
+use crate::kv_cache::variant_bloom_index::{VariantBloomIndex, variant_bloom_index_file};
 use crate::warm_cache::key::{position_key, variant_keys_from_allele_string};
 use crate::warm_cache::reader::projection_for_existing_roots;
 use crate::warm_cache::split::{
@@ -30,7 +31,9 @@ pub struct WarmVariationTierOptions {
     pub output_dir: PathBuf,
     pub af_threshold: f64,
     pub position_radius: i64,
-    pub row_group_rows: usize,
+    pub warm_row_group_rows: usize,
+    pub cold_row_group_rows: usize,
+    pub cold_data_page_row_count: usize,
     pub batch_size: usize,
 }
 
@@ -41,7 +44,9 @@ impl WarmVariationTierOptions {
             output_dir: output_dir.into(),
             af_threshold: 0.01,
             position_radius: 1,
-            row_group_rows: 500_000,
+            warm_row_group_rows: 500_000,
+            cold_row_group_rows: 8_192,
+            cold_data_page_row_count: 1_024,
             batch_size: 65_536,
         }
     }
@@ -55,7 +60,9 @@ pub struct WarmVariationTierPartsOptions {
     pub chrom: String,
     pub af_threshold: f64,
     pub position_radius: i64,
-    pub row_group_rows: usize,
+    pub warm_row_group_rows: usize,
+    pub cold_row_group_rows: usize,
+    pub cold_data_page_row_count: usize,
     pub batch_size: usize,
 }
 
@@ -73,7 +80,9 @@ impl WarmVariationTierPartsOptions {
             chrom: chrom.into(),
             af_threshold: 0.01,
             position_radius: 1,
-            row_group_rows: 500_000,
+            warm_row_group_rows: 500_000,
+            cold_row_group_rows: 8_192,
+            cold_data_page_row_count: 1_024,
             batch_size: 65_536,
         }
     }
@@ -97,7 +106,9 @@ struct Args {
     output_dir: PathBuf,
     af_threshold: f64,
     position_radius: i64,
-    row_group_rows: usize,
+    warm_row_group_rows: usize,
+    cold_row_group_rows: usize,
+    cold_data_page_row_count: usize,
     batch_size: usize,
 }
 
@@ -108,7 +119,9 @@ impl From<WarmVariationTierOptions> for Args {
             output_dir: options.output_dir,
             af_threshold: options.af_threshold,
             position_radius: options.position_radius,
-            row_group_rows: options.row_group_rows,
+            warm_row_group_rows: options.warm_row_group_rows,
+            cold_row_group_rows: options.cold_row_group_rows,
+            cold_data_page_row_count: options.cold_data_page_row_count,
             batch_size: options.batch_size,
         }
     }
@@ -154,7 +167,9 @@ pub fn build_warm_variation_tier_from_parts(
         output_dir: options.output_dir.clone(),
         af_threshold: options.af_threshold,
         position_radius: options.position_radius,
-        row_group_rows: options.row_group_rows,
+        warm_row_group_rows: options.warm_row_group_rows,
+        cold_row_group_rows: options.cold_row_group_rows,
+        cold_data_page_row_count: options.cold_data_page_row_count,
         batch_size: options.batch_size,
     };
 
@@ -366,9 +381,9 @@ fn write_split_files_to_paths(
     let warm_writer = create_writer(warm_path, output_schema.clone(), "warm", args)?;
     let cold_writer = create_writer(cold_path, output_schema.clone(), "cold", args)?;
     let mut warm_writer =
-        PositionAlignedWriter::new(warm_writer, output_schema.clone(), args.row_group_rows)?;
+        PositionAlignedWriter::new(warm_writer, output_schema.clone(), args.warm_row_group_rows)?;
     let mut cold_writer =
-        PositionAlignedWriter::new(cold_writer, output_schema.clone(), args.row_group_rows)?;
+        PositionAlignedWriter::new(cold_writer, output_schema.clone(), args.cold_row_group_rows)?;
 
     let reader = builder.with_batch_size(args.batch_size).build()?;
     let mut written = WrittenRows::default();
@@ -417,7 +432,12 @@ fn merge_position_aligned_files(
     drop(first_builder);
 
     let writer = create_writer(output_path, schema.clone(), tier, args)?;
-    let mut writer = PositionAlignedWriter::new(writer, schema, args.row_group_rows)?;
+    let target_rows = if tier == "cold" {
+        args.cold_row_group_rows
+    } else {
+        args.warm_row_group_rows
+    };
+    let mut writer = PositionAlignedWriter::new(writer, schema, target_rows)?;
     let mut rows = 0usize;
 
     for input in inputs {
@@ -455,6 +475,26 @@ fn write_cold_position_index(
         index.len(),
         cold_path.display()
     );
+    write_cold_variant_bloom_index(output_dir, chrom, cold_path, batch_size)?;
+    Ok(())
+}
+
+fn write_cold_variant_bloom_index(
+    output_dir: &Path,
+    chrom: &str,
+    cold_path: &Path,
+    batch_size: usize,
+) -> Result<()> {
+    let index_dir = variant_bloom_index_output_dir(output_dir);
+    let index_path = variant_bloom_index_file(&index_dir, chrom);
+    let index = VariantBloomIndex::from_parquet(cold_path, batch_size, 10)?;
+    index.write_to_path(&index_path)?;
+    eprintln!(
+        "cold_variant_bloom_index={} entries={} source={}",
+        index_path.display(),
+        index.inserted(),
+        cold_path.display()
+    );
     Ok(())
 }
 
@@ -466,6 +506,17 @@ fn position_index_output_dir(output_dir: &Path) -> PathBuf {
             .join("variation.position_index")
     } else {
         output_dir.join("variation.position_index")
+    }
+}
+
+fn variant_bloom_index_output_dir(output_dir: &Path) -> PathBuf {
+    if output_dir.file_name().and_then(|name| name.to_str()) == Some("variation") {
+        output_dir
+            .parent()
+            .unwrap_or(output_dir)
+            .join("variation.variant_bloom_index")
+    } else {
+        output_dir.join("variation.variant_bloom_index")
     }
 }
 
@@ -714,7 +765,12 @@ fn output_schema(source_schema: &SchemaRef) -> Result<SchemaRef> {
         return Err("input already contains position_key or variant_keys".into());
     }
 
-    let mut fields: Vec<FieldRef> = source_schema.fields().iter().cloned().collect();
+    let mut fields: Vec<FieldRef> = source_schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() != "region_bin")
+        .cloned()
+        .collect();
     fields.push(Arc::new(Field::new(
         "position_key",
         DataType::UInt64,
@@ -737,7 +793,12 @@ fn create_writer(
     tier: &str,
     args: &Args,
 ) -> Result<ArrowWriter<File>> {
-    let props = WriterProperties::builder()
+    let row_group_rows = if tier == "cold" {
+        args.cold_row_group_rows
+    } else {
+        args.warm_row_group_rows
+    };
+    let mut props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .set_max_row_group_size(usize::MAX)
         .set_key_value_metadata(Some(vec![
@@ -752,10 +813,13 @@ fn create_writer(
             KeyValue::new("vepyr.key_version".to_string(), "1".to_string()),
             KeyValue::new(
                 "vepyr.row_group_rows".to_string(),
-                args.row_group_rows.to_string(),
+                row_group_rows.to_string(),
             ),
-        ]))
-        .build();
+        ]));
+    if tier == "cold" {
+        props = props.set_data_page_row_count_limit(args.cold_data_page_row_count);
+    }
+    let props = props.build();
     let file = File::create(path)?;
     Ok(ArrowWriter::try_new(file, schema, Some(props))?)
 }
@@ -934,7 +998,8 @@ mod tests {
         );
         options.af_threshold = 0.01;
         options.position_radius = 1;
-        options.row_group_rows = 2;
+        options.warm_row_group_rows = 2;
+        options.cold_row_group_rows = 2;
         options.batch_size = 2;
 
         let stats = build_warm_variation_tier_from_parts(options).unwrap();
@@ -948,6 +1013,11 @@ mod tests {
         assert!(
             dir.path()
                 .join("variation.position_index/chr1.posidx")
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join("variation.variant_bloom_index/chr1.varbf")
                 .exists()
         );
         assert!(!work_dir.exists());

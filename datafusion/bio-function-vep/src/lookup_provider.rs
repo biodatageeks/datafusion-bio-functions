@@ -7,6 +7,7 @@
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -75,6 +76,8 @@ pub struct LookupProvider {
     cache_table: String,
     /// Columns to select from the cache table.
     cache_columns: Vec<String>,
+    /// Full variation cache schema.
+    cache_schema: SchemaRef,
     /// Coordinate normalizer for handling different coordinate systems.
     coord_normalizer: CoordinateNormalizer,
     /// When true, use interval-overlap matching instead of exact coordinate match.
@@ -90,6 +93,10 @@ pub struct LookupProvider {
     colocated_sink: Option<ColocatedSink>,
     /// Optional partition-local sinks for fjall co-located data collection.
     partition_colocated_sinks: Option<Vec<ColocatedSink>>,
+    /// Root of an indexed parquet cache. When set, variation lookup uses
+    /// warm/cold parquet tiers plus sidecar indexes, not the legacy interval join.
+    #[cfg(feature = "kv-cache")]
+    indexed_parquet_cache_root: Option<PathBuf>,
     /// Optional filter to apply to the VCF input (e.g., `chrom = 'chr1'`
     /// for per-contig partitioned annotation).
     vcf_filter: Option<Expr>,
@@ -161,6 +168,7 @@ impl LookupProvider {
             vcf_table,
             cache_table,
             cache_columns,
+            cache_schema: cache_schema_ref,
             coord_normalizer,
             extended_probes,
             allowed_failed,
@@ -168,6 +176,8 @@ impl LookupProvider {
             schema,
             colocated_sink: None,
             partition_colocated_sinks: None,
+            #[cfg(feature = "kv-cache")]
+            indexed_parquet_cache_root: None,
             vcf_filter: None,
         })
     }
@@ -180,6 +190,11 @@ impl LookupProvider {
     /// Set partition-local co-located data sinks for fjall lookup execution.
     pub fn set_partition_colocated_sinks(&mut self, sinks: Vec<ColocatedSink>) {
         self.partition_colocated_sinks = Some(sinks);
+    }
+
+    #[cfg(feature = "kv-cache")]
+    pub fn set_indexed_parquet_cache_root(&mut self, root: impl Into<PathBuf>) {
+        self.indexed_parquet_cache_root = Some(root.into());
     }
 
     /// Set an optional filter to apply to VCF input before lookup.
@@ -261,6 +276,40 @@ impl TableProvider for LookupProvider {
             use crate::allele::allele_matches;
             use crate::kv_cache::KvCacheTableProvider;
             use crate::kv_cache::cache_exec::{KvLookupExec, KvMatchMode};
+
+            if let Some(cache_root) = &self.indexed_parquet_cache_root {
+                let settings = self.fjall_batch_settings().await?;
+                let vcf_df = self.session.table(&self.vcf_table).await?;
+                let vcf_df = if let Some(ref filter) = self.vcf_filter {
+                    vcf_df.filter(filter.clone())?
+                } else {
+                    vcf_df
+                };
+                let vcf_plan = vcf_df.create_physical_plan().await?;
+
+                let mut exec = KvLookupExec::new_indexed_parquet(
+                    vcf_plan,
+                    cache_root.clone(),
+                    self.cache_schema.clone(),
+                    self.cache_columns.clone(),
+                    KvMatchMode::Exact,
+                    allele_matches as fn(&str, &str, &str) -> bool,
+                    settings.vcf_has_chr,
+                    settings.vcf_zero_based,
+                    settings.cache_zero_based,
+                    self.extended_probes,
+                    self.allowed_failed,
+                )?;
+                exec = exec.with_reference_fasta_path(settings.reference_fasta_path);
+                if let Some(ref sink) = self.colocated_sink {
+                    exec = exec.with_colocated_sink(Arc::clone(sink));
+                }
+                if let Some(ref sinks) = self.partition_colocated_sinks {
+                    exec = exec.with_colocated_partition_sinks(sinks.clone());
+                }
+                let plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
+                return wrap_with_projection(plan, projection);
+            }
 
             let table_ref = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()

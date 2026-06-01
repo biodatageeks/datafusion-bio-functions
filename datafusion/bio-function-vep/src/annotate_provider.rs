@@ -3006,15 +3006,61 @@ fn open_sift_prediction_store(parent: &std::path::Path) -> Result<Option<SiftPre
     for path in [
         parent.join("translation_sift_lookup"),
         parent.join("translation_sift.lookup"),
+        parent.join("translation_sift"),
     ] {
-        if let Some(store) = crate::kv_cache::SiftParquetStore::open_dir(&path)? {
-            return Ok(Some(Arc::new(store) as SiftPredictionStoreRef));
+        match crate::kv_cache::SiftParquetStore::open_dir(&path) {
+            Ok(Some(store)) => return Ok(Some(Arc::new(store) as SiftPredictionStoreRef)),
+            Ok(None) => {}
+            Err(error)
+                if path.file_name().and_then(|name| name.to_str()) == Some("translation_sift") =>
+            {
+                log::debug!(
+                    "translation_sift is not a compact SIFT lookup parquet directory: {error}"
+                );
+            }
+            Err(error) => return Err(error),
         }
     }
 
     let sift_path = parent.join("translation_sift.fjall");
     crate::kv_cache::SiftKvStore::open_path(&sift_path)
         .map(|store| store.map(|store| Arc::new(store) as SiftPredictionStoreRef))
+}
+
+#[cfg(feature = "kv-cache")]
+fn indexed_variation_parquet_path(
+    cache: &PartitionedParquetCache,
+    chrom: &str,
+) -> Option<std::path::PathBuf> {
+    for suffix in ["_warm", "_cold"] {
+        let path = cache
+            .base_dir()
+            .join("variation")
+            .join(format!("{chrom}{suffix}.parquet"));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "kv-cache")]
+fn read_variation_parquet_schema(path: &std::path::Path) -> Result<Schema> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(path).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "failed to open variation parquet schema sample '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "failed to read variation parquet schema sample '{}': {error}",
+            path.display()
+        ))
+    })?;
+    Ok(builder.schema().as_ref().clone())
 }
 
 #[cfg(feature = "kv-cache")]
@@ -4497,6 +4543,8 @@ impl AnnotateProvider {
         cache: &PartitionedParquetCache,
         translations_sift_table: Option<&str>,
         #[cfg(feature = "kv-cache")] kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
+        #[cfg(feature = "kv-cache")] use_indexed_parquet: bool,
+        #[cfg(feature = "kv-cache")] indexed_variation_schema: Option<Schema>,
         fetch_limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if profiling_enabled() {
@@ -4523,13 +4571,19 @@ impl AnnotateProvider {
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0)
             .unwrap_or(VEP_INPUT_BUFFER_SIZE);
-        let forks = self
+        let worker_forks = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_i64_option(opts, "forks"))
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(0);
-        let chromosome_lanes = if forks > 0 { forks } else { 1 };
+        let chromosome_lanes = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "contig_parallelism"))
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| if worker_forks > 0 { worker_forks } else { 1 });
         let chromosome_lanes = if fetch_limit.is_some() {
             1
         } else {
@@ -4539,7 +4593,7 @@ impl AnnotateProvider {
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "inline_lookup"))
-            .unwrap_or(forks == 0);
+            .unwrap_or(worker_forks == 0);
         Self::validate_hgvs_reference_fasta(hgvs_flags, reference_fasta_path.as_deref())?;
         let (upstream_distance, downstream_distance) = self.transcript_distance_config();
 
@@ -4580,12 +4634,17 @@ impl AnnotateProvider {
             self.schema.clone()
         };
         #[cfg(feature = "kv-cache")]
+        let indexed_parquet_cache_root =
+            use_indexed_parquet.then(|| cache.base_dir().to_path_buf());
+        #[cfg(feature = "kv-cache")]
         let sift_prediction_store = if let Some(store) = kv_store.as_ref() {
             if let Some(parent) = store.root_path().parent() {
                 open_sift_prediction_store(parent)?
             } else {
                 None
             }
+        } else if use_indexed_parquet {
+            open_sift_prediction_store(cache.base_dir())?
         } else {
             None
         };
@@ -4614,6 +4673,10 @@ impl AnnotateProvider {
             deregister_global_kv_on_finish: chromosome_lanes <= 1,
             #[cfg(feature = "kv-cache")]
             use_fjall: kv_store.is_some(),
+            #[cfg(feature = "kv-cache")]
+            indexed_parquet_cache_root,
+            #[cfg(feature = "kv-cache")]
+            indexed_variation_schema,
             #[cfg(feature = "kv-cache")]
             sift_prediction_store,
             #[cfg(feature = "kv-cache")]
@@ -7668,6 +7731,12 @@ struct ContigAnnotationConfig {
     /// When true, use fjall KV store for variation lookup + SIFT instead of parquet.
     #[cfg(feature = "kv-cache")]
     use_fjall: bool,
+    /// Root of an indexed parquet cache. When set, variation uses the warm/cold
+    /// indexed parquet lookup path and SIFT uses compact translation_sift parquet.
+    #[cfg(feature = "kv-cache")]
+    indexed_parquet_cache_root: Option<std::path::PathBuf>,
+    #[cfg(feature = "kv-cache")]
+    indexed_variation_schema: Option<Schema>,
     /// Shared fjall KV store handle (opened once, reused across contigs).
     #[cfg(feature = "kv-cache")]
     kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
@@ -10296,6 +10365,10 @@ async fn prepare_contig_context(
     let use_fjall = config.use_fjall;
     #[cfg(not(feature = "kv-cache"))]
     let use_fjall = false;
+    #[cfg(feature = "kv-cache")]
+    let use_indexed_parquet = config.indexed_parquet_cache_root.is_some();
+    #[cfg(not(feature = "kv-cache"))]
+    let use_indexed_parquet = false;
 
     let var_table = if use_fjall {
         #[cfg(feature = "kv-cache")]
@@ -10318,6 +10391,8 @@ async fn prepare_contig_context(
         {
             unreachable!("use_fjall requires kv-cache feature")
         }
+    } else if use_indexed_parquet {
+        "__vep_indexed_variation".to_string()
     } else {
         let var_table =
             crate::partitioned_cache::register_chrom_parquet(&session, &cache, "variation", &chrom)
@@ -10331,13 +10406,15 @@ async fn prepare_contig_context(
         ephemeral_tables.push(var_table.clone());
         var_table
     };
-    validate_partitioned_cache_source(
-        &cache,
-        "variation",
-        &chrom,
-        "variation",
-        config.cache_source_type,
-    )?;
+    if !use_indexed_parquet {
+        validate_partitioned_cache_source(
+            &cache,
+            "variation",
+            &chrom,
+            "variation",
+            config.cache_source_type,
+        )?;
+    }
 
     let tx_table =
         crate::partitioned_cache::register_chrom_parquet(&session, &cache, "transcript", &chrom)
@@ -10419,7 +10496,22 @@ async fn prepare_contig_context(
         .schema()
         .as_arrow()
         .clone();
-    let cache_schema = session.table(&var_table).await?.schema().as_arrow().clone();
+    let cache_schema = if use_indexed_parquet {
+        #[cfg(feature = "kv-cache")]
+        {
+            config.indexed_variation_schema.clone().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "indexed parquet variation lookup missing cache schema".to_string(),
+                )
+            })?
+        }
+        #[cfg(not(feature = "kv-cache"))]
+        {
+            unreachable!("indexed_parquet requires kv-cache feature")
+        }
+    } else {
+        session.table(&var_table).await?.schema().as_arrow().clone()
+    };
     let mut provider = LookupProvider::new(
         Arc::clone(&session),
         config.vcf_table.clone(),
@@ -10432,7 +10524,12 @@ async fn prepare_contig_context(
         config.reference_fasta_path.clone(),
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
-    let mut lookup_partitions = if use_fjall {
+    #[cfg(feature = "kv-cache")]
+    if let Some(root) = &config.indexed_parquet_cache_root {
+        provider.set_indexed_parquet_cache_root(root.clone());
+    }
+    let parallel_lookup = use_fjall || use_indexed_parquet;
+    let mut lookup_partitions = if parallel_lookup {
         let session_state = session.state();
         let mut plan = provider.scan(&session_state, None, &[], None).await?;
         let mut partition_count = plan.output_partitioning().partition_count().max(1);
@@ -10643,16 +10740,15 @@ async fn prepare_contig_context(
         config.hgvs_flags.shift_hgvs,
     );
 
-    // SIFT source: with the fjall variation path, prefer a shared transcript-id
-    // prediction store (compact parquet if configured/present, then fjall). With
-    // the parquet variation path, each annotation worker keeps using the direct
-    // genomic-window parquet reader.
+    // SIFT source: indexed parquet and legacy fjall use a shared transcript-id
+    // prediction store. The old interval parquet path uses direct genomic-window
+    // parquet reads.
     #[cfg(feature = "kv-cache")]
-    let use_fjall_sift = config.use_fjall;
+    let use_lookup_sift = config.use_fjall || config.indexed_parquet_cache_root.is_some();
     #[cfg(not(feature = "kv-cache"))]
-    let use_fjall_sift = false;
+    let use_lookup_sift = false;
 
-    let sift_direct_path = if config.flags.everything && !use_fjall_sift {
+    let sift_direct_path = if config.flags.everything && !use_lookup_sift {
         config
             .translations_sift_table
             .as_deref()
@@ -10679,7 +10775,7 @@ async fn prepare_contig_context(
     // Reuse the pre-opened SIFT prediction store from config (opened once,
     // shared across contigs).
     #[cfg(feature = "kv-cache")]
-    let sift_prediction_store = if use_fjall_sift && config.flags.everything {
+    let sift_prediction_store = if use_lookup_sift && config.flags.everything {
         config.sift_prediction_store.clone()
     } else {
         None
@@ -10747,16 +10843,34 @@ impl TableProvider for AnnotateProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let _store = build_store(self.backend, self.cache_source.clone());
 
-        // Parse use_fjall option — when true, use fjall KV store for variation
-        // lookup + SIFT while keeping context from partitioned parquet.
+        // Parse cache format. `indexed_parquet` is the default; `legacy_fjall`
+        // preserves the old Fjall variation/SIFT lookup path as an opt-in.
         #[cfg(feature = "kv-cache")]
-        let use_fjall = self
+        let legacy_use_fjall = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "use_fjall"))
             .unwrap_or(false);
+        #[cfg(feature = "kv-cache")]
+        let cache_format = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_string_option(opts, "cache_format"))
+            .unwrap_or_else(|| "indexed_parquet".to_string());
+        #[cfg(feature = "kv-cache")]
+        let use_fjall = legacy_use_fjall || cache_format == "legacy_fjall";
+        #[cfg(feature = "kv-cache")]
+        let use_indexed_parquet = !use_fjall && cache_format == "indexed_parquet";
         #[cfg(not(feature = "kv-cache"))]
         let use_fjall = false;
+        #[cfg(not(feature = "kv-cache"))]
+        let use_indexed_parquet = false;
+        #[cfg(feature = "kv-cache")]
+        if !matches!(cache_format.as_str(), "indexed_parquet" | "legacy_fjall") {
+            return Err(DataFusionError::Execution(format!(
+                "cache_format must be 'indexed_parquet' or 'legacy_fjall', got '{cache_format}'"
+            )));
+        }
 
         // Check for partitioned per-chromosome cache layout.
         // Opt-in/out via "partitioned": true/false in options_json.
@@ -10786,8 +10900,20 @@ impl TableProvider for AnnotateProvider {
             }
 
             // Determine requested cache columns.
-            // When using fjall, get schema from the KV store; otherwise from
-            // a sample variation parquet file.
+            // For indexed parquet, read schema from a warm/cold tier file.
+            #[cfg(feature = "kv-cache")]
+            let indexed_variation_schema: Option<Schema> = if use_indexed_parquet {
+                let sample_chrom = &cache.available_chroms()[0];
+                let sample_path = indexed_variation_parquet_path(cache, sample_chrom).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "indexed_parquet cache has no warm/cold variation parquet for sample chrom {sample_chrom}"
+                    ))
+                })?;
+                Some(read_variation_parquet_schema(&sample_path)?)
+            } else {
+                None
+            };
+
             #[cfg(feature = "kv-cache")]
             let kv_store_arc: Option<Arc<crate::kv_cache::VepKvStore>> = if use_fjall {
                 let fjall_path = std::path::Path::new(&self.cache_source).join("variation.fjall");
@@ -10827,6 +10953,25 @@ impl TableProvider for AnnotateProvider {
                 #[cfg(not(feature = "kv-cache"))]
                 {
                     unreachable!("use_fjall requires kv-cache feature")
+                }
+            } else if use_indexed_parquet {
+                #[cfg(feature = "kv-cache")]
+                {
+                    let cache_schema = indexed_variation_schema.as_ref().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "indexed parquet variation schema was not loaded".to_string(),
+                        )
+                    })?;
+                    let cols: HashSet<String> = cache_schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect();
+                    (cols, None)
+                }
+                #[cfg(not(feature = "kv-cache"))]
+                {
+                    unreachable!("indexed_parquet requires kv-cache feature")
                 }
             } else {
                 let sample_chrom = &cache.available_chroms()[0];
@@ -10902,6 +11047,10 @@ impl TableProvider for AnnotateProvider {
                     translations_sift_table.as_deref(),
                     #[cfg(feature = "kv-cache")]
                     kv_store_arc,
+                    #[cfg(feature = "kv-cache")]
+                    use_indexed_parquet,
+                    #[cfg(feature = "kv-cache")]
+                    indexed_variation_schema,
                     limit,
                 )
                 .await;
@@ -11013,6 +11162,10 @@ mod tests {
             pick_flags: PickFlags::default(),
             #[cfg(feature = "kv-cache")]
             use_fjall: true,
+            #[cfg(feature = "kv-cache")]
+            indexed_parquet_cache_root: None,
+            #[cfg(feature = "kv-cache")]
+            indexed_variation_schema: None,
             #[cfg(feature = "kv-cache")]
             kv_store: None,
             #[cfg(feature = "kv-cache")]

@@ -16,10 +16,10 @@ impl AnnotationBackend {
     /// Parse backend from UDTF argument.
     pub fn parse(value: &str) -> Result<Self> {
         match value {
-            "parquet" => Ok(Self::Parquet),
-            "fjall" => Ok(Self::Fjall),
+            "parquet" | "indexed_parquet" => Ok(Self::Parquet),
+            "fjall" | "legacy_fjall" => Ok(Self::Fjall),
             other => Err(DataFusionError::Plan(format!(
-                "annotate_vep() backend must be one of: parquet, fjall; got: {other}"
+                "annotate_vep() backend must be one of: indexed_parquet, legacy_fjall; got: {other}"
             ))),
         }
     }
@@ -107,6 +107,14 @@ mod tests {
         );
         assert_eq!(
             AnnotationBackend::parse("fjall").unwrap(),
+            AnnotationBackend::Fjall
+        );
+        assert_eq!(
+            AnnotationBackend::parse("indexed_parquet").unwrap(),
+            AnnotationBackend::Parquet
+        );
+        assert_eq!(
+            AnnotationBackend::parse("legacy_fjall").unwrap(),
             AnnotationBackend::Fjall
         );
     }
