@@ -22,6 +22,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
+use parquet::file::statistics::Statistics;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -237,9 +238,21 @@ pub fn build_warm_variation_tier_from_parts(
         merge_position_aligned_files(&warm_part_paths, &warm_path, "warm", &merge_args)?;
     let (cold_rows, cold_row_groups) =
         merge_position_aligned_files(&cold_part_paths, &cold_path, "cold", &merge_args)?;
-    let row_group_position_splits =
-        verify_position_aligned_row_groups(&warm_path, options.batch_size)?
-            + verify_position_aligned_row_groups(&cold_path, options.batch_size)?;
+    let verify_started = std::time::Instant::now();
+    eprintln!(
+        "variation_tier_verify_start chrom={} warm={} cold={}",
+        options.chrom,
+        warm_path.display(),
+        cold_path.display()
+    );
+    let row_group_position_splits = verify_position_aligned_row_groups(&warm_path)?
+        + verify_position_aligned_row_groups(&cold_path)?;
+    eprintln!(
+        "variation_tier_verify_done chrom={} row_group_position_splits={} elapsed_s={:.3}",
+        options.chrom,
+        row_group_position_splits,
+        verify_started.elapsed().as_secs_f64()
+    );
     write_cold_position_index(
         &options.output_dir,
         &options.chrom,
@@ -411,9 +424,8 @@ fn write_split_files_to_paths(
 
     written.warm_row_groups = warm_writer.close()?;
     written.cold_row_groups = cold_writer.close()?;
-    written.row_group_position_splits =
-        verify_position_aligned_row_groups(warm_path, args.batch_size)?
-            + verify_position_aligned_row_groups(cold_path, args.batch_size)?;
+    written.row_group_position_splits = verify_position_aligned_row_groups(warm_path)?
+        + verify_position_aligned_row_groups(cold_path)?;
     Ok(written)
 }
 
@@ -467,13 +479,20 @@ fn write_cold_position_index(
 ) -> Result<()> {
     let index_dir = position_index_output_dir(output_dir);
     let index_path = position_index_file(&index_dir, chrom);
+    let started = std::time::Instant::now();
+    eprintln!(
+        "cold_position_index_start chrom={} source={}",
+        chrom,
+        cold_path.display()
+    );
     let index = PositionIndex::from_parquet(cold_path, batch_size)?;
     index.write_to_path(&index_path)?;
     eprintln!(
-        "cold_position_index={} positions={} source={}",
+        "cold_position_index={} positions={} source={} elapsed_s={:.3}",
         index_path.display(),
         index.len(),
-        cold_path.display()
+        cold_path.display(),
+        started.elapsed().as_secs_f64()
     );
     write_cold_variant_bloom_index(output_dir, chrom, cold_path, batch_size)?;
     Ok(())
@@ -487,13 +506,20 @@ fn write_cold_variant_bloom_index(
 ) -> Result<()> {
     let index_dir = variant_bloom_index_output_dir(output_dir);
     let index_path = variant_bloom_index_file(&index_dir, chrom);
+    let started = std::time::Instant::now();
+    eprintln!(
+        "cold_variant_bloom_index_start chrom={} source={}",
+        chrom,
+        cold_path.display()
+    );
     let index = VariantBloomIndex::from_parquet(cold_path, batch_size, 10)?;
     index.write_to_path(&index_path)?;
     eprintln!(
-        "cold_variant_bloom_index={} entries={} source={}",
+        "cold_variant_bloom_index={} entries={} source={} elapsed_s={:.3}",
         index_path.display(),
         index.inserted(),
-        cold_path.display()
+        cold_path.display(),
+        started.elapsed().as_secs_f64()
     );
     Ok(())
 }
@@ -671,15 +697,12 @@ fn count_rows_with_warm_positions(
     Ok(count)
 }
 
-fn verify_position_aligned_row_groups(path: &Path, batch_size: usize) -> Result<usize> {
-    let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let row_groups = builder.metadata().num_row_groups();
+fn verify_position_aligned_row_groups(path: &Path) -> Result<usize> {
+    let ranges = row_group_position_ranges_from_metadata(path)?;
     let mut previous_max = None;
     let mut splits = 0usize;
 
-    for row_group in 0..row_groups {
-        let (min, max) = row_group_position_range(path, row_group, batch_size)?;
+    for (min, max) in ranges {
         if previous_max.is_some_and(|previous| previous >= min) {
             splits += 1;
         }
@@ -689,48 +712,75 @@ fn verify_position_aligned_row_groups(path: &Path, batch_size: usize) -> Result<
     Ok(splits)
 }
 
-fn row_group_position_range(
-    path: &Path,
-    row_group: usize,
-    batch_size: usize,
-) -> Result<(u64, u64)> {
+fn row_group_position_ranges_from_metadata(path: &Path) -> Result<Vec<(u64, u64)>> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let mask = projection_for_existing_roots(
-        builder.schema(),
-        builder.parquet_schema(),
-        &["position_key"],
-    );
-    let reader = builder
-        .with_projection(mask)
-        .with_row_groups(vec![row_group])
-        .with_batch_size(batch_size)
-        .build()?;
+    let position_leaf = builder
+        .parquet_schema()
+        .columns()
+        .iter()
+        .position(|column| column.name() == "position_key")
+        .ok_or_else(|| {
+            format!(
+                "parquet file {} missing position_key column",
+                path.display()
+            )
+        })?;
+    let metadata = builder.metadata();
+    let mut ranges = Vec::with_capacity(metadata.num_row_groups());
 
-    let mut first = None;
-    let mut last = None;
-    for batch in reader {
-        let batch = batch?;
-        let idx = batch.schema().index_of("position_key")?;
-        let positions = position_key_array(&batch, idx)?;
-        for row in 0..batch.num_rows() {
-            if positions.is_null(row) {
-                return Err("position_key must be non-null UInt64".into());
+    for row_group in 0..metadata.num_row_groups() {
+        let stats = metadata
+            .row_group(row_group)
+            .column(position_leaf)
+            .statistics()
+            .ok_or_else(|| {
+                format!(
+                    "row group {row_group} in {} missing position_key statistics",
+                    path.display()
+                )
+            })?;
+        let (min, max) = match stats {
+            Statistics::Int64(stats) => {
+                let min = *stats.min_opt().ok_or_else(|| {
+                    format!(
+                        "row group {row_group} in {} missing position_key min",
+                        path.display()
+                    )
+                })?;
+                let max = *stats.max_opt().ok_or_else(|| {
+                    format!(
+                        "row group {row_group} in {} missing position_key max",
+                        path.display()
+                    )
+                })?;
+                (
+                    u64::try_from(min).map_err(|_| {
+                        format!(
+                            "row group {row_group} in {} has negative position_key min: {min}",
+                            path.display()
+                        )
+                    })?,
+                    u64::try_from(max).map_err(|_| {
+                        format!(
+                            "row group {row_group} in {} has negative position_key max: {max}",
+                            path.display()
+                        )
+                    })?,
+                )
             }
-            let value = positions.value(row);
-            first.get_or_insert(value);
-            last = Some(value);
-        }
+            other => {
+                return Err(format!(
+                    "row group {row_group} in {} expected Int64 position_key statistics, got {other:?}",
+                    path.display()
+                )
+                .into());
+            }
+        };
+        ranges.push((min, max));
     }
 
-    match (first, last) {
-        (Some(first), Some(last)) => Ok((first, last)),
-        _ => Err(format!(
-            "row group {row_group} in {} has no position_key values",
-            path.display()
-        )
-        .into()),
-    }
+    Ok(ranges)
 }
 
 #[derive(Debug)]
@@ -1014,6 +1064,43 @@ mod tests {
             .build()
             .unwrap();
         reader.map(|batch| batch.unwrap().num_rows()).sum()
+    }
+
+    #[test]
+    fn row_group_position_ranges_come_from_parquet_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("positions.parquet");
+        let positions = vec![
+            position_key("1", 100).unwrap(),
+            position_key("1", 100).unwrap(),
+            position_key("1", 101).unwrap(),
+            position_key("1", 102).unwrap(),
+        ];
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "position_key",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt64Array::from(positions.clone())) as ArrayRef],
+        )
+        .unwrap();
+        let file = File::create(&path).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(2)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let ranges = row_group_position_ranges_from_metadata(&path).unwrap();
+
+        assert_eq!(
+            ranges,
+            vec![(positions[0], positions[1]), (positions[2], positions[3])]
+        );
+        assert_eq!(verify_position_aligned_row_groups(&path).unwrap(), 0);
     }
 
     #[test]
