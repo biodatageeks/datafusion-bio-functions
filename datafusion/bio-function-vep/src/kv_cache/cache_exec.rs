@@ -2473,7 +2473,7 @@ impl KvLookupStream {
 
         // Local buffer for colocated data (flushed to the shared sink after the loop).
         let mut coloc_buf: Option<HashMap<ColocatedKey, ColocatedSinkValue>> =
-            if self.colocated_sink.is_some() && self.coloc_col_indices.is_some() {
+            if self.colocated_sink.is_some() {
                 Some(HashMap::new())
             } else {
                 None
@@ -2604,11 +2604,6 @@ impl KvLookupStream {
                                 .into(),
                         ));
                     };
-                    let Some(decompressor) = decompressor.as_mut() else {
-                        return Err(DataFusionError::Execution(
-                            "legacy fjall decompressor was not initialized".into(),
-                        ));
-                    };
                     let map_lookup_started = self.profile_detailed.then(Instant::now);
                     let raw = prefetched.get(probe_start);
                     if let Some(t0) = map_lookup_started {
@@ -2622,7 +2617,7 @@ impl KvLookupStream {
                         let decode_started = self.profile_detailed.then(Instant::now);
                         store.decode_position_entry_value(
                             raw.as_ref(),
-                            Some(decompressor),
+                            decompressor.as_mut(),
                             &mut decompress_buf,
                         )?;
                         if let Some(t0) = decode_started {
@@ -2644,11 +2639,6 @@ impl KvLookupStream {
                                 .into(),
                         ));
                     };
-                    let Some(decompressor) = decompressor.as_mut() else {
-                        return Err(DataFusionError::Execution(
-                            "legacy fjall decompressor was not initialized".into(),
-                        ));
-                    };
                     if self.profile_enabled {
                         self.profile.point_gets += 1;
                     }
@@ -2667,7 +2657,7 @@ impl KvLookupStream {
                                 let decode_started = Instant::now();
                                 store.decode_position_entry_value(
                                     compressed.as_ref(),
-                                    Some(decompressor),
+                                    decompressor.as_mut(),
                                     &mut decompress_buf,
                                 )?;
                                 self.profile.decompress += decode_started.elapsed();
@@ -2684,7 +2674,7 @@ impl KvLookupStream {
                         store.get_position_entry_fast_with_key_buf(
                             chrom_code,
                             *probe_start,
-                            Some(decompressor),
+                            decompressor.as_mut(),
                             &mut decompress_buf,
                             &mut position_key_buf,
                         )?
@@ -4449,6 +4439,109 @@ mod tests {
         assert_eq!(entry.somatic, 1);
         assert_eq!(entry.pheno, 1);
         assert_eq!(entry.clin_sig, Some("pathogenic".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn indexed_parquet_warm_lookup_populates_colocated_sink_without_kv_store() {
+        let cache_root = tempfile::tempdir().unwrap();
+        let variation_dir = cache_root.path().join("variation");
+        std::fs::create_dir_all(&variation_dir).unwrap();
+
+        let mut variant_keys = datafusion::arrow::array::ListBuilder::new(
+            datafusion::arrow::array::UInt64Builder::new(),
+        );
+        for key in crate::warm_cache::key::variant_keys_from_allele_string("1", 100, "A/G").unwrap()
+        {
+            variant_keys.values().append_value(key);
+        }
+        variant_keys.append(true);
+        let warm_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("position_key", DataType::UInt64, false),
+                Field::new_list(
+                    "variant_keys",
+                    Arc::new(Field::new_list_field(DataType::UInt64, true)),
+                    false,
+                ),
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("variation_name", DataType::Utf8, true),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("clin_sig", DataType::Utf8, true),
+                Field::new("failed", DataType::Int64, false),
+                Field::new("somatic", DataType::Int64, true),
+                Field::new("phenotype_or_disease", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![position_key("1", 100).unwrap()])) as ArrayRef,
+                Arc::new(variant_keys.finish()) as ArrayRef,
+                Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["rs_indexed_warm"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["A/G"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["pathogenic"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        write_single_group_warm_parquet(&variation_dir.join("chr1_warm.parquet"), &warm_batch);
+        crate::kv_cache::position_index::PositionIndex::from_positions([])
+            .unwrap()
+            .write_to_path(
+                cache_root
+                    .path()
+                    .join("variation.position_index/chr1.posidx"),
+            )
+            .unwrap();
+
+        let vcf = simple_vcf_batch("1", 100, 100, "A", "G");
+        let vcf_schema = vcf.schema();
+        let vcf_mem = MemTable::try_new(vcf_schema, vec![vec![vcf]]).unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("vcf_indexed_warm_coloc", Arc::new(vcf_mem))
+            .unwrap();
+        let vcf_plan = ctx
+            .table("vcf_indexed_warm_coloc")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let sink: ColocatedSink = Arc::new(Mutex::new(StdHashMap::new()));
+
+        let exec = KvLookupExec::new_indexed_parquet(
+            vcf_plan,
+            cache_root.path().to_path_buf(),
+            simple_cache_schema(),
+            vec!["variation_name".into(), "clin_sig".into()],
+            KvMatchMode::Exact,
+            allele_matches as fn(&str, &str, &str) -> bool,
+            false,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap()
+        .with_colocated_sink(Arc::clone(&sink));
+
+        let stream = exec.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<_> = datafusion::physical_plan::common::collect(stream)
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        let coloc = sink.lock().unwrap();
+        let all_names: Vec<&str> = coloc
+            .values()
+            .flat_map(|value| value.entries.iter())
+            .map(|entry| entry.variation_name.as_str())
+            .collect();
+        assert_eq!(all_names, vec!["rs_indexed_warm"]);
     }
 
     /// Empty VCF input should produce zero output rows.
