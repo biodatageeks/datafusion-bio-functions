@@ -200,6 +200,9 @@ use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
 };
 
+#[cfg(feature = "kv-cache")]
+type SiftPredictionStoreRef = Arc<dyn crate::kv_cache::SiftPredictionStore>;
+
 /// Column categories for typed non-meta annotation columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnnotationCategory {
@@ -2929,7 +2932,7 @@ fn lookup_sift_polyphen(
     protein_position: Option<&str>,
     amino_acids: Option<&str>,
     cache: &mut SiftPolyphenCache,
-    #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
+    #[cfg(feature = "kv-cache")] sift_store: &Option<SiftPredictionStoreRef>,
     #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
 ) -> (String, String) {
     let empty = || (String::new(), String::new());
@@ -2956,12 +2959,15 @@ fn lookup_sift_polyphen(
         return empty();
     };
 
-    // Lazy load from fjall sift keyspace on cache miss.
+    // Lazy load from the configured transcript-id prediction store on cache miss.
     if cache.get(tx_id).is_none() {
         #[cfg(feature = "kv-cache")]
-        if let Some(kv) = sift_kv {
-            if let Ok(Some(preds)) = kv.get(tx_id) {
-                cache.insert(tx_id.to_string(), preds, i64::MAX);
+        if let Some(store) = sift_store {
+            let ids = [tx_id.to_string()];
+            if let Ok(mut found) = store.get_many(&ids) {
+                if let Some(preds) = found.remove(tx_id) {
+                    cache.insert(tx_id.to_string(), preds, i64::MAX);
+                }
             }
         }
     }
@@ -2980,6 +2986,57 @@ fn lookup_sift_polyphen(
         .unwrap_or_default();
 
     (sift, polyphen)
+}
+
+#[cfg(feature = "kv-cache")]
+fn open_sift_prediction_store(parent: &std::path::Path) -> Result<Option<SiftPredictionStoreRef>> {
+    if let Some(path) = std::env::var_os("VEP_SIFT_LOOKUP_PARQUET_DIR") {
+        let path = std::path::PathBuf::from(path);
+        return crate::kv_cache::SiftParquetStore::open_dir(&path)?
+            .map(|store| Arc::new(store) as SiftPredictionStoreRef)
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "VEP_SIFT_LOOKUP_PARQUET_DIR is set to '{}' but no lookup parquet files were found",
+                    path.display()
+                ))
+            })
+            .map(Some);
+    }
+
+    for path in [
+        parent.join("translation_sift_lookup"),
+        parent.join("translation_sift.lookup"),
+    ] {
+        if let Some(store) = crate::kv_cache::SiftParquetStore::open_dir(&path)? {
+            return Ok(Some(Arc::new(store) as SiftPredictionStoreRef));
+        }
+    }
+
+    let sift_path = parent.join("translation_sift.fjall");
+    crate::kv_cache::SiftKvStore::open_path(&sift_path)
+        .map(|store| store.map(|store| Arc::new(store) as SiftPredictionStoreRef))
+}
+
+#[cfg(feature = "kv-cache")]
+fn load_sift_prediction_store_for_context(
+    ctx: &PreparedContext<'_>,
+    cache: &mut SiftPolyphenCache,
+    store: &SiftPredictionStoreRef,
+) -> Result<()> {
+    let transcript_ids = ctx
+        .translation_by_tx
+        .keys()
+        .filter(|transcript_id| cache.get(transcript_id).is_none())
+        .map(|transcript_id| (*transcript_id).to_string())
+        .collect::<Vec<_>>();
+    if transcript_ids.is_empty() {
+        return Ok(());
+    }
+
+    for (transcript_id, predictions) in store.get_many(&transcript_ids)? {
+        cache.insert(transcript_id, predictions, i64::MAX);
+    }
+    Ok(())
 }
 
 /// Format a SIFT/PolyPhen prediction as `prediction(score)` with spaces→underscores.
@@ -4522,6 +4579,16 @@ impl AnnotateProvider {
         } else {
             self.schema.clone()
         };
+        #[cfg(feature = "kv-cache")]
+        let sift_prediction_store = if let Some(store) = kv_store.as_ref() {
+            if let Some(parent) = store.root_path().parent() {
+                open_sift_prediction_store(parent)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let config = ContigAnnotationConfig {
             vcf_table: self.vcf_table.clone(),
@@ -4548,13 +4615,7 @@ impl AnnotateProvider {
             #[cfg(feature = "kv-cache")]
             use_fjall: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
-            sift_kv_store: kv_store.as_ref().and_then(|store| {
-                let parent = store.root_path().parent()?;
-                let sift_path = parent.join("translation_sift.fjall");
-                crate::kv_cache::SiftKvStore::open_path(&sift_path)
-                    .ok()
-                    .flatten()
-            }),
+            sift_prediction_store,
             #[cfg(feature = "kv-cache")]
             kv_store,
         };
@@ -4586,7 +4647,7 @@ impl AnnotateProvider {
         ctx: &PreparedContext<'_>,
         colocated_map: &HashMap<ColocatedKey, ColocatedData>,
         sift_cache: &mut SiftPolyphenCache,
-        #[cfg(feature = "kv-cache")] sift_kv: &Option<crate::kv_cache::SiftKvStore>,
+        #[cfg(feature = "kv-cache")] sift_store: &Option<SiftPredictionStoreRef>,
         #[cfg(not(feature = "kv-cache"))] _sift_kv: &Option<()>,
         skip_csq: bool,
         skip_typed_cols: bool,
@@ -5320,7 +5381,7 @@ impl AnnotateProvider {
                                         tc.amino_acids.as_deref(),
                                         sift_cache,
                                         #[cfg(feature = "kv-cache")]
-                                        sift_kv,
+                                        sift_store,
                                         #[cfg(not(feature = "kv-cache"))]
                                         _sift_kv,
                                     )
@@ -5778,7 +5839,7 @@ impl AnnotateProvider {
                                 tc.amino_acids.as_deref(),
                                 sift_cache,
                                 #[cfg(feature = "kv-cache")]
-                                sift_kv,
+                                sift_store,
                                 #[cfg(not(feature = "kv-cache"))]
                                 _sift_kv,
                             );
@@ -7610,9 +7671,9 @@ struct ContigAnnotationConfig {
     /// Shared fjall KV store handle (opened once, reused across contigs).
     #[cfg(feature = "kv-cache")]
     kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
-    /// Shared fjall SIFT store (opened once, reused across contigs).
+    /// Shared transcript-id SIFT store (opened once, reused across contigs).
     #[cfg(feature = "kv-cache")]
-    sift_kv_store: Option<crate::kv_cache::SiftKvStore>,
+    sift_prediction_store: Option<SiftPredictionStoreRef>,
 }
 
 /// Leaf `ExecutionPlan` that processes contigs one at a time via a state-machine
@@ -7943,7 +8004,7 @@ struct SharedContigAnnotationContext {
     engine: Arc<TranscriptConsequenceEngine>,
     sift_direct: Option<Arc<SiftDirectReader>>,
     #[cfg(feature = "kv-cache")]
-    sift_kv: Option<crate::kv_cache::SiftKvStore>,
+    sift_prediction_store: Option<SiftPredictionStoreRef>,
 }
 
 struct AnnotationWorkerState {
@@ -9563,11 +9624,22 @@ fn annotate_worker_window(
                     profile.sift_load += sift_started.elapsed();
                 });
             }
+            #[cfg(feature = "kv-cache")]
+            if sift_enabled
+                && worker.sift_direct.is_none()
+                && let Some(store) = shared.sift_prediction_store.as_ref()
+            {
+                let sift_started = Instant::now();
+                load_sift_prediction_store_for_context(&ctx, &mut worker.sift_cache, store)?;
+                record_contig_profile(&profile, |profile| {
+                    profile.sift_load += sift_started.elapsed();
+                });
+            }
 
             #[cfg(not(feature = "kv-cache"))]
             let sift_kv: Option<()> = None;
             #[cfg(feature = "kv-cache")]
-            let sift_kv = &shared.sift_kv;
+            let sift_store = &shared.sift_prediction_store;
 
             let engine_started = Instant::now();
             let annotated = tmp_provider.annotate_batch_with_transcript_engine(
@@ -9577,7 +9649,7 @@ fn annotate_worker_window(
                 &worker.colocated_map,
                 &mut worker.sift_cache,
                 #[cfg(feature = "kv-cache")]
-                sift_kv,
+                sift_store,
                 #[cfg(not(feature = "kv-cache"))]
                 &sift_kv,
                 skip_csq,
@@ -10571,9 +10643,10 @@ async fn prepare_contig_context(
         config.hgvs_flags.shift_hgvs,
     );
 
-    // SIFT source: when use_fjall, use SiftKvStore from fjall for lazy
-    // per-transcript lookups; otherwise each annotation worker opens its own
-    // parquet direct reader from this immutable path.
+    // SIFT source: with the fjall variation path, prefer a shared transcript-id
+    // prediction store (compact parquet if configured/present, then fjall). With
+    // the parquet variation path, each annotation worker keeps using the direct
+    // genomic-window parquet reader.
     #[cfg(feature = "kv-cache")]
     let use_fjall_sift = config.use_fjall;
     #[cfg(not(feature = "kv-cache"))]
@@ -10603,11 +10676,11 @@ async fn prepare_contig_context(
         .and_then(AnnotateProvider::build_sift_direct_reader)
         .map(Arc::new);
 
-    // Reuse the pre-opened SiftKvStore from config (opened once, shared across
-    // contigs) rather than re-opening the fjall DB every contig.
+    // Reuse the pre-opened SIFT prediction store from config (opened once,
+    // shared across contigs).
     #[cfg(feature = "kv-cache")]
-    let sift_kv = if use_fjall_sift && config.flags.everything {
-        config.sift_kv_store.clone()
+    let sift_prediction_store = if use_fjall_sift && config.flags.everything {
+        config.sift_prediction_store.clone()
     } else {
         None
     };
@@ -10639,7 +10712,7 @@ async fn prepare_contig_context(
         engine: Arc::new(engine),
         sift_direct,
         #[cfg(feature = "kv-cache")]
-        sift_kv,
+        sift_prediction_store,
     });
 
     Ok(Some(ContigReadyState {
@@ -10943,7 +11016,7 @@ mod tests {
             #[cfg(feature = "kv-cache")]
             kv_store: None,
             #[cfg(feature = "kv-cache")]
-            sift_kv_store: None,
+            sift_prediction_store: None,
         }
     }
 
@@ -10997,7 +11070,7 @@ mod tests {
             )),
             sift_direct: None,
             #[cfg(feature = "kv-cache")]
-            sift_kv: None,
+            sift_prediction_store: None,
         })
     }
 
