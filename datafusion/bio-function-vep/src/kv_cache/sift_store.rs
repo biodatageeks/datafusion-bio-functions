@@ -29,6 +29,10 @@ pub struct SiftKvStore {
     inner: Arc<SiftKvStoreInner>,
 }
 
+pub trait SiftPredictionStore: Send + Sync {
+    fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>>;
+}
+
 struct SiftKvStoreInner {
     sift_ks: Keyspace,
 }
@@ -155,6 +159,21 @@ impl SiftKvStore {
     }
 }
 
+impl SiftPredictionStore for SiftKvStore {
+    fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
+        let mut out = HashMap::with_capacity(transcript_ids.len());
+        for transcript_id in transcript_ids {
+            if out.contains_key(transcript_id) {
+                continue;
+            }
+            if let Some(predictions) = self.get(transcript_id)? {
+                out.insert(transcript_id.clone(), predictions);
+            }
+        }
+        Ok(out)
+    }
+}
+
 pub(crate) fn serialize_predictions(preds: &CachedPredictions) -> Vec<u8> {
     let sift_count = preds.sift.len() as u32;
     let polyphen_count = preds.polyphen.len() as u32;
@@ -178,7 +197,7 @@ pub(crate) fn serialize_predictions(preds: &CachedPredictions) -> Vec<u8> {
     buf
 }
 
-fn deserialize_predictions(data: &[u8]) -> Result<CachedPredictions> {
+pub(crate) fn deserialize_predictions(data: &[u8]) -> Result<CachedPredictions> {
     if data.len() < 8 {
         return Err(DataFusionError::Execution(
             "sift entry too short".to_string(),
@@ -400,6 +419,32 @@ mod tests {
         };
         cloned.put("ENST00000333333", &extra).unwrap();
         assert!(store.get("ENST00000333333").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_sift_prediction_store_get_many_returns_found_and_skips_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fjall::Database::builder(dir.path())
+            .cache_size(64 * 1024 * 1024)
+            .open()
+            .unwrap();
+
+        let store = SiftKvStore::create(&db).unwrap();
+        store.put("ENST00000111111", &make_predictions()).unwrap();
+        store.put("ENST00000222222", &make_predictions()).unwrap();
+
+        let ids = vec![
+            "ENST00000111111".to_string(),
+            "missing".to_string(),
+            "ENST00000111111".to_string(),
+            "ENST00000222222".to_string(),
+        ];
+        let found = SiftPredictionStore::get_many(&store, &ids).unwrap();
+
+        assert_eq!(found.len(), 2);
+        assert!(found.contains_key("ENST00000111111"));
+        assert!(found.contains_key("ENST00000222222"));
+        assert!(!found.contains_key("missing"));
     }
 
     /// Verify that `SiftKvStore::create()` only creates the "sift" keyspace
