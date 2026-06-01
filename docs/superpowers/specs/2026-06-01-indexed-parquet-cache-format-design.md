@@ -21,7 +21,8 @@ The implementation should turn that path into one coherent cache format rather t
 ## Non-Goals
 
 - Do not keep `use_fjall` as a public API flag.
-- Do not make the old interval-join Parquet path a public cache format.
+- Do not keep the old VEP Parquet interval-join lookup path as a public cache format.
+- Do not remove the generic `IntervalJoinExec` implementation from `datafusion-bio-function-ranges`; it is a separate ranges feature.
 - Do not require environment variables for normal annotation.
 - Do not add or use `region_bin`.
 - Do not add or use `vepyr.echtvar_bin_bits`.
@@ -45,6 +46,8 @@ cache_format = indexed_parquet
 ```
 
 The current `backend=parquet|fjall` and `use_fjall` naming is misleading because the fast path currently enters the `fjall` backend name to reach `KvLookupExec`. Replace that naming at public call sites with `cache_format`.
+
+The old VEP annotation `backend=parquet` route, which uses the Parquet table lookup path rather than the indexed warm/cold cache, should be removed from public annotation APIs. It may remain temporarily only as an internal test/developer compatibility path during migration.
 
 ### VEPyR
 
