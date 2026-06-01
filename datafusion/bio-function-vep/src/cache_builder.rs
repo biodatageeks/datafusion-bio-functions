@@ -1,8 +1,9 @@
-//! Cache builder: converts raw Ensembl VEP cache to parquet + fjall.
+//! Cache builder: converts raw Ensembl VEP cache to indexed parquet.
 //!
 //! Ported from vepyr `convert.rs` and extended with:
-//! - Fjall dual-sink for `variation` (single pass via `start_ingestion()`)
-//! - Fjall second pass for `translation_sift` (re-sorted by `transcript_id`)
+//! - Indexed warm/cold variation parquet with sidecar indexes
+//! - Compact parquet-backed `translation_sift` lookup by `transcript_id`
+//! - Legacy fjall generation as an explicit opt-in
 //! - Progress callback for driving tqdm bars in Python wrappers
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -12,7 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use datafusion::arrow::array::{
-    Array, AsArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+    Array, ArrayRef, AsArray, BinaryArray, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
@@ -37,7 +39,7 @@ use crate::kv_cache::LoadStats;
 use crate::kv_cache::key_encoding::{chrom_to_code, encode_position_key};
 use crate::kv_cache::kv_store::VepKvStore;
 use crate::kv_cache::position_entry::serialize_position_entry;
-use crate::kv_cache::sift_store::SiftKvStore;
+use crate::kv_cache::sift_store::{SiftKvStore, serialize_predictions};
 use crate::transcript_consequence::CachedPredictions;
 use crate::warm_cache::build::{
     WarmVariationTierOptions, WarmVariationTierPartsOptions, build_warm_variation_tier,
@@ -64,6 +66,40 @@ const CHROM_CODE_ORDER: &[&str] = &[
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
     "18", "19", "20", "21", "22", "X", "Y", "MT",
 ];
+const DEFAULT_VARIATION_WARM_ROW_GROUP_ROWS: usize = 500_000;
+const DEFAULT_VARIATION_COLD_ROW_GROUP_ROWS: usize = 8_192;
+const DEFAULT_VARIATION_COLD_DATA_PAGE_ROW_COUNT: usize = 1_024;
+const DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS: usize = 16;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheFormat {
+    #[default]
+    IndexedParquet,
+    LegacyFjall,
+}
+
+impl CacheFormat {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "indexed_parquet" => Ok(Self::IndexedParquet),
+            "legacy_fjall" => Ok(Self::LegacyFjall),
+            other => Err(DataFusionError::Execution(format!(
+                "cache_format must be 'indexed_parquet' or 'legacy_fjall', got '{other}'"
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IndexedParquet => "indexed_parquet",
+            Self::LegacyFjall => "legacy_fjall",
+        }
+    }
+
+    fn builds_legacy_fjall(self) -> bool {
+        matches!(self, Self::LegacyFjall)
+    }
+}
 
 fn transcript_region_start_expr(start_col: &str) -> String {
     format!(
@@ -105,6 +141,7 @@ pub struct CacheBuilder {
     cache_root: String,
     output_dir: String,
     partitions: usize,
+    cache_format: CacheFormat,
     build_fjall: bool,
     overwrite: bool,
     zstd_level: i32,
@@ -112,7 +149,9 @@ pub struct CacheBuilder {
     cache_source_type: BioFormatsCacheSourceType,
     variation_af_threshold: f64,
     variation_position_radius: i64,
-    variation_row_group_rows: usize,
+    variation_warm_row_group_rows: usize,
+    variation_cold_row_group_rows: usize,
+    variation_cold_data_page_row_count: usize,
     variation_tier_batch_size: usize,
     on_progress: Option<Arc<OnProgress>>,
 }
@@ -123,14 +162,17 @@ impl CacheBuilder {
             cache_root: cache_root.into(),
             output_dir: output_dir.into(),
             partitions: 8,
-            build_fjall: true,
+            cache_format: CacheFormat::default(),
+            build_fjall: CacheFormat::default().builds_legacy_fjall(),
             overwrite: false,
             zstd_level: 3,
             dict_size_kb: 112,
             cache_source_type: BioFormatsCacheSourceType::Ensembl,
             variation_af_threshold: 0.01,
             variation_position_radius: 1,
-            variation_row_group_rows: 500_000,
+            variation_warm_row_group_rows: DEFAULT_VARIATION_WARM_ROW_GROUP_ROWS,
+            variation_cold_row_group_rows: DEFAULT_VARIATION_COLD_ROW_GROUP_ROWS,
+            variation_cold_data_page_row_count: DEFAULT_VARIATION_COLD_DATA_PAGE_ROW_COUNT,
             variation_tier_batch_size: 65_536,
             on_progress: None,
         }
@@ -142,7 +184,18 @@ impl CacheBuilder {
     }
 
     pub fn with_build_fjall(mut self, enabled: bool) -> Self {
+        self.cache_format = if enabled {
+            CacheFormat::LegacyFjall
+        } else {
+            CacheFormat::IndexedParquet
+        };
         self.build_fjall = enabled;
+        self
+    }
+
+    pub fn with_cache_format(mut self, cache_format: CacheFormat) -> Self {
+        self.cache_format = cache_format;
+        self.build_fjall = cache_format.builds_legacy_fjall();
         self
     }
 
@@ -175,8 +228,21 @@ impl CacheBuilder {
     ) -> Self {
         self.variation_af_threshold = af_threshold;
         self.variation_position_radius = position_radius;
-        self.variation_row_group_rows = row_group_rows.max(1);
+        self.variation_warm_row_group_rows = row_group_rows.max(1);
+        self.variation_cold_row_group_rows = row_group_rows.max(1);
         self.variation_tier_batch_size = batch_size.max(1);
+        self
+    }
+
+    pub fn with_indexed_variation_layout_options(
+        mut self,
+        warm_row_group_rows: usize,
+        cold_row_group_rows: usize,
+        cold_data_page_row_count: usize,
+    ) -> Self {
+        self.variation_warm_row_group_rows = warm_row_group_rows.max(1);
+        self.variation_cold_row_group_rows = cold_row_group_rows.max(1);
+        self.variation_cold_data_page_row_count = cold_data_page_row_count.max(1);
         self
     }
 
@@ -651,7 +717,9 @@ impl CacheBuilder {
         );
         options.af_threshold = self.variation_af_threshold;
         options.position_radius = self.variation_position_radius;
-        options.row_group_rows = self.variation_row_group_rows;
+        options.warm_row_group_rows = self.variation_warm_row_group_rows;
+        options.cold_row_group_rows = self.variation_cold_row_group_rows;
+        options.cold_data_page_row_count = self.variation_cold_data_page_row_count;
         options.batch_size = self.variation_tier_batch_size;
 
         let stats = build_warm_variation_tier_from_parts(options).map_err(|error| {
@@ -682,7 +750,9 @@ impl CacheBuilder {
         let mut options = WarmVariationTierOptions::new(input, output_dir);
         options.af_threshold = self.variation_af_threshold;
         options.position_radius = self.variation_position_radius;
-        options.row_group_rows = self.variation_row_group_rows;
+        options.warm_row_group_rows = self.variation_warm_row_group_rows;
+        options.cold_row_group_rows = self.variation_cold_row_group_rows;
+        options.cold_data_page_row_count = self.variation_cold_data_page_row_count;
         options.batch_size = self.variation_tier_batch_size;
 
         let stats = build_warm_variation_tier(options).map_err(|error| {
@@ -1289,51 +1359,57 @@ impl CacheBuilder {
         })?;
 
         // translation_sift
-        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
-            false,
-            self.cache_source_type,
-        );
-        let sift_select = sift_schema
-            .fields()
-            .iter()
-            .map(|f| format!("\"{}\"", f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
         let sift_file = format!("{}/translation_sift/chr{chrom}.parquet", self.output_dir);
-        let sift_query = format!("SELECT {sift_select} FROM _tl_deduped ORDER BY chrom, start");
+        let sift_rows = if self.cache_format == CacheFormat::IndexedParquet {
+            self.write_compact_sift_from_deduped(&split_ctx, &sift_file)
+                .await?
+        } else {
+            let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
+                false,
+                self.cache_source_type,
+            );
+            let sift_select = sift_schema
+                .fields()
+                .iter()
+                .map(|f| format!("\"{}\"", f.name()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sift_query = format!("SELECT {sift_select} FROM _tl_deduped ORDER BY chrom, start");
 
-        let mut w = create_writer(
-            &sift_file,
-            &sift_schema,
-            kind,
-            &["chrom", "start"],
-            Some(256),
-        )?;
-        let sift_df = split_ctx.sql(&sift_query).await?;
-        let mut stream = sift_df.execute_stream().await?;
-        let mut sift_rows = 0usize;
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result?;
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let batch = project_batch(&batch, &sift_schema)?;
-            sift_rows += batch.num_rows();
-            w.write(&batch)?;
+            let mut w = create_writer(
+                &sift_file,
+                &sift_schema,
+                kind,
+                &["chrom", "start"],
+                Some(256),
+            )?;
+            let sift_df = split_ctx.sql(&sift_query).await?;
+            let mut stream = sift_df.execute_stream().await?;
+            let mut sift_rows = 0usize;
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let batch = project_batch(&batch, &sift_schema)?;
+                sift_rows += batch.num_rows();
+                w.write(&batch)?;
 
-            if let Some(ref cb) = self.on_progress {
-                cb(
-                    "translation_sift",
-                    "parquet",
-                    batch.num_rows(),
-                    sift_rows,
-                    0,
-                );
+                if let Some(ref cb) = self.on_progress {
+                    cb(
+                        "translation_sift",
+                        "parquet",
+                        batch.num_rows(),
+                        sift_rows,
+                        0,
+                    );
+                }
             }
-        }
-        w.close().map_err(|e| {
-            DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
-        })?;
+            w.close().map_err(|e| {
+                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+            })?;
+            sift_rows
+        };
 
         info!(
             "translation: chr{chrom} core={} sift={}",
@@ -1422,36 +1498,42 @@ impl CacheBuilder {
             DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
         })?;
 
-        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
-            false,
-            self.cache_source_type,
-        );
-        let sift_select = sift_schema
-            .fields()
-            .iter()
-            .map(|f| format!("\"{}\"", f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
         let sift_file = format!("{}/translation_sift/other.parquet", self.output_dir);
-        let mut w = create_writer(
-            &sift_file,
-            &sift_schema,
-            kind,
-            &["chrom", "start"],
-            Some(256),
-        )?;
-        let sift_rows = stream_to_writer_with_progress(
-            &split_ctx,
-            &format!("SELECT {sift_select} FROM _tl_deduped ORDER BY chrom, start"),
-            &mut w,
-            false,
-            self.on_progress.as_deref(),
-            "translation_sift",
-        )
-        .await?;
-        w.close().map_err(|e| {
-            DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
-        })?;
+        let sift_rows = if self.cache_format == CacheFormat::IndexedParquet {
+            self.write_compact_sift_from_deduped(&split_ctx, &sift_file)
+                .await?
+        } else {
+            let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
+                false,
+                self.cache_source_type,
+            );
+            let sift_select = sift_schema
+                .fields()
+                .iter()
+                .map(|f| format!("\"{}\"", f.name()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut w = create_writer(
+                &sift_file,
+                &sift_schema,
+                kind,
+                &["chrom", "start"],
+                Some(256),
+            )?;
+            let sift_rows = stream_to_writer_with_progress(
+                &split_ctx,
+                &format!("SELECT {sift_select} FROM _tl_deduped ORDER BY chrom, start"),
+                &mut w,
+                false,
+                self.on_progress.as_deref(),
+                "translation_sift",
+            )
+            .await?;
+            w.close().map_err(|e| {
+                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+            })?;
+            sift_rows
+        };
 
         info!(
             "translation: other ({} contigs) core={} sift={}",
@@ -1471,6 +1553,69 @@ impl CacheBuilder {
             None
         };
         Ok((core_result, sift_result))
+    }
+
+    async fn write_compact_sift_from_deduped(
+        &self,
+        split_ctx: &SessionContext,
+        sift_file: &str,
+    ) -> Result<usize> {
+        let schema = compact_translation_sift_schema();
+        let mut writer = create_compact_sift_writer(sift_file, &schema)?;
+        let df = split_ctx
+            .sql(
+                "SELECT transcript_id, sift_predictions, polyphen_predictions \
+                 FROM _tl_deduped ORDER BY transcript_id",
+            )
+            .await?;
+        let mut stream = df.execute_stream().await?;
+        let mut ids = Vec::with_capacity(DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS);
+        let mut blobs = Vec::with_capacity(DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS);
+        let mut rows = 0usize;
+
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let batch_schema = batch.schema();
+            let tid_idx = batch_schema.index_of("transcript_id")?;
+            let sift_idx = batch_schema.index_of("sift_predictions").ok();
+            let poly_idx = batch_schema.index_of("polyphen_predictions").ok();
+
+            for row in 0..batch.num_rows() {
+                if batch.column(tid_idx).is_null(row) {
+                    continue;
+                }
+                let transcript_id = string_value(batch.column(tid_idx).as_ref(), row);
+                let mut predictions = CachedPredictions::default();
+                if let Some(idx) = sift_idx {
+                    predictions.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+                if let Some(idx) = poly_idx {
+                    predictions.polyphen =
+                        read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+                predictions.sort();
+                ids.push(transcript_id.to_string());
+                blobs.push(serialize_predictions(&predictions));
+                rows += 1;
+
+                if ids.len() >= DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS {
+                    flush_compact_sift_batch(&mut writer, schema.clone(), &mut ids, &mut blobs)?;
+                }
+            }
+
+            if let Some(ref cb) = self.on_progress {
+                cb("translation_sift", "parquet", batch.num_rows(), rows, 0);
+            }
+        }
+
+        flush_compact_sift_batch(&mut writer, schema, &mut ids, &mut blobs)?;
+        writer.close().map_err(|e| {
+            DataFusionError::Execution(format!("Failed to close compact sift parquet writer: {e}"))
+        })?;
+        Ok(rows)
     }
 
     /// Build fjall for translation_sift: re-read parquet sorted by transcript_id,
@@ -2362,7 +2507,12 @@ fn variation_cache_schema_without_tier_helpers(schema: &SchemaRef) -> SchemaRef 
     let fields: Vec<_> = schema
         .fields()
         .iter()
-        .filter(|field| !matches!(field.name().as_str(), "position_key" | "variant_keys"))
+        .filter(|field| {
+            !matches!(
+                field.name().as_str(),
+                "position_key" | "variant_keys" | "region_bin"
+            )
+        })
         .cloned()
         .collect();
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
@@ -2397,6 +2547,47 @@ fn create_writer(
         .map_err(|e| DataFusionError::Execution(format!("Failed to create file {path}: {e}")))?;
     ArrowWriter::try_new(file, schema.clone(), Some(props))
         .map_err(|e| DataFusionError::Execution(format!("Failed to create ArrowWriter: {e}")))
+}
+
+fn compact_translation_sift_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("transcript_id", DataType::Utf8, false),
+        Field::new("predictions", DataType::Binary, false),
+    ]))
+}
+
+fn create_compact_sift_writer(path: &str, schema: &SchemaRef) -> Result<ArrowWriter<File>> {
+    let props = WriterProperties::builder()
+        .set_max_row_group_size(DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS)
+        .set_dictionary_enabled(false)
+        .set_compression(Compression::UNCOMPRESSED)
+        .build();
+    let file = File::create(path)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to create file {path}: {e}")))?;
+    ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| {
+        DataFusionError::Execution(format!("Failed to create compact sift ArrowWriter: {e}"))
+    })
+}
+
+fn flush_compact_sift_batch(
+    writer: &mut ArrowWriter<File>,
+    schema: SchemaRef,
+    ids: &mut Vec<String>,
+    blobs: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(std::mem::take(ids))) as ArrayRef,
+            Arc::new(BinaryArray::from_iter_values(std::mem::take(blobs))) as ArrayRef,
+        ],
+    )
+    .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
+    writer.write(&batch)?;
+    Ok(())
 }
 
 async fn stream_to_writer_with_progress(
@@ -3100,7 +3291,20 @@ mod tests {
         assert_eq!(builder.cache_root, "/cache");
         assert_eq!(builder.output_dir, "/output");
         assert_eq!(builder.partitions, 8);
-        assert!(builder.build_fjall);
+        assert_eq!(builder.cache_format, CacheFormat::IndexedParquet);
+        assert!(!builder.build_fjall);
+        assert_eq!(
+            builder.variation_warm_row_group_rows,
+            DEFAULT_VARIATION_WARM_ROW_GROUP_ROWS
+        );
+        assert_eq!(
+            builder.variation_cold_row_group_rows,
+            DEFAULT_VARIATION_COLD_ROW_GROUP_ROWS
+        );
+        assert_eq!(
+            builder.variation_cold_data_page_row_count,
+            DEFAULT_VARIATION_COLD_DATA_PAGE_ROW_COUNT
+        );
         assert_eq!(builder.zstd_level, 3);
         assert_eq!(builder.dict_size_kb, 112);
         assert!(builder.on_progress.is_none());
@@ -3110,13 +3314,27 @@ mod tests {
     fn test_cache_builder_with_overrides() {
         let builder = CacheBuilder::new("/cache", "/output")
             .with_partitions(4)
-            .with_build_fjall(false)
+            .with_cache_format(CacheFormat::LegacyFjall)
             .with_zstd_level(9)
             .with_dict_size_kb(256);
         assert_eq!(builder.partitions, 4);
-        assert!(!builder.build_fjall);
+        assert_eq!(builder.cache_format, CacheFormat::LegacyFjall);
+        assert!(builder.build_fjall);
         assert_eq!(builder.zstd_level, 9);
         assert_eq!(builder.dict_size_kb, 256);
+    }
+
+    #[test]
+    fn cache_format_parser_accepts_default_and_legacy_names() {
+        assert_eq!(
+            CacheFormat::parse("indexed_parquet").unwrap(),
+            CacheFormat::IndexedParquet
+        );
+        assert_eq!(
+            CacheFormat::parse("legacy_fjall").unwrap(),
+            CacheFormat::LegacyFjall
+        );
+        assert!(CacheFormat::parse("rocksdb").is_err());
     }
 
     #[test]

@@ -68,7 +68,10 @@ pub enum KvMatchMode {
 /// and emits LEFT JOIN output (unmatched VCF rows get NULL cache columns).
 pub struct KvLookupExec {
     input: Arc<dyn ExecutionPlan>,
-    store: Arc<VepKvStore>,
+    store: Option<Arc<VepKvStore>>,
+    cache_root: Option<PathBuf>,
+    cache_schema: SchemaRef,
+    indexed_parquet: bool,
     cache_columns: Vec<String>,
     match_mode: KvMatchMode,
     exact_matcher: AlleleMatcher,
@@ -136,8 +139,9 @@ impl KvLookupExec {
         allowed_failed: i64,
     ) -> Result<Self> {
         let input_schema = input.schema();
+        let cache_schema = store.schema().clone();
         let (schema, output_col_positions) =
-            build_lookup_output_schema(input_schema, store.schema().clone(), &cache_columns);
+            build_lookup_output_schema(input_schema, cache_schema.clone(), &cache_columns);
 
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -148,7 +152,60 @@ impl KvLookupExec {
 
         Ok(Self {
             input,
-            store,
+            store: Some(store),
+            cache_root: None,
+            cache_schema,
+            indexed_parquet: false,
+            cache_columns,
+            match_mode,
+            exact_matcher,
+            schema,
+            vcf_has_chr,
+            vcf_zero_based,
+            cache_zero_based,
+            extended_probes,
+            allowed_failed,
+            properties,
+            output_col_positions,
+            colocated_sink: None,
+            colocated_partition_sinks: None,
+            reference_fasta_path: None,
+            #[cfg(test)]
+            warm_cache_dir_override: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_indexed_parquet(
+        input: Arc<dyn ExecutionPlan>,
+        cache_root: PathBuf,
+        cache_schema: SchemaRef,
+        cache_columns: Vec<String>,
+        match_mode: KvMatchMode,
+        exact_matcher: AlleleMatcher,
+        vcf_has_chr: bool,
+        vcf_zero_based: bool,
+        cache_zero_based: bool,
+        extended_probes: bool,
+        allowed_failed: i64,
+    ) -> Result<Self> {
+        let input_schema = input.schema();
+        let (schema, output_col_positions) =
+            build_lookup_output_schema(input_schema, cache_schema.clone(), &cache_columns);
+
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            input.output_partitioning().clone(),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+
+        Ok(Self {
+            input,
+            store: None,
+            cache_root: Some(cache_root),
+            cache_schema,
+            indexed_parquet: true,
             cache_columns,
             match_mode,
             exact_matcher,
@@ -239,18 +296,38 @@ impl ExecutionPlan for KvLookupExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 1);
-        let mut exec = KvLookupExec::new(
-            children[0].clone(),
-            self.store.clone(),
-            self.cache_columns.clone(),
-            self.match_mode,
-            self.exact_matcher,
-            self.vcf_has_chr,
-            self.vcf_zero_based,
-            self.cache_zero_based,
-            self.extended_probes,
-            self.allowed_failed,
-        )?;
+        let mut exec = if self.indexed_parquet {
+            KvLookupExec::new_indexed_parquet(
+                children[0].clone(),
+                self.cache_root.clone().ok_or_else(|| {
+                    DataFusionError::Execution("indexed parquet lookup missing cache root".into())
+                })?,
+                self.cache_schema.clone(),
+                self.cache_columns.clone(),
+                self.match_mode,
+                self.exact_matcher,
+                self.vcf_has_chr,
+                self.vcf_zero_based,
+                self.cache_zero_based,
+                self.extended_probes,
+                self.allowed_failed,
+            )?
+        } else {
+            KvLookupExec::new(
+                children[0].clone(),
+                self.store.clone().ok_or_else(|| {
+                    DataFusionError::Execution("fjall lookup missing KV store".into())
+                })?,
+                self.cache_columns.clone(),
+                self.match_mode,
+                self.exact_matcher,
+                self.vcf_has_chr,
+                self.vcf_zero_based,
+                self.cache_zero_based,
+                self.extended_probes,
+                self.allowed_failed,
+            )?
+        };
         if let Some(sink) = &self.colocated_sink {
             exec = exec.with_colocated_sink(Arc::clone(sink));
         }
@@ -280,6 +357,9 @@ impl ExecutionPlan for KvLookupExec {
         let stream = KvLookupStream::new(
             input_stream,
             self.store.clone(),
+            self.cache_root.clone(),
+            self.cache_schema.clone(),
+            self.indexed_parquet,
             self.schema.clone(),
             self.cache_columns.clone(),
             self.match_mode,
@@ -316,7 +396,10 @@ impl ExecutionPlan for KvLookupExec {
 /// the colocated map — matching the buffering behavior of `VariantLookupExec`.
 struct KvLookupStream {
     input: SendableRecordBatchStream,
-    store: Arc<VepKvStore>,
+    store: Option<Arc<VepKvStore>>,
+    cache_root: Option<PathBuf>,
+    cache_schema: SchemaRef,
+    indexed_parquet: bool,
     schema: SchemaRef,
     cache_columns: Vec<String>,
     _match_mode: KvMatchMode,
@@ -1200,7 +1283,10 @@ impl KvLookupStream {
     #[allow(clippy::too_many_arguments)]
     fn new(
         input: SendableRecordBatchStream,
-        store: Arc<VepKvStore>,
+        store: Option<Arc<VepKvStore>>,
+        cache_root: Option<PathBuf>,
+        cache_schema: SchemaRef,
+        indexed_parquet: bool,
         schema: SchemaRef,
         cache_columns: Vec<String>,
         match_mode: KvMatchMode,
@@ -1217,7 +1303,8 @@ impl KvLookupStream {
         // Resolve colocated column indices within the KV entry if we have a sink.
         let coloc_col_indices = colocated_sink
             .as_ref()
-            .and_then(|_| resolve_kv_coloc_indices(&store));
+            .and_then(|_| store.as_ref())
+            .and_then(|store| resolve_kv_coloc_indices(store));
 
         // Open the reference FASTA reader if a path is provided and we have a
         // colocated sink (shift state is only needed for colocated matching).
@@ -1235,23 +1322,41 @@ impl KvLookupStream {
         } else {
             None
         };
-        let warm_cache_dir = if warm_variation_cache_enabled() {
-            warm_variation_cache_dir(&store)
+        let warm_cache_dir = if indexed_parquet {
+            cache_root.as_ref().map(|root| root.join("variation"))
+        } else if warm_variation_cache_enabled() {
+            store
+                .as_ref()
+                .and_then(|store| warm_variation_cache_dir(store))
         } else {
             None
         };
-        let cold_variation_dir = if warm_cache_dir.is_some() {
-            variation_cold_dir(&store)
+        let cold_variation_dir = if indexed_parquet {
+            cache_root.as_ref().map(|root| root.join("variation"))
+        } else if warm_cache_dir.is_some() {
+            store.as_ref().and_then(|store| variation_cold_dir(store))
         } else {
             None
         };
-        let position_index_dir = if warm_cache_dir.is_some() {
-            variation_position_index_dir(&store)
+        let position_index_dir = if indexed_parquet {
+            cache_root
+                .as_ref()
+                .map(|root| root.join("variation.position_index"))
+        } else if warm_cache_dir.is_some() {
+            store
+                .as_ref()
+                .and_then(|store| variation_position_index_dir(store))
         } else {
             None
         };
-        let variant_bloom_index_dir = if warm_cache_dir.is_some() {
-            variation_variant_bloom_index_dir(&store)
+        let variant_bloom_index_dir = if indexed_parquet {
+            cache_root
+                .as_ref()
+                .map(|root| root.join("variation.variant_bloom_index"))
+        } else if warm_cache_dir.is_some() {
+            store
+                .as_ref()
+                .and_then(|store| variation_variant_bloom_index_dir(store))
         } else {
             None
         };
@@ -1259,6 +1364,9 @@ impl KvLookupStream {
         Self {
             input,
             store,
+            cache_root,
+            cache_schema,
+            indexed_parquet,
             schema,
             cache_columns,
             _match_mode: match_mode,
@@ -1279,8 +1387,16 @@ impl KvLookupStream {
             cold_variation_dir,
             position_index_dir,
             variant_bloom_index_dir,
-            warm_cold_backend: warm_cold_variation_backend_from_env(),
-            warm_cold_index_mode: warm_cold_variation_index_mode_from_env(),
+            warm_cold_backend: if indexed_parquet {
+                WarmColdVariationBackend::Parquet
+            } else {
+                warm_cold_variation_backend_from_env()
+            },
+            warm_cold_index_mode: if indexed_parquet {
+                WarmColdVariationIndexMode::PositionThenVariantBloom
+            } else {
+                warm_cold_variation_index_mode_from_env()
+            },
             profile_enabled: kv_profile_enabled(),
             profile_detailed: kv_profile_detailed_enabled(),
             profile_emitted: false,
@@ -2194,8 +2310,13 @@ impl KvLookupStream {
         // VCF row indices for output expansion (one per output row).
         let mut vcf_indices: Vec<u32> = Vec::with_capacity(num_rows);
 
-        // Reusable zstd decompressor — created once, amortized across all lookups.
-        let mut decompressor = self.store.create_decompressor()?;
+        // Reusable zstd decompressor — created once, amortized across legacy fjall lookups.
+        let mut decompressor = self
+            .store
+            .as_ref()
+            .map(|store| store.create_decompressor())
+            .transpose()?
+            .flatten();
 
         // Reusable decompression / raw-value buffer — avoids alloc per lookup.
         let mut decompress_buf: Vec<u8> = Vec::with_capacity(4096);
@@ -2212,7 +2333,11 @@ impl KvLookupStream {
             None
         };
         let mut range_prefetch: Option<HashMap<i64, fjall::UserValue>> = None;
-        if kv_range_prefetch_enabled() && self.warm_cache_dir.is_none() && num_rows > 1 {
+        if kv_range_prefetch_enabled()
+            && self.store.is_some()
+            && self.warm_cache_dir.is_none()
+            && num_rows > 1
+        {
             let mut batch_chrom_code: Option<u16> = None;
             let mut min_probe = i64::MAX;
             let mut max_probe = i64::MIN;
@@ -2257,7 +2382,8 @@ impl KvLookupStream {
                 if let Some(chrom_code) = batch_chrom_code {
                     let span = max_probe.saturating_sub(min_probe);
                     if min_probe <= max_probe && span <= kv_range_prefetch_max_span() {
-                        match self.store.range_position_entries_limited_with_reason(
+                        let store = self.store.as_ref().expect("checked store.is_some()");
+                        match store.range_position_entries_limited_with_reason(
                             chrom_code,
                             min_probe,
                             max_probe,
@@ -2308,7 +2434,7 @@ impl KvLookupStream {
         // Determine which column indices in the entry correspond to our output columns.
         // Entry stores all columns except chrom/start, in schema order minus those 2.
         // (`end` is stored as a regular column inside the entry.)
-        let cache_schema = self.store.schema();
+        let cache_schema = &self.cache_schema;
         let cache_chrom_idx = cache_schema.index_of("chrom").unwrap_or(usize::MAX);
         let cache_start_idx = cache_schema.index_of("start").unwrap_or(usize::MAX);
 
@@ -2472,6 +2598,17 @@ impl KvLookupStream {
                 }
 
                 let found = if let Some(prefetched) = range_prefetch.as_ref() {
+                    let Some(store) = self.store.as_ref() else {
+                        return Err(DataFusionError::Execution(
+                            "indexed parquet variation lookup unexpectedly reached legacy fjall range-prefetch path"
+                                .into(),
+                        ));
+                    };
+                    let Some(decompressor) = decompressor.as_mut() else {
+                        return Err(DataFusionError::Execution(
+                            "legacy fjall decompressor was not initialized".into(),
+                        ));
+                    };
                     let map_lookup_started = self.profile_detailed.then(Instant::now);
                     let raw = prefetched.get(probe_start);
                     if let Some(t0) = map_lookup_started {
@@ -2483,9 +2620,9 @@ impl KvLookupStream {
                             self.profile.compressed_bytes += raw.as_ref().len() as u64;
                         }
                         let decode_started = self.profile_detailed.then(Instant::now);
-                        self.store.decode_position_entry_value(
+                        store.decode_position_entry_value(
                             raw.as_ref(),
-                            decompressor.as_mut(),
+                            Some(decompressor),
                             &mut decompress_buf,
                         )?;
                         if let Some(t0) = decode_started {
@@ -2501,12 +2638,23 @@ impl KvLookupStream {
                         false
                     }
                 } else {
+                    let Some(store) = self.store.as_ref() else {
+                        return Err(DataFusionError::Execution(
+                            "indexed parquet variation lookup reached legacy fjall fallback; warm/cold parquet did not cover the probe"
+                                .into(),
+                        ));
+                    };
+                    let Some(decompressor) = decompressor.as_mut() else {
+                        return Err(DataFusionError::Execution(
+                            "legacy fjall decompressor was not initialized".into(),
+                        ));
+                    };
                     if self.profile_enabled {
                         self.profile.point_gets += 1;
                     }
                     if self.profile_detailed {
                         let get_started = Instant::now();
-                        let raw = self.store.get_position_entry_with_key_buf(
+                        let raw = store.get_position_entry_with_key_buf(
                             chrom_code,
                             *probe_start,
                             &mut position_key_buf,
@@ -2517,9 +2665,9 @@ impl KvLookupStream {
                                 self.profile.raw_get_hits += 1;
                                 self.profile.compressed_bytes += compressed.as_ref().len() as u64;
                                 let decode_started = Instant::now();
-                                self.store.decode_position_entry_value(
+                                store.decode_position_entry_value(
                                     compressed.as_ref(),
-                                    decompressor.as_mut(),
+                                    Some(decompressor),
                                     &mut decompress_buf,
                                 )?;
                                 self.profile.decompress += decode_started.elapsed();
@@ -2533,10 +2681,10 @@ impl KvLookupStream {
                             }
                         }
                     } else {
-                        self.store.get_position_entry_fast_with_key_buf(
+                        store.get_position_entry_fast_with_key_buf(
                             chrom_code,
                             *probe_start,
-                            decompressor.as_mut(),
+                            Some(decompressor),
                             &mut decompress_buf,
                             &mut position_key_buf,
                         )?
@@ -3700,7 +3848,10 @@ pub fn lookup_batch_with_store(
     });
     let mut stream = KvLookupStream::new(
         input,
-        store,
+        Some(store.clone()),
+        None,
+        store.schema().clone(),
+        false,
         schema,
         cache_columns,
         KvMatchMode::Exact,

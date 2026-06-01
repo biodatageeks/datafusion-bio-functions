@@ -1213,7 +1213,8 @@ pub fn cold_parquet_row_group_cache() -> usize {
 pub fn cold_parquet_load_page_index() -> bool {
     std::env::var("VEP_COLD_PARQUET_LOAD_PAGE_INDEX")
         .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(true)
 }
 
 fn push_unique_column(columns: &mut Vec<String>, name: &str) {
