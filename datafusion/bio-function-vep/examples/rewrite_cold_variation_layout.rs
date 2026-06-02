@@ -308,7 +308,9 @@ fn create_writer(path: &Path, schema: SchemaRef, args: &Args) -> Result<ArrowWri
         .set_max_row_group_size(usize::MAX)
         .set_key_value_metadata(Some(metadata));
     if let Some(rows) = args.data_page_row_count {
-        props = props.set_data_page_row_count_limit(rows);
+        props = props
+            .set_data_page_row_count_limit(rows)
+            .set_write_batch_size(rows);
     }
     let props = props.build();
     let file = File::create(path).map_err(|error| {
