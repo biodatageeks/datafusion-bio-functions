@@ -2556,13 +2556,16 @@ impl KvLookupStream {
                         LookupDecision::UseFjall
                             if self.warm_cold_backend == WarmColdVariationBackend::Parquet =>
                         {
-                            if !self.cold_variant_bloom_may_contain(
-                                chrom,
-                                chrom_code,
-                                *probe_start,
-                                vcf_ref,
-                                vcf_alt,
-                            )? {
+                            let collect_colocated = coloc_buf.is_some();
+                            if !collect_colocated
+                                && !self.cold_variant_bloom_may_contain(
+                                    chrom,
+                                    chrom_code,
+                                    *probe_start,
+                                    vcf_ref,
+                                    vcf_alt,
+                                )?
+                            {
                                 continue;
                             }
                             let position_key =
@@ -2573,7 +2576,6 @@ impl KvLookupStream {
                                         ))
                                     },
                                 )?;
-                            let collect_colocated = coloc_buf.is_some();
                             self.ensure_cold_parquet_lookup(
                                 chrom,
                                 &cache_columns,
@@ -4542,6 +4544,159 @@ mod tests {
             .map(|entry| entry.variation_name.as_str())
             .collect();
         assert_eq!(all_names, vec!["rs_indexed_warm"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn indexed_parquet_colocated_cold_cosmic_rows_bypass_variant_bloom() {
+        let cache_root = tempfile::tempdir().unwrap();
+        let variation_dir = cache_root.path().join("variation");
+        std::fs::create_dir_all(&variation_dir).unwrap();
+
+        let target_position = 100;
+        let warm_position = 10;
+        let mut warm_variant_keys = datafusion::arrow::array::ListBuilder::new(
+            datafusion::arrow::array::UInt64Builder::new(),
+        );
+        for key in
+            crate::warm_cache::key::variant_keys_from_allele_string("1", warm_position, "A/G")
+                .unwrap()
+        {
+            warm_variant_keys.values().append_value(key);
+        }
+        warm_variant_keys.append(true);
+        let warm_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("position_key", DataType::UInt64, false),
+                Field::new_list(
+                    "variant_keys",
+                    Arc::new(Field::new_list_field(DataType::UInt64, true)),
+                    false,
+                ),
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("variation_name", DataType::Utf8, true),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("clin_sig", DataType::Utf8, true),
+                Field::new("failed", DataType::Int64, false),
+                Field::new("somatic", DataType::Int64, true),
+                Field::new("phenotype_or_disease", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![
+                    position_key("1", warm_position).unwrap(),
+                ])) as ArrayRef,
+                Arc::new(warm_variant_keys.finish()) as ArrayRef,
+                Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![warm_position])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![warm_position])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["rs_warm_other"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["A/G"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Option::<&str>::None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        write_single_group_warm_parquet(&variation_dir.join("chr1_warm.parquet"), &warm_batch);
+
+        let cold_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("position_key", DataType::UInt64, false),
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::Int64, false),
+                Field::new("end", DataType::Int64, false),
+                Field::new("variation_name", DataType::Utf8, true),
+                Field::new("allele_string", DataType::Utf8, false),
+                Field::new("clin_sig", DataType::Utf8, true),
+                Field::new("failed", DataType::Int64, true),
+                Field::new("somatic", DataType::Int64, true),
+                Field::new("phenotype_or_disease", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![
+                    position_key("1", target_position).unwrap(),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![target_position])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![target_position])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["COSV_TEST"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["COSMIC_MUTATION"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Option::<&str>::None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Option::<i64>::None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        write_single_group_warm_parquet(&variation_dir.join("chr1_cold.parquet"), &cold_batch);
+
+        crate::kv_cache::position_index::PositionIndex::from_positions([target_position])
+            .unwrap()
+            .write_to_path(
+                cache_root
+                    .path()
+                    .join("variation.position_index/chr1.posidx"),
+            )
+            .unwrap();
+        VariantBloomIndex::with_expected_items(1, 10)
+            .unwrap()
+            .write_to_path(
+                cache_root
+                    .path()
+                    .join("variation.variant_bloom_index/chr1.varbf"),
+            )
+            .unwrap();
+
+        let vcf = simple_vcf_batch("1", target_position, target_position, "T", "C");
+        let vcf_schema = vcf.schema();
+        let vcf_mem = MemTable::try_new(vcf_schema, vec![vec![vcf]]).unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("vcf_indexed_cold_cosmic", Arc::new(vcf_mem))
+            .unwrap();
+        let vcf_plan = ctx
+            .table("vcf_indexed_cold_cosmic")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let sink: ColocatedSink = Arc::new(Mutex::new(StdHashMap::new()));
+
+        let exec = KvLookupExec::new_indexed_parquet(
+            vcf_plan,
+            cache_root.path().to_path_buf(),
+            simple_cache_schema(),
+            vec!["variation_name".into()],
+            KvMatchMode::Exact,
+            allele_matches as fn(&str, &str, &str) -> bool,
+            false,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap()
+        .with_colocated_sink(Arc::clone(&sink));
+
+        let stream = exec.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<_> = datafusion::physical_plan::common::collect(stream)
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        let coloc = sink.lock().unwrap();
+        let all_names: Vec<&str> = coloc
+            .values()
+            .flat_map(|value| value.entries.iter())
+            .map(|entry| entry.variation_name.as_str())
+            .collect();
+        assert_eq!(all_names, vec!["COSV_TEST"]);
+        let entry = &coloc.values().next().unwrap().entries[0];
+        assert_eq!(entry.allele_string, "COSMIC_MUTATION");
+        assert_eq!(entry.somatic, 1);
+        assert_eq!(entry.pheno, 1);
     }
 
     /// Empty VCF input should produce zero output rows.
