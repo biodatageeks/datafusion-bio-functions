@@ -1,4 +1,4 @@
-//! Build a per-chromosome Bloom index over cold variation `variant_keys`.
+//! Build a per-chromosome Bloom index over cold variation allele and fallback keys.
 //!
 //! Example:
 //!   build_variation_variant_bloom_index --cache /path/to/cache --chrom chr4 \
