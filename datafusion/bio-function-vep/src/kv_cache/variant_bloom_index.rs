@@ -13,10 +13,19 @@ use parquet::schema::types::SchemaDescriptor;
 use crate::allele::vcf_to_vep_allele;
 use crate::warm_cache::key::variant_key_from_position;
 
-const MAGIC: &[u8; 8] = b"VPVBF01\0";
+const MAGIC_V1: &[u8; 8] = b"VPVBF01\0";
+const MAGIC_V2: &[u8; 8] = b"VPVBF02\0";
 const DEFAULT_HASH_COUNT: u8 = 7;
 const MIN_BITS: u64 = 64;
 const BITS_PER_WORD: u64 = u64::BITS as u64;
+const VARIANT_KEY_DOMAIN: u64 = 0x9B64_12E8_4A7C_15D3;
+const POSITION_FALLBACK_KEY_DOMAIN: u64 = 0xC2B2_AE3D_27D4_EB4F;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BloomKeyFormat {
+    LegacyVariant,
+    TypedAdmission,
+}
 
 #[derive(Debug, Clone)]
 pub struct VariantBloomIndex {
@@ -24,6 +33,7 @@ pub struct VariantBloomIndex {
     bit_count: u64,
     hash_count: u8,
     inserted: u64,
+    key_format: BloomKeyFormat,
 }
 
 impl VariantBloomIndex {
@@ -43,6 +53,7 @@ impl VariantBloomIndex {
             bit_count,
             hash_count,
             inserted: 0,
+            key_format: BloomKeyFormat::TypedAdmission,
         })
     }
 
@@ -99,6 +110,14 @@ impl VariantBloomIndex {
         self.inserted += 1;
     }
 
+    pub fn insert_variant_key(&mut self, key: u64) {
+        self.insert(typed_variant_bloom_key(key));
+    }
+
+    pub fn insert_position_fallback_key(&mut self, position_key: u64) {
+        self.insert(typed_position_fallback_bloom_key(position_key));
+    }
+
     pub fn contains(&self, key: u64) -> bool {
         let (h1, h2) = hash_pair(key);
         for i in 0..self.hash_count {
@@ -112,11 +131,38 @@ impl VariantBloomIndex {
         true
     }
 
+    pub fn contains_variant_key(&self, key: u64) -> bool {
+        match self.key_format {
+            BloomKeyFormat::LegacyVariant => self.contains(key),
+            BloomKeyFormat::TypedAdmission => self.contains(typed_variant_bloom_key(key)),
+        }
+    }
+
     pub fn contains_any<I>(&self, keys: I) -> bool
     where
         I: IntoIterator<Item = u64>,
     {
         keys.into_iter().any(|key| self.contains(key))
+    }
+
+    pub fn contains_any_variant_keys<I>(&self, keys: I) -> bool
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        keys.into_iter().any(|key| self.contains_variant_key(key))
+    }
+
+    pub fn supports_position_fallback_keys(&self) -> bool {
+        self.key_format == BloomKeyFormat::TypedAdmission
+    }
+
+    pub fn contains_position_fallback_key(&self, position_key: u64) -> bool {
+        match self.key_format {
+            BloomKeyFormat::LegacyVariant => false,
+            BloomKeyFormat::TypedAdmission => {
+                self.contains(typed_position_fallback_bloom_key(position_key))
+            }
+        }
     }
 
     pub fn inserted(&self) -> u64 {
@@ -140,7 +186,11 @@ impl VariantBloomIndex {
             std::fs::create_dir_all(parent).map_err(io_err)?;
         }
         let mut file = File::create(path.as_ref()).map_err(io_err)?;
-        file.write_all(MAGIC).map_err(io_err)?;
+        let magic = match self.key_format {
+            BloomKeyFormat::LegacyVariant => MAGIC_V1,
+            BloomKeyFormat::TypedAdmission => MAGIC_V2,
+        };
+        file.write_all(magic).map_err(io_err)?;
         file.write_all(&self.bit_count.to_le_bytes())
             .map_err(io_err)?;
         file.write_all(&[self.hash_count]).map_err(io_err)?;
@@ -159,12 +209,16 @@ impl VariantBloomIndex {
         let mut file = File::open(path.as_ref()).map_err(io_err)?;
         let mut magic = [0_u8; 8];
         file.read_exact(&mut magic).map_err(io_err)?;
-        if &magic != MAGIC {
+        let key_format = if &magic == MAGIC_V1 {
+            BloomKeyFormat::LegacyVariant
+        } else if &magic == MAGIC_V2 {
+            BloomKeyFormat::TypedAdmission
+        } else {
             return Err(DataFusionError::Execution(format!(
                 "invalid variant bloom index magic in {}",
                 path.as_ref().display()
             )));
-        }
+        };
 
         let bit_count = read_u64(&mut file)?;
         let mut hash_count = [0_u8; 1];
@@ -198,6 +252,7 @@ impl VariantBloomIndex {
             bit_count,
             hash_count: hash_count[0],
             inserted,
+            key_format,
         })
     }
 
@@ -254,28 +309,31 @@ fn append_allele_match_keys(
         let Some(allele_string) = string_value(allele_array, row)? else {
             continue;
         };
-        let Some((reference, alternates)) = allele_string.split_once('/') else {
-            continue;
-        };
+        let mut inserted_for_row = false;
+        if let Some((reference, alternates)) = allele_string.split_once('/') {
+            for alternate in alternates
+                .split('/')
+                .filter(|alternate| !alternate.is_empty())
+            {
+                inserted_for_row = true;
+                insert_match_key(index, position_key, reference, alternate);
 
-        for alternate in alternates
-            .split('/')
-            .filter(|alternate| !alternate.is_empty())
-        {
-            insert_match_key(index, position_key, reference, alternate);
+                let (left_ref, left_alt) = vcf_to_vep_allele(reference, alternate);
+                insert_match_key(index, position_key, &left_ref, &left_alt);
 
-            let (left_ref, left_alt) = vcf_to_vep_allele(reference, alternate);
-            insert_match_key(index, position_key, &left_ref, &left_alt);
-
-            let (right_ref, right_alt) = trim_right_first(reference, alternate);
-            insert_match_key(index, position_key, &right_ref, &right_alt);
+                let (right_ref, right_alt) = trim_right_first(reference, alternate);
+                insert_match_key(index, position_key, &right_ref, &right_alt);
+            }
+        }
+        if !inserted_for_row {
+            index.insert_position_fallback_key(position_key);
         }
     }
     Ok(())
 }
 
 fn insert_match_key(index: &mut VariantBloomIndex, position_key: u64, reference: &str, alt: &str) {
-    index.insert(variant_key_from_position(position_key, reference, alt));
+    index.insert_variant_key(variant_key_from_position(position_key, reference, alt));
 }
 
 fn position_key_value(array: &dyn Array, row: usize) -> Result<Option<u64>> {
@@ -359,6 +417,21 @@ fn hash_pair(key: u64) -> (u64, u64) {
     salted[8..].copy_from_slice(&0x9E37_79B9_7F4A_7C15_u64.to_le_bytes());
     let h2 = rapidhash::v3::rapidhash_v3(&salted) | 1;
     (h1, h2)
+}
+
+fn typed_variant_bloom_key(key: u64) -> u64 {
+    typed_bloom_key(VARIANT_KEY_DOMAIN, key)
+}
+
+fn typed_position_fallback_bloom_key(position_key: u64) -> u64 {
+    typed_bloom_key(POSITION_FALLBACK_KEY_DOMAIN, position_key)
+}
+
+fn typed_bloom_key(domain: u64, key: u64) -> u64 {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&domain.to_le_bytes());
+    bytes[8..].copy_from_slice(&key.to_le_bytes());
+    rapidhash::v3::rapidhash_v3(&bytes)
 }
 
 fn read_u64(file: &mut File) -> Result<u64> {
@@ -491,6 +564,40 @@ mod tests {
 
         let index = VariantBloomIndex::from_parquet(&path, 1024, 10).unwrap();
 
-        assert!(index.contains(variant_key_from_position(position_key, "-", "GCCCA")));
+        assert!(index.contains_variant_key(variant_key_from_position(position_key, "-", "GCCCA")));
+    }
+
+    #[test]
+    fn variant_bloom_index_builds_position_fallback_for_unknown_alleles() {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::{ArrayRef, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chr1_cold.parquet");
+        let position_key = 101;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![position_key])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["COSMIC_MUTATION"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let index = VariantBloomIndex::from_parquet(&path, 1024, 10).unwrap();
+
+        assert!(index.supports_position_fallback_keys());
+        assert!(index.contains_position_fallback_key(position_key));
     }
 }

@@ -1903,6 +1903,7 @@ impl KvLookupStream {
         probe_start: i64,
         vcf_ref: &str,
         vcf_alt: &str,
+        collect_colocated: bool,
     ) -> Result<bool> {
         if !self.warm_cold_index_mode.uses_variant_bloom() {
             return Ok(true);
@@ -1944,7 +1945,23 @@ impl KvLookupStream {
             .variant_bloom_chroms
             .get(chrom)
             .and_then(Option::as_ref)
-            .is_some_and(|index| index.contains_any(variant_keys));
+            .is_some_and(|index| {
+                if index.contains_any_variant_keys(variant_keys.iter().copied()) {
+                    return true;
+                }
+
+                if !collect_colocated {
+                    return false;
+                }
+
+                if index.supports_position_fallback_keys() {
+                    index.contains_position_fallback_key(position_key)
+                } else {
+                    // V1 bloom files only contain allele keys, so they cannot
+                    // prove a coordinate-only colocated row absent.
+                    true
+                }
+            });
 
         if self.profile_enabled {
             self.profile.variant_bloom_checks += 1;
@@ -2557,15 +2574,14 @@ impl KvLookupStream {
                             if self.warm_cold_backend == WarmColdVariationBackend::Parquet =>
                         {
                             let collect_colocated = coloc_buf.is_some();
-                            if !collect_colocated
-                                && !self.cold_variant_bloom_may_contain(
-                                    chrom,
-                                    chrom_code,
-                                    *probe_start,
-                                    vcf_ref,
-                                    vcf_alt,
-                                )?
-                            {
+                            if !self.cold_variant_bloom_may_contain(
+                                chrom,
+                                chrom_code,
+                                *probe_start,
+                                vcf_ref,
+                                vcf_alt,
+                                collect_colocated,
+                            )? {
                                 continue;
                             }
                             let position_key =
@@ -4547,7 +4563,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn indexed_parquet_colocated_cold_cosmic_rows_bypass_variant_bloom() {
+    async fn indexed_parquet_colocated_cold_cosmic_rows_use_position_fallback_bloom() {
         let cache_root = tempfile::tempdir().unwrap();
         let variation_dir = cache_root.path().join("variation");
         std::fs::create_dir_all(&variation_dir).unwrap();
@@ -4640,8 +4656,9 @@ mod tests {
                     .join("variation.position_index/chr1.posidx"),
             )
             .unwrap();
-        VariantBloomIndex::with_expected_items(1, 10)
-            .unwrap()
+        let mut bloom = VariantBloomIndex::with_expected_items(1, 10).unwrap();
+        bloom.insert_position_fallback_key(position_key("1", target_position).unwrap());
+        bloom
             .write_to_path(
                 cache_root
                     .path()
