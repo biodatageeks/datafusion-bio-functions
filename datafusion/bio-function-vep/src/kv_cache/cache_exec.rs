@@ -672,6 +672,7 @@ struct LookupProfile {
     cold_parquet_row_group_metadata_misses: u64,
     cold_parquet_row_group_skipped_ahead: u64,
     cold_parquet_row_groups_loaded: u64,
+    cold_parquet_row_group_load_batches: u64,
     cold_parquet_row_group_cache_hits: u64,
     cold_parquet_row_group_cache_misses: u64,
     cold_parquet_rows_loaded: u64,
@@ -827,7 +828,7 @@ impl LookupProfile {
                 self.cold_parquet_rows_scanned,
             ),
             format!(
-                "[vep-kv-profile-detail] cold_parquet_row_groups total={} unique_touched={} untouched={} metadata_probes={} current_hits={} previous_hits={} advanced_hits={} binary_search_hits={} metadata_misses={} skipped_ahead={} loaded={} cache_hits={} cache_misses={} rows_loaded={}",
+                "[vep-kv-profile-detail] cold_parquet_row_groups total={} unique_touched={} untouched={} metadata_probes={} current_hits={} previous_hits={} advanced_hits={} binary_search_hits={} metadata_misses={} skipped_ahead={} loaded={} load_batches={} cache_hits={} cache_misses={} rows_loaded={}",
                 self.cold_parquet_row_groups_total,
                 self.cold_parquet_row_groups_unique_touched,
                 self.cold_parquet_row_groups_total
@@ -840,6 +841,7 @@ impl LookupProfile {
                 self.cold_parquet_row_group_metadata_misses,
                 self.cold_parquet_row_group_skipped_ahead,
                 self.cold_parquet_row_groups_loaded,
+                self.cold_parquet_row_group_load_batches,
                 self.cold_parquet_row_group_cache_hits,
                 self.cold_parquet_row_group_cache_misses,
                 self.cold_parquet_rows_loaded,
@@ -1835,6 +1837,7 @@ impl KvLookupStream {
             aggregate_stats.row_group_metadata_misses;
         self.profile.cold_parquet_row_group_skipped_ahead = aggregate_stats.row_group_skipped_ahead;
         self.profile.cold_parquet_row_groups_loaded = aggregate_stats.row_groups_loaded;
+        self.profile.cold_parquet_row_group_load_batches = aggregate_stats.row_group_load_batches;
         self.profile.cold_parquet_row_group_cache_hits = aggregate_stats.row_group_cache_hits;
         self.profile.cold_parquet_row_group_cache_misses = aggregate_stats.row_group_cache_misses;
         self.profile.cold_parquet_rows_loaded = aggregate_stats.rows_loaded;
@@ -2230,6 +2233,8 @@ impl KvLookupStream {
             self.profile.cold_parquet_row_group_skipped_ahead =
                 aggregate_stats.row_group_skipped_ahead;
             self.profile.cold_parquet_row_groups_loaded = aggregate_stats.row_groups_loaded;
+            self.profile.cold_parquet_row_group_load_batches =
+                aggregate_stats.row_group_load_batches;
             self.profile.cold_parquet_row_group_cache_hits = aggregate_stats.row_group_cache_hits;
             self.profile.cold_parquet_row_group_cache_misses =
                 aggregate_stats.row_group_cache_misses;
@@ -4058,6 +4063,7 @@ mod tests {
         profile.cold_parquet_row_group_metadata_misses = 46;
         profile.cold_parquet_row_group_skipped_ahead = 47;
         profile.cold_parquet_row_groups_loaded = 39;
+        profile.cold_parquet_row_group_load_batches = 12;
         profile.cold_parquet_position_page_index_loaded = true;
         profile.cold_parquet_position_column_index_loaded = true;
         profile.cold_parquet_position_pages_total = 51;
@@ -4106,6 +4112,7 @@ mod tests {
         assert!(lines[7].contains("untouched=10"));
         assert!(lines[7].contains("metadata_probes=41"));
         assert!(lines[7].contains("loaded=39"));
+        assert!(lines[7].contains("load_batches=12"));
         assert!(lines[8].contains("cold_parquet_pages position_page_index_loaded=true"));
         assert!(lines[8].contains("position_pages_total=51"));
         assert!(lines[8].contains("position_bloom_filter_row_groups=52"));

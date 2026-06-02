@@ -17,6 +17,7 @@ use crate::warm_cache::reader::projection_for_existing_roots;
 
 const DEFAULT_COLD_PARQUET_BATCH_SIZE: usize = 262_144;
 const DEFAULT_COLD_PARQUET_ROW_GROUP_CACHE: usize = 2;
+const DEFAULT_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE: usize = 64;
 
 #[derive(Debug)]
 pub struct ColdParquetLookup {
@@ -32,6 +33,7 @@ pub struct ColdParquetLookup {
     row_groups_touched: Vec<bool>,
     row_groups_unique_touched: u64,
     pub row_groups_loaded: u64,
+    pub row_group_load_batches: u64,
     pub row_group_cache_hits: u64,
     pub row_group_cache_misses: u64,
     pub rows_loaded: u64,
@@ -64,6 +66,12 @@ struct CachedColdRowGroup {
     row_group_id: usize,
     row_ranges: Option<Vec<Range<usize>>>,
     chunk: WarmChunkContext,
+}
+
+#[derive(Debug, Clone)]
+struct RowGroupLoadSpec {
+    row_group_id: usize,
+    row_ranges: Option<Vec<Range<usize>>>,
 }
 
 #[derive(Debug, Default)]
@@ -156,6 +164,7 @@ impl ColdParquetLookup {
             row_groups_touched: vec![false; row_group_count],
             row_groups_unique_touched: 0,
             row_groups_loaded: 0,
+            row_group_load_batches: 0,
             row_group_cache_hits: 0,
             row_group_cache_misses: 0,
             rows_loaded: 0,
@@ -298,12 +307,14 @@ impl ColdParquetLookup {
         }
 
         let result = (|| {
-            let mut full_row_group_ids = full_row_groups.iter().copied().collect::<Vec<_>>();
-            full_row_group_ids.sort_unstable();
-            for row_group_id in full_row_group_ids {
-                self.ensure_row_group(row_group_id, None)?;
-            }
-
+            let mut load_specs = full_row_groups
+                .iter()
+                .copied()
+                .map(|row_group_id| RowGroupLoadSpec {
+                    row_group_id,
+                    row_ranges: None,
+                })
+                .collect::<Vec<_>>();
             let mut ranged_row_groups = ranges_by_row_group.into_iter().collect::<Vec<_>>();
             ranged_row_groups.sort_by_key(|(row_group_id, _)| *row_group_id);
             for (row_group_id, mut row_ranges) in ranged_row_groups {
@@ -311,8 +322,13 @@ impl ColdParquetLookup {
                     continue;
                 }
                 merge_row_ranges(&mut row_ranges);
-                self.ensure_row_group(row_group_id, Some(row_ranges))?;
+                load_specs.push(RowGroupLoadSpec {
+                    row_group_id,
+                    row_ranges: Some(row_ranges),
+                });
             }
+            load_specs.sort_by_key(|spec| spec.row_group_id);
+            self.ensure_row_groups(load_specs)?;
 
             self.record_page_probe_stats(probe_stats);
             Ok(())
@@ -354,6 +370,7 @@ impl ColdParquetLookup {
         let started = Instant::now();
         let chunk = self.load_row_group(row_group_id, row_ranges.as_deref())?;
         self.load_time += started.elapsed();
+        self.row_group_load_batches += 1;
         self.rows_loaded += chunk.batch.num_rows() as u64;
         self.row_groups_loaded += 1;
         if !self.row_groups_touched[row_group_id] {
@@ -370,6 +387,50 @@ impl ColdParquetLookup {
             self.cache.pop_front();
         }
         Ok(self.cache.len() - 1)
+    }
+
+    fn ensure_row_groups(&mut self, specs: Vec<RowGroupLoadSpec>) -> Result<()> {
+        let mut to_load = Vec::new();
+        for spec in specs {
+            if self.cache.iter().any(|cached| {
+                cached.row_group_id == spec.row_group_id
+                    && cached_row_ranges_cover(
+                        cached.row_ranges.as_deref(),
+                        spec.row_ranges.as_deref(),
+                    )
+            }) {
+                self.row_group_cache_hits += 1;
+            } else {
+                self.row_group_cache_misses += 1;
+                to_load.push(spec);
+            }
+        }
+
+        for chunk_specs in to_load.chunks(cold_parquet_prefetch_row_group_batch_size()) {
+            let started = Instant::now();
+            let chunks = self.load_row_groups(chunk_specs)?;
+            self.load_time += started.elapsed();
+            self.row_group_load_batches += 1;
+            for (spec, chunk) in chunk_specs.iter().zip(chunks) {
+                self.rows_loaded += chunk.batch.num_rows() as u64;
+                self.row_groups_loaded += 1;
+                if !self.row_groups_touched[spec.row_group_id] {
+                    self.row_groups_touched[spec.row_group_id] = true;
+                    self.row_groups_unique_touched += 1;
+                }
+
+                self.cache.push_back(CachedColdRowGroup {
+                    row_group_id: spec.row_group_id,
+                    row_ranges: spec.row_ranges.clone(),
+                    chunk,
+                });
+            }
+            while self.cache.len() > self.max_cached_row_groups {
+                self.cache.pop_front();
+            }
+        }
+
+        Ok(())
     }
 
     fn load_row_group(
@@ -415,6 +476,89 @@ impl ColdParquetLookup {
         };
 
         WarmChunkContext::try_new_without_variant_index(row_group_id, batch)
+    }
+
+    fn load_row_groups(&self, specs: &[RowGroupLoadSpec]) -> Result<Vec<WarmChunkContext>> {
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mask = projection_for_existing_roots(
+            self.metadata.schema(),
+            self.metadata.parquet_schema(),
+            &self.projection_columns,
+        );
+        let file = File::open(&self.path).map_err(|error| {
+            DataFusionError::Execution(format!(
+                "failed to open cold variation parquet '{}': {error}",
+                self.path.display()
+            ))
+        })?;
+        let row_groups = specs
+            .iter()
+            .map(|spec| spec.row_group_id)
+            .collect::<Vec<_>>();
+        let mut selected_ranges = Vec::new();
+        let mut selected_rows_by_group = Vec::with_capacity(specs.len());
+        let mut selected_group_total_rows = 0usize;
+        for spec in specs {
+            let row_group_rows = self.cursor.row_groups[spec.row_group_id].rows;
+            match spec.row_ranges.as_deref() {
+                Some(row_ranges) if !row_ranges.is_empty() => {
+                    let mut selected_rows = 0usize;
+                    for range in row_ranges {
+                        let start = selected_group_total_rows.saturating_add(range.start);
+                        let end = selected_group_total_rows.saturating_add(range.end);
+                        selected_rows = selected_rows.saturating_add(range.end - range.start);
+                        selected_ranges.push(start..end);
+                    }
+                    selected_rows_by_group.push(selected_rows);
+                }
+                _ => {
+                    selected_ranges.push(
+                        selected_group_total_rows
+                            ..selected_group_total_rows.saturating_add(row_group_rows),
+                    );
+                    selected_rows_by_group.push(row_group_rows);
+                }
+            }
+            selected_group_total_rows = selected_group_total_rows.saturating_add(row_group_rows);
+        }
+
+        let mut builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.metadata.clone())
+                .with_projection(mask)
+                .with_row_groups(row_groups)
+                .with_batch_size(self.batch_size);
+        let selection = RowSelection::from_consecutive_ranges(
+            selected_ranges.into_iter(),
+            selected_group_total_rows,
+        );
+        builder = builder.with_row_selection(selection);
+        let reader = builder.build()?;
+        let batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
+        let batch = match batches.as_slice() {
+            [] => {
+                return Err(DataFusionError::Execution(
+                    "batched cold row group load produced no batches".into(),
+                ));
+            }
+            [single] => single.clone(),
+            _ => concat_batches(&batches[0].schema(), batches.iter())
+                .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?,
+        };
+
+        let mut chunks = Vec::with_capacity(specs.len());
+        let mut offset = 0usize;
+        for (spec, selected_rows) in specs.iter().zip(selected_rows_by_group) {
+            let group_batch = batch.slice(offset, selected_rows);
+            offset = offset.saturating_add(selected_rows);
+            chunks.push(WarmChunkContext::try_new_without_variant_index(
+                spec.row_group_id,
+                group_batch,
+            )?);
+        }
+        Ok(chunks)
     }
 
     fn candidate_page_row_ranges(
@@ -567,6 +711,7 @@ impl ColdParquetLookup {
             row_groups_total: self.cursor.row_groups.len() as u64,
             row_groups_unique_touched: self.row_groups_unique_touched,
             row_groups_loaded: self.row_groups_loaded,
+            row_group_load_batches: self.row_group_load_batches,
             row_group_cache_hits: self.row_group_cache_hits,
             row_group_cache_misses: self.row_group_cache_misses,
             rows_loaded: self.rows_loaded,
@@ -837,6 +982,7 @@ pub struct ColdParquetStats {
     pub row_groups_total: u64,
     pub row_groups_unique_touched: u64,
     pub row_groups_loaded: u64,
+    pub row_group_load_batches: u64,
     pub row_group_cache_hits: u64,
     pub row_group_cache_misses: u64,
     pub rows_loaded: u64,
@@ -869,6 +1015,7 @@ impl std::ops::AddAssign for ColdParquetStats {
         self.row_groups_total += rhs.row_groups_total;
         self.row_groups_unique_touched += rhs.row_groups_unique_touched;
         self.row_groups_loaded += rhs.row_groups_loaded;
+        self.row_group_load_batches += rhs.row_group_load_batches;
         self.row_group_cache_hits += rhs.row_group_cache_hits;
         self.row_group_cache_misses += rhs.row_group_cache_misses;
         self.rows_loaded += rhs.rows_loaded;
@@ -1210,6 +1357,14 @@ pub fn cold_parquet_row_group_cache() -> usize {
         .max(1)
 }
 
+pub fn cold_parquet_prefetch_row_group_batch_size() -> usize {
+    std::env::var("VEP_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE)
+        .max(1)
+}
+
 pub fn cold_parquet_load_page_index() -> bool {
     std::env::var("VEP_COLD_PARQUET_LOAD_PAGE_INDEX")
         .ok()
@@ -1358,6 +1513,7 @@ mod tests {
             row_groups_touched: vec![false; row_group_count],
             row_groups_unique_touched: 0,
             row_groups_loaded: 0,
+            row_group_load_batches: 0,
             row_group_cache_hits: 0,
             row_group_cache_misses: 0,
             rows_loaded: 0,
@@ -1518,6 +1674,60 @@ mod tests {
 
         assert_eq!(lookup.row_groups_loaded, 1);
         assert_eq!(lookup.row_group_cache_hits, 2);
+    }
+
+    #[test]
+    fn cold_lookup_prefetch_batches_multiple_row_group_loads() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("cold.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![
+                    position_key("1", 10).unwrap(),
+                    position_key("1", 10).unwrap(),
+                    position_key("1", 20).unwrap(),
+                    position_key("1", 20).unwrap(),
+                    position_key("1", 30).unwrap(),
+                    position_key("1", 30).unwrap(),
+                    position_key("1", 40).unwrap(),
+                    position_key("1", 40).unwrap(),
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "A/G", "A/T", "A/G", "A/T", "A/G", "A/T", "A/G", "A/T",
+                ])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 10, 20, 20, 30, 30, 40, 40])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0, 0, 0, 0, 0, 0, 0, 0])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(2)
+            .set_write_batch_size(2)
+            .set_data_page_row_count_limit(2)
+            .build();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let mut lookup = open_test_lookup_with_page_index(&path);
+        lookup
+            .prefetch_positions_retaining([
+                position_key("1", 10).unwrap(),
+                position_key("1", 30).unwrap(),
+            ])
+            .unwrap();
+
+        assert_eq!(lookup.row_groups_loaded, 2);
+        assert_eq!(lookup.row_group_load_batches, 1);
+        assert_eq!(lookup.rows_loaded, 4);
     }
 
     #[test]
