@@ -886,7 +886,9 @@ fn create_writer(
             ),
         ]));
     if tier == "cold" {
-        props = props.set_data_page_row_count_limit(args.cold_data_page_row_count);
+        props = props
+            .set_data_page_row_count_limit(args.cold_data_page_row_count)
+            .set_write_batch_size(args.cold_data_page_row_count);
     }
     let props = props.build();
     let file = File::create(path)?;
