@@ -227,7 +227,7 @@ Target fragment sizing:
 
 ```text
 initial target: 8,192 rows per fragment-equivalent unit
-benchmark range: 4,096 to 16,384 rows
+benchmark range: 512 to 16,384 rows
 ```
 
 Position boundary invariant:
@@ -698,6 +698,6 @@ These are implementation choices to settle during planning, not design ambiguiti
 
 - Whether a single Lance dataset can cleanly hold tier-specific fragment encodings.
 - Exact warm fragment size after benchmarking 250k, 500k, and 1M rows.
-- Exact cold fragment-equivalent size after benchmarking 4,096, 8,192, and 16,384 rows.
+- Exact cold fragment-equivalent size after benchmarking 512, 1,024, 2,048, 4,096, 8,192, and 16,384 rows.
 - Whether `gnomADg*` should remain unpacked in 2.2 if full-scan throughput is better.
 - Whether `variant_keys` should be materialized in cold Lance or remain sidecar-only.
