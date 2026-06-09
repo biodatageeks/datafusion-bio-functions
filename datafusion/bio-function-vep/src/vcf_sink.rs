@@ -139,10 +139,10 @@ struct VepConcurrencyPlan {
 
 impl VepConcurrencyPlan {
     fn from_config(config: &AnnotateVcfConfig) -> Self {
-        Self::from_forks(config.forks.unwrap_or(0))
+        Self::from_forks(config.forks.unwrap_or(0), config.lookup_partitions.max(1))
     }
 
-    fn from_forks(forks: usize) -> Self {
+    fn from_forks(forks: usize, lookup_partitions: usize) -> Self {
         if forks == 0 {
             return Self {
                 lookup_partitions: 1,
@@ -154,7 +154,7 @@ impl VepConcurrencyPlan {
 
         let chromosome_lanes = forks.max(1);
         Self {
-            lookup_partitions: 1,
+            lookup_partitions,
             chromosome_lanes,
             inline_lookup: false,
             spawn_vcf_provider_open: true,
@@ -729,6 +729,8 @@ pub struct AnnotateVcfConfig {
     /// single-lane path with no helper lookup task; `Some(n)` runs up to `n`
     /// contigs concurrently.
     pub forks: Option<usize>,
+    /// DataFusion partitions used by the per-contig variation lookup.
+    pub lookup_partitions: usize,
     /// Output compression type.
     pub compression: VcfCompressionType,
     /// Show an indicatif progress bar on stderr (for Rust CLI).
@@ -771,6 +773,7 @@ impl Default for AnnotateVcfConfig {
             distance: None,
             buffer_size: VEP_DEFAULT_BUFFER_SIZE,
             forks: Some(0),
+            lookup_partitions: 1,
             compression: VcfCompressionType::Plain,
             show_progress: false,
             on_batch_written: None,
@@ -784,6 +787,7 @@ impl std::fmt::Debug for AnnotateVcfConfig {
             .field("everything", &self.everything)
             .field("buffer_size", &self.buffer_size)
             .field("forks", &self.forks)
+            .field("lookup_partitions", &self.lookup_partitions)
             .field("compression", &self.compression)
             .field("show_progress", &self.show_progress)
             .field("on_batch_written", &self.on_batch_written.is_some())
@@ -876,9 +880,14 @@ impl AnnotateVcfConfig {
             serde_json::Value::Number(serde_json::Number::from(self.buffer_size)),
         );
         if let Some(forks) = self.forks {
+            let worker_forks = if forks == 0 {
+                0
+            } else {
+                self.lookup_partitions.max(1)
+            };
             opts.insert(
                 "forks".into(),
-                serde_json::Value::Number(serde_json::Number::from(forks)),
+                serde_json::Value::Number(serde_json::Number::from(worker_forks)),
             );
             opts.insert("inline_lookup".into(), serde_json::Value::Bool(forks == 0));
         }
@@ -1359,12 +1368,13 @@ mod tests {
     fn test_forks_nonzero_uses_fork_count_for_chromosome_lanes() {
         let config = AnnotateVcfConfig {
             forks: Some(4),
+            lookup_partitions: 3,
             ..Default::default()
         };
 
         let plan = VepConcurrencyPlan::from_config(&config);
 
-        assert_eq!(plan.lookup_partitions, 1);
+        assert_eq!(plan.lookup_partitions, 3);
         assert_eq!(plan.chromosome_lanes, 4);
         assert!(!plan.inline_lookup);
         assert!(plan.spawn_vcf_provider_open);
@@ -1388,13 +1398,14 @@ mod tests {
     fn test_to_options_json_emits_only_forks_for_chromosome_lanes() {
         let config = AnnotateVcfConfig {
             forks: Some(8),
+            lookup_partitions: 4,
             ..Default::default()
         };
 
         let json = config.to_options_json();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(value["forks"], 8);
+        assert_eq!(value["forks"], 4);
     }
 
     #[test]
