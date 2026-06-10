@@ -97,6 +97,8 @@ pub struct LookupProvider {
     /// warm/cold parquet tiers plus sidecar indexes, not the legacy interval join.
     #[cfg(feature = "kv-cache")]
     indexed_parquet_cache_root: Option<PathBuf>,
+    /// Maximum number of independent cold-Parquet readers used by lookup.
+    target_partitions: usize,
     /// Optional filter to apply to the VCF input (e.g., `chrom = 'chr1'`
     /// for per-contig partitioned annotation).
     vcf_filter: Option<Expr>,
@@ -178,6 +180,7 @@ impl LookupProvider {
             partition_colocated_sinks: None,
             #[cfg(feature = "kv-cache")]
             indexed_parquet_cache_root: None,
+            target_partitions: 1,
             vcf_filter: None,
         })
     }
@@ -195,6 +198,10 @@ impl LookupProvider {
     #[cfg(feature = "kv-cache")]
     pub fn set_indexed_parquet_cache_root(&mut self, root: impl Into<PathBuf>) {
         self.indexed_parquet_cache_root = Some(root.into());
+    }
+
+    pub fn set_target_partitions(&mut self, target_partitions: usize) {
+        self.target_partitions = target_partitions.max(1);
     }
 
     /// Set an optional filter to apply to VCF input before lookup.
@@ -301,6 +308,7 @@ impl TableProvider for LookupProvider {
                     self.allowed_failed,
                 )?;
                 exec = exec.with_reference_fasta_path(settings.reference_fasta_path);
+                exec = exec.with_target_partitions(self.target_partitions);
                 if let Some(ref sink) = self.colocated_sink {
                     exec = exec.with_colocated_sink(Arc::clone(sink));
                 }

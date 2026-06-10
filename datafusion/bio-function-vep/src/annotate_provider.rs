@@ -4577,6 +4577,13 @@ impl AnnotateProvider {
             .and_then(|opts| Self::parse_json_i64_option(opts, "forks"))
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(0);
+        let target_partitions = self
+            .options_json
+            .as_deref()
+            .and_then(|opts| Self::parse_json_i64_option(opts, "target_partitions"))
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
         let chromosome_lanes = self
             .options_json
             .as_deref()
@@ -4665,6 +4672,7 @@ impl AnnotateProvider {
             upstream_distance,
             downstream_distance,
             input_buffer_size,
+            target_partitions,
             projection: projection.cloned(),
             annotation_column_count: self.annotation_column_count(),
             fetch_limit,
@@ -7717,6 +7725,8 @@ struct ContigAnnotationConfig {
     upstream_distance: i64,
     downstream_distance: i64,
     input_buffer_size: usize,
+    /// Independent cold-Parquet lookup readers; does not repartition context scans.
+    target_partitions: usize,
     projection: Option<Vec<usize>>,
     annotation_column_count: usize,
     /// Maximum number of output rows (LIMIT pushdown).
@@ -10524,6 +10534,7 @@ async fn prepare_contig_context(
         config.reference_fasta_path.clone(),
     )?;
     provider.set_vcf_filter(Some(col("chrom").eq(lit(&*chrom))));
+    provider.set_target_partitions(config.target_partitions);
     #[cfg(feature = "kv-cache")]
     if let Some(root) = &config.indexed_parquet_cache_root {
         provider.set_indexed_parquet_cache_root(root.clone());
@@ -11153,6 +11164,7 @@ mod tests {
             upstream_distance: 5000,
             downstream_distance: 5000,
             input_buffer_size: VEP_INPUT_BUFFER_SIZE,
+            target_partitions: 1,
             projection: None,
             annotation_column_count: 0,
             fetch_limit: None,
