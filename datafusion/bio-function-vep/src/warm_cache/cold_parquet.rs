@@ -9,7 +9,8 @@ use datafusion::common::{DataFusionError, Result};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
 };
-use parquet::file::page_index::index::Index;
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use parquet::file::page_index::offset_index::PageLocation;
 use parquet::file::statistics::Statistics;
 
 use crate::warm_cache::chunk::WarmChunkContext;
@@ -614,7 +615,7 @@ impl ColdParquetLookup {
             stats.unavailable_probes += 1;
             return None;
         };
-        let Index::INT64(position_index) = position_index else {
+        let ColumnIndexMetaData::INT64(position_index) = position_index else {
             stats.unavailable_probes += 1;
             return None;
         };
@@ -629,14 +630,20 @@ impl ColdParquetLookup {
         stats.pages_in_probed_row_groups += page_locations.len() as u64;
 
         let mut row_ranges = Vec::new();
-        for (page_idx, page_index) in position_index.indexes.iter().enumerate() {
+        for (page_idx, page_location) in page_locations.iter().enumerate() {
             if page_idx >= page_locations.len() {
                 continue;
             }
-            let Some(min) = page_index.min.and_then(|value| u64::try_from(value).ok()) else {
+            let Some(min) = position_index
+                .min_value(page_idx)
+                .and_then(|value| u64::try_from(*value).ok())
+            else {
                 continue;
             };
-            let Some(max) = page_index.max.and_then(|value| u64::try_from(value).ok()) else {
+            let Some(max) = position_index
+                .max_value(page_idx)
+                .and_then(|value| u64::try_from(*value).ok())
+            else {
                 continue;
             };
             if position_key < min || position_key > max {
@@ -648,7 +655,7 @@ impl ColdParquetLookup {
                 page_idx,
                 self.cursor.row_groups[row_group_id].rows,
             );
-            let start = page_locations[page_idx].first_row_index as usize;
+            let start = page_location.first_row_index as usize;
             let end = start.saturating_add(rows);
             stats.candidate_pages += 1;
             stats.candidate_rows += rows as u64;
@@ -1291,7 +1298,7 @@ fn cold_page_layout_stats(
 }
 
 fn page_row_count(
-    page_locations: &[parquet::format::PageLocation],
+    page_locations: &[PageLocation],
     page_idx: usize,
     row_group_rows: usize,
 ) -> usize {

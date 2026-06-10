@@ -23,6 +23,7 @@ Run with pylance 7.0.0:
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import platform
@@ -41,9 +42,14 @@ import pyarrow.parquet as pq
 
 
 GIB = 1024**3
+POSITION_BITS = 48
 DEFAULT_CACHE_DIR = Path("/Users/mwiewior/workspace/data_vepyr/115_GRCh38_merged")
 DEFAULT_OUTPUT_DIR = Path("/Users/mwiewior/workspace/data_vepyr/lance_variation_chr1_bench")
 DEFAULT_REPORT_DIR = Path("research/reports")
+DEFAULT_VCF_DIR = Path("/Users/mwiewior/research/git/vepyr/e2e-testing/results")
+
+CHROM_CODES = {str(i): i for i in range(1, 23)}
+CHROM_CODES.update({"X": 0x0017, "Y": 0x0018, "MT": 0x0019})
 
 AF_1KG_COLUMNS = ["AF", "AFR", "AMR", "EAS", "EUR", "SAS"]
 AF_GNOMADE_COLUMNS = [
@@ -186,6 +192,121 @@ class BenchStats:
     columns: int
     path: str
     notes: str = ""
+
+
+def chrom_code(chrom: str) -> int:
+    bare = chrom.removeprefix("chr")
+    return CHROM_CODES[bare]
+
+
+def position_key(chrom: str, start: int) -> int:
+    return (chrom_code(chrom) << POSITION_BITS) | start
+
+
+def common_prefix_len(left: str, right: str) -> int:
+    n = 0
+    for a, b in zip(left.encode(), right.encode()):
+        if a != b:
+            break
+        n += 1
+    return n
+
+
+def canonical_event_lengths(ref: str, alt: str) -> tuple[int, int]:
+    ref_b = ref.encode()
+    alt_b = alt.encode()
+    ref_start = 0
+    alt_start = 0
+    while ref_start < len(ref_b) and alt_start < len(alt_b) and ref_b[ref_start] == alt_b[alt_start]:
+        ref_start += 1
+        alt_start += 1
+
+    ref_end = len(ref_b)
+    alt_end = len(alt_b)
+    while ref_end > ref_start and alt_end > alt_start and ref_b[ref_end - 1] == alt_b[alt_end - 1]:
+        ref_end -= 1
+        alt_end -= 1
+
+    return ref_end - ref_start, alt_end - alt_start
+
+
+def vcf_to_vep_input_start(start: int, ref: str, alt: str) -> int:
+    prefix = common_prefix_len(ref, alt)
+    if prefix > 0 and (len(ref) > prefix or len(alt) > prefix):
+        return start + prefix
+    return start
+
+
+def push_unique(values: list[int], value: int) -> None:
+    if value not in values:
+        values.append(value)
+
+
+def build_probe_starts(start: int, end: int, ref: str, alt_field: str, extended: bool = True) -> list[int]:
+    probes: list[int] = []
+    push_unique(probes, start)
+    if not extended:
+        return probes
+
+    if start == end:
+        push_unique(probes, start + 1)
+    else:
+        push_unique(probes, end)
+
+    for alt in [a for item in alt_field.split(",") for a in item.split("|") if a]:
+        push_unique(probes, vcf_to_vep_input_start(start, ref, alt))
+        shift = common_prefix_len(ref, alt)
+        if shift:
+            push_unique(probes, start + shift)
+
+    for alt in [a for item in alt_field.split(",") for a in item.split("|") if a]:
+        ref_event_len, alt_event_len = canonical_event_lengths(ref, alt)
+        if ref_event_len == 0 or alt_event_len != 0:
+            continue
+        del_len = ref_event_len
+        max_shift = min(del_len, 32)
+        for base_start in (start, start - 1):
+            for shift in range(max_shift + 1):
+                candidate_start = base_start + shift
+                candidate_end = candidate_start + del_len - 1
+                if candidate_start > end or candidate_end < start:
+                    continue
+                push_unique(probes, candidate_start)
+
+    return probes
+
+
+def unique_preserving_order(values: Iterable[int]) -> list[int]:
+    seen: set[int] = set()
+    unique: list[int] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
+
+
+def load_vcf_probe_keys(vcf: Path, chrom: str, extended: bool = True) -> tuple[list[int], list[int], int]:
+    all_keys: list[int] = []
+    row_count = 0
+    with gzip.open(vcf, "rt") as handle:
+        for line in handle:
+            if line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            row_chrom, pos_s, ref, alt = fields[0], fields[1], fields[3], fields[4]
+            pos = int(pos_s)
+            end = pos + len(ref) - 1
+            row_count += 1
+            for probe in build_probe_starts(pos, end, ref, alt, extended):
+                all_keys.append(position_key(row_chrom or chrom, probe))
+    return all_keys, unique_preserving_order(all_keys), row_count
+
+
+def chunks(values: Sequence[int], size: int) -> Iterator[list[int]]:
+    for i in range(0, len(values), size):
+        yield list(values[i : i + size])
 
 
 def storage_version_for_variant(variant: str) -> str:
@@ -652,6 +773,118 @@ def bench_lance_point_lookup(
     )
 
 
+def bench_parquet_probe_batches(
+    source_path: Path,
+    tier: str,
+    logical_columns: Sequence[str],
+    keys: Sequence[int],
+    workload_batch_size: int,
+    operation: str,
+) -> tuple[dict[str, Any], set[int]]:
+    source_schema = pq.ParquetFile(source_path).schema_arrow
+    columns = [name for name in logical_columns if name in source_schema.names]
+    dataset = ds.dataset(source_path, format="parquet")
+    rows = 0
+    selected_positions: set[int] = set()
+    batch_count = 0
+    started = time.perf_counter()
+    for key_chunk in chunks(keys, workload_batch_size):
+        unique_chunk = unique_preserving_order(key_chunk)
+        if not unique_chunk:
+            continue
+        batch_count += 1
+        table = dataset.to_table(
+            columns=columns,
+            filter=ds.field("position_key").isin(pa.array(unique_chunk, type=pa.uint64())),
+            batch_readahead=16,
+            fragment_readahead=8,
+        )
+        rows += table.num_rows
+        if table.num_rows:
+            selected_positions.update(table.column("position_key").to_pylist())
+    seconds = time.perf_counter() - started
+    return (
+        {
+            **asdict(
+                BenchStats(
+                    variant="parquet-current",
+                    tier=tier,
+                    operation=operation,
+                    fragment_rows=None,
+                    rows=rows,
+                    seconds=seconds,
+                    rows_per_s=rows / seconds if seconds > 0 else 0.0,
+                    artifact_gib=source_path.stat().st_size / GIB,
+                    columns=len(columns),
+                    path=str(source_path),
+                )
+            ),
+            "probe_keys": len(keys),
+            "unique_probe_keys": len(set(keys)),
+            "selected_positions": len(selected_positions),
+            "batches": batch_count,
+        },
+        selected_positions,
+    )
+
+
+def bench_lance_probe_batches(
+    lance_path: Path,
+    variant: str,
+    tier: str,
+    fragment_rows: int | None,
+    logical_columns: Sequence[str],
+    keys: Sequence[int],
+    workload_batch_size: int,
+    operation: str,
+) -> tuple[dict[str, Any], set[int]]:
+    projection = physical_projection_for_variant(variant, logical_columns)
+    dataset = lance.dataset(lance_path)
+    rows = 0
+    selected_positions: set[int] = set()
+    batch_count = 0
+    started = time.perf_counter()
+    for key_chunk in chunks(keys, workload_batch_size):
+        unique_chunk = unique_preserving_order(key_chunk)
+        if not unique_chunk:
+            continue
+        batch_count += 1
+        table = dataset.to_table(
+            columns=projection,
+            filter=lance_filter(unique_chunk),
+            use_scalar_index=True,
+            prefilter=True,
+            late_materialization=True,
+        )
+        rows += table.num_rows
+        if table.num_rows:
+            selected_positions.update(table.column("position_key").to_pylist())
+    seconds = time.perf_counter() - started
+    return (
+        {
+            **asdict(
+                BenchStats(
+                    variant=variant,
+                    tier=tier,
+                    operation=operation,
+                    fragment_rows=fragment_rows,
+                    rows=rows,
+                    seconds=seconds,
+                    rows_per_s=rows / seconds if seconds > 0 else 0.0,
+                    artifact_gib=dir_bytes(lance_path) / GIB,
+                    columns=len(projection),
+                    path=str(lance_path),
+                )
+            ),
+            "probe_keys": len(keys),
+            "unique_probe_keys": len(set(keys)),
+            "selected_positions": len(selected_positions),
+            "batches": batch_count,
+        },
+        selected_positions,
+    )
+
+
 def result_markdown_table(rows: Sequence[dict[str, Any]]) -> str:
     lines = [
         "| variant | tier | operation | rows | seconds | rows/s | artifact GiB |",
@@ -673,6 +906,7 @@ def build_markdown_report(report: dict[str, Any]) -> str:
         for row in report["results"]
         if row["tier"] == "cold" and row["variant"] != "parquet-current"
     ]
+    workload_rows = [row for row in report["results"] if row["operation"].startswith("vepyr_")]
     lines = [
         f"# Lance Variation chr1 Benchmark",
         "",
@@ -684,6 +918,8 @@ def build_markdown_report(report: dict[str, Any]) -> str:
         f"- Chromosome: `{config['chrom']}`",
         f"- Variants: `{', '.join(config['variants'])}`",
         f"- Cold sample size: `{config['cold_sample_size']}` position keys",
+        f"- VEPyr workload VCF: `{config.get('vcf_path') or 'not requested'}`",
+        f"- VEPyr workload batch size: `{config['workload_batch_size']}` probe keys",
         f"- Cold fragment row range: `{', '.join(str(v) for v in config['cold_fragment_rows'])}`",
         f"- Row limit: `{config['row_limit'] if config['row_limit'] is not None else 'full chr1'}`",
         "",
@@ -691,11 +927,38 @@ def build_markdown_report(report: dict[str, Any]) -> str:
         "",
         result_markdown_table(report["results"]),
         "",
+        "## VEPyr Workload Detail",
+        "",
+        "| variant | tier | operation | row-group rows | probe keys | unique probes | selected positions | selected rows | batches | seconds |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in workload_rows:
+        lines.append(
+            f"| {row['variant']} | {row['tier']} | {row['operation']} | "
+            f"{row.get('fragment_rows') or ''} | {row.get('probe_keys', '')} | "
+            f"{row.get('unique_probe_keys', '')} | {row.get('selected_positions', '')} | "
+            f"{row['rows']} | {row.get('batches', '')} | {row['seconds']:.3f} |"
+        )
+    if workload_rows:
+        lines.extend(
+            [
+                "",
+                "The VEPyr workload uses `input_chr1.vcf.gz` to build extended probe positions, probes warm first, then sends only warm-miss positions to cold in 2,000-key batches. It is a position-level I/O proxy and does not apply the Rust allele matcher or cold variant Bloom sidecar.",
+                f"Parquet VEPyr workload measurement: `{'enabled' if config.get('parquet_workload') else 'skipped'}`.",
+                "",
+            ]
+        )
+    else:
+        lines.append("")
+
+    lines.extend(
+        [
         "## Cold Fragment Detail",
         "",
         "| variant | row-group rows | lookup rows | seconds | rows/s | artifact GiB |",
         "|---|---:|---:|---:|---:|---:|",
-    ]
+        ]
+    )
     for row in cold_rows:
         lines.append(
             f"| {row['variant']} | {row['fragment_rows']} | {row['rows']} | "
@@ -797,6 +1060,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     warm_logical_columns = logical_columns_available(warm_schema, include_missing_variant_keys=True)
     cold_logical_columns = logical_columns_available(cold_schema, include_missing_variant_keys=True)
 
+    vcf_path = args.vcf_path or (args.vcf_dir / f"fast_{args.chrom}" / f"input_{args.chrom}.vcf.gz")
+    all_probe_keys: list[int] = []
+    unique_probe_keys: list[int] = []
+    vcf_row_count = 0
+    parquet_warm_workload_positions: set[int] = set()
+    if args.vepyr_workload:
+        if not vcf_path.exists():
+            raise FileNotFoundError(vcf_path)
+        print(f"Loading VEPyr workload probes from {vcf_path}")
+        all_probe_keys, unique_probe_keys, vcf_row_count = load_vcf_probe_keys(
+            vcf_path,
+            args.chrom,
+            args.extended_probes,
+        )
+        if args.workload_probe_limit is not None:
+            all_probe_keys = all_probe_keys[: args.workload_probe_limit]
+            unique_probe_keys = unique_preserving_order(all_probe_keys)
+        print(
+            f"Loaded {vcf_row_count} VCF rows, {len(all_probe_keys)} probe keys, "
+            f"{len(unique_probe_keys)} unique probe positions"
+        )
+
     print(f"Sampling {args.cold_sample_size} cold position keys from {cold_path}")
     cold_keys = sample_cold_keys(cold_path, args.cold_sample_size, args.row_limit)
     print(f"Sampled {len(cold_keys)} cold position keys")
@@ -810,8 +1095,40 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     print("Benchmarking current Parquet cold point lookup")
     results.append(asdict(bench_parquet_point_lookup(cold_path, cold_logical_columns, cold_keys, args.row_limit)))
 
+    if args.vepyr_workload and args.parquet_workload:
+        print("Benchmarking current Parquet VEPyr warm probe workload")
+        warm_workload, parquet_warm_workload_positions = bench_parquet_probe_batches(
+            warm_path,
+            "warm",
+            warm_logical_columns,
+            all_probe_keys,
+            args.workload_batch_size,
+            f"vepyr_warm_probe_batches_{args.workload_batch_size}",
+        )
+        results.append(warm_workload)
+        parquet_cold_probe_keys = [key for key in all_probe_keys if key not in parquet_warm_workload_positions]
+        print(
+            f"Benchmarking current Parquet VEPyr cold workload with "
+            f"{len(parquet_cold_probe_keys)} warm-miss probe keys"
+        )
+        cold_workload, parquet_cold_positions = bench_parquet_probe_batches(
+            cold_path,
+            "cold",
+            cold_logical_columns,
+            parquet_cold_probe_keys,
+            args.workload_batch_size,
+            f"vepyr_cold_probe_batches_{args.workload_batch_size}",
+        )
+        cold_workload["warm_selected_positions"] = len(parquet_warm_workload_positions)
+        cold_workload["cold_selected_positions"] = len(parquet_cold_positions)
+        cold_workload["warm_miss_probe_keys"] = len(parquet_cold_probe_keys)
+        results.append(cold_workload)
+    elif args.vepyr_workload:
+        print("Skipping Parquet VEPyr workload measurement")
+
     for variant in variants:
         warm_lance_path = args.output_dir / f"{args.chrom}_warm_{variant}.lance"
+        lance_warm_workload_positions: set[int] = set()
         try:
             print(f"Building {variant} warm Lance dataset at {warm_lance_path}")
             warm_build = build_lance_dataset(
@@ -830,6 +1147,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             builds.append(asdict(warm_build))
             print(f"Benchmarking {variant} warm full scan")
             results.append(asdict(bench_lance_full_scan(warm_lance_path, variant, warm_logical_columns, args.row_limit)))
+            if args.vepyr_workload:
+                print(f"Benchmarking {variant} VEPyr warm probe workload")
+                warm_workload, lance_warm_workload_positions = bench_lance_probe_batches(
+                    warm_lance_path,
+                    variant,
+                    "warm",
+                    None,
+                    warm_logical_columns,
+                    all_probe_keys,
+                    args.workload_batch_size,
+                    f"vepyr_warm_probe_batches_{args.workload_batch_size}",
+                )
+                results.append(warm_workload)
         except Exception as exc:  # pragma: no cover - report operational failures.
             errors.append({"variant": variant, "tier": "warm", "fragment_rows": args.warm_fragment_rows, "error": repr(exc)})
             print(f"ERROR warm {variant}: {exc!r}")
@@ -864,6 +1194,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         )
                     )
                 )
+                if args.vepyr_workload:
+                    cold_probe_keys = [key for key in all_probe_keys if key not in lance_warm_workload_positions]
+                    print(
+                        f"Benchmarking {variant} VEPyr cold workload fr={fragment_rows} with "
+                        f"{len(cold_probe_keys)} warm-miss probe keys"
+                    )
+                    cold_workload, cold_positions = bench_lance_probe_batches(
+                        cold_lance_path,
+                        variant,
+                        "cold",
+                        fragment_rows,
+                        cold_logical_columns,
+                        cold_probe_keys,
+                        args.workload_batch_size,
+                        f"vepyr_cold_probe_batches_{args.workload_batch_size}",
+                    )
+                    cold_workload["warm_selected_positions"] = len(lance_warm_workload_positions)
+                    cold_workload["cold_selected_positions"] = len(cold_positions)
+                    cold_workload["warm_miss_probe_keys"] = len(cold_probe_keys)
+                    results.append(cold_workload)
             except Exception as exc:  # pragma: no cover - report operational failures.
                 errors.append({"variant": variant, "tier": "cold", "fragment_rows": fragment_rows, "error": repr(exc)})
                 print(f"ERROR cold {variant} fr={fragment_rows}: {exc!r}")
@@ -881,6 +1231,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "row_limit": args.row_limit,
             "batch_size": args.batch_size,
             "unsafe_packed_metadata": args.unsafe_packed_metadata,
+            "vcf_path": str(vcf_path) if args.vepyr_workload else None,
+            "vcf_dir": str(args.vcf_dir),
+            "extended_probes": args.extended_probes,
+            "vepyr_workload": args.vepyr_workload,
+            "parquet_workload": args.parquet_workload,
+            "workload_batch_size": args.workload_batch_size,
+            "workload_probe_limit": args.workload_probe_limit,
         },
         "environment": {
             "lance_version": lance.__version__,
@@ -898,6 +1255,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "warm_projection": warm_logical_columns,
             "cold_projection": cold_logical_columns,
             "cold_sampled_keys": len(cold_keys),
+            "vcf_rows": vcf_row_count,
+            "vcf_probe_keys": len(all_probe_keys),
+            "vcf_unique_probe_keys": len(unique_probe_keys),
+            "parquet_warm_workload_positions": len(parquet_warm_workload_positions),
         },
         "builds": builds,
         "results": results,
@@ -917,6 +1278,8 @@ def main() -> None:
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR)
+    parser.add_argument("--vcf-dir", type=Path, default=DEFAULT_VCF_DIR)
+    parser.add_argument("--vcf-path", type=Path)
     parser.add_argument("--chrom", default="chr1")
     parser.add_argument("--variants", default="2.1-unpacked,2.2-packed")
     parser.add_argument("--cold-fragment-rows", default="512:16384")
@@ -929,6 +1292,11 @@ def main() -> None:
     parser.add_argument("--force-build", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--unsafe-packed-metadata", action="store_true")
+    parser.add_argument("--vepyr-workload", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--parquet-workload", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--extended-probes", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--workload-batch-size", type=int, default=2000)
+    parser.add_argument("--workload-probe-limit", type=int)
     args = parser.parse_args()
     run(args)
 

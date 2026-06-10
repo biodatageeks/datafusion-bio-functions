@@ -193,12 +193,12 @@ impl KvLookupExec {
         let (schema, output_col_positions) =
             build_lookup_output_schema(input_schema, cache_schema.clone(), &cache_columns);
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             input.output_partitioning().clone(),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Self {
             input,

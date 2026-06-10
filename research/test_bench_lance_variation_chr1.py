@@ -6,7 +6,9 @@ from research.bench_lance_variation_chr1 import (
     AF_GNOMADG_COLUMNS,
     ALWAYS_NULL_COLUMNS,
     EVERYTHING_VARIATION_COLUMNS,
+    build_probe_starts,
     physical_projection_for_variant,
+    position_key,
     result_markdown_table,
     schema_for_variant,
 )
@@ -71,3 +73,9 @@ def test_result_markdown_table_formats_core_metrics() -> None:
     markdown = result_markdown_table(rows)
     assert "| variant | tier | operation | rows | seconds | rows/s | artifact GiB |" in markdown
     assert "| 2.1-unpacked | warm | full_scan | 10 | 2.000 | 5 | 1.250 |" in markdown
+
+
+def test_vcf_probe_helpers_match_extended_probe_shape() -> None:
+    assert position_key("chr1", 1) == (1 << 48) | 1
+    assert build_probe_starts(10, 10, "A", "G", extended=False) == [10]
+    assert build_probe_starts(10, 10, "A", "G", extended=True) == [10, 11]
