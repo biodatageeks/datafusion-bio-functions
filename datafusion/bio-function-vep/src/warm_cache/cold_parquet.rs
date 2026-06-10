@@ -17,7 +17,8 @@ use crate::warm_cache::reader::projection_for_existing_roots;
 
 const DEFAULT_COLD_PARQUET_BATCH_SIZE: usize = 262_144;
 const DEFAULT_COLD_PARQUET_ROW_GROUP_CACHE: usize = 2;
-const DEFAULT_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE: usize = 64;
+const MIN_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE: usize = 64;
+const COLD_PARQUET_PREFETCH_ROW_GROUPS_PER_PARTITION: usize = 32;
 
 #[derive(Debug)]
 pub struct ColdParquetLookup {
@@ -413,7 +414,9 @@ impl ColdParquetLookup {
             }
         }
 
-        for chunk_specs in to_load.chunks(cold_parquet_prefetch_row_group_batch_size()) {
+        for chunk_specs in to_load.chunks(cold_parquet_prefetch_row_group_batch_size(
+            self.target_partitions,
+        )) {
             let started = Instant::now();
             let chunks = self.load_row_groups_partitioned(chunk_specs)?;
             self.load_time += started.elapsed();
@@ -1398,12 +1401,19 @@ pub fn cold_parquet_row_group_cache() -> usize {
         .max(1)
 }
 
-pub fn cold_parquet_prefetch_row_group_batch_size() -> usize {
+pub fn cold_parquet_prefetch_row_group_batch_size(target_partitions: usize) -> usize {
     std::env::var("VEP_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE)
+        .unwrap_or_else(|| default_cold_parquet_prefetch_row_group_batch_size(target_partitions))
         .max(1)
+}
+
+fn default_cold_parquet_prefetch_row_group_batch_size(target_partitions: usize) -> usize {
+    target_partitions
+        .max(1)
+        .saturating_mul(COLD_PARQUET_PREFETCH_ROW_GROUPS_PER_PARTITION)
+        .max(MIN_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE)
 }
 
 pub fn cold_parquet_load_page_index() -> bool {
@@ -1432,6 +1442,15 @@ mod tests {
     use parquet::file::properties::WriterProperties;
 
     use crate::warm_cache::key::position_key;
+
+    #[test]
+    fn cold_prefetch_batch_size_scales_with_reader_count() {
+        assert_eq!(default_cold_parquet_prefetch_row_group_batch_size(1), 64);
+        assert_eq!(default_cold_parquet_prefetch_row_group_batch_size(2), 64);
+        assert_eq!(default_cold_parquet_prefetch_row_group_batch_size(4), 128);
+        assert_eq!(default_cold_parquet_prefetch_row_group_batch_size(8), 256);
+        assert_eq!(default_cold_parquet_prefetch_row_group_batch_size(16), 512);
+    }
 
     #[test]
     fn cold_cursor_advances_monotonically_and_can_step_back_to_cached_group() {
