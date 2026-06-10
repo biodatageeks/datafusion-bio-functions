@@ -2072,6 +2072,7 @@ mod tests {
             gene_hgnc_id: None,
             display_xref_id: None,
             source: None,
+            source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
             is_gencode_basic: false,

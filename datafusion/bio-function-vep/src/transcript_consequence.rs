@@ -221,6 +221,8 @@ pub struct TranscriptFeature {
     /// Transcript source normalized to VEP-facing labels (`Ensembl` / `RefSeq`)
     /// when available.
     pub source: Option<String>,
+    /// Raw VEP `_source_cache` label used for exact pick-order source ranking.
+    pub source_cache: Option<String>,
     /// Pre-formatted REFSEQ_MATCH field, joined with `&` like VEP's VCF output.
     pub refseq_match: Option<String>,
     /// Parsed `_rna_edit*` transcript attributes used for VEP `REFSEQ_OFFSET`.
@@ -573,6 +575,8 @@ pub struct TranscriptConsequence {
     pub distance: Option<i64>,
     /// FLAGS: e.g. "cds_start_NF", "cds_end_NF".
     pub flags: Option<String>,
+    /// VEP `PICK` output flag emitted when this consequence wins a pick mode.
+    pub picked: bool,
     /// Override biotype for non-transcript features (e.g. regulatory feature_type).
     pub biotype_override: Option<String>,
     /// HGVSc notation (e.g. "ENST00000379410.6:c.1043G>A").
@@ -3034,25 +3038,6 @@ fn is_non_coding_biotype(biotype: &str) -> bool {
             | "TR_V_gene"
             | "polymorphic_pseudogene"
     )
-}
-
-/// Returns true for transcript IDs that VEP annotates against.
-/// When `merged` is true (VEP `--merged` mode), both Ensembl and RefSeq
-/// transcripts are accepted.  Default (non-merged) accepts only ENST.
-///
-/// Traceability:
-/// - Ensembl VEP `AnnotationSourceAdaptor::get_all_TranscriptVariations()`
-///   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/AnnotationSourceAdaptor.pm#L173-L220>
-pub fn is_vep_transcript(id: &str, merged: bool) -> bool {
-    if merged {
-        id.starts_with("ENST")
-            || id.starts_with("NM_")
-            || id.starts_with("NR_")
-            || id.starts_with("XM_")
-            || id.starts_with("XR_")
-    } else {
-        id.starts_with("ENST")
-    }
 }
 
 /// Strip only `protein_altering_variant` when specific children are present.
@@ -8305,6 +8290,7 @@ mod tests {
             gene_hgnc_id: None,
             display_xref_id: None,
             source: None,
+            source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
             is_gencode_basic: false,

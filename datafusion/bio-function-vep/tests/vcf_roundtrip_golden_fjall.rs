@@ -13,6 +13,8 @@ use datafusion::prelude::*;
 use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_function_vep::vcf_sink;
 
+mod common;
+
 /// Check if a file is a Git LFS pointer (not actual content).
 fn is_lfs_pointer(path: &std::path::Path) -> bool {
     std::fs::read_to_string(path)
@@ -212,7 +214,6 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
     let input_vcf = workspace_path("vep-benchmark/data/golden/input_1000.vcf");
     let golden_vcf = workspace_path("vep-benchmark/data/golden/golden_1000_vep115.vcf");
     let parquet_cache = workspace_path("vep-benchmark/data/golden/cache");
-    let fjall_cache = workspace_path("vep-benchmark/data/golden/fjall_cache");
     let ref_fasta = workspace_path("vep-benchmark/data/golden/reference_chr1.fa");
 
     if !input_vcf.exists() || !golden_vcf.exists() || is_lfs_pointer(&input_vcf) {
@@ -220,7 +221,12 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
         return;
     }
 
-    // Ensure fjall caches exist (generated from parquet on first run).
+    let parquet_cache_with_metadata = common::cache_with_source_metadata(&parquet_cache, "ensembl");
+    let parquet_cache = parquet_cache_with_metadata.path();
+
+    // Ensure fjall caches exist (generated from metadata-bearing parquet).
+    let fjall_tempdir = tempfile::TempDir::new().unwrap();
+    let fjall_cache = fjall_tempdir.path().join("fjall_cache");
     std::fs::create_dir_all(&fjall_cache).ok();
     let var_fjall = fjall_cache.join("variation.fjall");
     let sift_fjall = fjall_cache.join("translation_sift.fjall");
@@ -236,7 +242,7 @@ async fn test_roundtrip_golden_fjall_all_column_values() {
             .unwrap(),
         sift_fjall.to_str().unwrap(),
     );
-    ensure_context_symlinks(&fjall_cache, &parquet_cache);
+    ensure_context_symlinks(&fjall_cache, parquet_cache);
 
     let input_vcf = input_vcf.to_str().unwrap();
     let golden_vcf = golden_vcf.to_str().unwrap();

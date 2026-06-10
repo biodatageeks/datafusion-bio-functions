@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use datafusion::common::Result;
+use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_bio_format_vcf::serializer::batch_to_vcf_lines;
@@ -14,16 +14,38 @@ use datafusion_bio_format_vcf::table_provider::VcfTableProvider;
 use datafusion_bio_format_vcf::{VcfCompressionType, VcfLocalWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use crate::cache_source::CacheSourceType;
+
 /// Callback invoked after each batch is written to VCF.
 /// Arguments: (rows_in_batch, total_rows_written_so_far, total_input_rows).
 /// `total_input_rows` is 0 if the count was not computed (show_progress=false).
 /// Used by Python wrappers (vepyr) to drive tqdm progress bars in Jupyter.
 pub type OnBatchWritten = Box<dyn Fn(usize, usize, usize) + Send + Sync>;
 
+/// Ensembl VEP release/115 default `--buffer_size`.
+pub const VEP_DEFAULT_BUFFER_SIZE: usize = 5000;
+
 /// Configuration for VCF annotation output.
 pub struct AnnotateVcfConfig {
     /// Enable all annotation features (80-field CSQ, SIFT, PolyPhen, etc.).
     pub everything: bool,
+    /// Emit one consequence per variant (`--pick`).
+    pub pick: bool,
+    /// Emit one consequence per allele (`--pick_allele`).
+    pub pick_allele: bool,
+    /// Emit one consequence per gene and retain non-transcript rows (`--per_gene`).
+    pub per_gene: bool,
+    /// Emit one consequence per allele and gene (`--pick_allele_gene`).
+    pub pick_allele_gene: bool,
+    /// Add standalone `PICK=1` marker for one consequence per variant.
+    pub flag_pick: bool,
+    /// Add standalone `PICK=1` marker for one consequence per allele.
+    pub flag_pick_allele: bool,
+    /// Add standalone `PICK=1` markers for VEP `--flag_pick_allele_gene`.
+    /// VEP also marks retained non-transcript regulatory/motif/intergenic rows.
+    pub flag_pick_allele_gene: bool,
+    /// Override Ensembl VEP's default pick-order ranking.
+    pub pick_order: Option<String>,
     /// Use interval-overlap fallback for shifted indels.
     pub extended_probes: bool,
     /// Path to indexed reference FASTA (required for `everything` / `hgvs`).
@@ -60,6 +82,8 @@ pub struct AnnotateVcfConfig {
     pub failed: Option<i64>,
     /// Upstream/downstream distance for transcript overlap.
     pub distance: Option<String>,
+    /// Number of input variants per VEP-style annotation buffer.
+    pub buffer_size: usize,
     /// Output compression type.
     pub compression: VcfCompressionType,
     /// Show an indicatif progress bar on stderr (for Rust CLI).
@@ -74,6 +98,14 @@ impl Default for AnnotateVcfConfig {
     fn default() -> Self {
         Self {
             everything: false,
+            pick: false,
+            pick_allele: false,
+            per_gene: false,
+            pick_allele_gene: false,
+            flag_pick: false,
+            flag_pick_allele: false,
+            flag_pick_allele_gene: false,
+            pick_order: None,
             extended_probes: false,
             reference_fasta_path: None,
             use_fjall: false,
@@ -92,6 +124,7 @@ impl Default for AnnotateVcfConfig {
             exclude_predicted: false,
             failed: None,
             distance: None,
+            buffer_size: VEP_DEFAULT_BUFFER_SIZE,
             compression: VcfCompressionType::Plain,
             show_progress: false,
             on_batch_written: None,
@@ -103,6 +136,7 @@ impl std::fmt::Debug for AnnotateVcfConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnnotateVcfConfig")
             .field("everything", &self.everything)
+            .field("buffer_size", &self.buffer_size)
             .field("compression", &self.compression)
             .field("show_progress", &self.show_progress)
             .field("on_batch_written", &self.on_batch_written.is_some())
@@ -116,6 +150,25 @@ impl AnnotateVcfConfig {
         opts.insert("partitioned".into(), serde_json::Value::Bool(true));
         if self.everything {
             opts.insert("everything".into(), serde_json::Value::Bool(true));
+        }
+        for (key, enabled) in [
+            ("pick", self.pick),
+            ("pick_allele", self.pick_allele),
+            ("per_gene", self.per_gene),
+            ("pick_allele_gene", self.pick_allele_gene),
+            ("flag_pick", self.flag_pick),
+            ("flag_pick_allele", self.flag_pick_allele),
+            ("flag_pick_allele_gene", self.flag_pick_allele_gene),
+        ] {
+            if enabled {
+                opts.insert(key.into(), serde_json::Value::Bool(true));
+            }
+        }
+        if let Some(ref pick_order) = self.pick_order {
+            opts.insert(
+                "pick_order".into(),
+                serde_json::Value::String(pick_order.clone()),
+            );
         }
         if self.extended_probes {
             opts.insert("extended_probes".into(), serde_json::Value::Bool(true));
@@ -150,12 +203,6 @@ impl AnnotateVcfConfig {
         if self.hgvsp_use_prediction {
             opts.insert("hgvsp_use_prediction".into(), serde_json::Value::Bool(true));
         }
-        if self.refseq {
-            opts.insert("refseq".into(), serde_json::Value::Bool(true));
-        }
-        if self.merged {
-            opts.insert("merged".into(), serde_json::Value::Bool(true));
-        }
         if self.gencode_basic {
             opts.insert("gencode_basic".into(), serde_json::Value::Bool(true));
         }
@@ -177,8 +224,30 @@ impl AnnotateVcfConfig {
         if let Some(ref dist) = self.distance {
             opts.insert("distance".into(), serde_json::Value::String(dist.clone()));
         }
+        opts.insert(
+            "buffer_size".into(),
+            serde_json::Value::Number(serde_json::Number::from(self.buffer_size)),
+        );
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
+
+    fn include_pick_output(&self) -> bool {
+        self.flag_pick || self.flag_pick_allele || self.flag_pick_allele_gene
+    }
+}
+
+fn csq_header_description(
+    config: &AnnotateVcfConfig,
+    cache_source_type: CacheSourceType,
+) -> String {
+    let field_names = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
+        config.everything,
+        cache_source_type == CacheSourceType::RefSeq,
+        cache_source_type == CacheSourceType::Merged,
+        config.include_pick_output(),
+    );
+    let format_list = field_names.join("|");
+    format!("Consequence annotations from annotate_vep. Format: {format_list}")
 }
 
 /// Annotate a VCF file and write results to an output VCF.
@@ -192,6 +261,10 @@ impl AnnotateVcfConfig {
 /// are NOT written to the VCF — only core VCF columns, original INFO/FORMAT
 /// fields, and the `csq` annotation are included.
 ///
+/// Cache source mode is read from Arrow schema metadata on a parquet file under
+/// `{cache_source}/variation`. That directory must be readable even when
+/// `backend` selects a non-parquet annotation store such as `fjall`.
+///
 /// # Returns
 ///
 /// The number of rows written.
@@ -202,6 +275,13 @@ pub async fn annotate_to_vcf(
     output_vcf: &str,
     config: &AnnotateVcfConfig,
 ) -> Result<usize> {
+    if config.refseq || config.merged {
+        return Err(DataFusionError::Plan(
+            "annotate_to_vcf(): refseq and merged config fields are unsupported; cache source mode must come from cache schema metadata bio.vep.cache_source_type".to_string(),
+        ));
+    }
+    let cache_source_type = CacheSourceType::from_partitioned_cache_source(cache_source)?;
+
     // 1. Create session and register VCF table.
     let session_config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
     let ctx = SessionContext::new_with_config(session_config);
@@ -356,14 +436,7 @@ pub async fn annotate_to_vcf(
                 }
                 arrow_field.with_metadata(merged_metadata)
             } else if name == "CSQ" {
-                let field_names = crate::golden_benchmark::csq_field_names_for_mode(
-                    config.everything,
-                    config.refseq,
-                    config.merged,
-                );
-                let format_list = field_names.join("|");
-                let description =
-                    format!("Consequence annotations from annotate_vep. Format: {format_list}");
+                let description = csq_header_description(config, cache_source_type);
                 let mut meta = std::collections::HashMap::new();
                 meta.insert("bio.vcf.field.field_type".to_string(), "INFO".to_string());
                 meta.insert("bio.vcf.field.description".to_string(), description);
@@ -420,4 +493,85 @@ pub async fn annotate_to_vcf(
     pb.finish_and_clear();
 
     Ok(total_rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_options_json_emits_pick_flags() {
+        let config = AnnotateVcfConfig {
+            everything: true,
+            pick: true,
+            pick_allele: true,
+            per_gene: true,
+            pick_allele_gene: true,
+            flag_pick: true,
+            flag_pick_allele: true,
+            flag_pick_allele_gene: true,
+            pick_order: Some("mane_select,tsl,canonical".to_string()),
+            ..Default::default()
+        };
+
+        let json = config.to_options_json();
+        assert!(json.contains("\"everything\":true"));
+        assert!(json.contains("\"pick\":true"));
+        assert!(json.contains("\"pick_allele\":true"));
+        assert!(json.contains("\"per_gene\":true"));
+        assert!(json.contains("\"pick_allele_gene\":true"));
+        assert!(json.contains("\"flag_pick\":true"));
+        assert!(json.contains("\"flag_pick_allele\":true"));
+        assert!(json.contains("\"flag_pick_allele_gene\":true"));
+        assert!(json.contains("\"pick_order\":\"mane_select,tsl,canonical\""));
+    }
+
+    #[test]
+    fn test_to_options_json_emits_buffer_size() {
+        let config = AnnotateVcfConfig {
+            buffer_size: 1234,
+            ..Default::default()
+        };
+
+        let json = config.to_options_json();
+        assert!(json.contains("\"buffer_size\":1234"));
+    }
+
+    #[test]
+    fn test_to_options_json_does_not_emit_source_selectors() {
+        let config = AnnotateVcfConfig {
+            refseq: true,
+            merged: true,
+            ..Default::default()
+        };
+
+        let json = config.to_options_json();
+        assert!(!json.contains("\"refseq\""));
+        assert!(!json.contains("\"merged\""));
+    }
+
+    #[test]
+    fn test_csq_header_description_matches_vep_pick_layout() {
+        let config = AnnotateVcfConfig {
+            everything: true,
+            flag_pick_allele_gene: true,
+            ..Default::default()
+        };
+
+        let description = csq_header_description(&config, CacheSourceType::Ensembl);
+        assert!(description.starts_with("Consequence annotations from annotate_vep. Format: "));
+        assert!(description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
+    }
+
+    #[test]
+    fn test_csq_header_description_omits_pick_for_filter_modes() {
+        let config = AnnotateVcfConfig {
+            everything: true,
+            pick_allele_gene: true,
+            ..Default::default()
+        };
+
+        let description = csq_header_description(&config, CacheSourceType::Ensembl);
+        assert!(!description.contains("|FLAGS|PICK|VARIANT_CLASS|"));
+    }
 }

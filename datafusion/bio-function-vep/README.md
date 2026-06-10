@@ -60,12 +60,45 @@ SELECT * FROM annotate_vep(
 | `extended_probes` | Interval-overlap fallback for shifted indels | No |
 | `reference_fasta_path` | Indexed FASTA for HGVS genomic shifting | No |
 | `partitioned` | Use per-chromosome partitioned cache | No |
-| `refseq` | Use RefSeq cache/transcripts and emit RefSeq CSQ fields (`REFSEQ_MATCH`, `REFSEQ_OFFSET`, `GIVEN_REF`, `USED_REF`, `BAM_EDIT`) | No |
-| `merged` | Use VEP `--merged` Ensembl+RefSeq cache and emit RefSeq/source CSQ fields | No |
 | `gencode_basic` | Restrict consequences to transcripts with `gencode_basic` attribute | No |
 | `gencode_primary` | Restrict consequences to transcripts with `gencode_primary` attribute | No |
 | `all_refseq` | Keep all RefSeq cache transcripts, including CCDS/EST-style rows | No |
 | `exclude_predicted` | Exclude predicted RefSeq transcripts (`XM_` / `XR_`) | No |
+
+`refseq` and `merged` are not accepted as `options_json` source selectors.
+Cache source mode is read from Arrow schema metadata
+`bio.vep.cache_source_type = ensembl | merged | refseq`, written by the cache
+exporter on variation, transcript, exon, translation, regulatory, and motif
+tables.
+
+### Cache Source Modes and Transcript Filtering
+
+Transcript filtering follows Ensembl VEP release/115 source-mode behavior. The
+cache source mode is authoritative at the table schema level, mirroring VEP's
+cache-dir `source_type()` resolution for `ensembl`, `refseq`, and `merged`
+sources:
+https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/CacheDir.pm#L491-L510
+
+VEP's shared transcript filter first requires a stable ID and applies
+`gencode_basic` / `gencode_primary` filters before source-specific RefSeq
+logic:
+https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L195-L210
+
+| Cache source metadata | Transcript filtering logic | Ensembl VEP reference |
+|-----------------------|----------------------------|-----------------------|
+| `ensembl` | Keep transcripts with a non-empty stable ID after common filters. There is no `ENST*`-only filter in VEP release/115 for Ensembl mode. | VEP returns accepted transcripts after the common filters when the RefSeq condition does not apply: https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L216-L230 |
+| `refseq` | With `all_refseq=false`, keep default RefSeq stable IDs matching VEP's RefSeq whitelist, including mitochondrial exceptions and display-xref fallback. With `all_refseq=true`, bypass that whitelist after common filters. | The RefSeq whitelist is guarded by `source_type eq 'refseq'`: https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L216-L224 |
+| `merged` | Keep non-RefSeq-source rows after common filters. For rows whose normalized source is `RefSeq`, apply the same RefSeq whitelist as RefSeq mode unless `all_refseq=true`. | VEP merged cache generation marks each row `_source_cache = Ensembl` or `_source_cache = RefSeq`: https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Pipeline/DumpVEP/MergeVEP.pm#L102-L114, and the filter applies RefSeq logic only for merged RefSeq rows: https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/AnnotationType/Transcript.pm#L216-L224 |
+
+`exclude_predicted` matches VEP's configured transcript filter for predicted
+RefSeq accessions (`not stable_id match ^X._`):
+https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Config.pm#L555-L558
+
+The CSQ `SOURCE` field is populated only for `merged` cache mode, matching VEP's
+merged output field set and `_source_cache` emission:
+https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/Constants.pm#L97-L98
+and
+https://github.com/Ensembl/ensembl-vep/blob/2beada0d57ca6234f467b14a6c60280f4a082717/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L1530-L1531
 
 ## Output Modes
 

@@ -82,6 +82,7 @@ use crate::allele::{
     MatchedVariantAllele, vcf_to_vep_allele, vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
 use crate::annotation_store::{AnnotationBackend, build_store};
+use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 use crate::config;
 #[cfg(feature = "kv-cache")]
 use crate::kv_cache::KvCacheTableProvider;
@@ -90,11 +91,11 @@ use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
 use crate::partitioned_cache::PartitionedParquetCache;
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
 use crate::transcript_consequence::{
-    CachedPredictions, CompactPrediction, ExonFeature, MirnaFeature, MotifFeature, PreparedContext,
-    ProteinDomainFeature, RefSeqEdit, RegulatoryFeature, SiftPolyphenCache, StructuralFeature,
-    SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment, TranscriptConsequence,
-    TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature, VariantInput,
-    infer_refseq_deletion_edits_from_sequences, refseq_edit_offset_delta,
+    CachedPredictions, CompactPrediction, ExonFeature, FeatureType, MirnaFeature, MotifFeature,
+    PreparedContext, ProteinDomainFeature, RefSeqEdit, RegulatoryFeature, SiftPolyphenCache,
+    StructuralFeature, SvEventKind, SvFeatureKind, TranscriptCdnaMapperSegment,
+    TranscriptConsequence, TranscriptConsequenceEngine, TranscriptFeature, TranslationFeature,
+    VariantInput, infer_refseq_deletion_edits_from_sequences, refseq_edit_offset_delta,
 };
 use crate::variant_lookup_exec::{
     ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
@@ -139,13 +140,15 @@ fn list_i64_data_type() -> DataType {
     DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
 }
 
-/// Full default annotation output column definitions (87 columns, excluding csq and most_severe_consequence).
+/// Full annotation output column definitions (87 columns without `PICK`, 88 with `PICK`,
+/// excluding `CSQ` and `most_severe_consequence`).
 ///
-/// Order matches the README schema: transcript-level (42), frequency (29), variant-level (9), cache-only (7).
-fn annotation_column_defs() -> Vec<AnnotationColumnDef> {
+/// Order matches the VEP/README schema: transcript-level (42 or 43 with `PICK`),
+/// frequency (29), variant-level (9), cache-only (7).
+fn annotation_column_defs(include_pick_output: bool) -> Vec<AnnotationColumnDef> {
     use AnnotationCategory::*;
-    vec![
-        // ── Transcript-level (42) ──
+    let mut defs = vec![
+        // ── Transcript-level (42, or 43 with PICK) ──
         AnnotationColumnDef {
             name: "Allele",
             data_type: DataType::Utf8,
@@ -272,6 +275,16 @@ fn annotation_column_defs() -> Vec<AnnotationColumnDef> {
             category: Transcript,
             cache_col: None,
         },
+    ];
+    if include_pick_output {
+        defs.push(AnnotationColumnDef {
+            name: "PICK",
+            data_type: list_utf8_data_type(),
+            category: Transcript,
+            cache_col: None,
+        });
+    }
+    defs.extend([
         AnnotationColumnDef {
             name: "VARIANT_CLASS",
             data_type: DataType::Utf8,
@@ -671,13 +684,17 @@ fn annotation_column_defs() -> Vec<AnnotationColumnDef> {
             category: CacheOnly,
             cache_col: Some("dbsnp_ids"),
         },
-    ]
+    ]);
+    defs
 }
 
-fn refseq_annotation_column_defs(include_source: bool) -> Vec<AnnotationColumnDef> {
+fn refseq_annotation_column_defs(
+    include_source: bool,
+    include_pick_output: bool,
+) -> Vec<AnnotationColumnDef> {
     use AnnotationCategory::Transcript;
 
-    let mut defs = annotation_column_defs();
+    let mut defs = annotation_column_defs(include_pick_output);
     let insert_at = defs
         .iter()
         .position(|def| def.name == "GENE_PHENO")
@@ -728,11 +745,12 @@ fn refseq_annotation_column_defs(include_source: bool) -> Vec<AnnotationColumnDe
 
 fn annotation_column_defs_for_selection(
     transcript_selection: TranscriptSelectionFlags,
+    include_pick_output: bool,
 ) -> Vec<AnnotationColumnDef> {
     if transcript_selection.refseq_fields() {
-        refseq_annotation_column_defs(transcript_selection.source_field())
+        refseq_annotation_column_defs(transcript_selection.source_field(), include_pick_output)
     } else {
-        annotation_column_defs()
+        annotation_column_defs(include_pick_output)
     }
 }
 
@@ -1161,6 +1179,156 @@ impl VepFlags {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickCriterion {
+    ManeSelect,
+    ManePlusClinical,
+    Canonical,
+    Appris,
+    Tsl,
+    Biotype,
+    Ccds,
+    Rank,
+    Length,
+    Ensembl,
+    Refseq,
+}
+
+impl PickCriterion {
+    fn from_str(raw: &str) -> Result<Self> {
+        match raw.trim() {
+            "mane_select" => Ok(Self::ManeSelect),
+            "mane_plus_clinical" => Ok(Self::ManePlusClinical),
+            "canonical" => Ok(Self::Canonical),
+            "appris" => Ok(Self::Appris),
+            "tsl" => Ok(Self::Tsl),
+            "biotype" => Ok(Self::Biotype),
+            "ccds" => Ok(Self::Ccds),
+            "rank" => Ok(Self::Rank),
+            "length" => Ok(Self::Length),
+            "ensembl" => Ok(Self::Ensembl),
+            "refseq" => Ok(Self::Refseq),
+            other => Err(DataFusionError::Execution(format!(
+                "annotate_vep(): unsupported pick_order criterion '{other}'. Supported criteria: mane_select, mane_plus_clinical, canonical, appris, tsl, biotype, ccds, rank, length, ensembl, refseq"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickMode {
+    None,
+    Pick,
+    PickAllele,
+    PerGene,
+    PickAlleleGene,
+    FlagPick,
+    FlagPickAllele,
+    FlagPickAlleleGene,
+}
+
+impl PickMode {
+    fn is_enabled(self) -> bool {
+        self != Self::None
+    }
+
+    fn is_flag(self) -> bool {
+        matches!(
+            self,
+            Self::FlagPick | Self::FlagPickAllele | Self::FlagPickAlleleGene
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PickFlags {
+    mode: PickMode,
+    pick_order: Vec<PickCriterion>,
+}
+
+impl Default for PickFlags {
+    fn default() -> Self {
+        Self {
+            mode: PickMode::None,
+            // Traceability:
+            // - Ensembl VEP release 115 default `pick_order`
+            //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Config.pm#L300-L307>
+            pick_order: vec![
+                PickCriterion::ManeSelect,
+                PickCriterion::ManePlusClinical,
+                PickCriterion::Canonical,
+                PickCriterion::Appris,
+                PickCriterion::Tsl,
+                PickCriterion::Biotype,
+                PickCriterion::Ccds,
+                PickCriterion::Rank,
+                PickCriterion::Length,
+                PickCriterion::Ensembl,
+                PickCriterion::Refseq,
+            ],
+        }
+    }
+}
+
+impl PickFlags {
+    fn from_options_json(options_json: Option<&str>) -> Result<Self> {
+        let parse = |key| {
+            options_json
+                .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
+                .unwrap_or(false)
+        };
+
+        let mode = if parse("pick") {
+            PickMode::Pick
+        } else if parse("pick_allele") {
+            PickMode::PickAllele
+        } else if parse("per_gene") {
+            PickMode::PerGene
+        } else if parse("pick_allele_gene") {
+            PickMode::PickAlleleGene
+        } else if parse("flag_pick") {
+            PickMode::FlagPick
+        } else if parse("flag_pick_allele") {
+            PickMode::FlagPickAllele
+        } else if parse("flag_pick_allele_gene") {
+            PickMode::FlagPickAlleleGene
+        } else {
+            PickMode::None
+        };
+
+        let mut out = Self {
+            mode,
+            ..Self::default()
+        };
+
+        if let Some(raw_order) = options_json
+            .and_then(|opts| AnnotateProvider::parse_json_string_option(opts, "pick_order"))
+        {
+            let parsed: Vec<PickCriterion> = raw_order
+                .split(',')
+                .filter(|part| !part.trim().is_empty())
+                .map(PickCriterion::from_str)
+                .collect::<Result<Vec<_>>>()?;
+            if parsed.is_empty() {
+                return Err(DataFusionError::Execution(
+                    "annotate_vep(): pick_order must contain at least one criterion".to_string(),
+                ));
+            }
+            out.pick_order = parsed;
+        }
+
+        Ok(out)
+    }
+
+    fn requires_transcript_annotations(&self, skip_csq: bool, skip_typed_cols: bool) -> bool {
+        self.mode.is_enabled() && (!skip_csq || !skip_typed_cols)
+    }
+
+    fn include_pick_output(&self) -> bool {
+        self.mode.is_flag()
+    }
+}
+
 /// Parsed HGVS-related flags controlling HGVSc/HGVSp emission.
 ///
 /// Traceability:
@@ -1213,16 +1381,8 @@ impl HgvsFlags {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum TranscriptSourceMode {
-    #[default]
-    Ensembl,
-    RefSeq,
-    Merged,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct TranscriptSelectionFlags {
-    source_mode: TranscriptSourceMode,
+    cache_source_type: CacheSourceType,
     gencode_basic: bool,
     gencode_primary: bool,
     all_refseq: bool,
@@ -1230,35 +1390,21 @@ struct TranscriptSelectionFlags {
 }
 
 impl TranscriptSelectionFlags {
-    fn from_options_json(options_json: Option<&str>) -> Result<Self> {
+    fn from_options_json(
+        cache_source_type: CacheSourceType,
+        options_json: Option<&str>,
+    ) -> Result<Self> {
         let parse = |key| {
             options_json
                 .and_then(|opts| AnnotateProvider::parse_json_bool_option(opts, key))
                 .unwrap_or(false)
         };
 
-        let refseq = parse("refseq");
-        let merged = parse("merged");
         let gencode_basic = parse("gencode_basic");
         let gencode_primary = parse("gencode_primary");
         let all_refseq = parse("all_refseq");
         let exclude_predicted = parse("exclude_predicted");
 
-        if refseq && merged {
-            return Err(DataFusionError::Execution(
-                "annotate_vep(): --refseq and --merged are mutually exclusive".to_string(),
-            ));
-        }
-        if refseq && gencode_basic {
-            return Err(DataFusionError::Execution(
-                "annotate_vep(): --refseq and --gencode_basic are mutually exclusive".to_string(),
-            ));
-        }
-        if refseq && gencode_primary {
-            return Err(DataFusionError::Execution(
-                "annotate_vep(): --refseq and --gencode_primary are mutually exclusive".to_string(),
-            ));
-        }
         if gencode_basic && gencode_primary {
             return Err(DataFusionError::Execution(
                 "annotate_vep(): --gencode_basic and --gencode_primary are mutually exclusive"
@@ -1266,27 +1412,19 @@ impl TranscriptSelectionFlags {
             ));
         }
 
-        let source_mode = if merged {
-            TranscriptSourceMode::Merged
-        } else if refseq {
-            TranscriptSourceMode::RefSeq
-        } else {
-            TranscriptSourceMode::Ensembl
-        };
-
-        if source_mode == TranscriptSourceMode::Ensembl && all_refseq {
+        if cache_source_type == CacheSourceType::Ensembl && all_refseq {
             return Err(DataFusionError::Execution(
-                "annotate_vep(): --all_refseq requires --refseq or --merged".to_string(),
+                "annotate_vep(): --all_refseq requires cache schema metadata bio.vep.cache_source_type='refseq' or 'merged'".to_string(),
             ));
         }
-        if source_mode == TranscriptSourceMode::Ensembl && exclude_predicted {
+        if cache_source_type == CacheSourceType::Ensembl && exclude_predicted {
             return Err(DataFusionError::Execution(
-                "annotate_vep(): --exclude_predicted requires --refseq or --merged".to_string(),
+                "annotate_vep(): --exclude_predicted requires cache schema metadata bio.vep.cache_source_type='refseq' or 'merged'".to_string(),
             ));
         }
 
         Ok(Self {
-            source_mode,
+            cache_source_type,
             gencode_basic,
             gencode_primary,
             all_refseq,
@@ -1295,18 +1433,18 @@ impl TranscriptSelectionFlags {
     }
 
     fn merged(self) -> bool {
-        self.source_mode == TranscriptSourceMode::Merged
+        self.cache_source_type == CacheSourceType::Merged
     }
 
     fn refseq_fields(self) -> bool {
         matches!(
-            self.source_mode,
-            TranscriptSourceMode::RefSeq | TranscriptSourceMode::Merged
+            self.cache_source_type,
+            CacheSourceType::RefSeq | CacheSourceType::Merged
         )
     }
 
     fn source_field(self) -> bool {
-        self.source_mode == TranscriptSourceMode::Merged
+        self.cache_source_type == CacheSourceType::Merged
     }
 }
 
@@ -1402,11 +1540,16 @@ struct CsqPlaceholderLayout {
 }
 
 impl CsqPlaceholderLayout {
-    fn for_mode(everything: bool, transcript_selection: TranscriptSelectionFlags) -> Self {
-        let fields = crate::golden_benchmark::csq_field_names_for_mode(
+    fn for_mode(
+        everything: bool,
+        transcript_selection: TranscriptSelectionFlags,
+        include_pick: bool,
+    ) -> Self {
+        let fields = crate::golden_benchmark::csq_field_names_for_mode_with_pick(
             everything,
-            transcript_selection.source_mode == TranscriptSourceMode::RefSeq,
-            transcript_selection.source_mode == TranscriptSourceMode::Merged,
+            transcript_selection.cache_source_type == CacheSourceType::RefSeq,
+            transcript_selection.cache_source_type == CacheSourceType::Merged,
+            include_pick,
         )
         .into_iter()
         .map(CsqPlaceholderField::from_name)
@@ -1439,6 +1582,7 @@ struct CsqPlaceholderEntry<'a> {
 struct TranscriptRawMetadata {
     display_xref_id: Option<String>,
     source: Option<String>,
+    source_cache: Option<String>,
     gene_hgnc_id_native: Option<String>,
     refseq_match: Option<String>,
     refseq_edits: Vec<RefSeqEdit>,
@@ -1971,6 +2115,485 @@ fn format_appris(raw: &str) -> String {
     raw.replace("principal", "P").replace("alternative", "A")
 }
 
+fn parse_appris_pick_rank(raw: Option<&str>) -> u8 {
+    let Some(raw) = raw else {
+        return 100;
+    };
+
+    // Traceability:
+    // - Ensembl VEP release 115 `pick_worst_VariationFeatureOverlapAllele()`
+    //   parses APPRIS as `([A-Za-z]).+(\\d+)`, then adds 10 for
+    //   `alternative*` values
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L756-L767>
+    let Some(first) = raw
+        .chars()
+        .next()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .map(|ch| ch.to_ascii_lowercase())
+    else {
+        return 100;
+    };
+    let trailing_digits_len = raw
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
+    if trailing_digits_len == 0 {
+        return 100;
+    }
+    let digits = &raw[raw.len() - trailing_digits_len..];
+    let Some(mut grade) = digits.parse::<u8>().ok() else {
+        return 100;
+    };
+    if grade == 0 {
+        return 100;
+    }
+    if first == 'a' {
+        grade = grade.saturating_add(10);
+    }
+    grade
+}
+
+#[derive(Debug, Clone)]
+struct PickCandidateInfo {
+    assignment_idx: usize,
+    mane_select: u8,
+    mane_plus_clinical: u8,
+    canonical: u8,
+    ccds: u8,
+    length: i64,
+    biotype: u8,
+    tsl: i32,
+    appris: u8,
+    ensembl: u8,
+    refseq: u8,
+    rank: u32,
+}
+
+fn build_pick_candidate_info(
+    assignment_idx: usize,
+    assignments: &[TranscriptConsequence],
+    ctx: &PreparedContext<'_>,
+) -> PickCandidateInfo {
+    let tc = &assignments[assignment_idx];
+    let tx = tc.transcript_idx.map(|idx| ctx.transcripts[idx]);
+
+    let (mane_select, mane_plus_clinical, canonical, ccds, length, biotype, tsl, appris) =
+        if let Some(tx) = tx {
+            // Traceability:
+            // - Ensembl VEP release 115 `pick_worst_VariationFeatureOverlapAllele()`
+            //   initializes transcript criteria from transcript attributes,
+            //   translation/CDS length, and `_source_cache`
+            //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L702-L767>
+            let length = -i64::try_from(pick_transcript_length(tx, ctx)).unwrap_or(i64::MAX);
+            (
+                if tx
+                    .mane_select
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    0
+                } else {
+                    1
+                },
+                if tx
+                    .mane_plus_clinical
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    0
+                } else {
+                    1
+                },
+                if tx.is_canonical { 0 } else { 1 },
+                if tx
+                    .ccds
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty() && value != "-")
+                {
+                    0
+                } else {
+                    1
+                },
+                length,
+                if tx.biotype == "protein_coding" { 0 } else { 1 },
+                tx.tsl.unwrap_or(100),
+                parse_appris_pick_rank(tx.appris.as_deref()),
+            )
+        } else {
+            (1, 1, 1, 1, 0, 1, 100, 100)
+        };
+
+    PickCandidateInfo {
+        assignment_idx,
+        mane_select,
+        mane_plus_clinical,
+        canonical,
+        ccds,
+        length,
+        biotype,
+        tsl,
+        appris,
+        ensembl: pick_assignment_source_rank(tx, "ensembl"),
+        refseq: pick_assignment_source_rank(tx, "refseq"),
+        rank: pick_assignment_rank(tc),
+    }
+}
+
+fn pick_transcript_length(tx: &TranscriptFeature, ctx: &PreparedContext<'_>) -> usize {
+    if let Some(translation) = ctx.translation_by_tx.get(tx.transcript_id.as_str()) {
+        return translation
+            .cds_sequence
+            .as_ref()
+            .map(|sequence| sequence.len())
+            .or_else(|| tx.translateable_seq.as_ref().map(|sequence| sequence.len()))
+            .or(translation.cds_len)
+            .unwrap_or(0);
+    }
+
+    // Traceability:
+    // - Ensembl VEP release 115 uses `$tr->length()` for transcripts without
+    //   translation in `OutputFactory::pick_worst_VariationFeatureOverlapAllele()`.
+    // - Ensembl core `Bio::EnsEMBL::Transcript::length()` sums exon lengths;
+    //   it does not rank non-coding transcripts by cached `spliced_seq`.
+    ctx.exons_by_tx
+        .get(tx.transcript_id.as_str())
+        .map(|exons| {
+            exons
+                .iter()
+                .map(|exon| exon.end.saturating_sub(exon.start).saturating_add(1))
+                .filter_map(|len| usize::try_from(len).ok())
+                .sum()
+        })
+        .unwrap_or_else(|| {
+            usize::try_from(tx.end.saturating_sub(tx.start).saturating_add(1)).unwrap_or(0)
+        })
+}
+
+fn pick_assignment_gene_key(
+    tc: &TranscriptConsequence,
+    ctx: &PreparedContext<'_>,
+) -> Option<String> {
+    // Traceability:
+    // - Ensembl VEP release 115 groups transcript consequences by
+    //   `transcript->{_gene_stable_id}`, only falling back to a gene-adaptor
+    //   lookup when that cache slot is absent
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L845-L855>
+    let tx = ctx.transcripts.get(tc.transcript_idx?)?;
+    tx.gene_stable_id.clone()
+}
+
+fn pick_assignment_feature_id<'a>(
+    assignment_idx: usize,
+    assignments: &'a [TranscriptConsequence],
+    ctx: &'a PreparedContext<'_>,
+) -> &'a str {
+    assignments
+        .get(assignment_idx)
+        .map(|tc| {
+            if tc.feature_type == FeatureType::Transcript {
+                tc.transcript_idx
+                    .and_then(|idx| ctx.transcripts.get(idx))
+                    .map(|tx| tx.transcript_id.as_str())
+                    .or(tc.transcript_id.as_deref())
+                    .unwrap_or("")
+            } else {
+                tc.transcript_id.as_deref().unwrap_or("")
+            }
+        })
+        .unwrap_or("")
+}
+
+fn pick_assignment_source_rank(tx: Option<&TranscriptFeature>, wanted: &str) -> u8 {
+    let Some(tx) = tx else {
+        return 1;
+    };
+
+    // Traceability:
+    // - Ensembl VEP release 115 sets `$info->{lc($tr->{_source_cache})} = 0`
+    //   and only exact `ensembl` / `refseq` keys influence those categories
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L734-L741>
+    let source = tx.source_cache.as_deref().or(tx.source.as_deref());
+    if source.is_some_and(|source| source.eq_ignore_ascii_case(wanted)) {
+        0
+    } else {
+        1
+    }
+}
+
+fn pick_assignment_rank(tc: &TranscriptConsequence) -> u32 {
+    most_severe_term(tc.terms.iter())
+        .map(|term| term.rank() as u32)
+        .unwrap_or(1000)
+}
+
+fn retain_best_pick_candidates<T, F>(
+    candidates: &mut Vec<PickCandidateInfo>,
+    mut key: F,
+) -> Option<usize>
+where
+    T: Ord + Copy,
+    F: FnMut(&PickCandidateInfo) -> T,
+{
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by_key(|candidate| key(candidate));
+    let best = key(&candidates[0]);
+    let keep = candidates
+        .iter()
+        .take_while(|candidate| key(candidate) == best)
+        .count();
+    if keep == 1 {
+        return Some(candidates[0].assignment_idx);
+    }
+    candidates.truncate(keep);
+    None
+}
+
+fn pick_worst_assignment(
+    candidate_indices: &[usize],
+    assignments: &[TranscriptConsequence],
+    ctx: &PreparedContext<'_>,
+    pick_order: &[PickCriterion],
+) -> Option<usize> {
+    // Traceability:
+    // - Ensembl VEP release 115
+    //   `OutputFactory::pick_worst_VariationFeatureOverlapAllele()`
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L679-L809>
+    //
+    // VEP computes category values for all candidates, stably sorts on one
+    // `pick_order` criterion at a time, keeps only the tied best candidates,
+    // and then repeats with the next criterion.
+    let mut candidates: Vec<PickCandidateInfo> = candidate_indices
+        .iter()
+        .copied()
+        .map(|assignment_idx| build_pick_candidate_info(assignment_idx, assignments, ctx))
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0].assignment_idx);
+    }
+
+    for criterion in pick_order {
+        let winner = match criterion {
+            PickCriterion::ManeSelect => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.mane_select)
+            }
+            PickCriterion::ManePlusClinical => {
+                retain_best_pick_candidates(&mut candidates, |candidate| {
+                    candidate.mane_plus_clinical
+                })
+            }
+            PickCriterion::Canonical => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.canonical)
+            }
+            PickCriterion::Appris => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.appris)
+            }
+            PickCriterion::Tsl => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.tsl)
+            }
+            PickCriterion::Biotype => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.biotype)
+            }
+            PickCriterion::Ccds => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.ccds)
+            }
+            PickCriterion::Rank => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.rank)
+            }
+            PickCriterion::Length => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.length)
+            }
+            PickCriterion::Ensembl => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.ensembl)
+            }
+            PickCriterion::Refseq => {
+                retain_best_pick_candidates(&mut candidates, |candidate| candidate.refseq)
+            }
+        };
+        if winner.is_some() {
+            return winner;
+        }
+    }
+
+    candidates.first().map(|candidate| candidate.assignment_idx)
+}
+
+fn pick_assignment_allele_key<'a>(_tc: &'a TranscriptConsequence, row_allele: &'a str) -> &'a str {
+    row_allele
+}
+
+fn sort_pick_candidates_by_vep_order(
+    candidate_indices: &mut [usize],
+    assignments: &[TranscriptConsequence],
+    ctx: &PreparedContext<'_>,
+) {
+    // VEP's pick logic applies the configured biological/clinical criteria
+    // first, then returns the first candidate still tied after all criteria.
+    // That last fallback is only a deterministic representative choice; it
+    // carries no additional biological or interpretation meaning. Use the same
+    // feature concat order we use for CSQ output so COITree/query callback order
+    // cannot change which tied transcript/regulatory/motif feature wins.
+    candidate_indices.sort_by(|&a, &b| {
+        assignments[a]
+            .feature_type
+            .rank()
+            .cmp(&assignments[b].feature_type.rank())
+            .then_with(|| {
+                pick_assignment_feature_id(a, assignments, ctx).cmp(pick_assignment_feature_id(
+                    b,
+                    assignments,
+                    ctx,
+                ))
+            })
+            .then_with(|| a.cmp(&b))
+    });
+}
+
+fn insert_pick_winner(
+    selected: &mut HashSet<usize>,
+    candidate_indices: &mut [usize],
+    assignments: &[TranscriptConsequence],
+    ctx: &PreparedContext<'_>,
+    pick_flags: &PickFlags,
+) {
+    let Some(winner) =
+        pick_worst_assignment(candidate_indices, assignments, ctx, &pick_flags.pick_order)
+    else {
+        return;
+    };
+    selected.insert(winner);
+}
+
+fn select_pick_indices(
+    assignments: &[TranscriptConsequence],
+    ctx: &PreparedContext<'_>,
+    pick_flags: &PickFlags,
+    row_allele: &str,
+) -> HashSet<usize> {
+    let mut selected = HashSet::new();
+
+    match pick_flags.mode {
+        PickMode::None => {}
+        PickMode::Pick | PickMode::FlagPick => {
+            let mut candidates: Vec<usize> = (0..assignments.len()).collect();
+            sort_pick_candidates_by_vep_order(&mut candidates, assignments, ctx);
+            insert_pick_winner(&mut selected, &mut candidates, assignments, ctx, pick_flags);
+        }
+        PickMode::PickAllele | PickMode::FlagPickAllele => {
+            let mut grouped: HashMap<String, Vec<usize>> = HashMap::new();
+            for (idx, assignment) in assignments.iter().enumerate() {
+                let allele = pick_assignment_allele_key(assignment, row_allele).to_string();
+                grouped.entry(allele).or_default().push(idx);
+            }
+            for candidate_indices in grouped.values_mut() {
+                sort_pick_candidates_by_vep_order(candidate_indices, assignments, ctx);
+                insert_pick_winner(
+                    &mut selected,
+                    candidate_indices,
+                    assignments,
+                    ctx,
+                    pick_flags,
+                );
+            }
+        }
+        PickMode::PerGene => {
+            let mut grouped: HashMap<String, Vec<usize>> = HashMap::new();
+            for (idx, assignment) in assignments.iter().enumerate() {
+                if assignment.feature_type != FeatureType::Transcript {
+                    continue;
+                }
+                let Some(gene_key) = pick_assignment_gene_key(assignment, ctx) else {
+                    continue;
+                };
+                grouped.entry(gene_key).or_default().push(idx);
+            }
+            for candidate_indices in grouped.values_mut() {
+                sort_pick_candidates_by_vep_order(candidate_indices, assignments, ctx);
+                insert_pick_winner(
+                    &mut selected,
+                    candidate_indices,
+                    assignments,
+                    ctx,
+                    pick_flags,
+                );
+            }
+        }
+        PickMode::PickAlleleGene | PickMode::FlagPickAlleleGene => {
+            let mut grouped: HashMap<(String, String), Vec<usize>> = HashMap::new();
+            for (idx, assignment) in assignments.iter().enumerate() {
+                if assignment.feature_type != FeatureType::Transcript {
+                    continue;
+                }
+                let Some(gene_key) = pick_assignment_gene_key(assignment, ctx) else {
+                    continue;
+                };
+                let allele = pick_assignment_allele_key(assignment, row_allele).to_string();
+                grouped.entry((allele, gene_key)).or_default().push(idx);
+            }
+            for candidate_indices in grouped.values_mut() {
+                sort_pick_candidates_by_vep_order(candidate_indices, assignments, ctx);
+                insert_pick_winner(
+                    &mut selected,
+                    candidate_indices,
+                    assignments,
+                    ctx,
+                    pick_flags,
+                );
+            }
+        }
+    }
+
+    selected
+}
+
+fn apply_pick_mode(
+    mut assignments: Vec<TranscriptConsequence>,
+    ctx: &PreparedContext<'_>,
+    pick_flags: &PickFlags,
+    row_allele: &str,
+) -> Vec<TranscriptConsequence> {
+    if !pick_flags.mode.is_enabled() {
+        return assignments;
+    }
+
+    let selected = select_pick_indices(&assignments, ctx, pick_flags, row_allele);
+    if pick_flags.mode.is_flag() {
+        for (idx, assignment) in assignments.iter_mut().enumerate() {
+            if selected.contains(&idx)
+                || (pick_flags.mode == PickMode::FlagPickAlleleGene
+                    && assignment.feature_type != FeatureType::Transcript)
+            {
+                assignment.picked = true;
+            }
+        }
+        return assignments;
+    }
+
+    let retain_non_transcript = matches!(
+        pick_flags.mode,
+        PickMode::PerGene | PickMode::PickAlleleGene
+    );
+    assignments
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, assignment)| {
+            if selected.contains(&idx)
+                || (retain_non_transcript && assignment.feature_type != FeatureType::Transcript)
+            {
+                Some(assignment)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Compute miRNA CSQ field from ncRNA secondary structure and variant cDNA position.
 ///
 /// Traceability:
@@ -2248,25 +2871,33 @@ pub struct AnnotateProvider {
     vcf_table: String,
     cache_source: String,
     backend: AnnotationBackend,
+    cache_source_type: CacheSourceType,
     options_json: Option<String>,
     transcript_selection: TranscriptSelectionFlags,
+    pick_flags: PickFlags,
+    include_pick_output: bool,
     annotation_column_defs: Vec<AnnotationColumnDef>,
     schema: SchemaRef,
 }
 
 impl AnnotateProvider {
-    pub fn new(
+    pub(crate) fn new(
         session: Arc<SessionContext>,
         vcf_table: String,
         cache_source: String,
         backend: AnnotationBackend,
+        cache_source_type: CacheSourceType,
         options_json: Option<String>,
         vcf_schema: Schema,
     ) -> Result<Self> {
-        let transcript_selection =
-            TranscriptSelectionFlags::from_options_json(options_json.as_deref())?;
-        let annotation_column_defs = annotation_column_defs_for_selection(transcript_selection);
-
+        let transcript_selection = TranscriptSelectionFlags::from_options_json(
+            cache_source_type,
+            options_json.as_deref(),
+        )?;
+        let pick_flags = PickFlags::from_options_json(options_json.as_deref())?;
+        let include_pick_output = pick_flags.include_pick_output();
+        let annotation_column_defs =
+            annotation_column_defs_for_selection(transcript_selection, include_pick_output);
         // Output schema starts with all VCF columns and appends annotation fields.
         let mut fields: Vec<Arc<Field>> = vcf_schema
             .fields()
@@ -2299,8 +2930,11 @@ impl AnnotateProvider {
             vcf_table,
             cache_source,
             backend,
+            cache_source_type,
             options_json,
             transcript_selection,
+            pick_flags,
+            include_pick_output,
             annotation_column_defs,
             schema: Arc::new(Schema::new(fields)),
         })
@@ -2707,6 +3341,7 @@ impl AnnotateProvider {
                 let TranscriptRawMetadata {
                     display_xref_id,
                     source: raw_source,
+                    source_cache: raw_source_cache,
                     gene_hgnc_id_native: raw_gene_hgnc_id_native,
                     refseq_match,
                     refseq_edits,
@@ -2746,8 +3381,11 @@ impl AnnotateProvider {
                     .or(raw_flags_str)
                     .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf));
 
-                let gene_stable_id =
-                    gene_stable_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let raw_object_json =
+                    raw_object_json_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let gene_stable_id = gene_stable_id_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or_else(|| gene_stable_id_from_raw_object_json(raw_object_json.as_deref()));
                 let gene_symbol =
                     gene_symbol_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_symbol_source = gene_symbol_source_idx
@@ -2758,11 +3396,11 @@ impl AnnotateProvider {
                 let promoted_gene_hgnc_id =
                     gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let gene_hgnc_id = gene_hgnc_id_native.clone().or(promoted_gene_hgnc_id);
-                let source = raw_source.or_else(|| {
-                    source_idx
-                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
-                        .and_then(|value| normalize_source_label(&value))
+                let source_cache = raw_source_cache.or_else(|| {
+                    source_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row))
                 });
+                let source =
+                    raw_source.or_else(|| source_cache.as_deref().and_then(normalize_source_label));
                 let bam_edit_status =
                     bam_edit_status_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
                 let has_non_polya_rna_edit = has_non_polya_rna_edit_idx
@@ -2835,6 +3473,7 @@ impl AnnotateProvider {
                     gene_hgnc_id,
                     display_xref_id,
                     source,
+                    source_cache,
                     refseq_match,
                     refseq_edits,
                     is_gencode_basic,
@@ -3615,6 +4254,7 @@ impl AnnotateProvider {
         let flags = VepFlags::from_options_json(self.options_json.as_deref());
         let hgvs_flags = HgvsFlags::from_options_json(self.options_json.as_deref());
         let transcript_selection = self.transcript_selection;
+        let pick_flags = self.pick_flags.clone();
         let allowed_failed = self
             .options_json
             .as_deref()
@@ -3665,7 +4305,6 @@ impl AnnotateProvider {
         );
 
         let cache_columns: Vec<String> = requested_columns.iter().map(|s| s.to_string()).collect();
-
         let projected_schema = if let Some(indices) = projection {
             Arc::new(self.schema.project(indices)?)
         } else {
@@ -3680,7 +4319,9 @@ impl AnnotateProvider {
             translations_sift_table: translations_sift_table.map(|s| s.to_string()),
             flags,
             hgvs_flags,
+            cache_source_type: self.cache_source_type,
             transcript_selection,
+            pick_flags,
             allowed_failed,
             reference_fasta_path,
             upstream_distance,
@@ -3736,9 +4377,11 @@ impl AnnotateProvider {
         flags: &VepFlags,
         hgvs_flags: &HgvsFlags,
         transcript_selection: TranscriptSelectionFlags,
+        pick_flags: &PickFlags,
         hgvs_reference_reader: &mut Option<FastaReader>,
     ) -> Result<RecordBatch> {
         let schema = batch.schema();
+        let include_pick_output = self.include_pick_output;
         let chrom_idx = schema.index_of("chrom").map_err(|_| {
             DataFusionError::Execution(
                 "annotate_vep(): input VCF row is missing required chrom column".to_string(),
@@ -3776,8 +4419,8 @@ impl AnnotateProvider {
         let mut most_builder =
             StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 16);
 
-        // --- Annotation column builders (87 columns) ---
-        // Transcript-level (42)
+        // --- Annotation column builders (87 columns, or 88 with PICK) ---
+        // Transcript-level (42, or 43 with PICK)
         let mut b_allele = StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 4);
         let mut b_consequence = ListBuilder::new(StringBuilder::new());
         let mut b_impact = ListBuilder::new(StringBuilder::new());
@@ -3799,6 +4442,7 @@ impl AnnotateProvider {
         let mut b_distance = ListBuilder::new(Int64Builder::new());
         let mut b_strand = ListBuilder::new(Int8Builder::new());
         let mut b_flags = ListBuilder::new(StringBuilder::new());
+        let mut b_pick = ListBuilder::new(StringBuilder::new());
         let mut b_variant_class =
             StringBuilder::with_capacity(batch.num_rows(), batch.num_rows() * 8);
         let mut b_symbol_source = ListBuilder::new(StringBuilder::new());
@@ -3882,6 +4526,7 @@ impl AnnotateProvider {
                 b_distance.append(false);
                 b_strand.append(false);
                 b_flags.append(false);
+                b_pick.append(false);
                 b_variant_class.append_null();
                 b_symbol_source.append(false);
                 b_hgnc_id.append(false);
@@ -3947,8 +4592,11 @@ impl AnnotateProvider {
         // Reusable permutation index for VEP-compatible CSQ ordering.
         // Allocated once, reused across all rows in the batch.
         let mut sorted_indices: Vec<usize> = Vec::new();
-        let placeholder_layout =
-            CsqPlaceholderLayout::for_mode(flags.everything, transcript_selection);
+        let placeholder_layout = CsqPlaceholderLayout::for_mode(
+            flags.everything,
+            transcript_selection,
+            include_pick_output,
+        );
 
         for row in 0..batch.num_rows() {
             let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
@@ -4062,11 +4710,15 @@ impl AnnotateProvider {
             let mut row_assignments: Vec<TranscriptConsequence> = Vec::new();
             // Store the VariantInput for HGVS_OFFSET extraction in annotation columns.
             let mut row_variant: Option<VariantInput> = None;
+            let require_transcript_annotations =
+                pick_flags.requires_transcript_annotations(skip_csq, skip_typed_cols);
             if !skip_csq {
                 csq_buf.clear();
             }
-            if let Some(most_val) = &cached_most {
-                // Cache hit — produce single CSQ entry with empty transcript fields.
+            let use_cached_fast_path = cached_most.is_some() && !require_transcript_annotations;
+            if use_cached_fast_path {
+                use std::fmt::Write;
+                let most_val = cached_most.as_deref().unwrap_or_default();
                 if !skip_csq {
                     let csq_val = cached_csq.unwrap_or_default();
                     let impact = SoTerm::from_str(most_val)
@@ -4083,7 +4735,7 @@ impl AnnotateProvider {
                     };
                     placeholder_layout.append_entry(&mut csq_buf, &entry);
                 }
-                most_str = most_val.clone();
+                most_str = most_val.to_string();
             } else {
                 use std::fmt::Write;
                 // Cache miss — compute via transcript engine and produce per-transcript CSQ.
@@ -4151,7 +4803,11 @@ impl AnnotateProvider {
                 }
                 let assignments = engine.evaluate_variant_prepared(&variant, ctx);
 
-                // Derive most_severe from all assignments.
+                // Derive the local scalar `most_severe_consequence` from all
+                // computed assignments, even when pick filtering later reduces
+                // emitted CSQ/typed entries. Ensembl VEP VCF output has no
+                // equivalent scalar field, so this preserves the existing
+                // annotate_vep API contract.
                 let mut all_terms =
                     TranscriptConsequenceEngine::collapse_variant_terms(&assignments);
                 if all_terms.is_empty() {
@@ -4159,7 +4815,7 @@ impl AnnotateProvider {
                 }
                 let most = most_severe_term(all_terms.iter()).unwrap_or(SoTerm::SequenceVariant);
                 most_str = most.as_str().to_string();
-                row_assignments = assignments;
+                row_assignments = apply_pick_mode(assignments, ctx, pick_flags, &vep_allele);
                 row_variant = Some(variant);
 
                 // Build VEP-compatible sorted permutation index.
@@ -4240,6 +4896,7 @@ impl AnnotateProvider {
                         }
                         let distance = tc.distance.map(|d| d.to_string()).unwrap_or_default();
                         let tc_flags = tc.flags.as_deref().unwrap_or("");
+                        let pick_str = if tc.picked { "1" } else { "" };
                         let hgvsc = if hgvs_flags.hgvsc {
                             tc.hgvsc.as_deref().unwrap_or("")
                         } else {
@@ -4423,92 +5080,68 @@ impl AnnotateProvider {
                                     String::new()
                                 }
                             };
-                            // 80-field CSQ: 22 base + 20 Batch 1 + 33 Batch 3 + 5 motif.
+                            // 80-field CSQ base layout, with optional PICK and RefSeq fields.
                             // Traceability:
                             // - VEP Constants.pm CSQ field order for --everything
                             //   https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/Constants.pm#L66-L138
-                            if include_source_field {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
-                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
-                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|\
-                                 {variant_class}|{symbol_source}|{hgnc_id}|\
-                                 {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}|{gene_pheno}|\
-                                 {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
-                                 {hgvs_offset}|\
-                                 {batch3_suffix}|||||"
-                                );
-                            } else if include_refseq_fields {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
-                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
-                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|\
-                                 {variant_class}|{symbol_source}|{hgnc_id}|\
-                                 {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}|{gene_pheno}|\
-                                 {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
-                                 {hgvs_offset}|\
-                                 {batch3_suffix}|||||"
-                                );
+                            let pick_field = if include_pick_output {
+                                format!("|{pick_str}")
                             } else {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
-                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
-                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|\
-                                 {variant_class}|{symbol_source}|{hgnc_id}|\
-                                 {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
-                                 {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|{gene_pheno}|\
-                                 {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
-                                 {hgvs_offset}|\
-                                 {batch3_suffix}|||||"
-                                );
-                            }
+                                String::new()
+                            };
+                            let refseq_block = if include_source_field {
+                                format!(
+                                    "|{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                )
+                            } else if include_refseq_fields {
+                                format!(
+                                    "|{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                )
+                            } else {
+                                String::new()
+                            };
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                             {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                             {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                             {existing_var}|{distance}|{strand_str}|{tc_flags}{pick_field}|\
+                             {variant_class}|{symbol_source}|{hgnc_id}|\
+                             {canonical}|{mane}|{mane_select}|{mane_plus}|{tsl_str}|{appris_str}|{ccds}|{ensp}|\
+                             {swissprot}|{trembl}|{uniparc}|{uniprot_isoform}{refseq_block}|{gene_pheno}|\
+                             {sift_str}|{polyphen_str}|{domains}|{mirna_str}|\
+                             {hgvs_offset}|\
+                             {batch3_suffix}|||||"
+                            );
                         } else {
-                            // 74-field CSQ: 29 base + 12 Batch 1 + 33 Batch 3.
-                            if include_source_field {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
-                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
-                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
-                                 |||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}|\
-                                 {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
-                                 {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
-                                 {batch3_suffix}"
-                                );
-                            } else if include_refseq_fields {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
-                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
-                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
-                                 |||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}|\
-                                 {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
-                                 {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
-                                 {batch3_suffix}"
-                                );
+                            // 74-field CSQ base layout, with optional PICK and RefSeq fields.
+                            let pick_field = if include_pick_output {
+                                format!("|{pick_str}")
                             } else {
-                                let _ = write!(
-                                    csq_buf,
-                                    "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
-                                 {exon}|{intron}|{hgvsc}|{hgvsp}|\
-                                 {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
-                                 {existing_var}|{distance}|{strand_str}|{tc_flags}|{symbol_source}|{hgnc_id}|\
-                                 |||||{source_val}|\
-                                 {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
-                                 {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
-                                 {batch3_suffix}"
-                                );
-                            }
+                                String::new()
+                            };
+                            let source_block = if include_source_field {
+                                format!(
+                                    "|||||{refseq_match}|{source_val}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                )
+                            } else if include_refseq_fields {
+                                format!(
+                                    "|||||{refseq_match}|{refseq_offset}|{given_ref}|{used_ref}|{bam_edit}"
+                                )
+                            } else {
+                                format!("|||||{source_val}")
+                            };
+                            let _ = write!(
+                                csq_buf,
+                                "{vep_allele}|{terms_str}|{tc_impact}|{symbol}|{gene}|{feature_type}|{feature}|{biotype}|\
+                             {exon}|{intron}|{hgvsc}|{hgvsp}|\
+                             {cdna_pos}|{cds_pos}|{protein_pos}|{amino_acids}|{codons_str}|\
+                             {existing_var}|{distance}|{strand_str}|{tc_flags}{pick_field}|{symbol_source}|{hgnc_id}|\
+                             {source_block}|\
+                             {variant_class}|{canonical}|{tsl_str}|{mane_select}|{mane_plus}|\
+                             {ensp}|{gene_pheno}|{ccds}|{swissprot}|{trembl}|{uniparc}|{uniprot_isoform}|\
+                             {batch3_suffix}"
+                            );
                         }
                     }
                     if csq_buf.is_empty() {
@@ -4534,12 +5167,12 @@ impl AnnotateProvider {
             }
             most_builder.append_value(&most_str);
 
-            // --- Populate 87 annotation column builders for this row ---
+            // --- Populate structured annotation column builders for this row ---
             // Skip all typed column work when they're not in the projection.
             if skip_typed_cols {
                 append_null_annotation_row!();
             } else {
-                // -- Transcript-level columns (42) --
+                // -- Transcript-level columns (42, or 43 with PICK) --
                 // Allele (scalar, same for all transcripts)
                 b_allele.append_value(&vep_allele);
                 // VARIANT_CLASS (scalar)
@@ -4693,6 +5326,13 @@ impl AnnotateProvider {
 
                         // FLAGS
                         append_opt_str(b_flags.values(), tc.flags.as_deref());
+                        if include_pick_output {
+                            if tc.picked {
+                                b_pick.values().append_value("1");
+                            } else {
+                                b_pick.values().append_null();
+                            }
+                        }
 
                         // SYMBOL_SOURCE, HGNC_ID
                         append_opt_str(
@@ -4935,6 +5575,7 @@ impl AnnotateProvider {
                     b_distance.append(true);
                     b_strand.append(true);
                     b_flags.append(true);
+                    b_pick.append(include_pick_output);
                     b_symbol_source.append(true);
                     b_hgnc_id.append(true);
                     b_canonical.append(true);
@@ -4986,6 +5627,7 @@ impl AnnotateProvider {
                     b_distance.append(false);
                     b_strand.append(false);
                     b_flags.append(false);
+                    b_pick.append(false);
                     b_symbol_source.append(false);
                     b_hgnc_id.append(false);
                     b_canonical.append(false);
@@ -5218,7 +5860,7 @@ impl AnnotateProvider {
                 out_cols.push(new_null_array(&col_def.data_type, batch.num_rows()));
             }
         } else {
-            // Transcript-level columns (42)
+            // Transcript-level columns (42, or 43 with PICK)
             out_cols.push(Arc::new(b_allele.finish()));
             out_cols.push(Arc::new(b_consequence.finish()));
             out_cols.push(Arc::new(b_impact.finish()));
@@ -5240,6 +5882,9 @@ impl AnnotateProvider {
             out_cols.push(Arc::new(b_distance.finish()));
             out_cols.push(Arc::new(b_strand.finish()));
             out_cols.push(Arc::new(b_flags.finish()));
+            if self.include_pick_output {
+                out_cols.push(Arc::new(b_pick.finish()));
+            }
             out_cols.push(Arc::new(b_variant_class.finish()));
             out_cols.push(Arc::new(b_symbol_source.finish()));
             out_cols.push(Arc::new(b_hgnc_id.finish()));
@@ -5364,6 +6009,28 @@ fn flags_str_from_bools(cds_start_nf: bool, cds_end_nf: bool) -> Option<String> 
         (false, true) => Some("cds_end_NF".to_string()),
         (false, false) => None,
     }
+}
+
+fn gene_stable_id_from_raw_object_json(raw_object_json: Option<&str>) -> Option<String> {
+    let raw_object_json = raw_object_json?;
+    let parsed: Value = serde_json::from_str(raw_object_json).ok()?;
+    let transcript = parsed.get("__value")?;
+
+    // Traceability:
+    // - Ensembl VEP release 115 groups by `transcript->{_gene_stable_id}` and
+    //   otherwise fetches the gene stable ID from the transcript's gene object
+    //   <https://github.com/Ensembl/ensembl-vep/blob/release/115/modules/Bio/EnsEMBL/VEP/OutputFactory.pm#L849-L851>
+    transcript
+        .get("_gene_stable_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            transcript
+                .get("_gene")
+                .and_then(|gene| gene.get("stable_id"))
+                .and_then(Value::as_str)
+        })
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn normalize_source_label(source: &str) -> Option<String> {
@@ -5557,10 +6224,12 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
         .and_then(|xref| xref.get("display_id"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let source = tx
+    let source_cache = tx
         .get("_source_cache")
         .and_then(Value::as_str)
-        .and_then(normalize_source_label);
+        .filter(|value| !value.is_empty() && *value != "-")
+        .map(str::to_string);
+    let source = source_cache.as_deref().and_then(normalize_source_label);
     let cdna_mapper_segments = parse_raw_cdna_mapper_segments(vef_cache);
     let gene_hgnc_id_native = tx
         .get("_gene_hgnc_id")
@@ -5625,6 +6294,7 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
     TranscriptRawMetadata {
         display_xref_id,
         source,
+        source_cache,
         gene_hgnc_id_native,
         refseq_match: (!refseq_match_codes.is_empty()).then(|| refseq_match_codes.join("&")),
         refseq_edits,
@@ -5639,16 +6309,22 @@ fn parse_transcript_raw_metadata(raw_object_json: &str) -> TranscriptRawMetadata
     }
 }
 
-fn is_ensembl_transcript(tx: &TranscriptFeature) -> bool {
-    tx.source.as_deref() == Some("Ensembl") || tx.transcript_id.starts_with("ENST")
+fn row_source_is_refseq(tx: &TranscriptFeature) -> bool {
+    tx.source_cache
+        .as_deref()
+        .or(tx.source.as_deref())
+        .and_then(normalize_source_label)
+        .as_deref()
+        == Some("RefSeq")
 }
 
-fn is_refseq_transcript(tx: &TranscriptFeature) -> bool {
-    tx.source.as_deref() == Some("RefSeq")
-        || matches!(
-            tx.transcript_id.as_bytes().get(..2),
-            Some(b"NM") | Some(b"NR") | Some(b"XM") | Some(b"XR")
-        )
+fn is_standard_refseq_accession(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() >= 4
+        && bytes[0].is_ascii_uppercase()
+        && bytes[1].is_ascii_uppercase()
+        && bytes[2] == b'_'
+        && bytes[3].is_ascii_digit()
 }
 
 fn is_refseq_offset_transcript(tx: &TranscriptFeature) -> bool {
@@ -5714,12 +6390,7 @@ fn is_mitochondrial_chrom(chrom: &str) -> bool {
 
 fn is_default_refseq_transcript_id(tx: &TranscriptFeature) -> bool {
     let id = tx.transcript_id.as_str();
-    let starts_with_refseq_accession = id.len() >= 4
-        && id.as_bytes()[0].is_ascii_uppercase()
-        && id.as_bytes()[1].is_ascii_uppercase()
-        && id.as_bytes()[2] == b'_'
-        && id.as_bytes()[3].is_ascii_digit();
-    if starts_with_refseq_accession {
+    if is_standard_refseq_accession(id) {
         return true;
     }
 
@@ -5737,14 +6408,9 @@ fn is_default_refseq_transcript_id(tx: &TranscriptFeature) -> bool {
     }
 
     tx.display_xref_id.as_deref().is_some_and(|display_id| {
-        let is_refseq_accession = display_id.len() >= 4
-            && display_id.as_bytes()[0].is_ascii_uppercase()
-            && display_id.as_bytes()[1].is_ascii_uppercase()
-            && display_id.as_bytes()[2] == b'_'
-            && display_id.as_bytes()[3].is_ascii_digit();
         let is_mt_display_id =
             display_id.len() == 4 && display_id.chars().all(|ch| ch.is_ascii_digit());
-        is_refseq_accession || is_mt_display_id
+        is_standard_refseq_accession(display_id) || is_mt_display_id
     })
 }
 
@@ -5766,17 +6432,18 @@ fn passes_transcript_selection(
         return false;
     }
 
-    match selection.source_mode {
-        TranscriptSourceMode::Ensembl => is_ensembl_transcript(tx),
-        TranscriptSourceMode::RefSeq => {
-            is_refseq_transcript(tx)
-                && (selection.all_refseq || is_default_refseq_transcript_id(tx))
-        }
-        TranscriptSourceMode::Merged => {
-            if is_refseq_transcript(tx) {
+    // Ensembl VEP release/115 only applies the RefSeq stable-id whitelist when
+    // source_type is RefSeq, or when source_type is merged and the row came
+    // from the RefSeq cache. Other source rows pass once the common filters
+    // above have accepted their stable ID.
+    match selection.cache_source_type {
+        CacheSourceType::Ensembl => true,
+        CacheSourceType::RefSeq => selection.all_refseq || is_default_refseq_transcript_id(tx),
+        CacheSourceType::Merged => {
+            if row_source_is_refseq(tx) {
                 selection.all_refseq || is_default_refseq_transcript_id(tx)
             } else {
-                is_ensembl_transcript(tx)
+                true
             }
         }
     }
@@ -6088,6 +6755,7 @@ fn hydrate_refseq_translation_cds_from_reference<R>(
     translations: &mut [TranslationFeature],
     translateable_seq_by_tx: &HashMap<String, String>,
     input_variant_intervals: &HashMap<String, Vec<(i64, i64)>>,
+    cache_source_type: CacheSourceType,
 ) -> Result<HashSet<String>>
 where
     R: BufRead + Seek,
@@ -6112,7 +6780,7 @@ where
         if !translation_ids.contains(tx.transcript_id.as_str()) {
             continue;
         }
-        if !is_refseq_transcript_for_hydration(tx) {
+        if !is_refseq_transcript_for_hydration(tx, cache_source_type) {
             continue;
         }
         // VEP keeps transcript-local sequence state on the Transcript object.
@@ -6203,6 +6871,7 @@ fn hydrate_transcript_cdna_from_reference<R>(
     exons: &[ExonFeature],
     indel_intervals: &HashMap<String, Vec<(i64, i64)>>,
     all_intervals: &HashMap<String, Vec<(i64, i64)>>,
+    cache_source_type: CacheSourceType,
 ) -> Result<()>
 where
     R: BufRead + Seek,
@@ -6224,7 +6893,7 @@ where
         };
 
         let should_infer_implicit_refseq_deletions = tx.spliced_seq.is_some()
-            && is_refseq_transcript_for_hydration(tx)
+            && is_refseq_transcript_for_hydration(tx, cache_source_type)
             && tx.bam_edit_status.as_deref() == Some("ok")
             && tx.refseq_edits.is_empty()
             && tx.cdna_mapper_segments.is_empty();
@@ -6378,8 +7047,42 @@ fn apply_translateable_seq_overrides(
     }
 }
 
-fn is_refseq_transcript_for_hydration(tx: &TranscriptFeature) -> bool {
-    is_refseq_transcript(tx)
+fn validate_partitioned_cache_source(
+    cache: &PartitionedParquetCache,
+    context_type: &str,
+    chrom: &str,
+    role: &str,
+    expected: CacheSourceType,
+) -> Result<()> {
+    let Some(path) = cache.context_path(context_type, chrom) else {
+        return Ok(());
+    };
+    // This validates the co-located shard used for the current chromosome.
+    // Mixed metadata across other shards is caught when those shards are read.
+    let actual = CacheSourceType::from_parquet_file(&path).map_err(|err| {
+        DataFusionError::Plan(format!(
+            "annotate_vep(): {role} table '{}' has invalid cache source metadata: {err}",
+            path.display()
+        ))
+    })?;
+    if actual != expected {
+        return Err(DataFusionError::Plan(format!(
+            "annotate_vep(): {role} table '{}' has {CACHE_SOURCE_METADATA_KEY}='{}' but variation cache has {CACHE_SOURCE_METADATA_KEY}='{}'",
+            path.display(),
+            actual.as_str(),
+            expected.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn is_refseq_transcript_for_hydration(
+    tx: &TranscriptFeature,
+    cache_source_type: CacheSourceType,
+) -> bool {
+    row_source_is_refseq(tx)
+        || is_standard_refseq_accession(&tx.transcript_id)
+        || cache_source_type == CacheSourceType::RefSeq && is_default_refseq_transcript_id(tx)
 }
 
 fn read_reference_sequence<R>(
@@ -6737,10 +7440,11 @@ impl Debug for AnnotateProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "AnnotateProvider {{ vcf: {}, cache_source: {}, backend: {} }}",
+            "AnnotateProvider {{ vcf: {}, cache_source: {}, backend: {}, cache_source_type: {} }}",
             self.vcf_table,
             self.cache_source,
-            self.backend.as_str()
+            self.backend.as_str(),
+            self.cache_source_type.as_str()
         )
     }
 }
@@ -6759,6 +7463,7 @@ struct ContigAnnotationConfig {
     translations_sift_table: Option<String>,
     flags: VepFlags,
     hgvs_flags: HgvsFlags,
+    cache_source_type: CacheSourceType,
     transcript_selection: TranscriptSelectionFlags,
     allowed_failed: i64,
     reference_fasta_path: Option<String>,
@@ -6769,6 +7474,7 @@ struct ContigAnnotationConfig {
     annotation_column_count: usize,
     /// Maximum number of output rows (LIMIT pushdown).
     fetch_limit: Option<usize>,
+    pick_flags: PickFlags,
     /// When true, use fjall KV store for variation lookup + SIFT instead of parquet.
     #[cfg(feature = "kv-cache")]
     use_fjall: bool,
@@ -6904,6 +7610,71 @@ type PersistedBufferTranscripts =
 
 type FastaReader = fasta::io::indexed_reader::IndexedReader<fasta::io::BufReader<std::fs::File>>;
 
+#[derive(Default)]
+struct InputBufferAccumulator {
+    pending_batches: VecDeque<RecordBatch>,
+    pending_rows: usize,
+}
+
+impl InputBufferAccumulator {
+    fn pending_rows(&self) -> usize {
+        self.pending_rows
+    }
+
+    fn push_window_and_drain_ready(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        row_limit: usize,
+        flush_partial: bool,
+    ) -> Vec<Vec<RecordBatch>> {
+        for batch in batches {
+            let rows = batch.num_rows();
+            if rows == 0 {
+                continue;
+            }
+            self.pending_rows += rows;
+            self.pending_batches.push_back(batch);
+        }
+
+        let row_limit = row_limit.max(1);
+        let mut ready = Vec::new();
+        while self.pending_rows >= row_limit {
+            ready.push(self.drain_rows(row_limit));
+        }
+        if flush_partial && self.pending_rows > 0 {
+            ready.push(self.drain_rows(self.pending_rows));
+        }
+        ready
+    }
+
+    fn drain_rows(&mut self, rows: usize) -> Vec<RecordBatch> {
+        debug_assert!(rows > 0);
+        debug_assert!(rows <= self.pending_rows);
+
+        let mut remaining = rows;
+        let mut drained = Vec::new();
+        while remaining > 0 {
+            let batch = self
+                .pending_batches
+                .pop_front()
+                .expect("pending row count must match pending batches");
+            let batch_rows = batch.num_rows();
+            if batch_rows <= remaining {
+                remaining -= batch_rows;
+                drained.push(batch);
+            } else {
+                drained.push(batch.slice(0, remaining));
+                self.pending_batches
+                    .push_front(batch.slice(remaining, batch_rows - remaining));
+                remaining = 0;
+            }
+        }
+
+        self.pending_rows -= rows;
+        drained
+    }
+}
+
 /// Everything needed to start streaming annotation for a contig.
 /// Produced by `prepare_contig_context()`.
 struct ContigReadyState {
@@ -6957,6 +7728,7 @@ struct ContigAnnotationState {
     engine: TranscriptConsequenceEngine,
     // Window buffer.
     window_buffer: Vec<RecordBatch>,
+    input_buffer_accumulator: InputBufferAccumulator,
     lookup_done: bool,
     // Cleanup + profiling.
     ephemeral_tables: Vec<String>,
@@ -7104,6 +7876,7 @@ fn hydrate_window(
     hgvs_reader: &mut Option<FastaReader>,
     hydrated_cds_tx_ids: &mut HashSet<String>,
     window_batches: &[RecordBatch],
+    cache_source_type: CacheSourceType,
 ) -> Result<()> {
     let Some(reader) = hgvs_reader.as_mut() else {
         return Ok(());
@@ -7120,6 +7893,7 @@ fn hydrate_window(
         translations,
         translateable_seq_by_tx,
         &input_intervals,
+        cache_source_type,
     )?;
     // Merge newly hydrated IDs into cumulative set.
     let first_window = hydrated_cds_tx_ids.is_empty();
@@ -7135,6 +7909,7 @@ fn hydrate_window(
         exons,
         &indel_intervals,
         &input_intervals,
+        cache_source_type,
     )?;
 
     if first_window && profiling_enabled() {
@@ -7144,34 +7919,6 @@ fn hydrate_window(
         );
     }
     Ok(())
-}
-
-fn split_batches_by_row_limit(batches: &[RecordBatch], row_limit: usize) -> Vec<Vec<RecordBatch>> {
-    let mut out = Vec::new();
-    let mut current = Vec::new();
-    let mut current_rows = 0usize;
-
-    for batch in batches {
-        let mut offset = 0usize;
-        while offset < batch.num_rows() {
-            let remaining = row_limit.saturating_sub(current_rows);
-            let take = remaining.min(batch.num_rows() - offset);
-            current.push(batch.slice(offset, take));
-            current_rows += take;
-            offset += take;
-
-            if current_rows == row_limit {
-                out.push(std::mem::take(&mut current));
-                current_rows = 0;
-            }
-        }
-    }
-
-    if !current.is_empty() {
-        out.push(current);
-    }
-
-    out
 }
 
 fn buffer_variant_bounds(batches: &[RecordBatch]) -> Result<Option<(String, i64, i64)>> {
@@ -7346,7 +8093,12 @@ fn select_buffer_local_transcripts(
         .iter()
         .filter(|tx| {
             let tx_chrom = tx.chrom.strip_prefix("chr").unwrap_or(&tx.chrom);
-            tx_chrom == chrom_norm && tx.end >= query_start && tx.start <= query_end
+            tx_chrom == chrom_norm
+                // VEP fetches broad 1 Mb cache regions, but it filters those
+                // cached features against the input-buffer min/max window
+                // before merge_features() can propagate HGNC values.
+                && tx.end >= query_start
+                && tx.start <= query_end
         })
         .cloned()
         .collect()
@@ -7564,10 +8316,21 @@ fn annotate_window(
             .iter()
             .any(|&i| i >= typed_cols_start && i < typed_cols_end)
     });
+    let pick_requires_full_annotations = ann
+        .config
+        .pick_flags
+        .requires_transcript_annotations(skip_csq, skip_typed_cols);
     let sift_enabled = ann.config.flags.everything;
     let mut out = VecDeque::with_capacity(window_batches.len());
 
-    for buffer_batches in split_batches_by_row_limit(window_batches, ann.config.input_buffer_size) {
+    let flush_partial = ann.lookup_done && ann.window_buffer.is_empty();
+    let ready_input_buffers = ann.input_buffer_accumulator.push_window_and_drain_ready(
+        window_batches.to_vec(),
+        ann.config.input_buffer_size,
+        flush_partial,
+    );
+
+    for buffer_batches in ready_input_buffers {
         let Some((chrom, min_start, max_end)) = buffer_variant_bounds(&buffer_batches)? else {
             continue;
         };
@@ -7611,12 +8374,16 @@ fn annotate_window(
         for batch in &buffer_batches {
             // Lazy SIFT window loading (same pattern as before).
             if sift_enabled && ann.sift_direct.is_some() {
-                let batch_has_miss = batch
-                    .schema()
-                    .index_of("cache_most_severe_consequence")
-                    .ok()
-                    .map_or(true, |idx| batch.column(idx).null_count() > 0);
-                if batch_has_miss {
+                let batch_needs_engine = if pick_requires_full_annotations {
+                    true
+                } else {
+                    batch
+                        .schema()
+                        .index_of("cache_most_severe_consequence")
+                        .ok()
+                        .map_or(true, |idx| batch.column(idx).null_count() > 0)
+                };
+                if batch_needs_engine {
                     let schema = batch.schema();
                     if let (Ok(ci), Ok(si), Ok(ei)) = (
                         schema.index_of("chrom"),
@@ -7685,6 +8452,7 @@ fn annotate_window(
                 &ann.config.flags,
                 &ann.config.hgvs_flags,
                 ann.config.transcript_selection,
+                &ann.config.pick_flags,
                 &mut ann.hgvs_reader,
             )?;
 
@@ -7779,6 +8547,7 @@ impl Stream for ContigAnnotationStream {
                             config.vcf_table.clone(),
                             String::new(),
                             AnnotationBackend::Parquet,
+                            config.cache_source_type,
                             config.options_json.clone(),
                             vcf_only_schema,
                         ) {
@@ -7870,6 +8639,7 @@ impl Stream for ContigAnnotationStream {
                             tmp_provider,
                             engine,
                             window_buffer: Vec::with_capacity(HYDRATION_WINDOW_SIZE),
+                            input_buffer_accumulator: InputBufferAccumulator::default(),
                             lookup_done: false,
                             ephemeral_tables: ready.ephemeral_tables,
                             chrom: ready.chrom,
@@ -7948,8 +8718,10 @@ impl Stream for ContigAnnotationStream {
 
                     // LIMIT pushdown: skip remaining windows if limit reached.
                     let limit_reached = fetch_limit.is_some_and(|limit| rows_emitted >= limit);
+                    let has_pending_input_buffer = ann.input_buffer_accumulator.pending_rows() > 0;
 
-                    if ann.window_buffer.is_empty() || limit_reached {
+                    if limit_reached || (ann.window_buffer.is_empty() && !has_pending_input_buffer)
+                    {
                         // No more data (or limit reached) — clean up.
                         // Drop heavy state eagerly before the async cleanup future runs.
                         profile_end!(
@@ -7993,21 +8765,24 @@ impl Stream for ContigAnnotationStream {
                         ann.window_buffer.drain(..window_end).collect();
 
                     // Window-based HGVS hydration (like SIFT sliding window).
-                    if let Err(e) = hydrate_window(
-                        &mut ann.transcripts,
-                        &ann.exons,
-                        &mut ann.translations,
-                        &ann.translateable_seq_by_tx,
-                        &mut ann.hgvs_reader,
-                        &mut ann.hydrated_cds_tx_ids,
-                        &window_batches,
-                    ) {
-                        let fut = make_cleanup_future(
-                            Arc::clone(&ann.session),
-                            std::mem::take(&mut ann.ephemeral_tables),
-                        );
-                        self.state = StreamState::ErrorCleaningUp(fut, e);
-                        continue;
+                    if !window_batches.is_empty() {
+                        if let Err(e) = hydrate_window(
+                            &mut ann.transcripts,
+                            &ann.exons,
+                            &mut ann.translations,
+                            &ann.translateable_seq_by_tx,
+                            &mut ann.hgvs_reader,
+                            &mut ann.hydrated_cds_tx_ids,
+                            &window_batches,
+                            ann.config.cache_source_type,
+                        ) {
+                            let fut = make_cleanup_future(
+                                Arc::clone(&ann.session),
+                                std::mem::take(&mut ann.ephemeral_tables),
+                            );
+                            self.state = StreamState::ErrorCleaningUp(fut, e);
+                            continue;
+                        }
                     }
 
                     // Annotate window.
@@ -8173,16 +8948,37 @@ async fn prepare_contig_context(
         ephemeral_tables.push(var_table.clone());
         var_table
     };
+    validate_partitioned_cache_source(
+        &cache,
+        "variation",
+        &chrom,
+        "variation",
+        config.cache_source_type,
+    )?;
 
     let tx_table =
         crate::partitioned_cache::register_chrom_parquet(&session, &cache, "transcript", &chrom)
             .await?;
     if let Some(ref t) = tx_table {
+        validate_partitioned_cache_source(
+            &cache,
+            "transcript",
+            &chrom,
+            "transcript",
+            config.cache_source_type,
+        )?;
         ephemeral_tables.push(t.clone());
     }
     let ex_table =
         crate::partitioned_cache::register_chrom_parquet(&session, &cache, "exon", &chrom).await?;
     if let Some(ref t) = ex_table {
+        validate_partitioned_cache_source(
+            &cache,
+            "exon",
+            &chrom,
+            "exon",
+            config.cache_source_type,
+        )?;
         ephemeral_tables.push(t.clone());
     }
     let tl_table = crate::partitioned_cache::register_chrom_parquet(
@@ -8193,17 +8989,38 @@ async fn prepare_contig_context(
     )
     .await?;
     if let Some(ref t) = tl_table {
+        validate_partitioned_cache_source(
+            &cache,
+            "translation_core",
+            &chrom,
+            "translation_core",
+            config.cache_source_type,
+        )?;
         ephemeral_tables.push(t.clone());
     }
     let rg_table =
         crate::partitioned_cache::register_chrom_parquet(&session, &cache, "regulatory", &chrom)
             .await?;
     if let Some(ref t) = rg_table {
+        validate_partitioned_cache_source(
+            &cache,
+            "regulatory",
+            &chrom,
+            "regulatory",
+            config.cache_source_type,
+        )?;
         ephemeral_tables.push(t.clone());
     }
     let mt_table =
         crate::partitioned_cache::register_chrom_parquet(&session, &cache, "motif", &chrom).await?;
     if let Some(ref t) = mt_table {
+        validate_partitioned_cache_source(
+            &cache,
+            "motif",
+            &chrom,
+            "motif",
+            config.cache_source_type,
+        )?;
         ephemeral_tables.push(t.clone());
     }
 
@@ -8246,6 +9063,7 @@ async fn prepare_contig_context(
         config.vcf_table.clone(),
         String::new(),
         AnnotationBackend::Parquet,
+        config.cache_source_type,
         config.options_json.clone(),
         vcf_only_schema,
     )?;
@@ -8420,6 +9238,13 @@ impl TableProvider for AnnotateProvider {
                         "partitioned cache: no variation parquet for sample chrom".to_string(),
                     )
                 })?;
+                validate_partitioned_cache_source(
+                    cache,
+                    "variation",
+                    sample_chrom,
+                    "variation",
+                    self.cache_source_type,
+                )?;
                 let cache_schema = self
                     .session
                     .table(&sample_table)
@@ -8490,7 +9315,7 @@ impl TableProvider for AnnotateProvider {
 mod tests {
     use super::*;
     use crate::transcript_consequence::{
-        CachedPredictions, ProteinDomainFeature, SiftPolyphenCache, TranslationFeature,
+        CachedPredictions, FeatureType, ProteinDomainFeature, SiftPolyphenCache, TranslationFeature,
     };
 
     // ── format_appris ──────────────────────────────────────────────────
@@ -8513,6 +9338,558 @@ mod tests {
     #[test]
     fn test_format_appris_passthrough() {
         assert_eq!(format_appris("other"), "other");
+    }
+
+    #[test]
+    fn test_pick_flags_parse_custom_order() {
+        let flags = PickFlags::from_options_json(Some(
+            "{\"flag_pick_allele_gene\":true,\"pick_order\":\"biotype,rank,mane_select,tsl,canonical,appris,ccds,length\"}",
+        ))
+        .expect("pick flags should parse");
+
+        assert_eq!(flags.mode, PickMode::FlagPickAlleleGene);
+        assert_eq!(
+            flags.pick_order,
+            vec![
+                PickCriterion::Biotype,
+                PickCriterion::Rank,
+                PickCriterion::ManeSelect,
+                PickCriterion::Tsl,
+                PickCriterion::Canonical,
+                PickCriterion::Appris,
+                PickCriterion::Ccds,
+                PickCriterion::Length,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pick_flags_reject_invalid_pick_order_criterion() {
+        let err = PickFlags::from_options_json(Some(
+            "{\"flag_pick_allele_gene\":true,\"pick_order\":\"mane_select,bogus\"}",
+        ))
+        .expect_err("invalid pick_order should fail")
+        .to_string();
+
+        assert!(err.contains("unsupported pick_order criterion 'bogus'"));
+    }
+
+    #[test]
+    fn test_pick_flags_default_mode_is_none() {
+        let flags = PickFlags::from_options_json(Some("{}")).expect("pick flags should parse");
+        assert_eq!(flags.mode, PickMode::None);
+        assert!(!flags.include_pick_output());
+    }
+
+    #[test]
+    fn test_pick_flags_use_vep_precedence() {
+        let flags = PickFlags::from_options_json(Some(
+            "{\"flag_pick_allele_gene\":true,\"flag_pick\":true,\"pick_allele\":true,\"pick\":true}",
+        ))
+        .expect("pick flags should parse");
+
+        assert_eq!(flags.mode, PickMode::Pick);
+        assert!(!flags.include_pick_output());
+
+        let flags = PickFlags::from_options_json(Some(
+            "{\"flag_pick_allele_gene\":true,\"flag_pick\":true}",
+        ))
+        .expect("pick flags should parse");
+        assert_eq!(flags.mode, PickMode::FlagPick);
+        assert!(flags.include_pick_output());
+    }
+
+    #[test]
+    fn test_pick_flags_reject_empty_pick_order() {
+        let err = PickFlags::from_options_json(Some(
+            "{\"flag_pick_allele_gene\":true,\"pick_order\":\" , \"}",
+        ))
+        .expect_err("empty pick_order should fail")
+        .to_string();
+
+        assert!(err.contains("pick_order must contain at least one criterion"));
+    }
+
+    #[test]
+    fn test_gene_stable_id_from_raw_object_json_prefers_transcript_slot_then_gene_slot() {
+        let from_transcript = r#"{"__class":"Bio::EnsEMBL::Transcript","__value":{"_gene_stable_id":"ENSG00000001","_gene":{"stable_id":"ENSGSHOULDNOTWIN"}}}"#;
+        assert_eq!(
+            gene_stable_id_from_raw_object_json(Some(from_transcript)).as_deref(),
+            Some("ENSG00000001")
+        );
+
+        let from_gene = r#"{"__class":"Bio::EnsEMBL::Transcript","__value":{"_gene":{"stable_id":"ENSG00000002"}}}"#;
+        assert_eq!(
+            gene_stable_id_from_raw_object_json(Some(from_gene)).as_deref(),
+            Some("ENSG00000002")
+        );
+
+        assert_eq!(gene_stable_id_from_raw_object_json(None), None);
+    }
+
+    #[test]
+    fn test_parse_appris_pick_rank_matches_release_115() {
+        assert_eq!(parse_appris_pick_rank(Some("principal5")), 5);
+        assert_eq!(parse_appris_pick_rank(Some("alternative2")), 12);
+        assert_eq!(parse_appris_pick_rank(Some("other")), 100);
+        assert_eq!(parse_appris_pick_rank(None), 100);
+    }
+
+    #[test]
+    fn test_mark_flag_pick_allele_gene_marks_non_transcript_assignments() {
+        let ctx = PreparedContext::new(&[], &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                feature_type: FeatureType::RegulatoryFeature,
+                terms: vec![SoTerm::RegulatoryRegionVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                feature_type: FeatureType::MotifFeature,
+                terms: vec![SoTerm::TfBindingSiteVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                feature_type: FeatureType::None,
+                terms: vec![SoTerm::IntergenicVariant],
+                ..Default::default()
+            },
+        ];
+
+        let assignments = apply_pick_mode(
+            assignments,
+            &ctx,
+            &PickFlags {
+                mode: PickMode::FlagPickAlleleGene,
+                pick_order: vec![PickCriterion::Rank],
+            },
+            "A",
+        );
+
+        assert!(assignments.iter().all(|assignment| assignment.picked));
+    }
+
+    #[test]
+    fn test_apply_pick_mode_filters_variant_and_allele_modes() {
+        let mut tx_a = make_tx("ENST00000051", None, Some("GENE1"), Some("HGNC"), None);
+        tx_a.biotype = "protein_coding".to_string();
+        tx_a.is_canonical = false;
+
+        let mut tx_b = make_tx("ENST00000052", None, Some("GENE1"), Some("HGNC"), None);
+        tx_b.biotype = "protein_coding".to_string();
+        tx_b.is_canonical = true;
+
+        let transcripts = vec![tx_a, tx_b];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        for mode in [PickMode::Pick, PickMode::PickAllele] {
+            let picked = apply_pick_mode(
+                assignments.clone(),
+                &ctx,
+                &PickFlags {
+                    mode,
+                    pick_order: vec![PickCriterion::Canonical],
+                },
+                "A",
+            );
+            assert_eq!(picked.len(), 1);
+            assert_eq!(picked[0].transcript_idx, Some(1));
+            assert!(!picked[0].picked);
+        }
+    }
+
+    #[test]
+    fn test_apply_pick_allele_tie_breaks_by_vep_feature_order() {
+        let mut tx_a = make_tx("ENST00000051", None, Some("GENE1"), Some("HGNC"), None);
+        tx_a.biotype = "protein_coding".to_string();
+
+        let mut tx_b = make_tx("ENST00000052", None, Some("GENE1"), Some("HGNC"), None);
+        tx_b.biotype = "protein_coding".to_string();
+
+        let transcripts = vec![tx_a, tx_b];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::FivePrimeUtrVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::FivePrimeUtrVariant],
+                ..Default::default()
+            },
+        ];
+
+        let picked = apply_pick_mode(
+            assignments,
+            &ctx,
+            &PickFlags {
+                mode: PickMode::PickAllele,
+                pick_order: vec![PickCriterion::Rank],
+            },
+            "A",
+        );
+
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].transcript_idx, Some(0));
+    }
+
+    #[test]
+    fn test_apply_pick_mode_filters_per_gene_modes_and_retains_non_transcripts() {
+        let mut tx_a = make_tx("ENST00000061", Some("GENE1"), Some("HGNC"), None, None);
+        tx_a.biotype = "protein_coding".to_string();
+        tx_a.is_canonical = false;
+
+        let mut tx_b = make_tx("ENST00000062", Some("GENE1"), Some("HGNC"), None, None);
+        tx_b.biotype = "protein_coding".to_string();
+        tx_b.is_canonical = true;
+
+        let mut tx_c = make_tx("ENST00000063", Some("GENE2"), Some("HGNC"), None, None);
+        tx_c.biotype = "protein_coding".to_string();
+
+        let transcripts = vec![tx_a, tx_b, tx_c];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(2),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                feature_type: FeatureType::RegulatoryFeature,
+                terms: vec![SoTerm::RegulatoryRegionVariant],
+                ..Default::default()
+            },
+        ];
+
+        for mode in [PickMode::PerGene, PickMode::PickAlleleGene] {
+            let picked = apply_pick_mode(
+                assignments.clone(),
+                &ctx,
+                &PickFlags {
+                    mode,
+                    pick_order: vec![PickCriterion::Canonical],
+                },
+                "A",
+            );
+            assert_eq!(picked.len(), 3);
+            assert_eq!(picked[0].transcript_idx, Some(1));
+            assert_eq!(picked[1].transcript_idx, Some(2));
+            assert_eq!(picked[2].feature_type, FeatureType::RegulatoryFeature);
+        }
+    }
+
+    #[test]
+    fn test_apply_pick_mode_marks_flag_modes_without_filtering() {
+        let mut tx_a = make_tx("ENST00000071", Some("GENE1"), Some("HGNC"), None, None);
+        tx_a.biotype = "protein_coding".to_string();
+        tx_a.is_canonical = false;
+
+        let mut tx_b = make_tx("ENST00000072", Some("GENE1"), Some("HGNC"), None, None);
+        tx_b.biotype = "protein_coding".to_string();
+        tx_b.is_canonical = true;
+
+        let transcripts = vec![tx_a, tx_b];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        for mode in [PickMode::FlagPick, PickMode::FlagPickAllele] {
+            let picked = apply_pick_mode(
+                assignments.clone(),
+                &ctx,
+                &PickFlags {
+                    mode,
+                    pick_order: vec![PickCriterion::Canonical],
+                },
+                "A",
+            );
+            assert_eq!(picked.len(), 2);
+            assert!(!picked[0].picked);
+            assert!(picked[1].picked);
+        }
+    }
+
+    #[test]
+    fn test_mark_flag_pick_allele_gene_tie_breaks_by_feature_id_order() {
+        let mut tx_a = make_tx("ENST00000031", Some("GENE1"), Some("HGNC"), None, None);
+        tx_a.gene_stable_id = Some("ENSG00000031".to_string());
+        tx_a.biotype = "protein_coding".to_string();
+
+        let mut tx_b = make_tx("ENST00000032", Some("GENE1"), Some("HGNC"), None, None);
+        tx_b.gene_stable_id = Some("ENSG00000031".to_string());
+        tx_b.biotype = "protein_coding".to_string();
+
+        let transcripts = vec![tx_b, tx_a];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::IntronVariant],
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                terms: vec![SoTerm::IntronVariant],
+                ..Default::default()
+            },
+        ];
+
+        let assignments = apply_pick_mode(
+            assignments,
+            &ctx,
+            &PickFlags {
+                mode: PickMode::FlagPickAlleleGene,
+                pick_order: vec![PickCriterion::Rank],
+            },
+            "A",
+        );
+
+        assert!(!assignments[0].picked);
+        assert!(assignments[1].picked);
+    }
+
+    #[test]
+    fn test_mark_flag_pick_allele_gene_requires_exact_source_match() {
+        let mut tx_havana = make_tx("ENST00000001", Some("GENE1"), Some("HGNC"), None, None);
+        tx_havana.gene_stable_id = Some("ENSG00000001".to_string());
+        tx_havana.biotype = "protein_coding".to_string();
+        tx_havana.source = Some("Ensembl".to_string());
+        tx_havana.source_cache = Some("ensembl_havana".to_string());
+
+        let mut tx_ensembl = make_tx("ENST00000002", Some("GENE1"), Some("HGNC"), None, None);
+        tx_ensembl.gene_stable_id = Some("ENSG00000001".to_string());
+        tx_ensembl.biotype = "protein_coding".to_string();
+        tx_ensembl.source = Some("Ensembl".to_string());
+        tx_ensembl.source_cache = Some("Ensembl".to_string());
+
+        let transcripts = vec![tx_havana, tx_ensembl];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        let assignments = apply_pick_mode(
+            assignments,
+            &ctx,
+            &PickFlags {
+                mode: PickMode::FlagPickAlleleGene,
+                pick_order: vec![PickCriterion::Ensembl],
+            },
+            "A",
+        );
+
+        assert!(!assignments[0].picked);
+        assert!(assignments[1].picked);
+    }
+
+    #[test]
+    fn test_mark_flag_pick_allele_gene_prefers_cds_length_over_protein_length() {
+        let mut tx_shorter_cds = make_tx("ENST00000011", Some("GENE1"), Some("HGNC"), None, None);
+        tx_shorter_cds.gene_stable_id = Some("ENSG00000011".to_string());
+        tx_shorter_cds.biotype = "protein_coding".to_string();
+
+        let mut tx_longer_cds = make_tx("ENST00000012", Some("GENE1"), Some("HGNC"), None, None);
+        tx_longer_cds.gene_stable_id = Some("ENSG00000011".to_string());
+        tx_longer_cds.biotype = "protein_coding".to_string();
+
+        let transcripts = vec![tx_shorter_cds, tx_longer_cds];
+        let translations = vec![
+            TranslationFeature {
+                transcript_id: "ENST00000011".to_string(),
+                cds_len: Some(90),
+                protein_len: Some(100),
+                translation_seq: None,
+                cds_sequence: Some("A".repeat(90)),
+                translation_seq_canonical: None,
+                cds_sequence_canonical: None,
+                stable_id: None,
+                version: None,
+                protein_features: Vec::new(),
+            },
+            TranslationFeature {
+                transcript_id: "ENST00000012".to_string(),
+                cds_len: Some(99),
+                protein_len: Some(20),
+                translation_seq: None,
+                cds_sequence: Some("A".repeat(99)),
+                translation_seq_canonical: None,
+                cds_sequence_canonical: None,
+                stable_id: None,
+                version: None,
+                protein_features: Vec::new(),
+            },
+        ];
+        let ctx = PreparedContext::new(&transcripts, &[], &translations, &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        let assignments = apply_pick_mode(
+            assignments,
+            &ctx,
+            &PickFlags {
+                mode: PickMode::FlagPickAlleleGene,
+                pick_order: vec![PickCriterion::Length],
+            },
+            "A",
+        );
+
+        assert!(!assignments[0].picked);
+        assert!(assignments[1].picked);
+    }
+
+    #[test]
+    fn test_mark_flag_pick_allele_gene_uses_exon_length_for_noncoding_transcripts() {
+        let mut tx_shorter_exons = make_tx("ENST00000041", Some("GENE1"), Some("HGNC"), None, None);
+        tx_shorter_exons.gene_stable_id = Some("ENSG00000041".to_string());
+        tx_shorter_exons.biotype = "lncRNA".to_string();
+        tx_shorter_exons.start = 1;
+        tx_shorter_exons.end = 1000;
+        tx_shorter_exons.spliced_seq = Some("A".repeat(300));
+        tx_shorter_exons.cdna_seq = Some("A".repeat(300));
+
+        let mut tx_longer_exons = make_tx("ENST00000042", Some("GENE1"), Some("HGNC"), None, None);
+        tx_longer_exons.gene_stable_id = Some("ENSG00000041".to_string());
+        tx_longer_exons.biotype = "lncRNA".to_string();
+        tx_longer_exons.start = 1;
+        tx_longer_exons.end = 500;
+
+        let transcripts = vec![tx_shorter_exons, tx_longer_exons];
+        let exons = vec![
+            ExonFeature {
+                transcript_id: "ENST00000041".to_string(),
+                exon_number: 1,
+                start: 1,
+                end: 100,
+            },
+            ExonFeature {
+                transcript_id: "ENST00000042".to_string(),
+                exon_number: 1,
+                start: 1,
+                end: 200,
+            },
+        ];
+        let ctx = PreparedContext::new(&transcripts, &exons, &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        let assignments = apply_pick_mode(
+            assignments,
+            &ctx,
+            &PickFlags {
+                mode: PickMode::FlagPickAlleleGene,
+                pick_order: vec![PickCriterion::Length],
+            },
+            "A",
+        );
+
+        assert!(!assignments[0].picked);
+        assert!(assignments[1].picked);
+    }
+
+    #[test]
+    fn test_mark_flag_pick_allele_gene_skips_candidates_without_gene_stable_id() {
+        let mut tx_a = make_tx("ENST00000021", None, Some("GENE1"), Some("HGNC"), None);
+        tx_a.biotype = "protein_coding".to_string();
+        tx_a.is_canonical = false;
+
+        let mut tx_b = make_tx("ENST00000022", None, Some("GENE1"), Some("HGNC"), None);
+        tx_b.biotype = "protein_coding".to_string();
+        tx_b.is_canonical = true;
+
+        let transcripts = vec![tx_a, tx_b];
+        let ctx = PreparedContext::new(&transcripts, &[], &[], &[], &[], &[], &[]);
+        let assignments = vec![
+            TranscriptConsequence {
+                transcript_idx: Some(0),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+            TranscriptConsequence {
+                transcript_idx: Some(1),
+                feature_type: FeatureType::Transcript,
+                ..Default::default()
+            },
+        ];
+
+        let assignments = apply_pick_mode(
+            assignments,
+            &ctx,
+            &PickFlags {
+                mode: PickMode::FlagPickAlleleGene,
+                pick_order: vec![PickCriterion::Canonical],
+            },
+            "A",
+        );
+
+        assert!(!assignments[0].picked);
+        assert!(!assignments[1].picked);
     }
 
     // ── format_prediction ──────────────────────────────────────────────
@@ -8813,6 +10190,7 @@ mod tests {
             gene_hgnc_id: native_hgnc_id.map(|s| s.to_string()),
             display_xref_id: None,
             source: None,
+            source_cache: None,
             refseq_match: None,
             refseq_edits: Vec::new(),
             is_gencode_basic: false,
@@ -8849,6 +10227,7 @@ mod tests {
         tx.chrom = "1".to_string();
         tx.biotype = "protein_coding".to_string();
         tx.source = source.map(str::to_string);
+        tx.source_cache = source.map(str::to_string);
         tx
     }
 
@@ -8893,37 +10272,81 @@ mod tests {
         .unwrap()
     }
 
+    fn make_buffer_batch_many(chrom: &str, starts: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![chrom; starts.len()])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(starts.to_vec())) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(starts.to_vec())) as Arc<dyn Array>,
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_input_buffer_accumulator_carries_partial_rows_across_windows() {
+        let mut accumulator = InputBufferAccumulator::default();
+
+        let first_ready = accumulator.push_window_and_drain_ready(
+            vec![make_buffer_batch_many("chr2", &[1, 2, 3])],
+            5,
+            false,
+        );
+        assert!(first_ready.is_empty());
+        assert_eq!(accumulator.pending_rows(), 3);
+
+        let second_ready = accumulator.push_window_and_drain_ready(
+            vec![make_buffer_batch_many("chr2", &[4, 5, 6, 7])],
+            5,
+            false,
+        );
+        assert_eq!(second_ready.len(), 1);
+        assert_eq!(
+            buffer_variant_bounds(&second_ready[0]).unwrap(),
+            Some(("chr2".to_string(), 1, 5))
+        );
+        assert_eq!(accumulator.pending_rows(), 2);
+
+        let final_ready = accumulator.push_window_and_drain_ready(Vec::new(), 5, true);
+        assert_eq!(final_ready.len(), 1);
+        assert_eq!(
+            buffer_variant_bounds(&final_ready[0]).unwrap(),
+            Some(("chr2".to_string(), 6, 7))
+        );
+        assert_eq!(accumulator.pending_rows(), 0);
+    }
+
     #[test]
     fn test_transcript_selection_flags_reject_invalid_combinations() {
-        let err =
-            TranscriptSelectionFlags::from_options_json(Some("{\"refseq\":true,\"merged\":true}"))
-                .expect_err("refseq+merged should be rejected")
-                .to_string();
-        assert!(err.contains("--refseq and --merged"));
-
-        let err = TranscriptSelectionFlags::from_options_json(Some(
-            "{\"refseq\":true,\"gencode_basic\":true}",
-        ))
-        .expect_err("refseq+gencode_basic should be rejected")
-        .to_string();
-        assert!(err.contains("--refseq and --gencode_basic"));
-
-        let err = TranscriptSelectionFlags::from_options_json(Some(
-            "{\"gencode_basic\":true,\"gencode_primary\":true}",
-        ))
+        let err = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Ensembl,
+            Some("{\"gencode_basic\":true,\"gencode_primary\":true}"),
+        )
         .expect_err("gencode_basic+gencode_primary should be rejected")
         .to_string();
         assert!(err.contains("--gencode_basic and --gencode_primary"));
 
-        let err = TranscriptSelectionFlags::from_options_json(Some("{\"all_refseq\":true}"))
-            .expect_err("all_refseq without refseq/merged should be rejected")
-            .to_string();
-        assert!(err.contains("--all_refseq requires --refseq or --merged"));
+        let err = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Ensembl,
+            Some("{\"all_refseq\":true}"),
+        )
+        .expect_err("all_refseq without RefSeq-capable metadata should be rejected")
+        .to_string();
+        assert!(err.contains("--all_refseq requires cache schema metadata"));
 
-        let err = TranscriptSelectionFlags::from_options_json(Some("{\"exclude_predicted\":true}"))
-            .expect_err("exclude_predicted without refseq/merged should be rejected")
-            .to_string();
-        assert!(err.contains("--exclude_predicted requires --refseq or --merged"));
+        let err = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Ensembl,
+            Some("{\"exclude_predicted\":true}"),
+        )
+        .expect_err("exclude_predicted without RefSeq-capable metadata should be rejected")
+        .to_string();
+        assert!(err.contains("--exclude_predicted requires cache schema metadata"));
     }
 
     #[test]
@@ -8933,7 +10356,7 @@ mod tests {
             (
                 false,
                 TranscriptSelectionFlags {
-                    source_mode: TranscriptSourceMode::RefSeq,
+                    cache_source_type: CacheSourceType::RefSeq,
                     ..Default::default()
                 },
                 78,
@@ -8941,7 +10364,7 @@ mod tests {
             (
                 false,
                 TranscriptSelectionFlags {
-                    source_mode: TranscriptSourceMode::Merged,
+                    cache_source_type: CacheSourceType::Merged,
                     ..Default::default()
                 },
                 79,
@@ -8950,7 +10373,7 @@ mod tests {
             (
                 true,
                 TranscriptSelectionFlags {
-                    source_mode: TranscriptSourceMode::RefSeq,
+                    cache_source_type: CacheSourceType::RefSeq,
                     ..Default::default()
                 },
                 85,
@@ -8958,13 +10381,13 @@ mod tests {
             (
                 true,
                 TranscriptSelectionFlags {
-                    source_mode: TranscriptSourceMode::Merged,
+                    cache_source_type: CacheSourceType::Merged,
                     ..Default::default()
                 },
                 86,
             ),
         ] {
-            let layout = CsqPlaceholderLayout::for_mode(everything, selection);
+            let layout = CsqPlaceholderLayout::for_mode(everything, selection, false);
             assert_eq!(layout.fields.len(), expected_len);
         }
     }
@@ -8997,14 +10420,15 @@ mod tests {
         };
 
         let refseq_selection = TranscriptSelectionFlags {
-            source_mode: TranscriptSourceMode::RefSeq,
+            cache_source_type: CacheSourceType::RefSeq,
             ..Default::default()
         };
-        let refseq_layout = CsqPlaceholderLayout::for_mode(false, refseq_selection);
+        let refseq_layout = CsqPlaceholderLayout::for_mode(false, refseq_selection, false);
         let mut refseq_row = String::new();
         refseq_layout.append_entry(&mut refseq_row, &entry);
         let refseq_values: Vec<&str> = refseq_row.split('|').collect();
-        let refseq_fields = crate::golden_benchmark::csq_field_names_for_mode(false, true, false);
+        let refseq_fields =
+            crate::golden_benchmark::csq_field_names_for_mode_with_pick(false, true, false, false);
         assert_eq!(refseq_values.len(), refseq_fields.len());
         let refseq_index = |name: &str| {
             refseq_fields
@@ -9021,14 +10445,15 @@ mod tests {
         assert_eq!(refseq_values[refseq_index("MAX_AF_POPS")], "gnomADg_AFR");
 
         let merged_selection = TranscriptSelectionFlags {
-            source_mode: TranscriptSourceMode::Merged,
+            cache_source_type: CacheSourceType::Merged,
             ..Default::default()
         };
-        let merged_layout = CsqPlaceholderLayout::for_mode(true, merged_selection);
+        let merged_layout = CsqPlaceholderLayout::for_mode(true, merged_selection, false);
         let mut merged_row = String::new();
         merged_layout.append_entry(&mut merged_row, &entry);
         let merged_values: Vec<&str> = merged_row.split('|').collect();
-        let merged_fields = crate::golden_benchmark::csq_field_names_for_mode(true, false, true);
+        let merged_fields =
+            crate::golden_benchmark::csq_field_names_for_mode_with_pick(true, false, true, false);
         assert_eq!(merged_values.len(), merged_fields.len());
         let merged_index = |name: &str| {
             merged_fields
@@ -9069,6 +10494,7 @@ mod tests {
 
         let metadata = parse_transcript_raw_metadata(raw);
         assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
+        assert_eq!(metadata.source_cache.as_deref(), Some("RefSeq"));
         assert_eq!(metadata.display_xref_id.as_deref(), Some("NM_000001"));
         assert_eq!(metadata.gene_hgnc_id_native.as_deref(), Some("HGNC:5"));
         assert_eq!(metadata.refseq_match.as_deref(), Some("rseq_ens_match_cds"));
@@ -9163,6 +10589,7 @@ mod tests {
         let metadata = parse_transcript_raw_metadata(raw);
 
         assert_eq!(metadata.source.as_deref(), Some("RefSeq"));
+        assert_eq!(metadata.source_cache.as_deref(), Some("BestRefSeq"));
         assert_eq!(
             metadata.refseq_edits,
             vec![
@@ -9408,49 +10835,102 @@ mod tests {
     #[test]
     fn test_passes_transcript_selection_matches_vep_refseq_filters() {
         let ensembl_tx = make_selection_tx("ENST00000311111", Some("Ensembl"));
+        let lrg_tx = make_selection_tx("LRG_485", Some("Ensembl"));
         let nm_tx = make_selection_tx("NM_000001", Some("RefSeq"));
+        let nr_tx = make_selection_tx("NR_123456.1", Some("RefSeq"));
+        let xm_tx = make_selection_tx("XM_011520402.2", Some("RefSeq"));
+        let xr_tx = make_selection_tx("XR_001734695.1", Some("RefSeq"));
         let mut ccds_tx = make_selection_tx("CCDS1234.1", Some("RefSeq"));
         ccds_tx.display_xref_id = Some("CCDS1234".to_string());
-        let xm_tx = make_selection_tx("XM_123456", Some("RefSeq"));
+        let mut mt_numeric_tx = make_selection_tx("4540", Some("RefSeq"));
+        mt_numeric_tx.chrom = "MT".to_string();
+        let mut mt_gene_tx = make_selection_tx("COX3", Some("RefSeq"));
+        mt_gene_tx.chrom = "MT".to_string();
+        let mut mt_rna_tx = make_selection_tx("rna-TRNK", Some("RefSeq"));
+        mt_rna_tx.chrom = "MT".to_string();
+        let mut non_refseq_mt_gene_tx = make_selection_tx("COX3", Some("Ensembl"));
+        non_refseq_mt_gene_tx.chrom = "MT".to_string();
         let mut gencode_tx = make_selection_tx("ENST00000322222", Some("Ensembl"));
         gencode_tx.is_gencode_basic = true;
         gencode_tx.is_gencode_primary = true;
 
-        let default_selection = TranscriptSelectionFlags::from_options_json(None).unwrap();
+        let default_selection =
+            TranscriptSelectionFlags::from_options_json(CacheSourceType::Ensembl, None).unwrap();
         assert!(passes_transcript_selection(&ensembl_tx, default_selection));
-        assert!(!passes_transcript_selection(&nm_tx, default_selection));
+        assert!(
+            passes_transcript_selection(&lrg_tx, default_selection),
+            "VEP Ensembl mode does not require ENST-prefixed stable IDs"
+        );
 
         let refseq_selection =
-            TranscriptSelectionFlags::from_options_json(Some("{\"refseq\":true}")).unwrap();
+            TranscriptSelectionFlags::from_options_json(CacheSourceType::RefSeq, None).unwrap();
         assert!(!passes_transcript_selection(&ensembl_tx, refseq_selection));
         assert!(passes_transcript_selection(&nm_tx, refseq_selection));
+        assert!(passes_transcript_selection(&nr_tx, refseq_selection));
+        assert!(passes_transcript_selection(&xm_tx, refseq_selection));
+        assert!(passes_transcript_selection(&xr_tx, refseq_selection));
+        assert!(passes_transcript_selection(
+            &mt_numeric_tx,
+            refseq_selection
+        ));
+        assert!(passes_transcript_selection(&mt_gene_tx, refseq_selection));
+        assert!(passes_transcript_selection(&mt_rna_tx, refseq_selection));
         assert!(
             !passes_transcript_selection(&ccds_tx, refseq_selection),
             "CCDS rows should be excluded unless all_refseq is enabled"
         );
 
-        let all_refseq_selection = TranscriptSelectionFlags::from_options_json(Some(
-            "{\"merged\":true,\"all_refseq\":true}",
-        ))
+        let merged_selection =
+            TranscriptSelectionFlags::from_options_json(CacheSourceType::Merged, None).unwrap();
+        assert!(passes_transcript_selection(&ensembl_tx, merged_selection));
+        assert!(passes_transcript_selection(&lrg_tx, merged_selection));
+        assert!(passes_transcript_selection(&nm_tx, merged_selection));
+        assert!(passes_transcript_selection(&mt_gene_tx, merged_selection));
+        assert!(
+            passes_transcript_selection(&non_refseq_mt_gene_tx, merged_selection),
+            "VEP merged mode applies RefSeq filtering only to RefSeq-sourced rows"
+        );
+        assert!(
+            !passes_transcript_selection(&ccds_tx, merged_selection),
+            "merged RefSeq rows should still use the default RefSeq whitelist"
+        );
+
+        let all_refseq_selection = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Merged,
+            Some("{\"all_refseq\":true}"),
+        )
         .unwrap();
         assert!(passes_transcript_selection(
             &ensembl_tx,
             all_refseq_selection
         ));
+        assert!(passes_transcript_selection(&lrg_tx, all_refseq_selection));
         assert!(passes_transcript_selection(&nm_tx, all_refseq_selection));
         assert!(passes_transcript_selection(&ccds_tx, all_refseq_selection));
+        assert!(passes_transcript_selection(
+            &mt_gene_tx,
+            all_refseq_selection
+        ));
+        assert!(
+            passes_transcript_selection(&non_refseq_mt_gene_tx, all_refseq_selection),
+            "VEP merged mode applies RefSeq filtering only to RefSeq-sourced rows"
+        );
 
-        let exclude_predicted_selection = TranscriptSelectionFlags::from_options_json(Some(
-            "{\"merged\":true,\"all_refseq\":true,\"exclude_predicted\":true}",
-        ))
+        let exclude_predicted_selection = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Merged,
+            Some("{\"all_refseq\":true,\"exclude_predicted\":true}"),
+        )
         .unwrap();
         assert!(
             !passes_transcript_selection(&xm_tx, exclude_predicted_selection),
             "XM_/XR_ transcripts should be filtered by exclude_predicted"
         );
 
-        let gencode_basic_selection =
-            TranscriptSelectionFlags::from_options_json(Some("{\"gencode_basic\":true}")).unwrap();
+        let gencode_basic_selection = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Ensembl,
+            Some("{\"gencode_basic\":true}"),
+        )
+        .unwrap();
         assert!(passes_transcript_selection(
             &gencode_tx,
             gencode_basic_selection
@@ -9460,9 +10940,10 @@ mod tests {
             gencode_basic_selection
         ));
 
-        let gencode_primary_selection = TranscriptSelectionFlags::from_options_json(Some(
-            "{\"merged\":true,\"gencode_primary\":true}",
-        ))
+        let gencode_primary_selection = TranscriptSelectionFlags::from_options_json(
+            CacheSourceType::Merged,
+            Some("{\"gencode_primary\":true}"),
+        )
         .unwrap();
         assert!(passes_transcript_selection(
             &gencode_tx,
@@ -9471,6 +10952,38 @@ mod tests {
         assert!(!passes_transcript_selection(
             &nm_tx,
             gencode_primary_selection
+        ));
+    }
+
+    #[test]
+    fn test_refseq_hydration_accepts_standard_and_mitochondrial_ids() {
+        let nm_tx = make_selection_tx("NM_000546.6", None);
+        let mut mt_numeric_tx = make_selection_tx("4540", None);
+        mt_numeric_tx.chrom = "MT".to_string();
+        let mut mt_gene_tx = make_selection_tx("COX3", Some("RefSeq"));
+        mt_gene_tx.chrom = "MT".to_string();
+        let mut mt_rna_tx = make_selection_tx("rna-TRNK", None);
+        mt_rna_tx.chrom = "MT".to_string();
+
+        assert!(is_refseq_transcript_for_hydration(
+            &nm_tx,
+            CacheSourceType::Ensembl
+        ));
+        assert!(is_refseq_transcript_for_hydration(
+            &mt_numeric_tx,
+            CacheSourceType::RefSeq
+        ));
+        assert!(is_refseq_transcript_for_hydration(
+            &mt_gene_tx,
+            CacheSourceType::Merged
+        ));
+        assert!(is_refseq_transcript_for_hydration(
+            &mt_rna_tx,
+            CacheSourceType::RefSeq
+        ));
+        assert!(!is_refseq_transcript_for_hydration(
+            &mt_rna_tx,
+            CacheSourceType::Ensembl
         ));
     }
 
@@ -9543,7 +11056,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_buffer_local_transcripts_scopes_to_expanded_range() {
+    fn test_build_buffer_local_transcripts_filters_same_region_non_overlaps() {
         let mut tx_before = make_tx(
             "ENST00000000001",
             Some("ENSG_BEFORE"),
@@ -9560,8 +11073,17 @@ mod tests {
             Some("HGNC"),
             Some("HGNC:2"),
         );
-        tx_inside.start = 120;
-        tx_inside.end = 180;
+        tx_inside.start = 1_000_120;
+        tx_inside.end = 1_000_180;
+        let mut tx_same_region_donor = make_tx(
+            "ENST00000000004",
+            Some("ENSG_DONOR"),
+            Some("GENE4"),
+            Some("HGNC"),
+            Some("HGNC:4"),
+        );
+        tx_same_region_donor.start = 1_900_000;
+        tx_same_region_donor.end = 1_900_050;
         let mut tx_after = make_tx(
             "ENST00000000003",
             Some("ENSG_AFTER"),
@@ -9569,20 +11091,155 @@ mod tests {
             Some("HGNC"),
             Some("HGNC:3"),
         );
-        tx_after.start = 400;
-        tx_after.end = 450;
+        tx_after.start = 2_000_400;
+        tx_after.end = 2_000_450;
 
         let scoped = build_buffer_local_transcripts(
-            &[tx_before, tx_inside.clone(), tx_after],
+            &[
+                tx_before,
+                tx_inside.clone(),
+                tx_same_region_donor.clone(),
+                tx_after,
+            ],
             "chr2",
-            140,
-            160,
+            1_000_140,
+            1_000_160,
             50,
             50,
         );
 
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].transcript_id, tx_inside.transcript_id);
+        let scoped_ids: HashSet<&str> = scoped.iter().map(|tx| tx.transcript_id.as_str()).collect();
+        assert_eq!(scoped_ids.len(), 1);
+        assert!(scoped_ids.contains(tx_inside.transcript_id.as_str()));
+        assert!(!scoped_ids.contains(tx_same_region_donor.transcript_id.as_str()));
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_filters_same_region_hgnc_donor() {
+        let mut tx_recipient = make_tx(
+            "NR_160941.1",
+            Some("106479023"),
+            Some("H3P4"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr1".to_string();
+        tx_recipient.start = 121_059_763;
+        tx_recipient.end = 121_118_626;
+
+        let mut tx_donor = make_tx(
+            "ENST00000401004",
+            Some("ENSG00000213244"),
+            Some("H3P4"),
+            Some("HGNC"),
+            Some("HGNC:43797"),
+        );
+        tx_donor.chrom = "chr1".to_string();
+        tx_donor.start = 121_118_195;
+        tx_donor.end = 121_118_610;
+
+        let transcripts = vec![tx_recipient, tx_donor];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        let buffer = vec![make_buffer_batch("chr1", 121_096_952, 121_096_952)];
+        let scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &buffer,
+            "chr1",
+            121_096_952,
+            121_096_952,
+            5_000,
+            5_000,
+        )
+        .unwrap();
+
+        let recipient = scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "NR_160941.1")
+            .unwrap();
+        assert_eq!(recipient.gene_hgnc_id, None);
+    }
+
+    #[test]
+    fn test_stateful_buffer_local_transcripts_filters_anapc1p1_donor_before_boundary() {
+        let mut tx_recipient = make_tx(
+            "NR_037931.2",
+            Some("100286979"),
+            Some("ANAPC1P1"),
+            Some("EntrezGene"),
+            None,
+        );
+        tx_recipient.chrom = "chr2".to_string();
+        tx_recipient.start = 86_861_787;
+        tx_recipient.end = 86_912_978;
+
+        let mut tx_donor = make_tx(
+            "ENST00000426186",
+            Some("ENSG00000233673"),
+            Some("ANAPC1P1"),
+            Some("HGNC"),
+            Some("HGNC:44150"),
+        );
+        tx_donor.chrom = "chr2".to_string();
+        tx_donor.start = 86_871_301;
+        tx_donor.end = 86_912_978;
+
+        let transcripts = vec![tx_recipient, tx_donor];
+        let transcript_regions: HashMap<String, Vec<TranscriptCacheRegion>> = transcripts
+            .iter()
+            .map(|tx| (tx.transcript_id.clone(), transcript_cache_regions(tx)))
+            .collect();
+        let mut persisted_transcripts = HashMap::new();
+
+        let first_buffer = vec![make_buffer_batch_many(
+            "chr2",
+            &[
+                86_856_985, 86_857_793, 86_858_475, 86_858_518, 86_858_619, 86_859_060, 86_859_741,
+                86_860_097, 86_860_689, 86_861_077, 86_861_757, 86_861_841, 86_862_499,
+            ],
+        )];
+        let first_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &first_buffer,
+            "chr2",
+            86_856_985,
+            86_862_499,
+            5_000,
+            5_000,
+        )
+        .unwrap();
+        let first_recipient = first_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "NR_037931.2")
+            .unwrap();
+        assert_eq!(first_recipient.gene_hgnc_id, None);
+
+        let second_buffer = vec![make_buffer_batch_many("chr2", &[86_862_550, 86_871_302])];
+        let second_scoped = build_stateful_buffer_local_transcripts(
+            &transcripts,
+            &transcript_regions,
+            &mut persisted_transcripts,
+            &second_buffer,
+            "chr2",
+            86_862_550,
+            86_871_302,
+            5_000,
+            5_000,
+        )
+        .unwrap();
+        let second_recipient = second_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "NR_037931.2")
+            .unwrap();
+        assert_eq!(second_recipient.gene_hgnc_id.as_deref(), Some("HGNC:44150"));
     }
 
     #[test]
@@ -9646,9 +11303,11 @@ mod tests {
             50,
         )
         .unwrap();
-        assert_eq!(second_scoped.len(), 1);
-        assert_eq!(second_scoped[0].transcript_id, "XR_RECIPIENT");
-        assert_eq!(second_scoped[0].gene_hgnc_id.as_deref(), Some("HGNC:54298"));
+        let second_recipient = second_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "XR_RECIPIENT")
+            .unwrap();
+        assert_eq!(second_recipient.gene_hgnc_id.as_deref(), Some("HGNC:54298"));
     }
 
     #[test]
@@ -9714,9 +11373,11 @@ mod tests {
             50,
         )
         .unwrap();
-        assert_eq!(second_scoped.len(), 1);
-        assert_eq!(second_scoped[0].transcript_id, "XR_007060157.1");
-        assert_eq!(second_scoped[0].gene_hgnc_id.as_deref(), Some("HGNC:16001"));
+        let second_recipient = second_scoped
+            .iter()
+            .find(|tx| tx.transcript_id == "XR_007060157.1")
+            .unwrap();
+        assert_eq!(second_recipient.gene_hgnc_id.as_deref(), Some("HGNC:16001"));
     }
 
     #[test]

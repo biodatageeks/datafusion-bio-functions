@@ -880,6 +880,84 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lookup_preserves_vcf_row_order_when_cache_rows_are_reversed() {
+        let ctx = create_vep_session();
+
+        let vcf_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]));
+        let vcf_batch = RecordBatch::try_new(
+            vcf_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1", "1"])),
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+                Arc::new(StringArray::from(vec!["A", "C", "G"])),
+                Arc::new(StringArray::from(vec!["T", "A", "C"])),
+            ],
+        )
+        .unwrap();
+        let vcf = MemTable::try_new(vcf_schema, vec![vec![vcf_batch]]).unwrap();
+
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("failed", DataType::Int64, false),
+        ]));
+        let cache_batch = RecordBatch::try_new(
+            cache_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["1", "1", "1"])),
+                Arc::new(Int64Array::from(vec![300, 200, 100])),
+                Arc::new(Int64Array::from(vec![300, 200, 100])),
+                Arc::new(StringArray::from(vec!["G/C", "C/A", "A/T"])),
+                Arc::new(StringArray::from(vec!["rs300", "rs200", "rs100"])),
+                Arc::new(Int64Array::from(vec![0, 0, 0])),
+            ],
+        )
+        .unwrap();
+        let cache = MemTable::try_new(cache_schema, vec![vec![cache_batch]]).unwrap();
+
+        ctx.register_table("vcf_ordered", Arc::new(vcf)).unwrap();
+        ctx.register_table("cache_reversed", Arc::new(cache))
+            .unwrap();
+
+        let batches = ctx
+            .sql("SELECT * FROM lookup_variants('vcf_ordered', 'cache_reversed', 'variation_name')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut starts = Vec::new();
+        let mut variation_names = Vec::new();
+        for batch in &batches {
+            let start_col = batch
+                .column_by_name("start")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let names = string_values(batch.column_by_name("cache_variation_name").unwrap());
+            for row in 0..batch.num_rows() {
+                starts.push(start_col.value(row));
+                variation_names.push(names[row].clone().unwrap());
+            }
+        }
+
+        assert_eq!(starts, vec![100, 200, 300]);
+        assert_eq!(variation_names, vec!["rs100", "rs200", "rs300"]);
+    }
+
     /// Regression test: equi-join ensures VCF rows only match cache entries
     /// at exactly the same (chrom, start, end) coordinates. Decoy entries at
     /// adjacent positions must NOT produce output rows.
