@@ -27,8 +27,8 @@ use futures::StreamExt;
 use log::info;
 
 use datafusion_bio_format_ensembl_cache::{
-    EnsemblCacheOptions, EnsemblCacheTableProvider, EnsemblEntityKind, VEP_CACHE_REGION_SIZE_BP,
-    build_export_query, build_export_query_multi_chrom,
+    CacheSourceType, EnsemblCacheOptions, EnsemblCacheTableProvider, EnsemblEntityKind,
+    VEP_CACHE_REGION_SIZE_BP, build_export_query, build_export_query_multi_chrom,
 };
 
 use crate::annotate_provider::read_compact_predictions;
@@ -1153,7 +1153,10 @@ impl CacheBuilder {
         split_ctx.register_table("_tl_deduped", Arc::new(mem_table))?;
 
         // translation_core
-        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(false);
+        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(
+            false,
+            CacheSourceType::Ensembl,
+        );
         let core_select = core_schema
             .fields()
             .iter()
@@ -1191,7 +1194,10 @@ impl CacheBuilder {
         })?;
 
         // translation_sift
-        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(false);
+        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
+            false,
+            CacheSourceType::Ensembl,
+        );
         let sift_select = sift_schema
             .fields()
             .iter()
@@ -1290,7 +1296,10 @@ impl CacheBuilder {
         );
         split_ctx.register_table("_tl_deduped", Arc::new(mem_table))?;
 
-        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(false);
+        let core_schema = datafusion_bio_format_ensembl_cache::translation_core_schema(
+            false,
+            CacheSourceType::Ensembl,
+        );
         let core_select = core_schema
             .fields()
             .iter()
@@ -1312,7 +1321,10 @@ impl CacheBuilder {
             DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
         })?;
 
-        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(false);
+        let sift_schema = datafusion_bio_format_ensembl_cache::translation_sift_schema(
+            false,
+            CacheSourceType::Ensembl,
+        );
         let sift_select = sift_schema
             .fields()
             .iter()
@@ -2020,7 +2032,8 @@ fn make_ctx_and_register(
 ) -> Result<SessionContext> {
     let config = SessionConfig::new().with_target_partitions(partitions);
     let ctx = SessionContext::new_with_config(config);
-    let mut options = EnsemblCacheOptions::new(cache_root);
+    let mut options =
+        EnsemblCacheOptions::new(cache_root).with_cache_source_type(CacheSourceType::Ensembl);
     options.target_partitions = Some(partitions);
     let provider = EnsemblCacheTableProvider::for_entity(kind, options)?;
     ctx.register_table(table_name, provider)?;
@@ -2428,7 +2441,7 @@ mod tests {
             Some(&schema),
         );
         assert!(q.contains("ROW_NUMBER()"));
-        assert!(q.contains("PARTITION BY stable_id"));
+        assert!(q.contains("PARTITION BY chrom, stable_id"));
         assert!(q.contains("WHERE _rn = 1"));
         assert!(q.contains("ORDER BY chrom, start"));
         assert!(q.contains("WHERE chrom = 'X'"));
@@ -2470,7 +2483,7 @@ mod tests {
     #[test]
     fn test_build_query_exon_dedup() {
         let q = build_export_query(EnsemblEntityKind::Exon, "exon", None, None);
-        assert!(q.contains("PARTITION BY transcript_id, exon_number"));
+        assert!(q.contains("PARTITION BY chrom, transcript_id, exon_number"));
         assert!(q.contains("ORDER BY transcript_id, start"));
     }
 
@@ -2501,7 +2514,7 @@ mod tests {
         assert!(q.contains("WHERE chrom IN ('1', '2')"));
         assert!(q.contains("ROW_NUMBER()"));
         assert!(q.contains("WHERE _rn = 1"));
-        assert!(q.contains("PARTITION BY stable_id"));
+        assert!(q.contains("PARTITION BY chrom, stable_id"));
         // HGNC propagation is a runtime concern (see
         // apply_buffer_local_hgnc_propagation) — must not be embedded in the
         // cache-level export query.
