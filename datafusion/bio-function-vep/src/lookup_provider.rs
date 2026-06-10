@@ -97,6 +97,10 @@ pub struct LookupProvider {
     /// warm/cold parquet tiers plus sidecar indexes, not the legacy interval join.
     #[cfg(feature = "kv-cache")]
     indexed_parquet_cache_root: Option<PathBuf>,
+    /// Root of a Lance variation cache. When set, variation lookup uses
+    /// `variation.lance/chrN.lance` plus the sidecar position/bloom indexes.
+    #[cfg(feature = "lance-cache")]
+    lance_cache_root: Option<PathBuf>,
     /// Optional filter to apply to the VCF input (e.g., `chrom = 'chr1'`
     /// for per-contig partitioned annotation).
     vcf_filter: Option<Expr>,
@@ -178,6 +182,8 @@ impl LookupProvider {
             partition_colocated_sinks: None,
             #[cfg(feature = "kv-cache")]
             indexed_parquet_cache_root: None,
+            #[cfg(feature = "lance-cache")]
+            lance_cache_root: None,
             vcf_filter: None,
         })
     }
@@ -195,6 +201,11 @@ impl LookupProvider {
     #[cfg(feature = "kv-cache")]
     pub fn set_indexed_parquet_cache_root(&mut self, root: impl Into<PathBuf>) {
         self.indexed_parquet_cache_root = Some(root.into());
+    }
+
+    #[cfg(feature = "lance-cache")]
+    pub fn set_lance_cache_root(&mut self, root: impl Into<PathBuf>) {
+        self.lance_cache_root = Some(root.into());
     }
 
     /// Set an optional filter to apply to VCF input before lookup.
@@ -288,6 +299,41 @@ impl TableProvider for LookupProvider {
                 let vcf_plan = vcf_df.create_physical_plan().await?;
 
                 let mut exec = KvLookupExec::new_indexed_parquet(
+                    vcf_plan,
+                    cache_root.clone(),
+                    self.cache_schema.clone(),
+                    self.cache_columns.clone(),
+                    KvMatchMode::Exact,
+                    allele_matches as fn(&str, &str, &str) -> bool,
+                    settings.vcf_has_chr,
+                    settings.vcf_zero_based,
+                    settings.cache_zero_based,
+                    self.extended_probes,
+                    self.allowed_failed,
+                )?;
+                exec = exec.with_reference_fasta_path(settings.reference_fasta_path);
+                if let Some(ref sink) = self.colocated_sink {
+                    exec = exec.with_colocated_sink(Arc::clone(sink));
+                }
+                if let Some(ref sinks) = self.partition_colocated_sinks {
+                    exec = exec.with_colocated_partition_sinks(sinks.clone());
+                }
+                let plan: Arc<dyn ExecutionPlan> = Arc::new(exec);
+                return wrap_with_projection(plan, projection);
+            }
+
+            #[cfg(feature = "lance-cache")]
+            if let Some(cache_root) = &self.lance_cache_root {
+                let settings = self.fjall_batch_settings().await?;
+                let vcf_df = self.session.table(&self.vcf_table).await?;
+                let vcf_df = if let Some(ref filter) = self.vcf_filter {
+                    vcf_df.filter(filter.clone())?
+                } else {
+                    vcf_df
+                };
+                let vcf_plan = vcf_df.create_physical_plan().await?;
+
+                let mut exec = KvLookupExec::new_lance(
                     vcf_plan,
                     cache_root.clone(),
                     self.cache_schema.clone(),

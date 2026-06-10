@@ -54,6 +54,10 @@ use crate::warm_cache::key::{
     position_key_from_code as warm_position_key_from_code,
     variant_key_from_position as warm_variant_key_from_position,
 };
+#[cfg(feature = "lance-cache")]
+use crate::warm_cache::lance_variation::{
+    DEFAULT_LANCE_COLD_LOOKUP_BATCH_SIZE, LanceVariationLookup, lance_variation_dataset_path,
+};
 
 /// Lookup match mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +73,8 @@ pub enum KvMatchMode {
 pub struct KvLookupExec {
     input: Arc<dyn ExecutionPlan>,
     store: Option<Arc<VepKvStore>>,
-    cache_root: Option<PathBuf>,
+    variation_storage: VariationLookupStorage,
     cache_schema: SchemaRef,
-    indexed_parquet: bool,
     cache_columns: Vec<String>,
     match_mode: KvMatchMode,
     exact_matcher: AlleleMatcher,
@@ -97,6 +100,18 @@ pub struct KvLookupExec {
     reference_fasta_path: Option<String>,
     #[cfg(test)]
     warm_cache_dir_override: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+enum VariationLookupStorage {
+    Fjall,
+    IndexedParquet {
+        cache_root: PathBuf,
+    },
+    #[cfg(feature = "lance-cache")]
+    Lance {
+        cache_root: PathBuf,
+    },
 }
 
 fn build_lookup_output_schema(
@@ -153,9 +168,8 @@ impl KvLookupExec {
         Ok(Self {
             input,
             store: Some(store),
-            cache_root: None,
+            variation_storage: VariationLookupStorage::Fjall,
             cache_schema,
-            indexed_parquet: false,
             cache_columns,
             match_mode,
             exact_matcher,
@@ -203,9 +217,58 @@ impl KvLookupExec {
         Ok(Self {
             input,
             store: None,
-            cache_root: Some(cache_root),
+            variation_storage: VariationLookupStorage::IndexedParquet { cache_root },
             cache_schema,
-            indexed_parquet: true,
+            cache_columns,
+            match_mode,
+            exact_matcher,
+            schema,
+            vcf_has_chr,
+            vcf_zero_based,
+            cache_zero_based,
+            extended_probes,
+            allowed_failed,
+            properties,
+            output_col_positions,
+            colocated_sink: None,
+            colocated_partition_sinks: None,
+            reference_fasta_path: None,
+            #[cfg(test)]
+            warm_cache_dir_override: None,
+        })
+    }
+
+    #[cfg(feature = "lance-cache")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_lance(
+        input: Arc<dyn ExecutionPlan>,
+        cache_root: PathBuf,
+        cache_schema: SchemaRef,
+        cache_columns: Vec<String>,
+        match_mode: KvMatchMode,
+        exact_matcher: AlleleMatcher,
+        vcf_has_chr: bool,
+        vcf_zero_based: bool,
+        cache_zero_based: bool,
+        extended_probes: bool,
+        allowed_failed: i64,
+    ) -> Result<Self> {
+        let input_schema = input.schema();
+        let (schema, output_col_positions) =
+            build_lookup_output_schema(input_schema, cache_schema.clone(), &cache_columns);
+
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            input.output_partitioning().clone(),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+
+        Ok(Self {
+            input,
+            store: None,
+            variation_storage: VariationLookupStorage::Lance { cache_root },
+            cache_schema,
             cache_columns,
             match_mode,
             exact_matcher,
@@ -296,24 +359,8 @@ impl ExecutionPlan for KvLookupExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 1);
-        let mut exec = if self.indexed_parquet {
-            KvLookupExec::new_indexed_parquet(
-                children[0].clone(),
-                self.cache_root.clone().ok_or_else(|| {
-                    DataFusionError::Execution("indexed parquet lookup missing cache root".into())
-                })?,
-                self.cache_schema.clone(),
-                self.cache_columns.clone(),
-                self.match_mode,
-                self.exact_matcher,
-                self.vcf_has_chr,
-                self.vcf_zero_based,
-                self.cache_zero_based,
-                self.extended_probes,
-                self.allowed_failed,
-            )?
-        } else {
-            KvLookupExec::new(
+        let mut exec = match &self.variation_storage {
+            VariationLookupStorage::Fjall => KvLookupExec::new(
                 children[0].clone(),
                 self.store.clone().ok_or_else(|| {
                     DataFusionError::Execution("fjall lookup missing KV store".into())
@@ -326,7 +373,36 @@ impl ExecutionPlan for KvLookupExec {
                 self.cache_zero_based,
                 self.extended_probes,
                 self.allowed_failed,
-            )?
+            )?,
+            VariationLookupStorage::IndexedParquet { cache_root } => {
+                KvLookupExec::new_indexed_parquet(
+                    children[0].clone(),
+                    cache_root.clone(),
+                    self.cache_schema.clone(),
+                    self.cache_columns.clone(),
+                    self.match_mode,
+                    self.exact_matcher,
+                    self.vcf_has_chr,
+                    self.vcf_zero_based,
+                    self.cache_zero_based,
+                    self.extended_probes,
+                    self.allowed_failed,
+                )?
+            }
+            #[cfg(feature = "lance-cache")]
+            VariationLookupStorage::Lance { cache_root } => KvLookupExec::new_lance(
+                children[0].clone(),
+                cache_root.clone(),
+                self.cache_schema.clone(),
+                self.cache_columns.clone(),
+                self.match_mode,
+                self.exact_matcher,
+                self.vcf_has_chr,
+                self.vcf_zero_based,
+                self.cache_zero_based,
+                self.extended_probes,
+                self.allowed_failed,
+            )?,
         };
         if let Some(sink) = &self.colocated_sink {
             exec = exec.with_colocated_sink(Arc::clone(sink));
@@ -357,9 +433,8 @@ impl ExecutionPlan for KvLookupExec {
         let stream = KvLookupStream::new(
             input_stream,
             self.store.clone(),
-            self.cache_root.clone(),
+            self.variation_storage.clone(),
             self.cache_schema.clone(),
-            self.indexed_parquet,
             self.schema.clone(),
             self.cache_columns.clone(),
             self.match_mode,
@@ -397,9 +472,8 @@ impl ExecutionPlan for KvLookupExec {
 struct KvLookupStream {
     input: SendableRecordBatchStream,
     store: Option<Arc<VepKvStore>>,
-    cache_root: Option<PathBuf>,
+    variation_storage: VariationLookupStorage,
     cache_schema: SchemaRef,
-    indexed_parquet: bool,
     schema: SchemaRef,
     cache_columns: Vec<String>,
     _match_mode: KvMatchMode,
@@ -419,6 +493,8 @@ struct KvLookupStream {
     warm_cache_dir: Option<PathBuf>,
     warm_chroms: HashMap<String, Option<Box<WarmChromCache>>>,
     cold_parquet_chroms: HashMap<String, Option<ColdParquetLookupSet>>,
+    #[cfg(feature = "lance-cache")]
+    lance_chroms: HashMap<String, Option<LanceVariationLookup>>,
     variant_bloom_chroms: HashMap<String, Option<Arc<VariantBloomIndex>>>,
     cold_variation_dir: Option<PathBuf>,
     position_index_dir: Option<PathBuf>,
@@ -511,6 +587,8 @@ struct ColdChunkProbeMetrics {
 enum WarmColdVariationBackend {
     Fjall,
     Parquet,
+    #[cfg(feature = "lance-cache")]
+    Lance,
 }
 
 impl WarmColdVariationBackend {
@@ -518,10 +596,26 @@ impl WarmColdVariationBackend {
         match value.unwrap_or("fjall").to_ascii_lowercase().as_str() {
             "fjall" => Ok(Self::Fjall),
             "parquet" => Ok(Self::Parquet),
+            #[cfg(feature = "lance-cache")]
+            "lance" => Ok(Self::Lance),
             other => Err(DataFusionError::Execution(format!(
-                "VEP_WARM_COLD_VARIATION_BACKEND must be 'fjall' or 'parquet', got '{other}'"
+                "VEP_WARM_COLD_VARIATION_BACKEND must be 'fjall', 'parquet', or 'lance', got '{other}'"
             ))),
         }
+    }
+
+    fn uses_batched_cold_lookup(self) -> bool {
+        match self {
+            Self::Fjall => false,
+            Self::Parquet => true,
+            #[cfg(feature = "lance-cache")]
+            Self::Lance => true,
+        }
+    }
+
+    #[cfg(feature = "lance-cache")]
+    fn is_lance(self) -> bool {
+        matches!(self, Self::Lance)
     }
 }
 
@@ -954,6 +1048,15 @@ fn warm_variation_batch_size() -> usize {
         .unwrap_or(262_144)
 }
 
+#[cfg(feature = "lance-cache")]
+fn lance_cold_lookup_batch_size() -> usize {
+    std::env::var("VEP_LANCE_COLD_LOOKUP_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LANCE_COLD_LOOKUP_BATCH_SIZE)
+}
+
 fn warm_cold_variation_backend_from_env() -> WarmColdVariationBackend {
     match WarmColdVariationBackend::parse(
         std::env::var("VEP_WARM_COLD_VARIATION_BACKEND")
@@ -1286,9 +1389,8 @@ impl KvLookupStream {
     fn new(
         input: SendableRecordBatchStream,
         store: Option<Arc<VepKvStore>>,
-        cache_root: Option<PathBuf>,
+        variation_storage: VariationLookupStorage,
         cache_schema: SchemaRef,
-        indexed_parquet: bool,
         schema: SchemaRef,
         cache_columns: Vec<String>,
         match_mode: KvMatchMode,
@@ -1324,8 +1426,16 @@ impl KvLookupStream {
         } else {
             None
         };
-        let warm_cache_dir = if indexed_parquet {
-            cache_root.as_ref().map(|root| root.join("variation"))
+        let indexed_cache_root = match &variation_storage {
+            VariationLookupStorage::IndexedParquet { cache_root } => Some(cache_root),
+            #[cfg(feature = "lance-cache")]
+            VariationLookupStorage::Lance { cache_root } => Some(cache_root),
+            VariationLookupStorage::Fjall => None,
+        };
+        let warm_cache_dir = if let Some(root) = indexed_cache_root {
+            root.join("variation")
+                .exists()
+                .then(|| root.join("variation"))
         } else if warm_variation_cache_enabled() {
             store
                 .as_ref()
@@ -1333,17 +1443,19 @@ impl KvLookupStream {
         } else {
             None
         };
-        let cold_variation_dir = if indexed_parquet {
-            cache_root.as_ref().map(|root| root.join("variation"))
-        } else if warm_cache_dir.is_some() {
-            store.as_ref().and_then(|store| variation_cold_dir(store))
-        } else {
-            None
+        let cold_variation_dir = match &variation_storage {
+            VariationLookupStorage::IndexedParquet { cache_root } => {
+                Some(cache_root.join("variation"))
+            }
+            #[cfg(feature = "lance-cache")]
+            VariationLookupStorage::Lance { .. } => None,
+            VariationLookupStorage::Fjall if warm_cache_dir.is_some() => {
+                store.as_ref().and_then(|store| variation_cold_dir(store))
+            }
+            VariationLookupStorage::Fjall => None,
         };
-        let position_index_dir = if indexed_parquet {
-            cache_root
-                .as_ref()
-                .map(|root| root.join("variation.position_index"))
+        let position_index_dir = if let Some(root) = indexed_cache_root {
+            Some(root.join("variation.position_index"))
         } else if warm_cache_dir.is_some() {
             store
                 .as_ref()
@@ -1351,10 +1463,8 @@ impl KvLookupStream {
         } else {
             None
         };
-        let variant_bloom_index_dir = if indexed_parquet {
-            cache_root
-                .as_ref()
-                .map(|root| root.join("variation.variant_bloom_index"))
+        let variant_bloom_index_dir = if let Some(root) = indexed_cache_root {
+            Some(root.join("variation.variant_bloom_index"))
         } else if warm_cache_dir.is_some() {
             store
                 .as_ref()
@@ -1366,9 +1476,8 @@ impl KvLookupStream {
         Self {
             input,
             store,
-            cache_root,
+            variation_storage: variation_storage.clone(),
             cache_schema,
-            indexed_parquet,
             schema,
             cache_columns,
             _match_mode: match_mode,
@@ -1385,16 +1494,19 @@ impl KvLookupStream {
             warm_cache_dir,
             warm_chroms: HashMap::new(),
             cold_parquet_chroms: HashMap::new(),
+            #[cfg(feature = "lance-cache")]
+            lance_chroms: HashMap::new(),
             variant_bloom_chroms: HashMap::new(),
             cold_variation_dir,
             position_index_dir,
             variant_bloom_index_dir,
-            warm_cold_backend: if indexed_parquet {
-                WarmColdVariationBackend::Parquet
-            } else {
-                warm_cold_variation_backend_from_env()
+            warm_cold_backend: match variation_storage {
+                VariationLookupStorage::IndexedParquet { .. } => WarmColdVariationBackend::Parquet,
+                #[cfg(feature = "lance-cache")]
+                VariationLookupStorage::Lance { .. } => WarmColdVariationBackend::Lance,
+                VariationLookupStorage::Fjall => warm_cold_variation_backend_from_env(),
             },
-            warm_cold_index_mode: if indexed_parquet {
+            warm_cold_index_mode: if indexed_cache_root.is_some() {
                 WarmColdVariationIndexMode::PositionThenVariantBloom
             } else {
                 warm_cold_variation_index_mode_from_env()
@@ -2007,6 +2119,44 @@ impl KvLookupStream {
         Ok(())
     }
 
+    #[cfg(feature = "lance-cache")]
+    fn ensure_lance_lookup(
+        &mut self,
+        chrom: &str,
+        cache_columns: &[String],
+        collect_colocated: bool,
+    ) -> Result<()> {
+        let cache_root = match &self.variation_storage {
+            VariationLookupStorage::Lance { cache_root } => cache_root.clone(),
+            _ => {
+                return Err(DataFusionError::Execution(
+                    "lance variation lookup requested without Lance cache root".into(),
+                ));
+            }
+        };
+
+        if !self.lance_chroms.contains_key(chrom) {
+            let path = lance_variation_dataset_path(&cache_root, chrom);
+            if !path.exists() {
+                return Err(DataFusionError::Execution(format!(
+                    "lance variation lookup but no Lance dataset for {chrom} at {}",
+                    path.display()
+                )));
+            }
+            let projection = cold_parquet_projection_columns(cache_columns, collect_colocated);
+            let lookup = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(LanceVariationLookup::open(
+                    &path,
+                    projection,
+                    lance_cold_lookup_batch_size(),
+                ))
+            })?;
+            self.lance_chroms.insert(chrom.to_string(), Some(lookup));
+        }
+
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn probe_cold_parquet_position(
         &mut self,
@@ -2576,7 +2726,7 @@ impl KvLookupStream {
                             continue;
                         }
                         LookupDecision::UseFjall
-                            if self.warm_cold_backend == WarmColdVariationBackend::Parquet =>
+                            if self.warm_cold_backend.uses_batched_cold_lookup() =>
                         {
                             let collect_colocated = coloc_buf.is_some();
                             if !self.cold_variant_bloom_may_contain(
@@ -2597,6 +2747,17 @@ impl KvLookupStream {
                                         ))
                                     },
                                 )?;
+                            #[cfg(feature = "lance-cache")]
+                            if self.warm_cold_backend.is_lance() {
+                                self.ensure_lance_lookup(chrom, &cache_columns, collect_colocated)?;
+                            } else {
+                                self.ensure_cold_parquet_lookup(
+                                    chrom,
+                                    &cache_columns,
+                                    collect_colocated,
+                                )?;
+                            }
+                            #[cfg(not(feature = "lance-cache"))]
                             self.ensure_cold_parquet_lookup(
                                 chrom,
                                 &cache_columns,
@@ -2955,22 +3116,69 @@ impl KvLookupStream {
             let touched_cold_chroms = pending_keys_by_chrom.keys().cloned().collect::<Vec<_>>();
 
             for (chrom, position_keys) in pending_keys_by_chrom {
-                let lookup = self
-                    .cold_parquet_chroms
-                    .get_mut(&chrom)
-                    .and_then(Option::as_mut)
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "cold parquet lookup not open for {chrom}"
-                        ))
+                #[cfg(feature = "lance-cache")]
+                if self.warm_cold_backend.is_lance() {
+                    let lookup = self
+                        .lance_chroms
+                        .get_mut(&chrom)
+                        .and_then(Option::as_mut)
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "lance variation lookup not open for {chrom}"
+                            ))
+                        })?;
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(lookup.prefetch_cold_positions(position_keys))
                     })?;
-                lookup.prefetch_positions_retaining(position_keys)?;
+                } else {
+                    let lookup = self
+                        .cold_parquet_chroms
+                        .get_mut(&chrom)
+                        .and_then(Option::as_mut)
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "cold parquet lookup not open for {chrom}"
+                            ))
+                        })?;
+                    lookup.prefetch_positions_retaining(position_keys)?;
+                }
+                #[cfg(not(feature = "lance-cache"))]
+                {
+                    let lookup = self
+                        .cold_parquet_chroms
+                        .get_mut(&chrom)
+                        .and_then(Option::as_mut)
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "cold parquet lookup not open for {chrom}"
+                            ))
+                        })?;
+                    lookup.prefetch_positions_retaining(position_keys)?;
+                }
             }
 
             for pending in &pending_cold_probes {
                 let row = pending.vcf_row as usize;
                 let emit_output = !row_output_emitted[row];
                 let (result, metrics) = {
+                    #[cfg(feature = "lance-cache")]
+                    let chunk = if self.warm_cold_backend.is_lance() {
+                        self.lance_chroms
+                            .get(&pending.chrom)
+                            .and_then(Option::as_ref)
+                            .and_then(|lookup| {
+                                lookup.cached_chunk_for_position(pending.position_key)
+                            })
+                    } else {
+                        self.cold_parquet_chroms
+                            .get(&pending.chrom)
+                            .and_then(Option::as_ref)
+                            .and_then(|lookup| {
+                                lookup.cached_chunk_for_position(pending.position_key)
+                            })
+                    };
+                    #[cfg(not(feature = "lance-cache"))]
                     let chunk = self
                         .cold_parquet_chroms
                         .get(&pending.chrom)
@@ -3018,12 +3226,25 @@ impl KvLookupStream {
             }
 
             for chrom in touched_cold_chroms {
-                if let Some(lookup) = self
-                    .cold_parquet_chroms
-                    .get_mut(&chrom)
-                    .and_then(Option::as_mut)
+                #[cfg(feature = "lance-cache")]
+                if !self.warm_cold_backend.is_lance() {
+                    if let Some(lookup) = self
+                        .cold_parquet_chroms
+                        .get_mut(&chrom)
+                        .and_then(Option::as_mut)
+                    {
+                        lookup.trim_cache_to_capacity();
+                    }
+                }
+                #[cfg(not(feature = "lance-cache"))]
                 {
-                    lookup.trim_cache_to_capacity();
+                    if let Some(lookup) = self
+                        .cold_parquet_chroms
+                        .get_mut(&chrom)
+                        .and_then(Option::as_mut)
+                    {
+                        lookup.trim_cache_to_capacity();
+                    }
                 }
             }
 
@@ -3862,9 +4083,8 @@ pub fn lookup_batch_with_store(
     let mut stream = KvLookupStream::new(
         input,
         Some(store.clone()),
-        None,
+        VariationLookupStorage::Fjall,
         store.schema().clone(),
-        false,
         schema,
         cache_columns,
         KvMatchMode::Exact,

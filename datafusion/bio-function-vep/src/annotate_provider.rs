@@ -4544,6 +4544,7 @@ impl AnnotateProvider {
         translations_sift_table: Option<&str>,
         #[cfg(feature = "kv-cache")] kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
         #[cfg(feature = "kv-cache")] use_indexed_parquet: bool,
+        #[cfg(feature = "lance-cache")] use_lance: bool,
         #[cfg(feature = "kv-cache")] indexed_variation_schema: Option<Schema>,
         fetch_limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -4636,6 +4637,8 @@ impl AnnotateProvider {
         #[cfg(feature = "kv-cache")]
         let indexed_parquet_cache_root =
             use_indexed_parquet.then(|| cache.base_dir().to_path_buf());
+        #[cfg(feature = "lance-cache")]
+        let lance_cache_root = use_lance.then(|| cache.base_dir().to_path_buf());
         #[cfg(feature = "kv-cache")]
         let sift_prediction_store = if let Some(store) = kv_store.as_ref() {
             if let Some(parent) = store.root_path().parent() {
@@ -4643,7 +4646,18 @@ impl AnnotateProvider {
             } else {
                 None
             }
-        } else if use_indexed_parquet {
+        } else if use_indexed_parquet
+            || cfg!(feature = "lance-cache") && {
+                #[cfg(feature = "lance-cache")]
+                {
+                    use_lance
+                }
+                #[cfg(not(feature = "lance-cache"))]
+                {
+                    false
+                }
+            }
+        {
             open_sift_prediction_store(cache.base_dir())?
         } else {
             None
@@ -4675,6 +4689,8 @@ impl AnnotateProvider {
             use_fjall: kv_store.is_some(),
             #[cfg(feature = "kv-cache")]
             indexed_parquet_cache_root,
+            #[cfg(feature = "lance-cache")]
+            lance_cache_root,
             #[cfg(feature = "kv-cache")]
             indexed_variation_schema,
             #[cfg(feature = "kv-cache")]
@@ -7735,6 +7751,8 @@ struct ContigAnnotationConfig {
     /// indexed parquet lookup path and SIFT uses compact translation_sift parquet.
     #[cfg(feature = "kv-cache")]
     indexed_parquet_cache_root: Option<std::path::PathBuf>,
+    #[cfg(feature = "lance-cache")]
+    lance_cache_root: Option<std::path::PathBuf>,
     #[cfg(feature = "kv-cache")]
     indexed_variation_schema: Option<Schema>,
     /// Shared fjall KV store handle (opened once, reused across contigs).
@@ -10369,6 +10387,10 @@ async fn prepare_contig_context(
     let use_indexed_parquet = config.indexed_parquet_cache_root.is_some();
     #[cfg(not(feature = "kv-cache"))]
     let use_indexed_parquet = false;
+    #[cfg(feature = "lance-cache")]
+    let use_lance = config.lance_cache_root.is_some();
+    #[cfg(not(feature = "lance-cache"))]
+    let use_lance = false;
 
     let var_table = if use_fjall {
         #[cfg(feature = "kv-cache")]
@@ -10391,7 +10413,7 @@ async fn prepare_contig_context(
         {
             unreachable!("use_fjall requires kv-cache feature")
         }
-    } else if use_indexed_parquet {
+    } else if use_indexed_parquet || use_lance {
         "__vep_indexed_variation".to_string()
     } else {
         let var_table =
@@ -10406,7 +10428,7 @@ async fn prepare_contig_context(
         ephemeral_tables.push(var_table.clone());
         var_table
     };
-    if !use_indexed_parquet {
+    if !use_indexed_parquet && !use_lance {
         validate_partitioned_cache_source(
             &cache,
             "variation",
@@ -10496,12 +10518,12 @@ async fn prepare_contig_context(
         .schema()
         .as_arrow()
         .clone();
-    let cache_schema = if use_indexed_parquet {
+    let cache_schema = if use_indexed_parquet || use_lance {
         #[cfg(feature = "kv-cache")]
         {
             config.indexed_variation_schema.clone().ok_or_else(|| {
                 DataFusionError::Execution(
-                    "indexed parquet variation lookup missing cache schema".to_string(),
+                    "indexed variation lookup missing cache schema".to_string(),
                 )
             })?
         }
@@ -10528,7 +10550,11 @@ async fn prepare_contig_context(
     if let Some(root) = &config.indexed_parquet_cache_root {
         provider.set_indexed_parquet_cache_root(root.clone());
     }
-    let parallel_lookup = use_fjall || use_indexed_parquet;
+    #[cfg(feature = "lance-cache")]
+    if let Some(root) = &config.lance_cache_root {
+        provider.set_lance_cache_root(root.clone());
+    }
+    let parallel_lookup = use_fjall || use_indexed_parquet || use_lance;
     let mut lookup_partitions = if parallel_lookup {
         let session_state = session.state();
         let mut plan = provider.scan(&session_state, None, &[], None).await?;
@@ -10744,7 +10770,16 @@ async fn prepare_contig_context(
     // prediction store. The old interval parquet path uses direct genomic-window
     // parquet reads.
     #[cfg(feature = "kv-cache")]
-    let use_lookup_sift = config.use_fjall || config.indexed_parquet_cache_root.is_some();
+    let use_lookup_sift = config.use_fjall || config.indexed_parquet_cache_root.is_some() || {
+        #[cfg(feature = "lance-cache")]
+        {
+            config.lance_cache_root.is_some()
+        }
+        #[cfg(not(feature = "lance-cache"))]
+        {
+            false
+        }
+    };
     #[cfg(not(feature = "kv-cache"))]
     let use_lookup_sift = false;
 
@@ -10861,15 +10896,30 @@ impl TableProvider for AnnotateProvider {
         let use_fjall = legacy_use_fjall || cache_format == "legacy_fjall";
         #[cfg(feature = "kv-cache")]
         let use_indexed_parquet = !use_fjall && cache_format == "indexed_parquet";
+        #[cfg(feature = "lance-cache")]
+        let use_lance = !use_fjall && cache_format == "lance";
+        #[cfg(all(feature = "kv-cache", not(feature = "lance-cache")))]
+        let use_lance = false;
         #[cfg(not(feature = "kv-cache"))]
         let use_fjall = false;
         #[cfg(not(feature = "kv-cache"))]
         let use_indexed_parquet = false;
+        #[cfg(not(feature = "kv-cache"))]
+        let use_lance = false;
         #[cfg(feature = "kv-cache")]
-        if !matches!(cache_format.as_str(), "indexed_parquet" | "legacy_fjall") {
+        if !matches!(
+            cache_format.as_str(),
+            "indexed_parquet" | "legacy_fjall" | "lance"
+        ) {
             return Err(DataFusionError::Execution(format!(
-                "cache_format must be 'indexed_parquet' or 'legacy_fjall', got '{cache_format}'"
+                "cache_format must be 'indexed_parquet', 'legacy_fjall', or 'lance', got '{cache_format}'"
             )));
+        }
+        #[cfg(all(feature = "kv-cache", not(feature = "lance-cache")))]
+        if cache_format == "lance" {
+            return Err(DataFusionError::Execution(
+                "cache_format='lance' requires the lance-cache feature".to_string(),
+            ));
         }
 
         // Check for partitioned per-chromosome cache layout.
@@ -10910,6 +10960,26 @@ impl TableProvider for AnnotateProvider {
                     ))
                 })?;
                 Some(read_variation_parquet_schema(&sample_path)?)
+            } else if use_lance {
+                #[cfg(feature = "lance-cache")]
+                {
+                    let sample_chrom = &cache.available_chroms()[0];
+                    let sample_path =
+                        crate::warm_cache::lance_variation::lance_variation_dataset_path(
+                            cache.base_dir(),
+                            sample_chrom,
+                        );
+                    Some(
+                        crate::warm_cache::lance_variation::read_lance_variation_schema(
+                            &sample_path,
+                        )
+                        .await?,
+                    )
+                }
+                #[cfg(not(feature = "lance-cache"))]
+                {
+                    None
+                }
             } else {
                 None
             };
@@ -10954,12 +11024,12 @@ impl TableProvider for AnnotateProvider {
                 {
                     unreachable!("use_fjall requires kv-cache feature")
                 }
-            } else if use_indexed_parquet {
+            } else if use_indexed_parquet || use_lance {
                 #[cfg(feature = "kv-cache")]
                 {
                     let cache_schema = indexed_variation_schema.as_ref().ok_or_else(|| {
                         DataFusionError::Execution(
-                            "indexed parquet variation schema was not loaded".to_string(),
+                            "indexed variation schema was not loaded".to_string(),
                         )
                     })?;
                     let cols: HashSet<String> = cache_schema
@@ -11049,6 +11119,8 @@ impl TableProvider for AnnotateProvider {
                     kv_store_arc,
                     #[cfg(feature = "kv-cache")]
                     use_indexed_parquet,
+                    #[cfg(feature = "lance-cache")]
+                    use_lance,
                     #[cfg(feature = "kv-cache")]
                     indexed_variation_schema,
                     limit,
@@ -11137,6 +11209,42 @@ mod tests {
         assert!(frequency_fields.max_af_pops.is_empty());
     }
 
+    #[cfg(feature = "kv-cache")]
+    #[tokio::test]
+    async fn lance_cache_format_is_accepted() {
+        let session = Arc::new(SessionContext::new());
+        let vcf_schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new("ref", DataType::Utf8, false),
+            Field::new("alt", DataType::Utf8, false),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = AnnotateProvider::new(
+            Arc::clone(&session),
+            "vcf".to_string(),
+            tmp.path().to_string_lossy().to_string(),
+            AnnotationBackend::Lance,
+            CacheSourceType::Merged,
+            Some(r#"{"partitioned":true,"cache_format":"lance","everything":true}"#.to_string()),
+            vcf_schema,
+        )
+        .unwrap();
+
+        let state = session.state();
+        let err = provider
+            .scan(&state, None, &[], None)
+            .await
+            .expect_err("missing partitioned cache should fail");
+        let message = err.to_string();
+        assert!(
+            !message.contains("cache_format must"),
+            "lance cache_format was rejected: {message}"
+        );
+        assert!(message.contains("no partitioned cache detected"));
+    }
+
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {
         ContigAnnotationConfig {
             vcf_table: "vcf".to_string(),
@@ -11164,6 +11272,8 @@ mod tests {
             use_fjall: true,
             #[cfg(feature = "kv-cache")]
             indexed_parquet_cache_root: None,
+            #[cfg(feature = "lance-cache")]
+            lance_cache_root: None,
             #[cfg(feature = "kv-cache")]
             indexed_variation_schema: None,
             #[cfg(feature = "kv-cache")]

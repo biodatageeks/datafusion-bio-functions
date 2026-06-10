@@ -168,6 +168,10 @@ impl LanceVariationLookup {
         self.warm_chunk.as_ref()
     }
 
+    pub fn cached_chunk_for_position(&self, position_key: u64) -> Option<&WarmChunkContext> {
+        self.cold_chunks.get(&position_key)
+    }
+
     pub fn cold_probe_position_emit_and_visit<P, E, V>(
         &self,
         position_key: u64,
