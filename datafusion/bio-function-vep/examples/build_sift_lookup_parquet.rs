@@ -195,7 +195,7 @@ fn convert_file(
         DataFusionError::Execution(format!("failed to create '{}': {error}", output.display()))
     })?;
     let props = WriterProperties::builder()
-        .set_max_row_group_size(row_group_size)
+        .set_max_row_group_row_count(Some(row_group_size))
         .set_dictionary_enabled(false)
         .set_compression(compression)
         .build();

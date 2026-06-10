@@ -4373,7 +4373,7 @@ mod tests {
     fn write_single_group_warm_parquet(path: &std::path::Path, batch: &RecordBatch) {
         let file = std::fs::File::create(path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(batch.num_rows())
+            .set_max_row_group_row_count(Some(batch.num_rows()))
             .build();
         let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
         writer.write(batch).unwrap();

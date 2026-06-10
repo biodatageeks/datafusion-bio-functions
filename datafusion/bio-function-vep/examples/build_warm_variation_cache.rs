@@ -533,7 +533,7 @@ fn create_writer(
 ) -> Result<ArrowWriter<File>> {
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(usize::MAX)
+        .set_max_row_group_row_count(Some(usize::MAX))
         .set_key_value_metadata(Some(vec![
             KeyValue::new("vepyr.cache_tier".to_string(), tier.to_string()),
             KeyValue::new(

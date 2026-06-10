@@ -1487,6 +1487,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "indicatif",
  "lance",
+ "lance-file",
  "log",
  "lz4_flex 0.12.2",
  "nohash-hasher",

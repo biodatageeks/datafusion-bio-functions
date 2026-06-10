@@ -9,6 +9,7 @@ use datafusion::common::{DataFusionError, Result};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
 };
+use parquet::file::metadata::PageIndexPolicy;
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::page_index::offset_index::PageLocation;
 use parquet::file::statistics::Statistics;
@@ -142,8 +143,8 @@ impl ColdParquetLookup {
                 path.display()
             ))
         })?;
-        let metadata_options =
-            ArrowReaderOptions::new().with_page_index(cold_parquet_load_page_index());
+        let metadata_options = ArrowReaderOptions::new()
+            .with_page_index_policy(PageIndexPolicy::from(cold_parquet_load_page_index()));
         let metadata = ArrowReaderMetadata::load(&file, metadata_options)?;
         reject_deprecated_cold_variant_keys(&metadata, &path)?;
         let position_leaf = cold_position_leaf_index(&metadata)?;
@@ -1500,7 +1501,8 @@ mod tests {
 
     fn open_test_lookup_with_page_index(path: &Path) -> ColdParquetLookup {
         let file = File::open(path).unwrap();
-        let metadata_options = ArrowReaderOptions::new().with_page_index(true);
+        let metadata_options =
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::from(true));
         let metadata = ArrowReaderMetadata::load(&file, metadata_options).unwrap();
         let position_leaf = cold_position_leaf_index(&metadata).unwrap();
         let row_groups = cold_row_group_metadata(&metadata, position_leaf).unwrap();
@@ -1569,7 +1571,7 @@ mod tests {
         )
         .unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(batch.num_rows())
+            .set_max_row_group_row_count(Some(batch.num_rows()))
             .set_write_batch_size(2)
             .set_data_page_row_count_limit(2)
             .build();
@@ -1644,7 +1646,7 @@ mod tests {
         )
         .unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(batch.num_rows())
+            .set_max_row_group_row_count(Some(batch.num_rows()))
             .set_write_batch_size(2)
             .set_data_page_row_count_limit(2)
             .build();
@@ -1715,7 +1717,7 @@ mod tests {
         )
         .unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(2)
+            .set_max_row_group_row_count(Some(2))
             .set_write_batch_size(2)
             .set_data_page_row_count_limit(2)
             .build();
@@ -1763,7 +1765,7 @@ mod tests {
         )
         .unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(batch.num_rows())
+            .set_max_row_group_row_count(Some(batch.num_rows()))
             .set_write_batch_size(2)
             .set_data_page_row_count_limit(2)
             .build();

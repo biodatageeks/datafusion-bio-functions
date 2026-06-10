@@ -76,6 +76,7 @@ pub enum CacheFormat {
     #[default]
     IndexedParquet,
     LegacyFjall,
+    Lance,
 }
 
 impl CacheFormat {
@@ -83,8 +84,9 @@ impl CacheFormat {
         match value.to_ascii_lowercase().as_str() {
             "indexed_parquet" => Ok(Self::IndexedParquet),
             "legacy_fjall" => Ok(Self::LegacyFjall),
+            "lance" => Ok(Self::Lance),
             other => Err(DataFusionError::Execution(format!(
-                "cache_format must be 'indexed_parquet' or 'legacy_fjall', got '{other}'"
+                "cache_format must be 'indexed_parquet', 'legacy_fjall', or 'lance', got '{other}'"
             ))),
         }
     }
@@ -93,6 +95,7 @@ impl CacheFormat {
         match self {
             Self::IndexedParquet => "indexed_parquet",
             Self::LegacyFjall => "legacy_fjall",
+            Self::Lance => "lance",
         }
     }
 
@@ -2578,7 +2581,7 @@ fn compact_translation_sift_schema() -> SchemaRef {
 
 fn create_compact_sift_writer(path: &str, schema: &SchemaRef) -> Result<ArrowWriter<File>> {
     let props = WriterProperties::builder()
-        .set_max_row_group_size(DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS)
+        .set_max_row_group_row_count(Some(DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS))
         .set_dictionary_enabled(false)
         .set_compression(Compression::UNCOMPRESSED)
         .build();
@@ -3390,6 +3393,7 @@ mod tests {
             CacheFormat::parse("legacy_fjall").unwrap(),
             CacheFormat::LegacyFjall
         );
+        assert_eq!(CacheFormat::parse("lance").unwrap(), CacheFormat::Lance);
         assert!(CacheFormat::parse("rocksdb").is_err());
     }
 

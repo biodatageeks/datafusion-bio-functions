@@ -600,7 +600,7 @@ mod tests {
         let path = dir.path().join("chr1_warm.parquet");
         let file = File::create(&path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(2)
+            .set_max_row_group_row_count(Some(2))
             .build();
         let batch1 = warm_batch(&[101, 102], &["A/G", "C/T"]);
         let batch2 = warm_batch(&[205], &["G/A"]);
@@ -623,7 +623,7 @@ mod tests {
         let path = dir.path().join("chr1_warm.parquet");
         let file = File::create(&path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(2)
+            .set_max_row_group_row_count(Some(2))
             .build();
         let batch1 = warm_batch(&[101, 102], &["A/G", "C/T"]);
         let batch2 = warm_batch(&[205], &["G/A"]);
@@ -655,7 +655,7 @@ mod tests {
         let path = dir.path().join("chr1_warm.parquet");
         let file = File::create(&path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(2)
+            .set_max_row_group_row_count(Some(2))
             .build();
         let batch1 = warm_batch(&[101, 102], &["A/G", "C/T"]);
         let batch2 = warm_batch(&[205], &["G/A"]);
@@ -719,7 +719,7 @@ mod tests {
         let path = dir.path().join("chr1_warm.parquet");
         let file = File::create(&path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(2)
+            .set_max_row_group_row_count(Some(2))
             .build();
         let batch1 = warm_batch(&[101, 102], &["A/G", "C/T"]);
         let batch2 = warm_batch(&[205], &["G/A"]);

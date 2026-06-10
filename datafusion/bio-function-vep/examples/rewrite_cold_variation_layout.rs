@@ -305,7 +305,7 @@ fn create_writer(path: &Path, schema: SchemaRef, args: &Args) -> Result<ArrowWri
     }
     let mut props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(usize::MAX)
+        .set_max_row_group_row_count(Some(usize::MAX))
         .set_key_value_metadata(Some(metadata));
     if let Some(rows) = args.data_page_row_count {
         props = props

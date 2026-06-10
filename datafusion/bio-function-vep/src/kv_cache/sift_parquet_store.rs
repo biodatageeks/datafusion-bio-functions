@@ -413,7 +413,7 @@ mod tests {
         .unwrap();
         let file = std::fs::File::create(path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(1)
+            .set_max_row_group_row_count(Some(1))
             .build();
         let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
         writer.write(&batch).unwrap();

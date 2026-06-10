@@ -869,7 +869,7 @@ fn create_writer(
     };
     let mut props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(usize::MAX)
+        .set_max_row_group_row_count(Some(usize::MAX))
         .set_key_value_metadata(Some(vec![
             KeyValue::new("vepyr.cache_tier".to_string(), tier.to_string()),
             KeyValue::new(
@@ -1109,7 +1109,7 @@ mod tests {
         .unwrap();
         let file = File::create(&path).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(2)
+            .set_max_row_group_row_count(Some(2))
             .build();
         let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
         writer.write(&batch).unwrap();
