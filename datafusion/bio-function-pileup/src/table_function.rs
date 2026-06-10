@@ -16,6 +16,12 @@ use datafusion_bio_format_bam::table_provider::BamTableProvider;
 use crate::physical_exec::{PileupConfig, PileupExec};
 use crate::schema::{coverage_output_schema, per_base_output_schema};
 
+/// Retain the BAM provider's default unknown-tag inference behavior.
+const INFER_UNKNOWN_BAM_TAG_TYPES: bool = true;
+/// Number of records sampled if tag inference is needed. Pileup does not
+/// request tags, but keeping this named default avoids opaque constructor args.
+const BAM_TAG_INFERENCE_SAMPLE_SIZE: usize = 100;
+
 /// A TableProvider that wraps a child provider (e.g., BAM reader) and produces depth output.
 pub struct DepthTableProvider {
     input: Arc<dyn TableProvider>,
@@ -26,6 +32,55 @@ impl DepthTableProvider {
     /// Create a new DepthTableProvider wrapping the given input provider.
     pub fn new(input: Arc<dyn TableProvider>, config: PileupConfig) -> Self {
         Self { input, config }
+    }
+}
+
+/// Open a BAM provider with the defaults expected by pileup/depth.
+///
+/// Pileup does not request BAM tag columns, so tag inference settings only
+/// preserve the provider defaults for future tag-aware callers. `binary_cigar`
+/// is exposed because pileup normally wants packed CIGAR ops, while parsing
+/// benchmarks intentionally request string CIGAR.
+pub async fn open_bam_provider_for_pileup(
+    file_path: String,
+    zero_based: bool,
+    binary_cigar: bool,
+) -> Result<BamTableProvider> {
+    BamTableProvider::new(
+        file_path,
+        None,
+        zero_based,
+        None,
+        binary_cigar,
+        INFER_UNKNOWN_BAM_TAG_TYPES,
+        BAM_TAG_INFERENCE_SAMPLE_SIZE,
+        None,
+    )
+    .await
+}
+
+fn block_on_open_bam_provider_for_pileup(
+    file_path: String,
+    zero_based: bool,
+    binary_cigar: bool,
+) -> Result<BamTableProvider> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(open_bam_provider_for_pileup(
+                file_path,
+                zero_based,
+                binary_cigar,
+            ))
+        }),
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            rt.block_on(open_bam_provider_for_pileup(
+                file_path,
+                zero_based,
+                binary_cigar,
+            ))
+        }
     }
 }
 
@@ -122,22 +177,8 @@ impl TableFunctionImpl for DepthFunction {
             false
         };
 
-        // Create BamTableProvider — handle both tokio and non-tokio contexts
         // Always request binary CIGAR for zero-copy performance
-        let bam_provider = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(BamTableProvider::new(
-                    file_path, None, zero_based, None, true,
-                ))
-            })?,
-            Err(_) => {
-                let rt = tokio::runtime::Runtime::new()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                rt.block_on(BamTableProvider::new(
-                    file_path, None, zero_based, None, true,
-                ))?
-            }
-        };
+        let bam_provider = block_on_open_bam_provider_for_pileup(file_path, zero_based, true)?;
 
         let config = PileupConfig {
             binary_cigar: true,

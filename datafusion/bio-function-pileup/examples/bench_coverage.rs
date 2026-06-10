@@ -3,8 +3,10 @@ use std::time::Instant;
 
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
-use datafusion_bio_format_bam::table_provider::BamTableProvider;
-use datafusion_bio_function_pileup::physical_exec::{DenseMode, PileupConfig, PileupExec};
+use datafusion_bio_function_pileup::{
+    open_bam_provider_for_pileup,
+    physical_exec::{DenseMode, PileupConfig, PileupExec},
+};
 use futures::StreamExt;
 
 #[tokio::main]
@@ -25,7 +27,7 @@ async fn main() {
 
     let start = Instant::now();
 
-    let table = BamTableProvider::new(bam_path.clone(), None, zero_based, None, binary_cigar)
+    let table = open_bam_provider_for_pileup(bam_path.clone(), zero_based, binary_cigar)
         .await
         .expect("Failed to open BAM file");
     let open_time = start.elapsed();

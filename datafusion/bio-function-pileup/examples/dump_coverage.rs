@@ -3,8 +3,10 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Int16Array, Int32Array, StringArray};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
-use datafusion_bio_format_bam::table_provider::BamTableProvider;
-use datafusion_bio_function_pileup::physical_exec::{PileupConfig, PileupExec};
+use datafusion_bio_function_pileup::{
+    open_bam_provider_for_pileup,
+    physical_exec::{PileupConfig, PileupExec},
+};
 use futures::StreamExt;
 
 /// Dumps coverage output to stdout for comparison with mosdepth / samtools.
@@ -22,7 +24,7 @@ async fn main() {
     let zero_based = args.iter().any(|a| a == "--zero-based");
     let per_base = args.iter().any(|a| a == "--per-base");
 
-    let table = BamTableProvider::new(bam_path.clone(), None, zero_based, None, true)
+    let table = open_bam_provider_for_pileup(bam_path.clone(), zero_based, true)
         .await
         .expect("Failed to open BAM file");
 

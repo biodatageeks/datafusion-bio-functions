@@ -4,9 +4,9 @@ use datafusion::arrow::array::{Int16Array, Int32Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
-use datafusion_bio_format_bam::table_provider::BamTableProvider;
 use futures::StreamExt;
 
+use datafusion_bio_function_pileup::open_bam_provider_for_pileup;
 use datafusion_bio_function_pileup::physical_exec::{PileupConfig, PileupExec};
 use datafusion_bio_function_pileup::register_pileup_functions;
 
@@ -117,7 +117,7 @@ async fn collect_coverage_sql(ctx: &SessionContext, sql: &str) -> Vec<(String, i
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ovl_fast_mode() {
     let bam_path = format!("{}/tests/data/ovl.bam", env!("CARGO_MANIFEST_DIR"));
-    let table = BamTableProvider::new(bam_path, None, true, None, true)
+    let table = open_bam_provider_for_pileup(bam_path, true, true)
         .await
         .unwrap();
 
@@ -156,7 +156,7 @@ async fn test_overlapping_pairs() {
         "{}/tests/data/overlapping-pairs.bam",
         env!("CARGO_MANIFEST_DIR")
     );
-    let table = BamTableProvider::new(bam_path, None, true, None, true)
+    let table = open_bam_provider_for_pileup(bam_path, true, true)
         .await
         .unwrap();
 

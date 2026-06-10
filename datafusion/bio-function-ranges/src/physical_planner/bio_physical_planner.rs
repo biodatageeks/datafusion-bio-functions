@@ -113,7 +113,10 @@ fn from_hash_join(
         join_exec.filter.clone(),
         intervals,
         &join_exec.join_type,
-        join_exec.projection.clone(),
+        join_exec
+            .projection
+            .clone()
+            .map(|projection| projection.to_vec()),
         *join_exec.partition_mode(),
         join_exec.null_equality() == NullEquality::NullEqualsNull,
         algorithm,
@@ -135,7 +138,10 @@ fn from_nested_loop_join(
         join_exec.filter().cloned(),
         intervals,
         join_exec.join_type(),
-        None,
+        join_exec
+            .projection()
+            .clone()
+            .map(|projection| projection.to_vec()),
         PartitionMode::CollectLeft,
         true,
         algorithm,

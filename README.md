@@ -269,7 +269,7 @@ Add the crates you need to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-datafusion = "50.3.0"
+datafusion = "53.1.0"
 datafusion-bio-function-pileup = { git = "https://github.com/biodatageeks/datafusion-bio-functions" }
 datafusion-bio-function-ranges = { git = "https://github.com/biodatageeks/datafusion-bio-functions" }
 ```
@@ -485,14 +485,14 @@ For more control, use `PileupExec` directly:
 ```rust
 use std::sync::Arc;
 use datafusion::prelude::*;
-use datafusion_bio_format_bam::table_provider::BamTableProvider;
+use datafusion_bio_function_pileup::open_bam_provider_for_pileup;
 use datafusion_bio_function_pileup::physical_exec::{PileupConfig, PileupExec};
 use futures::StreamExt;
 
 #[tokio::main]
 async fn main() -> datafusion::error::Result<()> {
     // Register BAM file as a table (zero_based=false for 1-based coordinates)
-    let table = BamTableProvider::new("path/to/alignments.bam", None, false, None, true).await?;
+    let table = open_bam_provider_for_pileup("path/to/alignments.bam".to_string(), false, true).await?;
     let ctx = SessionContext::new();
     ctx.register_table("reads", Arc::new(table))?;
 
@@ -548,7 +548,7 @@ datafusion-bio-function-pileup = { git = "https://github.com/biodatageeks/datafu
 datafusion-bio-format-bam = { git = "https://github.com/biodatageeks/datafusion-bio-formats", rev = "<commit-hash>" }
 ```
 
-Keep `datafusion-bio-formats` and `datafusion-bio-functions` revisions in sync — they must use the same DataFusion/Arrow versions (currently DataFusion 50.3.0, Arrow 56.x).
+Keep `datafusion-bio-formats` and `datafusion-bio-functions` revisions in sync — they must use the same DataFusion/Arrow versions (currently DataFusion 53.1.0, Arrow 58.3.0).
 
 ### Feature Flags
 
@@ -565,17 +565,26 @@ datafusion-bio-function-pileup = { git = "...", rev = "...", default-features = 
 
 The core pileup API (`PileupExec`, `PileupConfig`, `cigar::*`, `events::*`, `coverage::*`) is always available regardless of features.
 
-### BamTableProvider API
+### BAM Provider Defaults
 
-The BAM reader accepts a `binary_cigar` parameter:
+For pileup/depth, prefer `open_bam_provider_for_pileup(file_path, zero_based, binary_cigar)`. It centralizes the BAM reader defaults used by this crate:
+
+```rust
+let table = open_bam_provider_for_pileup(file_path, false, true).await?;
+```
+
+The underlying BAM reader also accepts explicit tag-inference settings:
 
 ```rust
 BamTableProvider::new(
-    file_path,           // String: path to BAM file (local or object-store URL)
-    storage_opts,        // Option<ObjectStorageOptions>: S3/GCS/Azure credentials
-    zero_based,          // bool: false for 1-based (default), true for 0-based
-    tag_fields,          // Option<Vec<String>>: optional BAM tag fields to include
-    binary_cigar,        // bool: true for zero-copy binary CIGAR (recommended)
+    file_path,                 // String: path to BAM file (local or object-store URL)
+    storage_opts,              // Option<ObjectStorageOptions>: S3/GCS/Azure credentials
+    zero_based,                // bool: false for 1-based (default), true for 0-based
+    tag_fields,                // Option<Vec<String>>: optional BAM tag fields to include
+    binary_cigar,              // bool: true for zero-copy binary CIGAR (recommended)
+    infer_tag_types,           // bool: infer types for requested non-standard tags
+    tag_inference_sample_size, // usize: records sampled when tag inference is needed
+    tag_type_hints,            // Option<Vec<String>>: explicit SAM tag type hints
 ).await?
 ```
 
@@ -624,13 +633,15 @@ Dense mode requires BAM header metadata (contig lengths) in the schema. If unava
 ```rust
 use std::sync::Arc;
 use datafusion::prelude::*;
-use datafusion_bio_format_bam::table_provider::BamTableProvider;
+use datafusion_bio_function_pileup::open_bam_provider_for_pileup;
 use datafusion_bio_function_pileup::physical_exec::{PileupConfig, PileupExec};
 use futures::StreamExt;
 
 async fn compute_coverage(bam_path: &str, partitions: usize) -> Vec<RecordBatch> {
-    let table = BamTableProvider::new(
-        bam_path.to_string(), None, false, None, true,  // zero_based=false, binary_cigar=true
+    let table = open_bam_provider_for_pileup(
+        bam_path.to_string(),
+        false, // 1-based coordinates
+        true,  // binary CIGAR
     ).await.unwrap();
 
     let config = SessionConfig::new().with_target_partitions(partitions);
