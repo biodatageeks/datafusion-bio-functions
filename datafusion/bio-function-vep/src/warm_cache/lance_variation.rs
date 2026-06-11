@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, UInt8Array, UInt64Array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, UInt8Array, UInt64Array, new_null_array,
+};
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchIterator};
@@ -18,6 +21,21 @@ pub const LANCE_VARIATION_DIR: &str = "variation.lance";
 pub const WARM_TIER: u8 = 0;
 pub const COLD_TIER: u8 = 1;
 pub const DEFAULT_LANCE_COLD_LOOKUP_BATCH_SIZE: usize = 2_000;
+pub const DEFAULT_WARM_LANCE_ROWS_PER_FILE: usize = 500_000;
+pub const DEFAULT_WARM_LANCE_ROW_GROUP_ROWS: usize = 262_144;
+pub const DEFAULT_COLD_LANCE_ROWS_PER_FILE: usize = 1_000_000;
+
+const LANCE_MINIBLOCK_ZSTD3_METADATA: &[(&str, &str)] = &[
+    ("lance-encoding:structural-encoding", "miniblock"),
+    ("lance-encoding:compression", "zstd"),
+    ("lance-encoding:compression-level", "3"),
+    ("lance-encoding:dict-values-compression", "zstd"),
+    ("lance-encoding:dict-values-compression-level", "3"),
+    ("lance-encoding:rle-threshold", "0.95"),
+    ("lance-encoding:dict-size-ratio", "0.99"),
+    ("lance-encoding:dict-divisor", "1"),
+    ("lance-encoding:minichunk-size", "16384"),
+];
 
 const LANCE_REQUIRED_RUNTIME_COLUMNS: &[&str] = &[
     "position_key",
@@ -255,28 +273,81 @@ pub async fn write_merged_lance_variation_dataset(
         })?;
     }
 
-    let batches = warm_batches
+    let warm_batches = warm_batches
         .into_iter()
         .map(|batch| append_tier_column(batch, WARM_TIER))
-        .chain(
-            cold_batches
-                .into_iter()
-                .map(|batch| append_tier_column(batch, COLD_TIER)),
-        )
+        .collect::<Result<Vec<_>>>()?;
+    let cold_batches = cold_batches
+        .into_iter()
+        .map(|batch| append_tier_column(batch, COLD_TIER))
+        .collect::<Result<Vec<_>>>()?;
+    let batches = warm_batches
+        .iter()
+        .chain(cold_batches.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if batches.is_empty() {
+        return Err(DataFusionError::Execution(
+            "cannot write empty Lance variation dataset".into(),
+        ));
+    }
+    let schema = lance_2_1_unpacked_schema(merged_lance_schema(&batches)?);
+    let warm_batches = warm_batches
+        .into_iter()
+        .map(|batch| align_batch_to_schema(batch, schema.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let cold_batches = cold_batches
+        .into_iter()
+        .map(|batch| align_batch_to_schema(batch, schema.clone()))
         .collect::<Result<Vec<_>>>()?;
 
-    let schema = batches
-        .first()
-        .ok_or_else(|| {
-            DataFusionError::Execution("cannot write empty Lance variation dataset".into())
-        })?
-        .schema();
-    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    let mut wrote = false;
+    if !warm_batches.is_empty() {
+        write_lance_batches(
+            path,
+            schema.clone(),
+            warm_batches,
+            WriteMode::Overwrite,
+            warm_fragment_rows.max(1),
+            DEFAULT_WARM_LANCE_ROW_GROUP_ROWS
+                .min(warm_fragment_rows.max(1))
+                .max(1),
+        )
+        .await?;
+        wrote = true;
+    }
+    if !cold_batches.is_empty() {
+        write_lance_batches(
+            path,
+            schema,
+            cold_batches,
+            if wrote {
+                WriteMode::Append
+            } else {
+                WriteMode::Overwrite
+            },
+            DEFAULT_COLD_LANCE_ROWS_PER_FILE.max(cold_fragment_rows.max(1)),
+            cold_fragment_rows.max(1),
+        )
+        .await?;
+    }
+    Ok(())
+}
 
+async fn write_lance_batches(
+    path: &Path,
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+    mode: WriteMode,
+    max_rows_per_file: usize,
+    max_rows_per_group: usize,
+) -> Result<()> {
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
     let params = WriteParams {
-        mode: WriteMode::Overwrite,
-        max_rows_per_file: cold_fragment_rows.max(1),
-        max_rows_per_group: warm_fragment_rows.max(1),
+        mode,
+        max_rows_per_file,
+        max_rows_per_group,
         data_storage_version: Some(LanceFileVersion::V2_1),
         ..Default::default()
     };
@@ -290,6 +361,78 @@ pub async fn write_merged_lance_variation_dataset(
             ))
         })?;
     Ok(())
+}
+
+fn merged_lance_schema(batches: &[RecordBatch]) -> Result<Arc<Schema>> {
+    let mut fields = Vec::<Field>::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    let mut present_counts = Vec::<usize>::new();
+
+    for batch in batches {
+        for field in batch.schema().fields() {
+            let field = field.as_ref();
+            if let Some(&idx) = indexes.get(field.name()) {
+                let existing = &fields[idx];
+                if existing.data_type() != field.data_type() {
+                    return Err(DataFusionError::Execution(format!(
+                        "cannot merge Lance variation field '{}' with incompatible types: {:?} vs {:?}",
+                        field.name(),
+                        existing.data_type(),
+                        field.data_type()
+                    )));
+                }
+                if existing.metadata() != field.metadata() {
+                    return Err(DataFusionError::Execution(format!(
+                        "cannot merge Lance variation field '{}' with incompatible metadata",
+                        field.name()
+                    )));
+                }
+                present_counts[idx] += 1;
+                if field.is_nullable() && !existing.is_nullable() {
+                    fields[idx] = existing.clone().with_nullable(true);
+                }
+            } else {
+                indexes.insert(field.name().clone(), fields.len());
+                fields.push(field.clone());
+                present_counts.push(1);
+            }
+        }
+    }
+
+    for (idx, field) in fields.iter_mut().enumerate() {
+        if present_counts[idx] < batches.len() && !field.is_nullable() {
+            *field = field.clone().with_nullable(true);
+        }
+    }
+
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+fn lance_2_1_unpacked_schema(schema: Arc<Schema>) -> Arc<Schema> {
+    Arc::new(Schema::new(
+        schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let mut metadata = field.metadata().clone();
+                for (key, value) in LANCE_MINIBLOCK_ZSTD3_METADATA {
+                    metadata.insert((*key).to_string(), (*value).to_string());
+                }
+                field.as_ref().clone().with_metadata(metadata)
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn align_batch_to_schema(batch: RecordBatch, schema: Arc<Schema>) -> Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        match batch.schema().index_of(field.name()) {
+            Ok(idx) => columns.push(batch.column(idx).clone()),
+            Err(_) => columns.push(new_null_array(field.data_type(), batch.num_rows())),
+        }
+    }
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 fn append_tier_column(batch: RecordBatch, tier: u8) -> Result<RecordBatch> {
@@ -368,7 +511,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{StringArray, UInt64Array};
+    use datafusion::arrow::array::{
+        ListArray, ListBuilder, StringArray, UInt64Array, UInt64Builder,
+    };
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::arrow::record_batch::RecordBatch;
     use futures::TryStreamExt;
@@ -438,5 +583,72 @@ mod tests {
             .unwrap();
 
         assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 2);
+    }
+
+    #[tokio::test]
+    async fn materializer_adds_typed_nulls_for_columns_missing_from_one_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("variation.lance/chr1.lance");
+
+        let mut variant_keys = ListBuilder::new(UInt64Builder::new());
+        variant_keys.values().append_value(100);
+        variant_keys.append(true);
+        let variant_keys = Arc::new(variant_keys.finish()) as ArrayRef;
+
+        let warm_schema = Arc::new(Schema::new(vec![
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new("variant_keys", variant_keys.data_type().clone(), true),
+            Field::new("allele_string", DataType::Utf8, true),
+        ]));
+        let warm = RecordBatch::try_new(
+            warm_schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![10_u64])),
+                variant_keys,
+                Arc::new(StringArray::from(vec![Some("A/T")])),
+            ],
+        )
+        .unwrap();
+
+        let cold_schema = Arc::new(Schema::new(vec![
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new("allele_string", DataType::Utf8, true),
+        ]));
+        let cold = RecordBatch::try_new(
+            cold_schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![20_u64])),
+                Arc::new(StringArray::from(vec![Some("G/C")])),
+            ],
+        )
+        .unwrap();
+
+        write_merged_lance_variation_dataset(&path, vec![warm], vec![cold], 65_536, 1_024)
+            .await
+            .unwrap();
+
+        let ds = lance::Dataset::open(path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let rows = ds
+            .scan()
+            .project(&["tier", "position_key", "variant_keys"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let schema = rows.first().unwrap().schema();
+        let batch = concat_batches(&schema, &rows).unwrap();
+        let variant_keys = batch
+            .column(batch.schema().index_of("variant_keys").unwrap())
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(variant_keys.null_count(), 1);
     }
 }

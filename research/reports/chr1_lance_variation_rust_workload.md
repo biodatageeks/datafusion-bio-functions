@@ -18,6 +18,7 @@
 - Best default cold `posidx` scan: `2.1-unpacked` with `512` fragment rows at `7.934s`, selecting `66461` rows across `46785` positions.
 - Best optional `posidx_bloom` scan: `2.1-unpacked` with `1024` fragment rows at `3.575s`, selecting `11463` rows across `9497` positions.
 - Current result favors `2.1-unpacked` for cold point lookups; `2.2-packed` is about 2x slower in this all-column Rust workload.
+- Implemented merged 2.1-unpacked Lance materializer output for chr1 is `4.6G` total with `93` data files after projecting the 47 runtime `everything` columns and applying miniblock/zstd field encoding metadata.
 
 ## Workload
 
@@ -36,6 +37,34 @@
 | variant-bloom admitted cold probe attempts | 9638 |
 | 2k cold Lance filter batches | 24 |
 | 2k cold Lance filter batches after bloom | 5 |
+
+## Implementation Validation
+
+| metric | value |
+|---|---:|
+| materialized dataset | `/Users/mwiewior/workspace/data_vepyr/115_GRCh38_merged/variation.lance/chr1.lance` |
+| layout | `2.1-unpacked` |
+| projected runtime columns | 47 |
+| warm rows | 3628123 |
+| cold rows | 84525843 |
+| warm rows/file | 500000 |
+| warm row-group rows | 262144 |
+| cold rows/file | 1000000 |
+| cold row-group rows | 1024 |
+| build elapsed | 64.72s |
+| artifact size | 4.6G |
+| data file count | 93 |
+| total file count | 98 |
+| e2e command | `uv run python run_annotation_fast.py chr1 --cache merged --backend lance --forks 0 --force` |
+| e2e annotated variants | 323430 |
+| e2e annotation elapsed | 51.3s |
+| e2e annotation throughput | 6309 variants/s |
+| e2e peak memory | 1937 MB |
+| e2e only in vepyr | 0 |
+| e2e only in VEP | 0 |
+| e2e CSQ count mismatches | 0 |
+| e2e CSQ order mismatches | 0 |
+| e2e shared CSQ fields at 100% | 86 |
 
 ## Rust Lance Results
 

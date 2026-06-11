@@ -4,7 +4,7 @@
 //!   cargo run --release -p datafusion-bio-function-vep --features lance-cache \
 //!     --example build_lance_variation_cache -- \
 //!     --cache /path/to/cache --chrom chr1 \
-//!     [--warm-fragment-rows 65536] [--cold-fragment-rows 1024] [--batch-size 65536] \
+//!     [--warm-fragment-rows 500000] [--cold-fragment-rows 1024] [--batch-size 65536] \
 //!     [--overwrite]
 
 use std::fs::File;
@@ -15,9 +15,13 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion_bio_function_vep::kv_cache::position_index::cold_variation_files_for_chrom;
 use datafusion_bio_function_vep::warm_cache::lance_variation::{
-    lance_variation_dataset_path, write_merged_lance_variation_dataset,
+    DEFAULT_WARM_LANCE_ROWS_PER_FILE, lance_variation_dataset_path,
+    write_merged_lance_variation_dataset,
 };
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datafusion_bio_function_vep::warm_cache::reader::{
+    WARM_RUNTIME_COLUMNS, projection_for_existing_roots,
+};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 
 #[derive(Debug)]
 struct Args {
@@ -68,10 +72,17 @@ async fn main() -> Result<()> {
     eprintln!("cold_fragment_rows={}", args.cold_fragment_rows);
     eprintln!("batch_size={}", args.batch_size);
 
-    let warm_batches = read_parquet_batches(&warm_path, args.batch_size)?;
+    let projection_columns = runtime_projection_columns();
+    eprintln!("projected_columns={}", projection_columns.len());
+
+    let warm_batches = read_parquet_batches(&warm_path, args.batch_size, &projection_columns)?;
     let mut cold_batches = Vec::new();
     for path in &cold_paths {
-        cold_batches.extend(read_parquet_batches(path, args.batch_size)?);
+        cold_batches.extend(read_parquet_batches(
+            path,
+            args.batch_size,
+            &projection_columns,
+        )?);
     }
     let warm_rows = row_count(&warm_batches);
     let cold_rows = row_count(&cold_batches);
@@ -97,7 +108,7 @@ async fn main() -> Result<()> {
 fn parse_args() -> Result<Args> {
     let mut cache = None;
     let mut chrom = None;
-    let mut warm_fragment_rows = 65_536usize;
+    let mut warm_fragment_rows = DEFAULT_WARM_LANCE_ROWS_PER_FILE;
     let mut cold_fragment_rows = 1_024usize;
     let mut batch_size = 65_536usize;
     let mut overwrite = false;
@@ -151,7 +162,7 @@ fn parse_usize(value: String) -> Result<usize> {
 fn print_usage() {
     eprintln!(
         "Usage: build_lance_variation_cache --cache /path/to/cache --chrom chr1 \
-         [--warm-fragment-rows 65536] [--cold-fragment-rows 1024] [--batch-size 65536] \
+         [--warm-fragment-rows 500000] [--cold-fragment-rows 1024] [--batch-size 65536] \
          [--overwrite]"
     );
 }
@@ -185,11 +196,29 @@ fn variation_split_file_for_chrom(
     None
 }
 
-fn read_parquet_batches(path: &Path, batch_size: usize) -> Result<Vec<RecordBatch>> {
+fn runtime_projection_columns() -> Vec<String> {
+    WARM_RUNTIME_COLUMNS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn read_parquet_batches(
+    path: &Path,
+    batch_size: usize,
+    projection_columns: &[String],
+) -> Result<Vec<RecordBatch>> {
     let file = File::open(path).map_err(|error| {
         DataFusionError::Execution(format!("failed to open '{}': {error}", path.display()))
     })?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+    let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+    let mask = projection_for_existing_roots(
+        metadata.schema(),
+        metadata.parquet_schema(),
+        projection_columns,
+    );
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
+        .with_projection(mask)
         .with_batch_size(batch_size.max(1))
         .build()?;
 
