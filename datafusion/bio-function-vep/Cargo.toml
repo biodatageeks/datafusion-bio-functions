@@ -43,6 +43,8 @@ noodles-vcf = { git = "https://github.com/biodatageeks/noodles.git", rev = "9b7b
 env_logger = "0.11"
 tempfile = "3"
 arrow-array = "58.0.0"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
 
 [[example]]
 name = "vcf_batch_stats"
@@ -110,6 +112,10 @@ required-features = ["kv-cache"]
 
 [[example]]
 name = "bench_lance_variation_chr1_workload"
+required-features = ["lance-cache"]
+
+[[example]]
+name = "bench_arrow_mmap_cold_lookup"
 required-features = ["lance-cache"]
 
 [features]
