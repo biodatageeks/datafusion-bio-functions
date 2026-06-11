@@ -32,7 +32,8 @@ use super::kv_store::RangePrefetchLimitExceeded;
 use super::kv_store::VepKvStore;
 use super::position_entry::{PositionEntryReader, make_builder};
 use super::position_index::{
-    PositionIndexSource, cold_variation_file_for_chrom, cold_variation_files_for_chrom,
+    PositionIndex, PositionIndexSource, cold_variation_file_for_chrom,
+    cold_variation_files_for_chrom,
 };
 use super::variant_bloom_index::{VariantBloomIndex, find_variant_bloom_index_file};
 use crate::allele::{
@@ -506,6 +507,8 @@ struct KvLookupStream {
     cold_parquet_chroms: HashMap<String, Option<ColdParquetLookupSet>>,
     #[cfg(feature = "lance-cache")]
     lance_chroms: HashMap<String, Option<LanceVariationLookup>>,
+    #[cfg(feature = "lance-cache")]
+    lance_position_indices: HashMap<String, Option<Arc<PositionIndex>>>,
     variant_bloom_chroms: HashMap<String, Option<Arc<VariantBloomIndex>>>,
     cold_variation_dir: Option<PathBuf>,
     position_index_dir: Option<PathBuf>,
@@ -700,6 +703,18 @@ fn format_variation_lookup_profile_line(
         position_index_dir.unwrap_or("-"),
         variant_bloom_index_dir.unwrap_or("-"),
     )
+}
+
+fn warm_source_label(
+    backend: WarmColdVariationBackend,
+    has_parquet_warm_dir: bool,
+) -> &'static str {
+    match backend {
+        #[cfg(feature = "lance-cache")]
+        WarmColdVariationBackend::Lance => "lance",
+        _ if has_parquet_warm_dir => "parquet",
+        _ => "none",
+    }
 }
 
 fn decide_after_warm_probe(
@@ -1485,16 +1500,17 @@ impl KvLookupStream {
             VariationLookupStorage::Lance { cache_root } => Some(cache_root),
             VariationLookupStorage::Fjall => None,
         };
-        let warm_cache_dir = if let Some(root) = indexed_cache_root {
-            root.join("variation")
+        let warm_cache_dir = match &variation_storage {
+            VariationLookupStorage::IndexedParquet { cache_root } => cache_root
+                .join("variation")
                 .exists()
-                .then(|| root.join("variation"))
-        } else if warm_variation_cache_enabled() {
-            store
+                .then(|| cache_root.join("variation")),
+            #[cfg(feature = "lance-cache")]
+            VariationLookupStorage::Lance { .. } => None,
+            VariationLookupStorage::Fjall if warm_variation_cache_enabled() => store
                 .as_ref()
-                .and_then(|store| warm_variation_cache_dir(store))
-        } else {
-            None
+                .and_then(|store| warm_variation_cache_dir(store)),
+            VariationLookupStorage::Fjall => None,
         };
         let cold_variation_dir = match &variation_storage {
             VariationLookupStorage::IndexedParquet { cache_root } => {
@@ -1558,11 +1574,7 @@ impl KvLookupStream {
                 "{}",
                 format_variation_lookup_profile_line(
                     variation_storage.as_str(),
-                    if warm_cache_dir.is_some() {
-                        "parquet"
-                    } else {
-                        "none"
-                    },
+                    warm_source_label(warm_cold_backend, warm_cache_dir.is_some()),
                     warm_cold_backend,
                     warm_cold_index_mode,
                     &cache_root_label,
@@ -1597,6 +1609,8 @@ impl KvLookupStream {
             cold_parquet_chroms: HashMap::new(),
             #[cfg(feature = "lance-cache")]
             lance_chroms: HashMap::new(),
+            #[cfg(feature = "lance-cache")]
+            lance_position_indices: HashMap::new(),
             variant_bloom_chroms: HashMap::new(),
             cold_variation_dir,
             position_index_dir,
@@ -1633,6 +1647,26 @@ impl KvLookupStream {
         vcf_indices: &mut Vec<u32>,
         coloc_buf: Option<&mut HashMap<ColocatedKey, ColocatedSinkValue>>,
     ) -> Result<Option<LookupDecision>> {
+        #[cfg(feature = "lance-cache")]
+        if self.warm_cold_backend.is_lance() {
+            return self.probe_lance_warm_position(
+                chrom,
+                chrom_code,
+                probe_start,
+                vcf_ref,
+                vcf_alt,
+                vcf_iv_start,
+                vcf_iv_end,
+                emit_output,
+                vcf_row,
+                cache_columns,
+                col_map,
+                builders,
+                vcf_indices,
+                coloc_buf,
+            );
+        }
+
         let Some(warm_cache_dir) = self.warm_cache_dir.clone() else {
             return Ok(None);
         };
@@ -2016,6 +2050,347 @@ impl KvLookupStream {
         Ok(Some(decision))
     }
 
+    #[cfg(feature = "lance-cache")]
+    #[allow(clippy::too_many_arguments)]
+    fn probe_lance_warm_position(
+        &mut self,
+        chrom: &str,
+        chrom_code: u16,
+        probe_start: i64,
+        vcf_ref: &str,
+        vcf_alt: &str,
+        vcf_iv_start: i64,
+        vcf_iv_end: i64,
+        emit_output: bool,
+        vcf_row: u32,
+        cache_columns: &[String],
+        col_map: &[usize],
+        builders: &mut [Box<dyn datafusion::arrow::array::ArrayBuilder>],
+        vcf_indices: &mut Vec<u32>,
+        coloc_buf: Option<&mut HashMap<ColocatedKey, ColocatedSinkValue>>,
+    ) -> Result<Option<LookupDecision>> {
+        let collect_colocated = coloc_buf.is_some();
+        self.ensure_lance_lookup(chrom, cache_columns, collect_colocated)?;
+
+        let position_key = warm_position_key_from_code(chrom_code, probe_start).map_err(|e| {
+            DataFusionError::Execution(format!("failed to build warm position key: {e}"))
+        })?;
+        let variant_keys = warm_variant_key_candidates(position_key, vcf_ref, vcf_alt);
+        if variant_keys.is_empty() {
+            return Ok(None);
+        }
+
+        let cold_position_index = if self.warm_cold_index_mode.uses_position_index() {
+            self.ensure_lance_position_index(chrom)?
+        } else {
+            None
+        };
+
+        let exact_matcher = self.exact_matcher;
+        let allowed_failed = self.allowed_failed;
+        let profile_detailed = self.profile_detailed;
+        let mut append_elapsed = Duration::ZERO;
+        let mut emitted = false;
+        let mut colocated_prepare_elapsed = Duration::ZERO;
+        let mut colocated_match_elapsed = Duration::ZERO;
+        let mut primary_allele_rows = 0_u64;
+        let mut exact_match_calls = 0_u64;
+        let mut colocated_allele_rows = 0_u64;
+        let mut colocated_entries = 0_u64;
+        let mut warm_candidate_rows = 0_u64;
+        let mut warm_rows_scanned = 0_u64;
+        let started = self.profile_enabled.then(Instant::now);
+
+        let lookup = self
+            .lance_chroms
+            .get(chrom)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("lance variation lookup not open for {chrom}"))
+            })?;
+
+        let row_matches =
+            |chunk: &WarmChunkContext, row: u32, allele_string: &str| -> Result<bool> {
+                let failed = chunk
+                    .i64_value(chunk.columns.failed, row as usize)
+                    .unwrap_or(0);
+                if failed > allowed_failed {
+                    return Ok(false);
+                }
+
+                let existing_end = chunk
+                    .i64_value(chunk.columns.end, row as usize)
+                    .unwrap_or(probe_start);
+                let cache_iv_start = probe_start.min(existing_end);
+                let cache_iv_end = probe_start.max(existing_end);
+                if cache_iv_start > vcf_iv_end || cache_iv_end < vcf_iv_start {
+                    return Ok(false);
+                }
+
+                Ok(exact_matcher(vcf_ref, vcf_alt, allele_string))
+            };
+
+        let mut exact_row: Option<u32> = None;
+        let mut position_rows: Option<Range<u32>> = None;
+        for variant_key in variant_keys {
+            match lookup.warm_probe_exact(position_key, variant_key, |chunk, row| {
+                Ok(chunk
+                    .allele_string(row as usize)?
+                    .map(|allele_string| exact_matcher(vcf_ref, vcf_alt, allele_string))
+                    .unwrap_or(false))
+            })? {
+                WarmProbe::Exact {
+                    row,
+                    position_rows: rows,
+                } => {
+                    exact_row = Some(row);
+                    position_rows = Some(rows);
+                    break;
+                }
+                WarmProbe::PositionCoveredNoExact {
+                    position_rows: rows,
+                } => {
+                    position_rows.get_or_insert(rows);
+                }
+                WarmProbe::NotCovered => {}
+            }
+        }
+
+        let Some(chunk) = lookup.warm_chunk() else {
+            return Err(DataFusionError::Execution(format!(
+                "lance warm tier not loaded for {chrom}"
+            )));
+        };
+
+        if let Some(row) = exact_row {
+            warm_rows_scanned += 1;
+            let matched = chunk
+                .allele_string(row as usize)?
+                .map(|allele_string| row_matches(chunk, row, allele_string))
+                .transpose()?
+                .unwrap_or(false);
+            if !matched {
+                exact_row = None;
+            }
+        }
+
+        if exact_row.is_none() {
+            if let Some(rows) = position_rows.clone() {
+                for row in rows {
+                    warm_rows_scanned += 1;
+                    let Some(allele_string) = chunk.allele_string(row as usize)? else {
+                        continue;
+                    };
+                    if profile_detailed {
+                        primary_allele_rows += 1;
+                        exact_match_calls += 1;
+                    }
+                    if row_matches(chunk, row, allele_string)? {
+                        exact_row = Some(row);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut coloc_buf = coloc_buf;
+        if collect_colocated {
+            if let Some(rows) = position_rows.clone() {
+                let prepare_started = Instant::now();
+                let chrom_norm = chrom.to_string();
+                let (input_ref, input_alt, input_start) =
+                    vcf_to_vep_input_allele(vcf_iv_start, vcf_ref, vcf_alt);
+                let input_allele_string = format!("{input_ref}/{input_alt}");
+                let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
+                let compare_allele_string = format!("{compare_ref}/{compare_alt}");
+                let vep_start = vep_norm_start(vcf_iv_start, vcf_ref, vcf_alt);
+                let vep_end = vep_norm_end(vcf_iv_start, vcf_ref, vcf_alt);
+                let compare_output_allele =
+                    output_allele_from_allele_string(&compare_allele_string).map(str::to_string);
+                let unshifted_output_allele: Option<String> = None;
+                colocated_prepare_elapsed += prepare_started.elapsed();
+
+                let ci = resolve_warm_coloc_indices(chunk);
+                for row in rows {
+                    let Some(allele_string) = chunk.allele_string(row as usize)? else {
+                        continue;
+                    };
+                    let colocated_started = Instant::now();
+                    let Some(buf) = coloc_buf.as_deref_mut() else {
+                        continue;
+                    };
+                    if !probe_start_visible_to_window(probe_start, vep_start, vep_end) {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    }
+                    let Some(ci) = ci.as_ref() else {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    };
+                    if profile_detailed {
+                        colocated_allele_rows += 1;
+                    }
+                    let failed = chunk.i64_value(ci.failed, row as usize).unwrap_or(0);
+                    if failed > allowed_failed {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    }
+
+                    let Some(var_name) =
+                        warm_string_value(chunk, Some(ci.variation_name), row as usize)?
+                    else {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    };
+                    if var_name.is_empty() {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    }
+
+                    let existing_end = chunk
+                        .i64_value(ci.end_col, row as usize)
+                        .unwrap_or(probe_start);
+                    let Some(matched_alleles) = compare_existing_variant_alleles(
+                        &compare_allele_string,
+                        vep_start,
+                        vep_end,
+                        None,
+                        None,
+                        None,
+                        allele_string,
+                        probe_start,
+                        existing_end,
+                    ) else {
+                        colocated_match_elapsed += colocated_started.elapsed();
+                        continue;
+                    };
+
+                    let key: ColocatedKey = (
+                        chrom_norm.clone(),
+                        input_start,
+                        vcf_iv_end,
+                        input_allele_string.clone(),
+                    );
+                    let sink_value = buf.entry(key).or_insert_with(|| ColocatedSinkValue {
+                        entries: Vec::new(),
+                        compare_output_allele: compare_output_allele.clone(),
+                        unshifted_output_allele: unshifted_output_allele.clone(),
+                    });
+                    let af_values: Vec<String> = ci
+                        .af_indices
+                        .iter()
+                        .map(|idx| {
+                            warm_string_value(chunk, *idx, row as usize)
+                                .map(|value| value.unwrap_or_default())
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    sink_value.entries.push(ColocatedCacheEntry {
+                        variation_name: var_name,
+                        allele_string: allele_string.to_string(),
+                        matched_alleles,
+                        somatic: chunk.i64_value(ci.somatic, row as usize).unwrap_or(0),
+                        pheno: chunk.i64_value(ci.pheno, row as usize).unwrap_or(0),
+                        clin_sig: warm_string_value(chunk, ci.clin_sig, row as usize)?,
+                        clin_sig_allele: warm_string_value(
+                            chunk,
+                            ci.clin_sig_allele,
+                            row as usize,
+                        )?,
+                        pubmed: warm_string_value(chunk, ci.pubmed, row as usize)?,
+                        af_values,
+                    });
+                    if profile_detailed {
+                        colocated_entries += 1;
+                    }
+                    colocated_match_elapsed += colocated_started.elapsed();
+                }
+            }
+        }
+
+        if emit_output {
+            if let Some(row) = exact_row {
+                let append_started = Instant::now();
+                let Some(indices) = chunk.output_indices(cache_columns, col_map) else {
+                    return Err(DataFusionError::Execution(
+                        "Lance warm chunk missing one or more requested cache output columns"
+                            .into(),
+                    ));
+                };
+                vcf_indices.push(vcf_row);
+                append_warm_row_values(chunk, row as usize, indices, builders)?;
+                append_elapsed += append_started.elapsed();
+                emitted = true;
+            }
+        }
+
+        let warm_decision = if exact_row.is_some() {
+            WarmProbeForDecision::Exact
+        } else if position_rows.is_some() {
+            WarmProbeForDecision::PositionCoveredNoExact
+        } else {
+            WarmProbeForDecision::NotCovered
+        };
+        if let Some(rows) = position_rows.as_ref() {
+            warm_candidate_rows += u64::from(rows.end.saturating_sub(rows.start));
+        }
+
+        let mut position_index_checks = 0_u64;
+        let mut position_index_positive_gets = 0_u64;
+        let mut position_index_negative_skips = 0_u64;
+        let cold_decision = if warm_decision == WarmProbeForDecision::NotCovered
+            && self.warm_cold_index_mode.uses_position_index()
+        {
+            position_index_checks += 1;
+            if cold_position_index
+                .as_ref()
+                .is_none_or(|index| index.contains_position_key(position_key))
+            {
+                position_index_positive_gets += 1;
+                ColdPositionDecision::Present
+            } else {
+                position_index_negative_skips += 1;
+                ColdPositionDecision::Absent
+            }
+        } else {
+            ColdPositionDecision::Present
+        };
+        let decision = decide_after_warm_probe(warm_decision, cold_decision);
+
+        if self.profile_enabled {
+            self.profile.warm_probes += 1;
+            if let Some(t0) = started {
+                self.profile.warm_probe += t0.elapsed();
+            }
+            self.profile.cache_column_append += append_elapsed;
+            self.profile.colocated_prepare += colocated_prepare_elapsed;
+            self.profile.colocated_match += colocated_match_elapsed;
+            self.profile.position_index_checks += position_index_checks;
+            self.profile.position_index_positive_gets += position_index_positive_gets;
+            self.profile.position_index_negative_skips += position_index_negative_skips;
+            self.profile.warm_candidate_rows += warm_candidate_rows;
+            self.profile.warm_rows_scanned += warm_rows_scanned;
+            if decision == LookupDecision::EmitWarmExact {
+                self.profile.warm_matches += 1;
+            } else if decision == LookupDecision::SkipFjall {
+                self.profile.warm_definitive_misses += 1;
+            } else {
+                self.profile.warm_not_covered += 1;
+            }
+            if profile_detailed {
+                self.profile.primary_allele_rows += primary_allele_rows;
+                self.profile.exact_match_calls += exact_match_calls;
+                self.profile.colocated_allele_rows += colocated_allele_rows;
+                self.profile.colocated_entries += colocated_entries;
+            }
+        }
+
+        if exact_row.is_some() && emitted && self.profile_detailed {
+            self.profile.primary_matches += 1;
+        }
+
+        Ok(Some(decision))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn cold_parquet_aggregate_stats(&self) -> ColdParquetStats {
         let mut aggregate = ColdParquetStats::default();
@@ -2212,6 +2587,54 @@ impl KvLookupStream {
     }
 
     #[cfg(feature = "lance-cache")]
+    fn ensure_lance_position_index(&mut self, chrom: &str) -> Result<Option<Arc<PositionIndex>>> {
+        if !self.warm_cold_index_mode.uses_position_index() {
+            return Ok(None);
+        }
+
+        if !self.lance_position_indices.contains_key(chrom) {
+            let Some(position_index_dir) = self.position_index_dir.clone() else {
+                return Err(DataFusionError::Execution(
+                    "Lance variation lookup uses position index but no position index directory is configured"
+                        .into(),
+                ));
+            };
+
+            let started = self.profile_enabled.then(Instant::now);
+            let (index, source) = PositionIndex::shared_for_chrom(
+                &position_index_dir,
+                chrom,
+                None,
+                warm_variation_batch_size(),
+            )?;
+            if self.profile_enabled {
+                if let Some(t0) = started {
+                    self.profile.position_index_load += t0.elapsed();
+                }
+                self.profile.position_index_loaded += 1;
+                match source {
+                    PositionIndexSource::Persisted => {
+                        self.profile.position_index_persisted_loads += 1;
+                    }
+                    PositionIndexSource::ParquetFallback => {
+                        self.profile.position_index_parquet_fallback_loads += 1;
+                    }
+                }
+                self.profile.position_index_rows += index.len() as u64;
+                self.profile.position_index_bytes += index.storage_bytes() as u64;
+            }
+            self.lance_position_indices
+                .insert(chrom.to_string(), Some(index));
+        }
+
+        Ok(self
+            .lance_position_indices
+            .get(chrom)
+            .and_then(|index| index.as_ref())
+            .cloned())
+    }
+
+    #[cfg(feature = "lance-cache")]
     fn ensure_lance_lookup(
         &mut self,
         chrom: &str,
@@ -2239,19 +2662,37 @@ impl KvLookupStream {
             let projected_cols = projection.len();
             let batch_size = lance_cold_lookup_batch_size();
             let open_started = Instant::now();
-            let lookup = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(LanceVariationLookup::open(&path, projection, batch_size))
+            let (lookup, warm_load) = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let mut lookup =
+                        LanceVariationLookup::open(&path, projection, batch_size).await?;
+                    let warm_started = Instant::now();
+                    lookup.load_warm_tier().await?;
+                    Ok::<_, DataFusionError>((lookup, warm_started.elapsed()))
+                })
             })?;
+            let open_elapsed = open_started.elapsed();
+            let warm_rows = lookup
+                .warm_chunk()
+                .map_or(0_u64, |chunk| chunk.batch.num_rows() as u64);
+            if self.profile_enabled {
+                self.profile.warm_chunk_load += warm_load;
+                if warm_rows > 0 {
+                    self.profile.warm_chunks_loaded += 1;
+                    self.profile.warm_chunk_rows += warm_rows;
+                }
+            }
             if self.profile_detailed || std::env::var_os("VEP_LANCE_PROFILE").is_some() {
                 eprintln!(
-                    "[vep-lance-profile] open chrom={} path={} projected_cols={} collect_colocated={} batch_size={} open_s={:.3}",
+                    "[vep-lance-profile] open chrom={} path={} projected_cols={} collect_colocated={} batch_size={} warm_rows={} warm_load_s={:.3} open_s={:.3}",
                     chrom,
                     path.display(),
                     projected_cols,
                     collect_colocated,
                     batch_size,
-                    open_started.elapsed().as_secs_f64(),
+                    warm_rows,
+                    warm_load.as_secs_f64(),
+                    open_elapsed.as_secs_f64(),
                 );
             }
             self.lance_chroms.insert(chrom.to_string(), Some(lookup));
@@ -4448,22 +4889,36 @@ mod tests {
     fn variation_lookup_profile_line_identifies_lance_backend() {
         let line = format_variation_lookup_profile_line(
             "lance",
-            "parquet",
+            "lance",
             WarmColdVariationBackend::Lance,
             WarmColdVariationIndexMode::PositionThenVariantBloom,
             "/cache/variation.lance",
-            Some("/cache/variation"),
+            None,
             None,
             Some("/cache/variation.position_index"),
             Some("/cache/variation.variant_bloom_index"),
         );
 
         assert!(line.contains("storage=lance"));
-        assert!(line.contains("warm_source=parquet"));
+        assert!(line.contains("warm_source=lance"));
         assert!(line.contains("warm_cold_backend=lance"));
         assert!(line.contains("index_mode=posidx_bloom"));
+        assert!(line.contains("warm_dir=-"));
         assert!(line.contains("cold_dir=-"));
         assert!(line.contains("variant_bloom_index_dir=/cache/variation.variant_bloom_index"));
+    }
+
+    #[cfg(feature = "lance-cache")]
+    #[test]
+    fn warm_source_label_uses_lance_for_lance_backend() {
+        assert_eq!(
+            warm_source_label(WarmColdVariationBackend::Lance, true),
+            "lance"
+        );
+        assert_eq!(
+            warm_source_label(WarmColdVariationBackend::Parquet, true),
+            "parquet"
+        );
     }
 
     #[test]

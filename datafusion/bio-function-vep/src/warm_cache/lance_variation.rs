@@ -28,6 +28,7 @@ pub const LANCE_VARIATION_DIR: &str = "variation.lance";
 pub const WARM_TIER: u8 = 0;
 pub const COLD_TIER: u8 = 1;
 pub const DEFAULT_LANCE_COLD_LOOKUP_BATCH_SIZE: usize = 2_000;
+pub const DEFAULT_LANCE_WARM_SCAN_BATCH_SIZE: usize = 16_384;
 pub const DEFAULT_WARM_LANCE_ROWS_PER_FILE: usize = 500_000;
 pub const DEFAULT_WARM_LANCE_ROW_GROUP_ROWS: usize = 262_144;
 pub const DEFAULT_COLD_LANCE_ROWS_PER_FILE: usize = 1_000_000;
@@ -248,6 +249,10 @@ impl LanceVariationLookup {
             .collect::<Vec<_>>();
         let profile_enabled = lance_profile_enabled();
         let (scan_kind, filter_keys) = classify_lance_scan_filter(filter);
+        let scan_batch_size = match scan_kind {
+            LanceScanKind::Warm => lance_warm_scan_batch_size(),
+            LanceScanKind::Cold | LanceScanKind::Other => self.batch_size,
+        };
         let stats_slot = profile_enabled.then(|| Arc::new(Mutex::new(None::<LanceScanStats>)));
         let mut scanner = self.dataset.scan();
         scanner
@@ -256,7 +261,7 @@ impl LanceVariationLookup {
         scanner.project(&projection).map_err(|err| {
             DataFusionError::Execution(format!("invalid Lance projection: {err}"))
         })?;
-        scanner.batch_size(self.batch_size);
+        scanner.batch_size(scan_batch_size);
         if let Some(stats_slot) = stats_slot.as_ref() {
             let stats_sink = Arc::clone(stats_slot);
             scanner.scan_stats_callback(Arc::new(move |stats| {
@@ -293,6 +298,7 @@ impl LanceVariationLookup {
                 format_lance_scan_profile_line(
                     scan_kind,
                     projection.len(),
+                    scan_batch_size,
                     filter_keys,
                     rows,
                     batches.len(),
@@ -567,6 +573,14 @@ fn lance_profile_enabled() -> bool {
         || std::env::var_os("VEP_KV_PROFILE_DETAILED").is_some()
 }
 
+fn lance_warm_scan_batch_size() -> usize {
+    std::env::var("VEP_LANCE_WARM_SCAN_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LANCE_WARM_SCAN_BATCH_SIZE)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanceScanKind {
     Warm,
@@ -652,6 +666,7 @@ fn lance_filter_in_value_count(filter: &str) -> usize {
 fn format_lance_scan_profile_line(
     kind: LanceScanKind,
     projected_cols: usize,
+    batch_size: usize,
     filter_keys: usize,
     rows: usize,
     batches: usize,
@@ -659,9 +674,10 @@ fn format_lance_scan_profile_line(
     stats: &LanceScanStats,
 ) -> String {
     format!(
-        "[vep-lance-profile] scan kind={} projected_cols={} filter_keys={} rows={} batches={} scan_s={:.3} index_used={} indices_loaded={} parts_loaded={} index_comparisons={} fragments_scanned={} ranges_scanned={} rows_scanned={} bytes_read={} requests={} iops={}",
+        "[vep-lance-profile] scan kind={} projected_cols={} batch_size={} filter_keys={} rows={} batches={} scan_s={:.3} index_used={} indices_loaded={} parts_loaded={} index_comparisons={} fragments_scanned={} ranges_scanned={} rows_scanned={} bytes_read={} requests={} iops={}",
         kind.as_str(),
         projected_cols,
+        batch_size,
         filter_keys,
         rows,
         batches,
@@ -954,6 +970,7 @@ mod tests {
         let line = format_lance_scan_profile_line(
             LanceScanKind::Warm,
             30,
+            DEFAULT_LANCE_WARM_SCAN_BATCH_SIZE,
             0,
             3_628_123,
             58,
@@ -966,6 +983,7 @@ mod tests {
             (LanceScanKind::Cold, 3)
         );
         assert!(line.contains("[vep-lance-profile] scan kind=warm"));
+        assert!(line.contains("batch_size=16384"));
         assert!(line.contains("index_used=true"));
         assert!(line.contains("indices_loaded=1"));
         assert!(line.contains("fragments_scanned=8"));
