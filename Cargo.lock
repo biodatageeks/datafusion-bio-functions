@@ -1488,6 +1488,7 @@ dependencies = [
  "indicatif",
  "lance",
  "lance-file",
+ "lance-index",
  "log",
  "lz4_flex 0.12.2",
  "nohash-hasher",

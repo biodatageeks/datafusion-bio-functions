@@ -885,8 +885,28 @@ impl AnnotateVcfConfig {
         serde_json::to_string(&serde_json::Value::Object(opts)).unwrap()
     }
 
+    fn to_options_json_with_backend(&self, backend: &str) -> String {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&self.to_options_json()).expect("generated options JSON is valid");
+        if let Some(opts) = value.as_object_mut() {
+            opts.insert(
+                "cache_format".into(),
+                serde_json::Value::String(cache_format_for_backend(backend).to_string()),
+            );
+        }
+        value.to_string()
+    }
+
     fn include_pick_output(&self) -> bool {
         self.flag_pick || self.flag_pick_allele || self.flag_pick_allele_gene
+    }
+}
+
+fn cache_format_for_backend(backend: &str) -> &str {
+    match backend {
+        "parquet" => "indexed_parquet",
+        "fjall" => "legacy_fjall",
+        other => other,
     }
 }
 
@@ -1074,7 +1094,7 @@ pub async fn annotate_to_vcf(
     }
     let select_list = select_cols.join(", ");
 
-    let options_json = config.to_options_json();
+    let options_json = config.to_options_json_with_backend(backend);
     let opts_clause = format!(", '{}'", options_json.replace('\'', "''"));
     let sql = format!(
         "SELECT {select_list} FROM annotate_vep('{vcf_table}', '{}', '{}'{opts_clause})",
@@ -1323,6 +1343,16 @@ mod tests {
 
         let json = config.to_options_json();
         assert!(json.contains("\"buffer_size\":1234"));
+    }
+
+    #[test]
+    fn test_to_options_json_with_backend_emits_cache_format() {
+        let config = AnnotateVcfConfig::default();
+
+        let json = config.to_options_json_with_backend("lance");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["cache_format"], "lance");
     }
 
     #[test]

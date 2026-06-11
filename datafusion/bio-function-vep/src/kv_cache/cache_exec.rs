@@ -114,6 +114,17 @@ enum VariationLookupStorage {
     },
 }
 
+impl VariationLookupStorage {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fjall => "fjall",
+            Self::IndexedParquet { .. } => "indexed_parquet",
+            #[cfg(feature = "lance-cache")]
+            Self::Lance { .. } => "lance",
+        }
+    }
+}
+
 fn build_lookup_output_schema(
     input_schema: SchemaRef,
     cache_schema: SchemaRef,
@@ -613,6 +624,15 @@ impl WarmColdVariationBackend {
         }
     }
 
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fjall => "fjall",
+            Self::Parquet => "parquet",
+            #[cfg(feature = "lance-cache")]
+            Self::Lance => "lance",
+        }
+    }
+
     #[cfg(feature = "lance-cache")]
     fn is_lance(self) -> bool {
         matches!(self, Self::Lance)
@@ -647,6 +667,39 @@ impl WarmColdVariationIndexMode {
     fn uses_variant_bloom(self) -> bool {
         matches!(self, Self::PositionThenVariantBloom | Self::VariantBloom)
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Position => "posidx",
+            Self::PositionThenVariantBloom => "posidx_bloom",
+            Self::VariantBloom => "bloom",
+        }
+    }
+}
+
+fn format_variation_lookup_profile_line(
+    storage: &str,
+    warm_source: &str,
+    warm_cold_backend: WarmColdVariationBackend,
+    warm_cold_index_mode: WarmColdVariationIndexMode,
+    cache_root: &str,
+    warm_dir: Option<&str>,
+    cold_dir: Option<&str>,
+    position_index_dir: Option<&str>,
+    variant_bloom_index_dir: Option<&str>,
+) -> String {
+    format!(
+        "[vep-kv-profile-detail] variation_lookup storage={} warm_source={} warm_cold_backend={} index_mode={} cache_root={} warm_dir={} cold_dir={} position_index_dir={} variant_bloom_index_dir={}",
+        storage,
+        warm_source,
+        warm_cold_backend.as_str(),
+        warm_cold_index_mode.as_str(),
+        cache_root,
+        warm_dir.unwrap_or("-"),
+        cold_dir.unwrap_or("-"),
+        position_index_dir.unwrap_or("-"),
+        variant_bloom_index_dir.unwrap_or("-"),
+    )
 }
 
 fn decide_after_warm_probe(
@@ -1472,6 +1525,54 @@ impl KvLookupStream {
         } else {
             None
         };
+        let warm_cold_backend = match &variation_storage {
+            VariationLookupStorage::IndexedParquet { .. } => WarmColdVariationBackend::Parquet,
+            #[cfg(feature = "lance-cache")]
+            VariationLookupStorage::Lance { .. } => WarmColdVariationBackend::Lance,
+            VariationLookupStorage::Fjall => warm_cold_variation_backend_from_env(),
+        };
+        let warm_cold_index_mode = if indexed_cache_root.is_some() {
+            WarmColdVariationIndexMode::PositionThenVariantBloom
+        } else {
+            warm_cold_variation_index_mode_from_env()
+        };
+        let profile_enabled = kv_profile_enabled();
+        let profile_detailed = kv_profile_detailed_enabled();
+        if profile_detailed || std::env::var_os("VEP_LANCE_PROFILE").is_some() {
+            let cache_root_label = indexed_cache_root
+                .map(|root| root.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let warm_dir_label = warm_cache_dir
+                .as_ref()
+                .map(|path| path.display().to_string());
+            let cold_dir_label = cold_variation_dir
+                .as_ref()
+                .map(|path| path.display().to_string());
+            let position_index_dir_label = position_index_dir
+                .as_ref()
+                .map(|path| path.display().to_string());
+            let variant_bloom_index_dir_label = variant_bloom_index_dir
+                .as_ref()
+                .map(|path| path.display().to_string());
+            eprintln!(
+                "{}",
+                format_variation_lookup_profile_line(
+                    variation_storage.as_str(),
+                    if warm_cache_dir.is_some() {
+                        "parquet"
+                    } else {
+                        "none"
+                    },
+                    warm_cold_backend,
+                    warm_cold_index_mode,
+                    &cache_root_label,
+                    warm_dir_label.as_deref(),
+                    cold_dir_label.as_deref(),
+                    position_index_dir_label.as_deref(),
+                    variant_bloom_index_dir_label.as_deref(),
+                )
+            );
+        }
 
         Self {
             input,
@@ -1500,19 +1601,10 @@ impl KvLookupStream {
             cold_variation_dir,
             position_index_dir,
             variant_bloom_index_dir,
-            warm_cold_backend: match variation_storage {
-                VariationLookupStorage::IndexedParquet { .. } => WarmColdVariationBackend::Parquet,
-                #[cfg(feature = "lance-cache")]
-                VariationLookupStorage::Lance { .. } => WarmColdVariationBackend::Lance,
-                VariationLookupStorage::Fjall => warm_cold_variation_backend_from_env(),
-            },
-            warm_cold_index_mode: if indexed_cache_root.is_some() {
-                WarmColdVariationIndexMode::PositionThenVariantBloom
-            } else {
-                warm_cold_variation_index_mode_from_env()
-            },
-            profile_enabled: kv_profile_enabled(),
-            profile_detailed: kv_profile_detailed_enabled(),
+            warm_cold_backend,
+            warm_cold_index_mode,
+            profile_enabled,
+            profile_detailed,
             profile_emitted: false,
             profile: LookupProfile::default(),
             matched_batches: VecDeque::new(),
@@ -2144,13 +2236,24 @@ impl KvLookupStream {
                 )));
             }
             let projection = cold_parquet_projection_columns(cache_columns, collect_colocated);
+            let projected_cols = projection.len();
+            let batch_size = lance_cold_lookup_batch_size();
+            let open_started = Instant::now();
             let lookup = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(LanceVariationLookup::open(
-                    &path,
-                    projection,
-                    lance_cold_lookup_batch_size(),
-                ))
+                tokio::runtime::Handle::current()
+                    .block_on(LanceVariationLookup::open(&path, projection, batch_size))
             })?;
+            if self.profile_detailed || std::env::var_os("VEP_LANCE_PROFILE").is_some() {
+                eprintln!(
+                    "[vep-lance-profile] open chrom={} path={} projected_cols={} collect_colocated={} batch_size={} open_s={:.3}",
+                    chrom,
+                    path.display(),
+                    projected_cols,
+                    collect_colocated,
+                    batch_size,
+                    open_started.elapsed().as_secs_f64(),
+                );
+            }
             self.lance_chroms.insert(chrom.to_string(), Some(lookup));
         }
 
@@ -4338,6 +4441,29 @@ mod tests {
         assert!(lines[8].contains("position_bloom_filter_row_groups=52"));
         assert!(lines[8].contains("page_index_probes=54"));
         assert!(lines[8].contains("unique_candidate_rows=61"));
+    }
+
+    #[cfg(feature = "lance-cache")]
+    #[test]
+    fn variation_lookup_profile_line_identifies_lance_backend() {
+        let line = format_variation_lookup_profile_line(
+            "lance",
+            "parquet",
+            WarmColdVariationBackend::Lance,
+            WarmColdVariationIndexMode::PositionThenVariantBloom,
+            "/cache/variation.lance",
+            Some("/cache/variation"),
+            None,
+            Some("/cache/variation.position_index"),
+            Some("/cache/variation.variant_bloom_index"),
+        );
+
+        assert!(line.contains("storage=lance"));
+        assert!(line.contains("warm_source=parquet"));
+        assert!(line.contains("warm_cold_backend=lance"));
+        assert!(line.contains("index_mode=posidx_bloom"));
+        assert!(line.contains("cold_dir=-"));
+        assert!(line.contains("variant_bloom_index_dir=/cache/variation.variant_bloom_index"));
     }
 
     #[test]

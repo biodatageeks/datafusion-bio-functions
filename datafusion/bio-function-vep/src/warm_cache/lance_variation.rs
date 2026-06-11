@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, UInt8Array, UInt64Array, new_null_array,
@@ -10,8 +11,14 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use datafusion::common::{DataFusionError, Result};
 use futures::TryStreamExt;
+use lance::dataset::scanner::ExecutionSummaryCounts;
 use lance::dataset::{WriteMode, WriteParams};
+use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
+use lance_index::{
+    IndexType,
+    scalar::{BuiltinIndexType, ScalarIndexParams},
+};
 
 use crate::warm_cache::chrom_cache::WarmProbe;
 use crate::warm_cache::chunk::{WarmChunkContext, WarmChunkProbe};
@@ -44,6 +51,10 @@ const LANCE_REQUIRED_RUNTIME_COLUMNS: &[&str] = &[
     "end",
     "failed",
 ];
+const LANCE_POSITION_KEY_COLUMN: &str = "position_key";
+const LANCE_POSITION_KEY_INDEX_NAME: &str = "position_key_idx";
+const LANCE_TIER_COLUMN: &str = "tier";
+const LANCE_TIER_BITMAP_INDEX_NAME: &str = "tier_bitmap_idx";
 
 pub struct LanceVariationLookup {
     dataset: lance::Dataset,
@@ -235,6 +246,9 @@ impl LanceVariationLookup {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
+        let profile_enabled = lance_profile_enabled();
+        let (scan_kind, filter_keys) = classify_lance_scan_filter(filter);
+        let stats_slot = profile_enabled.then(|| Arc::new(Mutex::new(None::<LanceScanStats>)));
         let mut scanner = self.dataset.scan();
         scanner
             .filter(filter)
@@ -243,15 +257,49 @@ impl LanceVariationLookup {
             DataFusionError::Execution(format!("invalid Lance projection: {err}"))
         })?;
         scanner.batch_size(self.batch_size);
+        if let Some(stats_slot) = stats_slot.as_ref() {
+            let stats_sink = Arc::clone(stats_slot);
+            scanner.scan_stats_callback(Arc::new(move |stats| {
+                *stats_sink
+                    .lock()
+                    .expect("Lance scan profile stats lock poisoned") =
+                    Some(LanceScanStats::from_summary(stats));
+            }));
+        }
 
+        let scan_started = Instant::now();
         let mut stream = scanner.try_into_stream().await.map_err(|err| {
             DataFusionError::Execution(format!("failed to scan Lance variation dataset: {err}"))
         })?;
         let mut batches = Vec::new();
+        let mut rows = 0usize;
         while let Some(batch) = stream.try_next().await.map_err(|err| {
             DataFusionError::Execution(format!("failed to read Lance variation batch: {err}"))
         })? {
+            rows += batch.num_rows();
             batches.push(batch);
+        }
+        if profile_enabled {
+            let stats = stats_slot
+                .as_ref()
+                .and_then(|slot| {
+                    slot.lock()
+                        .expect("Lance scan profile stats lock poisoned")
+                        .clone()
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "{}",
+                format_lance_scan_profile_line(
+                    scan_kind,
+                    projection.len(),
+                    filter_keys,
+                    rows,
+                    batches.len(),
+                    scan_started.elapsed(),
+                    &stats,
+                )
+            );
         }
         Ok(batches)
     }
@@ -332,6 +380,50 @@ pub async fn write_merged_lance_variation_dataset(
         )
         .await?;
     }
+    create_lance_variation_indices(path).await?;
+    Ok(())
+}
+
+async fn create_lance_variation_indices(path: &Path) -> Result<()> {
+    let mut dataset = lance::Dataset::open(path.to_string_lossy().as_ref())
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!(
+                "failed to open Lance variation dataset for indexing '{}': {err}",
+                path.display()
+            ))
+        })?;
+
+    dataset
+        .create_index(
+            &[LANCE_POSITION_KEY_COLUMN],
+            IndexType::BTree,
+            Some(LANCE_POSITION_KEY_INDEX_NAME.to_string()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            true,
+        )
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!(
+                "failed to create Lance position_key index '{}': {err}",
+                path.display()
+            ))
+        })?;
+    dataset
+        .create_index(
+            &[LANCE_TIER_COLUMN],
+            IndexType::Bitmap,
+            Some(LANCE_TIER_BITMAP_INDEX_NAME.to_string()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+            true,
+        )
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!(
+                "failed to create Lance tier bitmap index '{}': {err}",
+                path.display()
+            ))
+        })?;
     Ok(())
 }
 
@@ -468,6 +560,123 @@ fn lance_projection_columns(dataset: &lance::Dataset, requested_columns: &[Strin
         }
     }
     columns
+}
+
+fn lance_profile_enabled() -> bool {
+    std::env::var_os("VEP_LANCE_PROFILE").is_some()
+        || std::env::var_os("VEP_KV_PROFILE_DETAILED").is_some()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanceScanKind {
+    Warm,
+    Cold,
+    Other,
+}
+
+impl LanceScanKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::Cold => "cold",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct LanceScanStats {
+    iops: usize,
+    requests: usize,
+    bytes_read: usize,
+    indices_loaded: usize,
+    parts_loaded: usize,
+    index_comparisons: usize,
+    fragments_scanned: usize,
+    ranges_scanned: usize,
+    rows_scanned: usize,
+}
+
+impl LanceScanStats {
+    fn from_summary(summary: &ExecutionSummaryCounts) -> Self {
+        Self {
+            iops: summary.iops,
+            requests: summary.requests,
+            bytes_read: summary.bytes_read,
+            indices_loaded: summary.indices_loaded,
+            parts_loaded: summary.parts_loaded,
+            index_comparisons: summary.index_comparisons,
+            fragments_scanned: lance_summary_count(summary, "fragments_scanned"),
+            ranges_scanned: lance_summary_count(summary, "ranges_scanned"),
+            rows_scanned: lance_summary_count(summary, "rows_scanned"),
+        }
+    }
+
+    fn index_used(&self) -> bool {
+        self.indices_loaded > 0 || self.parts_loaded > 0 || self.index_comparisons > 0
+    }
+}
+
+fn lance_summary_count(summary: &ExecutionSummaryCounts, name: &str) -> usize {
+    summary.all_counts.get(name).copied().unwrap_or_default()
+}
+
+fn classify_lance_scan_filter(filter: &str) -> (LanceScanKind, usize) {
+    let normalized = filter.split_whitespace().collect::<Vec<_>>().join(" ");
+    let keys = lance_filter_in_value_count(filter);
+    if normalized == "tier = 0" {
+        (LanceScanKind::Warm, keys)
+    } else if normalized.starts_with("tier = 1") {
+        (LanceScanKind::Cold, keys)
+    } else {
+        (LanceScanKind::Other, keys)
+    }
+}
+
+fn lance_filter_in_value_count(filter: &str) -> usize {
+    let Some(open_idx) = filter.find("IN (") else {
+        return 0;
+    };
+    let value_start = open_idx + "IN (".len();
+    let Some(close_idx) = filter[value_start..].find(')') else {
+        return 0;
+    };
+    let values = filter[value_start..value_start + close_idx].trim();
+    if values.is_empty() || values.eq_ignore_ascii_case("NULL") {
+        0
+    } else {
+        values.split(',').count()
+    }
+}
+
+fn format_lance_scan_profile_line(
+    kind: LanceScanKind,
+    projected_cols: usize,
+    filter_keys: usize,
+    rows: usize,
+    batches: usize,
+    scan_elapsed: Duration,
+    stats: &LanceScanStats,
+) -> String {
+    format!(
+        "[vep-lance-profile] scan kind={} projected_cols={} filter_keys={} rows={} batches={} scan_s={:.3} index_used={} indices_loaded={} parts_loaded={} index_comparisons={} fragments_scanned={} ranges_scanned={} rows_scanned={} bytes_read={} requests={} iops={}",
+        kind.as_str(),
+        projected_cols,
+        filter_keys,
+        rows,
+        batches,
+        scan_elapsed.as_secs_f64(),
+        stats.index_used(),
+        stats.indices_loaded,
+        stats.parts_loaded,
+        stats.index_comparisons,
+        stats.fragments_scanned,
+        stats.ranges_scanned,
+        stats.rows_scanned,
+        stats.bytes_read,
+        stats.requests,
+        stats.iops,
+    )
 }
 
 fn push_projection_column(columns: &mut Vec<String>, schema: &Schema, name: &str) {
@@ -650,5 +859,117 @@ mod tests {
 
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(variant_keys.null_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn materializer_creates_scalar_indices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("variation.lance/chr1.lance");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("position_key", DataType::UInt64, false),
+            Field::new("allele_string", DataType::Utf8, true),
+        ]));
+        let warm = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![10_u64, 20])),
+                Arc::new(StringArray::from(vec![Some("A/T"), Some("G/C")])),
+            ],
+        )
+        .unwrap();
+        let cold = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![30_u64, 40])),
+                Arc::new(StringArray::from(vec![Some("C/A"), Some("T/G")])),
+            ],
+        )
+        .unwrap();
+
+        write_merged_lance_variation_dataset(&path, vec![warm], vec![cold], 65_536, 1_024)
+            .await
+            .unwrap();
+
+        let ds = lance::Dataset::open(path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let indices = ds.load_indices().await.unwrap();
+
+        let index_names = || indices.iter().map(|index| &index.name).collect::<Vec<_>>();
+        let position_index = indices
+            .iter()
+            .find(|index| index.name == LANCE_POSITION_KEY_INDEX_NAME)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a Lance scalar index named {LANCE_POSITION_KEY_INDEX_NAME}, got: {:?}",
+                    index_names()
+                )
+            });
+        let index_details = position_index
+            .index_details
+            .as_ref()
+            .expect("expected Lance index details metadata");
+
+        assert!(
+            index_details.type_url.ends_with("BTreeIndexDetails"),
+            "expected position_key_idx to be a BTREE index, got metadata type URL {:?}",
+            index_details.type_url
+        );
+
+        let tier_index = indices
+            .iter()
+            .find(|index| index.name == LANCE_TIER_BITMAP_INDEX_NAME)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a Lance scalar index named {LANCE_TIER_BITMAP_INDEX_NAME}, got: {:?}",
+                    index_names()
+                )
+            });
+        let index_details = tier_index
+            .index_details
+            .as_ref()
+            .expect("expected Lance index details metadata");
+
+        assert!(
+            index_details.type_url.ends_with("BitmapIndexDetails"),
+            "expected tier_bitmap_idx to be a bitmap index, got metadata type URL {:?}",
+            index_details.type_url
+        );
+    }
+
+    #[test]
+    fn lance_scan_profile_line_reports_index_and_pruning_metrics() {
+        let stats = LanceScanStats {
+            iops: 12,
+            requests: 8,
+            bytes_read: 2048,
+            indices_loaded: 1,
+            parts_loaded: 1,
+            index_comparisons: 1,
+            fragments_scanned: 8,
+            ranges_scanned: 8,
+            rows_scanned: 3_628_123,
+        };
+
+        let line = format_lance_scan_profile_line(
+            LanceScanKind::Warm,
+            30,
+            0,
+            3_628_123,
+            58,
+            Duration::from_millis(388),
+            &stats,
+        );
+
+        assert_eq!(
+            classify_lance_scan_filter("tier = 1 AND position_key IN (10,20,30)"),
+            (LanceScanKind::Cold, 3)
+        );
+        assert!(line.contains("[vep-lance-profile] scan kind=warm"));
+        assert!(line.contains("index_used=true"));
+        assert!(line.contains("indices_loaded=1"));
+        assert!(line.contains("fragments_scanned=8"));
+        assert!(line.contains("rows_scanned=3628123"));
+        assert!(line.contains("scan_s=0.388"));
     }
 }
