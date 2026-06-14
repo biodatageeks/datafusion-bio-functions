@@ -36,7 +36,7 @@ const DEFAULT_CHROMS: &[&str] = &[
     "18", "19", "20", "21", "22", "X", "Y", "MT",
 ];
 const LANCE_VARIATION_WRITE_CHUNK_ROWS: usize = 1_000_000;
-const LANCE_CONTEXT_WRITE_CHUNK_ROWS: usize = 65_536;
+const LANCE_CONTEXT_WRITE_CHUNK_ROWS: usize = 4_096;
 
 pub fn lance_entity_dir_name(entity: &str) -> String {
     format!("{entity}.lance")
@@ -353,12 +353,21 @@ impl<'a> LanceChunkWriter<'a> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        self.pending_rows += batch.num_rows();
-        self.total_rows += batch.num_rows();
-        self.pending.push(batch);
+        let mut offset = 0usize;
+        while offset < batch.num_rows() {
+            if self.pending_rows >= self.chunk_rows {
+                self.flush().await?;
+            }
+            let remaining_capacity = self.chunk_rows.saturating_sub(self.pending_rows).max(1);
+            let len = remaining_capacity.min(batch.num_rows() - offset);
+            self.pending_rows += len;
+            self.total_rows += len;
+            self.pending.push(batch.slice(offset, len));
+            offset += len;
 
-        if self.pending_rows >= self.chunk_rows {
-            self.flush().await?;
+            if self.pending_rows >= self.chunk_rows {
+                self.flush().await?;
+            }
         }
         Ok(())
     }
