@@ -1,0 +1,292 @@
+use datafusion::arrow::array::{Array, UInt32Array, UInt64Array};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::{DataFusionError, Result};
+use futures::TryStreamExt;
+use lance::dataset::index::LanceIndexStoreExt;
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use lance::table::format::IndexMetadata;
+use lance_index::IndexCriteria;
+use lance_index::scalar::{IndexStore, lance_format::LanceIndexStore};
+
+const BTREE_PAGE_DATA_FILE: &str = "page_data.lance";
+const BTREE_VALUES_COLUMN: &str = "values";
+const BTREE_IDS_COLUMN: &str = "ids";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionRowIdIndex {
+    positions: Vec<u32>,
+    row_ids: Vec<u64>,
+    unique_positions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRowIds {
+    pub requested_positions: usize,
+    pub matched_positions: usize,
+    pub row_ids: Vec<u64>,
+}
+
+impl PositionRowIdIndex {
+    #[cfg(test)]
+    pub fn from_pairs_for_test(mut pairs: Vec<(u32, u64)>) -> Self {
+        pairs.sort_unstable_by_key(|pair| *pair);
+        let mut positions = Vec::with_capacity(pairs.len());
+        let mut row_ids = Vec::with_capacity(pairs.len());
+        let mut unique_positions = 0;
+        let mut last = None;
+        for (position, row_id) in pairs {
+            if last != Some(position) {
+                unique_positions += 1;
+                last = Some(position);
+            }
+            positions.push(position);
+            row_ids.push(row_id);
+        }
+        Self {
+            positions,
+            row_ids,
+            unique_positions,
+        }
+    }
+
+    pub fn new(positions: Vec<u32>, row_ids: Vec<u64>, unique_positions: usize) -> Result<Self> {
+        if positions.len() != row_ids.len() {
+            return Err(DataFusionError::Execution(
+                "position row-id index arrays have different lengths".into(),
+            ));
+        }
+        if positions.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(DataFusionError::Execution(
+                "position row-id index positions are not sorted".into(),
+            ));
+        }
+        Ok(Self {
+            positions,
+            row_ids,
+            unique_positions,
+        })
+    }
+
+    pub fn unique_positions(&self) -> usize {
+        self.unique_positions
+    }
+
+    pub fn row_ids_len(&self) -> usize {
+        self.row_ids.len()
+    }
+
+    pub fn resolve_sorted_positions_from_cursor(
+        &self,
+        query_positions: &[u32],
+        cursor: &mut usize,
+    ) -> ResolvedRowIds {
+        let mut matched_positions = 0;
+        let mut row_ids = Vec::new();
+        *cursor = (*cursor).min(self.positions.len());
+
+        for &position in query_positions {
+            while *cursor < self.positions.len() && self.positions[*cursor] < position {
+                *cursor += 1;
+            }
+            if *cursor == self.positions.len() {
+                break;
+            }
+            if self.positions[*cursor] == position {
+                matched_positions += 1;
+                while *cursor < self.positions.len() && self.positions[*cursor] == position {
+                    row_ids.push(self.row_ids[*cursor]);
+                    *cursor += 1;
+                }
+            }
+        }
+
+        ResolvedRowIds {
+            requested_positions: query_positions.len(),
+            matched_positions,
+            row_ids,
+        }
+    }
+}
+
+pub async fn load_start_index_from_lance_btree(
+    dataset: &lance::Dataset,
+) -> Result<PositionRowIdIndex> {
+    load_u32_btree_index(dataset, "start", "start_btree_idx").await
+}
+
+async fn load_u32_btree_index(
+    dataset: &lance::Dataset,
+    column: &str,
+    index_name: &str,
+) -> Result<PositionRowIdIndex> {
+    let index_segments = load_btree_segments(dataset, column, index_name).await?;
+    let mut pairs = Vec::<(u32, u64)>::new();
+    for index_segment in &index_segments {
+        append_btree_segment_pairs(dataset, index_segment, &mut pairs).await?;
+    }
+    pairs.sort_unstable_by_key(|(position, row_id)| (*position, *row_id));
+
+    let mut positions = Vec::with_capacity(pairs.len());
+    let mut row_ids = Vec::with_capacity(pairs.len());
+    let mut unique_positions = 0usize;
+    let mut previous = None;
+    for (position, row_id) in pairs {
+        if previous != Some(position) {
+            unique_positions += 1;
+            previous = Some(position);
+        }
+        positions.push(position);
+        row_ids.push(row_id);
+    }
+
+    PositionRowIdIndex::new(positions, row_ids, unique_positions)
+}
+
+async fn load_btree_segments(
+    dataset: &lance::Dataset,
+    column: &str,
+    index_name: &str,
+) -> Result<Vec<IndexMetadata>> {
+    let mut index_segments = dataset
+        .load_indices_by_name(index_name)
+        .await
+        .map_err(|err| DataFusionError::Execution(format!("failed to load {index_name}: {err}")))?;
+    if index_segments.is_empty() {
+        if let Some(index) = dataset
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column(column)
+                    .supports_exact_equality(),
+            )
+            .await
+            .map_err(|err| {
+                DataFusionError::Execution(format!(
+                    "failed to discover BTree index for {column}: {err}"
+                ))
+            })?
+        {
+            index_segments.push(index);
+        }
+    }
+    if index_segments.is_empty() {
+        return Err(DataFusionError::Execution(format!(
+            "missing scalar BTree index '{index_name}' for column '{column}'"
+        )));
+    }
+    Ok(index_segments)
+}
+
+async fn append_btree_segment_pairs(
+    dataset: &lance::Dataset,
+    index_segment: &IndexMetadata,
+    pairs: &mut Vec<(u32, u64)>,
+) -> Result<()> {
+    let store = LanceIndexStore::from_dataset_for_existing(dataset, index_segment)
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!("failed to open Lance index store: {err}"))
+        })?;
+    let reader = store
+        .open_index_file(BTREE_PAGE_DATA_FILE)
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!("failed to open BTree page data: {err}"))
+        })?;
+    let num_rows = reader.num_rows();
+    if num_rows == 0 {
+        return Ok(());
+    }
+    pairs.reserve(num_rows);
+    let mut stream = reader
+        .read_range_stream(0..num_rows, Some(&[BTREE_VALUES_COLUMN, BTREE_IDS_COLUMN]))
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!("failed to stream BTree page data: {err}"))
+        })?;
+    while let Some(batch) = stream.try_next().await.map_err(|err| {
+        DataFusionError::Execution(format!("failed to read BTree page data batch: {err}"))
+    })? {
+        append_btree_page_row_id_pairs(&batch, pairs)?;
+    }
+    Ok(())
+}
+
+fn append_btree_page_row_id_pairs(batch: &RecordBatch, pairs: &mut Vec<(u32, u64)>) -> Result<()> {
+    let value_array = batch
+        .column_by_name(BTREE_VALUES_COLUMN)
+        .unwrap_or_else(|| batch.column(0));
+    let row_ids = batch
+        .column_by_name(BTREE_IDS_COLUMN)
+        .ok_or_else(|| DataFusionError::Execution("BTree page data missing ids column".into()))?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| DataFusionError::Execution("BTree page ids column must be UInt64".into()))?;
+    let positions = value_array
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| {
+            DataFusionError::Execution("BTree page values column must be UInt32".into())
+        })?;
+
+    for row in 0..batch.num_rows() {
+        if !positions.is_null(row) {
+            pairs.push((positions.value(row), row_ids.value(row)));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::ArrayRef;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn resolves_sorted_positions_from_monotonic_cursor() {
+        let index = PositionRowIdIndex::from_pairs_for_test(vec![
+            (10, 1),
+            (10, 2),
+            (20, 3),
+            (30, 4),
+            (30, 5),
+        ]);
+        let mut cursor = 0;
+        let result = index.resolve_sorted_positions_from_cursor(&[10, 30], &mut cursor);
+        assert_eq!(result.matched_positions, 2);
+        assert_eq!(result.row_ids, vec![1, 2, 4, 5]);
+        assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn skips_missing_positions_without_resetting_cursor() {
+        let index = PositionRowIdIndex::from_pairs_for_test(vec![(10, 1), (20, 2), (40, 3)]);
+        let mut cursor = 0;
+        let result = index.resolve_sorted_positions_from_cursor(&[15, 20, 35], &mut cursor);
+        assert_eq!(result.matched_positions, 1);
+        assert_eq!(result.row_ids, vec![2]);
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn extracts_u32_position_row_id_pairs_from_btree_page_data() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(BTREE_VALUES_COLUMN, DataType::UInt32, false),
+            Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![10, 10, 30])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![101, 102, 300])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut pairs = Vec::new();
+
+        append_btree_page_row_id_pairs(&batch, &mut pairs).unwrap();
+
+        assert_eq!(pairs, vec![(10, 101), (10, 102), (30, 300)]);
+    }
+}
