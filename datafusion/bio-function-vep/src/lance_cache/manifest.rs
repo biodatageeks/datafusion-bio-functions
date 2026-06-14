@@ -79,8 +79,9 @@ impl ChromManifest {
 }
 
 pub fn dataset_dir_name(chrom: &str) -> String {
-    let mut encoded = String::with_capacity(chrom.len() + ".lance".len());
-    for byte in chrom.bytes() {
+    let label = canonical_chrom_label(chrom);
+    let mut encoded = String::with_capacity(label.len() + ".lance".len());
+    for byte in label.bytes() {
         let keep = byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.');
         if keep {
             encoded.push(byte as char);
@@ -93,6 +94,20 @@ pub fn dataset_dir_name(chrom: &str) -> String {
     encoded
 }
 
+pub fn canonical_chrom_label(chrom: &str) -> String {
+    let bare = chrom.strip_prefix("chr").unwrap_or(chrom);
+    if let Ok(number) = bare.parse::<u8>()
+        && (1..=22).contains(&number)
+    {
+        return format!("chr{number}");
+    }
+    match bare {
+        "X" | "Y" => format!("chr{bare}"),
+        "M" | "MT" => "chrMT".to_string(),
+        _ => chrom.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +116,11 @@ mod tests {
     #[test]
     fn encodes_labels_without_losing_original_chrom() {
         assert_eq!(dataset_dir_name("chr1"), "chr1.lance");
+        assert_eq!(dataset_dir_name("1"), "chr1.lance");
+        assert_eq!(canonical_chrom_label("1"), "chr1");
+        assert_eq!(canonical_chrom_label("chr1"), "chr1");
+        assert_eq!(canonical_chrom_label("X"), "chrX");
+        assert_eq!(canonical_chrom_label("MT"), "chrMT");
         assert_eq!(
             dataset_dir_name("HSCHR6_MHC_COX_CTG1"),
             "HSCHR6_MHC_COX_CTG1.lance"

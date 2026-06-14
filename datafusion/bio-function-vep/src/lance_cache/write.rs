@@ -28,6 +28,15 @@ pub async fn write_record_batches_to_lance(
     batches: Vec<RecordBatch>,
     index_kind: LanceIndexKind,
 ) -> Result<()> {
+    write_record_batches_to_lance_with_mode(path, batches, WriteMode::Overwrite).await?;
+    create_required_index(path, index_kind).await
+}
+
+pub async fn write_record_batches_to_lance_with_mode(
+    path: &Path,
+    batches: Vec<RecordBatch>,
+    mode: WriteMode,
+) -> Result<()> {
     if batches.is_empty() {
         return Err(DataFusionError::Execution(format!(
             "cannot write empty Lance dataset at {}",
@@ -47,7 +56,7 @@ pub async fn write_record_batches_to_lance(
         .collect::<Result<Vec<_>>>()?;
     let reader = RecordBatchIterator::new(aligned.into_iter().map(Ok), Arc::clone(&schema));
     let params = WriteParams {
-        mode: WriteMode::Overwrite,
+        mode,
         data_storage_version: Some(LanceFileVersion::V2_1),
         ..Default::default()
     };
@@ -60,7 +69,7 @@ pub async fn write_record_batches_to_lance(
                 path.display()
             ))
         })?;
-    create_required_index(path, index_kind).await
+    Ok(())
 }
 
 fn align_batch_to_schema(batch: RecordBatch, schema: Arc<Schema>) -> Result<RecordBatch> {
@@ -166,6 +175,67 @@ mod tests {
             details.type_url.ends_with("BTreeIndexDetails"),
             "expected BTree index details, got {:?}",
             details.type_url
+        );
+    }
+
+    #[tokio::test]
+    async fn appends_lance_chunks_before_creating_start_btree() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::UInt32, false),
+            Field::new("end", DataType::UInt32, false),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("failed", DataType::Int8, true),
+            Field::new("variation_name", DataType::Utf8, false),
+        ]));
+        let first = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"])),
+                Arc::new(UInt32Array::from(vec![10])),
+                Arc::new(UInt32Array::from(vec![10])),
+                Arc::new(StringArray::from(vec!["A/T"])),
+                Arc::new(Int8Array::from(vec![Some(0)])),
+                Arc::new(StringArray::from(vec!["rs1"])),
+            ],
+        )
+        .unwrap();
+        let second = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"])),
+                Arc::new(UInt32Array::from(vec![20])),
+                Arc::new(UInt32Array::from(vec![20])),
+                Arc::new(StringArray::from(vec!["G/C"])),
+                Arc::new(Int8Array::from(vec![Some(0)])),
+                Arc::new(StringArray::from(vec!["rs2"])),
+            ],
+        )
+        .unwrap();
+        let dataset_path = dir.path().join("variation/chr1.lance");
+
+        write_record_batches_to_lance_with_mode(&dataset_path, vec![first], WriteMode::Overwrite)
+            .await
+            .unwrap();
+        write_record_batches_to_lance_with_mode(&dataset_path, vec![second], WriteMode::Append)
+            .await
+            .unwrap();
+        create_required_index(&dataset_path, LanceIndexKind::Start)
+            .await
+            .unwrap();
+
+        let dataset = lance::Dataset::open(dataset_path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+        assert!(
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .any(|idx| idx.name == START_BTREE_INDEX_NAME)
         );
     }
 

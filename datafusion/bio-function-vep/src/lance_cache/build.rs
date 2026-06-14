@@ -14,22 +14,26 @@ use datafusion_bio_format_ensembl_cache::{
     translation_sift_schema,
 };
 use futures::StreamExt;
+use lance::dataset::WriteMode;
 use log::info;
 
 use crate::cache_builder::EntityStats;
 use crate::lance_cache::manifest::{
-    CHROM_MANIFEST_FILE, ChromDatasetEntry, ChromManifest, dataset_dir_name,
+    CHROM_MANIFEST_FILE, ChromDatasetEntry, ChromManifest, canonical_chrom_label, dataset_dir_name,
 };
 use crate::lance_cache::schema::{
     VARIATION_FORBIDDEN_COLUMNS, VARIATION_REQUIRED_COLUMNS, validate_variation_schema,
     with_cache_source_metadata,
 };
-use crate::lance_cache::write::{LanceIndexKind, write_record_batches_to_lance};
+use crate::lance_cache::write::{
+    LanceIndexKind, create_required_index, write_record_batches_to_lance_with_mode,
+};
 
 const DEFAULT_CHROMS: &[&str] = &[
     "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
     "18", "19", "20", "21", "22", "X", "Y", "MT",
 ];
+const LANCE_WRITE_CHUNK_ROWS: usize = 1_000_000;
 
 pub fn lance_entity_dir_name(entity: &str) -> String {
     format!("{entity}.lance")
@@ -75,17 +79,24 @@ async fn build_lance_variation(options: &LanceCacheBuildOptions) -> Result<Vec<E
 
     for chrom in chroms {
         let query = build_export_query(EnsemblEntityKind::Variation, "var", Some(&chrom), None);
-        let batches =
-            collect_query_batches(options, EnsemblEntityKind::Variation, "var", &query).await?;
-        let batches = transform_variation_batches(batches, options.cache_source_type.as_str())?;
-        let rows = batch_rows(&batches);
+        let manifest_chrom = canonical_chrom_label(&chrom);
+        let dataset_name = dataset_dir_name(&manifest_chrom);
+        let dataset_path = entity_dir.join(&dataset_name);
+        let source_type = options.cache_source_type.as_str();
+        let rows = write_query_stream_to_lance(
+            options,
+            EnsemblEntityKind::Variation,
+            "var",
+            &query,
+            &dataset_path,
+            LanceIndexKind::Start,
+            |batch| transform_variation_batch(batch, source_type),
+        )
+        .await?;
         if rows == 0 {
             continue;
         }
-        let dataset_name = dataset_dir_name(&chrom);
-        let dataset_path = entity_dir.join(&dataset_name);
-        write_record_batches_to_lance(&dataset_path, batches, LanceIndexKind::Start).await?;
-        manifest_entries.push(ChromDatasetEntry::new(chrom, dataset_name, rows));
+        manifest_entries.push(ChromDatasetEntry::new(manifest_chrom, dataset_name, rows));
         files.push((dataset_path.to_string_lossy().to_string(), rows));
     }
 
@@ -120,17 +131,24 @@ async fn build_lance_context_entity(
 
     for chrom in chroms {
         let query = build_export_query(kind, table_name, Some(&chrom), None);
-        let batches = collect_query_batches(options, kind, table_name, &query).await?;
-        let batches =
-            attach_schema_metadata_to_batches(batches, options.cache_source_type.as_str())?;
-        let rows = batch_rows(&batches);
+        let manifest_chrom = canonical_chrom_label(&chrom);
+        let dataset_name = dataset_dir_name(&manifest_chrom);
+        let dataset_path = entity_dir.join(&dataset_name);
+        let source_type = options.cache_source_type.as_str();
+        let rows = write_query_stream_to_lance(
+            options,
+            kind,
+            table_name,
+            &query,
+            &dataset_path,
+            index_kind,
+            |batch| attach_schema_metadata_to_batch(batch, source_type),
+        )
+        .await?;
         if rows == 0 {
             continue;
         }
-        let dataset_name = dataset_dir_name(&chrom);
-        let dataset_path = entity_dir.join(&dataset_name);
-        write_record_batches_to_lance(&dataset_path, batches, index_kind).await?;
-        manifest_entries.push(ChromDatasetEntry::new(chrom, dataset_name, rows));
+        manifest_entries.push(ChromDatasetEntry::new(manifest_chrom, dataset_name, rows));
         files.push((dataset_path.to_string_lossy().to_string(), rows));
     }
 
@@ -181,24 +199,31 @@ async fn build_lance_translation_split(
             "tl",
             &format!(" WHERE chrom = '{}'", sql_escape_literal(&chrom)),
         );
-        let batches =
-            collect_query_batches(options, EnsemblEntityKind::Translation, "tl", &query).await?;
-        let batches = drop_row_number_batches(batches)?;
-        if batch_rows(&batches) == 0 {
-            continue;
-        }
-        let projected = project_batches_to_schema(batches, Arc::clone(&target_schema))?;
-        let projected =
-            attach_schema_metadata_to_batches(projected, options.cache_source_type.as_str())?;
-        let rows = batch_rows(&projected);
+        let manifest_chrom = canonical_chrom_label(&chrom);
+        let dataset_name = dataset_dir_name(&manifest_chrom);
+        let dataset_path = entity_dir.join(&dataset_name);
+        let source_type = options.cache_source_type.as_str();
+        let rows = write_query_stream_to_lance(
+            options,
+            EnsemblEntityKind::Translation,
+            "tl",
+            &query,
+            &dataset_path,
+            LanceIndexKind::TranscriptId,
+            {
+                let target_schema = Arc::clone(&target_schema);
+                move |batch| {
+                    let batch = drop_row_number_batch(batch)?;
+                    let batch = project_batch_to_schema(batch, Arc::clone(&target_schema))?;
+                    attach_schema_metadata_to_batch(batch, source_type)
+                }
+            },
+        )
+        .await?;
         if rows == 0 {
             continue;
         }
-        let dataset_name = dataset_dir_name(&chrom);
-        let dataset_path = entity_dir.join(&dataset_name);
-        write_record_batches_to_lance(&dataset_path, projected, LanceIndexKind::TranscriptId)
-            .await?;
-        manifest_entries.push(ChromDatasetEntry::new(chrom, dataset_name, rows));
+        manifest_entries.push(ChromDatasetEntry::new(manifest_chrom, dataset_name, rows));
         files.push((dataset_path.to_string_lossy().to_string(), rows));
     }
 
@@ -238,23 +263,63 @@ async fn discover_chroms(
     Ok(chroms_from_schema(table.schema().inner()))
 }
 
-async fn collect_query_batches(
+async fn write_query_stream_to_lance<F>(
     options: &LanceCacheBuildOptions,
     kind: EnsemblEntityKind,
     table_name: &str,
     query: &str,
-) -> Result<Vec<RecordBatch>> {
+    dataset_path: &Path,
+    index_kind: LanceIndexKind,
+    mut transform: F,
+) -> Result<usize>
+where
+    F: FnMut(RecordBatch) -> Result<RecordBatch>,
+{
     let ctx = make_ctx_and_register(options, kind, table_name)?;
     let df = ctx.sql(query).await?;
     let mut stream = df.execute_stream().await?;
-    let mut batches = Vec::new();
+    let mut pending = Vec::new();
+    let mut pending_rows = 0usize;
+    let mut total_rows = 0usize;
+    let mut mode = WriteMode::Overwrite;
+    let mut wrote_any = false;
+
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
-        if batch.num_rows() > 0 {
-            batches.push(batch);
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let batch = transform(batch)?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        pending_rows += batch.num_rows();
+        total_rows += batch.num_rows();
+        pending.push(batch);
+
+        if pending_rows >= LANCE_WRITE_CHUNK_ROWS {
+            write_record_batches_to_lance_with_mode(
+                dataset_path,
+                std::mem::take(&mut pending),
+                mode,
+            )
+            .await?;
+            mode = WriteMode::Append;
+            pending_rows = 0;
+            wrote_any = true;
         }
     }
-    Ok(batches)
+
+    if !pending.is_empty() {
+        write_record_batches_to_lance_with_mode(dataset_path, pending, mode).await?;
+        wrote_any = true;
+    }
+
+    if wrote_any {
+        create_required_index(dataset_path, index_kind).await?;
+    }
+
+    Ok(total_rows)
 }
 
 fn make_ctx_and_register(
@@ -272,103 +337,80 @@ fn make_ctx_and_register(
     Ok(ctx)
 }
 
+fn transform_variation_batch(batch: RecordBatch, source_type: &str) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let mut fields = Vec::new();
+    let mut columns = Vec::new();
+    let forbidden = VARIATION_FORBIDDEN_COLUMNS
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+
+    for name in VARIATION_REQUIRED_COLUMNS {
+        if forbidden.contains(name) {
+            continue;
+        }
+        let (index, field) = schema.column_with_name(name).ok_or_else(|| {
+            DataFusionError::Execution(format!("variation source batch missing column {name}"))
+        })?;
+        if *name == "start" || *name == "end" {
+            fields.push(Field::new(*name, DataType::UInt32, field.is_nullable()));
+            columns.push(
+                cast(batch.column(index).as_ref(), &DataType::UInt32).map_err(|err| {
+                    DataFusionError::Execution(format!(
+                        "failed to cast variation {name} to UInt32: {err}"
+                    ))
+                })?,
+            );
+        } else {
+            fields.push(field.as_ref().clone());
+            columns.push(batch.column(index).clone());
+        }
+    }
+
+    let target_schema = with_cache_source_metadata(&Schema::new(fields), source_type);
+    validate_variation_schema(&target_schema)?;
+    RecordBatch::try_new(Arc::new(target_schema), columns).map_err(|err| {
+        DataFusionError::Execution(format!("failed to build Lance variation batch: {err}"))
+    })
+}
+
+#[cfg(test)]
 fn transform_variation_batches(
     batches: Vec<RecordBatch>,
     source_type: &str,
 ) -> Result<Vec<RecordBatch>> {
-    let mut out = Vec::with_capacity(batches.len());
-    for batch in batches {
-        let schema = batch.schema();
-        let mut fields = Vec::new();
-        let mut columns = Vec::new();
-        let forbidden = VARIATION_FORBIDDEN_COLUMNS
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
-
-        for name in VARIATION_REQUIRED_COLUMNS {
-            if forbidden.contains(name) {
-                continue;
-            }
-            let (index, field) = schema.column_with_name(name).ok_or_else(|| {
-                DataFusionError::Execution(format!("variation source batch missing column {name}"))
-            })?;
-            if *name == "start" || *name == "end" {
-                fields.push(Field::new(*name, DataType::UInt32, field.is_nullable()));
-                columns.push(
-                    cast(batch.column(index).as_ref(), &DataType::UInt32).map_err(|err| {
-                        DataFusionError::Execution(format!(
-                            "failed to cast variation {name} to UInt32: {err}"
-                        ))
-                    })?,
-                );
-            } else {
-                fields.push(field.as_ref().clone());
-                columns.push(batch.column(index).clone());
-            }
-        }
-
-        let target_schema = with_cache_source_metadata(&Schema::new(fields), source_type);
-        validate_variation_schema(&target_schema)?;
-        out.push(
-            RecordBatch::try_new(Arc::new(target_schema), columns).map_err(|err| {
-                DataFusionError::Execution(format!("failed to build Lance variation batch: {err}"))
-            })?,
-        );
-    }
-    Ok(out)
-}
-
-fn attach_schema_metadata_to_batches(
-    batches: Vec<RecordBatch>,
-    source_type: &str,
-) -> Result<Vec<RecordBatch>> {
-    let mut out = Vec::with_capacity(batches.len());
-    for batch in batches {
-        let schema = with_cache_source_metadata(batch.schema().as_ref(), source_type);
-        out.push(
-            RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).map_err(|err| {
-                DataFusionError::Execution(format!("failed to attach Lance schema metadata: {err}"))
-            })?,
-        );
-    }
-    Ok(out)
-}
-
-fn drop_row_number_batches(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
-    let mut out = Vec::with_capacity(batches.len());
-    for batch in batches {
-        let schema = batch.schema();
-        let fields = schema
-            .fields()
-            .iter()
-            .filter(|field| field.name() != "_rn")
-            .map(|field| field.as_ref().clone())
-            .collect::<Vec<_>>();
-        let columns = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| field.name() != "_rn")
-            .map(|(index, _)| batch.column(index).clone())
-            .collect::<Vec<_>>();
-        out.push(
-            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|err| {
-                DataFusionError::Execution(format!("failed to drop translation row number: {err}"))
-            })?,
-        );
-    }
-    Ok(out)
-}
-
-fn project_batches_to_schema(
-    batches: Vec<RecordBatch>,
-    target_schema: SchemaRef,
-) -> Result<Vec<RecordBatch>> {
     batches
         .into_iter()
-        .map(|batch| project_batch_to_schema(batch, Arc::clone(&target_schema)))
+        .map(|batch| transform_variation_batch(batch, source_type))
         .collect()
+}
+
+fn attach_schema_metadata_to_batch(batch: RecordBatch, source_type: &str) -> Result<RecordBatch> {
+    let schema = with_cache_source_metadata(batch.schema().as_ref(), source_type);
+    RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).map_err(|err| {
+        DataFusionError::Execution(format!("failed to attach Lance schema metadata: {err}"))
+    })
+}
+
+fn drop_row_number_batch(batch: RecordBatch) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let fields = schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() != "_rn")
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name() != "_rn")
+        .map(|(index, _)| batch.column(index).clone())
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|err| {
+        DataFusionError::Execution(format!("failed to drop translation row number: {err}"))
+    })
 }
 
 fn project_batch_to_schema(batch: RecordBatch, target_schema: SchemaRef) -> Result<RecordBatch> {
@@ -400,10 +442,6 @@ fn chroms_from_schema(schema: &SchemaRef) -> Vec<String> {
                 .map(|chrom| (*chrom).to_string())
                 .collect()
         })
-}
-
-fn batch_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(RecordBatch::num_rows).sum()
 }
 
 fn entity_output_name(kind: EnsemblEntityKind) -> &'static str {
