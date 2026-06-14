@@ -10889,26 +10889,34 @@ impl TableProvider for AnnotateProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let _store = build_store(self.backend, self.cache_source.clone());
 
-        // Parse cache format. `indexed_parquet` is the default; `legacy_fjall`
-        // preserves the old Fjall variation/SIFT lookup path as an opt-in.
+        // Parse cache format. The backend argument selects the default while
+        // `cache_format` remains accepted for existing callers.
         #[cfg(feature = "kv-cache")]
         let legacy_use_fjall = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "use_fjall"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self.backend == AnnotationBackend::Fjall;
+        #[cfg(feature = "kv-cache")]
+        let default_cache_format = match self.backend {
+            AnnotationBackend::Parquet => "indexed_parquet",
+            AnnotationBackend::Fjall => "legacy_fjall",
+            AnnotationBackend::Lance => "lance",
+        };
         #[cfg(feature = "kv-cache")]
         let cache_format = self
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_string_option(opts, "cache_format"))
-            .unwrap_or_else(|| "indexed_parquet".to_string());
+            .unwrap_or_else(|| default_cache_format.to_string());
         #[cfg(feature = "kv-cache")]
         let use_fjall = legacy_use_fjall || cache_format == "legacy_fjall";
         #[cfg(feature = "kv-cache")]
         let use_indexed_parquet = !use_fjall && cache_format == "indexed_parquet";
         #[cfg(feature = "lance-cache")]
-        let use_lance = !use_fjall && cache_format == "lance";
+        let use_lance =
+            !use_fjall && (cache_format == "lance" || self.backend == AnnotationBackend::Lance);
         #[cfg(all(feature = "kv-cache", not(feature = "lance-cache")))]
         let use_lance = false;
         #[cfg(not(feature = "kv-cache"))]
@@ -10940,11 +10948,33 @@ impl TableProvider for AnnotateProvider {
             .options_json
             .as_deref()
             .and_then(|opts| Self::parse_json_bool_option(opts, "partitioned"));
-        let partitioned_cache = if partitioned_opt != Some(false) {
+        #[cfg(feature = "lance-cache")]
+        let partitioned_lance_cache = if use_lance && partitioned_opt != Some(false) {
+            crate::partitioned_cache::PartitionedLanceCache::detect(&self.cache_source)
+        } else {
+            None
+        };
+        let partitioned_cache = if !use_lance && partitioned_opt != Some(false) {
             PartitionedParquetCache::detect(&self.cache_source)
         } else {
             None
         };
+        #[cfg(feature = "lance-cache")]
+        if let Some(ref cache) = partitioned_lance_cache {
+            if profiling_enabled() {
+                eprintln!(
+                    "[VEP_PROFILE] detected partitioned Lance cache: {} chroms in {}",
+                    cache.available_chroms().len(),
+                    self.cache_source,
+                );
+            }
+
+            return Err(DataFusionError::Execution(format!(
+                "annotate_vep(): cache_format='lance' detected a Lance cache at '{}' with {} chromosomes, but Lance context runtime is not wired yet",
+                self.cache_source,
+                cache.available_chroms().len(),
+            )));
+        }
         // When explicitly requested or auto-detected, use partitioned path.
         if let Some(ref cache) = partitioned_cache {
             if profiling_enabled() {
@@ -11139,11 +11169,18 @@ impl TableProvider for AnnotateProvider {
                 .await;
         }
 
-        Err(DataFusionError::Execution(format!(
-            "annotate_vep(): no partitioned cache detected at '{}'. \
-             Expected a directory with a variation/ subdirectory containing per-chromosome parquet files.",
-            self.cache_source
-        )))
+        let message = if use_lance {
+            format!(
+                "annotate_vep(): no partitioned Lance cache detected at '{}'. Expected a directory with variation.lance/chrom_manifest.json.",
+                self.cache_source
+            )
+        } else {
+            format!(
+                "annotate_vep(): no partitioned cache detected at '{}'. Expected a directory with a variation/ subdirectory containing per-chromosome parquet files.",
+                self.cache_source
+            )
+        };
+        Err(DataFusionError::Execution(message))
     }
 }
 
@@ -11253,7 +11290,29 @@ mod tests {
             !message.contains("cache_format must"),
             "lance cache_format was rejected: {message}"
         );
-        assert!(message.contains("no partitioned cache detected"));
+        assert!(message.contains("no partitioned Lance cache detected"));
+    }
+
+    #[cfg(feature = "lance-cache")]
+    #[tokio::test]
+    async fn lance_backend_detects_lance_manifest_without_parquet_variation_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let variation = tmp.path().join("variation.lance");
+        std::fs::create_dir_all(variation.join("chr1.lance")).unwrap();
+        crate::lance_cache::manifest::ChromManifest::new(vec![
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
+        ])
+        .write_to_entity_dir(&variation)
+        .unwrap();
+
+        assert!(
+            crate::partitioned_cache::PartitionedLanceCache::detect(tmp.path().to_str().unwrap())
+                .is_some()
+        );
+        assert!(
+            crate::partitioned_cache::PartitionedParquetCache::detect(tmp.path().to_str().unwrap())
+                .is_none()
+        );
     }
 
     fn minimal_contig_annotation_config() -> ContigAnnotationConfig {

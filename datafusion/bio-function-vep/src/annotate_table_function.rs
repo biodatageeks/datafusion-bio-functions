@@ -19,9 +19,9 @@ use crate::cache_source::{CACHE_SOURCE_METADATA_KEY, CacheSourceType};
 /// Table function implementing
 /// `annotate_vep(vcf_table, cache_source, backend [, options_json])`.
 ///
-/// Cache source mode is read from Arrow schema metadata on a parquet file under
-/// `{cache_source}/variation`. That directory must be readable even when the
-/// annotation backend itself is `fjall`.
+/// Cache source mode is read from Arrow schema metadata on the cache backend:
+/// parquet metadata under `{cache_source}/variation` or Lance metadata under
+/// `{cache_source}/variation.lance`.
 pub struct AnnotateFunction {
     session: Arc<SessionContext>,
     /// Catalog list captured at registration time to avoid acquiring
@@ -81,7 +81,24 @@ impl TableFunctionImpl for AnnotateFunction {
             None
         };
         reject_options_json_source_selectors(options_json.as_deref())?;
-        let cache_source_type = CacheSourceType::from_partitioned_cache_source(&cache_source)?;
+        let cache_format = options_json_string_value(options_json.as_deref(), "cache_format")?;
+        let use_lance_source =
+            backend == AnnotationBackend::Lance || cache_format.as_deref() == Some("lance");
+        let cache_source_type = if use_lance_source {
+            #[cfg(feature = "lance-cache")]
+            {
+                CacheSourceType::from_partitioned_lance_cache_source(&cache_source)?
+            }
+            #[cfg(not(feature = "lance-cache"))]
+            {
+                return Err(DataFusionError::Plan(
+                    "annotate_vep(): Lance cache source metadata requires the lance-cache feature"
+                        .to_string(),
+                ));
+            }
+        } else {
+            CacheSourceType::from_partitioned_cache_source(&cache_source)?
+        };
 
         let vcf_schema = resolve_schema_from_catalog(
             &*self.catalog_list,
@@ -190,6 +207,31 @@ fn options_json_has_key(options_json: Option<&str>, key: &str) -> Result<bool> {
         ))
     })?;
     Ok(value.as_object().is_some_and(|obj| obj.contains_key(key)))
+}
+
+fn options_json_string_value(options_json: Option<&str>, key: &str) -> Result<Option<String>> {
+    let Some(raw) = options_json else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(raw).map_err(|err| {
+        DataFusionError::Plan(format!(
+            "annotate_vep() options_json must be valid JSON: {err}"
+        ))
+    })?;
+    let Some(raw_value) = value.as_object().and_then(|obj| obj.get(key)) else {
+        return Ok(None);
+    };
+    let Some(text) = raw_value.as_str() else {
+        return Err(DataFusionError::Plan(format!(
+            "annotate_vep(): options_json key '{key}' must be a string"
+        )));
+    };
+    if text.contains('`') {
+        return Err(DataFusionError::Plan(format!(
+            "annotate_vep(): options_json key '{key}' must not contain backtick characters"
+        )));
+    }
+    Ok(Some(text.to_string()))
 }
 
 fn reject_options_json_source_selectors(options_json: Option<&str>) -> Result<()> {
