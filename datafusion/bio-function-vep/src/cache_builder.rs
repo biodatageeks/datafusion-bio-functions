@@ -1,7 +1,8 @@
-//! Cache builder: converts raw Ensembl VEP cache to indexed parquet.
+//! Cache builder: converts raw Ensembl VEP cache to indexed parquet or Lance.
 //!
 //! Ported from vepyr `convert.rs` and extended with:
 //! - Indexed warm/cold variation parquet with sidecar indexes
+//! - Single-path Lance cache generation
 //! - Compact parquet-backed `translation_sift` lookup by `transcript_id`
 //! - Legacy fjall generation as an explicit opt-in
 //! - Progress callback for driving tqdm bars in Python wrappers
@@ -311,6 +312,27 @@ impl CacheBuilder {
     pub async fn build_entity(&self, entity: &str) -> Result<Vec<EntityStats>> {
         let kind = parse_entity(entity)
             .ok_or_else(|| DataFusionError::Execution(format!("Unknown entity: {entity}")))?;
+
+        if self.cache_format == CacheFormat::Lance {
+            #[cfg(feature = "lance-cache")]
+            {
+                let options = crate::lance_cache::build::LanceCacheBuildOptions {
+                    cache_root: self.cache_root.clone(),
+                    output_dir: self.output_dir.clone(),
+                    partitions: self.partitions,
+                    cache_source_type: self.cache_source_type,
+                    overwrite: self.overwrite,
+                };
+                return crate::lance_cache::build::build_lance_entity(&options, kind).await;
+            }
+
+            #[cfg(not(feature = "lance-cache"))]
+            {
+                return Err(DataFusionError::Execution(
+                    "cache_format='lance' requires the lance-cache feature".to_string(),
+                ));
+            }
+        }
 
         // Create output directories.
         // Translation outputs to translation_core/ and translation_sift/,
@@ -3334,6 +3356,13 @@ mod tests {
     }
 
     #[test]
+    fn lance_cache_format_does_not_build_legacy_fjall() {
+        let builder = CacheBuilder::new("/cache", "/output").with_cache_format(CacheFormat::Lance);
+        assert_eq!(builder.cache_format, CacheFormat::Lance);
+        assert!(!builder.build_fjall);
+    }
+
+    #[test]
     fn test_cache_builder_with_overrides() {
         let builder = CacheBuilder::new("/cache", "/output")
             .with_partitions(4)
@@ -4263,7 +4292,8 @@ mod tests {
         let fjall_dir = dir.path().join("variation.fjall");
         std::fs::create_dir_all(&fjall_dir).unwrap();
 
-        let builder = CacheBuilder::new("/nonexistent_cache", output);
+        let builder = CacheBuilder::new("/nonexistent_cache", output)
+            .with_cache_format(CacheFormat::LegacyFjall);
         let result = builder.build_entity("variation").await;
         assert!(result.is_ok());
         let stats = result.unwrap();
@@ -4282,7 +4312,8 @@ mod tests {
         std::fs::write(var_dir.join("chr1_warm.parquet"), b"PAR1").unwrap();
         std::fs::write(var_dir.join("chr1_cold.parquet"), b"PAR1").unwrap();
 
-        let builder = CacheBuilder::new("/nonexistent_cache", output);
+        let builder = CacheBuilder::new("/nonexistent_cache", output)
+            .with_cache_format(CacheFormat::LegacyFjall);
         let result = builder.build_entity("variation").await;
         // Will try to rebuild fjall from parquet but fail because the
         // parquet file is not a real parquet file
