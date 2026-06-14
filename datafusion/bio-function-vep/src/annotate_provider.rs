@@ -185,6 +185,8 @@ use crate::config;
 use crate::kv_cache::KvCacheTableProvider;
 use crate::lookup_provider::LookupProvider;
 use crate::miss_worklist::{MissWorklist, collect_miss_worklist};
+#[cfg(feature = "lance-cache")]
+use crate::partitioned_cache::PartitionedLanceCache;
 use crate::partitioned_cache::PartitionedParquetCache;
 use crate::pipeline_trace::{self, PipelineTraceValue as TraceValue};
 use crate::so_terms::{SoImpact, SoTerm, most_severe_term};
@@ -3063,6 +3065,92 @@ fn read_variation_parquet_schema(path: &std::path::Path) -> Result<Schema> {
     Ok(builder.schema().as_ref().clone())
 }
 
+#[cfg(feature = "lance-cache")]
+async fn read_lance_dataset_schema(path: &std::path::Path) -> Result<Schema> {
+    let dataset = lance::Dataset::open(path.to_string_lossy().as_ref())
+        .await
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "failed to open Lance schema sample '{}': {error}",
+                path.display()
+            ))
+        })?;
+    Ok(dataset.schema().into())
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+#[derive(Clone)]
+struct InMemorySiftPredictionStore {
+    predictions: Arc<HashMap<String, CachedPredictions>>,
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+impl crate::kv_cache::SiftPredictionStore for InMemorySiftPredictionStore {
+    fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
+        let mut out = HashMap::with_capacity(transcript_ids.len());
+        for transcript_id in transcript_ids {
+            if let Some(predictions) = self.predictions.get(transcript_id) {
+                out.insert(transcript_id.clone(), predictions.clone());
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+async fn load_lance_sift_prediction_store(
+    cache: &PartitionedLanceCache,
+) -> Result<Option<SiftPredictionStoreRef>> {
+    let mut predictions = HashMap::new();
+    for chrom in cache.available_chroms() {
+        let batches = scan_lance_context_entity(
+            cache,
+            "translation_sift",
+            chrom,
+            &[
+                "transcript_id",
+                "stable_id",
+                "sift_predictions",
+                "polyphen_predictions",
+            ],
+        )
+        .await?;
+        for batch in &batches {
+            let schema = batch.schema();
+            let tx_idx = schema
+                .index_of("transcript_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .ok();
+            let sift_idx = schema.index_of("sift_predictions").ok();
+            let polyphen_idx = schema.index_of("polyphen_predictions").ok();
+            let Some(tx_idx) = tx_idx else { continue };
+            for row in 0..batch.num_rows() {
+                let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                    continue;
+                };
+                let mut cached = CachedPredictions::default();
+                if let Some(idx) = sift_idx {
+                    cached.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+                if let Some(idx) = polyphen_idx {
+                    cached.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
+                }
+                cached.sort();
+                if !cached.sift.is_empty() || !cached.polyphen.is_empty() {
+                    predictions.insert(transcript_id, cached);
+                }
+            }
+        }
+    }
+    if predictions.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Arc::new(InMemorySiftPredictionStore {
+            predictions: Arc::new(predictions),
+        }) as SiftPredictionStoreRef))
+    }
+}
+
 #[cfg(feature = "kv-cache")]
 fn load_sift_prediction_store_for_context(
     ctx: &PreparedContext<'_>,
@@ -4312,6 +4400,490 @@ impl AnnotateProvider {
         Ok(out)
     }
 
+    fn parse_lance_transcript_batches(
+        table: &str,
+        batches: &[RecordBatch],
+    ) -> Result<(Vec<TranscriptFeature>, HashMap<String, String>)> {
+        let mut out = Vec::new();
+        let mut translateable_seq_by_tx = HashMap::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let tx_idx = schema
+                .index_of("transcript_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "annotate_vep(): transcript table '{table}' is missing required column transcript_id (or stable_id)"
+                    ))
+                })?;
+            let chrom_idx = schema.index_of("chrom").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column chrom"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column end"
+                ))
+            })?;
+            let strand_idx = schema.index_of("strand").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column strand"
+                ))
+            })?;
+            let biotype_idx = schema.index_of("biotype").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): transcript table '{table}' is missing required column biotype"
+                ))
+            })?;
+            let cds_start_idx = schema.index_of("cds_start").ok();
+            let cds_end_idx = schema.index_of("cds_end").ok();
+            let cdna_coding_start_idx = schema.index_of("cdna_coding_start").ok();
+            let cdna_coding_end_idx = schema.index_of("cdna_coding_end").ok();
+            let gene_stable_id_idx = schema.index_of("gene_stable_id").ok();
+            let gene_symbol_idx = schema.index_of("gene_symbol").ok();
+            let gene_symbol_source_idx = schema.index_of("gene_symbol_source").ok();
+            let gene_hgnc_id_native_idx = schema.index_of("gene_hgnc_id_native").ok();
+            let gene_hgnc_id_idx = schema.index_of("gene_hgnc_id").ok();
+            let source_idx = schema.index_of("source").ok();
+            let source_cache_idx = schema.index_of("source_cache").ok();
+            let display_xref_id_idx = schema.index_of("display_xref_id").ok();
+            let version_idx = schema.index_of("version").ok();
+            let cds_start_nf_idx = schema.index_of("cds_start_nf").ok();
+            let cds_end_nf_idx = schema.index_of("cds_end_nf").ok();
+            let mirna_regions_idx = schema.index_of("mature_mirna_regions").ok();
+            let cdna_seq_idx = schema.index_of("cdna_seq").ok();
+            let bam_edit_status_idx = schema.index_of("bam_edit_status").ok();
+            let has_non_polya_rna_edit_idx = schema.index_of("has_non_polya_rna_edit").ok();
+            let spliced_seq_idx = schema.index_of("spliced_seq").ok();
+            let translateable_seq_idx = schema.index_of("translateable_seq").ok();
+            let five_prime_utr_seq_idx = schema.index_of("five_prime_utr_seq").ok();
+            let three_prime_utr_seq_idx = schema.index_of("three_prime_utr_seq").ok();
+            let flags_str_idx = schema.index_of("flags_str").ok();
+            let refseq_match_idx = schema.index_of("refseq_match").ok();
+            let refseq_edits_idx = schema.index_of("refseq_edits").ok();
+            let is_gencode_basic_idx = schema.index_of("is_gencode_basic").ok();
+            let is_gencode_primary_idx = schema.index_of("is_gencode_primary").ok();
+            let cdna_mapper_segments_idx = schema.index_of("cdna_mapper_segments").ok();
+            let is_canonical_idx = schema.index_of("is_canonical").ok();
+            let tsl_idx = schema.index_of("tsl").ok();
+            let mane_select_idx = schema.index_of("mane_select").ok();
+            let mane_plus_clinical_idx = schema.index_of("mane_plus_clinical").ok();
+            let translation_stable_id_idx = schema.index_of("translation_stable_id").ok();
+            let gene_phenotype_idx = schema.index_of("gene_phenotype").ok();
+            let ccds_idx = schema.index_of("ccds").ok();
+            let swissprot_idx = schema.index_of("swissprot").ok();
+            let trembl_idx = schema.index_of("trembl").ok();
+            let uniparc_idx = schema.index_of("uniparc").ok();
+            let uniprot_isoform_idx = schema.index_of("uniprot_isoform").ok();
+            let appris_idx = schema.index_of("appris").ok();
+            let ncrna_structure_idx = schema.index_of("ncrna_structure").ok();
+
+            for row in 0..batch.num_rows() {
+                let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(strand_raw) = int64_at(batch.column(strand_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(biotype) = string_at(batch.column(biotype_idx).as_ref(), row) else {
+                    continue;
+                };
+
+                let cds_start = cds_start_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .filter(|v| *v > 0);
+                let cds_end = cds_end_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .filter(|v| *v > 0);
+                let cdna_coding_start = cdna_coding_start_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .filter(|v| *v > 0)
+                    .and_then(|v| usize::try_from(v).ok());
+                let cdna_coding_end = cdna_coding_end_idx
+                    .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                    .filter(|v| *v > 0)
+                    .and_then(|v| usize::try_from(v).ok());
+                let mature_mirna_regions = if biotype == "miRNA" {
+                    mirna_regions_idx
+                        .and_then(|idx| read_mirna_regions(batch, idx, row))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let cds_start_nf = cds_start_nf_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
+                let cds_end_nf = cds_end_nf_idx
+                    .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                    .unwrap_or(false);
+                let cdna_mapper_segments = cdna_mapper_segments_idx
+                    .map(|idx| {
+                        cdna_mapper_segments_from_list_column(batch.column(idx).as_ref(), row)
+                    })
+                    .unwrap_or_default();
+                let translateable_seq = translateable_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                if let Some(seq) = translateable_seq.as_ref() {
+                    translateable_seq_by_tx.insert(transcript_id.clone(), seq.clone());
+                }
+                let five_prime_utr_seq = five_prime_utr_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let three_prime_utr_seq = three_prime_utr_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let cdna_seq =
+                    cdna_seq_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let spliced_seq = spliced_seq_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .or_else(|| {
+                        synthesize_spliced_seq(
+                            five_prime_utr_seq.as_deref(),
+                            translateable_seq.as_deref(),
+                            three_prime_utr_seq.as_deref(),
+                            cdna_coding_start,
+                            cdna_coding_end,
+                            cdna_seq.as_deref(),
+                        )
+                    });
+                let mut refseq_edits = refseq_edits_idx
+                    .map(|idx| refseq_edits_from_list_column(batch.column(idx).as_ref(), row))
+                    .unwrap_or_default();
+                refseq_edits.sort_by(|left, right| {
+                    left.start
+                        .cmp(&right.start)
+                        .then(left.end.cmp(&right.end))
+                        .then(left.replacement_len.cmp(&right.replacement_len))
+                });
+                let source_col = source_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .filter(|source| !source.is_empty() && source != "-");
+                let source_cache = source_cache_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                    .filter(|source| !source.is_empty() && source != "-")
+                    .or_else(|| source_col.clone());
+                let source = source_cache
+                    .as_deref()
+                    .and_then(normalize_source_label)
+                    .or_else(|| source_col.as_deref().and_then(normalize_source_label));
+                let gene_hgnc_id_native = gene_hgnc_id_native_idx
+                    .and_then(|idx| string_at(batch.column(idx).as_ref(), row));
+                let gene_hgnc_id = gene_hgnc_id_native.clone().or_else(|| {
+                    gene_hgnc_id_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                });
+
+                out.push(TranscriptFeature {
+                    transcript_id,
+                    chrom,
+                    start,
+                    end,
+                    strand: if strand_raw >= 0 { 1 } else { -1 },
+                    biotype,
+                    cds_start,
+                    cds_end,
+                    cdna_coding_start,
+                    cdna_coding_end,
+                    cdna_mapper_segments,
+                    mature_mirna_regions,
+                    gene_stable_id: gene_stable_id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    gene_symbol: gene_symbol_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    gene_symbol_source: gene_symbol_source_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    gene_hgnc_id_native,
+                    gene_hgnc_id,
+                    display_xref_id: display_xref_id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    source,
+                    source_cache,
+                    refseq_match: refseq_match_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    refseq_edits,
+                    is_gencode_basic: is_gencode_basic_idx
+                        .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or(false),
+                    is_gencode_primary: is_gencode_primary_idx
+                        .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or(false),
+                    bam_edit_status: bam_edit_status_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    has_non_polya_rna_edit: has_non_polya_rna_edit_idx
+                        .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or(false),
+                    spliced_seq,
+                    five_prime_utr_seq,
+                    three_prime_utr_seq,
+                    translateable_seq,
+                    cdna_seq,
+                    version: version_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .and_then(|v| i32::try_from(v).ok()),
+                    cds_start_nf,
+                    cds_end_nf,
+                    flags_str: flags_str_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .or_else(|| flags_str_from_bools(cds_start_nf, cds_end_nf)),
+                    is_canonical: is_canonical_idx
+                        .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or(false),
+                    tsl: tsl_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .and_then(|v| i32::try_from(v).ok()),
+                    mane_select: mane_select_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    mane_plus_clinical: mane_plus_clinical_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    translation_stable_id: translation_stable_id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    gene_phenotype: gene_phenotype_idx
+                        .and_then(|idx| bool_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or(false),
+                    ccds: ccds_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    swissprot: swissprot_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    trembl: trembl_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    uniparc: uniparc_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    uniprot_isoform: uniprot_isoform_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    appris: appris_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    ncrna_structure: ncrna_structure_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                });
+            }
+        }
+        Ok((out, translateable_seq_by_tx))
+    }
+
+    fn parse_lance_exon_batches(table: &str, batches: &[RecordBatch]) -> Result<Vec<ExonFeature>> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let tx_idx = schema
+                .index_of("transcript_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "annotate_vep(): exon table '{table}' is missing required column transcript_id (or stable_id)"
+                    ))
+                })?;
+            let exon_idx = schema.index_of("exon_number").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): exon table '{table}' is missing required column exon_number"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): exon table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): exon table '{table}' is missing required column end"
+                ))
+            })?;
+            for row in 0..batch.num_rows() {
+                let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(exon_number_raw) = int64_at(batch.column(exon_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                out.push(ExonFeature {
+                    transcript_id,
+                    exon_number: i32::try_from(exon_number_raw).unwrap_or(i32::MAX),
+                    start,
+                    end,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_lance_translation_batches(
+        table: &str,
+        batches: &[RecordBatch],
+    ) -> Result<Vec<TranslationFeature>> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let tx_idx = schema
+                .index_of("transcript_id")
+                .or_else(|_| schema.index_of("stable_id"))
+                .map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "annotate_vep(): translation table '{table}' is missing required column transcript_id (or stable_id)"
+                    ))
+                })?;
+            let cds_len_idx = schema
+                .index_of("cds_len")
+                .or_else(|_| schema.index_of("cds_length"))
+                .ok();
+            let protein_len_idx = schema.index_of("protein_len").ok();
+            let translation_seq_idx = schema.index_of("translation_seq").ok();
+            let translation_seq_canonical_idx = schema.index_of("translation_seq_canonical").ok();
+            let cds_seq_idx = schema
+                .index_of("cds_sequence")
+                .or_else(|_| schema.index_of("cds_seq"))
+                .or_else(|_| schema.index_of("coding_sequence"))
+                .ok();
+            let cds_seq_canonical_idx = schema.index_of("cds_sequence_canonical").ok();
+            let tl_stable_id_idx = schema.index_of("stable_id").ok();
+            let tl_version_idx = schema.index_of("version").ok();
+            let pf_idx = schema.index_of("protein_features").ok();
+            for row in 0..batch.num_rows() {
+                let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                    continue;
+                };
+                out.push(TranslationFeature {
+                    transcript_id,
+                    cds_len: cds_len_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .and_then(|v| usize::try_from(v).ok()),
+                    protein_len: protein_len_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .and_then(|v| usize::try_from(v).ok()),
+                    translation_seq: translation_seq_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    cds_sequence: cds_seq_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    translation_seq_canonical: translation_seq_canonical_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    cds_sequence_canonical: cds_seq_canonical_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    stable_id: tl_stable_id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                    version: tl_version_idx
+                        .and_then(|idx| int64_at(batch.column(idx).as_ref(), row))
+                        .and_then(|v| i32::try_from(v).ok()),
+                    protein_features: pf_idx
+                        .map(|idx| read_protein_features(batch.column(idx).as_ref(), row))
+                        .unwrap_or_default(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_lance_regulatory_batches(
+        table: &str,
+        batches: &[RecordBatch],
+    ) -> Result<Vec<RegulatoryFeature>> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let id_idx = schema
+                .index_of("stable_id")
+                .or_else(|_| schema.index_of("feature_id"))
+                .ok();
+            let ft_idx = schema.index_of("feature_type").ok();
+            let chrom_idx = schema.index_of("chrom").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): regulatory table '{table}' is missing required column chrom"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): regulatory table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): regulatory table '{table}' is missing required column end"
+                ))
+            })?;
+            for row in 0..batch.num_rows() {
+                let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                out.push(RegulatoryFeature {
+                    feature_id: id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or_else(|| "reg".to_string()),
+                    chrom,
+                    start,
+                    end,
+                    feature_type: ft_idx.and_then(|idx| string_at(batch.column(idx).as_ref(), row)),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn parse_lance_motif_batches(
+        table: &str,
+        batches: &[RecordBatch],
+    ) -> Result<Vec<MotifFeature>> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let id_idx = schema
+                .index_of("motif_id")
+                .or_else(|_| schema.index_of("feature_id"))
+                .ok();
+            let chrom_idx = schema.index_of("chrom").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): motif table '{table}' is missing required column chrom"
+                ))
+            })?;
+            let start_idx = schema.index_of("start").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): motif table '{table}' is missing required column start"
+                ))
+            })?;
+            let end_idx = schema.index_of("end").map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "annotate_vep(): motif table '{table}' is missing required column end"
+                ))
+            })?;
+            for row in 0..batch.num_rows() {
+                let Some(chrom) = string_at(batch.column(chrom_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(start) = int64_at(batch.column(start_idx).as_ref(), row) else {
+                    continue;
+                };
+                let Some(end) = int64_at(batch.column(end_idx).as_ref(), row) else {
+                    continue;
+                };
+                out.push(MotifFeature {
+                    motif_id: id_idx
+                        .and_then(|idx| string_at(batch.column(idx).as_ref(), row))
+                        .unwrap_or_else(|| "motif".to_string()),
+                    chrom,
+                    start,
+                    end,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     async fn load_mirna_features(
         &self,
         table: &str,
@@ -4540,7 +5112,7 @@ impl AnnotateProvider {
         projection: Option<&Vec<usize>>,
         requested_columns: &[&str],
         extended_probes: bool,
-        cache: &PartitionedParquetCache,
+        cache: PartitionedAnnotationCache,
         translations_sift_table: Option<&str>,
         #[cfg(feature = "kv-cache")] kv_store: Option<Arc<crate::kv_cache::VepKvStore>>,
         #[cfg(feature = "kv-cache")] use_indexed_parquet: bool,
@@ -4611,7 +5183,8 @@ impl AnnotateProvider {
         // Build expanded cache chrom set with both bare and chr-prefixed forms
         // so that VCF "chr1" matches cache "1" and vice versa.
         let mut cache_chroms: HashSet<String> = HashSet::new();
-        for c in cache.available_chroms() {
+        let available_chroms = cache.available_chroms();
+        for c in &available_chroms {
             cache_chroms.insert(c.clone());
             if let Some(bare) = c.strip_prefix("chr") {
                 cache_chroms.insert(bare.to_string());
@@ -4630,7 +5203,7 @@ impl AnnotateProvider {
             format!(
                 "{} VCF contigs, {} in cache, {} to process",
                 vcf_contigs.len(),
-                cache.available_chroms().len(),
+                available_chroms.len(),
                 contigs.len()
             )
         );
@@ -4646,6 +5219,10 @@ impl AnnotateProvider {
             use_indexed_parquet.then(|| cache.base_dir().to_path_buf());
         #[cfg(feature = "lance-cache")]
         let lance_cache_root = use_lance.then(|| cache.base_dir().to_path_buf());
+        #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+        let lance_sift_requested = use_lance;
+        #[cfg(all(feature = "kv-cache", not(feature = "lance-cache")))]
+        let lance_sift_requested = false;
         #[cfg(feature = "kv-cache")]
         let sift_prediction_store = if let Some(store) = kv_store.as_ref() {
             if let Some(parent) = store.root_path().parent() {
@@ -4653,19 +5230,22 @@ impl AnnotateProvider {
             } else {
                 None
             }
-        } else if use_indexed_parquet
-            || cfg!(feature = "lance-cache") && {
-                #[cfg(feature = "lance-cache")]
-                {
-                    use_lance
-                }
-                #[cfg(not(feature = "lance-cache"))]
-                {
-                    false
-                }
-            }
-        {
+        } else if use_indexed_parquet {
             open_sift_prediction_store(cache.base_dir())?
+        } else if lance_sift_requested {
+            #[cfg(feature = "lance-cache")]
+            {
+                let lance_cache = cache.as_lance().ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "Lance SIFT store requires a Lance cache layout".to_string(),
+                    )
+                })?;
+                load_lance_sift_prediction_store(lance_cache).await?
+            }
+            #[cfg(not(feature = "lance-cache"))]
+            {
+                None
+            }
         } else {
             None
         };
@@ -4713,7 +5293,7 @@ impl AnnotateProvider {
             contigs,
             chromosome_lanes,
             Arc::clone(&self.session),
-            Arc::new(cache.clone()),
+            Arc::new(cache),
             config,
         );
 
@@ -7773,6 +8353,51 @@ struct ContigAnnotationConfig {
     sift_prediction_store: Option<SiftPredictionStoreRef>,
 }
 
+#[derive(Clone)]
+enum PartitionedAnnotationCache {
+    Parquet(PartitionedParquetCache),
+    #[cfg(feature = "lance-cache")]
+    Lance(PartitionedLanceCache),
+}
+
+impl PartitionedAnnotationCache {
+    fn available_chroms(&self) -> Vec<String> {
+        match self {
+            Self::Parquet(cache) => cache.available_chroms().to_vec(),
+            #[cfg(feature = "lance-cache")]
+            Self::Lance(cache) => cache
+                .available_chroms()
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+        }
+    }
+
+    fn base_dir(&self) -> &std::path::Path {
+        match self {
+            Self::Parquet(cache) => cache.base_dir(),
+            #[cfg(feature = "lance-cache")]
+            Self::Lance(cache) => cache.base_dir(),
+        }
+    }
+
+    fn as_parquet(&self) -> Option<&PartitionedParquetCache> {
+        match self {
+            Self::Parquet(cache) => Some(cache),
+            #[cfg(feature = "lance-cache")]
+            Self::Lance(_) => None,
+        }
+    }
+
+    #[cfg(feature = "lance-cache")]
+    fn as_lance(&self) -> Option<&PartitionedLanceCache> {
+        match self {
+            Self::Parquet(_) => None,
+            Self::Lance(cache) => Some(cache),
+        }
+    }
+}
+
 /// Leaf `ExecutionPlan` that processes contigs one at a time via a state-machine
 /// stream, reclaiming memory after each contig completes.
 struct ContigAnnotationExec {
@@ -7780,7 +8405,7 @@ struct ContigAnnotationExec {
     full_schema: SchemaRef,
     contig_partitions: Vec<Vec<String>>,
     session: Arc<SessionContext>,
-    cache: Arc<PartitionedParquetCache>,
+    cache: Arc<PartitionedAnnotationCache>,
     config: ContigAnnotationConfig,
     properties: Arc<PlanProperties>,
 }
@@ -7792,7 +8417,7 @@ impl ContigAnnotationExec {
         contigs: Vec<String>,
         chromosome_lanes: usize,
         session: Arc<SessionContext>,
-        cache: Arc<PartitionedParquetCache>,
+        cache: Arc<PartitionedAnnotationCache>,
         config: ContigAnnotationConfig,
     ) -> Self {
         let contig_partitions = partition_contigs_for_execution(contigs, chromosome_lanes);
@@ -8082,6 +8707,188 @@ fn emit_contig_pipeline_profile(profile: &Option<SharedContigPipelineProfile>, c
     if let Ok(guard) = profile.lock() {
         eprintln!("{}", guard.summary_line(chrom));
     }
+}
+
+#[cfg(feature = "lance-cache")]
+async fn load_lance_contig_context(
+    cache: &PartitionedLanceCache,
+    chrom: &str,
+    config: &ContigAnnotationConfig,
+    profile: &Option<SharedContigPipelineProfile>,
+) -> Result<LoadedContigContext> {
+    let tx_batches = scan_lance_context_entity(
+        cache,
+        "transcript",
+        chrom,
+        &[
+            "transcript_id",
+            "stable_id",
+            "chrom",
+            "start",
+            "\"end\"",
+            "strand",
+            "biotype",
+            "cds_start",
+            "cds_end",
+            "cdna_coding_start",
+            "cdna_coding_end",
+            "gene_stable_id",
+            "gene_symbol",
+            "gene_symbol_source",
+            "gene_hgnc_id_native",
+            "gene_hgnc_id",
+            "source",
+            "source_cache",
+            "display_xref_id",
+            "version",
+            "cds_start_nf",
+            "cds_end_nf",
+            "mature_mirna_regions",
+            "cdna_seq",
+            "bam_edit_status",
+            "has_non_polya_rna_edit",
+            "spliced_seq",
+            "five_prime_utr_seq",
+            "three_prime_utr_seq",
+            "translateable_seq",
+            "flags_str",
+            "refseq_match",
+            "refseq_edits",
+            "is_gencode_basic",
+            "is_gencode_primary",
+            "cdna_mapper_segments",
+            "is_canonical",
+            "tsl",
+            "mane_select",
+            "mane_plus_clinical",
+            "translation_stable_id",
+            "gene_phenotype",
+            "ccds",
+            "swissprot",
+            "trembl",
+            "uniparc",
+            "uniprot_isoform",
+            "appris",
+            "ncrna_structure",
+        ],
+    )
+    .await?;
+    let started = Instant::now();
+    let (tx, translateable_seq) =
+        AnnotateProvider::parse_lance_transcript_batches("transcript.lance", &tx_batches)?;
+    let tx_vec: Vec<_> = tx
+        .into_iter()
+        .filter(|t| passes_transcript_selection(t, config.transcript_selection))
+        .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_transcripts += started.elapsed();
+    });
+    let tx_ids: HashSet<String> = tx_vec.iter().map(|tx| tx.transcript_id.clone()).collect();
+
+    let ex_batches = scan_lance_context_entity(
+        cache,
+        "exon",
+        chrom,
+        &[
+            "transcript_id",
+            "stable_id",
+            "exon_number",
+            "start",
+            "\"end\"",
+            "chrom",
+        ],
+    )
+    .await?;
+    let started = Instant::now();
+    let ex: Vec<_> = AnnotateProvider::parse_lance_exon_batches("exon.lance", &ex_batches)?
+        .into_iter()
+        .filter(|exon| tx_ids.contains(&exon.transcript_id))
+        .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_exons += started.elapsed();
+    });
+
+    let tl_batches = scan_lance_context_entity(
+        cache,
+        "translation_core",
+        chrom,
+        &[
+            "transcript_id",
+            "stable_id",
+            "chrom",
+            "start",
+            "\"end\"",
+            "cds_len",
+            "cds_length",
+            "protein_len",
+            "translation_seq",
+            "cds_sequence",
+            "cds_seq",
+            "coding_sequence",
+            "translation_seq_canonical",
+            "cds_sequence_canonical",
+            "version",
+            "protein_features",
+        ],
+    )
+    .await?;
+    let started = Instant::now();
+    let tl: Vec<_> =
+        AnnotateProvider::parse_lance_translation_batches("translation_core.lance", &tl_batches)?
+            .into_iter()
+            .filter(|translation| tx_ids.contains(&translation.transcript_id))
+            .collect();
+    record_contig_profile(profile, |profile| {
+        profile.context_translations += started.elapsed();
+    });
+
+    let rg_batches = scan_lance_context_entity(
+        cache,
+        "regulatory",
+        chrom,
+        &[
+            "stable_id",
+            "feature_id",
+            "feature_type",
+            "chrom",
+            "start",
+            "\"end\"",
+        ],
+    )
+    .await?;
+    let started = Instant::now();
+    let rg = AnnotateProvider::parse_lance_regulatory_batches("regulatory.lance", &rg_batches)?;
+    record_contig_profile(profile, |profile| {
+        profile.context_regulatory += started.elapsed();
+    });
+
+    let mt_batches = scan_lance_context_entity(
+        cache,
+        "motif",
+        chrom,
+        &["motif_id", "feature_id", "chrom", "start", "\"end\""],
+    )
+    .await?;
+    let started = Instant::now();
+    let mt = AnnotateProvider::parse_lance_motif_batches("motif.lance", &mt_batches)?;
+    record_contig_profile(profile, |profile| {
+        profile.context_motifs += started.elapsed();
+    });
+
+    Ok((tx_vec, translateable_seq, ex, tl, rg, mt))
+}
+
+#[cfg(feature = "lance-cache")]
+async fn scan_lance_context_entity(
+    cache: &PartitionedLanceCache,
+    entity: &str,
+    chrom: &str,
+    columns: &[&str],
+) -> Result<Vec<RecordBatch>> {
+    let Some(path) = cache.context_path(entity, chrom) else {
+        return Ok(Vec::new());
+    };
+    crate::lance_cache::context_runtime::scan_projected_existing_columns(&path, columns).await
 }
 
 struct SharedContigAnnotationContext {
@@ -8754,7 +9561,7 @@ struct ContigAnnotationStream {
     full_schema: SchemaRef,
     contigs: VecDeque<String>,
     session: Arc<SessionContext>,
-    cache: Arc<PartitionedParquetCache>,
+    cache: Arc<PartitionedAnnotationCache>,
     config: ContigAnnotationConfig,
     state: StreamState,
     /// Rows emitted so far (for LIMIT pushdown).
@@ -8767,7 +9574,7 @@ impl ContigAnnotationStream {
         full_schema: SchemaRef,
         contigs: Vec<String>,
         session: Arc<SessionContext>,
-        cache: Arc<PartitionedParquetCache>,
+        cache: Arc<PartitionedAnnotationCache>,
         config: ContigAnnotationConfig,
     ) -> Self {
         Self {
@@ -10366,7 +11173,7 @@ impl Stream for ContigAnnotationStream {
 /// Returns `None` if the contig has no variation table (skip).
 async fn prepare_contig_context(
     session: Arc<SessionContext>,
-    cache: Arc<PartitionedParquetCache>,
+    cache: Arc<PartitionedAnnotationCache>,
     chrom: String,
     config: ContigAnnotationConfig,
     full_schema: SchemaRef,
@@ -10402,6 +11209,8 @@ async fn prepare_contig_context(
     #[cfg(not(feature = "lance-cache"))]
     let use_lance = false;
 
+    let parquet_cache = cache.as_parquet();
+
     let var_table = if use_fjall {
         #[cfg(feature = "kv-cache")]
         {
@@ -10426,9 +11235,18 @@ async fn prepare_contig_context(
     } else if use_indexed_parquet || use_lance {
         "__vep_indexed_variation".to_string()
     } else {
-        let var_table =
-            crate::partitioned_cache::register_chrom_parquet(&session, &cache, "variation", &chrom)
-                .await?;
+        let parquet_cache = parquet_cache.ok_or_else(|| {
+            DataFusionError::Execution(
+                "parquet variation registration requires a parquet cache layout".to_string(),
+            )
+        })?;
+        let var_table = crate::partitioned_cache::register_chrom_parquet(
+            &session,
+            parquet_cache,
+            "variation",
+            &chrom,
+        )
+        .await?;
         let Some(var_table) = var_table else {
             if profiling_enabled() {
                 eprintln!("[VEP_PROFILE] ------ contig {chrom} SKIP (no variation) ------");
@@ -10439,8 +11257,13 @@ async fn prepare_contig_context(
         var_table
     };
     if !use_indexed_parquet && !use_lance {
+        let parquet_cache = parquet_cache.ok_or_else(|| {
+            DataFusionError::Execution(
+                "parquet variation validation requires a parquet cache layout".to_string(),
+            )
+        })?;
         validate_partitioned_cache_source(
-            &cache,
+            parquet_cache,
             "variation",
             &chrom,
             "variation",
@@ -10448,73 +11271,97 @@ async fn prepare_contig_context(
         )?;
     }
 
-    let tx_table =
-        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "transcript", &chrom)
+    let (tx_table, ex_table, tl_table, rg_table, mt_table) =
+        if let Some(parquet_cache) = parquet_cache {
+            let tx_table = crate::partitioned_cache::register_chrom_parquet(
+                &session,
+                parquet_cache,
+                "transcript",
+                &chrom,
+            )
             .await?;
-    if let Some(ref t) = tx_table {
-        validate_partitioned_cache_source(
-            &cache,
-            "transcript",
-            &chrom,
-            "transcript",
-            config.cache_source_type,
-        )?;
-        ephemeral_tables.push(t.clone());
-    }
-    let ex_table =
-        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "exon", &chrom).await?;
-    if let Some(ref t) = ex_table {
-        validate_partitioned_cache_source(
-            &cache,
-            "exon",
-            &chrom,
-            "exon",
-            config.cache_source_type,
-        )?;
-        ephemeral_tables.push(t.clone());
-    }
-    let tl_table = crate::partitioned_cache::register_chrom_parquet(
-        &session,
-        &cache,
-        "translation_core",
-        &chrom,
-    )
-    .await?;
-    if let Some(ref t) = tl_table {
-        validate_partitioned_cache_source(
-            &cache,
-            "translation_core",
-            &chrom,
-            "translation_core",
-            config.cache_source_type,
-        )?;
-        ephemeral_tables.push(t.clone());
-    }
-    let rg_table =
-        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "regulatory", &chrom)
+            if let Some(ref t) = tx_table {
+                validate_partitioned_cache_source(
+                    parquet_cache,
+                    "transcript",
+                    &chrom,
+                    "transcript",
+                    config.cache_source_type,
+                )?;
+                ephemeral_tables.push(t.clone());
+            }
+            let ex_table = crate::partitioned_cache::register_chrom_parquet(
+                &session,
+                parquet_cache,
+                "exon",
+                &chrom,
+            )
             .await?;
-    if let Some(ref t) = rg_table {
-        validate_partitioned_cache_source(
-            &cache,
-            "regulatory",
-            &chrom,
-            "regulatory",
-            config.cache_source_type,
-        )?;
-        ephemeral_tables.push(t.clone());
-    }
-    let mt_table =
-        crate::partitioned_cache::register_chrom_parquet(&session, &cache, "motif", &chrom).await?;
-    if let Some(ref t) = mt_table {
-        validate_partitioned_cache_source(
-            &cache,
-            "motif",
-            &chrom,
-            "motif",
-            config.cache_source_type,
-        )?;
-        ephemeral_tables.push(t.clone());
-    }
+            if let Some(ref t) = ex_table {
+                validate_partitioned_cache_source(
+                    parquet_cache,
+                    "exon",
+                    &chrom,
+                    "exon",
+                    config.cache_source_type,
+                )?;
+                ephemeral_tables.push(t.clone());
+            }
+            let tl_table = crate::partitioned_cache::register_chrom_parquet(
+                &session,
+                parquet_cache,
+                "translation_core",
+                &chrom,
+            )
+            .await?;
+            if let Some(ref t) = tl_table {
+                validate_partitioned_cache_source(
+                    parquet_cache,
+                    "translation_core",
+                    &chrom,
+                    "translation_core",
+                    config.cache_source_type,
+                )?;
+                ephemeral_tables.push(t.clone());
+            }
+            let rg_table = crate::partitioned_cache::register_chrom_parquet(
+                &session,
+                parquet_cache,
+                "regulatory",
+                &chrom,
+            )
+            .await?;
+            if let Some(ref t) = rg_table {
+                validate_partitioned_cache_source(
+                    parquet_cache,
+                    "regulatory",
+                    &chrom,
+                    "regulatory",
+                    config.cache_source_type,
+                )?;
+                ephemeral_tables.push(t.clone());
+            }
+            let mt_table = crate::partitioned_cache::register_chrom_parquet(
+                &session,
+                parquet_cache,
+                "motif",
+                &chrom,
+            )
+            .await?;
+            if let Some(ref t) = mt_table {
+                validate_partitioned_cache_source(
+                    parquet_cache,
+                    "motif",
+                    &chrom,
+                    "motif",
+                    config.cache_source_type,
+                )?;
+                ephemeral_tables.push(t.clone());
+            }
+            (tx_table, ex_table, tl_table, rg_table, mt_table)
+        } else {
+            (None, None, None, None, None)
+        };
 
     // 2. Create lookup stream + load context data.
     let worklist = MissWorklist::for_chrom(&chrom);
@@ -10650,6 +11497,41 @@ async fn prepare_contig_context(
     let context_result: Result<LoadedContigContext> = async {
         let t_ctx = profile_start!();
         pipeline_trace::emit("context", "start", &[("chrom", TraceValue::Str(&chrom))]);
+        #[cfg(feature = "lance-cache")]
+        if use_lance {
+            let lance_cache = cache.as_lance().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Lance context loading requires a Lance cache layout".to_string(),
+                )
+            })?;
+            let loaded =
+                load_lance_contig_context(lance_cache, &chrom, &config, &pipeline_profile).await?;
+            let context_elapsed = t_ctx.elapsed();
+            pipeline_trace::emit(
+                "context",
+                "done",
+                &[
+                    ("chrom", TraceValue::Str(&chrom)),
+                    ("transcripts", TraceValue::Usize(loaded.0.len())),
+                    ("exons", TraceValue::Usize(loaded.2.len())),
+                    ("translations", TraceValue::Usize(loaded.3.len())),
+                    ("regulatory", TraceValue::Usize(loaded.4.len())),
+                    ("motifs", TraceValue::Usize(loaded.5.len())),
+                    ("elapsed", TraceValue::Duration(context_elapsed)),
+                ],
+            );
+            record_contig_profile(&pipeline_profile, |profile| {
+                profile.context_load += context_elapsed;
+            });
+            if profiling_enabled() {
+                eprintln!(
+                    "[VEP_PROFILE] {:.<50} {:>8.1}ms",
+                    format!("{chrom}: context_load"),
+                    context_elapsed.as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(loaded);
+        }
         let tmp_provider = AnnotateProvider::new(
             Arc::clone(&session),
             config.vcf_table.clone(),
@@ -10807,8 +11689,9 @@ async fn prepare_contig_context(
             })
             .or_else(|| {
                 cache
-                    .context_path("translation_sift", &chrom)
-                    .and_then(|p| p.to_str().map(ToString::to_string))
+                    .as_parquet()
+                    .and_then(|cache| cache.context_path("translation_sift", &chrom))
+                    .and_then(|path| path.to_str().map(ToString::to_string))
             })
     } else {
         None
@@ -10960,33 +11843,32 @@ impl TableProvider for AnnotateProvider {
             None
         };
         #[cfg(feature = "lance-cache")]
-        if let Some(ref cache) = partitioned_lance_cache {
-            if profiling_enabled() {
-                eprintln!(
-                    "[VEP_PROFILE] detected partitioned Lance cache: {} chroms in {}",
-                    cache.available_chroms().len(),
-                    self.cache_source,
-                );
-            }
+        let partitioned_annotation_cache = partitioned_lance_cache
+            .map(PartitionedAnnotationCache::Lance)
+            .or_else(|| {
+                partitioned_cache
+                    .clone()
+                    .map(PartitionedAnnotationCache::Parquet)
+            });
+        #[cfg(not(feature = "lance-cache"))]
+        let partitioned_annotation_cache = partitioned_cache
+            .clone()
+            .map(PartitionedAnnotationCache::Parquet);
 
-            return Err(DataFusionError::Execution(format!(
-                "annotate_vep(): cache_format='lance' detected a Lance cache at '{}' with {} chromosomes, but Lance context runtime is not wired yet",
-                self.cache_source,
-                cache.available_chroms().len(),
-            )));
-        }
         // When explicitly requested or auto-detected, use partitioned path.
-        if let Some(ref cache) = partitioned_cache {
+        if let Some(cache) = partitioned_annotation_cache {
+            let available_chroms = cache.available_chroms();
             if profiling_enabled() {
                 eprintln!(
-                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {}{}",
-                    cache.available_chroms().len(),
+                    "[VEP_PROFILE] detected partitioned cache: {} chroms in {}{}{}",
+                    available_chroms.len(),
                     self.cache_source,
                     if use_fjall {
                         " [fjall variation+sift]"
                     } else {
                         ""
                     },
+                    if use_lance { " [lance]" } else { "" },
                 );
             }
 
@@ -10994,8 +11876,13 @@ impl TableProvider for AnnotateProvider {
             // For indexed parquet, read schema from a warm/cold tier file.
             #[cfg(feature = "kv-cache")]
             let indexed_variation_schema: Option<Schema> = if use_indexed_parquet {
-                let sample_chrom = &cache.available_chroms()[0];
-                let sample_path = indexed_variation_parquet_path(cache, sample_chrom).ok_or_else(|| {
+                let parquet_cache = cache.as_parquet().ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "indexed_parquet cache format requires a parquet cache layout".to_string(),
+                    )
+                })?;
+                let sample_chrom = &available_chroms[0];
+                let sample_path = indexed_variation_parquet_path(parquet_cache, sample_chrom).ok_or_else(|| {
                     DataFusionError::Execution(format!(
                         "indexed_parquet cache has no warm/cold variation parquet for sample chrom {sample_chrom}"
                     ))
@@ -11004,18 +11891,18 @@ impl TableProvider for AnnotateProvider {
             } else if use_lance {
                 #[cfg(feature = "lance-cache")]
                 {
-                    let sample_chrom = &cache.available_chroms()[0];
-                    let sample_path =
-                        crate::warm_cache::lance_variation::lance_variation_dataset_path(
-                            cache.base_dir(),
-                            sample_chrom,
-                        );
-                    Some(
-                        crate::warm_cache::lance_variation::read_lance_variation_schema(
-                            &sample_path,
+                    let lance_cache = cache.as_lance().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "lance cache format requires a Lance cache layout".to_string(),
                         )
-                        .await?,
-                    )
+                    })?;
+                    let sample_chrom = &available_chroms[0];
+                    let sample_path = lance_cache.variation_path(sample_chrom).ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "Lance cache has no variation dataset for sample chrom {sample_chrom}"
+                        ))
+                    })?;
+                    Some(read_lance_dataset_schema(&sample_path).await?)
                 }
                 #[cfg(not(feature = "lance-cache"))]
                 {
@@ -11085,10 +11972,13 @@ impl TableProvider for AnnotateProvider {
                     unreachable!("indexed_parquet requires kv-cache feature")
                 }
             } else {
-                let sample_chrom = &cache.available_chroms()[0];
+                let parquet_cache = cache
+                    .as_parquet()
+                    .expect("non-indexed partitioned path requires parquet cache");
+                let sample_chrom = &available_chroms[0];
                 let sample_table = crate::partitioned_cache::register_chrom_parquet(
                     &self.session,
-                    cache,
+                    parquet_cache,
                     "variation",
                     sample_chrom,
                 )
@@ -11099,7 +11989,7 @@ impl TableProvider for AnnotateProvider {
                     )
                 })?;
                 validate_partitioned_cache_source(
-                    cache,
+                    parquet_cache,
                     "variation",
                     sample_chrom,
                     "variation",

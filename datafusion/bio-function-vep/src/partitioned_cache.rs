@@ -144,6 +144,15 @@ impl PartitionedLanceCache {
             .path_for_chrom(chrom)
             .map(|path| self.base_dir.join("variation.lance").join(path))
     }
+
+    pub fn context_path(&self, context_type: &str, chrom: &str) -> Option<PathBuf> {
+        let entity_dir = self.base_dir.join(format!("{context_type}.lance"));
+        let manifest =
+            crate::lance_cache::manifest::ChromManifest::read_from_entity_dir(&entity_dir).ok()?;
+        manifest
+            .path_for_chrom(chrom)
+            .map(|path| entity_dir.join(path))
+    }
 }
 
 /// Register a per-chromosome parquet file as an ephemeral DataFusion table.
@@ -342,5 +351,33 @@ mod tests {
             variation.join("chr1.lance")
         );
         assert!(cache.variation_path("chr2").is_none());
+    }
+
+    #[cfg(feature = "lance-cache")]
+    #[test]
+    fn resolves_partitioned_lance_context_paths_from_entity_manifests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let variation = tmp.path().join("variation.lance");
+        std::fs::create_dir_all(variation.join("chr1.lance")).unwrap();
+        crate::lance_cache::manifest::ChromManifest::new(vec![
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
+        ])
+        .write_to_entity_dir(&variation)
+        .unwrap();
+
+        let transcript = tmp.path().join("transcript.lance");
+        std::fs::create_dir_all(transcript.join("chr1.lance")).unwrap();
+        crate::lance_cache::manifest::ChromManifest::new(vec![
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
+        ])
+        .write_to_entity_dir(&transcript)
+        .unwrap();
+
+        let cache = PartitionedLanceCache::detect(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            cache.context_path("transcript", "chr1").unwrap(),
+            transcript.join("chr1.lance")
+        );
+        assert!(cache.context_path("transcript", "chr2").is_none());
     }
 }

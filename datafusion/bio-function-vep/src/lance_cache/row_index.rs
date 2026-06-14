@@ -1,4 +1,6 @@
-use datafusion::arrow::array::{Array, UInt32Array, UInt64Array};
+use datafusion::arrow::array::{
+    Array, LargeStringArray, StringArray, StringViewArray, UInt32Array, UInt64Array,
+};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use futures::TryStreamExt;
@@ -17,6 +19,13 @@ pub struct PositionRowIdIndex {
     positions: Vec<u32>,
     row_ids: Vec<u64>,
     unique_positions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringRowIdIndex {
+    values: Vec<String>,
+    row_ids: Vec<u64>,
+    unique_values: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,10 +117,66 @@ impl PositionRowIdIndex {
     }
 }
 
+impl StringRowIdIndex {
+    pub fn new(values: Vec<String>, row_ids: Vec<u64>, unique_values: usize) -> Result<Self> {
+        if values.len() != row_ids.len() {
+            return Err(DataFusionError::Execution(
+                "string row-id index arrays have different lengths".into(),
+            ));
+        }
+        if values.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(DataFusionError::Execution(
+                "string row-id index values are not sorted".into(),
+            ));
+        }
+        Ok(Self {
+            values,
+            row_ids,
+            unique_values,
+        })
+    }
+
+    pub fn unique_values(&self) -> usize {
+        self.unique_values
+    }
+
+    pub fn row_ids_len(&self) -> usize {
+        self.row_ids.len()
+    }
+
+    pub fn resolve_sorted_values(&self, query_values: &[String]) -> Vec<u64> {
+        let mut cursor = 0usize;
+        let mut row_ids = Vec::new();
+
+        for value in query_values {
+            while cursor < self.values.len() && self.values[cursor].as_str() < value.as_str() {
+                cursor += 1;
+            }
+            if cursor == self.values.len() {
+                break;
+            }
+            if self.values[cursor] == *value {
+                while cursor < self.values.len() && self.values[cursor] == *value {
+                    row_ids.push(self.row_ids[cursor]);
+                    cursor += 1;
+                }
+            }
+        }
+
+        row_ids
+    }
+}
+
 pub async fn load_start_index_from_lance_btree(
     dataset: &lance::Dataset,
 ) -> Result<PositionRowIdIndex> {
     load_u32_btree_index(dataset, "start", "start_btree_idx").await
+}
+
+pub async fn load_transcript_id_index_from_lance_btree(
+    dataset: &lance::Dataset,
+) -> Result<StringRowIdIndex> {
+    load_string_btree_index(dataset, "transcript_id", "transcript_id_btree_idx").await
 }
 
 async fn load_u32_btree_index(
@@ -140,6 +205,34 @@ async fn load_u32_btree_index(
     }
 
     PositionRowIdIndex::new(positions, row_ids, unique_positions)
+}
+
+async fn load_string_btree_index(
+    dataset: &lance::Dataset,
+    column: &str,
+    index_name: &str,
+) -> Result<StringRowIdIndex> {
+    let index_segments = load_btree_segments(dataset, column, index_name).await?;
+    let mut pairs = Vec::<(String, u64)>::new();
+    for index_segment in &index_segments {
+        append_btree_segment_string_pairs(dataset, index_segment, &mut pairs).await?;
+    }
+    pairs.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+
+    let mut values = Vec::with_capacity(pairs.len());
+    let mut row_ids = Vec::with_capacity(pairs.len());
+    let mut unique_values = 0usize;
+    let mut previous: Option<String> = None;
+    for (value, row_id) in pairs {
+        if previous.as_deref() != Some(value.as_str()) {
+            unique_values += 1;
+        }
+        previous = Some(value.clone());
+        values.push(value);
+        row_ids.push(row_id);
+    }
+
+    StringRowIdIndex::new(values, row_ids, unique_values)
 }
 
 async fn load_btree_segments(
@@ -211,6 +304,41 @@ async fn append_btree_segment_pairs(
     Ok(())
 }
 
+async fn append_btree_segment_string_pairs(
+    dataset: &lance::Dataset,
+    index_segment: &IndexMetadata,
+    pairs: &mut Vec<(String, u64)>,
+) -> Result<()> {
+    let store = LanceIndexStore::from_dataset_for_existing(dataset, index_segment)
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!("failed to open Lance index store: {err}"))
+        })?;
+    let reader = store
+        .open_index_file(BTREE_PAGE_DATA_FILE)
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!("failed to open BTree page data: {err}"))
+        })?;
+    let num_rows = reader.num_rows();
+    if num_rows == 0 {
+        return Ok(());
+    }
+    pairs.reserve(num_rows);
+    let mut stream = reader
+        .read_range_stream(0..num_rows, Some(&[BTREE_VALUES_COLUMN, BTREE_IDS_COLUMN]))
+        .await
+        .map_err(|err| {
+            DataFusionError::Execution(format!("failed to stream BTree page data: {err}"))
+        })?;
+    while let Some(batch) = stream.try_next().await.map_err(|err| {
+        DataFusionError::Execution(format!("failed to read BTree page data batch: {err}"))
+    })? {
+        append_btree_page_string_row_id_pairs(&batch, pairs)?;
+    }
+    Ok(())
+}
+
 fn append_btree_page_row_id_pairs(batch: &RecordBatch, pairs: &mut Vec<(u32, u64)>) -> Result<()> {
     let value_array = batch
         .column_by_name(BTREE_VALUES_COLUMN)
@@ -234,6 +362,44 @@ fn append_btree_page_row_id_pairs(batch: &RecordBatch, pairs: &mut Vec<(u32, u64
         }
     }
     Ok(())
+}
+
+fn append_btree_page_string_row_id_pairs(
+    batch: &RecordBatch,
+    pairs: &mut Vec<(String, u64)>,
+) -> Result<()> {
+    let value_array = batch
+        .column_by_name(BTREE_VALUES_COLUMN)
+        .unwrap_or_else(|| batch.column(0));
+    let row_ids = batch
+        .column_by_name(BTREE_IDS_COLUMN)
+        .ok_or_else(|| DataFusionError::Execution("BTree page data missing ids column".into()))?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| DataFusionError::Execution("BTree page ids column must be UInt64".into()))?;
+
+    for row in 0..batch.num_rows() {
+        if let Some(value) = string_value_at(value_array.as_ref(), row) {
+            pairs.push((value, row_ids.value(row)));
+        }
+    }
+    Ok(())
+}
+
+fn string_value_at(array: &dyn Array, row: usize) -> Option<String> {
+    if array.is_null(row) {
+        return None;
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+        return Some(values.value(row).to_string());
+    }
+    if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Some(values.value(row).to_string());
+    }
+    if let Some(values) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Some(values.value(row).to_string());
+    }
+    None
 }
 
 #[cfg(test)]
