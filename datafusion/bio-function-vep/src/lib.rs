@@ -51,6 +51,8 @@ pub mod golden_benchmark;
 pub mod hgvs;
 #[cfg(feature = "kv-cache")]
 pub mod kv_cache;
+#[cfg(feature = "lance-cache")]
+pub mod lance_cache;
 pub mod lookup_provider;
 pub mod miss_worklist;
 pub mod partitioned_cache;
