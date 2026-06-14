@@ -7,6 +7,7 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_bio_format_ensembl_cache::{
     CacheSourceType as BioFormatsCacheSourceType, EnsemblCacheOptions, EnsemblCacheTableProvider,
@@ -16,6 +17,7 @@ use datafusion_bio_format_ensembl_cache::{
 use futures::StreamExt;
 use lance::dataset::WriteMode;
 use log::info;
+use tokio::sync::mpsc;
 
 use crate::cache_builder::EntityStats;
 use crate::lance_cache::manifest::{
@@ -82,7 +84,7 @@ async fn build_lance_variation(options: &LanceCacheBuildOptions) -> Result<Vec<E
         let manifest_chrom = canonical_chrom_label(&chrom);
         let dataset_name = dataset_dir_name(&manifest_chrom);
         let dataset_path = entity_dir.join(&dataset_name);
-        let source_type = options.cache_source_type.as_str();
+        let source_type = options.cache_source_type.as_str().to_string();
         let rows = write_query_stream_to_lance(
             options,
             EnsemblEntityKind::Variation,
@@ -90,7 +92,7 @@ async fn build_lance_variation(options: &LanceCacheBuildOptions) -> Result<Vec<E
             &query,
             &dataset_path,
             LanceIndexKind::Start,
-            |batch| transform_variation_batch(batch, source_type),
+            move |batch| transform_variation_batch(batch, &source_type),
         )
         .await?;
         if rows == 0 {
@@ -134,7 +136,7 @@ async fn build_lance_context_entity(
         let manifest_chrom = canonical_chrom_label(&chrom);
         let dataset_name = dataset_dir_name(&manifest_chrom);
         let dataset_path = entity_dir.join(&dataset_name);
-        let source_type = options.cache_source_type.as_str();
+        let source_type = options.cache_source_type.as_str().to_string();
         let rows = write_query_stream_to_lance(
             options,
             kind,
@@ -142,7 +144,7 @@ async fn build_lance_context_entity(
             &query,
             &dataset_path,
             index_kind,
-            |batch| attach_schema_metadata_to_batch(batch, source_type),
+            move |batch| attach_schema_metadata_to_batch(batch, &source_type),
         )
         .await?;
         if rows == 0 {
@@ -202,7 +204,7 @@ async fn build_lance_translation_split(
         let manifest_chrom = canonical_chrom_label(&chrom);
         let dataset_name = dataset_dir_name(&manifest_chrom);
         let dataset_path = entity_dir.join(&dataset_name);
-        let source_type = options.cache_source_type.as_str();
+        let source_type = options.cache_source_type.as_str().to_string();
         let rows = write_query_stream_to_lance(
             options,
             EnsemblEntityKind::Translation,
@@ -215,7 +217,7 @@ async fn build_lance_translation_split(
                 move |batch| {
                     let batch = drop_row_number_batch(batch)?;
                     let batch = project_batch_to_schema(batch, Arc::clone(&target_schema))?;
-                    attach_schema_metadata_to_batch(batch, source_type)
+                    attach_schema_metadata_to_batch(batch, &source_type)
                 }
             },
         )
@@ -270,19 +272,101 @@ async fn write_query_stream_to_lance<F>(
     query: &str,
     dataset_path: &Path,
     index_kind: LanceIndexKind,
+    transform: F,
+) -> Result<usize>
+where
+    F: FnMut(RecordBatch) -> Result<RecordBatch> + Clone + Send + Sync + 'static,
+{
+    let ctx = make_ctx_and_register(options, kind, table_name)?;
+    let df = ctx.sql(query).await?;
+    let plan = df.create_physical_plan().await?;
+    if let Some(inner) = extract_multi_partition_inner(&plan) {
+        let partition_count = inner.properties().partitioning.partition_count();
+        info!(
+            "Lance build {} {} using {partition_count} physical partitions",
+            table_name,
+            dataset_path.display()
+        );
+        return write_partitioned_plan_to_lance(&ctx, inner, dataset_path, index_kind, transform)
+            .await;
+    }
+
+    let stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+    write_stream_to_lance(stream, dataset_path, index_kind, transform).await
+}
+
+struct LanceChunkWriter<'a> {
+    dataset_path: &'a Path,
+    index_kind: LanceIndexKind,
+    pending: Vec<RecordBatch>,
+    pending_rows: usize,
+    total_rows: usize,
+    mode: WriteMode,
+    wrote_any: bool,
+}
+
+impl<'a> LanceChunkWriter<'a> {
+    fn new(dataset_path: &'a Path, index_kind: LanceIndexKind) -> Self {
+        Self {
+            dataset_path,
+            index_kind,
+            pending: Vec::new(),
+            pending_rows: 0,
+            total_rows: 0,
+            mode: WriteMode::Overwrite,
+            wrote_any: false,
+        }
+    }
+
+    async fn push(&mut self, batch: RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        self.pending_rows += batch.num_rows();
+        self.total_rows += batch.num_rows();
+        self.pending.push(batch);
+
+        if self.pending_rows >= LANCE_WRITE_CHUNK_ROWS {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        write_record_batches_to_lance_with_mode(
+            self.dataset_path,
+            std::mem::take(&mut self.pending),
+            self.mode,
+        )
+        .await?;
+        self.mode = WriteMode::Append;
+        self.pending_rows = 0;
+        self.wrote_any = true;
+        Ok(())
+    }
+
+    async fn finish(mut self) -> Result<usize> {
+        self.flush().await?;
+        if self.wrote_any {
+            create_required_index(self.dataset_path, self.index_kind).await?;
+        }
+        Ok(self.total_rows)
+    }
+}
+
+async fn write_stream_to_lance<F>(
+    mut stream: SendableRecordBatchStream,
+    dataset_path: &Path,
+    index_kind: LanceIndexKind,
     mut transform: F,
 ) -> Result<usize>
 where
     F: FnMut(RecordBatch) -> Result<RecordBatch>,
 {
-    let ctx = make_ctx_and_register(options, kind, table_name)?;
-    let df = ctx.sql(query).await?;
-    let mut stream = df.execute_stream().await?;
-    let mut pending = Vec::new();
-    let mut pending_rows = 0usize;
-    let mut total_rows = 0usize;
-    let mut mode = WriteMode::Overwrite;
-    let mut wrote_any = false;
+    let mut writer = LanceChunkWriter::new(dataset_path, index_kind);
 
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
@@ -293,33 +377,91 @@ where
         if batch.num_rows() == 0 {
             continue;
         }
-        pending_rows += batch.num_rows();
-        total_rows += batch.num_rows();
-        pending.push(batch);
-
-        if pending_rows >= LANCE_WRITE_CHUNK_ROWS {
-            write_record_batches_to_lance_with_mode(
-                dataset_path,
-                std::mem::take(&mut pending),
-                mode,
-            )
-            .await?;
-            mode = WriteMode::Append;
-            pending_rows = 0;
-            wrote_any = true;
-        }
+        writer.push(batch).await?;
     }
 
-    if !pending.is_empty() {
-        write_record_batches_to_lance_with_mode(dataset_path, pending, mode).await?;
-        wrote_any = true;
+    writer.finish().await
+}
+
+async fn write_partitioned_plan_to_lance<F>(
+    ctx: &SessionContext,
+    inner: Arc<dyn ExecutionPlan>,
+    dataset_path: &Path,
+    index_kind: LanceIndexKind,
+    transform: F,
+) -> Result<usize>
+where
+    F: FnMut(RecordBatch) -> Result<RecordBatch> + Clone + Send + Sync + 'static,
+{
+    let partition_count = inner.properties().partitioning.partition_count();
+    let task_ctx = ctx.task_ctx();
+    let (tx, mut rx) = mpsc::channel::<RecordBatch>((partition_count.max(1) * 2).max(8));
+    let mut handles = tokio::task::JoinSet::new();
+
+    for partition_idx in 0..partition_count {
+        let mut stream = inner.execute(partition_idx, Arc::clone(&task_ctx))?;
+        let tx = tx.clone();
+        let mut transform = transform.clone();
+        handles.spawn(async move {
+            let mut rows = 0usize;
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let batch = transform(batch)?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                rows += batch.num_rows();
+                tx.send(batch).await.map_err(|_| {
+                    DataFusionError::Execution(
+                        "Lance partition writer stopped before all batches were sent".to_string(),
+                    )
+                })?;
+            }
+            Ok::<usize, DataFusionError>(rows)
+        });
+    }
+    drop(tx);
+
+    let mut writer = LanceChunkWriter::new(dataset_path, index_kind);
+    while let Some(batch) = rx.recv().await {
+        writer.push(batch).await?;
     }
 
-    if wrote_any {
-        create_required_index(dataset_path, index_kind).await?;
+    let mut partition_rows = 0usize;
+    while let Some(result) = handles.join_next().await {
+        partition_rows += result.map_err(|err| {
+            DataFusionError::Execution(format!("Lance partition task failed: {err}"))
+        })??;
     }
 
-    Ok(total_rows)
+    let written_rows = writer.finish().await?;
+    if written_rows != partition_rows {
+        return Err(DataFusionError::Execution(format!(
+            "Lance partition row count mismatch for {}: wrote {written_rows}, source partitions produced {partition_rows}",
+            dataset_path.display()
+        )));
+    }
+
+    Ok(written_rows)
+}
+
+fn extract_multi_partition_inner(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    if plan.name() != "SortPreservingMergeExec" {
+        return None;
+    }
+    let children = plan.children();
+    if children.len() != 1 {
+        return None;
+    }
+    let inner = Arc::clone(children[0]);
+    if inner.properties().partitioning.partition_count() > 1 {
+        Some(inner)
+    } else {
+        None
+    }
 }
 
 fn make_ctx_and_register(
@@ -574,5 +716,14 @@ mod tests {
         let query = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom = 'chr1'");
         assert!(query.contains("PARTITION BY chrom, transcript_id"));
         assert!(query.contains("WHERE chrom = 'chr1'"));
+    }
+
+    #[tokio::test]
+    async fn multi_partition_detector_ignores_non_merge_plan() {
+        let ctx = SessionContext::new();
+        let df = ctx.sql("SELECT 1 AS x").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        assert!(extract_multi_partition_inner(&plan).is_none());
     }
 }
