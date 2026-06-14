@@ -3,4 +3,5 @@ pub mod build;
 pub mod manifest;
 pub mod row_index;
 pub mod schema;
+pub mod variation_runtime;
 pub mod write;

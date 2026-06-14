@@ -40,6 +40,10 @@ use crate::allele::{
     VariantAlleleInput, allele_matches, get_matched_variant_alleles, vcf_to_vep_allele,
     vcf_to_vep_input_allele, vep_norm_end, vep_norm_start,
 };
+#[cfg(feature = "lance-cache")]
+use crate::lance_cache::variation_runtime::SinglePathLanceVariationLookup;
+#[cfg(feature = "lance-cache")]
+use crate::partitioned_cache::PartitionedLanceCache;
 use crate::variant_lookup_exec::{
     AF_COL_NAMES, ColocatedCacheEntry, ColocatedKey, ColocatedSink, ColocatedSinkValue,
     compare_existing_variant_alleles, output_allele_from_allele_string, read_reference_sequence,
@@ -54,10 +58,6 @@ use crate::warm_cache::cold_parquet::{
 use crate::warm_cache::key::{
     position_key_from_code as warm_position_key_from_code,
     variant_key_from_position as warm_variant_key_from_position,
-};
-#[cfg(feature = "lance-cache")]
-use crate::warm_cache::lance_variation::{
-    DEFAULT_LANCE_COLD_LOOKUP_BATCH_SIZE, LanceVariationLookup, lance_variation_dataset_path,
 };
 
 /// Lookup match mode.
@@ -518,9 +518,9 @@ struct KvLookupStream {
     warm_chroms: HashMap<String, Option<Box<WarmChromCache>>>,
     cold_parquet_chroms: HashMap<String, Option<ColdParquetLookupSet>>,
     #[cfg(feature = "lance-cache")]
-    lance_chroms: HashMap<String, Option<LanceVariationLookup>>,
+    lance_chroms: HashMap<String, Option<SinglePathLanceVariationLookup>>,
     #[cfg(feature = "lance-cache")]
-    lance_position_indices: HashMap<String, Option<Arc<PositionIndex>>>,
+    lance_cursors: HashMap<String, usize>,
     variant_bloom_chroms: HashMap<String, Option<Arc<VariantBloomIndex>>>,
     cold_variation_dir: Option<PathBuf>,
     position_index_dir: Option<PathBuf>,
@@ -727,6 +727,22 @@ fn warm_source_label(
         _ if has_parquet_warm_dir => "parquet",
         _ => "none",
     }
+}
+
+#[cfg(feature = "lance-cache")]
+fn lance_variation_path_for_chrom(cache: &PartitionedLanceCache, chrom: &str) -> Option<PathBuf> {
+    cache.variation_path(chrom).or_else(|| {
+        chrom
+            .strip_prefix("chr")
+            .and_then(|bare| cache.variation_path(bare))
+            .or_else(|| {
+                if chrom.starts_with("chr") {
+                    None
+                } else {
+                    cache.variation_path(&format!("chr{chrom}"))
+                }
+            })
+    })
 }
 
 fn decide_after_warm_probe(
@@ -1128,15 +1144,6 @@ fn warm_variation_batch_size() -> usize {
         .unwrap_or(262_144)
 }
 
-#[cfg(feature = "lance-cache")]
-fn lance_cold_lookup_batch_size() -> usize {
-    std::env::var("VEP_LANCE_COLD_LOOKUP_BATCH_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_LANCE_COLD_LOOKUP_BATCH_SIZE)
-}
-
 fn warm_cold_variation_backend_from_env() -> WarmColdVariationBackend {
     match WarmColdVariationBackend::parse(
         std::env::var("VEP_WARM_COLD_VARIATION_BACKEND")
@@ -1464,6 +1471,241 @@ fn probe_cold_chunk_position(
     }
 }
 
+#[cfg(feature = "lance-cache")]
+#[allow(clippy::too_many_arguments)]
+fn probe_lance_taken_batch_position(
+    batch: &RecordBatch,
+    rows: &[u32],
+    exact_matcher: AlleleMatcher,
+    allowed_failed: i64,
+    profile_detailed: bool,
+    chrom: &str,
+    probe_start: i64,
+    vcf_ref: &str,
+    vcf_alt: &str,
+    vcf_iv_start: i64,
+    vcf_iv_end: i64,
+    emit_output: bool,
+    vcf_row: u32,
+    cache_columns: &[String],
+    col_map: &[usize],
+    builders: &mut [Box<dyn datafusion::arrow::array::ArrayBuilder>],
+    vcf_indices: &mut Vec<u32>,
+    coloc_buf: Option<&mut HashMap<ColocatedKey, ColocatedSinkValue>>,
+) -> Result<(ColdProbeResult, ColdChunkProbeMetrics)> {
+    struct PreparedColoc {
+        chrom_norm: String,
+        input_start: i64,
+        input_allele_string: String,
+        compare_allele_string: String,
+        vep_start: i64,
+        vep_end: i64,
+        compare_output_allele: Option<String>,
+        unshifted_output_allele: Option<String>,
+    }
+
+    let mut metrics = ColdChunkProbeMetrics::default();
+    if rows.is_empty() {
+        return Ok((ColdProbeResult::NotCovered, metrics));
+    }
+    let indices = LanceBatchProbeIndices::new(batch)?;
+    let mut coloc_buf = coloc_buf;
+    let prepared_coloc = if coloc_buf.is_some() {
+        let prepare_started = Instant::now();
+        let (input_ref, input_alt, input_start) =
+            vcf_to_vep_input_allele(vcf_iv_start, vcf_ref, vcf_alt);
+        let input_allele_string = format!("{input_ref}/{input_alt}");
+        let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
+        let compare_allele_string = format!("{compare_ref}/{compare_alt}");
+        let prepared = PreparedColoc {
+            chrom_norm: chrom.to_string(),
+            input_start,
+            input_allele_string,
+            compare_output_allele: output_allele_from_allele_string(&compare_allele_string)
+                .map(str::to_string),
+            unshifted_output_allele: None,
+            compare_allele_string,
+            vep_start: vep_norm_start(vcf_iv_start, vcf_ref, vcf_alt),
+            vep_end: vep_norm_end(vcf_iv_start, vcf_ref, vcf_alt),
+        };
+        metrics.colocated_prepare_elapsed += prepare_started.elapsed();
+        Some(prepared)
+    } else {
+        None
+    };
+    let coloc_visible = prepared_coloc.as_ref().is_some_and(|prepared| {
+        probe_start_visible_to_window(probe_start, prepared.vep_start, prepared.vep_end)
+    });
+    let coloc_indices = if coloc_visible {
+        resolve_batch_coloc_indices(batch)
+    } else {
+        None
+    };
+
+    let mut matched = false;
+    for &row in rows {
+        let row_usize = row as usize;
+        let Some(allele_string) =
+            batch_string_value(batch, Some(indices.allele_string), row_usize)?
+        else {
+            continue;
+        };
+
+        metrics.cold_rows_scanned += 1;
+        if profile_detailed {
+            metrics.primary_allele_rows += 1;
+            metrics.exact_match_calls += 1;
+        }
+
+        if let (Some(buf), Some(prepared), Some(ci)) = (
+            coloc_buf.as_deref_mut(),
+            prepared_coloc.as_ref(),
+            coloc_indices.as_ref(),
+        ) {
+            let colocated_started = Instant::now();
+            if profile_detailed {
+                metrics.colocated_allele_rows += 1;
+            }
+
+            let failed = batch_i64_value(batch, ci.failed, row_usize).unwrap_or(0);
+            if failed <= allowed_failed
+                && let Some(var_name) =
+                    batch_string_value(batch, Some(ci.variation_name), row_usize)?
+                && !var_name.is_empty()
+            {
+                let existing_end =
+                    batch_i64_value(batch, ci.end_col, row_usize).unwrap_or(probe_start);
+                if let Some(matched_alleles) = compare_existing_variant_alleles(
+                    &prepared.compare_allele_string,
+                    prepared.vep_start,
+                    prepared.vep_end,
+                    None,
+                    None,
+                    None,
+                    &allele_string,
+                    probe_start,
+                    existing_end,
+                ) {
+                    let key: ColocatedKey = (
+                        prepared.chrom_norm.clone(),
+                        prepared.input_start,
+                        vcf_iv_end,
+                        prepared.input_allele_string.clone(),
+                    );
+                    let sink_value = buf.entry(key).or_insert_with(|| ColocatedSinkValue {
+                        entries: Vec::new(),
+                        compare_output_allele: prepared.compare_output_allele.clone(),
+                        unshifted_output_allele: prepared.unshifted_output_allele.clone(),
+                    });
+                    let af_values: Vec<String> = ci
+                        .af_indices
+                        .iter()
+                        .map(|idx| {
+                            batch_string_value(batch, *idx, row_usize)
+                                .map(|value| value.unwrap_or_default())
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    sink_value.entries.push(ColocatedCacheEntry {
+                        variation_name: var_name,
+                        allele_string: allele_string.clone(),
+                        matched_alleles,
+                        somatic: batch_i64_value(batch, ci.somatic, row_usize).unwrap_or(0),
+                        pheno: batch_i64_value(batch, ci.pheno, row_usize).unwrap_or(0),
+                        clin_sig: batch_string_value(batch, ci.clin_sig, row_usize)?,
+                        clin_sig_allele: batch_string_value(batch, ci.clin_sig_allele, row_usize)?,
+                        pubmed: batch_string_value(batch, ci.pubmed, row_usize)?,
+                        af_values,
+                    });
+                    if profile_detailed {
+                        metrics.colocated_entries += 1;
+                    }
+                }
+            }
+            metrics.colocated_match_elapsed += colocated_started.elapsed();
+        }
+
+        if matched {
+            continue;
+        }
+
+        let failed = batch_i64_value(batch, indices.failed, row_usize).unwrap_or(0);
+        if failed > allowed_failed {
+            continue;
+        }
+
+        let existing_end = batch_i64_value(batch, indices.end, row_usize).unwrap_or(probe_start);
+        let cache_iv_start = probe_start.min(existing_end);
+        let cache_iv_end = probe_start.max(existing_end);
+        if cache_iv_start > vcf_iv_end || cache_iv_end < vcf_iv_start {
+            continue;
+        }
+
+        if exact_matcher(vcf_ref, vcf_alt, &allele_string) {
+            if emit_output {
+                let append_started = Instant::now();
+                let Some(output_indices) = batch_output_indices(batch, cache_columns, col_map)
+                else {
+                    return Err(DataFusionError::Execution(
+                        "Lance batch missing one or more requested cache output columns".into(),
+                    ));
+                };
+                vcf_indices.push(vcf_row);
+                append_batch_row_values(batch, row_usize, &output_indices, builders)?;
+                metrics.append_elapsed += append_started.elapsed();
+                metrics.emitted = true;
+            }
+            matched = true;
+        }
+    }
+
+    if matched {
+        Ok((ColdProbeResult::Match, metrics))
+    } else {
+        Ok((ColdProbeResult::PositionCoveredNoExact, metrics))
+    }
+}
+
+#[cfg(feature = "lance-cache")]
+struct LanceBatchProbeIndices {
+    allele_string: usize,
+    end: Option<usize>,
+    failed: Option<usize>,
+}
+
+#[cfg(feature = "lance-cache")]
+impl LanceBatchProbeIndices {
+    fn new(batch: &RecordBatch) -> Result<Self> {
+        let schema = batch.schema();
+        Ok(Self {
+            allele_string: schema.index_of("allele_string").map_err(|_| {
+                DataFusionError::Execution("Lance batch missing allele_string".into())
+            })?,
+            end: schema.index_of("end").ok(),
+            failed: schema.index_of("failed").ok(),
+        })
+    }
+}
+
+#[cfg(feature = "lance-cache")]
+fn lance_start_row_map(batch: &RecordBatch) -> Result<HashMap<u32, Vec<u32>>> {
+    let schema = batch.schema();
+    let start_idx = schema
+        .index_of("start")
+        .map_err(|_| DataFusionError::Execution("Lance batch missing start".into()))?;
+    let starts = batch
+        .column(start_idx)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| DataFusionError::Execution("Lance batch start must be UInt32".into()))?;
+    let mut rows = HashMap::<u32, Vec<u32>>::new();
+    for row in 0..batch.num_rows() {
+        if !starts.is_null(row) {
+            rows.entry(starts.value(row)).or_default().push(row as u32);
+        }
+    }
+    Ok(rows)
+}
+
 impl KvLookupStream {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1624,7 +1866,7 @@ impl KvLookupStream {
             #[cfg(feature = "lance-cache")]
             lance_chroms: HashMap::new(),
             #[cfg(feature = "lance-cache")]
-            lance_position_indices: HashMap::new(),
+            lance_cursors: HashMap::new(),
             variant_bloom_chroms: HashMap::new(),
             cold_variation_dir,
             position_index_dir,
@@ -2069,340 +2311,29 @@ impl KvLookupStream {
     fn probe_lance_warm_position(
         &mut self,
         chrom: &str,
-        chrom_code: u16,
-        probe_start: i64,
-        vcf_ref: &str,
-        vcf_alt: &str,
-        vcf_iv_start: i64,
-        vcf_iv_end: i64,
+        _chrom_code: u16,
+        _probe_start: i64,
+        _vcf_ref: &str,
+        _vcf_alt: &str,
+        _vcf_iv_start: i64,
+        _vcf_iv_end: i64,
         emit_output: bool,
-        vcf_row: u32,
+        _vcf_row: u32,
         cache_columns: &[String],
-        col_map: &[usize],
-        builders: &mut [Box<dyn datafusion::arrow::array::ArrayBuilder>],
-        vcf_indices: &mut Vec<u32>,
+        _col_map: &[usize],
+        _builders: &mut [Box<dyn datafusion::arrow::array::ArrayBuilder>],
+        _vcf_indices: &mut Vec<u32>,
         coloc_buf: Option<&mut HashMap<ColocatedKey, ColocatedSinkValue>>,
     ) -> Result<Option<LookupDecision>> {
         let collect_colocated = coloc_buf.is_some();
         self.ensure_lance_lookup(chrom, cache_columns, collect_colocated)?;
-
-        let position_key = warm_position_key_from_code(chrom_code, probe_start).map_err(|e| {
-            DataFusionError::Execution(format!("failed to build warm position key: {e}"))
-        })?;
-        let variant_keys = warm_variant_key_candidates(position_key, vcf_ref, vcf_alt);
-        if variant_keys.is_empty() {
-            return Ok(None);
-        }
-
-        let cold_position_index = if self.warm_cold_index_mode.uses_position_index() {
-            self.ensure_lance_position_index(chrom)?
-        } else {
-            None
-        };
-
-        let exact_matcher = self.exact_matcher;
-        let allowed_failed = self.allowed_failed;
-        let profile_detailed = self.profile_detailed;
-        let mut append_elapsed = Duration::ZERO;
-        let mut emitted = false;
-        let mut colocated_prepare_elapsed = Duration::ZERO;
-        let mut colocated_match_elapsed = Duration::ZERO;
-        let mut primary_allele_rows = 0_u64;
-        let mut exact_match_calls = 0_u64;
-        let mut colocated_allele_rows = 0_u64;
-        let mut colocated_entries = 0_u64;
-        let mut warm_candidate_rows = 0_u64;
-        let mut warm_rows_scanned = 0_u64;
-        let started = self.profile_enabled.then(Instant::now);
-
-        let lookup = self
-            .lance_chroms
-            .get(chrom)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!("lance variation lookup not open for {chrom}"))
-            })?;
-
-        let row_matches =
-            |chunk: &WarmChunkContext, row: u32, allele_string: &str| -> Result<bool> {
-                let failed = chunk
-                    .i64_value(chunk.columns.failed, row as usize)
-                    .unwrap_or(0);
-                if failed > allowed_failed {
-                    return Ok(false);
-                }
-
-                let existing_end = chunk
-                    .i64_value(chunk.columns.end, row as usize)
-                    .unwrap_or(probe_start);
-                let cache_iv_start = probe_start.min(existing_end);
-                let cache_iv_end = probe_start.max(existing_end);
-                if cache_iv_start > vcf_iv_end || cache_iv_end < vcf_iv_start {
-                    return Ok(false);
-                }
-
-                Ok(exact_matcher(vcf_ref, vcf_alt, allele_string))
-            };
-
-        let mut exact_row: Option<u32> = None;
-        let mut position_rows: Option<Range<u32>> = None;
-        for variant_key in variant_keys {
-            match lookup.warm_probe_exact(position_key, variant_key, |chunk, row| {
-                Ok(chunk
-                    .allele_string(row as usize)?
-                    .map(|allele_string| exact_matcher(vcf_ref, vcf_alt, allele_string))
-                    .unwrap_or(false))
-            })? {
-                WarmProbe::Exact {
-                    row,
-                    position_rows: rows,
-                } => {
-                    exact_row = Some(row);
-                    position_rows = Some(rows);
-                    break;
-                }
-                WarmProbe::PositionCoveredNoExact {
-                    position_rows: rows,
-                } => {
-                    position_rows.get_or_insert(rows);
-                }
-                WarmProbe::NotCovered => {}
-            }
-        }
-
-        let Some(chunk) = lookup.warm_chunk() else {
-            return Err(DataFusionError::Execution(format!(
-                "lance warm tier not loaded for {chrom}"
-            )));
-        };
-
-        if let Some(row) = exact_row {
-            warm_rows_scanned += 1;
-            let matched = chunk
-                .allele_string(row as usize)?
-                .map(|allele_string| row_matches(chunk, row, allele_string))
-                .transpose()?
-                .unwrap_or(false);
-            if !matched {
-                exact_row = None;
-            }
-        }
-
-        if exact_row.is_none() {
-            if let Some(rows) = position_rows.clone() {
-                for row in rows {
-                    warm_rows_scanned += 1;
-                    let Some(allele_string) = chunk.allele_string(row as usize)? else {
-                        continue;
-                    };
-                    if profile_detailed {
-                        primary_allele_rows += 1;
-                        exact_match_calls += 1;
-                    }
-                    if row_matches(chunk, row, allele_string)? {
-                        exact_row = Some(row);
-                        break;
-                    }
-                }
-            }
-        }
-
-        let mut coloc_buf = coloc_buf;
-        if collect_colocated {
-            if let Some(rows) = position_rows.clone() {
-                let prepare_started = Instant::now();
-                let chrom_norm = chrom.to_string();
-                let (input_ref, input_alt, input_start) =
-                    vcf_to_vep_input_allele(vcf_iv_start, vcf_ref, vcf_alt);
-                let input_allele_string = format!("{input_ref}/{input_alt}");
-                let (compare_ref, compare_alt) = vcf_to_vep_allele(vcf_ref, vcf_alt);
-                let compare_allele_string = format!("{compare_ref}/{compare_alt}");
-                let vep_start = vep_norm_start(vcf_iv_start, vcf_ref, vcf_alt);
-                let vep_end = vep_norm_end(vcf_iv_start, vcf_ref, vcf_alt);
-                let compare_output_allele =
-                    output_allele_from_allele_string(&compare_allele_string).map(str::to_string);
-                let unshifted_output_allele: Option<String> = None;
-                colocated_prepare_elapsed += prepare_started.elapsed();
-
-                let ci = resolve_warm_coloc_indices(chunk);
-                for row in rows {
-                    let Some(allele_string) = chunk.allele_string(row as usize)? else {
-                        continue;
-                    };
-                    let colocated_started = Instant::now();
-                    let Some(buf) = coloc_buf.as_deref_mut() else {
-                        continue;
-                    };
-                    if !probe_start_visible_to_window(probe_start, vep_start, vep_end) {
-                        colocated_match_elapsed += colocated_started.elapsed();
-                        continue;
-                    }
-                    let Some(ci) = ci.as_ref() else {
-                        colocated_match_elapsed += colocated_started.elapsed();
-                        continue;
-                    };
-                    if profile_detailed {
-                        colocated_allele_rows += 1;
-                    }
-                    let failed = chunk.i64_value(ci.failed, row as usize).unwrap_or(0);
-                    if failed > allowed_failed {
-                        colocated_match_elapsed += colocated_started.elapsed();
-                        continue;
-                    }
-
-                    let Some(var_name) =
-                        warm_string_value(chunk, Some(ci.variation_name), row as usize)?
-                    else {
-                        colocated_match_elapsed += colocated_started.elapsed();
-                        continue;
-                    };
-                    if var_name.is_empty() {
-                        colocated_match_elapsed += colocated_started.elapsed();
-                        continue;
-                    }
-
-                    let existing_end = chunk
-                        .i64_value(ci.end_col, row as usize)
-                        .unwrap_or(probe_start);
-                    let Some(matched_alleles) = compare_existing_variant_alleles(
-                        &compare_allele_string,
-                        vep_start,
-                        vep_end,
-                        None,
-                        None,
-                        None,
-                        allele_string,
-                        probe_start,
-                        existing_end,
-                    ) else {
-                        colocated_match_elapsed += colocated_started.elapsed();
-                        continue;
-                    };
-
-                    let key: ColocatedKey = (
-                        chrom_norm.clone(),
-                        input_start,
-                        vcf_iv_end,
-                        input_allele_string.clone(),
-                    );
-                    let sink_value = buf.entry(key).or_insert_with(|| ColocatedSinkValue {
-                        entries: Vec::new(),
-                        compare_output_allele: compare_output_allele.clone(),
-                        unshifted_output_allele: unshifted_output_allele.clone(),
-                    });
-                    let af_values: Vec<String> = ci
-                        .af_indices
-                        .iter()
-                        .map(|idx| {
-                            warm_string_value(chunk, *idx, row as usize)
-                                .map(|value| value.unwrap_or_default())
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    sink_value.entries.push(ColocatedCacheEntry {
-                        variation_name: var_name,
-                        allele_string: allele_string.to_string(),
-                        matched_alleles,
-                        somatic: chunk.i64_value(ci.somatic, row as usize).unwrap_or(0),
-                        pheno: chunk.i64_value(ci.pheno, row as usize).unwrap_or(0),
-                        clin_sig: warm_string_value(chunk, ci.clin_sig, row as usize)?,
-                        clin_sig_allele: warm_string_value(
-                            chunk,
-                            ci.clin_sig_allele,
-                            row as usize,
-                        )?,
-                        pubmed: warm_string_value(chunk, ci.pubmed, row as usize)?,
-                        af_values,
-                    });
-                    if profile_detailed {
-                        colocated_entries += 1;
-                    }
-                    colocated_match_elapsed += colocated_started.elapsed();
-                }
-            }
-        }
-
-        if emit_output {
-            if let Some(row) = exact_row {
-                let append_started = Instant::now();
-                let Some(indices) = chunk.output_indices(cache_columns, col_map) else {
-                    return Err(DataFusionError::Execution(
-                        "Lance warm chunk missing one or more requested cache output columns"
-                            .into(),
-                    ));
-                };
-                vcf_indices.push(vcf_row);
-                append_warm_row_values(chunk, row as usize, indices, builders)?;
-                append_elapsed += append_started.elapsed();
-                emitted = true;
-            }
-        }
-
-        let warm_decision = if exact_row.is_some() {
-            WarmProbeForDecision::Exact
-        } else if position_rows.is_some() {
-            WarmProbeForDecision::PositionCoveredNoExact
-        } else {
-            WarmProbeForDecision::NotCovered
-        };
-        if let Some(rows) = position_rows.as_ref() {
-            warm_candidate_rows += u64::from(rows.end.saturating_sub(rows.start));
-        }
-
-        let mut position_index_checks = 0_u64;
-        let mut position_index_positive_gets = 0_u64;
-        let mut position_index_negative_skips = 0_u64;
-        let cold_decision = if warm_decision == WarmProbeForDecision::NotCovered
-            && self.warm_cold_index_mode.uses_position_index()
-        {
-            position_index_checks += 1;
-            if cold_position_index
-                .as_ref()
-                .is_none_or(|index| index.contains_position_key(position_key))
-            {
-                position_index_positive_gets += 1;
-                ColdPositionDecision::Present
-            } else {
-                position_index_negative_skips += 1;
-                ColdPositionDecision::Absent
-            }
-        } else {
-            ColdPositionDecision::Present
-        };
-        let decision = decide_after_warm_probe(warm_decision, cold_decision);
-
         if self.profile_enabled {
             self.profile.warm_probes += 1;
-            if let Some(t0) = started {
-                self.profile.warm_probe += t0.elapsed();
-            }
-            self.profile.cache_column_append += append_elapsed;
-            self.profile.colocated_prepare += colocated_prepare_elapsed;
-            self.profile.colocated_match += colocated_match_elapsed;
-            self.profile.position_index_checks += position_index_checks;
-            self.profile.position_index_positive_gets += position_index_positive_gets;
-            self.profile.position_index_negative_skips += position_index_negative_skips;
-            self.profile.warm_candidate_rows += warm_candidate_rows;
-            self.profile.warm_rows_scanned += warm_rows_scanned;
-            if decision == LookupDecision::EmitWarmExact {
-                self.profile.warm_matches += 1;
-            } else if decision == LookupDecision::SkipFjall {
-                self.profile.warm_definitive_misses += 1;
-            } else {
-                self.profile.warm_not_covered += 1;
-            }
-            if profile_detailed {
-                self.profile.primary_allele_rows += primary_allele_rows;
-                self.profile.exact_match_calls += exact_match_calls;
-                self.profile.colocated_allele_rows += colocated_allele_rows;
-                self.profile.colocated_entries += colocated_entries;
-            }
+            self.profile.warm_not_covered += 1;
         }
 
-        if exact_row.is_some() && emitted && self.profile_detailed {
-            self.profile.primary_matches += 1;
-        }
-
-        Ok(Some(decision))
+        let _ = emit_output;
+        Ok(Some(LookupDecision::UseFjall))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2602,54 +2533,6 @@ impl KvLookupStream {
     }
 
     #[cfg(feature = "lance-cache")]
-    fn ensure_lance_position_index(&mut self, chrom: &str) -> Result<Option<Arc<PositionIndex>>> {
-        if !self.warm_cold_index_mode.uses_position_index() {
-            return Ok(None);
-        }
-
-        if !self.lance_position_indices.contains_key(chrom) {
-            let Some(position_index_dir) = self.position_index_dir.clone() else {
-                return Err(DataFusionError::Execution(
-                    "Lance variation lookup uses position index but no position index directory is configured"
-                        .into(),
-                ));
-            };
-
-            let started = self.profile_enabled.then(Instant::now);
-            let (index, source) = PositionIndex::shared_for_chrom(
-                &position_index_dir,
-                chrom,
-                None,
-                warm_variation_batch_size(),
-            )?;
-            if self.profile_enabled {
-                if let Some(t0) = started {
-                    self.profile.position_index_load += t0.elapsed();
-                }
-                self.profile.position_index_loaded += 1;
-                match source {
-                    PositionIndexSource::Persisted => {
-                        self.profile.position_index_persisted_loads += 1;
-                    }
-                    PositionIndexSource::ParquetFallback => {
-                        self.profile.position_index_parquet_fallback_loads += 1;
-                    }
-                }
-                self.profile.position_index_rows += index.len() as u64;
-                self.profile.position_index_bytes += index.storage_bytes() as u64;
-            }
-            self.lance_position_indices
-                .insert(chrom.to_string(), Some(index));
-        }
-
-        Ok(self
-            .lance_position_indices
-            .get(chrom)
-            .and_then(|index| index.as_ref())
-            .cloned())
-    }
-
-    #[cfg(feature = "lance-cache")]
     fn ensure_lance_lookup(
         &mut self,
         chrom: &str,
@@ -2666,51 +2549,47 @@ impl KvLookupStream {
         };
 
         if !self.lance_chroms.contains_key(chrom) {
-            let path = lance_variation_dataset_path(&cache_root, chrom);
-            if !path.exists() {
-                return Err(DataFusionError::Execution(format!(
-                    "lance variation lookup but no Lance dataset for {chrom} at {}",
-                    path.display()
-                )));
-            }
+            let cache = PartitionedLanceCache::detect(cache_root.to_string_lossy().as_ref())
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "lance variation lookup but no variation.lance manifest under {}",
+                        cache_root.display()
+                    ))
+                })?;
+            let path = lance_variation_path_for_chrom(&cache, chrom).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "lance variation lookup but no Lance dataset for {chrom} in {}",
+                    cache_root.display()
+                ))
+            })?;
             let projection = cold_parquet_projection_columns(cache_columns, collect_colocated);
             let projected_cols = projection.len();
-            let batch_size = lance_cold_lookup_batch_size();
             let open_started = Instant::now();
-            let (lookup, warm_load) = tokio::task::block_in_place(|| {
+            let lookup = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    let mut lookup =
-                        LanceVariationLookup::open(&path, projection, batch_size).await?;
-                    let warm_started = Instant::now();
-                    lookup.load_warm_tier().await?;
-                    Ok::<_, DataFusionError>((lookup, warm_started.elapsed()))
+                    SinglePathLanceVariationLookup::open(&path, projection).await
                 })
             })?;
             let open_elapsed = open_started.elapsed();
-            let warm_rows = lookup
-                .warm_chunk()
-                .map_or(0_u64, |chunk| chunk.batch.num_rows() as u64);
             if self.profile_enabled {
-                self.profile.warm_chunk_load += warm_load;
-                if warm_rows > 0 {
-                    self.profile.warm_chunks_loaded += 1;
-                    self.profile.warm_chunk_rows += warm_rows;
-                }
+                self.profile.position_index_load += open_elapsed;
+                self.profile.position_index_loaded += 1;
+                self.profile.position_index_rows += lookup.row_ids_len() as u64;
             }
             if self.profile_detailed || std::env::var_os("VEP_LANCE_PROFILE").is_some() {
                 eprintln!(
-                    "[vep-lance-profile] open chrom={} path={} projected_cols={} collect_colocated={} batch_size={} warm_rows={} warm_load_s={:.3} open_s={:.3}",
+                    "[vep-lance-profile] open chrom={} path={} projected_cols={} collect_colocated={} row_ids={} unique_positions={} open_s={:.3}",
                     chrom,
                     path.display(),
                     projected_cols,
                     collect_colocated,
-                    batch_size,
-                    warm_rows,
-                    warm_load.as_secs_f64(),
+                    lookup.row_ids_len(),
+                    lookup.unique_positions(),
                     open_elapsed.as_secs_f64(),
                 );
             }
             self.lance_chroms.insert(chrom.to_string(), Some(lookup));
+            self.lance_cursors.insert(chrom.to_string(), 0);
         }
 
         Ok(())
@@ -3288,6 +3167,24 @@ impl KvLookupStream {
                             if self.warm_cold_backend.uses_batched_cold_lookup() =>
                         {
                             let collect_colocated = coloc_buf.is_some();
+                            #[cfg(feature = "lance-cache")]
+                            if self.warm_cold_backend.is_lance() {
+                                self.ensure_lance_lookup(chrom, &cache_columns, collect_colocated)?;
+                                let pending_idx = pending_cold_probes.len();
+                                pending_cold_probes.push(PendingColdProbe {
+                                    chrom: chrom.to_string(),
+                                    probe_start: *probe_start,
+                                    position_key: 0,
+                                    vcf_ref: vcf_ref.to_string(),
+                                    vcf_alt: vcf_alt.to_string(),
+                                    vcf_iv_start,
+                                    vcf_iv_end,
+                                    vcf_row: row as u32,
+                                });
+                                pending_cold_by_row[row].push(pending_idx);
+                                continue;
+                            }
+
                             if !self.cold_variant_bloom_may_contain(
                                 chrom,
                                 chrom_code,
@@ -3665,32 +3562,56 @@ impl KvLookupStream {
         }
 
         if !pending_cold_probes.is_empty() {
-            let mut pending_keys_by_chrom: HashMap<String, Vec<u64>> = HashMap::new();
-            for pending in &pending_cold_probes {
-                pending_keys_by_chrom
-                    .entry(pending.chrom.clone())
-                    .or_default()
-                    .push(pending.position_key);
-            }
-            let touched_cold_chroms = pending_keys_by_chrom.keys().cloned().collect::<Vec<_>>();
+            #[cfg(feature = "lance-cache")]
+            let mut lance_taken_by_chrom =
+                HashMap::<String, (RecordBatch, HashMap<u32, Vec<u32>>)>::new();
 
-            for (chrom, position_keys) in pending_keys_by_chrom {
-                #[cfg(feature = "lance-cache")]
-                if self.warm_cold_backend.is_lance() {
+            #[cfg(feature = "lance-cache")]
+            if self.warm_cold_backend.is_lance() {
+                let mut pending_starts_by_chrom: HashMap<String, Vec<u32>> = HashMap::new();
+                for pending in &pending_cold_probes {
+                    if let Ok(start) = u32::try_from(pending.probe_start) {
+                        pending_starts_by_chrom
+                            .entry(pending.chrom.clone())
+                            .or_default()
+                            .push(start);
+                    }
+                }
+
+                for (chrom, mut starts) in pending_starts_by_chrom {
+                    starts.sort_unstable();
+                    starts.dedup();
                     let lookup = self
                         .lance_chroms
-                        .get_mut(&chrom)
-                        .and_then(Option::as_mut)
+                        .get(&chrom)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| {
                             DataFusionError::Execution(format!(
                                 "lance variation lookup not open for {chrom}"
                             ))
                         })?;
-                    tokio::task::block_in_place(|| {
+                    let cursor = self.lance_cursors.entry(chrom.clone()).or_default();
+                    let take_started = self.profile_enabled.then(Instant::now);
+                    let taken = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current()
-                            .block_on(lookup.prefetch_cold_positions(position_keys))
+                            .block_on(lookup.resolve_and_take(&starts, cursor))
                     })?;
-                } else {
+                    if let Some(t0) = take_started {
+                        self.profile.cold_parquet_load += t0.elapsed();
+                    }
+                    let row_map = lance_start_row_map(&taken.batch)?;
+                    lance_taken_by_chrom.insert(chrom, (taken.batch, row_map));
+                }
+            } else {
+                let mut pending_keys_by_chrom: HashMap<String, Vec<u64>> = HashMap::new();
+                for pending in &pending_cold_probes {
+                    pending_keys_by_chrom
+                        .entry(pending.chrom.clone())
+                        .or_default()
+                        .push(pending.position_key);
+                }
+
+                for (chrom, position_keys) in pending_keys_by_chrom {
                     let lookup = self
                         .cold_parquet_chroms
                         .get_mut(&chrom)
@@ -3702,8 +3623,19 @@ impl KvLookupStream {
                         })?;
                     lookup.prefetch_positions_retaining(position_keys)?;
                 }
-                #[cfg(not(feature = "lance-cache"))]
-                {
+            }
+
+            #[cfg(not(feature = "lance-cache"))]
+            {
+                let mut pending_keys_by_chrom: HashMap<String, Vec<u64>> = HashMap::new();
+                for pending in &pending_cold_probes {
+                    pending_keys_by_chrom
+                        .entry(pending.chrom.clone())
+                        .or_default()
+                        .push(pending.position_key);
+                }
+
+                for (chrom, position_keys) in pending_keys_by_chrom {
                     let lookup = self
                         .cold_parquet_chroms
                         .get_mut(&chrom)
@@ -3722,27 +3654,83 @@ impl KvLookupStream {
                 let emit_output = !row_output_emitted[row];
                 let (result, metrics) = {
                     #[cfg(feature = "lance-cache")]
-                    let chunk = if self.warm_cold_backend.is_lance() {
-                        self.lance_chroms
-                            .get(&pending.chrom)
-                            .and_then(Option::as_ref)
-                            .and_then(|lookup| {
-                                lookup.cached_chunk_for_position(pending.position_key)
-                            })
+                    if self.warm_cold_backend.is_lance() {
+                        if let Some((batch, row_map)) = lance_taken_by_chrom.get(&pending.chrom) {
+                            let rows = u32::try_from(pending.probe_start)
+                                .ok()
+                                .and_then(|start| row_map.get(&start))
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]);
+                            probe_lance_taken_batch_position(
+                                batch,
+                                rows,
+                                self.exact_matcher,
+                                self.allowed_failed,
+                                self.profile_detailed,
+                                &pending.chrom,
+                                pending.probe_start,
+                                &pending.vcf_ref,
+                                &pending.vcf_alt,
+                                pending.vcf_iv_start,
+                                pending.vcf_iv_end,
+                                emit_output,
+                                pending.vcf_row,
+                                &cache_columns,
+                                &col_map,
+                                &mut builders,
+                                &mut vcf_indices,
+                                coloc_buf.as_mut(),
+                            )?
+                        } else {
+                            (
+                                ColdProbeResult::NotCovered,
+                                ColdChunkProbeMetrics::default(),
+                            )
+                        }
                     } else {
-                        self.cold_parquet_chroms
+                        let chunk = self
+                            .cold_parquet_chroms
                             .get(&pending.chrom)
                             .and_then(Option::as_ref)
                             .and_then(|lookup| {
                                 lookup.cached_chunk_for_position(pending.position_key)
-                            })
-                    };
+                            });
+                        if let Some(chunk) = chunk {
+                            probe_cold_chunk_position(
+                                chunk,
+                                self.exact_matcher,
+                                self.allowed_failed,
+                                self.profile_detailed,
+                                &pending.chrom,
+                                pending.probe_start,
+                                pending.position_key,
+                                &pending.vcf_ref,
+                                &pending.vcf_alt,
+                                pending.vcf_iv_start,
+                                pending.vcf_iv_end,
+                                emit_output,
+                                pending.vcf_row,
+                                &cache_columns,
+                                &col_map,
+                                &mut builders,
+                                &mut vcf_indices,
+                                coloc_buf.as_mut(),
+                            )?
+                        } else {
+                            (
+                                ColdProbeResult::NotCovered,
+                                ColdChunkProbeMetrics::default(),
+                            )
+                        }
+                    }
+
                     #[cfg(not(feature = "lance-cache"))]
                     let chunk = self
                         .cold_parquet_chroms
                         .get(&pending.chrom)
                         .and_then(Option::as_ref)
                         .and_then(|lookup| lookup.cached_chunk_for_position(pending.position_key));
+                    #[cfg(not(feature = "lance-cache"))]
                     if let Some(chunk) = chunk {
                         probe_cold_chunk_position(
                             chunk,
@@ -3780,10 +3768,23 @@ impl KvLookupStream {
                 }
             }
 
-            if self.profile_enabled {
+            if self.profile_enabled && {
+                #[cfg(feature = "lance-cache")]
+                {
+                    !self.warm_cold_backend.is_lance()
+                }
+                #[cfg(not(feature = "lance-cache"))]
+                {
+                    true
+                }
+            } {
                 self.record_cold_parquet_stats_snapshot();
             }
 
+            let touched_cold_chroms = pending_cold_probes
+                .iter()
+                .map(|pending| pending.chrom.clone())
+                .collect::<std::collections::HashSet<_>>();
             for chrom in touched_cold_chroms {
                 #[cfg(feature = "lance-cache")]
                 if !self.warm_cold_backend.is_lance() {
@@ -4018,6 +4019,25 @@ fn warm_output_indices(
         .collect()
 }
 
+#[cfg(feature = "lance-cache")]
+fn batch_output_indices(
+    batch: &RecordBatch,
+    cache_columns: &[String],
+    col_map: &[usize],
+) -> Option<Vec<Option<usize>>> {
+    cache_columns
+        .iter()
+        .zip(col_map.iter())
+        .map(|(name, entry_idx)| {
+            if *entry_idx == usize::MAX {
+                Some(None)
+            } else {
+                batch.schema().index_of(name).ok().map(Some)
+            }
+        })
+        .collect()
+}
+
 fn append_warm_row_values(
     chunk: &WarmChunkContext,
     row: usize,
@@ -4031,6 +4051,23 @@ fn append_warm_row_values(
                 row,
                 builder.as_mut(),
             )?;
+        } else {
+            append_null_to_builder(builder.as_mut())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "lance-cache")]
+fn append_batch_row_values(
+    batch: &RecordBatch,
+    row: usize,
+    output_indices: &[Option<usize>],
+    builders: &mut [Box<dyn datafusion::arrow::array::ArrayBuilder>],
+) -> Result<()> {
+    for (idx, builder) in output_indices.iter().zip(builders.iter_mut()) {
+        if let Some(idx) = idx {
+            append_array_value_to_builder(batch.column(*idx).as_ref(), row, builder.as_mut())?;
         } else {
             append_null_to_builder(builder.as_mut())?;
         }
@@ -4063,6 +4100,80 @@ fn warm_string_value(
             array.data_type()
         )))
     }
+}
+
+#[cfg(feature = "lance-cache")]
+fn batch_string_value(
+    batch: &RecordBatch,
+    column_idx: Option<usize>,
+    row: usize,
+) -> Result<Option<String>> {
+    let Some(column_idx) = column_idx else {
+        return Ok(None);
+    };
+    let array = batch.column(column_idx);
+    if row >= array.len() || array.is_null(row) {
+        return Ok(None);
+    }
+
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        Ok(Some(array.value(row).to_string()))
+    } else if let Some(array) = array.as_any().downcast_ref::<StringViewArray>() {
+        Ok(Some(array.value(row).to_string()))
+    } else if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
+        Ok(Some(array.value(row).to_string()))
+    } else {
+        Err(DataFusionError::Execution(format!(
+            "Lance batch column expected string array, got {:?}",
+            array.data_type()
+        )))
+    }
+}
+
+#[cfg(feature = "lance-cache")]
+fn batch_i64_value(batch: &RecordBatch, column_idx: Option<usize>, row: usize) -> Option<i64> {
+    let array = batch.column(column_idx?);
+    if row >= array.len() || array.is_null(row) {
+        return None;
+    }
+
+    if let Some(array) = array.as_any().downcast_ref::<Int8Array>() {
+        Some(array.value(row) as i64)
+    } else if let Some(array) = array.as_any().downcast_ref::<Int16Array>() {
+        Some(array.value(row) as i64)
+    } else if let Some(array) = array.as_any().downcast_ref::<Int32Array>() {
+        Some(array.value(row) as i64)
+    } else if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
+        Some(array.value(row))
+    } else if let Some(array) = array.as_any().downcast_ref::<UInt8Array>() {
+        Some(array.value(row) as i64)
+    } else if let Some(array) = array.as_any().downcast_ref::<UInt16Array>() {
+        Some(array.value(row) as i64)
+    } else if let Some(array) = array.as_any().downcast_ref::<UInt32Array>() {
+        Some(array.value(row) as i64)
+    } else {
+        array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map(|array| array.value(row) as i64)
+    }
+}
+
+#[cfg(feature = "lance-cache")]
+fn resolve_batch_coloc_indices(batch: &RecordBatch) -> Option<WarmColocIndices> {
+    let schema = batch.schema();
+    let find = |name: &str| schema.index_of(name).ok();
+    Some(WarmColocIndices {
+        variation_name: find("variation_name")?,
+        end_col: find("end"),
+        failed: find("failed"),
+        somatic: find("somatic"),
+        pheno: find("phenotype_or_disease"),
+        clin_sig: find("clin_sig"),
+        clin_sig_allele: find("clin_sig_allele"),
+        pubmed: find("pubmed"),
+        af_indices: AF_COL_NAMES.iter().map(|name| find(name)).collect(),
+    })
 }
 
 fn append_array_value_to_builder(
