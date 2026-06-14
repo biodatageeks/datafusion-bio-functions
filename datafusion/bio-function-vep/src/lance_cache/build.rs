@@ -126,13 +126,19 @@ async fn build_lance_context_entity(
     }
 
     let table_name = entity_table_name(kind);
-    let chroms = discover_chroms(options, kind, table_name).await?;
+    let (chroms, provider_schema) = discover_chroms_and_schema(options, kind, table_name).await?;
+    let transcript_schema = (kind == EnsemblEntityKind::Transcript).then_some(provider_schema);
     let mut manifest_entries = Vec::new();
     let mut files = Vec::new();
     let index_kind = context_index_kind(kind);
 
     for chrom in chroms {
-        let query = build_export_query(kind, table_name, Some(&chrom), None);
+        let query = build_export_query(
+            kind,
+            table_name,
+            Some(&chrom),
+            transcript_schema.as_ref().map(|schema| schema.as_ref()),
+        );
         let manifest_chrom = canonical_chrom_label(&chrom);
         let dataset_name = dataset_dir_name(&manifest_chrom);
         let dataset_path = entity_dir.join(&dataset_name);
@@ -260,9 +266,20 @@ async fn discover_chroms(
     kind: EnsemblEntityKind,
     table_name: &str,
 ) -> Result<Vec<String>> {
+    discover_chroms_and_schema(options, kind, table_name)
+        .await
+        .map(|(chroms, _)| chroms)
+}
+
+async fn discover_chroms_and_schema(
+    options: &LanceCacheBuildOptions,
+    kind: EnsemblEntityKind,
+    table_name: &str,
+) -> Result<(Vec<String>, SchemaRef)> {
     let ctx = make_ctx_and_register(options, kind, table_name)?;
     let table = ctx.table(table_name).await?;
-    Ok(chroms_from_schema(table.schema().inner()))
+    let schema = Arc::clone(table.schema().inner());
+    Ok((chroms_from_schema(&schema), schema))
 }
 
 async fn write_query_stream_to_lance<F>(
@@ -727,6 +744,28 @@ mod tests {
         let query = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom = 'chr1'");
         assert!(query.contains("PARTITION BY chrom, transcript_id"));
         assert!(query.contains("WHERE chrom = 'chr1'"));
+    }
+
+    #[test]
+    fn transcript_context_query_uses_provider_schema() {
+        let schema = Schema::new(vec![
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("stable_id", DataType::Utf8, false),
+            Field::new("source_file", DataType::Utf8, false),
+            Field::new("cds_start", DataType::Int64, true),
+        ]);
+
+        let query = build_export_query(
+            EnsemblEntityKind::Transcript,
+            "tx",
+            Some("1"),
+            Some(&schema),
+        );
+
+        assert!(query.contains("ROW_NUMBER()"));
+        assert!(query.contains("PARTITION BY chrom, stable_id"));
+        assert!(query.contains("WHERE chrom = '1'"));
     }
 
     #[test]
