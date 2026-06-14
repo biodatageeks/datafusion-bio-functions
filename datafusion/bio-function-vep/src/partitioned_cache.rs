@@ -13,6 +13,8 @@
 //!   translation_sift/chr1.parquet
 //!   regulatory/chr1.parquet
 //!   motif/chr1.parquet
+//!   variation.lance/chrom_manifest.json
+//!   variation.lance/chr1.lance/
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -101,6 +103,46 @@ impl PartitionedParquetCache {
     /// Base directory of the cache.
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
+    }
+}
+
+/// Represents a partitioned per-chromosome Lance cache directory.
+#[cfg(feature = "lance-cache")]
+#[derive(Debug, Clone)]
+pub struct PartitionedLanceCache {
+    base_dir: PathBuf,
+    variation_manifest: crate::lance_cache::manifest::ChromManifest,
+}
+
+#[cfg(feature = "lance-cache")]
+impl PartitionedLanceCache {
+    /// Detect a Lance cache layout at `cache_source`.
+    ///
+    /// Returns `Some` when `variation.lance/chrom_manifest.json` can be read.
+    pub fn detect(cache_source: &str) -> Option<Self> {
+        let base_dir = PathBuf::from(cache_source);
+        let variation_dir = base_dir.join("variation.lance");
+        let variation_manifest =
+            crate::lance_cache::manifest::ChromManifest::read_from_entity_dir(&variation_dir)
+                .ok()?;
+        Some(Self {
+            base_dir,
+            variation_manifest,
+        })
+    }
+
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    pub fn available_chroms(&self) -> Vec<&str> {
+        self.variation_manifest.available_chroms()
+    }
+
+    pub fn variation_path(&self, chrom: &str) -> Option<PathBuf> {
+        self.variation_manifest
+            .path_for_chrom(chrom)
+            .map(|path| self.base_dir.join("variation.lance").join(path))
     }
 }
 
@@ -279,5 +321,26 @@ mod tests {
         assert!(cache.has_chrom("transcript", "chr1"));
         assert!(!cache.has_chrom("transcript", "chr99"));
         assert!(!cache.has_chrom("nonexistent", "chr1"));
+    }
+
+    #[cfg(feature = "lance-cache")]
+    #[test]
+    fn detects_partitioned_lance_cache_from_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let variation = tmp.path().join("variation.lance");
+        std::fs::create_dir_all(variation.join("chr1.lance")).unwrap();
+        let manifest = crate::lance_cache::manifest::ChromManifest::new(vec![
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
+        ]);
+        manifest.write_to_entity_dir(&variation).unwrap();
+
+        let cache = PartitionedLanceCache::detect(tmp.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(cache.available_chroms(), ["chr1"]);
+        assert_eq!(
+            cache.variation_path("chr1").unwrap(),
+            variation.join("chr1.lance")
+        );
+        assert!(cache.variation_path("chr2").is_none());
     }
 }
