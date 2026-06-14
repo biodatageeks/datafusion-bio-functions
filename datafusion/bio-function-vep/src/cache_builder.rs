@@ -153,6 +153,10 @@ pub struct CacheBuilder {
     variation_cold_row_group_rows: usize,
     variation_cold_data_page_row_count: usize,
     variation_tier_batch_size: usize,
+    /// Max number of entity build tasks allowed to run concurrently in
+    /// `build_all`. 1 reproduces the original serial behaviour; higher values
+    /// overlap entities (which write to disjoint output dirs).
+    build_concurrency: usize,
     on_progress: Option<Arc<OnProgress>>,
 }
 
@@ -174,6 +178,7 @@ impl CacheBuilder {
             variation_cold_row_group_rows: DEFAULT_VARIATION_COLD_ROW_GROUP_ROWS,
             variation_cold_data_page_row_count: DEFAULT_VARIATION_COLD_DATA_PAGE_ROW_COUNT,
             variation_tier_batch_size: 65_536,
+            build_concurrency: 1,
             on_progress: None,
         }
     }
@@ -271,8 +276,23 @@ impl CacheBuilder {
         self
     }
 
+    /// Set the maximum number of entity build tasks that may run concurrently
+    /// in `build_all`. Clamped to at least 1.
+    pub fn with_build_concurrency(mut self, n: usize) -> Self {
+        self.build_concurrency = n.max(1);
+        self
+    }
+
     /// Build all entities (parquet + optional fjall).
-    pub async fn build_all(&self) -> Result<Vec<EntityStats>> {
+    ///
+    /// Entities write to disjoint output directories (`variation/`, `transcript/`,
+    /// `exon/`, `translation_core|sift/`, `regulatory/`, `motif/`) and share no
+    /// mutable state, so they are built concurrently — each entity runs as its
+    /// own task on the shared runtime. A hard error aborts the remaining tasks
+    /// and drains them before returning, so no orphaned task keeps writing after
+    /// the failure. "skipped" / "No source files discovered" outcomes are not
+    /// errors and are logged, matching the previous serial behaviour.
+    pub async fn build_all(self: Arc<Self>) -> Result<Vec<EntityStats>> {
         let entities = [
             "variation",
             "transcript",
@@ -281,15 +301,35 @@ impl CacheBuilder {
             "regulatory",
             "motif",
         ];
-        let mut results = Vec::new();
+        // One global budget of `build_concurrency` permits, acquired per
+        // chromosome-unit (not per entity), so that entity-level and
+        // chromosome-level concurrency share a single bound on peak memory.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.build_concurrency.max(1)));
+        let mut set = tokio::task::JoinSet::new();
         for entity in entities {
-            match self.build_entity(entity).await {
+            let cb = Arc::clone(&self);
+            let sem = Arc::clone(&semaphore);
+            let entity = entity.to_string();
+            set.spawn(async move {
+                let stats = cb.build_entity(&entity, sem).await;
+                (entity, stats)
+            });
+        }
+
+        let mut results = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            let (entity, stats) = joined.map_err(|e| {
+                DataFusionError::Execution(format!("entity build task failed to join: {e}"))
+            })?;
+            match stats {
                 Ok(stats) => results.extend(stats),
                 Err(e) => {
                     let msg = e.to_string();
                     if msg.contains("No source files discovered") || msg.contains("skipped") {
                         info!("{entity}: skipped (no source files)");
                     } else {
+                        set.abort_all();
+                        while set.join_next().await.is_some() {}
                         return Err(e);
                     }
                 }
@@ -305,7 +345,11 @@ impl CacheBuilder {
     /// - For parquet-only entities: skips if the parquet directory contains `.parquet` files
     /// - For variation: skips parquet if files exist, skips fjall if `variation.fjall` exists
     /// - For translation: skips parquet if files exist, skips sift fjall if `translation_sift.fjall` exists
-    pub async fn build_entity(&self, entity: &str) -> Result<Vec<EntityStats>> {
+    pub async fn build_entity(
+        self: Arc<Self>,
+        entity: &str,
+        sem: Arc<tokio::sync::Semaphore>,
+    ) -> Result<Vec<EntityStats>> {
         let kind = parse_entity(entity)
             .ok_or_else(|| DataFusionError::Execution(format!("Unknown entity: {entity}")))?;
 
@@ -344,15 +388,15 @@ impl CacheBuilder {
         }
 
         if kind == EnsemblEntityKind::Variation {
-            return self.build_variation().await;
+            return self.build_variation(sem).await;
         }
 
         if kind == EnsemblEntityKind::Translation {
-            return self.build_translation().await;
+            return self.build_translation(sem).await;
         }
 
         // All other entities: parquet only
-        let results = self.build_parquet_entity(kind).await?;
+        let results = self.build_parquet_entity(kind, sem).await?;
         Ok(vec![EntityStats {
             entity: subdir.to_string(),
             parquet_files: results,
@@ -364,7 +408,10 @@ impl CacheBuilder {
     ///
     /// When parquet files already exist and fjall is missing, reads from the
     /// existing parquet files to populate fjall without re-parsing the source.
-    async fn build_variation(&self) -> Result<Vec<EntityStats>> {
+    async fn build_variation(
+        self: Arc<Self>,
+        sem: Arc<tokio::sync::Semaphore>,
+    ) -> Result<Vec<EntityStats>> {
         let kind = EnsemblEntityKind::Variation;
         let table_name = "var";
         let parquet_dir = format!("{}/variation", self.output_dir);
@@ -442,244 +489,45 @@ impl CacheBuilder {
 
         let mut parquet_results: Vec<(String, usize)> = Vec::new();
 
-        // Build a unified processing list: main chroms (in chrom_code order)
-        // then non-main contigs (sorted by hash-based chrom_code for ascending
-        // fjall keys). Main chroms get individual parquet files; other contigs
-        // share other.parquet. All contigs feed fjall.
-        //
-        // Each entry: (chrom, output_path, is_other)
-        let mut chrom_batches: Vec<(String, String, bool)> = Vec::new();
+        // Main chroms (in chrom_code order) each produce independent
+        // chrN_warm/chrN_cold files; non-main contigs share other.parquet.
+        let mut main_in_order: Vec<String> = Vec::new();
         for chrom in CHROM_CODE_ORDER {
             if main_chroms.iter().any(|c| c == chrom) {
-                let out = format!("{}/variation/chr{chrom}.parquet", self.output_dir);
-                chrom_batches.push((chrom.to_string(), out, false));
+                main_in_order.push(chrom.to_string());
             }
         }
-
         // Sort other_chroms alphabetically for deterministic other.parquet output.
-        // Fjall key ordering is handled later by build_variation_fjall_from_parquet().
         let mut sorted_other = other_chroms.clone();
         sorted_other.sort();
+
+        // Build main chroms concurrently (each is an independent output file),
+        // plus the combined "other" contigs as a single unit. All units share
+        // the global `sem` budget (one permit each).
+        let mut set = tokio::task::JoinSet::new();
+        for chrom in main_in_order {
+            let cb = Arc::clone(&self);
+            let permits = Arc::clone(&sem);
+            let output_file = format!("{}/variation/chr{chrom}.parquet", self.output_dir);
+            set.spawn(async move {
+                let _permit = permits.acquire_owned().await.expect("semaphore closed");
+                cb.build_variation_main_chrom(chrom, output_file).await
+            });
+        }
         if !sorted_other.is_empty() {
-            let other_out = format!("{}/variation/other.parquet", self.output_dir);
-            for chrom in &sorted_other {
-                chrom_batches.push((chrom.clone(), other_out.clone(), true));
-            }
+            let cb = Arc::clone(&self);
+            let permits = Arc::clone(&sem);
+            let others = sorted_other.clone();
+            set.spawn(async move {
+                let _permit = permits.acquire_owned().await.expect("semaphore closed");
+                cb.build_variation_other(others).await
+            });
         }
-
-        let mut total_parquet_rows: usize = 0;
-
-        // Shared writer for other.parquet (opened lazily)
-        let mut other_writer: Option<ArrowWriter<File>> = None;
-        let mut other_total_rows = 0usize;
-
-        for (chrom, output_file, is_other) in &chrom_batches {
-            let ctx = make_ctx_and_register(
-                &self.cache_root,
-                kind,
-                table_name,
-                self.partitions,
-                self.cache_source_type,
-            )?;
-            let query = build_export_query(kind, table_name, Some(chrom), None);
-
-            let df = ctx.sql(&query).await?;
-            let plan = df.create_physical_plan().await?;
-
-            // Check if the plan has a SortPreservingMergeExec wrapping a
-            // multi-partition inner plan.  If so, use parallel execution.
-            let inner_plan = extract_multi_partition_inner(&plan);
-            let num_partitions = inner_plan
-                .as_ref()
-                .map(|p| p.properties().partitioning.partition_count())
-                .unwrap_or(1);
-
-            info!(
-                "variation: [{chrom}] {} partitions (parallel={})",
-                num_partitions,
-                inner_plan.is_some()
-            );
-
-            let schema = plan.schema();
-            let sk = sort_key(kind);
-
-            // For main chroms: create a new writer per chrom.
-            // For other contigs: use shared other_writer (opened lazily).
-            let mut main_writer: Option<ArrowWriter<File>> = None;
-            let writer = if *is_other {
-                if other_writer.is_none() {
-                    other_writer = Some(create_writer(output_file, &schema, kind, sk, None)?);
-                }
-                other_writer.as_mut().unwrap()
-            } else {
-                main_writer = Some(create_writer(output_file, &schema, kind, sk, None)?);
-                main_writer.as_mut().unwrap()
-            };
-
-            let mut chrom_rows = 0usize;
-            let mut variation_tier_written = false;
-
-            if let Some(inner) = inner_plan.filter(|_| num_partitions > 1 && !is_other) {
-                // --- Parallel path: write N temp parquet files, then build
-                // warm/cold tiers directly from those parts. This avoids the
-                // previous serial chrN.parquet -> warm/cold split pass.
-                let temp_dir = format!("{}/variation/_tmp_{chrom}", self.output_dir);
-                std::fs::create_dir_all(&temp_dir).map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to create temp dir: {e}"))
-                })?;
-
-                // Phase 1: Execute all partitions in parallel, each writes a temp parquet
-                let task_ctx = ctx.task_ctx();
-                let mut handles = tokio::task::JoinSet::new();
-                for partition_idx in 0..num_partitions {
-                    let stream = inner.execute(partition_idx, Arc::clone(&task_ctx))?;
-                    let part_schema = stream.schema();
-                    let part_file = format!("{temp_dir}/part_{partition_idx}.parquet");
-                    let part_sk = sort_key(kind);
-                    handles.spawn(async move {
-                        let mut pw = create_writer(&part_file, &part_schema, kind, part_sk, None)?;
-                        let mut rows = 0usize;
-                        let mut stream = stream;
-                        while let Some(batch_result) = stream.next().await {
-                            let batch = batch_result?;
-                            if batch.num_rows() == 0 {
-                                continue;
-                            }
-                            pw.write(&batch)?;
-                            rows += batch.num_rows();
-                        }
-                        pw.close().map_err(|e| {
-                            DataFusionError::Execution(format!("Failed to close temp parquet: {e}"))
-                        })?;
-                        // Return partition_idx so we can sort by it after JoinSet
-                        Ok::<(usize, String, usize), DataFusionError>((
-                            partition_idx,
-                            part_file,
-                            rows,
-                        ))
-                    });
-                }
-
-                // Collect results — JoinSet returns in completion order
-                let mut part_files: Vec<(usize, String, usize)> = Vec::new();
-                while let Some(result) = handles.join_next().await {
-                    let (idx, file, rows) = result
-                        .map_err(|e| DataFusionError::Execution(format!("Task join error: {e}")))?
-                        .map_err(|e: DataFusionError| e)?;
-                    part_files.push((idx, file, rows));
-                }
-                // Sort by partition index for ascending position order
-                part_files.sort_by_key(|(idx, _, _)| *idx);
-
-                let parallel_rows: usize = part_files.iter().map(|(_, _, r)| *r).sum();
-                info!(
-                    "variation: [{chrom}] phase 1 done: {} rows in {} partitions",
-                    format_rows(parallel_rows),
-                    num_partitions
-                );
-
-                // Close and remove the empty base parquet writer; the final
-                // output for main chromosomes is chrN_warm/chrN_cold.
-                {
-                    let empty_writer = main_writer.take().unwrap();
-                    empty_writer.close().map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "Failed to close empty parquet writer: {e}"
-                        ))
-                    })?;
-                }
-                if let Err(error) = std::fs::remove_file(output_file) {
-                    log::debug!(
-                        "variation: failed to remove empty base parquet {output_file}: {error}"
-                    );
-                }
-
-                let tier_results = self.build_variation_tier_from_partition_parquets(
-                    chrom,
-                    &part_files,
-                    Path::new(&temp_dir).join("tier"),
-                )?;
-                let tier_rows: usize = tier_results.iter().map(|(_, rows)| *rows).sum();
-                if tier_rows != parallel_rows {
-                    return Err(DataFusionError::Execution(format!(
-                        "warm/cold tier row count mismatch for {chrom}: wrote {tier_rows}, expected {parallel_rows}"
-                    )));
-                }
-                chrom_rows += tier_rows;
-                total_parquet_rows += tier_rows;
-                parquet_results.extend(tier_results);
-                variation_tier_written = true;
-
-                if let Some(ref cb) = self.on_progress {
-                    cb("variation", "parquet", chrom_rows, total_parquet_rows, 0);
-                }
-
-                // Cleanup temp files
-                if let Err(e) = std::fs::remove_dir_all(&temp_dir) {
-                    log::warn!("Failed to clean up temp dir {temp_dir}: {e}");
-                }
-
-                // Prevent the outer close from running on the taken writer
-                // (main_writer was already taken above)
-            } else {
-                // --- Sequential path: single partition, stream directly ---
-                let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
-
-                while let Some(batch_result) = stream.next().await {
-                    let batch = batch_result?;
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-
-                    writer.write(&batch)?;
-                    chrom_rows += batch.num_rows();
-                    total_parquet_rows += batch.num_rows();
-
-                    if let Some(ref cb) = self.on_progress {
-                        cb(
-                            "variation",
-                            "parquet",
-                            batch.num_rows(),
-                            total_parquet_rows,
-                            0,
-                        );
-                    }
-                }
-            }
-
-            // Close main-chrom writer; other_writer stays open across contigs
-            if let Some(w) = main_writer {
-                w.close().map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
-                })?;
-            }
-
-            if *is_other {
-                other_total_rows += chrom_rows;
-            } else if variation_tier_written {
-                info!("variation: {chrom} {} rows", format_rows(chrom_rows));
-            } else if chrom_rows > 0 {
-                parquet_results.extend(self.split_variation_base_parquet(output_file)?);
-                info!("variation: {chrom} {} rows", format_rows(chrom_rows));
-            } else if let Err(error) = std::fs::remove_file(output_file) {
-                log::debug!("variation: failed to remove empty parquet {output_file}: {error}");
-            }
-        }
-
-        // Close shared other.parquet writer
-        if let Some(w) = other_writer {
-            w.close().map_err(|e| {
-                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
-            })?;
-        }
-        if other_total_rows > 0 {
-            let other_out = format!("{}/variation/other.parquet", self.output_dir);
-            parquet_results.extend(self.split_variation_base_parquet(&other_out)?);
-            info!(
-                "variation: other {} rows ({} contigs)",
-                format_rows(other_total_rows),
-                sorted_other.len()
-            );
+        while let Some(joined) = set.join_next().await {
+            let chrom_results = joined.map_err(|e| {
+                DataFusionError::Execution(format!("variation chrom task failed to join: {e}"))
+            })??;
+            parquet_results.extend(chrom_results);
         }
 
         // Phase 2: Build fjall from the parquet files we just wrote.
@@ -704,6 +552,203 @@ impl CacheBuilder {
             parquet_files: parquet_results,
             fjall_stats,
         }])
+    }
+
+    /// Build one main-chromosome variation file (chrN_warm + chrN_cold).
+    /// Self-contained: own context, own temp dir, own output files — safe to
+    /// run concurrently with other chromosomes. Returns the chrom's tier files.
+    async fn build_variation_main_chrom(
+        self: Arc<Self>,
+        chrom: String,
+        output_file: String,
+    ) -> Result<Vec<(String, usize)>> {
+        let kind = EnsemblEntityKind::Variation;
+        let table_name = "var";
+        let ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            table_name,
+            self.partitions,
+            self.cache_source_type,
+        )?;
+        let query = build_export_query(kind, table_name, Some(&chrom), None);
+        let df = ctx.sql(&query).await?;
+        let plan = df.create_physical_plan().await?;
+
+        // If the plan is a SortPreservingMergeExec over a multi-partition inner
+        // plan, write each partition to a temp parquet in parallel, then build
+        // the warm/cold tier from those parts. Otherwise stream sequentially.
+        let inner_plan = extract_multi_partition_inner(&plan);
+        let num_partitions = inner_plan
+            .as_ref()
+            .map(|p| p.properties().partitioning.partition_count())
+            .unwrap_or(1);
+        info!(
+            "variation: [{chrom}] {} partitions (parallel={})",
+            num_partitions,
+            inner_plan.is_some()
+        );
+
+        if let Some(inner) = inner_plan.filter(|_| num_partitions > 1) {
+            let temp_dir = format!("{}/variation/_tmp_{chrom}", self.output_dir);
+            std::fs::create_dir_all(&temp_dir).map_err(|e| {
+                DataFusionError::Execution(format!("Failed to create temp dir: {e}"))
+            })?;
+
+            let task_ctx = ctx.task_ctx();
+            let mut handles = tokio::task::JoinSet::new();
+            for partition_idx in 0..num_partitions {
+                let stream = inner.execute(partition_idx, Arc::clone(&task_ctx))?;
+                let part_schema = stream.schema();
+                let part_file = format!("{temp_dir}/part_{partition_idx}.parquet");
+                let part_sk = sort_key(kind);
+                handles.spawn(async move {
+                    let mut pw = create_writer(&part_file, &part_schema, kind, part_sk, None)?;
+                    let mut rows = 0usize;
+                    let mut stream = stream;
+                    while let Some(batch_result) = stream.next().await {
+                        let batch = batch_result?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        pw.write(&batch)?;
+                        rows += batch.num_rows();
+                    }
+                    pw.close().map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to close temp parquet: {e}"))
+                    })?;
+                    Ok::<(usize, String, usize), DataFusionError>((partition_idx, part_file, rows))
+                });
+            }
+
+            let mut part_files: Vec<(usize, String, usize)> = Vec::new();
+            while let Some(result) = handles.join_next().await {
+                let (idx, file, rows) = result
+                    .map_err(|e| DataFusionError::Execution(format!("Task join error: {e}")))??;
+                part_files.push((idx, file, rows));
+            }
+            part_files.sort_by_key(|(idx, _, _)| *idx);
+            let parallel_rows: usize = part_files.iter().map(|(_, _, r)| *r).sum();
+            info!(
+                "variation: [{chrom}] phase 1 done: {} rows in {} partitions",
+                format_rows(parallel_rows),
+                num_partitions
+            );
+
+            let tier_results = self.build_variation_tier_from_partition_parquets(
+                &chrom,
+                &part_files,
+                Path::new(&temp_dir).join("tier"),
+            )?;
+            let tier_rows: usize = tier_results.iter().map(|(_, rows)| *rows).sum();
+            if tier_rows != parallel_rows {
+                return Err(DataFusionError::Execution(format!(
+                    "warm/cold tier row count mismatch for {chrom}: wrote {tier_rows}, expected {parallel_rows}"
+                )));
+            }
+            if let Some(ref cb) = self.on_progress {
+                cb("variation", "parquet", tier_rows, tier_rows, 0);
+            }
+            if let Err(e) = std::fs::remove_dir_all(&temp_dir) {
+                log::warn!("Failed to clean up temp dir {temp_dir}: {e}");
+            }
+            info!("variation: {chrom} {} rows", format_rows(tier_rows));
+            Ok(tier_results)
+        } else {
+            let schema = plan.schema();
+            let sk = sort_key(kind);
+            let mut writer = create_writer(&output_file, &schema, kind, sk, None)?;
+            let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+            let mut chrom_rows = 0usize;
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                writer.write(&batch)?;
+                chrom_rows += batch.num_rows();
+                if let Some(ref cb) = self.on_progress {
+                    cb("variation", "parquet", batch.num_rows(), chrom_rows, 0);
+                }
+            }
+            writer.close().map_err(|e| {
+                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+            })?;
+
+            if chrom_rows > 0 {
+                let results = self.split_variation_base_parquet(&output_file)?;
+                info!("variation: {chrom} {} rows", format_rows(chrom_rows));
+                Ok(results)
+            } else {
+                if let Err(error) = std::fs::remove_file(&output_file) {
+                    log::debug!(
+                        "variation: failed to remove empty parquet {output_file}: {error}"
+                    );
+                }
+                Ok(vec![])
+            }
+        }
+    }
+
+    /// Build the combined non-main-contig variation file (other.parquet) as a
+    /// single unit (one shared writer across contigs), then split into tiers.
+    async fn build_variation_other(
+        self: Arc<Self>,
+        sorted_other: Vec<String>,
+    ) -> Result<Vec<(String, usize)>> {
+        let kind = EnsemblEntityKind::Variation;
+        let table_name = "var";
+        let other_out = format!("{}/variation/other.parquet", self.output_dir);
+        let mut other_writer: Option<ArrowWriter<File>> = None;
+        let mut other_total_rows = 0usize;
+
+        for chrom in &sorted_other {
+            let ctx = make_ctx_and_register(
+                &self.cache_root,
+                kind,
+                table_name,
+                self.partitions,
+                self.cache_source_type,
+            )?;
+            let query = build_export_query(kind, table_name, Some(chrom), None);
+            let df = ctx.sql(&query).await?;
+            let plan = df.create_physical_plan().await?;
+            let schema = plan.schema();
+            let sk = sort_key(kind);
+            if other_writer.is_none() {
+                other_writer = Some(create_writer(&other_out, &schema, kind, sk, None)?);
+            }
+            let writer = other_writer.as_mut().unwrap();
+            let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                writer.write(&batch)?;
+                other_total_rows += batch.num_rows();
+                if let Some(ref cb) = self.on_progress {
+                    cb("variation", "parquet", batch.num_rows(), other_total_rows, 0);
+                }
+            }
+        }
+
+        if let Some(w) = other_writer {
+            w.close().map_err(|e| {
+                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+            })?;
+        }
+        if other_total_rows > 0 {
+            let results = self.split_variation_base_parquet(&other_out)?;
+            info!(
+                "variation: other {} rows ({} contigs)",
+                format_rows(other_total_rows),
+                sorted_other.len()
+            );
+            Ok(results)
+        } else {
+            Ok(vec![])
+        }
     }
 
     fn build_variation_tier_from_base_parquet(
@@ -1207,7 +1252,10 @@ impl CacheBuilder {
     }
 
     /// Build translation: split into core + sift parquet, then fjall for sift.
-    async fn build_translation(&self) -> Result<Vec<EntityStats>> {
+    async fn build_translation(
+        self: Arc<Self>,
+        sem: Arc<tokio::sync::Semaphore>,
+    ) -> Result<Vec<EntityStats>> {
         let table_name = "tl";
         let kind = EnsemblEntityKind::Translation;
 
@@ -1251,11 +1299,22 @@ impl CacheBuilder {
         let mut core_results: Vec<(String, usize)> = Vec::new();
         let mut sift_results: Vec<(String, usize)> = Vec::new();
 
-        // Process each main chromosome
+        // Process main chromosomes concurrently (each writes its own
+        // translation_core/ and translation_sift/ chrN files), bounded by sem.
+        let mut set = tokio::task::JoinSet::new();
         for chrom in &main_chroms {
-            let (core_res, sift_res) = self
-                .build_translation_chrom(chrom, kind, table_name)
-                .await?;
+            let cb = Arc::clone(&self);
+            let permits = Arc::clone(&sem);
+            let chrom = chrom.clone();
+            set.spawn(async move {
+                let _permit = permits.acquire_owned().await.expect("semaphore closed");
+                cb.build_translation_chrom(&chrom, kind, table_name).await
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let (core_res, sift_res) = joined.map_err(|e| {
+                DataFusionError::Execution(format!("translation chrom task failed to join: {e}"))
+            })??;
             if let Some(r) = core_res {
                 core_results.push(r);
             }
@@ -1264,8 +1323,9 @@ impl CacheBuilder {
             }
         }
 
-        // Process other contigs
+        // Process other contigs as a single unit.
         if !other_chroms.is_empty() {
+            let _permit = sem.acquire().await.expect("semaphore closed");
             let (core_res, sift_res) = self
                 .build_translation_multi_chrom(&other_chroms, kind, table_name)
                 .await?;
@@ -1802,7 +1862,15 @@ impl CacheBuilder {
     }
 
     /// Build a parquet-only entity (transcript, exon, regulatory, motif).
-    async fn build_parquet_entity(&self, kind: EnsemblEntityKind) -> Result<Vec<(String, usize)>> {
+    ///
+    /// Each main chromosome and the combined "other contigs" file are
+    /// independent output files, so they are built concurrently — bounded by
+    /// the shared `sem` budget (one permit per chromosome unit).
+    async fn build_parquet_entity(
+        self: Arc<Self>,
+        kind: EnsemblEntityKind,
+        sem: Arc<tokio::sync::Semaphore>,
+    ) -> Result<Vec<(String, usize)>> {
         let table_name = entity_table_name(kind);
         let subdir = entity_subdir(kind);
         // Transcript uses an explicit column list (for HGNC propagation) that
@@ -1833,123 +1901,112 @@ impl CacheBuilder {
             other_chroms.len()
         );
 
-        let mut all_results = Vec::new();
-        let global_start = Instant::now();
-        let mut total_rows: usize = 0;
-
         let tx_schema = if kind == EnsemblEntityKind::Transcript {
             Some(provider_schema.as_ref())
         } else {
             None
         };
 
+        // Build the (query, output_file) work list up front. Export queries are
+        // self-contained strings, so no schema borrow crosses into the spawned
+        // tasks. Each main chrom is its own file; "other" contigs share one file.
+        let mut units: Vec<(String, String)> = Vec::new();
         for chrom in &main_chroms {
-            let ctx = make_ctx_and_register(
-                &self.cache_root,
-                kind,
-                table_name,
-                self.partitions,
-                self.cache_source_type,
-            )?;
             let query = build_export_query(kind, table_name, Some(chrom), tx_schema);
             let output_file = format!("{}/{subdir}/chr{chrom}.parquet", self.output_dir);
-
-            let df = ctx.sql(&query).await?;
-            let df = if needs_rn_drop {
-                let schema = df.schema().clone();
-                let cols: Vec<_> = schema
-                    .columns()
-                    .into_iter()
-                    .filter(|c| c.name() != "_rn")
-                    .collect();
-                df.select_columns(&cols.iter().map(|c| c.name()).collect::<Vec<_>>())?
-            } else {
-                df
-            };
-            let mut stream = df.execute_stream().await?;
-            let schema = stream.schema();
-            let sk = sort_key(kind);
-            let mut writer = create_writer(&output_file, &schema, kind, sk, None)?;
-
-            let mut chrom_rows = 0usize;
-            while let Some(batch_result) = stream.next().await {
-                let batch = batch_result?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                chrom_rows += batch.num_rows();
-                total_rows += batch.num_rows();
-                writer.write(&batch)?;
-
-                if let Some(ref cb) = self.on_progress {
-                    cb(subdir, "parquet", batch.num_rows(), total_rows, 0);
-                }
-            }
-            writer.close().map_err(|e| {
-                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
-            })?;
-
-            if chrom_rows > 0 {
-                all_results.push((output_file, chrom_rows));
-            }
+            units.push((query, output_file));
         }
-
-        // Process remaining contigs as "other.parquet"
         if !other_chroms.is_empty() {
-            let ctx = make_ctx_and_register(
-                &self.cache_root,
-                kind,
-                table_name,
-                self.partitions,
-                self.cache_source_type,
-            )?;
             let other_refs: Vec<&str> = other_chroms.iter().map(|s| s.as_str()).collect();
             let query = build_export_query_multi_chrom(kind, table_name, &other_refs, tx_schema);
             let output_file = format!("{}/{subdir}/other.parquet", self.output_dir);
+            units.push((query, output_file));
+        }
 
-            let df = ctx.sql(&query).await?;
-            let df = if needs_rn_drop {
-                let schema = df.schema().clone();
-                let cols: Vec<_> = schema
-                    .columns()
-                    .into_iter()
-                    .filter(|c| c.name() != "_rn")
-                    .collect();
-                df.select_columns(&cols.iter().map(|c| c.name()).collect::<Vec<_>>())?
-            } else {
-                df
-            };
-            let mut stream = df.execute_stream().await?;
-            let schema = stream.schema();
-            let sk = sort_key(kind);
-            let mut writer = create_writer(&output_file, &schema, kind, sk, None)?;
+        let global_start = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for (query, output_file) in units {
+            let cb = Arc::clone(&self);
+            let permits = Arc::clone(&sem);
+            set.spawn(async move {
+                let _permit = permits.acquire_owned().await.expect("semaphore closed");
+                cb.build_parquet_query_to_file(kind, query, output_file, needs_rn_drop)
+                    .await
+            });
+        }
 
-            let mut other_rows = 0usize;
-            while let Some(batch_result) = stream.next().await {
-                let batch = batch_result?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                other_rows += batch.num_rows();
-                total_rows += batch.num_rows();
-                writer.write(&batch)?;
-
-                if let Some(ref cb) = self.on_progress {
-                    cb(subdir, "parquet", batch.num_rows(), total_rows, 0);
-                }
-            }
-            writer.close().map_err(|e| {
-                DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+        let mut all_results = Vec::new();
+        let mut total_rows: usize = 0;
+        while let Some(joined) = set.join_next().await {
+            let res = joined.map_err(|e| {
+                DataFusionError::Execution(format!("{subdir} chrom task failed to join: {e}"))
             })?;
-
-            if other_rows > 0 {
-                all_results.push((output_file, other_rows));
+            if let Some((file, rows)) = res? {
+                total_rows += rows;
+                all_results.push((file, rows));
             }
         }
 
         let elapsed = global_start.elapsed().as_secs_f64();
         print_progress(subdir, total_rows, elapsed);
         Ok(all_results)
+    }
+
+    /// Run one export query and stream it to a single parquet file.
+    /// Returns `Some((path, rows))` when rows were written, else `None`.
+    async fn build_parquet_query_to_file(
+        self: Arc<Self>,
+        kind: EnsemblEntityKind,
+        query: String,
+        output_file: String,
+        needs_rn_drop: bool,
+    ) -> Result<Option<(String, usize)>> {
+        let subdir = entity_subdir(kind);
+        let ctx = make_ctx_and_register(
+            &self.cache_root,
+            kind,
+            entity_table_name(kind),
+            self.partitions,
+            self.cache_source_type,
+        )?;
+        let df = ctx.sql(&query).await?;
+        let df = if needs_rn_drop {
+            let schema = df.schema().clone();
+            let cols: Vec<_> = schema
+                .columns()
+                .into_iter()
+                .filter(|c| c.name() != "_rn")
+                .collect();
+            df.select_columns(&cols.iter().map(|c| c.name()).collect::<Vec<_>>())?
+        } else {
+            df
+        };
+        let mut stream = df.execute_stream().await?;
+        let schema = stream.schema();
+        let sk = sort_key(kind);
+        let mut writer = create_writer(&output_file, &schema, kind, sk, None)?;
+
+        let mut rows = 0usize;
+        while let Some(batch_result) = stream.next().await {
+            let batch = batch_result?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            rows += batch.num_rows();
+            writer.write(&batch)?;
+            if let Some(ref cb) = self.on_progress {
+                cb(subdir, "parquet", batch.num_rows(), rows, 0);
+            }
+        }
+        writer.close().map_err(|e| {
+            DataFusionError::Execution(format!("Failed to close parquet writer: {e}"))
+        })?;
+
+        if rows > 0 {
+            Ok(Some((output_file, rows)))
+        } else {
+            Ok(None)
+        }
     }
 }
 
