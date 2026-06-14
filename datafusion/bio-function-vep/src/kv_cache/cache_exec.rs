@@ -99,6 +99,7 @@ pub struct KvLookupExec {
     /// Optional indexed reference FASTA for genomic shift state in colocated
     /// matching (parity with parquet path's two-pass allele matching).
     reference_fasta_path: Option<String>,
+    target_partitions: usize,
     #[cfg(test)]
     warm_cache_dir_override: Option<PathBuf>,
 }
@@ -196,6 +197,7 @@ impl KvLookupExec {
             colocated_sink: None,
             colocated_partition_sinks: None,
             reference_fasta_path: None,
+            target_partitions: 1,
             #[cfg(test)]
             warm_cache_dir_override: None,
         })
@@ -245,6 +247,7 @@ impl KvLookupExec {
             colocated_sink: None,
             colocated_partition_sinks: None,
             reference_fasta_path: None,
+            target_partitions: 1,
             #[cfg(test)]
             warm_cache_dir_override: None,
         })
@@ -295,9 +298,15 @@ impl KvLookupExec {
             colocated_sink: None,
             colocated_partition_sinks: None,
             reference_fasta_path: None,
+            target_partitions: 1,
             #[cfg(test)]
             warm_cache_dir_override: None,
         })
+    }
+
+    pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
+        self.target_partitions = target_partitions.max(1);
+        self
     }
 
     /// Set the co-located data sink for piggybacked collection during probe.
@@ -423,6 +432,7 @@ impl ExecutionPlan for KvLookupExec {
             exec = exec.with_colocated_partition_sinks(sinks.clone());
         }
         exec = exec.with_reference_fasta_path(self.reference_fasta_path.clone());
+        exec = exec.with_target_partitions(self.target_partitions);
         #[cfg(test)]
         if let Some(path) = &self.warm_cache_dir_override {
             exec = exec.with_warm_cache_dir_override(path.clone());
@@ -459,6 +469,7 @@ impl ExecutionPlan for KvLookupExec {
             self.output_col_positions.clone(),
             colocated_sink,
             self.reference_fasta_path.clone(),
+            self.target_partitions,
         );
 
         #[cfg(test)]
@@ -502,6 +513,7 @@ struct KvLookupStream {
     /// Optional indexed reference FASTA reader for genomic shift state.
     reference_reader:
         Option<noodles_fasta::IndexedReader<noodles_fasta::io::BufReader<std::fs::File>>>,
+    target_partitions: usize,
     warm_cache_dir: Option<PathBuf>,
     warm_chroms: HashMap<String, Option<Box<WarmChromCache>>>,
     cold_parquet_chroms: HashMap<String, Option<ColdParquetLookupSet>>,
@@ -1471,6 +1483,7 @@ impl KvLookupStream {
         output_col_positions: Vec<usize>,
         colocated_sink: Option<ColocatedSink>,
         reference_fasta_path: Option<String>,
+        target_partitions: usize,
     ) -> Self {
         // Resolve colocated column indices within the KV entry if we have a sink.
         let coloc_col_indices = colocated_sink
@@ -1604,6 +1617,7 @@ impl KvLookupStream {
             colocated_sink,
             coloc_col_indices,
             reference_reader,
+            target_partitions: target_partitions.max(1),
             warm_cache_dir,
             warm_chroms: HashMap::new(),
             cold_parquet_chroms: HashMap::new(),
@@ -2578,7 +2592,8 @@ impl KvLookupStream {
                 )));
             }
             let projection = cold_parquet_projection_columns(cache_columns, collect_colocated);
-            let lookup = ColdParquetLookupSet::from_env(cold_paths, projection)?;
+            let lookup = ColdParquetLookupSet::from_env(cold_paths, projection)?
+                .with_target_partitions(self.target_partitions);
             self.cold_parquet_chroms
                 .insert(chrom.to_string(), Some(lookup));
         }
@@ -4641,6 +4656,7 @@ pub fn lookup_batch_with_store(
         output_col_positions,
         colocated_sink,
         reference_fasta_path,
+        1,
     );
     let batch = stream.process_batch(vcf_batch);
     if stream.profile_enabled && !stream.profile_emitted {

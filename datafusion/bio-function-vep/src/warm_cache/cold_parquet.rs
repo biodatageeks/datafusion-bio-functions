@@ -19,7 +19,8 @@ use crate::warm_cache::reader::projection_for_existing_roots;
 
 const DEFAULT_COLD_PARQUET_BATCH_SIZE: usize = 262_144;
 const DEFAULT_COLD_PARQUET_ROW_GROUP_CACHE: usize = 2;
-const DEFAULT_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE: usize = 64;
+const MIN_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE: usize = 64;
+const COLD_PARQUET_PREFETCH_ROW_GROUPS_PER_PARTITION: usize = 32;
 
 #[derive(Debug)]
 pub struct ColdParquetLookup {
@@ -28,6 +29,7 @@ pub struct ColdParquetLookup {
     projection_columns: Vec<String>,
     batch_size: usize,
     max_cached_row_groups: usize,
+    target_partitions: usize,
     position_leaf: usize,
     page_layout: ColdPageLayoutStats,
     cursor: ColdRowGroupCursor,
@@ -159,6 +161,7 @@ impl ColdParquetLookup {
             projection_columns,
             batch_size: batch_size.max(1),
             max_cached_row_groups: max_cached_row_groups.max(1),
+            target_partitions: 1,
             position_leaf,
             page_layout,
             cursor: ColdRowGroupCursor::new(row_groups),
@@ -190,6 +193,11 @@ impl ColdParquetLookup {
             cold_parquet_batch_size(),
             cold_parquet_row_group_cache(),
         )
+    }
+
+    pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
+        self.target_partitions = target_partitions.max(1);
+        self
     }
 
     fn position_range(&self) -> Option<(u64, u64)> {
@@ -408,9 +416,11 @@ impl ColdParquetLookup {
             }
         }
 
-        for chunk_specs in to_load.chunks(cold_parquet_prefetch_row_group_batch_size()) {
+        for chunk_specs in to_load.chunks(cold_parquet_prefetch_row_group_batch_size(
+            self.target_partitions,
+        )) {
             let started = Instant::now();
-            let chunks = self.load_row_groups(chunk_specs)?;
+            let chunks = self.load_row_groups_partitioned(chunk_specs)?;
             self.load_time += started.elapsed();
             self.row_group_load_batches += 1;
             for (spec, chunk) in chunk_specs.iter().zip(chunks) {
@@ -561,6 +571,32 @@ impl ColdParquetLookup {
             )?);
         }
         Ok(chunks)
+    }
+
+    fn load_row_groups_partitioned(
+        &self,
+        specs: &[RowGroupLoadSpec],
+    ) -> Result<Vec<WarmChunkContext>> {
+        let partition_count = self.target_partitions.min(specs.len()).max(1);
+        if partition_count == 1 {
+            return self.load_row_groups(specs);
+        }
+
+        let specs_per_partition = specs.len().div_ceil(partition_count);
+        std::thread::scope(|scope| {
+            let handles = specs
+                .chunks(specs_per_partition)
+                .map(|partition_specs| scope.spawn(move || self.load_row_groups(partition_specs)))
+                .collect::<Vec<_>>();
+            let mut chunks = Vec::with_capacity(specs.len());
+            for handle in handles {
+                let partition_chunks = handle.join().map_err(|_| {
+                    DataFusionError::Execution("cold parquet lookup worker panicked".to_string())
+                })??;
+                chunks.extend(partition_chunks);
+            }
+            Ok(chunks)
+        })
     }
 
     fn candidate_page_row_ranges(
@@ -797,6 +833,14 @@ impl ColdParquetLookupSet {
             cold_parquet_batch_size(),
             cold_parquet_row_group_cache(),
         )
+    }
+
+    pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
+        let target_partitions = target_partitions.max(1);
+        for lookup in &mut self.lookups {
+            lookup.target_partitions = target_partitions;
+        }
+        self
     }
 
     pub fn probe_position_emit_and_visit<P, E, V>(
@@ -1365,12 +1409,19 @@ pub fn cold_parquet_row_group_cache() -> usize {
         .max(1)
 }
 
-pub fn cold_parquet_prefetch_row_group_batch_size() -> usize {
+pub fn cold_parquet_prefetch_row_group_batch_size(target_partitions: usize) -> usize {
     std::env::var("VEP_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE)
+        .unwrap_or_else(|| default_cold_parquet_prefetch_row_group_batch_size(target_partitions))
         .max(1)
+}
+
+fn default_cold_parquet_prefetch_row_group_batch_size(target_partitions: usize) -> usize {
+    target_partitions
+        .max(1)
+        .saturating_mul(COLD_PARQUET_PREFETCH_ROW_GROUPS_PER_PARTITION)
+        .max(MIN_COLD_PARQUET_PREFETCH_ROW_GROUP_BATCH_SIZE)
 }
 
 pub fn cold_parquet_load_page_index() -> bool {
@@ -1399,6 +1450,15 @@ mod tests {
     use parquet::file::properties::WriterProperties;
 
     use crate::warm_cache::key::position_key;
+
+    #[test]
+    fn cold_prefetch_batch_size_scales_with_reader_count() {
+        assert_eq!(default_cold_parquet_prefetch_row_group_batch_size(1), 64);
+        assert_eq!(default_cold_parquet_prefetch_row_group_batch_size(2), 64);
+        assert_eq!(default_cold_parquet_prefetch_row_group_batch_size(4), 128);
+        assert_eq!(default_cold_parquet_prefetch_row_group_batch_size(8), 256);
+        assert_eq!(default_cold_parquet_prefetch_row_group_batch_size(16), 512);
+    }
 
     #[test]
     fn cold_cursor_advances_monotonically_and_can_step_back_to_cached_group() {
@@ -1515,6 +1575,7 @@ mod tests {
             projection_columns: cold_parquet_projection_columns(&[], false),
             batch_size: 64,
             max_cached_row_groups: 2,
+            target_partitions: 1,
             position_leaf,
             page_layout,
             cursor: ColdRowGroupCursor::new(row_groups),
