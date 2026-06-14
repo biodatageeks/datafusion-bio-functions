@@ -574,7 +574,7 @@ fn project_batch_to_schema(batch: RecordBatch, target_schema: SchemaRef) -> Resu
 }
 
 fn chroms_from_schema(schema: &SchemaRef) -> Vec<String> {
-    schema
+    let mut chroms: Vec<String> = schema
         .metadata()
         .get("bio.vep.chromosomes")
         .and_then(|json| serde_json::from_str(json).ok())
@@ -583,7 +583,18 @@ fn chroms_from_schema(schema: &SchemaRef) -> Vec<String> {
                 .iter()
                 .map(|chrom| (*chrom).to_string())
                 .collect()
-        })
+        });
+    chroms.sort_by(|left, right| chrom_cache_order_key(left).cmp(&chrom_cache_order_key(right)));
+    chroms
+}
+
+fn chrom_cache_order_key(chrom: &str) -> (usize, &str) {
+    let bare = chrom.strip_prefix("chr").unwrap_or(chrom);
+    if let Some(index) = DEFAULT_CHROMS.iter().position(|known| *known == bare) {
+        (index, "")
+    } else {
+        (DEFAULT_CHROMS.len(), chrom)
+    }
 }
 
 fn entity_output_name(kind: EnsemblEntityKind) -> &'static str {
@@ -716,6 +727,22 @@ mod tests {
         let query = build_translation_dedup_query_with_where_clause("tl", " WHERE chrom = 'chr1'");
         assert!(query.contains("PARTITION BY chrom, transcript_id"));
         assert!(query.contains("WHERE chrom = 'chr1'"));
+    }
+
+    #[test]
+    fn chroms_from_schema_uses_old_cache_order() {
+        let metadata = [(
+            "bio.vep.chromosomes".to_string(),
+            serde_json::json!(["10", "2", "1", "X", "MT", "HSCHR6_MHC_COX_CTG1"]).to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let schema = Arc::new(Schema::new_with_metadata(Vec::<Field>::new(), metadata));
+
+        assert_eq!(
+            chroms_from_schema(&schema),
+            ["1", "2", "10", "X", "MT", "HSCHR6_MHC_COX_CTG1"]
+        );
     }
 
     #[tokio::test]
