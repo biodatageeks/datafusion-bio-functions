@@ -3098,47 +3098,46 @@ impl crate::kv_cache::SiftPredictionStore for InMemorySiftPredictionStore {
 }
 
 #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
-async fn load_lance_sift_prediction_store(
+async fn load_lance_sift_prediction_store_for_chrom(
     cache: &PartitionedLanceCache,
+    chrom: &str,
 ) -> Result<Option<SiftPredictionStoreRef>> {
     let mut predictions = HashMap::new();
-    for chrom in cache.available_chroms() {
-        let batches = scan_lance_context_entity(
-            cache,
-            "translation_sift",
-            chrom,
-            &[
-                "transcript_id",
-                "stable_id",
-                "sift_predictions",
-                "polyphen_predictions",
-            ],
-        )
-        .await?;
-        for batch in &batches {
-            let schema = batch.schema();
-            let tx_idx = schema
-                .index_of("transcript_id")
-                .or_else(|_| schema.index_of("stable_id"))
-                .ok();
-            let sift_idx = schema.index_of("sift_predictions").ok();
-            let polyphen_idx = schema.index_of("polyphen_predictions").ok();
-            let Some(tx_idx) = tx_idx else { continue };
-            for row in 0..batch.num_rows() {
-                let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
-                    continue;
-                };
-                let mut cached = CachedPredictions::default();
-                if let Some(idx) = sift_idx {
-                    cached.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
-                }
-                if let Some(idx) = polyphen_idx {
-                    cached.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
-                }
-                cached.sort();
-                if !cached.sift.is_empty() || !cached.polyphen.is_empty() {
-                    predictions.insert(transcript_id, cached);
-                }
+    let batches = scan_lance_context_entity(
+        cache,
+        "translation_sift",
+        chrom,
+        &[
+            "transcript_id",
+            "stable_id",
+            "sift_predictions",
+            "polyphen_predictions",
+        ],
+    )
+    .await?;
+    for batch in &batches {
+        let schema = batch.schema();
+        let tx_idx = schema
+            .index_of("transcript_id")
+            .or_else(|_| schema.index_of("stable_id"))
+            .ok();
+        let sift_idx = schema.index_of("sift_predictions").ok();
+        let polyphen_idx = schema.index_of("polyphen_predictions").ok();
+        let Some(tx_idx) = tx_idx else { continue };
+        for row in 0..batch.num_rows() {
+            let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+                continue;
+            };
+            let mut cached = CachedPredictions::default();
+            if let Some(idx) = sift_idx {
+                cached.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
+            }
+            if let Some(idx) = polyphen_idx {
+                cached.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
+            }
+            cached.sort();
+            if !cached.sift.is_empty() || !cached.polyphen.is_empty() {
+                predictions.insert(transcript_id, cached);
             }
         }
     }
@@ -5219,10 +5218,6 @@ impl AnnotateProvider {
             use_indexed_parquet.then(|| cache.base_dir().to_path_buf());
         #[cfg(feature = "lance-cache")]
         let lance_cache_root = use_lance.then(|| cache.base_dir().to_path_buf());
-        #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
-        let lance_sift_requested = use_lance;
-        #[cfg(all(feature = "kv-cache", not(feature = "lance-cache")))]
-        let lance_sift_requested = false;
         #[cfg(feature = "kv-cache")]
         let sift_prediction_store = if let Some(store) = kv_store.as_ref() {
             if let Some(parent) = store.root_path().parent() {
@@ -5232,20 +5227,6 @@ impl AnnotateProvider {
             }
         } else if use_indexed_parquet {
             open_sift_prediction_store(cache.base_dir())?
-        } else if lance_sift_requested {
-            #[cfg(feature = "lance-cache")]
-            {
-                let lance_cache = cache.as_lance().ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "Lance SIFT store requires a Lance cache layout".to_string(),
-                    )
-                })?;
-                load_lance_sift_prediction_store(lance_cache).await?
-            }
-            #[cfg(not(feature = "lance-cache"))]
-            {
-                None
-            }
         } else {
             None
         };
@@ -11701,11 +11682,23 @@ async fn prepare_contig_context(
         .and_then(AnnotateProvider::build_sift_direct_reader)
         .map(Arc::new);
 
-    // Reuse the pre-opened SIFT prediction store from config (opened once,
-    // shared across contigs).
     #[cfg(feature = "kv-cache")]
     let sift_prediction_store = if use_lookup_sift && config.flags.everything {
-        config.sift_prediction_store.clone()
+        #[cfg(feature = "lance-cache")]
+        if use_lance {
+            let lance_cache = cache.as_lance().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Lance SIFT store requires a Lance cache layout".to_string(),
+                )
+            })?;
+            load_lance_sift_prediction_store_for_chrom(lance_cache, &chrom).await?
+        } else {
+            config.sift_prediction_store.clone()
+        }
+        #[cfg(not(feature = "lance-cache"))]
+        {
+            config.sift_prediction_store.clone()
+        }
     } else {
         None
     };
@@ -12566,6 +12559,141 @@ mod tests {
         }
 
         Arc::new(list_builder.finish())
+    }
+
+    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    type TestCompactPrediction = (i32, &'static str, &'static str, f32);
+
+    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    fn compact_prediction_array(rows: Vec<Option<Vec<TestCompactPrediction>>>) -> Arc<dyn Array> {
+        use datafusion::arrow::array::{ArrayBuilder, Float32Builder, Int32Builder, StructBuilder};
+
+        let fields = vec![
+            Field::new("position", DataType::Int32, false),
+            Field::new("amino_acid", DataType::Utf8, false),
+            Field::new("prediction", DataType::Utf8, false),
+            Field::new("score", DataType::Float32, false),
+        ];
+        let struct_builder = StructBuilder::new(
+            fields,
+            vec![
+                Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+                Box::new(Float32Builder::new()) as Box<dyn ArrayBuilder>,
+            ],
+        );
+        let mut list_builder = ListBuilder::new(struct_builder);
+
+        for row in rows {
+            match row {
+                Some(predictions) => {
+                    for (position, amino_acid, prediction, score) in predictions {
+                        let values = list_builder.values();
+                        values
+                            .field_builder::<Int32Builder>(0)
+                            .unwrap()
+                            .append_value(position);
+                        values
+                            .field_builder::<StringBuilder>(1)
+                            .unwrap()
+                            .append_value(amino_acid);
+                        values
+                            .field_builder::<StringBuilder>(2)
+                            .unwrap()
+                            .append_value(prediction);
+                        values
+                            .field_builder::<Float32Builder>(3)
+                            .unwrap()
+                            .append_value(score);
+                        values.append(true);
+                    }
+                    list_builder.append(true);
+                }
+                None => list_builder.append(false),
+            }
+        }
+
+        Arc::new(list_builder.finish())
+    }
+
+    #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+    #[tokio::test]
+    async fn lance_sift_prediction_store_loads_only_requested_chrom() {
+        use datafusion::arrow::array::Int64Array;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let entity_dir = tmp.path().join("translation_sift.lance");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("chrom", DataType::Utf8, false),
+            Field::new("start", DataType::Int64, false),
+            Field::new("end", DataType::Int64, false),
+            Field::new(
+                "sift_predictions",
+                compact_prediction_array(vec![Some(vec![(1, "A", "tolerated", 0.1)])])
+                    .data_type()
+                    .clone(),
+                true,
+            ),
+            Field::new(
+                "polyphen_predictions",
+                compact_prediction_array(vec![Some(vec![(1, "A", "benign", 0.2)])])
+                    .data_type()
+                    .clone(),
+                true,
+            ),
+        ]));
+
+        for (chrom, tx) in [("chr1", "tx1"), ("chr2", "tx2")] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec![tx])),
+                    Arc::new(StringArray::from(vec![chrom])),
+                    Arc::new(Int64Array::from(vec![1_i64])),
+                    Arc::new(Int64Array::from(vec![2_i64])),
+                    compact_prediction_array(vec![Some(vec![(1, "A", "tolerated", 0.1)])]),
+                    compact_prediction_array(vec![Some(vec![(1, "A", "benign", 0.2)])]),
+                ],
+            )
+            .unwrap();
+            let dataset = entity_dir.join(format!("{chrom}.lance"));
+            crate::lance_cache::write::write_record_batches_to_lance(
+                &dataset,
+                vec![batch],
+                crate::lance_cache::write::LanceIndexKind::TranscriptId,
+            )
+            .await
+            .unwrap();
+        }
+        crate::lance_cache::manifest::ChromManifest::new(vec![
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr2", "chr2.lance", 1),
+        ])
+        .write_to_entity_dir(&entity_dir)
+        .unwrap();
+        let variation = tmp.path().join("variation.lance");
+        std::fs::create_dir_all(variation.join("chr1.lance")).unwrap();
+        crate::lance_cache::manifest::ChromManifest::new(vec![
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
+        ])
+        .write_to_entity_dir(&variation)
+        .unwrap();
+        let cache =
+            crate::partitioned_cache::PartitionedLanceCache::detect(tmp.path().to_str().unwrap())
+                .unwrap();
+
+        let store = load_lance_sift_prediction_store_for_chrom(&cache, "chr1")
+            .await
+            .unwrap()
+            .unwrap();
+        let loaded = store
+            .get_many(&["tx1".to_string(), "tx2".to_string()])
+            .unwrap();
+
+        assert!(loaded.contains_key("tx1"));
+        assert!(!loaded.contains_key("tx2"));
     }
 
     #[tokio::test]
