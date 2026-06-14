@@ -115,6 +115,10 @@ name = "bench_lance_variation_chr1_workload"
 required-features = ["lance-cache"]
 
 [[example]]
+name = "bench_lance_cold_batching"
+required-features = ["lance-cache"]
+
+[[example]]
 name = "bench_arrow_mmap_cold_lookup"
 required-features = ["lance-cache"]
 

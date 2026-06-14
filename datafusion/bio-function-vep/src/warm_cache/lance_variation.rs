@@ -32,6 +32,7 @@ pub const DEFAULT_LANCE_WARM_SCAN_BATCH_SIZE: usize = 16_384;
 pub const DEFAULT_WARM_LANCE_ROWS_PER_FILE: usize = 500_000;
 pub const DEFAULT_WARM_LANCE_ROW_GROUP_ROWS: usize = 262_144;
 pub const DEFAULT_COLD_LANCE_ROWS_PER_FILE: usize = 1_000_000;
+pub const DEFAULT_LANCE_MINICHUNK_SIZE: usize = 16 * 1024;
 
 const LANCE_MINIBLOCK_ZSTD3_METADATA: &[(&str, &str)] = &[
     ("lance-encoding:structural-encoding", "miniblock"),
@@ -42,7 +43,6 @@ const LANCE_MINIBLOCK_ZSTD3_METADATA: &[(&str, &str)] = &[
     ("lance-encoding:rle-threshold", "0.95"),
     ("lance-encoding:dict-size-ratio", "0.99"),
     ("lance-encoding:dict-divisor", "1"),
-    ("lance-encoding:minichunk-size", "16384"),
 ];
 
 const LANCE_REQUIRED_RUNTIME_COLUMNS: &[&str] = &[
@@ -507,6 +507,7 @@ fn merged_lance_schema(batches: &[RecordBatch]) -> Result<Arc<Schema>> {
 }
 
 fn lance_2_1_unpacked_schema(schema: Arc<Schema>) -> Arc<Schema> {
+    let minichunk_size = lance_minichunk_size().to_string();
     Arc::new(Schema::new(
         schema
             .fields()
@@ -516,6 +517,10 @@ fn lance_2_1_unpacked_schema(schema: Arc<Schema>) -> Arc<Schema> {
                 for (key, value) in LANCE_MINIBLOCK_ZSTD3_METADATA {
                     metadata.insert((*key).to_string(), (*value).to_string());
                 }
+                metadata.insert(
+                    "lance-encoding:minichunk-size".to_string(),
+                    minichunk_size.clone(),
+                );
                 field.as_ref().clone().with_metadata(metadata)
             })
             .collect::<Vec<_>>(),
@@ -579,6 +584,24 @@ fn lance_warm_scan_batch_size() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_LANCE_WARM_SCAN_BATCH_SIZE)
+}
+
+fn lance_minichunk_size() -> usize {
+    std::env::var("VEP_LANCE_MINICHUNK_SIZE")
+        .ok()
+        .and_then(|value| parse_lance_byte_size(&value))
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LANCE_MINICHUNK_SIZE)
+}
+
+fn parse_lance_byte_size(value: &str) -> Option<usize> {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(number) = lower.strip_suffix("kb").or_else(|| lower.strip_suffix('k')) {
+        number.trim().parse::<usize>().ok()?.checked_mul(1024)
+    } else {
+        trimmed.parse::<usize>().ok()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
