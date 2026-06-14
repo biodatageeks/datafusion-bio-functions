@@ -930,6 +930,28 @@ fn cache_format_for_backend(backend: &str) -> &str {
     }
 }
 
+fn cache_source_type_from_cache_source_for_backend(
+    cache_source: &str,
+    backend: &str,
+) -> Result<CacheSourceType> {
+    match cache_format_for_backend(backend) {
+        "lance" => {
+            #[cfg(feature = "lance-cache")]
+            {
+                CacheSourceType::from_partitioned_lance_cache_source(cache_source)
+            }
+            #[cfg(not(feature = "lance-cache"))]
+            {
+                Err(DataFusionError::Plan(
+                    "annotate_to_vcf(): Lance cache source metadata requires the lance-cache feature"
+                        .to_string(),
+                ))
+            }
+        }
+        _ => CacheSourceType::from_partitioned_cache_source(cache_source),
+    }
+}
+
 fn csq_header_description(
     config: &AnnotateVcfConfig,
     cache_source_type: CacheSourceType,
@@ -955,9 +977,8 @@ fn csq_header_description(
 /// are NOT written to the VCF — only core VCF columns, original INFO/FORMAT
 /// fields, and the `csq` annotation are included.
 ///
-/// Cache source mode is read from Arrow schema metadata on a parquet file under
-/// `{cache_source}/variation`. That directory must be readable even when
-/// `backend` selects a non-parquet annotation store such as `fjall`.
+/// Cache source mode is read from Arrow schema metadata on the selected cache
+/// backend's variation table.
 ///
 /// # Returns
 ///
@@ -984,7 +1005,7 @@ pub async fn annotate_to_vcf(
             "annotate_to_vcf(): refseq and merged config fields are unsupported; cache source mode must come from cache schema metadata bio.vep.cache_source_type".to_string(),
         ));
     }
-    let cache_source_type = CacheSourceType::from_partitioned_cache_source(cache_source)?;
+    let cache_source_type = cache_source_type_from_cache_source_for_backend(cache_source, backend)?;
     let concurrency_plan = VepConcurrencyPlan::from_config(config);
     if sink_profile_enabled() {
         eprintln!(
@@ -1385,6 +1406,53 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(value["cache_format"], "lance");
+    }
+
+    #[cfg(feature = "lance-cache")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lance_backend_reads_cache_source_metadata_from_lance_variation() {
+        use datafusion::arrow::array::{StringArray, UInt32Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let variation_dir = tmp.path().join("variation.lance");
+        let dataset_path = variation_dir.join("chr1.lance");
+        let schema = Arc::new(crate::lance_cache::schema::with_cache_source_metadata(
+            &Schema::new(vec![
+                Field::new("chrom", DataType::Utf8, false),
+                Field::new("start", DataType::UInt32, false),
+                Field::new("end", DataType::UInt32, false),
+            ]),
+            "merged",
+        ));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["chr1"])),
+                Arc::new(UInt32Array::from(vec![10])),
+                Arc::new(UInt32Array::from(vec![10])),
+            ],
+        )
+        .unwrap();
+
+        crate::lance_cache::write::write_record_batches_to_lance(
+            &dataset_path,
+            vec![batch],
+            crate::lance_cache::write::LanceIndexKind::Start,
+        )
+        .await
+        .unwrap();
+        crate::lance_cache::manifest::ChromManifest::new(vec![
+            crate::lance_cache::manifest::ChromDatasetEntry::new("chr1", "chr1.lance", 1),
+        ])
+        .write_to_entity_dir(&variation_dir)
+        .unwrap();
+
+        let source_type =
+            cache_source_type_from_cache_source_for_backend(tmp.path().to_str().unwrap(), "lance")
+                .unwrap();
+
+        assert_eq!(source_type, CacheSourceType::Merged);
     }
 
     #[test]
