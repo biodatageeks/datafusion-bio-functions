@@ -37,6 +37,16 @@ pub async fn write_record_batches_to_lance_with_mode(
     batches: Vec<RecordBatch>,
     mode: WriteMode,
 ) -> Result<()> {
+    write_record_batches_to_lance_with_mode_and_version(path, batches, mode, LanceFileVersion::V2_1)
+        .await
+}
+
+pub async fn write_record_batches_to_lance_with_mode_and_version(
+    path: &Path,
+    batches: Vec<RecordBatch>,
+    mode: WriteMode,
+    data_storage_version: LanceFileVersion,
+) -> Result<()> {
     if batches.is_empty() {
         return Err(DataFusionError::Execution(format!(
             "cannot write empty Lance dataset at {}",
@@ -57,7 +67,7 @@ pub async fn write_record_batches_to_lance_with_mode(
     let reader = RecordBatchIterator::new(aligned.into_iter().map(Ok), Arc::clone(&schema));
     let params = WriteParams {
         mode,
-        data_storage_version: Some(LanceFileVersion::V2_1),
+        data_storage_version: Some(data_storage_version),
         ..Default::default()
     };
 

@@ -16,6 +16,7 @@ use datafusion_bio_format_ensembl_cache::{
 };
 use futures::StreamExt;
 use lance::dataset::WriteMode;
+use lance_file::version::LanceFileVersion;
 use log::info;
 use tokio::sync::mpsc;
 
@@ -28,7 +29,7 @@ use crate::lance_cache::schema::{
     with_cache_source_metadata,
 };
 use crate::lance_cache::write::{
-    LanceIndexKind, create_required_index, write_record_batches_to_lance_with_mode,
+    LanceIndexKind, create_required_index, write_record_batches_to_lance_with_mode_and_version,
 };
 
 const DEFAULT_CHROMS: &[&str] = &[
@@ -94,6 +95,7 @@ async fn build_lance_variation(options: &LanceCacheBuildOptions) -> Result<Vec<E
             &dataset_path,
             LanceIndexKind::Start,
             LANCE_VARIATION_WRITE_CHUNK_ROWS,
+            LanceFileVersion::V2_1,
             move |batch| transform_variation_batch(batch, &source_type),
         )
         .await?;
@@ -153,6 +155,7 @@ async fn build_lance_context_entity(
             &dataset_path,
             index_kind,
             LANCE_CONTEXT_WRITE_CHUNK_ROWS,
+            LanceFileVersion::V2_2,
             move |batch| attach_schema_metadata_to_batch(batch, &source_type),
         )
         .await?;
@@ -222,6 +225,7 @@ async fn build_lance_translation_split(
             &dataset_path,
             LanceIndexKind::TranscriptId,
             LANCE_CONTEXT_WRITE_CHUNK_ROWS,
+            LanceFileVersion::V2_2,
             {
                 let target_schema = Arc::clone(&target_schema);
                 move |batch| {
@@ -294,6 +298,7 @@ async fn write_query_stream_to_lance<F>(
     dataset_path: &Path,
     index_kind: LanceIndexKind,
     chunk_rows: usize,
+    data_storage_version: LanceFileVersion,
     transform: F,
 ) -> Result<usize>
 where
@@ -315,19 +320,29 @@ where
             dataset_path,
             index_kind,
             chunk_rows,
+            data_storage_version,
             transform,
         )
         .await;
     }
 
     let stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
-    write_stream_to_lance(stream, dataset_path, index_kind, chunk_rows, transform).await
+    write_stream_to_lance(
+        stream,
+        dataset_path,
+        index_kind,
+        chunk_rows,
+        data_storage_version,
+        transform,
+    )
+    .await
 }
 
 struct LanceChunkWriter<'a> {
     dataset_path: &'a Path,
     index_kind: LanceIndexKind,
     chunk_rows: usize,
+    data_storage_version: LanceFileVersion,
     pending: Vec<RecordBatch>,
     pending_rows: usize,
     total_rows: usize,
@@ -336,11 +351,17 @@ struct LanceChunkWriter<'a> {
 }
 
 impl<'a> LanceChunkWriter<'a> {
-    fn new(dataset_path: &'a Path, index_kind: LanceIndexKind, chunk_rows: usize) -> Self {
+    fn new(
+        dataset_path: &'a Path,
+        index_kind: LanceIndexKind,
+        chunk_rows: usize,
+        data_storage_version: LanceFileVersion,
+    ) -> Self {
         Self {
             dataset_path,
             index_kind,
             chunk_rows,
+            data_storage_version,
             pending: Vec::new(),
             pending_rows: 0,
             total_rows: 0,
@@ -376,10 +397,11 @@ impl<'a> LanceChunkWriter<'a> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        write_record_batches_to_lance_with_mode(
+        write_record_batches_to_lance_with_mode_and_version(
             self.dataset_path,
             std::mem::take(&mut self.pending),
             self.mode,
+            self.data_storage_version,
         )
         .await?;
         self.mode = WriteMode::Append;
@@ -402,12 +424,14 @@ async fn write_stream_to_lance<F>(
     dataset_path: &Path,
     index_kind: LanceIndexKind,
     chunk_rows: usize,
+    data_storage_version: LanceFileVersion,
     mut transform: F,
 ) -> Result<usize>
 where
     F: FnMut(RecordBatch) -> Result<RecordBatch>,
 {
-    let mut writer = LanceChunkWriter::new(dataset_path, index_kind, chunk_rows);
+    let mut writer =
+        LanceChunkWriter::new(dataset_path, index_kind, chunk_rows, data_storage_version);
 
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
@@ -430,6 +454,7 @@ async fn write_partitioned_plan_to_lance<F>(
     dataset_path: &Path,
     index_kind: LanceIndexKind,
     chunk_rows: usize,
+    data_storage_version: LanceFileVersion,
     transform: F,
 ) -> Result<usize>
 where
@@ -467,7 +492,8 @@ where
     }
     drop(tx);
 
-    let mut writer = LanceChunkWriter::new(dataset_path, index_kind, chunk_rows);
+    let mut writer =
+        LanceChunkWriter::new(dataset_path, index_kind, chunk_rows, data_storage_version);
     while let Some(batch) = rx.recv().await {
         writer.push(batch).await?;
     }
