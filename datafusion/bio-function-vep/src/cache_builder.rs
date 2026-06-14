@@ -71,6 +71,18 @@ const DEFAULT_VARIATION_COLD_ROW_GROUP_ROWS: usize = 8_192;
 const DEFAULT_VARIATION_COLD_DATA_PAGE_ROW_COUNT: usize = 1_024;
 const DEFAULT_COMPACT_SIFT_ROW_GROUP_ROWS: usize = 16;
 
+/// Permits a single variation unit acquires from the build semaphore.
+/// variation tiers are far heavier (RAM) than other entities, so weighting
+/// them caps how many run concurrently. Tunable via `VEPYR_VAR_WEIGHT`
+/// (default 1 = unweighted). Clamped to `[1, total]` so a unit can always run.
+fn variation_permit_weight(total: usize) -> u32 {
+    let w = std::env::var("VEPYR_VAR_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1);
+    w.clamp(1, total.max(1)) as u32
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CacheFormat {
     #[default]
@@ -134,6 +146,115 @@ pub struct EntityStats {
     pub entity: String,
     pub parquet_files: Vec<(String, usize)>,
     pub fjall_stats: Option<LoadStats>,
+}
+
+/// One independent build unit (one output file, or the combined "other"
+/// contigs file). The unified scheduler runs these concurrently across all
+/// entities, ordered longest-first (LPT) and bounded by a weighted semaphore.
+enum UnitKind {
+    /// Parquet-only entity chromosome (or its combined "other" file).
+    Parquet {
+        kind: EnsemblEntityKind,
+        query: String,
+        output_file: String,
+        needs_rn_drop: bool,
+    },
+    VariationMain {
+        chrom: String,
+        output_file: String,
+    },
+    VariationOther {
+        chroms: Vec<String>,
+    },
+    TranslationChrom {
+        chrom: String,
+    },
+    TranslationOther {
+        chroms: Vec<String>,
+    },
+}
+
+struct WorkUnit {
+    /// Relative processing cost, used only for longest-processing-time-first
+    /// (LPT) scheduling order. Higher = scheduled earlier.
+    cost: u64,
+    /// Permits this unit acquires from the build semaphore (memory weight).
+    weight: u32,
+    kind: UnitKind,
+}
+
+/// Per-entity result of one finished unit. Translation produces both core and
+/// sift rows; all other entities only fill `core`.
+struct UnitOut {
+    entity: &'static str,
+    core: Vec<(String, usize)>,
+    sift: Vec<(String, usize)>,
+}
+
+/// Outcome of entity discovery: either the entity is skipped/handled inline
+/// (special rebuild paths) and yields finished stats, or it contributes a set
+/// of work units to the global scheduler.
+enum Discovery {
+    Done(Vec<EntityStats>),
+    Units(Vec<WorkUnit>),
+}
+
+impl UnitKind {
+    async fn run(self, cb: Arc<CacheBuilder>) -> Result<UnitOut> {
+        match self {
+            UnitKind::Parquet {
+                kind,
+                query,
+                output_file,
+                needs_rn_drop,
+            } => {
+                let r = cb
+                    .build_parquet_query_to_file(kind, query, output_file, needs_rn_drop)
+                    .await?;
+                Ok(UnitOut {
+                    entity: entity_subdir(kind),
+                    core: r.into_iter().collect(),
+                    sift: vec![],
+                })
+            }
+            UnitKind::VariationMain { chrom, output_file } => {
+                let core = cb.build_variation_main_chrom(chrom, output_file).await?;
+                Ok(UnitOut {
+                    entity: "variation",
+                    core,
+                    sift: vec![],
+                })
+            }
+            UnitKind::VariationOther { chroms } => {
+                let core = cb.build_variation_other(chroms).await?;
+                Ok(UnitOut {
+                    entity: "variation",
+                    core,
+                    sift: vec![],
+                })
+            }
+            UnitKind::TranslationChrom { chrom } => {
+                let (core, sift) = cb
+                    .build_translation_chrom(&chrom, EnsemblEntityKind::Translation, "tl")
+                    .await?;
+                Ok(UnitOut {
+                    entity: "translation",
+                    core: core.into_iter().collect(),
+                    sift: sift.into_iter().collect(),
+                })
+            }
+            UnitKind::TranslationOther { chroms } => {
+                let (core, sift) = cb
+                    .build_translation_multi_chrom(&chroms, EnsemblEntityKind::Translation, "tl")
+                    .await?;
+                Ok(UnitOut {
+                    entity: "translation",
+                    core: core.into_iter().collect(),
+                    sift: sift.into_iter().collect(),
+                })
+            }
+        }
+    }
 }
 
 /// Builder for converting Ensembl VEP cache to parquet and fjall.
@@ -301,55 +422,149 @@ impl CacheBuilder {
             "regulatory",
             "motif",
         ];
-        // One global budget of `build_concurrency` permits, acquired per
-        // chromosome-unit (not per entity), so that entity-level and
-        // chromosome-level concurrency share a single bound on peak memory.
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.build_concurrency.max(1)));
-        let mut set = tokio::task::JoinSet::new();
-        for entity in entities {
-            let cb = Arc::clone(&self);
-            let sem = Arc::clone(&semaphore);
-            let entity = entity.to_string();
-            set.spawn(async move {
-                let stats = cb.build_entity(&entity, sem).await;
-                (entity, stats)
-            });
-        }
 
-        let mut results = Vec::new();
-        while let Some(joined) = set.join_next().await {
-            let (entity, stats) = joined.map_err(|e| {
-                DataFusionError::Execution(format!("entity build task failed to join: {e}"))
-            })?;
-            match stats {
-                Ok(stats) => results.extend(stats),
+        // Phase 1 — discover work units per entity (cheap: schema + chrom lists
+        // + skip checks). Entities that are skipped or handled by a special
+        // rebuild path yield finished stats directly.
+        let mut done: Vec<EntityStats> = Vec::new();
+        let mut units: Vec<WorkUnit> = Vec::new();
+        for entity in entities {
+            match self.discover_entity(entity).await {
+                Ok(Discovery::Done(stats)) => done.extend(stats),
+                Ok(Discovery::Units(u)) => units.extend(u),
                 Err(e) => {
                     let msg = e.to_string();
                     if msg.contains("No source files discovered") || msg.contains("skipped") {
                         info!("{entity}: skipped (no source files)");
                     } else {
-                        set.abort_all();
-                        while set.join_next().await.is_some() {}
                         return Err(e);
                     }
                 }
             }
         }
+
+        // Phase 2 — LPT (#1): schedule heaviest units (variation chromosomes)
+        // first to minimise the makespan tail.
+        units.sort_by(|a, b| b.cost.cmp(&a.cost));
+
+        // Phase 3 — run all (entity, chromosome) units concurrently, bounded by
+        // one weighted semaphore (#2). build_concurrency=1 => fully serial.
+        let total = self.build_concurrency.max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(total));
+        let mut set = tokio::task::JoinSet::new();
+        for unit in units {
+            let cb = Arc::clone(&self);
+            let permits = Arc::clone(&semaphore);
+            let weight = unit.weight.min(total as u32).max(1);
+            set.spawn(async move {
+                let _permit = permits
+                    .acquire_many_owned(weight)
+                    .await
+                    .expect("semaphore closed");
+                unit.kind.run(cb).await
+            });
+        }
+
+        // Group finished unit outputs by entity.
+        let mut var_core: Vec<(String, usize)> = Vec::new();
+        let mut tx_core: Vec<(String, usize)> = Vec::new();
+        let mut exon_core: Vec<(String, usize)> = Vec::new();
+        let mut reg_core: Vec<(String, usize)> = Vec::new();
+        let mut motif_core: Vec<(String, usize)> = Vec::new();
+        let mut tl_core: Vec<(String, usize)> = Vec::new();
+        let mut tl_sift: Vec<(String, usize)> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            let out = match joined.map_err(|e| {
+                DataFusionError::Execution(format!("build unit failed to join: {e}"))
+            })? {
+                Ok(out) => out,
+                Err(e) => {
+                    set.abort_all();
+                    while set.join_next().await.is_some() {}
+                    return Err(e);
+                }
+            };
+            match out.entity {
+                "variation" => var_core.extend(out.core),
+                "transcript" => tx_core.extend(out.core),
+                "exon" => exon_core.extend(out.core),
+                "regulatory" => reg_core.extend(out.core),
+                "motif" => motif_core.extend(out.core),
+                "translation" => {
+                    tl_core.extend(out.core);
+                    tl_sift.extend(out.sift);
+                }
+                other => {
+                    return Err(DataFusionError::Execution(format!(
+                        "unexpected unit entity tag: {other}"
+                    )));
+                }
+            }
+        }
+
+        // Phase 4 — per-entity post-passes (fjall) + assemble stats.
+        let mut results = done;
+        if !var_core.is_empty() {
+            let fjall_stats = if self.build_fjall {
+                let fjall_dir = format!("{}/variation.fjall", self.output_dir);
+                if Path::new(&fjall_dir).exists() && !self.overwrite {
+                    info!("variation.fjall already exists, skipping (use overwrite to rebuild)");
+                    None
+                } else {
+                    info!("variation: parquet complete, building fjall from parquet files...");
+                    self.build_variation_fjall_from_parquet()
+                        .await?
+                        .into_iter()
+                        .next()
+                        .and_then(|s| s.fjall_stats)
+                }
+            } else {
+                None
+            };
+            results.push(EntityStats {
+                entity: "variation".to_string(),
+                parquet_files: var_core,
+                fjall_stats,
+            });
+        }
+        for (entity, core) in [
+            ("transcript", tx_core),
+            ("exon", exon_core),
+            ("regulatory", reg_core),
+            ("motif", motif_core),
+        ] {
+            if !core.is_empty() {
+                results.push(EntityStats {
+                    entity: entity.to_string(),
+                    parquet_files: core,
+                    fjall_stats: None,
+                });
+            }
+        }
+        if !tl_core.is_empty() || !tl_sift.is_empty() {
+            let sift_fjall = if self.build_fjall && !tl_sift.is_empty() {
+                self.build_sift_fjall(&tl_sift).await?
+            } else {
+                None
+            };
+            results.push(EntityStats {
+                entity: "translation_core".to_string(),
+                parquet_files: tl_core,
+                fjall_stats: None,
+            });
+            results.push(EntityStats {
+                entity: "translation_sift".to_string(),
+                parquet_files: tl_sift,
+                fjall_stats: sift_fjall,
+            });
+        }
         Ok(results)
     }
 
-    /// Build a single entity. Returns one or more EntityStats (translation splits into two).
-    ///
-    /// When `overwrite` is false (default), skips entities whose output
-    /// already exists:
-    /// - For parquet-only entities: skips if the parquet directory contains `.parquet` files
-    /// - For variation: skips parquet if files exist, skips fjall if `variation.fjall` exists
-    /// - For translation: skips parquet if files exist, skips sift fjall if `translation_sift.fjall` exists
-    pub async fn build_entity(
-        self: Arc<Self>,
-        entity: &str,
-        sem: Arc<tokio::sync::Semaphore>,
-    ) -> Result<Vec<EntityStats>> {
+    /// Discover the work units for one entity (no execution). Creates output
+    /// dirs and applies the skip checks; returns finished stats for skipped /
+    /// special-rebuild entities, otherwise the units to schedule.
+    async fn discover_entity(&self, entity: &str) -> Result<Discovery> {
         let kind = parse_entity(entity)
             .ok_or_else(|| DataFusionError::Execution(format!("Unknown entity: {entity}")))?;
 
@@ -371,7 +586,7 @@ impl CacheBuilder {
 
         // Skip if all outputs exist (unless overwrite is set).
         // Variation and translation have partial-skip logic in their
-        // own build methods (e.g. parquet exists but fjall missing).
+        // own discovery methods (e.g. parquet exists but fjall missing).
         if !self.overwrite
             && kind != EnsemblEntityKind::Variation
             && kind != EnsemblEntityKind::Translation
@@ -379,39 +594,27 @@ impl CacheBuilder {
             let entity_dir = format!("{}/{}", self.output_dir, subdir);
             if dir_has_parquet_files(&entity_dir) {
                 info!("{entity}: parquet already exists, skipping (use overwrite to rebuild)");
-                return Ok(vec![EntityStats {
+                return Ok(Discovery::Done(vec![EntityStats {
                     entity: subdir.to_string(),
                     parquet_files: vec![],
                     fjall_stats: None,
-                }]);
+                }]));
             }
         }
 
-        if kind == EnsemblEntityKind::Variation {
-            return self.build_variation(sem).await;
+        match kind {
+            EnsemblEntityKind::Variation => self.discover_variation().await,
+            EnsemblEntityKind::Translation => self.discover_translation().await,
+            _ => self.discover_parquet(kind).await,
         }
-
-        if kind == EnsemblEntityKind::Translation {
-            return self.build_translation(sem).await;
-        }
-
-        // All other entities: parquet only
-        let results = self.build_parquet_entity(kind, sem).await?;
-        Ok(vec![EntityStats {
-            entity: subdir.to_string(),
-            parquet_files: results,
-            fjall_stats: None,
-        }])
     }
 
-    /// Build variation: parquet + optional fjall.
+    /// Discover variation work units (or handle special rebuild paths inline).
     ///
     /// When parquet files already exist and fjall is missing, reads from the
-    /// existing parquet files to populate fjall without re-parsing the source.
-    async fn build_variation(
-        self: Arc<Self>,
-        sem: Arc<tokio::sync::Semaphore>,
-    ) -> Result<Vec<EntityStats>> {
+    /// existing parquet files to populate fjall without re-parsing the source —
+    /// these special paths run inline and return finished stats.
+    async fn discover_variation(&self) -> Result<Discovery> {
         let kind = EnsemblEntityKind::Variation;
         let table_name = "var";
         let parquet_dir = format!("{}/variation", self.output_dir);
@@ -426,11 +629,11 @@ impl CacheBuilder {
 
             if !need_parquet && !need_fjall {
                 info!("variation: all outputs exist, skipping (use overwrite to rebuild)");
-                return Ok(vec![EntityStats {
+                return Ok(Discovery::Done(vec![EntityStats {
                     entity: "variation".to_string(),
                     parquet_files: vec![],
                     fjall_stats: None,
-                }]);
+                }]));
             }
 
             // Legacy cache exists as chrN.parquet / other.parquet. Convert it
@@ -447,11 +650,11 @@ impl CacheBuilder {
                 } else {
                     None
                 };
-                return Ok(vec![EntityStats {
+                return Ok(Discovery::Done(vec![EntityStats {
                     entity: "variation".to_string(),
                     parquet_files: parquet_results,
                     fjall_stats,
-                }]);
+                }]));
             }
 
             // Parquet exists but fjall missing → rebuild fjall from parquet
@@ -459,7 +662,7 @@ impl CacheBuilder {
                 info!(
                     "variation: warm/cold parquet exists, building fjall from existing parquet files"
                 );
-                return self.build_variation_fjall_from_parquet().await;
+                return Ok(Discovery::Done(self.build_variation_fjall_from_parquet().await?));
             }
         }
 
@@ -487,71 +690,37 @@ impl CacheBuilder {
             other_chroms.len()
         );
 
-        let mut parquet_results: Vec<(String, usize)> = Vec::new();
-
-        // Main chroms (in chrom_code order) each produce independent
-        // chrN_warm/chrN_cold files; non-main contigs share other.parquet.
-        let mut main_in_order: Vec<String> = Vec::new();
+        // One unit per main chromosome (independent chrN_warm/chrN_cold files),
+        // plus one combined unit for the non-main contigs (shared other.parquet).
+        // Variation units are memory-heavy → weight them (#2); high cost ensures
+        // LPT (#1) schedules them first.
+        let var_weight = variation_permit_weight(self.build_concurrency);
+        let mut units: Vec<WorkUnit> = Vec::new();
         for chrom in CHROM_CODE_ORDER {
             if main_chroms.iter().any(|c| c == chrom) {
-                main_in_order.push(chrom.to_string());
+                let output_file = format!("{}/variation/chr{chrom}.parquet", self.output_dir);
+                units.push(WorkUnit {
+                    cost: 1000,
+                    weight: var_weight,
+                    kind: UnitKind::VariationMain {
+                        chrom: chrom.to_string(),
+                        output_file,
+                    },
+                });
             }
         }
-        // Sort other_chroms alphabetically for deterministic other.parquet output.
         let mut sorted_other = other_chroms.clone();
         sorted_other.sort();
-
-        // Build main chroms concurrently (each is an independent output file),
-        // plus the combined "other" contigs as a single unit. All units share
-        // the global `sem` budget (one permit each).
-        let mut set = tokio::task::JoinSet::new();
-        for chrom in main_in_order {
-            let cb = Arc::clone(&self);
-            let permits = Arc::clone(&sem);
-            let output_file = format!("{}/variation/chr{chrom}.parquet", self.output_dir);
-            set.spawn(async move {
-                let _permit = permits.acquire_owned().await.expect("semaphore closed");
-                cb.build_variation_main_chrom(chrom, output_file).await
-            });
-        }
         if !sorted_other.is_empty() {
-            let cb = Arc::clone(&self);
-            let permits = Arc::clone(&sem);
-            let others = sorted_other.clone();
-            set.spawn(async move {
-                let _permit = permits.acquire_owned().await.expect("semaphore closed");
-                cb.build_variation_other(others).await
+            units.push(WorkUnit {
+                cost: 600,
+                weight: var_weight,
+                kind: UnitKind::VariationOther {
+                    chroms: sorted_other,
+                },
             });
         }
-        while let Some(joined) = set.join_next().await {
-            let chrom_results = joined.map_err(|e| {
-                DataFusionError::Execution(format!("variation chrom task failed to join: {e}"))
-            })??;
-            parquet_results.extend(chrom_results);
-        }
-
-        // Phase 2: Build fjall from the parquet files we just wrote.
-        // This uses the optimized pipelined path with parallel compression.
-        let fjall_stats = if self.build_fjall {
-            let fjall_dir = format!("{}/variation.fjall", self.output_dir);
-            let fjall_exists = Path::new(&fjall_dir).exists();
-            if fjall_exists && !self.overwrite {
-                info!("variation.fjall already exists, skipping (use overwrite to rebuild)");
-                None
-            } else {
-                info!("variation: parquet complete, building fjall from parquet files...");
-                let fjall_result = self.build_variation_fjall_from_parquet().await?;
-                fjall_result.into_iter().next().and_then(|s| s.fjall_stats)
-            }
-        } else {
-            None
-        };
-
-        Ok(vec![EntityStats {
-            entity: "variation".to_string(),
-            parquet_files: parquet_results,
-            fjall_stats,
-        }])
+        Ok(Discovery::Units(units))
     }
 
     /// Build one main-chromosome variation file (chrN_warm + chrN_cold).
@@ -1252,10 +1421,9 @@ impl CacheBuilder {
     }
 
     /// Build translation: split into core + sift parquet, then fjall for sift.
-    async fn build_translation(
-        self: Arc<Self>,
-        sem: Arc<tokio::sync::Semaphore>,
-    ) -> Result<Vec<EntityStats>> {
+    /// Discover translation work units (one per main chromosome + one combined
+    /// "other" unit). The translation_sift fjall post-pass runs in build_all.
+    async fn discover_translation(&self) -> Result<Discovery> {
         let table_name = "tl";
         let kind = EnsemblEntityKind::Translation;
 
@@ -1270,11 +1438,11 @@ impl CacheBuilder {
 
             if core_exists && sift_parquet_exists && (sift_fjall_exists || !self.build_fjall) {
                 info!("translation: all outputs exist, skipping (use overwrite to rebuild)");
-                return Ok(vec![EntityStats {
+                return Ok(Discovery::Done(vec![EntityStats {
                     entity: "translation".to_string(),
                     parquet_files: vec![],
                     fjall_stats: None,
-                }]);
+                }]));
             }
         }
 
@@ -1296,66 +1464,26 @@ impl CacheBuilder {
         let main_set: HashSet<&str> = MAIN_CHROMS.iter().copied().collect();
         let (main_chroms, other_chroms) = split_chroms(&chroms, &main_set);
 
-        let mut core_results: Vec<(String, usize)> = Vec::new();
-        let mut sift_results: Vec<(String, usize)> = Vec::new();
-
-        // Process main chromosomes concurrently (each writes its own
-        // translation_core/ and translation_sift/ chrN files), bounded by sem.
-        let mut set = tokio::task::JoinSet::new();
+        let mut units: Vec<WorkUnit> = Vec::new();
         for chrom in &main_chroms {
-            let cb = Arc::clone(&self);
-            let permits = Arc::clone(&sem);
-            let chrom = chrom.clone();
-            set.spawn(async move {
-                let _permit = permits.acquire_owned().await.expect("semaphore closed");
-                cb.build_translation_chrom(&chrom, kind, table_name).await
+            units.push(WorkUnit {
+                cost: 200,
+                weight: 1,
+                kind: UnitKind::TranslationChrom {
+                    chrom: chrom.clone(),
+                },
             });
         }
-        while let Some(joined) = set.join_next().await {
-            let (core_res, sift_res) = joined.map_err(|e| {
-                DataFusionError::Execution(format!("translation chrom task failed to join: {e}"))
-            })??;
-            if let Some(r) = core_res {
-                core_results.push(r);
-            }
-            if let Some(r) = sift_res {
-                sift_results.push(r);
-            }
-        }
-
-        // Process other contigs as a single unit.
         if !other_chroms.is_empty() {
-            let _permit = sem.acquire().await.expect("semaphore closed");
-            let (core_res, sift_res) = self
-                .build_translation_multi_chrom(&other_chroms, kind, table_name)
-                .await?;
-            if let Some(r) = core_res {
-                core_results.push(r);
-            }
-            if let Some(r) = sift_res {
-                sift_results.push(r);
-            }
+            units.push(WorkUnit {
+                cost: 120,
+                weight: 1,
+                kind: UnitKind::TranslationOther {
+                    chroms: other_chroms,
+                },
+            });
         }
-
-        // Build fjall for translation_sift (second pass, re-sorted by transcript_id)
-        let sift_fjall_stats = if self.build_fjall && !sift_results.is_empty() {
-            self.build_sift_fjall(&sift_results).await?
-        } else {
-            None
-        };
-
-        Ok(vec![
-            EntityStats {
-                entity: "translation_core".to_string(),
-                parquet_files: core_results,
-                fjall_stats: None,
-            },
-            EntityStats {
-                entity: "translation_sift".to_string(),
-                parquet_files: sift_results,
-                fjall_stats: sift_fjall_stats,
-            },
-        ])
+        Ok(Discovery::Units(units))
     }
 
     async fn build_translation_chrom(
@@ -1861,16 +1989,9 @@ impl CacheBuilder {
         }))
     }
 
-    /// Build a parquet-only entity (transcript, exon, regulatory, motif).
-    ///
-    /// Each main chromosome and the combined "other contigs" file are
-    /// independent output files, so they are built concurrently — bounded by
-    /// the shared `sem` budget (one permit per chromosome unit).
-    async fn build_parquet_entity(
-        self: Arc<Self>,
-        kind: EnsemblEntityKind,
-        sem: Arc<tokio::sync::Semaphore>,
-    ) -> Result<Vec<(String, usize)>> {
+    /// Discover work units for a parquet-only entity (transcript, exon,
+    /// regulatory, motif): one per main chromosome + one combined "other" unit.
+    async fn discover_parquet(&self, kind: EnsemblEntityKind) -> Result<Discovery> {
         let table_name = entity_table_name(kind);
         let subdir = entity_subdir(kind);
         // Transcript uses an explicit column list (for HGNC propagation) that
@@ -1907,49 +2028,46 @@ impl CacheBuilder {
             None
         };
 
-        // Build the (query, output_file) work list up front. Export queries are
-        // self-contained strings, so no schema borrow crosses into the spawned
-        // tasks. Each main chrom is its own file; "other" contigs share one file.
-        let mut units: Vec<(String, String)> = Vec::new();
+        // Export queries are self-contained strings, so building them here (with
+        // the schema borrow) and moving the owned String into each unit is safe.
+        // Relative LPT cost by entity (transcript heaviest of the parquet ones).
+        let cost = match kind {
+            EnsemblEntityKind::Transcript => 150,
+            EnsemblEntityKind::Exon => 120,
+            EnsemblEntityKind::RegulatoryFeature => 60,
+            _ => 40,
+        };
+        let mut units: Vec<WorkUnit> = Vec::new();
         for chrom in &main_chroms {
             let query = build_export_query(kind, table_name, Some(chrom), tx_schema);
             let output_file = format!("{}/{subdir}/chr{chrom}.parquet", self.output_dir);
-            units.push((query, output_file));
+            units.push(WorkUnit {
+                cost,
+                weight: 1,
+                kind: UnitKind::Parquet {
+                    kind,
+                    query,
+                    output_file,
+                    needs_rn_drop,
+                },
+            });
         }
         if !other_chroms.is_empty() {
             let other_refs: Vec<&str> = other_chroms.iter().map(|s| s.as_str()).collect();
             let query = build_export_query_multi_chrom(kind, table_name, &other_refs, tx_schema);
             let output_file = format!("{}/{subdir}/other.parquet", self.output_dir);
-            units.push((query, output_file));
-        }
-
-        let global_start = Instant::now();
-        let mut set = tokio::task::JoinSet::new();
-        for (query, output_file) in units {
-            let cb = Arc::clone(&self);
-            let permits = Arc::clone(&sem);
-            set.spawn(async move {
-                let _permit = permits.acquire_owned().await.expect("semaphore closed");
-                cb.build_parquet_query_to_file(kind, query, output_file, needs_rn_drop)
-                    .await
+            units.push(WorkUnit {
+                cost: cost / 2,
+                weight: 1,
+                kind: UnitKind::Parquet {
+                    kind,
+                    query,
+                    output_file,
+                    needs_rn_drop,
+                },
             });
         }
-
-        let mut all_results = Vec::new();
-        let mut total_rows: usize = 0;
-        while let Some(joined) = set.join_next().await {
-            let res = joined.map_err(|e| {
-                DataFusionError::Execution(format!("{subdir} chrom task failed to join: {e}"))
-            })?;
-            if let Some((file, rows)) = res? {
-                total_rows += rows;
-                all_results.push((file, rows));
-            }
-        }
-
-        let elapsed = global_start.elapsed().as_secs_f64();
-        print_progress(subdir, total_rows, elapsed);
-        Ok(all_results)
+        Ok(Discovery::Units(units))
     }
 
     /// Run one export query and stream it to a single parquet file.
