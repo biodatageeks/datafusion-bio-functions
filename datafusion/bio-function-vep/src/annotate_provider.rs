@@ -3080,15 +3080,21 @@ async fn read_lance_dataset_schema(path: &std::path::Path) -> Result<Schema> {
 
 #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
 #[derive(Clone)]
-struct InMemorySiftPredictionStore {
+struct LanceSiftPredictionStore {
     predictions: Arc<HashMap<String, CachedPredictions>>,
 }
 
 #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
-impl crate::kv_cache::SiftPredictionStore for InMemorySiftPredictionStore {
+impl crate::kv_cache::SiftPredictionStore for LanceSiftPredictionStore {
     fn get_many(&self, transcript_ids: &[String]) -> Result<HashMap<String, CachedPredictions>> {
+        if transcript_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let mut out = HashMap::with_capacity(transcript_ids.len());
         for transcript_id in transcript_ids {
+            if out.contains_key(transcript_id) {
+                continue;
+            }
             if let Some(predictions) = self.predictions.get(transcript_id) {
                 out.insert(transcript_id.clone(), predictions.clone());
             }
@@ -3102,11 +3108,13 @@ async fn load_lance_sift_prediction_store_for_chrom(
     cache: &PartitionedLanceCache,
     chrom: &str,
 ) -> Result<Option<SiftPredictionStoreRef>> {
-    let mut predictions = HashMap::new();
-    let batches = scan_lance_context_entity(
-        cache,
-        "translation_sift",
-        chrom,
+    let Some(path) = cache.context_path("translation_sift", chrom) else {
+        return Ok(None);
+    };
+    let profile_enabled = std::env::var_os("VEP_LANCE_PROFILE").is_some();
+    let scan_started = profile_enabled.then(std::time::Instant::now);
+    let batches = crate::lance_cache::context_runtime::scan_projected_existing_columns(
+        &path,
         &[
             "transcript_id",
             "stable_id",
@@ -3115,39 +3123,68 @@ async fn load_lance_sift_prediction_store_for_chrom(
         ],
     )
     .await?;
-    for batch in &batches {
-        let schema = batch.schema();
-        let tx_idx = schema
-            .index_of("transcript_id")
-            .or_else(|_| schema.index_of("stable_id"))
-            .ok();
-        let sift_idx = schema.index_of("sift_predictions").ok();
-        let polyphen_idx = schema.index_of("polyphen_predictions").ok();
-        let Some(tx_idx) = tx_idx else { continue };
-        for row in 0..batch.num_rows() {
-            let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
-                continue;
-            };
-            let mut cached = CachedPredictions::default();
-            if let Some(idx) = sift_idx {
-                cached.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
-            }
-            if let Some(idx) = polyphen_idx {
-                cached.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
-            }
-            cached.sort();
-            if !cached.sift.is_empty() || !cached.polyphen.is_empty() {
-                predictions.insert(transcript_id, cached);
-            }
-        }
+    let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    let predictions = sift_predictions_from_batches(&batches)?;
+    if let Some(started) = scan_started {
+        eprintln!(
+            "[vep-lance-profile] sift_scan_load path={} batches={} rows={} transcripts={} seconds={:.3}",
+            path.display(),
+            batches.len(),
+            rows,
+            predictions.len(),
+            started.elapsed().as_secs_f64(),
+        );
     }
     if predictions.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(Arc::new(InMemorySiftPredictionStore {
-            predictions: Arc::new(predictions),
-        }) as SiftPredictionStoreRef))
+        return Ok(None);
     }
+    Ok(Some(Arc::new(LanceSiftPredictionStore {
+        predictions: Arc::new(predictions),
+    }) as SiftPredictionStoreRef))
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+fn sift_predictions_from_batches(
+    batches: &[RecordBatch],
+) -> Result<HashMap<String, CachedPredictions>> {
+    let mut predictions = HashMap::new();
+    for batch in batches {
+        predictions.extend(sift_predictions_from_batch(batch)?);
+    }
+    Ok(predictions)
+}
+
+#[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
+fn sift_predictions_from_batch(batch: &RecordBatch) -> Result<HashMap<String, CachedPredictions>> {
+    let schema = batch.schema();
+    let tx_idx = schema
+        .index_of("transcript_id")
+        .or_else(|_| schema.index_of("stable_id"))
+        .ok();
+    let sift_idx = schema.index_of("sift_predictions").ok();
+    let polyphen_idx = schema.index_of("polyphen_predictions").ok();
+    let Some(tx_idx) = tx_idx else {
+        return Ok(HashMap::new());
+    };
+
+    let mut predictions = HashMap::new();
+    for row in 0..batch.num_rows() {
+        let Some(transcript_id) = string_at(batch.column(tx_idx).as_ref(), row) else {
+            continue;
+        };
+        let mut cached = CachedPredictions::default();
+        if let Some(idx) = sift_idx {
+            cached.sift = read_compact_predictions(batch.column(idx).as_ref(), row);
+        }
+        if let Some(idx) = polyphen_idx {
+            cached.polyphen = read_compact_predictions(batch.column(idx).as_ref(), row);
+        }
+        cached.sort();
+        if !cached.sift.is_empty() || !cached.polyphen.is_empty() {
+            predictions.insert(transcript_id, cached);
+        }
+    }
+    Ok(predictions)
 }
 
 #[cfg(feature = "kv-cache")]
@@ -12618,7 +12655,7 @@ mod tests {
     }
 
     #[cfg(all(feature = "kv-cache", feature = "lance-cache"))]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn lance_sift_prediction_store_loads_only_requested_chrom() {
         use datafusion::arrow::array::Int64Array;
 

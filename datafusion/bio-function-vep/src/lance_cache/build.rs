@@ -307,7 +307,7 @@ where
     let ctx = make_ctx_and_register(options, kind, table_name)?;
     let df = ctx.sql(query).await?;
     let plan = df.create_physical_plan().await?;
-    if let Some(inner) = extract_multi_partition_inner(&plan) {
+    if let Some(inner) = extract_parallel_source_plan(&plan) {
         let partition_count = inner.properties().partitioning.partition_count();
         info!(
             "Lance build {} {} using {partition_count} physical partitions",
@@ -326,6 +326,13 @@ where
         .await;
     }
 
+    info!(
+        "Lance build {} {} using serial plan root={} partitions={}",
+        table_name,
+        dataset_path.display(),
+        plan.name(),
+        plan.properties().partitioning.partition_count(),
+    );
     let stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
     write_stream_to_lance(
         stream,
@@ -516,7 +523,18 @@ where
     Ok(written_rows)
 }
 
-fn extract_multi_partition_inner(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+fn extract_parallel_source_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    if plan.properties().partitioning.partition_count() > 1 {
+        return Some(Arc::clone(plan));
+    }
+
+    if is_transparent_single_partition_wrapper(plan.name()) {
+        let children = plan.children();
+        if children.len() == 1 {
+            return extract_parallel_source_plan(children[0]);
+        }
+    }
+
     if plan.name() != "SortPreservingMergeExec" {
         return None;
     }
@@ -530,6 +548,16 @@ fn extract_multi_partition_inner(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dy
     } else {
         None
     }
+}
+
+fn is_transparent_single_partition_wrapper(plan_name: &str) -> bool {
+    matches!(
+        plan_name,
+        // These nodes preserve the row set and schema.  They can appear above
+        // SortPreservingMergeExec in optimized plans, and bypassing them only
+        // drops scheduling or batch-sizing behavior.
+        "CoalesceBatchesExec" | "CooperativeExec" | "BufferExec"
+    )
 }
 
 fn make_ctx_and_register(
@@ -731,8 +759,15 @@ fn sql_escape_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+    use datafusion::arrow::compute::SortOptions;
     use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
+    #[allow(deprecated)]
+    use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+    use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+    use datafusion::physical_plan::test::TestMemoryExec;
 
     #[test]
     fn lance_entity_dirs_use_lance_suffix() {
@@ -841,6 +876,40 @@ mod tests {
         let df = ctx.sql("SELECT 1 AS x").await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
 
-        assert!(extract_multi_partition_inner(&plan).is_none());
+        assert!(extract_parallel_source_plan(&plan).is_none());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn parallel_source_detector_unwraps_transparent_merge_wrapper() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let make_batch = |value| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![value])) as ArrayRef],
+            )
+            .unwrap()
+        };
+        let source = TestMemoryExec::try_new_exec(
+            &[
+                vec![make_batch(1)],
+                vec![make_batch(2)],
+                vec![make_batch(3)],
+            ],
+            Arc::clone(&schema),
+            None,
+        )
+        .unwrap();
+        let sort = LexOrdering::new(vec![PhysicalSortExpr {
+            expr: Arc::new(Column::new("x", 0)),
+            options: SortOptions::default(),
+        }])
+        .expect("non-empty sort ordering");
+        let merge: Arc<dyn ExecutionPlan> = Arc::new(SortPreservingMergeExec::new(sort, source));
+        let wrapped: Arc<dyn ExecutionPlan> = Arc::new(CoalesceBatchesExec::new(merge, 8192));
+
+        let parallel = extract_parallel_source_plan(&wrapped)
+            .expect("transparent wrapper around merge should expose source partitions");
+        assert_eq!(parallel.properties().partitioning.partition_count(), 3);
     }
 }

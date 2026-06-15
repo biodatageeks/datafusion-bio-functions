@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
@@ -12,20 +13,34 @@ pub struct TranscriptIdLanceLookup {
     dataset: lance::Dataset,
     projection: Vec<String>,
     index: StringRowIdIndex,
+    path: PathBuf,
 }
 
 impl TranscriptIdLanceLookup {
     pub async fn open(path: &Path, projection: Vec<String>) -> Result<Self> {
+        let profile_enabled = std::env::var_os("VEP_LANCE_PROFILE").is_some();
+        let opened_at = profile_enabled.then(Instant::now);
         let dataset = open_lance_dataset(path).await?;
         let index = load_transcript_id_index_from_lance_btree(&dataset).await?;
         let projection = existing_projection_columns(
             dataset_schema_field_names(&dataset),
             projection.iter().map(String::as_str),
         );
+        if let Some(started) = opened_at {
+            eprintln!(
+                "[vep-lance-profile] transcript_lookup_open path={} projection_cols={} row_ids={} unique_values={} seconds={:.3}",
+                path.display(),
+                projection.len(),
+                index.row_ids_len(),
+                index.unique_values(),
+                started.elapsed().as_secs_f64(),
+            );
+        }
         Ok(Self {
             dataset,
             projection,
             index,
+            path: path.to_path_buf(),
         })
     }
 
@@ -34,16 +49,39 @@ impl TranscriptIdLanceLookup {
         ids.sort_unstable();
         ids.dedup();
         let row_ids = self.index.resolve_sorted_values(&ids);
+        let profile_enabled = std::env::var_os("VEP_LANCE_PROFILE").is_some();
+        let take_started = profile_enabled.then(Instant::now);
+        if profile_enabled {
+            eprintln!(
+                "[vep-lance-profile] transcript_take_start path={} requested_ids={} unique_ids={} row_ids={} projection_cols={}",
+                self.path.display(),
+                transcript_ids.len(),
+                ids.len(),
+                row_ids.len(),
+                self.projection.len(),
+            );
+        }
         let projection_request = ProjectionRequest::from_columns(
             self.projection.iter().map(String::as_str),
             self.dataset.schema(),
         );
-        self.dataset
+        let batch = self
+            .dataset
             .take_rows(&row_ids, projection_request)
             .await
             .map_err(|err| {
                 DataFusionError::Execution(format!("Lance transcript_id take_rows failed: {err}"))
-            })
+            })?;
+        if let Some(started) = take_started {
+            eprintln!(
+                "[vep-lance-profile] transcript_take path={} row_ids={} batch_rows={} seconds={:.3}",
+                self.path.display(),
+                row_ids.len(),
+                batch.num_rows(),
+                started.elapsed().as_secs_f64(),
+            );
+        }
+        Ok(batch)
     }
 
     pub fn row_ids_len(&self) -> usize {

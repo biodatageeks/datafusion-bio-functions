@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Instant;
 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
@@ -7,6 +8,7 @@ use lance::dataset::ProjectionRequest;
 use crate::lance_cache::row_index::{
     PositionRowIdIndex, ResolvedRowIds, load_start_index_from_lance_btree,
 };
+use crate::lance_cache::schema::VARIATION_FORBIDDEN_COLUMNS;
 
 #[derive(Debug)]
 pub struct TakenVariationRows {
@@ -47,15 +49,34 @@ impl SinglePathLanceVariationLookup {
         let resolved = self
             .index
             .resolve_sorted_positions_from_cursor(sorted_unique_starts, cursor);
+        let profile_enabled = std::env::var_os("VEP_LANCE_PROFILE").is_some();
+        if profile_enabled {
+            eprintln!(
+                "[vep-lance-profile] variation_resolve requested_starts={} matched_positions={} row_ids={} cursor={}",
+                resolved.requested_positions,
+                resolved.matched_positions,
+                resolved.row_ids.len(),
+                *cursor,
+            );
+        }
         let projection_request = ProjectionRequest::from_columns(
             self.projection.iter().map(String::as_str),
             self.dataset.schema(),
         );
+        let take_started = profile_enabled.then(Instant::now);
         let batch = self
             .dataset
             .take_rows(&resolved.row_ids, projection_request)
             .await
             .map_err(|err| DataFusionError::Execution(format!("Lance take_rows failed: {err}")))?;
+        if let Some(started) = take_started {
+            eprintln!(
+                "[vep-lance-profile] variation_take row_ids={} batch_rows={} seconds={:.3}",
+                resolved.row_ids.len(),
+                batch.num_rows(),
+                started.elapsed().as_secs_f64(),
+            );
+        }
         Ok(TakenVariationRows { resolved, batch })
     }
 
@@ -72,13 +93,22 @@ impl SinglePathLanceVariationLookup {
     }
 }
 
-pub fn ensure_runtime_projection(mut projection: Vec<String>) -> Vec<String> {
-    for required in ["start", "end", "allele_string", "failed"] {
-        if !projection.iter().any(|column| column == required) {
-            projection.push(required.to_string());
+pub fn ensure_runtime_projection(projection: Vec<String>) -> Vec<String> {
+    let mut sanitized = Vec::with_capacity(projection.len() + 4);
+    for column in projection {
+        let forbidden = VARIATION_FORBIDDEN_COLUMNS
+            .iter()
+            .any(|forbidden| column == *forbidden);
+        if !forbidden && !sanitized.iter().any(|existing| existing == &column) {
+            sanitized.push(column);
         }
     }
-    projection
+    for required in ["start", "end", "allele_string", "failed"] {
+        if !sanitized.iter().any(|column| column == required) {
+            sanitized.push(required.to_string());
+        }
+    }
+    sanitized
 }
 
 #[cfg(test)]
@@ -140,6 +170,22 @@ mod tests {
         assert_eq!(
             projection,
             vec!["variation_name", "start", "allele_string", "end", "failed"]
+        );
+    }
+
+    #[test]
+    fn runtime_projection_drops_legacy_warm_cold_columns() {
+        let projection = ensure_runtime_projection(vec![
+            "position_key".into(),
+            "variant_keys".into(),
+            "tier".into(),
+            "variation_name".into(),
+            "position_key".into(),
+        ]);
+
+        assert_eq!(
+            projection,
+            vec!["variation_name", "start", "end", "allele_string", "failed"]
         );
     }
 

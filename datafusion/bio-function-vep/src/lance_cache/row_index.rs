@@ -92,6 +92,14 @@ impl PositionRowIdIndex {
         let mut matched_positions = 0;
         let mut row_ids = Vec::new();
         *cursor = (*cursor).min(self.positions.len());
+        if let Some(first_position) = query_positions.first().copied() {
+            let cursor_position = self.positions.get(*cursor).copied();
+            if cursor_position.is_none_or(|position| position > first_position) {
+                *cursor = self
+                    .positions
+                    .partition_point(|position| *position < first_position);
+            }
+        }
 
         for &position in query_positions {
             while *cursor < self.positions.len() && self.positions[*cursor] < position {
@@ -433,6 +441,21 @@ mod tests {
         assert_eq!(result.matched_positions, 1);
         assert_eq!(result.row_ids, vec![2]);
         assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn rewinds_cursor_when_extended_probes_overlap_later_window() {
+        let index =
+            PositionRowIdIndex::from_pairs_for_test(vec![(100, 1), (101, 2), (102, 3), (130, 4)]);
+        let mut cursor = 0;
+
+        let first = index.resolve_sorted_positions_from_cursor(&[100, 102, 130], &mut cursor);
+        assert_eq!(first.row_ids, vec![1, 3, 4]);
+        assert_eq!(cursor, 4);
+
+        let second = index.resolve_sorted_positions_from_cursor(&[101, 102], &mut cursor);
+        assert_eq!(second.row_ids, vec![2, 3]);
+        assert_eq!(cursor, 3);
     }
 
     #[test]

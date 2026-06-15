@@ -60,6 +60,8 @@ use crate::warm_cache::key::{
     variant_key_from_position as warm_variant_key_from_position,
 };
 
+const DEFAULT_LANCE_LOOKUP_PROCESS_BATCH_ROWS: usize = 5_000;
+
 /// Lookup match mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvMatchMode {
@@ -531,6 +533,9 @@ struct KvLookupStream {
     profile_detailed: bool,
     profile_emitted: bool,
     profile: LookupProfile,
+    /// Input slices waiting to be processed after a large upstream batch was
+    /// split to bound Lance `take_rows` work.
+    pending_input_slices: VecDeque<RecordBatch>,
     /// Buffered matched batches (used when colocated sink is present).
     /// Batches are collected during probe and emitted after input exhaustion.
     matched_batches: VecDeque<RecordBatch>,
@@ -1142,6 +1147,33 @@ fn warm_variation_batch_size() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(262_144)
+}
+
+fn lance_lookup_process_batch_rows() -> usize {
+    std::env::var("VEP_LANCE_LOOKUP_PROCESS_BATCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LANCE_LOOKUP_PROCESS_BATCH_ROWS)
+}
+
+fn enqueue_record_batch_slices(
+    queue: &mut VecDeque<RecordBatch>,
+    batch: RecordBatch,
+    max_rows: usize,
+) {
+    let max_rows = max_rows.max(1);
+    if batch.num_rows() <= max_rows {
+        queue.push_back(batch);
+        return;
+    }
+
+    let mut offset = 0usize;
+    while offset < batch.num_rows() {
+        let len = max_rows.min(batch.num_rows() - offset);
+        queue.push_back(batch.slice(offset, len));
+        offset += len;
+    }
 }
 
 fn warm_cold_variation_backend_from_env() -> WarmColdVariationBackend {
@@ -1877,6 +1909,7 @@ impl KvLookupStream {
             profile_detailed,
             profile_emitted: false,
             profile: LookupProfile::default(),
+            pending_input_slices: VecDeque::new(),
             matched_batches: VecDeque::new(),
             input_exhausted: false,
         }
@@ -2874,6 +2907,25 @@ impl KvLookupStream {
         }
 
         Ok(result)
+    }
+
+    fn enqueue_input_batch(&mut self, batch: RecordBatch) {
+        let max_rows = self.input_slice_rows();
+        enqueue_record_batch_slices(&mut self.pending_input_slices, batch, max_rows);
+    }
+
+    fn input_slice_rows(&self) -> usize {
+        #[cfg(feature = "lance-cache")]
+        if self.warm_cold_backend.is_lance() {
+            return lance_lookup_process_batch_rows();
+        }
+        usize::MAX
+    }
+
+    fn process_next_pending_input_slice(&mut self) -> Option<Result<RecordBatch>> {
+        self.pending_input_slices
+            .pop_front()
+            .map(|batch| self.process_batch(&batch))
     }
 
     fn process_batch(&mut self, vcf_batch: &RecordBatch) -> Result<RecordBatch> {
@@ -4680,13 +4732,17 @@ impl Stream for KvLookupStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(result) = self.process_next_pending_input_slice() {
+            return Poll::Ready(Some(result));
+        }
+
         // KvLookupExec reads ALL alleles at each position in a single point
         // lookup (the position entry contains all alleles), so co-located
         // data for each VCF row is complete immediately — no buffering needed.
         match self.input.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                let result = self.process_batch(&batch);
-                Poll::Ready(Some(result))
+                self.enqueue_input_batch(batch);
+                Poll::Ready(self.process_next_pending_input_slice())
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => {
@@ -5049,6 +5105,24 @@ mod tests {
     }
 
     #[test]
+    fn record_batch_slicer_bounds_large_lance_lookup_batches() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("start", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..12_001)) as ArrayRef],
+        )
+        .unwrap();
+        let mut queue = VecDeque::new();
+
+        enqueue_record_batch_slices(&mut queue, batch, 5_000);
+
+        let lengths = queue.iter().map(RecordBatch::num_rows).collect::<Vec<_>>();
+        assert_eq!(lengths, vec![5_000, 5_000, 2_001]);
+    }
+
+    #[test]
     fn warm_row_values_append_to_cache_builders() {
         use std::sync::Arc;
 
@@ -5296,6 +5370,80 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[cfg(feature = "lance-cache")]
+    #[test]
+    fn lance_colocated_probe_matches_chr1_homopolymer_deletion() {
+        let cache_schema = Arc::new(Schema::new(vec![
+            Field::new("start", DataType::UInt32, false),
+            Field::new("end", DataType::UInt32, false),
+            Field::new("variation_name", DataType::Utf8, true),
+            Field::new("allele_string", DataType::Utf8, false),
+            Field::new("failed", DataType::Int8, false),
+            Field::new("gnomADg", DataType::Utf8, true),
+            Field::new("gnomADg_EAS", DataType::Utf8, true),
+        ]));
+        let allele_string =
+            "AAAAAAAAAAAAAAAA/AAAAAAAAAAAA/AAAAAAAAAAAAA/AAAAAAAAAAAAAA/AAAAAAAAAAAAAAA";
+        let batch = RecordBatch::try_new(
+            cache_schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![244_978_492])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![244_978_507])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("rs58680543")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![allele_string])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![0])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("AAAAAAAAAAAAAAA:0.1017")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("AAAAAAAAAAAAAAA:0.2402")])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let mut coloc = StdHashMap::new();
+        let mut builders = Vec::new();
+        let mut vcf_indices = Vec::new();
+        let row_map = lance_start_row_map(&batch).unwrap();
+        let rows = row_map.get(&244_978_492).unwrap();
+
+        let (result, metrics) = probe_lance_taken_batch_position(
+            &batch,
+            rows,
+            allele_matches as fn(&str, &str, &str) -> bool,
+            0,
+            true,
+            "1",
+            244_978_492,
+            "CA",
+            "C",
+            244_978_491,
+            244_978_492,
+            false,
+            0,
+            &[],
+            &[],
+            &mut builders,
+            &mut vcf_indices,
+            Some(&mut coloc),
+        )
+        .unwrap();
+
+        assert_eq!(result, ColdProbeResult::Match);
+        assert_eq!(metrics.colocated_entries, 1);
+        let key = ("1".to_string(), 244_978_492, 244_978_492, "A/-".to_string());
+        let sink_value = coloc
+            .get(&key)
+            .expect("colocated entry keyed by parser allele");
+        assert_eq!(sink_value.entries.len(), 1);
+        assert_eq!(sink_value.entries[0].variation_name, "rs58680543");
+        assert_eq!(
+            sink_value.entries[0].af_values[16],
+            "AAAAAAAAAAAAAAA:0.1017"
+        );
+        assert_eq!(
+            sink_value.entries[0].af_values[21],
+            "AAAAAAAAAAAAAAA:0.2402"
+        );
     }
 
     fn write_single_group_warm_parquet(path: &std::path::Path, batch: &RecordBatch) {
